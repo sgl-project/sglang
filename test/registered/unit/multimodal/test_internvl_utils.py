@@ -13,6 +13,7 @@ import torch
 from PIL import Image
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
@@ -23,7 +24,7 @@ except Exception:  # pragma: no cover
 
 
 @unittest.skipIf(internvl_utils is None, "torchvision / internvl_utils not available")
-class TestFindClosestAspectRatio(unittest.TestCase):
+class TestFindClosestAspectRatio(CustomTestCase):
     def test_picks_closest_ratio(self):
         ratios = [(1, 1), (2, 1), (3, 2)]
         best = internvl_utils.find_closest_aspect_ratio(
@@ -58,7 +59,7 @@ class TestFindClosestAspectRatio(unittest.TestCase):
 
 
 @unittest.skipIf(internvl_utils is None, "torchvision / internvl_utils not available")
-class TestDynamicPreprocess(unittest.TestCase):
+class TestDynamicPreprocess(CustomTestCase):
     def test_single_block_no_thumbnail(self):
         img = Image.new("RGB", (64, 64), color=(1, 2, 3))
         tiles = internvl_utils.dynamic_preprocess(
@@ -100,7 +101,7 @@ class TestDynamicPreprocess(unittest.TestCase):
 
 
 @unittest.skipIf(internvl_utils is None, "torchvision / internvl_utils not available")
-class TestImageToPixelValues(unittest.TestCase):
+class TestImageToPixelValues(CustomTestCase):
     def test_returns_stacked_tensor(self):
         img = Image.new("RGB", (64, 64), color=(1, 2, 3))
         pixel_values = internvl_utils.image_to_pixel_values(

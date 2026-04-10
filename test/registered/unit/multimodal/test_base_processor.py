@@ -4,22 +4,22 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import importlib.util
-import pathlib
 import re
 import sys
 import types
-import unittest
+from unittest import mock
 
 import numpy as np
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
-# Load `base_processor.py` from source with lightweight stubs for heavy runtime deps.
+# These stub classes mirror the real schedule_batch types and are injected into
+# the sys.modules stub so that base_processor.py uses the same classes as the tests.
 class Modality(enum.Enum):
     IMAGE = enum.auto()
     MULTI_IMAGES = enum.auto()
@@ -43,64 +43,38 @@ class MultimodalInputFormat(enum.Enum):
     PRECOMPUTED_EMBEDDING = enum.auto()
 
 
-def _install_stub_modules():
-    touched = {}
+def _build_stub_modules() -> dict:
+    schedule_batch = types.ModuleType("sglang.srt.managers.schedule_batch")
+    schedule_batch.Modality = Modality
+    schedule_batch.MultimodalDataItem = MultimodalDataItem
+    schedule_batch.MultimodalInputFormat = MultimodalInputFormat
 
-    def _set_module(name: str, mod):
-        touched[name] = sys.modules.get(name)
-        sys.modules[name] = mod
-
-    if "transformers" not in sys.modules:
-        transformers_stub = types.ModuleType("transformers")
-
-        class BaseImageProcessorFast:
-            pass
-
-        class PretrainedConfig:
-            model_type = None
-
-        class ProcessorMixin:
-            pass
-
-        transformers_stub.BaseImageProcessorFast = BaseImageProcessorFast
-        transformers_stub.PretrainedConfig = PretrainedConfig
-        transformers_stub.ProcessorMixin = ProcessorMixin
-        _set_module("transformers", transformers_stub)
-
-    schedule_batch_mod = types.ModuleType("sglang.srt.managers.schedule_batch")
-    schedule_batch_mod.Modality = Modality
-    schedule_batch_mod.MultimodalDataItem = MultimodalDataItem
-    schedule_batch_mod.MultimodalInputFormat = MultimodalInputFormat
-    _set_module("sglang.srt.managers.schedule_batch", schedule_batch_mod)
-
-    server_args_mod = types.ModuleType("sglang.srt.server_args")
+    server_args = types.ModuleType("sglang.srt.server_args")
 
     class _Args:
         rl_on_policy_target = None
 
-    server_args_mod.get_global_server_args = lambda: _Args()
-    _set_module("sglang.srt.server_args", server_args_mod)
+    server_args.get_global_server_args = lambda: _Args()
 
-    utils_mod = types.ModuleType("sglang.srt.utils")
-    utils_mod.envs = types.SimpleNamespace(
+    utils = types.ModuleType("sglang.srt.utils")
+    utils.envs = types.SimpleNamespace(
         SGLANG_USE_CUDA_IPC_TRANSPORT=types.SimpleNamespace(get=lambda: False)
     )
-    utils_mod.is_cpu = lambda: True
-    utils_mod.is_npu = lambda: False
-    utils_mod.is_xpu = lambda: False
-    utils_mod.load_audio = lambda data, sr=None: data
-    utils_mod.load_image = lambda data: (data, (0, 0))
-    utils_mod.load_video = lambda data, frame_count_limit=None: data
-    utils_mod.logger = types.SimpleNamespace(
+    utils.is_cpu = lambda: True
+    utils.is_npu = lambda: False
+    utils.is_xpu = lambda: False
+    utils.load_audio = lambda data, sr=None: data
+    utils.load_image = lambda data: (data, (0, 0))
+    utils.load_video = lambda data, frame_count_limit=None: data
+    utils.logger = types.SimpleNamespace(
         debug=lambda *a, **k: None,
         warning=lambda *a, **k: None,
         exception=lambda *a, **k: None,
     )
-    _set_module("sglang.srt.utils", utils_mod)
 
-    cuda_ipc_mod = types.ModuleType("sglang.srt.utils.cuda_ipc_transport_utils")
-    cuda_ipc_mod.MM_FEATURE_CACHE_SIZE = 0
-    cuda_ipc_mod.MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = 0
+    cuda_ipc = types.ModuleType("sglang.srt.utils.cuda_ipc_transport_utils")
+    cuda_ipc.MM_FEATURE_CACHE_SIZE = 0
+    cuda_ipc.MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = 0
 
     class CudaIpcTensorTransportProxy:
         def __init__(self, data=None, info_data=None, sync_buffer_meta=None):
@@ -115,44 +89,26 @@ def _install_stub_modules():
         def return_a_slice_tensor_with_flag(self, _):
             return None, None
 
-    cuda_ipc_mod.CudaIpcTensorTransportProxy = CudaIpcTensorTransportProxy
-    cuda_ipc_mod.MmItemMemoryPool = MmItemMemoryPool
-    _set_module("sglang.srt.utils.cuda_ipc_transport_utils", cuda_ipc_mod)
+    cuda_ipc.CudaIpcTensorTransportProxy = CudaIpcTensorTransportProxy
+    cuda_ipc.MmItemMemoryPool = MmItemMemoryPool
 
-    return touched
-
-
-_touched_modules = _install_stub_modules()
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
-_TARGET = (
-    _REPO_ROOT
-    / "python"
-    / "sglang"
-    / "srt"
-    / "multimodal"
-    / "processors"
-    / "base_processor.py"
-)
-spec = importlib.util.spec_from_file_location(
-    "base_processor_test_module", str(_TARGET)
-)
-base_processor_mod = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(base_processor_mod)
-
-# Restore global module table so other test files are unaffected.
-for _name, _old in _touched_modules.items():
-    if _old is None:
-        sys.modules.pop(_name, None)
-    else:
-        sys.modules[_name] = _old
-
-BaseMultiModalProcessorOutput = base_processor_mod.BaseMultiModalProcessorOutput
-BaseMultimodalProcessor = base_processor_mod.BaseMultimodalProcessor
-MultimodalSpecialTokens = base_processor_mod.MultimodalSpecialTokens
+    return {
+        "sglang.srt.managers.schedule_batch": schedule_batch,
+        "sglang.srt.server_args": server_args,
+        "sglang.srt.utils": utils,
+        "sglang.srt.utils.cuda_ipc_transport_utils": cuda_ipc,
+    }
 
 
-class TestBaseMultiModalProcessorOutput(unittest.TestCase):
+with mock.patch.dict(sys.modules, _build_stub_modules()):
+    from sglang.srt.multimodal.processors.base_processor import (
+        BaseMultiModalProcessorOutput,
+        BaseMultimodalProcessor,
+        MultimodalSpecialTokens,
+    )
+
+
+class TestBaseMultiModalProcessorOutput(CustomTestCase):
     def test_organize_results_orders_modalities(self):
         out = BaseMultiModalProcessorOutput(
             input_text="x",
@@ -175,7 +131,7 @@ class TestBaseMultiModalProcessorOutput(unittest.TestCase):
         self.assertEqual([m for m, _ in organized], [Modality.IMAGE, Modality.IMAGE])
 
 
-class TestMultimodalSpecialTokens(unittest.TestCase):
+class TestMultimodalSpecialTokens(CustomTestCase):
     def test_get_modality_of_token_exact_match(self):
         tokens = MultimodalSpecialTokens(
             image_token="<image>",
@@ -232,7 +188,7 @@ class TestMultimodalSpecialTokens(unittest.TestCase):
         self.assertIs(first, second)
 
 
-class TestValidateMmData(unittest.TestCase):
+class TestValidateMmData(CustomTestCase):
     def test_validate_mm_data_all_none(self):
         BaseMultimodalProcessor.validate_mm_data(None, None, None)
 
@@ -250,7 +206,7 @@ class TestValidateMmData(unittest.TestCase):
         BaseMultimodalProcessor.validate_mm_data(image_data=good)
 
 
-class TestMmOffsets(unittest.TestCase):
+class TestMmOffsets(CustomTestCase):
     def test_get_mm_items_offset_docstring_example(self):
         input_ids = torch.tensor([1, 2, 3, 3, 3, 4, 3, 3])
         offsets = BaseMultimodalProcessor.get_mm_items_offset(input_ids, mm_token_id=3)
@@ -295,7 +251,7 @@ class _MinimalProcessor(BaseMultimodalProcessor):
         raise NotImplementedError()
 
 
-class TestProcessLoadedMmData(unittest.TestCase):
+class TestProcessLoadedMmData(CustomTestCase):
     def _make_minimal(self):
         # Create an instance without calling BaseMultimodalProcessor.__init__ (heavy).
         obj = object.__new__(_MinimalProcessor)
@@ -352,4 +308,6 @@ class TestProcessLoadedMmData(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()

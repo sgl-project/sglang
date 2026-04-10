@@ -2,56 +2,12 @@
 
 from __future__ import annotations
 
-import importlib.util
-import pathlib
-import sys
-import types
-import unittest
-
+import sglang.srt.multimodal.customized_mm_processor_utils as cmmpu
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from transformers import PretrainedConfig, ProcessorMixin
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
-
-# Load the target module from source with a lightweight `transformers` stub.
-_old_transformers = sys.modules.get("transformers")
-if "transformers" not in sys.modules:
-    transformers_stub = types.ModuleType("transformers")
-
-    class PretrainedConfig:
-        model_type = None
-
-    class ProcessorMixin:
-        pass
-
-    transformers_stub.PretrainedConfig = PretrainedConfig
-    transformers_stub.ProcessorMixin = ProcessorMixin
-    sys.modules["transformers"] = transformers_stub
-else:
-    from transformers import PretrainedConfig, ProcessorMixin
-
-if "PretrainedConfig" not in globals():
-    from transformers import PretrainedConfig, ProcessorMixin
-
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
-_TARGET = (
-    _REPO_ROOT
-    / "python"
-    / "sglang"
-    / "srt"
-    / "multimodal"
-    / "customized_mm_processor_utils.py"
-)
-spec = importlib.util.spec_from_file_location(
-    "customized_mm_processor_utils_test", str(_TARGET)
-)
-cmmpu = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(cmmpu)
-
-if _old_transformers is None:
-    sys.modules.pop("transformers", None)
-else:
-    sys.modules["transformers"] = _old_transformers
 
 
 class _DummyProcessor(ProcessorMixin):
@@ -64,8 +20,9 @@ class _DummyProcessor(ProcessorMixin):
         raise NotImplementedError()
 
 
-class TestRegisterCustomizedProcessor(unittest.TestCase):
+class TestRegisterCustomizedProcessor(CustomTestCase):
     def setUp(self):
+        super().setUp()
         self._orig = dict(cmmpu._CUSTOMIZED_MM_PROCESSOR)
         cmmpu._CUSTOMIZED_MM_PROCESSOR.clear()
 
@@ -106,4 +63,6 @@ class TestRegisterCustomizedProcessor(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()

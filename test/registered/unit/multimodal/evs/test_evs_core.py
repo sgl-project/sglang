@@ -2,30 +2,16 @@
 
 from __future__ import annotations
 
-import importlib.util
-import os
-import pathlib
-import unittest
-
 import torch
 
+from sglang.srt.multimodal.evs import evs_core
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
-_EVS_CORE = (
-    _REPO_ROOT / "python" / "sglang" / "srt" / "multimodal" / "evs" / "evs_core.py"
-)
-spec = importlib.util.spec_from_file_location(
-    "sglang_evs_core_for_test", os.fspath(_EVS_CORE)
-)
-evs_core = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(evs_core)
 
-
-class TestComputeRetainedTokensCount(unittest.TestCase):
+class TestComputeRetainedTokensCount(CustomTestCase):
     def test_q_zero_retains_all_tokens(self):
         # total=8, (1-q)=1.0 → retain 8
         self.assertEqual(evs_core.compute_retained_tokens_count(4, 2, q=0.0), 8)
@@ -42,7 +28,7 @@ class TestComputeRetainedTokensCount(unittest.TestCase):
         self.assertEqual(evs_core.compute_retained_tokens_count(16, 1, q=0.99), 16)
 
 
-class TestComputeRetentionMask(unittest.TestCase):
+class TestComputeRetentionMask(CustomTestCase):
     def _make_video_embeds(self, T: int, H: int, W: int, hidden: int):
         # Create embeddings where frame 0 and 1 are identical → similarity=1, dissimilarity=0
         per_frame = H * W
@@ -107,7 +93,7 @@ class TestComputeRetentionMask(unittest.TestCase):
         self.assertEqual(mask.dim(), 1)
 
 
-class TestEvsInputIdHelpers(unittest.TestCase):
+class TestEvsInputIdHelpers(CustomTestCase):
     def test_tokens_per_frame_sums_to_retained(self):
         out = evs_core.tokens_per_frame(q=0.25, num_frames=3, frame_num_tokens=4)
         retained = evs_core.compute_retained_tokens_count(
@@ -138,4 +124,6 @@ class TestEvsInputIdHelpers(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()

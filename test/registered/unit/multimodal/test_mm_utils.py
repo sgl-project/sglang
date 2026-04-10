@@ -32,11 +32,12 @@ if os.name == "nt" and "resource" not in sys.modules:
 
 from sglang.srt.multimodal import mm_utils
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
-class TestEnsureNumpy(unittest.TestCase):
+class TestEnsureNumpy(CustomTestCase):
     def test_tensor_to_numpy(self):
         x = torch.tensor([1, 2, 3], dtype=torch.int64)
         y = mm_utils.ensure_numpy(x)
@@ -54,7 +55,7 @@ class TestEnsureNumpy(unittest.TestCase):
         self.assertIs(y, x)
 
 
-class TestHasValidData(unittest.TestCase):
+class TestHasValidData(CustomTestCase):
     def test_none_is_invalid(self):
         self.assertFalse(mm_utils.has_valid_data(None))
 
@@ -65,7 +66,7 @@ class TestHasValidData(unittest.TestCase):
         self.assertTrue(mm_utils.has_valid_data([[None, []], [0, [False, [1]]]]))
 
 
-class TestSelectBestResolution(unittest.TestCase):
+class TestSelectBestResolution(CustomTestCase):
     def test_selects_best_fit_by_effective_resolution(self):
         original = (1000, 500)
         possible = [(256, 256), (1024, 1024), (512, 512)]
@@ -89,7 +90,7 @@ class TestSelectBestResolution(unittest.TestCase):
         )
 
 
-class TestGetAnyresImageGridShape(unittest.TestCase):
+class TestGetAnyresImageGridShape(CustomTestCase):
     def test_grid_pinpoints_as_list(self):
         image_size = (800, 600)
         grid_pinpoints = [(224, 224), (448, 448)]
@@ -123,7 +124,7 @@ class TestGetAnyresImageGridShape(unittest.TestCase):
         self.assertEqual(shape, (2, 2))
 
 
-class TestDivideToPatches(unittest.TestCase):
+class TestDivideToPatches(CustomTestCase):
     def test_divides_even_grid(self):
         img = Image.new("RGB", (32, 16), color=(1, 2, 3))
         patches = mm_utils.divide_to_patches(img, patch_size=8)
@@ -143,7 +144,7 @@ class TestDivideToPatches(unittest.TestCase):
         self.assertEqual(len(patches), 4)
 
 
-class TestResizeAndPadImage(unittest.TestCase):
+class TestResizeAndPadImage(CustomTestCase):
     def test_output_is_exact_target_resolution(self):
         img = Image.new("RGB", (100, 50), color=(10, 20, 30))
         out = mm_utils.resize_and_pad_image(img, (224, 224))
@@ -171,7 +172,7 @@ class TestResizeAndPadImage(unittest.TestCase):
         self.assertEqual(out.getpixel((0, 0)), (0, 0, 0))
 
 
-class TestExpand2Square(unittest.TestCase):
+class TestExpand2Square(CustomTestCase):
     def test_returns_identity_for_square(self):
         img = Image.new("RGB", (64, 64), color=(1, 2, 3))
         out = mm_utils.expand2square(img, (0, 0, 0))
@@ -188,7 +189,7 @@ class TestExpand2Square(unittest.TestCase):
         self.assertEqual(out.mode, "RGB")
 
 
-class TestUnpadImage(unittest.TestCase):
+class TestUnpadImage(CustomTestCase):
     def test_unpads_width_dominant_original(self):
         # current is square-ish, original is wider → crop height.
         x = torch.zeros((3, 10, 10))
@@ -210,7 +211,7 @@ class TestUnpadImage(unittest.TestCase):
         self.assertEqual(out.shape, x.shape)
 
 
-class TestUnpadImageShape(unittest.TestCase):
+class TestUnpadImageShape(CustomTestCase):
     def test_shape_width_dominant_original(self):
         new_shape = mm_utils.unpad_image_shape(10, 10, original_size=(20, 10))
         self.assertIsInstance(new_shape, tuple)
@@ -232,7 +233,7 @@ class TestUnpadImageShape(unittest.TestCase):
         self.assertEqual(result.shape[1:], expected_shape)
 
 
-class TestLoadImageFromBase64(unittest.TestCase):
+class TestLoadImageFromBase64(CustomTestCase):
     def test_loads_valid_png(self):
         img = Image.new("RGB", (2, 3), color=(123, 45, 67))
         buf = torch.zeros(
@@ -258,7 +259,7 @@ class TestLoadImageFromBase64(unittest.TestCase):
             mm_utils.load_image_from_base64("")
 
 
-class TestGetDpEncoderLbAssignment(unittest.TestCase):
+class TestGetDpEncoderLbAssignment(CustomTestCase):
     def test_balances_by_total_size_greedy(self):
         sizes = [1000, 100, 200, 50]
         shuffle, counts, loads = mm_utils.get_dp_encoder_lb_assignment(
@@ -322,7 +323,7 @@ class _DummyCfg:
         self.image_grid_pinpoints = image_grid_pinpoints
 
 
-class TestProcessAnyresImage(unittest.TestCase):
+class TestProcessAnyresImage(CustomTestCase):
     def test_uses_crop_size_when_present(self):
         img = Image.new("RGB", (100, 50), color=(5, 6, 7))
         processor = _DummyProcessor(
@@ -343,7 +344,7 @@ class TestProcessAnyresImage(unittest.TestCase):
         self.assertEqual(out.shape[1:], (3, 224, 224))
 
 
-class TestProcessImages(unittest.TestCase):
+class TestProcessImages(CustomTestCase):
     def test_pad_path_stacks_when_shapes_match(self):
         images = [
             Image.new("RGB", (32, 16), color=(1, 2, 3)),
