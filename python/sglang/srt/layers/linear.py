@@ -247,7 +247,12 @@ class ReplicatedLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(
+        self, param: Parameter, loaded_weight: torch.Tensor, shard_id=None
+    ):
+        # shard_id is accepted but unused: ReplicatedLinear is not sharded,
+        # but callers like deepseek_weight_loader pass it via stacked_params_mapping.
+
         # If the weight on disk does not have a shape, give it one
         # (such scales for AutoFp8).
         if len(loaded_weight.shape) == 0:
@@ -376,7 +381,9 @@ class ColumnParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(
+        self, param: Parameter, loaded_weight: torch.Tensor, shard_id=None
+    ):
         output_dim = getattr(param, "output_dim", None)
         param_data = param.data
 
@@ -1396,7 +1403,9 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
 
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(
+        self, param: Parameter, loaded_weight: torch.Tensor, shard_id=None
+    ):
         input_dim = getattr(param, "input_dim", None)
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
 
