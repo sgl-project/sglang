@@ -216,9 +216,15 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
-        # Bytes per max_total_num_token.
-        # For hybrid (full_layers > 0): full_tokens * _cell_size = total memory for both pools.
-        # For all-SWA (full_layers == 0): swa_tokens * _cell_size = total SWA memory.
+        # Bytes per token of max_total_num_tokens.
+        #
+        # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
+        # for both pools: F*nf + r*S*ns (where swa_tokens = full_tokens * r).
+        #
+        # All-SWA (full_layers == 0): max_total = swa_tokens directly. The ratio
+        # is meaningless here -- there is no full pool to relate to, and every
+        # token beyond the sliding window can be evicted. So cell_size = S*ns,
+        # with no ratio factor applied.
         if self._full_layers_num == 0:
             self._cell_size = self._swa_per_token * self._swa_layers_num
         else:
@@ -238,7 +244,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             return (x // page_size) * page_size
 
         if self._full_layers_num == 0:
-            # All layers are SWA — no full pool needed
+            # All-SWA: no full pool, max_total = actual SWA pool size.
+            # Ratio is not applied -- see __init__ comment.
             swa_tokens = align_page_size(max_total_num_tokens)
             logger.info(
                 f"Use sliding window memory pool (all SWA). "
@@ -250,8 +257,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 swa_max_total_num_tokens=swa_tokens,
             )
 
-        # full_tokens = max_total_num_tokens (page aligned)
-        # swa_tokens = full_tokens * ratio (page aligned)
+        # Hybrid: full_tokens = max_total_num_tokens, swa_tokens = full_tokens * ratio
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
