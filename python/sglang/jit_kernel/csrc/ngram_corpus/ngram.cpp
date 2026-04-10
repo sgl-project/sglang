@@ -2,20 +2,12 @@
 
 #include "trie.h"
 #include <algorithm>
-#include <cmath>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace ngram {
 
 namespace {
-
-struct WeightedBudgetSource {
-  double score = 0.0;
-  size_t cap = 0;
-  size_t budget = 0;
-};
 
 double computeSourceScore(const MatchQuality& quality, double source_prior, const Param& param) {
   if (!quality.has_match) {
@@ -37,79 +29,8 @@ double computeSourceScore(const MatchQuality& quality, double source_prior, cons
   return source_prior * (specificity_weight * quality.specificity + confidence_weight * quality.confidence);
 }
 
-size_t ceilShare(double share, size_t total_budget) {
-  if (share <= 0.0 || total_budget == 0) {
-    return 0;
-  }
-  return std::min(total_budget, static_cast<size_t>(std::ceil(share * static_cast<double>(total_budget) - 1e-12)));
-}
-
-void allocateLargestRemainder(size_t total_budget, std::vector<WeightedBudgetSource>* sources) {
-  size_t remaining_budget = total_budget;
-  while (remaining_budget > 0) {
-    double total_score = 0.0;
-    std::vector<size_t> active;
-    active.reserve(sources->size());
-    for (size_t i = 0; i < sources->size(); ++i) {
-      const auto& source = (*sources)[i];
-      if (source.score > 0.0 && source.budget < source.cap) {
-        active.push_back(i);
-        total_score += source.score;
-      }
-    }
-    if (active.empty() || total_score <= 0.0) {
-      break;
-    }
-
-    std::vector<std::pair<double, size_t>> remainders;
-    remainders.reserve(active.size());
-    size_t distributed = 0;
-    for (const auto idx : active) {
-      auto& source = (*sources)[idx];
-      const auto remaining_cap = source.cap - source.budget;
-      const double ideal = static_cast<double>(remaining_budget) * source.score / total_score;
-      const auto whole = std::min(remaining_cap, static_cast<size_t>(ideal));
-      source.budget += whole;
-      distributed += whole;
-      if (source.budget < source.cap) {
-        remainders.emplace_back(ideal - static_cast<double>(whole), idx);
-      }
-    }
-
-    remaining_budget -= distributed;
-    if (remaining_budget == 0 || remainders.empty()) {
-      break;
-    }
-
-    std::sort(remainders.begin(), remainders.end(), [sources](const auto& lhs, const auto& rhs) {
-      if (lhs.first != rhs.first) {
-        return lhs.first > rhs.first;
-      }
-      const auto& lhs_source = (*sources)[lhs.second];
-      const auto& rhs_source = (*sources)[rhs.second];
-      if (lhs_source.score != rhs_source.score) {
-        return lhs_source.score > rhs_source.score;
-      }
-      return lhs.second < rhs.second;
-    });
-
-    size_t assigned = 0;
-    for (const auto& [_, idx] : remainders) {
-      if (remaining_budget == 0) {
-        break;
-      }
-      auto& source = (*sources)[idx];
-      if (source.budget >= source.cap) {
-        continue;
-      }
-      ++source.budget;
-      --remaining_budget;
-      ++assigned;
-    }
-    if (assigned == 0) {
-      break;
-    }
-  }
+double effectiveTrieSourcePrior(double source_prior) {
+  return source_prior > 0.0 ? source_prior : 1.0;
 }
 
 }  // namespace
@@ -137,10 +58,6 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
     throw std::runtime_error(
         "trie_source_prior must be greater than or equal to 0, current value: " +
         std::to_string(param_.trie_source_prior));
-  }
-  if (!(param_.min_trie_share >= 0.0 && param_.min_trie_share <= 1.0)) {
-    throw std::runtime_error(
-        "min_trie_share must be between 0 and 1, current value: " + std::to_string(param_.min_trie_share));
   }
   if (param_.match_specificity_weight < 0.0) {
     throw std::runtime_error(
@@ -294,12 +211,8 @@ Result Ngram::batchMatch(
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
 
-  // All budget values are loop-invariant (mutex_ held, sams_ won't change).
-  const size_t num_sams = sams_.size();
   const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
-  const size_t max_total_sam_budget =
-      num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
-  const size_t trie_base_budget = total_draft_token_num - max_total_sam_budget;
+  const auto result_token_num = static_cast<int>(total_draft_token_num + 1);
   std::vector<std::pair<std::string, const SuffixAutomaton*>> ordered_sams;
   ordered_sams.reserve(sams_.size());
   for (const auto& [corpus_id, sam] : sams_) {
@@ -319,81 +232,50 @@ Result Ngram::batchMatch(
     auto trie_anchors = trie_->match(suffix.data(), suffix.size(), state, total_lens[i]);
     auto trie_quality = trie_->summarizeMatchQuality(trie_anchors, param_);
 
-    if (max_total_sam_budget == 0) {
+    if (ordered_sams.empty()) {
       auto res = (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
       continue;
     }
 
-    struct SamMatchView {
-      const SuffixAutomaton* sam = nullptr;
-      std::vector<SamAnchor> anchors;
-      MatchQuality quality;
-      size_t budget = 0;
+    struct RankedSourceResult {
+      double score = 0.0;
+      Result result;
     };
 
-    std::vector<SamMatchView> sam_matches;
-    sam_matches.reserve(ordered_sams.size());
+    std::vector<RankedSourceResult> source_results;
+    source_results.reserve(ordered_sams.size() + 1);
+    if (trie_quality.has_match) {
+      source_results.push_back(RankedSourceResult{
+          computeSourceScore(trie_quality, effectiveTrieSourcePrior(param_.trie_source_prior), param_),
+          (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)});
+    }
+
     for (const auto& [_, sam] : ordered_sams) {
       auto anchors = sam->match(suffix.data(), suffix.size(), param_.max_trie_depth);
       auto quality = sam->summarizeMatchQuality(anchors, param_);
-      sam_matches.push_back(SamMatchView{sam, std::move(anchors), quality, 0});
-    }
-
-    size_t trie_budget = trie_base_budget;
-    size_t flexible_budget = max_total_sam_budget;
-    if (trie_quality.has_match && flexible_budget > 0) {
-      const auto trie_floor_budget =
-          std::max(trie_base_budget, ceilShare(param_.min_trie_share, total_draft_token_num));
-      const auto reserved_for_trie = std::min(flexible_budget, trie_floor_budget - trie_base_budget);
-      trie_budget += reserved_for_trie;
-      flexible_budget -= reserved_for_trie;
-    }
-
-    if (flexible_budget > 0) {
-      std::vector<WeightedBudgetSource> sources;
-      const auto no_source = std::numeric_limits<size_t>::max();
-      size_t trie_source_idx = no_source;
-      if (trie_quality.has_match) {
-        trie_source_idx = sources.size();
-        sources.push_back(
-            WeightedBudgetSource{
-                computeSourceScore(trie_quality, param_.trie_source_prior, param_), flexible_budget, 0});
-      }
-
-      std::vector<size_t> sam_source_indices(sam_matches.size(), no_source);
-      for (size_t sam_idx = 0; sam_idx < sam_matches.size(); ++sam_idx) {
-        const auto score = computeSourceScore(sam_matches[sam_idx].quality, 1.0, param_);
-        if (score <= 0.0) {
-          continue;
-        }
-        sam_source_indices[sam_idx] = sources.size();
-        sources.push_back(WeightedBudgetSource{score, flexible_budget, 0});
-      }
-
-      allocateLargestRemainder(flexible_budget, &sources);
-
-      if (trie_source_idx != no_source) {
-        trie_budget += sources[trie_source_idx].budget;
-      }
-      for (size_t sam_idx = 0; sam_idx < sam_matches.size(); ++sam_idx) {
-        const auto source_idx = sam_source_indices[sam_idx];
-        if (source_idx != no_source) {
-          sam_matches[sam_idx].budget = sources[source_idx].budget;
-        }
-      }
-    }
-
-    auto combined = (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), trie_budget, param_);
-
-    for (const auto& sam_match : sam_matches) {
-      if (sam_match.budget == 0) {
+      const auto score = computeSourceScore(quality, 1.0, param_);
+      if (score <= 0.0) {
         continue;
       }
-      auto sam_res =
-          (sam_match.sam->*sam_anchored_build_fn)(sam_match.anchors, suffix.back(), sam_match.budget, param_);
-      combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
+      source_results.push_back(RankedSourceResult{
+          score, (sam->*sam_anchored_build_fn)(anchors, suffix.back(), total_draft_token_num, param_)});
+    }
+
+    Result combined;
+    if (source_results.empty()) {
+      combined = (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
+    } else {
+      // Merge stronger sources first so the final cap keeps their branches when the tree saturates.
+      std::stable_sort(source_results.begin(), source_results.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.score > rhs.score;
+      });
+      combined = std::move(source_results.front().result);
+      for (size_t source_idx = 1; source_idx < source_results.size(); ++source_idx) {
+        combined = combineRootResults_(
+            suffix.back(), result_token_num, combined, source_results[source_idx].result);
+      }
     }
 
     merged.token.insert(merged.token.end(), combined.token.begin(), combined.token.end());

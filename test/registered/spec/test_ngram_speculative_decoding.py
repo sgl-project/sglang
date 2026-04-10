@@ -73,12 +73,7 @@ class TestNgramSpeculativeDecodingTriton(TestNgramSpeculativeDecodingBase):
 class TestNgramSpeculativeDecodingFlashinfer(TestNgramSpeculativeDecodingBase):
     @classmethod
     def get_server_args(cls):
-        return DEFAULT_SERVER_ARGS + [
-            "--attention-backend",
-            "flashinfer",
-            "--speculative-ngram-external-sam-budget",
-            "8",
-        ]
+        return DEFAULT_SERVER_ARGS + ["--attention-backend", "flashinfer"]
 
     def test_output_as_corpus_boosts_accept_length(self):
         """Baseline → HTTP add corpus → verify accept length boost."""

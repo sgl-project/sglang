@@ -54,10 +54,8 @@ class NGRAMWorker:
             capacity=server_args.speculative_ngram_capacity,
             max_trie_depth=server_args.speculative_ngram_max_trie_depth,
             draft_token_num=server_args.speculative_num_draft_tokens,
-            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
             trie_source_prior=server_args.speculative_ngram_trie_source_prior,
-            min_trie_share=server_args.speculative_ngram_min_trie_share,
             match_specificity_weight=server_args.speculative_ngram_match_specificity_weight,
             match_confidence_weight=server_args.speculative_ngram_match_confidence_weight,
         )

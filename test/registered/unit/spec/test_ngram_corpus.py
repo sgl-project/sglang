@@ -24,7 +24,6 @@ def _make_corpus(match_type="BFS", **kwargs):
         max_bfs_breadth=8,
         draft_token_num=8,
         capacity=100000,
-        external_sam_budget=0,
         external_corpus_max_tokens=10000000,
     )
     defaults.update(kwargs)
@@ -704,13 +703,12 @@ class TestNgramCorpusIncremental(CustomTestCase):
 
 
 class TestNgramCorpusExternalSam(CustomTestCase):
-    """Verify external SAM loading and fixed-budget composition."""
+    """Verify external SAM loading and score-ordered composition."""
 
     def test_external_corpus_iterator_streams_documents(self):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=4,
-            external_sam_budget=3,
             external_corpus_max_tokens=8,
         )
         with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
@@ -737,7 +735,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
     def test_external_corpus_iterator_rejects_oversized_corpus(self):
         corpus = _make_corpus(
             "BFS",
-            external_sam_budget=2,
             external_corpus_max_tokens=4,
         )
         with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
@@ -758,7 +755,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=4,
-            external_sam_budget=3,
             external_corpus_documents=[[1, 2, 3, 4, 5]],
         )
 
@@ -771,7 +767,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=4,
-            external_sam_budget=3,
             external_corpus_documents=[[1, 2, 3], [4, 5, 6]],
         )
 
@@ -784,7 +779,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=6,
-            external_sam_budget=2,
             external_corpus_documents=[[1, 2, 3, 20, 21]],
         )
         corpus.batch_put([[1, 2, 3, 10, 11]])
@@ -801,7 +795,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=5,
-            external_sam_budget=2,
             external_corpus_documents=[[1, 2, 3, 10, 99]],
         )
         corpus.batch_put([[1, 2, 3, 10, 11]])
@@ -814,11 +807,10 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         self.assertIn([3, 10, 11], leaf_paths)
         self.assertIn([3, 10, 99], leaf_paths)
 
-    def test_shared_prefix_merge_can_underfill_budget(self):
+    def test_shared_prefix_merge_can_leave_padding(self):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=6,
-            external_sam_budget=2,
             external_corpus_documents=[[1, 2, 3, 10, 99]],
         )
         corpus.batch_put([[1, 2, 3, 10, 11]])
@@ -837,7 +829,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
             draft_token_num=2,
             min_bfs_breadth=1,
             max_bfs_breadth=1,
-            external_sam_budget=1,
             external_corpus_documents=[
                 [1, 2, 3, 10],
                 [1, 2, 3, 20],
@@ -854,7 +845,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         weighted = _make_corpus(
             "BFS",
             trie_source_prior=3.0,
-            min_trie_share=1.0,
             match_specificity_weight=0.2,
             match_confidence_weight=0.8,
         )
@@ -867,6 +857,27 @@ class TestNgramCorpusExternalSam(CustomTestCase):
 
         np.testing.assert_array_equal(baseline_ids, weighted_ids)
         np.testing.assert_array_equal(baseline_masks, weighted_masks)
+
+    def test_unmatched_sam_batch_keeps_fixed_request_layout(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=6,
+            external_corpus_documents=[[100, 200, 300, 400]],
+        )
+        corpus.batch_put([[10, 20, 30, 40, 50]])
+        corpus.synchronize()
+
+        batch_queries = [[1, 2, 3], [10, 20, 30]]
+        batch_ids, batch_masks = _batch_get(corpus, batch_queries)
+        batch_ids = batch_ids.reshape(-1, 6)
+        batch_masks = batch_masks.reshape(-1, 6, 6)
+
+        expected = [_batch_get(corpus, [query]) for query in batch_queries]
+        expected_ids = np.stack([ids.reshape(6) for ids, _ in expected])
+        expected_masks = np.stack([masks.reshape(6, 6) for _, masks in expected])
+
+        np.testing.assert_array_equal(batch_ids, expected_ids)
+        np.testing.assert_array_equal(batch_masks, expected_masks)
 
 
 class TestNgramCorpusMatchBenchmark(CustomTestCase):
@@ -934,10 +945,10 @@ class TestNgramCorpusMatchBenchmark(CustomTestCase):
 
 
 class TestNgramCorpusMultiSam(CustomTestCase):
-    """Verify multi-SAM add/remove/list and budget splitting."""
+    """Verify multi-SAM add/remove/list and score-ordered merging."""
 
     def test_add_and_list(self):
-        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
+        corpus = _make_corpus("BFS", draft_token_num=4)
         loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
         corpus.commit_external_corpus_load("a", loaded_token_count)
         loaded_token_count = corpus.load_external_corpus_named(
@@ -950,7 +961,7 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         self.assertEqual(token_counts["b"], 5)
 
     def test_remove(self):
-        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
+        corpus = _make_corpus("BFS", draft_token_num=4)
         loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
         corpus.commit_external_corpus_load("a", loaded_token_count)
         loaded_token_count = corpus.load_external_corpus_named(
@@ -961,12 +972,12 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         self.assertEqual(list(corpus.list_external_corpora().keys()), ["b"])
 
     def test_remove_nonexistent_is_noop(self):
-        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
+        corpus = _make_corpus("BFS", draft_token_num=4)
         corpus.remove_external_corpus("nonexistent")
         self.assertEqual(corpus.list_external_corpora(), {})
 
     def test_multi_sam_candidates(self):
-        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
+        corpus = _make_corpus("BFS", draft_token_num=6)
         loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
         corpus.commit_external_corpus_load("a", loaded_token_count)
         loaded_token_count = corpus.load_external_corpus_named("b", [[1, 2, 3, 20, 21]])
@@ -980,13 +991,11 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         self.assertIn([3, 10, 11], leaf_paths)
         self.assertIn([3, 20, 21], leaf_paths)
 
-    def test_weighted_budget_favors_more_specific_sam(self):
+    def test_source_score_favors_more_specific_sam(self):
         corpus = _make_corpus(
             "BFS",
             max_trie_depth=4,
             draft_token_num=5,
-            external_sam_budget=4,
-            min_trie_share=0.0,
             match_specificity_weight=1.0,
             match_confidence_weight=0.0,
         )
@@ -1007,13 +1016,11 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         self.assertIn([4, 60], leaf_paths)
         self.assertNotIn([4, 60, 61], leaf_paths)
 
-    def test_weighted_budget_uses_full_sam_budget_without_cap(self):
+    def test_single_sam_can_fill_full_tree(self):
         corpus = _make_corpus(
             "BFS",
             max_trie_depth=4,
             draft_token_num=5,
-            external_sam_budget=4,
-            min_trie_share=0.0,
             match_specificity_weight=1.0,
             match_confidence_weight=0.0,
         )
@@ -1028,13 +1035,10 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         )
         self.assertIn([4, 50, 51, 52], leaf_paths)
 
-    def test_weighted_budget_preserves_trie_floor(self):
+    def test_trie_and_sam_coexist_when_tree_has_capacity(self):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=6,
-            external_sam_budget=5,
-            trie_source_prior=0.0,
-            min_trie_share=0.4,
             match_specificity_weight=1.0,
             match_confidence_weight=0.0,
             external_corpus_documents=[[1, 2, 3, 20, 21, 22, 23, 24]],
@@ -1046,11 +1050,11 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         leaf_paths = corpus.leaf_paths_from_mask(
             ids.tolist(), masks.reshape(6, 6).tolist()
         )
-        self.assertIn([3, 10, 11], leaf_paths)
-        self.assertIn([3, 20, 21, 22], leaf_paths)
+        self.assertTrue(any(path[:3] == [3, 10, 11] for path in leaf_paths), leaf_paths)
+        self.assertTrue(any(path[:3] == [3, 20, 21] for path in leaf_paths), leaf_paths)
 
     def test_remove_reduces_candidates(self):
-        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
+        corpus = _make_corpus("BFS", draft_token_num=6)
         loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
         corpus.commit_external_corpus_load("a", loaded_token_count)
         loaded_token_count = corpus.load_external_corpus_named("b", [[1, 2, 3, 20, 21]])
@@ -1070,7 +1074,6 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=4,
-            external_sam_budget=3,
             external_corpus_documents=[[1, 2, 3, 4, 5]],
         )
         token_counts = corpus.list_external_corpora()
@@ -1081,7 +1084,6 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=4,
-            external_sam_budget=3,
             external_corpus_max_tokens=10,
         )
         loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
@@ -1105,7 +1107,6 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=4,
-            external_sam_budget=3,
             external_corpus_max_tokens=10,
         )
         loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
@@ -1131,7 +1132,6 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=4,
-            external_sam_budget=3,
             external_corpus_max_tokens=10,
         )
         loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])

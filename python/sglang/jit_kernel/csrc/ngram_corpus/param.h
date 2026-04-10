@@ -25,10 +25,8 @@ struct Param {
   size_t max_bfs_breadth;
   size_t max_trie_depth;
   size_t draft_token_num;
-  size_t external_sam_budget = 0;
   size_t external_corpus_max_tokens = 10000000;
   double trie_source_prior = 0.0;
-  double min_trie_share = 0.0;
   double match_specificity_weight = 0.7;
   double match_confidence_weight = 0.3;
   std::string match_type;
@@ -104,10 +102,9 @@ struct Param {
     ss << "enable = " << enable << ", enable_router_mode = " << enable_router_mode
        << ", min_bfs_breadth = " << min_bfs_breadth << ", max_bfs_breadth = " << max_bfs_breadth
        << ", max_trie_depth = " << max_trie_depth << ", draft_token_num = " << draft_token_num
-       << ", external_sam_budget = " << external_sam_budget
        << ", external_corpus_max_tokens = " << external_corpus_max_tokens
-       << ", trie_source_prior = " << trie_source_prior << ", min_trie_share = " << min_trie_share
-       << ", match_specificity_weight = " << match_specificity_weight
+       << ", trie_source_prior = " << trie_source_prior << ", match_specificity_weight = "
+       << match_specificity_weight
        << ", match_confidence_weight = " << match_confidence_weight << ", match_type = " << match_type;
     ss << ", batch_draft_token_num(" << batch_draft_token_num.size() << ") = ";
     for (int i = 0; i < batch_draft_token_num.size(); ++i) {
