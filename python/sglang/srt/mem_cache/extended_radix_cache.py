@@ -250,15 +250,20 @@ class ExtendedRadixCache(BasePrefixCache):
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
         self._connector.prefetch(req.rid, token_ids)
 
-    def can_be_scheduled(self, req: Req) -> bool:
+    def check_prefetch_progress(self, req_id: str) -> bool:
         if self._connector is None:
             return True
-        return self._connector.check_prefetch_completed(req.rid)
+        return self._connector.check_prefetch_progress(req_id)
 
-    def release_aborted_request(self, req: Req) -> None:
+    def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        if self._connector is None:
+            return 0
+        return self._connector.pop_prefetch_loaded_tokens(req_id)
+
+    def release_aborted_request(self, req_id: str) -> None:
         if self._connector is None:
             return
-        self._connector.cancel_prefetch(req.rid)
+        self._connector.cancel_prefetch(req_id)
 
     # -- Private helpers --
 

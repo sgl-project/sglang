@@ -114,7 +114,7 @@ class BaseKVConnector(ABC):
         """
         pass
 
-    def check_prefetch_completed(self, rid: str) -> bool:
+    def check_prefetch_progress(self, rid: str) -> bool:
         """Return True if the prefetch for *rid* has completed.
 
         Args:
@@ -123,6 +123,19 @@ class BaseKVConnector(ABC):
             True if complete or no prefetch was needed.
         """
         return True
+
+    def pop_prefetch_loaded_tokens(self, rid: str) -> int:
+        """
+        Pop and return the number of tokens loaded from storage for a request.
+        Returns 0 if no prefetch was done or was revoked.
+        This should be called after check_prefetch_progress() returns True.
+
+        Args:
+            rid: Request id previously passed to prefetch.
+        Returns:
+            Number of tokens loaded from storage.
+        """
+        return 0
 
     def cancel_prefetch(self, rid: str) -> None:
         """Cancel an in-progress or pending prefetch for *rid*.

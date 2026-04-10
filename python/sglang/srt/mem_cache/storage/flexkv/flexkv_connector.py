@@ -310,6 +310,14 @@ class FlexKVConnector(BaseKVConnector):
         self._completed_stores: List[int] = []
         # flexkv task ids for periodic drain to prevent pipe deadlock
         self._load_fkv_tids: List[int] = []
+        # rid -> flexkv_task_id (prefetch in flight)
+        self._ongoing_prefetches: Dict[str, int] = {}
+        cache_cfg = self.flexkv_config.cache_config
+        self._prefetch_enabled = bool(
+            cache_cfg.enable_ssd
+            or cache_cfg.enable_remote
+            or cache_cfg.enable_kv_sharing
+        )
 
         if self.rank == 0:
             while not self.kv_manager.is_ready():
@@ -318,9 +326,10 @@ class FlexKVConnector(BaseKVConnector):
             logger.info("[FlexKV] FlexKV is ready")
 
         logger.info(
-            "[FlexKV] Connector initialized for rank %d, layerwise_transfer=%s",
+            "[FlexKV] Connector initialized for rank %d, layerwise_transfer=%s, prefetch_enabled=%s",
             self.rank,
             self.enable_layerwise_transfer,
+            self._prefetch_enabled,
         )
 
     # ---- BaseKVConnector abstract methods ----
@@ -489,8 +498,73 @@ class FlexKVConnector(BaseKVConnector):
 
     # ---- Optional overrides ----
 
+    def prefetch(self, rid: str, token_ids: List[int]) -> None:
+        if not self._prefetch_enabled:
+            return
+        if not rid:
+            return
+
+        prefetch_task_id = -1
+        if self.rank == 0:
+            token_ids_np = np.array(token_ids, dtype=np.int64)
+            prefetch_task_id = self.kv_manager.prefetch_async(token_ids=token_ids_np)
+
+        if self.tp_cpu_group is not None and self.tp_size > 1:
+            prefetch_task_id = broadcast_pyobj(
+                [{"task_id": prefetch_task_id}],
+                self.rank,
+                self.tp_cpu_group,
+                src=0,
+            )[0]["task_id"]
+
+        if prefetch_task_id >= 0:
+            self._ongoing_prefetches[rid] = prefetch_task_id
+
+    def check_prefetch_progress(self, rid: str) -> bool:
+        if not self._prefetch_enabled:
+            return True
+
+        prefetch_task_id = self._ongoing_prefetches.get(rid, -1)
+        if prefetch_task_id < 0:
+            return True
+
+        is_completed = False
+        if self.rank == 0:
+            completed = self.kv_manager.try_wait(task_ids=[prefetch_task_id])
+            if prefetch_task_id in completed:
+                status = completed[prefetch_task_id].status
+                if status != KVResponseStatus.SUCCESS:
+                    logger.warning(
+                        "[FlexKV] prefetch task %d for rid=%s finished with status=%s",
+                        prefetch_task_id,
+                        rid,
+                        status,
+                    )
+                is_completed = True
+
+        if self.tp_cpu_group is not None and self.tp_size > 1:
+            data = broadcast_pyobj(
+                [{"is_completed": is_completed}],
+                self.rank,
+                self.tp_cpu_group,
+                src=0,
+            )[0]
+            is_completed = data["is_completed"]
+
+        if is_completed:
+            self._ongoing_prefetches.pop(rid, None)
+        return is_completed
+
+    def pop_prefetch_loaded_tokens(self, rid: str) -> int:
+        # TODO: Implement this
+        return 0
+
     def cancel_prefetch(self, rid: str) -> None:
         self._pending_loads.pop(rid, None)
+        prefetch_task_id = self._ongoing_prefetches.pop(rid, -1)
+        if self.rank == 0 and prefetch_task_id >= 0:
+            # Flexkv not support cancel prefetch task yet
+            pass
 
     @property
     def layer_done_counter(self) -> Any:
@@ -502,6 +576,7 @@ class FlexKVConnector(BaseKVConnector):
 
     def reset(self) -> None:
         self._pending_loads.clear()
+        self._ongoing_prefetches.clear()
         self._ongoing_loads.clear()
         self._completed_loads.clear()
         self._load_fkv_tids.clear()

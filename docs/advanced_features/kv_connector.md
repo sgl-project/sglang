@@ -65,7 +65,8 @@ class BaseKVConnector(ABC):
 | Method | Purpose |
 |--------|---------|
 | `prefetch(rid, token_ids)` | Pre-stage data from slow to fast tier before scheduling. |
-| `check_prefetch_completed(rid) -> bool` | Gate scheduling (default `True`). |
+| `check_prefetch_progress(rid) -> bool` | Gate scheduling (default `True`). |
+| `pop_prefetch_loaded_tokens(rid) -> int` | Pop and return the number of tokens loaded from storage for a request. Returns 0 if no prefetch was done or was revoked. This should be called after check_prefetch_progress() returns True. |
 | `cancel_prefetch(rid)` | Cancel prefetch on request abort. |
 | `layer_done_counter` (property) | Layer-wise sync counter for overlapped load+compute. |
 | `reset()` | Clear all state on cache flush. |
