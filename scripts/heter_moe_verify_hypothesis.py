@@ -33,7 +33,7 @@ GROUP_SIZE = 128
 NUM_BITS = 4
 COLD_RATIO = 0.8
 WARMUP, ITERS = 50, 200
-BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 OUT_DIR = "/data/heter-moe/profiles/groupgemm"
 
 # L2 flush: allocate a buffer larger than L2 cache (A100 = 40MB L2)
