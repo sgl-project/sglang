@@ -319,6 +319,32 @@ class SessionAwareCache(BasePrefixCache):
             slot = SessionSlot()
             self.slots[session_id] = slot
 
+        # If the session's KV is shrinking (e.g. client sent a shorter
+        # prompt after an abort), free the orphaned tail pages before
+        # save_from_req overwrites the slot's committed length.
+        if (
+            not is_first
+            and slot.is_holding_kv
+            and req.kv_committed_len < slot.kv_committed_len
+        ):
+            old_end = slot.kv_allocated_len
+            new_end = req.kv_committed_len
+            if self.page_size > 1:
+                new_end = ceil_align(new_end, self.page_size)
+            if new_end < old_end:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    slot.req_pool_idx, new_end:old_end
+                ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+                self._log_debug(
+                    "cache-finished-shrink",
+                    session_id,
+                    req=req,
+                    slot=slot,
+                    shrink_start=new_end,
+                    shrink_end=old_end,
+                )
+
         slot.save_from_req(req, is_first=is_first)
         self._log_debug(
             "cache-finished-save",
