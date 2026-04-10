@@ -1857,6 +1857,7 @@ class GetLoadReqOutput(BaseReq):
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+    num_pending_tokens: int
     ts_tic: float
 
 
