@@ -229,7 +229,7 @@ class HeterFusedMoE(nn.Module):
     ) -> torch.Tensor:
         assignment = self.policy.assign(topk_ids, self.num_experts, self.group_ratios)
 
-        output = torch.zeros_like(hidden_states)
+        output = None
 
         for group_idx, gcfg in enumerate(self.group_cfgs):
             expert_ids_list = assignment.group_assignments[group_idx]
@@ -266,47 +266,21 @@ class HeterFusedMoE(nn.Module):
                     gcfg,
                 )
             elif num_bits == 8:
-                # DEPRECATED: see _init_group_weights
                 group_out = self._run_int8_group(
                     prefix,
                     hidden_states,
                     group_weights,
                     group_ids,
                 )
-
-            num_bits = gcfg.get("num_bits", 16)
-            prefix = f"group{group_idx}"
-
-            if num_bits == 16:
-                group_out = self._run_bf16_group(
-                    prefix,
-                    hidden_states,
-                    group_weights,
-                    topk_ids,
-                )
-            elif num_bits == 4:
-                group_out = self._run_int4_group(
-                    prefix,
-                    hidden_states,
-                    group_weights,
-                    topk_ids,
-                    router_logits,
-                    gcfg,
-                )
-            elif num_bits == 8:
-                # DEPRECATED: see _init_group_weights
-                group_out = self._run_int8_group(
-                    prefix,
-                    hidden_states,
-                    group_weights,
-                    topk_ids,
-                )
             else:
                 raise ValueError(f"Unsupported num_bits={num_bits}")
 
-            output = output + group_out
+            if output is None:
+                output = group_out
+            else:
+                output.add_(group_out)
 
-        return output
+        return output if output is not None else torch.zeros_like(hidden_states)
 
     def _run_bf16_group(
         self,
