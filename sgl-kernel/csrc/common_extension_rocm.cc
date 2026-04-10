@@ -206,12 +206,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("transfer_kv_per_layer_ph_lf", torch::kCUDA, &transfer_kv_per_layer_ph_lf);
 
   /*
-   * From csrc/grammar
-   */
-  m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
-  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
-
-  /*
    * From csrc/elementwise
    */
   m.def(

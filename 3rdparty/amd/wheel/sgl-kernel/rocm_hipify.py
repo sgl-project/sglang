@@ -19,7 +19,6 @@ sources = [
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/pos_enc.cu",
     "csrc/elementwise/topk.cu",
-    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/kvcacheio/transfer.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/moe/moe_align_kernel.cu",

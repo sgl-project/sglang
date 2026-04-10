@@ -53,7 +53,6 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
     shuffle_rows,
 )
-from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
@@ -114,7 +113,6 @@ if torch.version.hip is not None:
 
 _DEBUG_EXPORT_NAMES = [
     "apply_shuffle_mul_sum",
-    "apply_token_bitmask_inplace_cuda",
     "awq_dequantize",
     "bmm_fp8",
     "build_tree_kernel_efficient",
