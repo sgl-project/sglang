@@ -224,7 +224,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
         valid = int(valid)
         if valid <= 0 or valid >= int(seq_len):
             return None
-        mask = torch.ones((batch_size, int(seq_len)), device=device, dtype=torch.float32)
+        mask = torch.ones(
+            (batch_size, int(seq_len)), device=device, dtype=torch.float32
+        )
         mask[:, valid:] = 0.0
         return mask
 
@@ -693,9 +695,8 @@ class LTX2AVDenoisingStage(DenoisingStage):
 
                         video_coords = None
                         audio_coords = None
-                        if (
-                            getattr(batch, "did_sp_shard_latents", False)
-                            and hasattr(current_model, "rope")
+                        if getattr(batch, "did_sp_shard_latents", False) and hasattr(
+                            current_model, "rope"
                         ):
                             video_coords = current_model.rope.prepare_video_coords(
                                 batch_size=int(latent_model_input.shape[0]),
@@ -708,17 +709,18 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     getattr(batch, "sp_video_start_frame", 0)
                                 ),
                             )
-                        if (
-                            getattr(batch, "did_sp_shard_audio_latents", False)
-                            and hasattr(current_model, "audio_rope")
-                        ):
-                            audio_coords = current_model.audio_rope.prepare_audio_coords(
-                                batch_size=int(audio_latent_model_input.shape[0]),
-                                num_frames=audio_num_frames_latent,
-                                device=audio_latent_model_input.device,
-                                start_frame=int(
-                                    getattr(batch, "sp_audio_start_frame", 0)
-                                ),
+                        if getattr(
+                            batch, "did_sp_shard_audio_latents", False
+                        ) and hasattr(current_model, "audio_rope"):
+                            audio_coords = (
+                                current_model.audio_rope.prepare_audio_coords(
+                                    batch_size=int(audio_latent_model_input.shape[0]),
+                                    num_frames=audio_num_frames_latent,
+                                    device=audio_latent_model_input.device,
+                                    start_frame=int(
+                                        getattr(batch, "sp_audio_start_frame", 0)
+                                    ),
+                                )
                             )
 
                         batch_size = int(latent_model_input.shape[0])

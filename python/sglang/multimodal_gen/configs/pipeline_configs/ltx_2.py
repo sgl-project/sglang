@@ -372,7 +372,9 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_video_latent_num_frames = int(local_frames)
         batch.sp_video_start_frame = int(start_frame)
         batch.sp_video_tokens_per_frame = int(tokens_per_frame)
-        batch.sp_video_valid_token_count = int(valid_local_frames) * int(tokens_per_frame)
+        batch.sp_video_valid_token_count = int(valid_local_frames) * int(
+            tokens_per_frame
+        )
 
         return latents, True
 
@@ -409,7 +411,10 @@ class LTX2PipelineConfig(PipelineConfig):
         start_frame = sp_rank * local_frames
         end_frame = start_frame + local_frames
         valid_local_frames = max(
-            min(int(batch.sp_audio_orig_num_frames) - int(start_frame), int(local_frames)),
+            min(
+                int(batch.sp_audio_orig_num_frames) - int(start_frame),
+                int(local_frames),
+            ),
             0,
         )
         audio_latents = audio_latents[:, start_frame:end_frame, :]

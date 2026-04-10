@@ -423,8 +423,11 @@ class USPAttention(nn.Module):
         """
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
-        effective_skip_sp = self.skip_sequence_parallel or skip_sequence_parallel_override
+        effective_skip_sp = (
+            self.skip_sequence_parallel or skip_sequence_parallel_override
+        )
         if attn_mask is not None:
+
             def _prepare_sdpa_mask(
                 mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
             ) -> torch.Tensor:
@@ -449,9 +452,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(
-                    attn_mask, dtype=q_.dtype, device=q_.device
-                )
+                mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 return torch.nn.functional.scaled_dot_product_attention(
                     q_,
                     k_,
@@ -483,9 +484,7 @@ class USPAttention(nn.Module):
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
-            mask = _prepare_sdpa_mask(
-                gathered_mask, dtype=q_.dtype, device=q_.device
-            )
+            mask = _prepare_sdpa_mask(gathered_mask, dtype=q_.dtype, device=q_.device)
             out = torch.nn.functional.scaled_dot_product_attention(
                 q_,
                 k_,
