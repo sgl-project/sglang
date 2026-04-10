@@ -11,8 +11,8 @@ from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE,
-    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=283, suite="stage-b-test-1-gpu-small")
 
 
-class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
+class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
     max_running_requests = 64
     attention_backend = "triton"
     spec_steps = 5
@@ -30,18 +30,21 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     spec_draft_tokens = 6
     page_size = 1
     other_launch_args = []
-    model = DEFAULT_TARGET_MODEL_EAGLE
-    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         launch_args = [
             "--trust-remote-code",
+            "--dtype=float16",
+            "--chunked-prefill-size",
+            "1024",
             "--attention-backend",
             cls.attention_backend,
             "--speculative-algorithm",
-            "EAGLE",
+            "EAGLE3",
             "--speculative-draft-model",
             cls.draft_model,
             "--speculative-num-steps",
@@ -67,6 +70,8 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         ), envs.SGLANG_SPEC_NAN_DETECTION.override(
             True
         ), envs.SGLANG_SPEC_OOB_DETECTION.override(
+            True
+        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(
             True
         ):
             cls.process = popen_launch_server(
@@ -95,10 +100,8 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             num_threads=128,
         )
         metrics = run_eval(args)
-        print(f"TestEagleLargeBS -- {metrics=}")
-        self.assertGreater(
-            metrics["score"], 0.22
-        )  # ~0.227 for 1000 questions via /v1/completions
+        print(f"TestEagle3LargeBS -- {metrics=}")
+        self.assertGreater(metrics["score"], 0.7)
         assert self.process.poll() is None
 
     def test_logprob_spec_v2_match(self):
@@ -240,8 +243,43 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
                 res = f.result()
                 self.assertIn("text", res, f"Server error: {res}")
 
+    def test_penalty(self):
+        """Verify spec v2 handles penalty parameters without crashing."""
+        import concurrent.futures
 
-class TestEagleServerPage(TestEagleServerBase):
+        args = [
+            {"max_new_tokens": 32},
+            {"max_new_tokens": 16, "frequency_penalty": 2},
+            {"max_new_tokens": 48, "presence_penalty": 1},
+            {"max_new_tokens": 8, "frequency_penalty": 0.4, "presence_penalty": 0.8},
+            {"max_new_tokens": 64, "frequency_penalty": -0.5, "presence_penalty": 0.3},
+            {"max_new_tokens": 24, "min_new_tokens": 8, "frequency_penalty": 0.4},
+            {"max_new_tokens": 32, "repetition_penalty": 1.5},
+        ]
+
+        def run_decode(sampling_params):
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": sampling_params,
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            res = response.json()
+            self.assertIn("text", res, f"Server error: {res}")
+            self.assertIsInstance(
+                res["text"],
+                str,
+                f"Expected 'text' to be str, got {type(res['text']).__name__}: {res}",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(run_decode, args * 3))
+        assert self.process.poll() is None
+
+
+class TestEagle3ServerPage(TestEagle3ServerBase):
     other_launch_args = ["--page-size", "64"]
 
 

@@ -1,5 +1,7 @@
 import copy
+import json
 import math
+import os
 import time
 from io import BytesIO
 
@@ -10,8 +12,15 @@ import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.utils.torch_utils import randn_tensor
+from safetensors.torch import load_file as safetensors_load_file
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    is_ltx23_native_variant,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
+    LTX23VideoConditionEncoder,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     load_image,
     normalize,
@@ -46,6 +55,8 @@ class LTX2AVDenoisingStage(DenoisingStage):
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
         self.audio_vae = audio_vae
+        self._condition_image_encoder = None
+        self._condition_image_encoder_dir = None
 
     @staticmethod
     def _get_video_latent_num_frames_for_model(
@@ -116,13 +127,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
     ) -> dict[str, object] | None:
         if stage != "stage1":
             return None
-
-        pipeline_ref = getattr(self, "pipeline", None)
-        pipeline = pipeline_ref() if callable(pipeline_ref) else pipeline_ref
-        pipeline_name = getattr(pipeline, "pipeline_name", None)
-        if pipeline_name != "LTX2TwoStagePipeline":
-            return None
-
         return batch.extra.get("ltx2_stage1_guider_params")
 
     @staticmethod
@@ -140,6 +144,56 @@ class LTX2AVDenoisingStage(DenoisingStage):
         factor = cond.std() / pred.std()
         factor = rescale_scale * factor + (1.0 - rescale_scale)
         return pred * factor
+
+    @staticmethod
+    def _prepare_ltx2_ti2v_clean_state(
+        latents: torch.Tensor,
+        image_latent: torch.Tensor,
+        num_img_tokens: int,
+        zero_clean_latent: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        latents = latents.clone()
+        conditioned = image_latent[:, :num_img_tokens, :].to(
+            device=latents.device, dtype=latents.dtype
+        )
+        latents[:, :num_img_tokens, :] = conditioned
+        denoise_mask = torch.ones(
+            (latents.shape[0], latents.shape[1], 1),
+            device=latents.device,
+            dtype=torch.float32,
+        )
+        denoise_mask[:, :num_img_tokens, :] = 0.0
+        if zero_clean_latent:
+            clean_latent = torch.zeros_like(latents)
+        else:
+            clean_latent = latents.detach().clone()
+        clean_latent[:, :num_img_tokens, :] = conditioned
+        return latents, denoise_mask, clean_latent
+
+    @staticmethod
+    def _ltx2_velocity_to_x0(
+        sample: torch.Tensor,
+        velocity: torch.Tensor,
+        sigma: float | torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(sigma, torch.Tensor):
+            sigma = sigma.to(device=sample.device, dtype=torch.float32)
+            while sigma.ndim < sample.ndim:
+                sigma = sigma.unsqueeze(-1)
+            return (sample.float() - sigma * velocity.float()).to(sample.dtype)
+        return (sample.float() - float(sigma) * velocity.float()).to(sample.dtype)
+
+    @staticmethod
+    def _repeat_batch_dim(tensor: torch.Tensor, target_batch_size: int) -> torch.Tensor:
+        """Repeat along batch dim while preserving any tokenwise timestep layout."""
+        if tensor.shape[0] == int(target_batch_size):
+            return tensor
+        if tensor.shape[0] <= 0 or int(target_batch_size) % int(tensor.shape[0]) != 0:
+            raise ValueError(
+                f"Cannot repeat tensor with batch={tensor.shape[0]} to target_batch_size={target_batch_size}"
+            )
+        repeat_factor = int(target_batch_size) // int(tensor.shape[0])
+        return tensor.repeat(repeat_factor, *([1] * (tensor.ndim - 1)))
 
     @classmethod
     def _ltx2_calculate_guided_x0(
@@ -252,6 +306,40 @@ class LTX2AVDenoisingStage(DenoisingStage):
             return True
         return int(getattr(batch, "sp_video_start_frame", 0)) == 0
 
+    def _get_condition_image_encoder(
+        self,
+        server_args: ServerArgs,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> LTX23VideoConditionEncoder | None:
+        arch_config = server_args.pipeline_config.vae_config.arch_config
+        encoder_subdir = str(getattr(arch_config, "condition_encoder_subdir", ""))
+        if not encoder_subdir:
+            return None
+
+        vae_model_path = server_args.model_paths["vae"]
+        encoder_dir = os.path.join(vae_model_path, encoder_subdir)
+        config_path = os.path.join(encoder_dir, "config.json")
+        weights_path = os.path.join(encoder_dir, "model.safetensors")
+        if not os.path.exists(config_path) or not os.path.exists(weights_path):
+            raise ValueError(
+                f"LTX-2 condition encoder files not found under {encoder_dir}"
+            )
+
+        cached_dir = self._condition_image_encoder_dir
+        encoder = self._condition_image_encoder
+        if encoder is None or cached_dir != encoder_dir:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+            encoder = LTX23VideoConditionEncoder(config)
+            encoder.load_state_dict(safetensors_load_file(weights_path), strict=True)
+            self._condition_image_encoder = encoder
+            self._condition_image_encoder_dir = encoder_dir
+
+        encoder = encoder.to(device=device, dtype=dtype)
+        return encoder
+
     def _prepare_ltx2_image_latent(self, batch: Req, server_args: ServerArgs) -> None:
         """Encode `batch.image_path` into packed token latents for LTX-2 TI2V."""
         if (
@@ -276,8 +364,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
         )
 
         img = load_image(image_path)
+        img_array = np.array(img).astype(np.uint8)[..., :3]
+        img_array = self._apply_video_codec_compression(img_array, crf=33)
+        conditioned_img = PIL.Image.fromarray(img_array)
         batch.condition_image = self._resize_center_crop(
-            img, width=int(batch.width), height=int(batch.height)
+            conditioned_img, width=int(batch.width), height=int(batch.height)
         )
 
         latents_device = (
@@ -287,17 +378,22 @@ class LTX2AVDenoisingStage(DenoisingStage):
         )
         encode_dtype = batch.latents.dtype
         original_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        self.vae = self.vae.to(device=latents_device, dtype=encode_dtype)
         vae_autocast_enabled = (
             original_dtype != torch.float32
         ) and not server_args.disable_autocast
+        condition_image_encoder = self._get_condition_image_encoder(
+            server_args, device=latents_device, dtype=encode_dtype
+        )
+        if condition_image_encoder is None:
+            self.vae = self.vae.to(device=latents_device, dtype=encode_dtype)
 
         video_condition = self._resize_center_crop_tensor(
-            img,
+            conditioned_img,
             width=int(batch.width),
             height=int(batch.height),
             device=latents_device,
             dtype=encode_dtype,
+            apply_codec_compression=False,
         )
 
         with torch.autocast(
@@ -306,31 +402,42 @@ class LTX2AVDenoisingStage(DenoisingStage):
             enabled=vae_autocast_enabled,
         ):
             try:
-                if server_args.pipeline_config.vae_tiling:
+                if (
+                    condition_image_encoder is None
+                    and server_args.pipeline_config.vae_tiling
+                ):
                     self.vae.enable_tiling()
             except Exception:
                 pass
             if not vae_autocast_enabled:
                 video_condition = video_condition.to(encode_dtype)
 
-            latent_dist: DiagonalGaussianDistribution = self.vae.encode(video_condition)
-            if isinstance(latent_dist, AutoencoderKLOutput):
-                latent_dist = latent_dist.latent_dist
+            if condition_image_encoder is not None:
+                latent = condition_image_encoder(video_condition)
+            else:
+                latent_dist: DiagonalGaussianDistribution = self.vae.encode(
+                    video_condition
+                )
+                if isinstance(latent_dist, AutoencoderKLOutput):
+                    latent_dist = latent_dist.latent_dist
 
-        mode = server_args.pipeline_config.vae_config.encode_sample_mode()
-        if mode == "argmax":
-            latent = latent_dist.mode()
-        elif mode == "sample":
-            if batch.generator is None:
-                raise ValueError("Generator must be provided for VAE sampling.")
-            latent = latent_dist.sample(batch.generator)
+        if condition_image_encoder is None:
+            mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+            if mode == "argmax":
+                latent = latent_dist.mode()
+            elif mode == "sample":
+                if batch.generator is None:
+                    raise ValueError("Generator must be provided for VAE sampling.")
+                latent = latent_dist.sample(batch.generator)
+            else:
+                raise ValueError(f"Unsupported encode_sample_mode: {mode}")
+
+            # Per-channel normalization: normalized = (x - mean) / std
+            mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latent)
+            std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latent)
+            latent = (latent - mean) / std
         else:
-            raise ValueError(f"Unsupported encode_sample_mode: {mode}")
-
-        # Per-channel normalization: normalized = (x - mean) / std
-        mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latent)
-        std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latent)
-        latent = (latent - mean) / std
+            latent = latent.to(dtype=encode_dtype)
 
         packed = server_args.pipeline_config.maybe_pack_latents(
             latent, latent.shape[0], batch
@@ -362,9 +469,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 batch.height,
             )
 
-        self.vae.to(original_dtype)
+        if condition_image_encoder is None:
+            self.vae.to(original_dtype)
         if server_args.vae_cpu_offload:
             self.vae = self.vae.to("cpu")
+            if condition_image_encoder is not None:
+                self._condition_image_encoder = condition_image_encoder.to("cpu")
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -437,19 +547,15 @@ class LTX2AVDenoisingStage(DenoisingStage):
         if do_ti2v:
             if not (isinstance(latents, torch.Tensor) and latents.ndim == 3):
                 raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")
-            latents[:, :num_img_tokens, :] = batch.image_latent[
-                :, :num_img_tokens, :
-            ].to(device=latents.device, dtype=latents.dtype)
-            denoise_mask = torch.ones(
-                (latents.shape[0], latents.shape[1], 1),
-                device=latents.device,
-                dtype=torch.float32,
+            use_zero_clean_latent = is_ltx23_native_variant(
+                server_args.pipeline_config.vae_config.arch_config
             )
-            denoise_mask[:, :num_img_tokens, :] = 0.0
-            clean_latent = latents.detach().clone()
-            clean_latent[:, :num_img_tokens, :] = batch.image_latent[
-                :, :num_img_tokens, :
-            ].to(device=latents.device, dtype=latents.dtype)
+            latents, denoise_mask, clean_latent = self._prepare_ltx2_ti2v_clean_state(
+                latents=latents,
+                image_latent=batch.image_latent,
+                num_img_tokens=num_img_tokens,
+                zero_clean_latent=use_zero_clean_latent,
+            )
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
@@ -558,11 +664,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     ],
                                     dim=0,
                                 )
-                                timestep_video = timestep_video.expand(
-                                    int(latent_model_input.shape[0])
+                                cfg_batch_size = int(latent_model_input.shape[0])
+                                timestep_video = self._repeat_batch_dim(
+                                    timestep_video, cfg_batch_size
                                 )
-                                timestep_audio = timestep_audio.expand(
-                                    int(latent_model_input.shape[0])
+                                timestep_audio = self._repeat_batch_dim(
+                                    timestep_audio, cfg_batch_size
                                 )
 
                             with set_forward_context(
@@ -616,11 +723,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             audio_latents = audio_scheduler.step(
                                 a_v_pos, t_device, audio_latents, return_dict=False
                             )[0]
-                            if do_ti2v:
-                                latents[:, :num_img_tokens, :] = batch.image_latent[
-                                    :, :num_img_tokens, :
-                                ].to(device=latents.device, dtype=latents.dtype)
-
                             latents = self.post_forward_for_ti2v_task(
                                 batch, server_args, reserved_frames_mask, latents, z
                             )
@@ -714,14 +816,20 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             if a_v_neg is not None:
                                 a_v_neg = a_v_neg.float()
 
-                        # Velocity -> denoised (x0): x0 = x - sigma * v
                         sigma_val = float(sigma.item())
-                        denoised_video = (latents.float() - sigma_val * v_pos).to(
-                            latents.dtype
+                        video_sigma_for_x0: float | torch.Tensor = sigma_val
+                        if do_ti2v and denoise_mask is not None:
+                            video_sigma_for_x0 = sigma.to(
+                                device=latents.device, dtype=torch.float32
+                            ) * denoise_mask.squeeze(-1)
+                        denoised_video = self._ltx2_velocity_to_x0(
+                            latents, v_pos, video_sigma_for_x0
                         )
-                        denoised_audio = (
-                            audio_latents.float() - sigma_val * a_v_pos
-                        ).to(audio_latents.dtype)
+                        denoised_audio = self._ltx2_velocity_to_x0(
+                            audio_latents, a_v_pos, sigma_val
+                        )
+                        denoised_video_cond = denoised_video
+                        denoised_audio_cond = denoised_audio
                         denoised_video_neg = None
                         denoised_audio_neg = None
                         denoised_video_perturbed = None
@@ -737,12 +845,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             and v_neg is not None
                             and a_v_neg is not None
                         ):
-                            denoised_video_neg = (
-                                latents.float() - sigma_val * v_neg
-                            ).to(latents.dtype)
-                            denoised_audio_neg = (
-                                audio_latents.float() - sigma_val * a_v_neg
-                            ).to(audio_latents.dtype)
+                            denoised_video_neg = self._ltx2_velocity_to_x0(
+                                latents, v_neg, video_sigma_for_x0
+                            )
+                            denoised_audio_neg = self._ltx2_velocity_to_x0(
+                                audio_latents, a_v_neg, sigma_val
+                            )
                         if stage1_guider_params is not None:
                             video_skip = self._ltx2_should_skip_step(
                                 i, int(stage1_guider_params["video_skip_step"])
@@ -784,12 +892,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                             stage1_guider_params["audio_stg_blocks"]
                                         ),
                                     )
-                                denoised_video_perturbed = (
-                                    latents.float() - sigma_val * v_ptb.float()
-                                ).to(latents.dtype)
-                                denoised_audio_perturbed = (
-                                    audio_latents.float() - sigma_val * a_v_ptb.float()
-                                ).to(audio_latents.dtype)
+                                denoised_video_perturbed = self._ltx2_velocity_to_x0(
+                                    latents, v_ptb.float(), video_sigma_for_x0
+                                )
+                                denoised_audio_perturbed = self._ltx2_velocity_to_x0(
+                                    audio_latents, a_v_ptb.float(), sigma_val
+                                )
 
                             need_modality = (
                                 float(stage1_guider_params["video_modality_scale"])
@@ -822,12 +930,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         disable_a2v_cross_attn=True,
                                         disable_v2a_cross_attn=True,
                                     )
-                                denoised_video_modality = (
-                                    latents.float() - sigma_val * v_mod.float()
-                                ).to(latents.dtype)
-                                denoised_audio_modality = (
-                                    audio_latents.float() - sigma_val * a_v_mod.float()
-                                ).to(audio_latents.dtype)
+                                denoised_video_modality = self._ltx2_velocity_to_x0(
+                                    latents, v_mod.float(), video_sigma_for_x0
+                                )
+                                denoised_audio_modality = self._ltx2_velocity_to_x0(
+                                    audio_latents, a_v_mod.float(), sigma_val
+                                )
 
                             if not video_skip:
                                 denoised_video = self._ltx2_calculate_guided_x0(
@@ -933,11 +1041,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         audio_latents = (
                             audio_latents.float() + v_audio.float() * dt
                         ).to(dtype=audio_latents.dtype)
-
-                        if do_ti2v:
-                            latents[:, :num_img_tokens, :] = batch.image_latent[
-                                :, :num_img_tokens, :
-                            ].to(device=latents.device, dtype=latents.dtype)
 
                         latents = self.post_forward_for_ti2v_task(
                             batch, server_args, reserved_frames_mask, latents, z
