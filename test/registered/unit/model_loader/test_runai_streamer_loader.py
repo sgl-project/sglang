@@ -93,7 +93,9 @@ class TestRunaiSafetensorsWeightsIterator(CustomTestCase):
 
     @patch("sglang.srt.model_loader.weight_utils.tqdm", side_effect=lambda x, **k: x)
     def test_distributed_always_clones_tensors(self, _tqdm):
-        from sglang.srt.model_loader.weight_utils import runai_safetensors_weights_iterator
+        from sglang.srt.model_loader.weight_utils import (
+            runai_safetensors_weights_iterator,
+        )
 
         t = torch.tensor([1.0, 2.0])
         self._streamer_instance._set_tensors([("w", t)])
@@ -107,7 +109,9 @@ class TestRunaiSafetensorsWeightsIterator(CustomTestCase):
 
     @patch("sglang.srt.model_loader.weight_utils.tqdm", side_effect=lambda x, **k: x)
     def test_non_distributed_yields_same_tensor(self, _tqdm):
-        from sglang.srt.model_loader.weight_utils import runai_safetensors_weights_iterator
+        from sglang.srt.model_loader.weight_utils import (
+            runai_safetensors_weights_iterator,
+        )
 
         t = torch.tensor([3.0])
         self._streamer_instance._set_tensors([("w", t)])
