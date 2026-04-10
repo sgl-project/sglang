@@ -27,7 +27,6 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -36,13 +35,16 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import terminate_process
 
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = (
+    "/LLM-Research/Llama-3.2-1B-Instruct"  # Example ModelScope model
+)
+
 mp.set_start_method("spawn", force=True)
 
 register_npu_ci(
     est_time=400,
     suite="nightly-1-npu-a3",
     nightly=True,
-    disabled="run failed",
 )
 
 
@@ -216,6 +218,7 @@ def init_process_dst(
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=(
                 "--attention-backend",
+                "ascend",
                 "--device",
                 "npu",
                 "--base-gpu-id",

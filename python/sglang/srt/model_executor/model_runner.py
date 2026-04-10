@@ -1487,6 +1487,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torch.cuda.empty_cache()
         success = False
         message = ""
+        device_id = None
+        if self.device == "cuda":
+            device_id = torch.device("cuda", self.gpu_id)
+        elif self.device == "npu":
+            device_id = torch.device("npu", self.gpu_id)
+            backend = "hccl"
+        else:
+            logger.error(
+                f"Unsupported device: {self.device}. Only 'cuda' and 'npu' are supported."
+            )
+            raise ValueError(
+                f"Unsupported device: {self.device}. Only 'cuda' and 'npu' are supported."
+            )
         try:
             na = NetworkAddress(master_address, group_port)
             self._weights_send_group[group_name] = init_custom_process_group(
@@ -1495,7 +1508,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 world_size=world_size,
                 rank=group_rank,
                 group_name=group_name,
-                device_id=torch.device("cuda", self.gpu_id),
+                device_id=device_id,
             )
             dist.barrier(group=self._weights_send_group[group_name])
             success = True
