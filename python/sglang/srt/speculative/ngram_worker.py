@@ -202,7 +202,7 @@ class NGRAMWorker:
             req_ids.append(req.rid)
             batch_tokens.append(check_token)
             i += 1
-            total_lens.append(len(req.origin_input_ids) + len(req.output_ids))
+            total_lens.append(len(req.origin_input_ids) + len(req.output_ids) + len(prev_tokens))
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
