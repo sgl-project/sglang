@@ -2304,7 +2304,10 @@ class Scheduler(
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
+            prev_bs = self.running_batch.batch_size()
             self.running_batch.filter_batch()
+            if self.running_batch.batch_size() < prev_bs:
+                self.running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
