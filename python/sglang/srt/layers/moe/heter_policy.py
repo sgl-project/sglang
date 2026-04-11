@@ -1,174 +1,310 @@
-"""Heterogeneous-precision MoE dispatch policies.
+"""Heterogeneous dispatch policies for mixed-precision MoE.
 
-Classifies experts into precision groups (e.g., cold→INT4, hot→BF16)
-based on per-batch routing signals. Assignment is dynamic per forward pass.
+Partitions experts into precision groups and transforms standard MoE routing
+into per-group dispatches.  Each group's dispatch is ``(experts, scales)``
+with shape ``[N, K]``.  Non-group expert slots use sentinel expert ID
+(``num_experts``) and zero scale so the kernel skips them.
+
+All operations use fixed-shape GPU tensors -- torch.compile and CUDA graph safe.
 """
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+import abc
+import logging
+from typing import List, Optional, Tuple
 
 import torch
 
+logger = logging.getLogger(__name__)
 
-@dataclass
-class HeterDispatchPlan:
-    """Expert-to-group assignment for one forward pass.
+# (experts, scales) pair for one group, both [N, K].
+GroupDispatchTuple = Tuple[torch.Tensor, torch.Tensor]
 
-    group_assignments[i] = sorted list of expert IDs in group i.
-    Every expert appears in exactly one group.
+
+def _compute_group_sizes(
+    num_experts: int,
+    group_size_ratios: List[float],
+) -> List[int]:
+    """Convert fractional ratios to concrete group sizes. Last group absorbs rounding."""
+    sizes: List[int] = []
+    offset = 0
+    for i, ratio in enumerate(group_size_ratios):
+        if i == len(group_size_ratios) - 1:
+            sizes.append(num_experts - offset)
+        else:
+            count = round(ratio * num_experts)
+            sizes.append(count)
+            offset += count
+    return sizes
+
+
+def _build_group_labels(
+    num_experts: int,
+    group_size_ratios: List[float],
+    device: torch.device,
+) -> torch.Tensor:
+    """Pre-compute position-to-group labels for the N-group argsort path.
+
+    Returns ``[num_experts]`` mapping sorted positions to group indices.
+    Built once at init -- CPU->GPU transfer only happens here, not in hot path.
+    """
+    num_groups = len(group_size_ratios)
+    group_sizes = _compute_group_sizes(num_experts, group_size_ratios)
+    group_labels_list: List[int] = []
+    for rev_idx, size in enumerate(reversed(group_sizes)):
+        original_gidx = num_groups - 1 - rev_idx
+        group_labels_list.extend([original_gidx] * size)
+    return torch.tensor(group_labels_list, dtype=torch.long, device=device)
+
+
+def _assign_by_score_gpu(
+    scores: torch.Tensor,
+    num_experts: int,
+    group_size_ratios: List[float],
+    expert_to_group: torch.Tensor,
+    group_labels: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Split experts into groups by descending score (GPU-only, no sync).
+
+    Last group gets highest-scoring experts (high-precision).
+    G=2: ``torch.topk`` (O(E)).  G>2: ``torch.argsort + scatter_`` (O(E log E)).
+    """
+    num_groups = len(group_size_ratios)
+
+    if num_groups <= 1:
+        expert_to_group.zero_()
+        return expert_to_group
+
+    if num_groups == 2:
+        k_high = round(num_experts * group_size_ratios[1])
+        expert_to_group.zero_()
+        _, top_indices = torch.topk(scores, k_high)
+        expert_to_group[top_indices] = 1
+        return expert_to_group
+    else:
+        assert group_labels is not None, (
+            "group_labels required for N-group path (N>2)")
+        sorted_ids = torch.argsort(scores, descending=True)
+        expert_to_group.scatter_(0, sorted_ids, group_labels)
+        return expert_to_group
+
+
+class HeterDispatchPolicy(abc.ABC):
+    """Base class for heterogeneous MoE dispatch policies.
+
+    Subclasses implement ``_assign()`` -- the expert-to-group assignment
+    strategy.  ``dispatch()`` calls ``_assign()``, then builds per-group
+    ``(experts, scales)`` tuples with sentinel masking via ``torch.where``.
     """
 
-    group_assignments: List[List[int]]
-
-    def validate(self, num_experts: int) -> None:
-        all_experts = []
-        for group in self.group_assignments:
-            all_experts.extend(group)
-        all_experts_sorted = sorted(all_experts)
-        expected = list(range(num_experts))
-        assert all_experts_sorted == expected, (
-            f"Expert assignment mismatch: got {all_experts_sorted}, expected {expected}"
-        )
-
-    def get_expert_to_group(self, num_experts: int) -> torch.Tensor:
-        """Return tensor [num_experts] mapping expert_id -> group_idx."""
-        mapping = torch.zeros(num_experts, dtype=torch.long)
-        for group_idx, expert_ids in enumerate(self.group_assignments):
-            for eid in expert_ids:
-                mapping[eid] = group_idx
-        return mapping
-
-
-class BaseHeterPolicy:
-    """Abstract base for heterogeneous dispatch policies."""
-
-    def assign(
+    def __init__(
         self,
-        topk_ids: torch.Tensor,
         num_experts: int,
-        group_ratios: List[float],
-        topk_weights: Optional[torch.Tensor] = None,
-    ) -> HeterDispatchPlan:
-        """Assign experts to precision groups.
+        group_size_ratios: List[float],
+        device: Optional[torch.device] = None,
+    ):
+        self._num_experts = num_experts
+        self._group_size_ratios = group_size_ratios
+        if device is None:
+            device = torch.device("cuda")
+        self._device = device
+        self._expert_to_group_buf = torch.empty(
+            num_experts, dtype=torch.long, device=device)
+        self._group_labels: Optional[torch.Tensor] = None
+        if len(group_size_ratios) > 2:
+            self._group_labels = _build_group_labels(
+                num_experts, group_size_ratios, device)
 
-        Args:
-            topk_ids: [num_tokens, top_k] selected expert IDs.
-            num_experts: total expert count.
-            group_ratios: fraction of experts per group (must sum to 1.0).
-            topk_weights: [num_tokens, top_k] routing weights (optional).
+    @property
+    def num_experts(self) -> int:
+        return self._num_experts
 
-        Returns:
-            HeterDispatchPlan with expert-to-group mapping.
+    @property
+    def num_groups(self) -> int:
+        return len(self._group_size_ratios)
+
+    @property
+    def group_size_ratios(self) -> List[float]:
+        return self._group_size_ratios
+
+    @abc.abstractmethod
+    def _assign(
+        self,
+        token_selected_experts: Optional[torch.Tensor],
+        token_final_scales: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Return ``expert_to_group`` tensor ``[num_experts]`` on GPU."""
+        ...
+
+    def dispatch(
+        self,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+    ) -> List[GroupDispatchTuple]:
+        """Transform N-expert routing into per-group dispatches.
+
+        Returns list of ``(experts, scales)`` with shape ``[N, K]`` per group.
+        Non-group slots: expert=``num_experts``, scale=0.
         """
-        raise NotImplementedError
+        expert_to_group = self._assign(
+            token_selected_experts,
+            token_final_scales,
+        )
+        return self._dispatch_from_expert_to_group(
+            expert_to_group, token_selected_experts, token_final_scales)
+
+    def _dispatch_from_expert_to_group(
+        self,
+        expert_to_group: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+    ) -> List[GroupDispatchTuple]:
+        """Build per-group dispatch tuples using torch.where (fixed shapes)."""
+        num_groups = self.num_groups
+        slot_groups = expert_to_group[token_selected_experts.long()]
+
+        results: List[GroupDispatchTuple] = []
+        for gidx in range(num_groups):
+            in_group = (slot_groups == gidx)
+            experts_g = torch.where(
+                in_group, token_selected_experts, self._num_experts)
+            scales_g = torch.where(
+                in_group, token_final_scales, 0.0)
+            results.append((experts_g, scales_g))
+
+        return results
 
 
-class TokenCountPolicy(BaseHeterPolicy):
-    """Assign experts based on token activation frequency.
+class RandomHeterDispatch(HeterDispatchPolicy):
+    """Random expert-to-group assignment. Deterministic when seed is set."""
 
-    Hot experts (high token count) go to the high-precision group (last group).
-    Cold experts (low token count) go to the low-precision group (first group).
+    def __init__(
+        self,
+        num_experts: int,
+        group_size_ratios: List[float],
+        seed: int = 42,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__(num_experts, group_size_ratios, device=device)
+        gen = torch.Generator(device=self._device).manual_seed(seed)
+        scores = torch.rand(
+            num_experts, device=self._device, generator=gen)
+        _assign_by_score_gpu(
+            scores, num_experts, group_size_ratios,
+            self._expert_to_group_buf, self._group_labels)
+
+    def _assign(self, token_selected_experts, token_final_scales):
+        return self._expert_to_group_buf
+
+
+class ConfidenceThresholdHeterDispatch(HeterDispatchPolicy):
+    """Assign by per-expert mean routing weight.
+
+    High-weight experts -> last group (high-precision).
+    Falls back to random when signals are unavailable.
     """
 
-    def assign(
+    def __init__(
         self,
-        topk_ids: torch.Tensor,
         num_experts: int,
-        group_ratios: List[float],
-        topk_weights: Optional[torch.Tensor] = None,
-    ) -> HeterDispatchPlan:
-        # Count tokens per expert
-        flat_ids = topk_ids.reshape(-1)
-        counts = torch.bincount(flat_ids, minlength=num_experts)
+        group_size_ratios: List[float],
+        confidence_threshold: float = 0.5,
+        fallback_seed: int = 42,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__(num_experts, group_size_ratios, device=device)
+        self._confidence_threshold = confidence_threshold
+        self._fallback = RandomHeterDispatch(
+            num_experts, group_size_ratios, seed=fallback_seed, device=device)
+        self._expert_weight_sum = torch.empty(
+            num_experts, device=self._device, dtype=torch.float32)
+        self._expert_count_buf = torch.zeros(
+            num_experts, device=self._device, dtype=torch.float32)
 
-        # Sort experts by count (ascending: cold first, hot last)
-        sorted_indices = torch.argsort(counts, descending=False)
+    def _assign(self, token_selected_experts, token_final_scales):
+        if token_selected_experts is None or token_final_scales is None:
+            return self._fallback._assign(
+                token_selected_experts, token_final_scales)
 
-        # Split into groups by ratio
-        group_assignments: List[List[int]] = []
-        start = 0
-        for i, ratio in enumerate(group_ratios):
-            if i == len(group_ratios) - 1:
-                # Last group gets remaining experts (avoids rounding issues)
-                end = num_experts
-            else:
-                end = start + round(ratio * num_experts)
-                end = min(end, num_experts)
-            group_experts = sorted(sorted_indices[start:end].tolist())
-            group_assignments.append(group_experts)
-            start = end
+        buf = self._expert_weight_sum
+        flat_experts = token_selected_experts.reshape(-1).long()
+        flat_scales = token_final_scales.reshape(-1)
 
-        plan = HeterDispatchPlan(group_assignments=group_assignments)
-        plan.validate(num_experts)
-        return plan
+        buf.zero_()
+        buf.scatter_add_(0, flat_experts, flat_scales)
 
+        expert_count = self._expert_count_buf
+        expert_count.zero_()
+        expert_count.scatter_add_(
+            0, flat_experts,
+            torch.ones_like(flat_experts, dtype=torch.float32))
+        expert_count.clamp_min_(1.0)
+        buf.div_(expert_count)
 
-class FixedPolicy(BaseHeterPolicy):
-    """Fixed expert-to-group assignment (for testing / manual override)."""
-
-    def __init__(self, fixed_assignments: List[List[int]]):
-        self.fixed_assignments = fixed_assignments
-
-    def assign(
-        self,
-        topk_ids: torch.Tensor,
-        num_experts: int,
-        group_ratios: List[float],
-        topk_weights: Optional[torch.Tensor] = None,
-    ) -> HeterDispatchPlan:
-        plan = HeterDispatchPlan(group_assignments=self.fixed_assignments)
-        plan.validate(num_experts)
-        return plan
+        return _assign_by_score_gpu(
+            buf, self._num_experts, self._group_size_ratios,
+            self._expert_to_group_buf, self._group_labels)
 
 
-class RandomPolicy(BaseHeterPolicy):
-    """Deterministic random assignment (for testing).
+class ExpertLoadHeterDispatch(HeterDispatchPolicy):
+    """Assign by expert activation frequency.
 
-    Uses a fixed seed so assignment is reproducible given the same config.
+    Hot experts -> last group (high-precision).
+    Falls back to random when signals are unavailable.
     """
 
-    def __init__(self, seed: int = 42):
-        self.seed = seed
-
-    def assign(
+    def __init__(
         self,
-        topk_ids: torch.Tensor,
         num_experts: int,
-        group_ratios: List[float],
-        topk_weights: Optional[torch.Tensor] = None,
-    ) -> HeterDispatchPlan:
-        gen = torch.Generator()
-        gen.manual_seed(self.seed)
-        perm = torch.randperm(num_experts, generator=gen)
+        group_size_ratios: List[float],
+        fallback_seed: int = 42,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__(num_experts, group_size_ratios, device=device)
+        self._fallback = RandomHeterDispatch(
+            num_experts, group_size_ratios, seed=fallback_seed, device=device)
+        self._count_buf = torch.zeros(
+            num_experts, device=self._device, dtype=torch.float32)
 
-        group_assignments: List[List[int]] = []
-        start = 0
-        for i, ratio in enumerate(group_ratios):
-            if i == len(group_ratios) - 1:
-                end = num_experts
-            else:
-                end = start + round(ratio * num_experts)
-                end = min(end, num_experts)
-            group_experts = sorted(perm[start:end].tolist())
-            group_assignments.append(group_experts)
-            start = end
+    def _assign(self, token_selected_experts, token_final_scales):
+        if token_selected_experts is None:
+            return self._fallback._assign(
+                token_selected_experts, token_final_scales)
 
-        plan = HeterDispatchPlan(group_assignments=group_assignments)
-        plan.validate(num_experts)
-        return plan
+        flat_experts = token_selected_experts.reshape(-1).long()
+        counts = self._count_buf
+        counts.zero_()
+        counts.scatter_add_(
+            0, flat_experts,
+            torch.ones_like(flat_experts, dtype=torch.float32))
+
+        return _assign_by_score_gpu(
+            counts, self._num_experts, self._group_size_ratios,
+            self._expert_to_group_buf, self._group_labels)
 
 
-_POLICY_REGISTRY: Dict[str, type] = {
-    "token_count": TokenCountPolicy,
-    "fixed": FixedPolicy,
-    "random": RandomPolicy,
+_POLICY_REGISTRY = {
+    "expert_load": ExpertLoadHeterDispatch,
+    "confidence": ConfidenceThresholdHeterDispatch,
+    "random": RandomHeterDispatch,
 }
 
 
-def create_policy(policy_name: str, **kwargs) -> BaseHeterPolicy:
+def create_policy(
+    policy_name: str,
+    num_experts: int,
+    group_size_ratios: List[float],
+    device: Optional[torch.device] = None,
+    **kwargs,
+) -> HeterDispatchPolicy:
     cls = _POLICY_REGISTRY.get(policy_name)
     if cls is None:
         raise ValueError(
-            f"Unknown heter policy: {policy_name}. Available: {list(_POLICY_REGISTRY.keys())}"
+            f"Unknown heter policy: {policy_name}. "
+            f"Available: {list(_POLICY_REGISTRY.keys())}"
         )
-    return cls(**kwargs)
+    return cls(
+        num_experts=num_experts,
+        group_size_ratios=group_size_ratios,
+        device=device,
+        **kwargs,
+    )
