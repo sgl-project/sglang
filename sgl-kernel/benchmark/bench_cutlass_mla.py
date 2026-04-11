@@ -8,12 +8,9 @@ import triton
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 
 from sglang.srt.utils import get_device_capability
+from sglang.utils import is_in_ci
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 # CI environment uses simplified parameters
 if IS_CI:

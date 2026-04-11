@@ -8,6 +8,7 @@ from deep_gemm import calc_diff
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
 
 # Import shared functionality from the regular GEMM benchmark
+from sglang.benchmark.bench_utils import run_bench
 from sglang.benchmark.kernels.deepseek.benchmark_deepgemm_fp8_gemm import (
     per_block_cast_to_fp8,
     per_token_cast_to_fp8,
@@ -397,10 +398,10 @@ def get_benchmark(tp_size):
             .view(-1)
         )
 
-        quantiles = [0.5, 0.2, 0.8]
+        quantiles = (0.5, 0.2, 0.8)
 
         if provider == "deepgemm":
-            ms, min_ms, max_ms = triton.testing.do_bench(
+            ms, min_ms, max_ms = run_bench(
                 lambda: fp8_gemm_group_deepgemm(
                     x_fp8_grouped,
                     y_fp8_grouped,
@@ -420,7 +421,7 @@ def get_benchmark(tp_size):
             M, _ = a.shape
             _, N = b.shape
             c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
-            ms, min_ms, max_ms = triton.testing.do_bench(
+            ms, min_ms, max_ms = run_bench(
                 lambda: fp8_gemm_group_triton(
                     (a, a_scale),
                     (b, b_scale),

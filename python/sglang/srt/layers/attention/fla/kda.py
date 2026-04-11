@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.srt.layers.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
 from sglang.srt.layers.attention.fla.fused_norm_gate import layer_norm_gated_fwd
 from sglang.srt.layers.attention.fla.fused_recurrent import (
@@ -17,7 +18,6 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
-from sglang.srt.layers.attention.fla.solve_tril import solve_tril
 from sglang.srt.layers.attention.fla.utils import is_amd
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
@@ -59,11 +59,11 @@ def fused_recurrent_kda_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = torch.empty_like(k)
+    o = q.new_empty(NK, *v.shape)
     if inplace_final_state:
         final_state = initial_state
     else:
-        final_state = q.new_empty(T, HV, K, V, dtype=initial_state.dtype)
+        final_state = q.new_empty(N, HV, V, K, dtype=initial_state.dtype)
 
     stride_init_state_token = initial_state.stride(0)
     stride_final_state_token = final_state.stride(0)
@@ -113,6 +113,7 @@ def fused_recurrent_kda_fwd(
         num_stages=num_stages,
     )
 
+    o = o.squeeze(0)
     return o, final_state
 
 
@@ -756,11 +757,11 @@ def chunk_gla_fwd_kernel_o(
             (1, 0),
         )
         p_h = tl.make_block_ptr(
-            h + (i_tg * H + i_h) * K * V,
-            (K, V),
-            (V, 1),
-            (i_k * BK, i_v * BV),
-            (BK, BV),
+            h + (i_tg * H + i_h) * V * K,
+            (V, K),
+            (K, 1),
+            (i_v * BV, i_k * BK),
+            (BV, BK),
             (1, 0),
         )
 
@@ -776,7 +777,7 @@ def chunk_gla_fwd_kernel_o(
         # works but dkw, owing to divine benevolence
         # [BT, BV]
         if i_k >= 0:
-            b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
+            b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
     p_v = tl.make_block_ptr(
         v + (bos * H + i_h) * V,
         (T, V),
@@ -862,27 +863,19 @@ def chunk_kda_fwd(
 ):
     chunk_size = 64
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
-    # the intra Aqk is kept in fp32
-    # the computation has very marginal effect on the entire throughput
-    A, Aqk = chunk_kda_scaled_dot_kkt_fwd(
+
+    # Fused: scaled_dot_kkt + solve_tril + recompute_w_u
+    w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
+        v=v,
         gk=g,
         beta=beta,
         scale=scale,
         cu_seqlens=cu_seqlens,
-        output_dtype=torch.float32,
+        chunk_size=chunk_size,
     )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u, _, kg = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        gk=g,
-        cu_seqlens=cu_seqlens,
-    )
-    del A
+
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,

@@ -55,6 +55,28 @@ globally_suppress_loggers()
 MESH_OUTPUT_PATHS: dict[str, str] = {}
 
 
+def _urlopen_with_retry(url: str, timeout: int = 30, max_retries: int = 3) -> bytes:
+    """Download content from a URL with retry on transient failures."""
+    for attempt in range(max_retries + 1):
+        try:
+            with urlopen(url, timeout=timeout) as response:
+                return response.read()
+        except (TimeoutError, OSError) as e:
+            if attempt < max_retries:
+                wait = 2**attempt
+                logger.warning(
+                    f"Download attempt {attempt + 1}/{max_retries + 1} failed "
+                    f"for {url}: {e}. Retrying in {wait}s..."
+                )
+                time.sleep(wait)
+            else:
+                logger.error(
+                    f"Failed to download from {url} after "
+                    f"{max_retries + 1} attempts: {e}"
+                )
+                raise
+
+
 def download_image_from_url(url: str) -> Path:
     """Download an image from a URL to a temporary file.
 
@@ -76,14 +98,10 @@ def download_image_from_url(url: str) -> Path:
         Path(tempfile.gettempdir()) / f"diffusion_test_image_{int(time.time())}{ext}"
     )
 
-    try:
-        with urlopen(url, timeout=30) as response:
-            temp_file.write_bytes(response.read())
-        logger.info(f"Downloaded image to: {temp_file}")
-        return temp_file
-    except Exception as e:
-        logger.error(f"Failed to download image from {url}: {e}")
-        raise
+    data = _urlopen_with_retry(url)
+    temp_file.write_bytes(data)
+    logger.info(f"Downloaded image to: {temp_file}")
+    return temp_file
 
 
 def parse_dimensions(size_string: str | None) -> tuple[int | None, int | None]:
@@ -161,6 +179,9 @@ class ServerContext:
             # Clean up downloaded models if HF cache is not persistent
             # This prevents disk exhaustion in CI when cache is not mounted
             self._cleanup_hf_cache_if_not_persistent()
+        else:
+            # Give the runtime a brief cooldown after server shutdown.
+            time.sleep(2)
 
     def _cleanup_hf_cache_if_not_persistent(self) -> None:
         """Clean up HF cache if it's not on a persistent volume.
@@ -357,8 +378,10 @@ class ServerManager:
         # Apply custom environment variables
         env.update(self.env_vars)
 
-        # TODO: unify with run_command
-        logger.info(f"Running command: {shlex.join(command)}")
+        cmd_str = shlex.join(command)
+        # Use print (not logger) so the command always appears in CI output
+        # regardless of log-level configuration.
+        print(f"[server-test] Running command: {cmd_str}", flush=True)
 
         process = subprocess.Popen(
             command,
@@ -394,11 +417,10 @@ class ServerManager:
             log_thread.daemon = True
             log_thread.start()
 
-        logger.info(
-            "[server-test] Starting server pid=%s, model=%s, log=%s",
-            process.pid,
-            self.model,
-            stdout_path,
+        print(
+            f"[server-test] Starting server pid={process.pid}, "
+            f"model={self.model}, log={stdout_path}",
+            flush=True,
         )
 
         self._wait_for_ready(process, stdout_path)
@@ -664,8 +686,7 @@ def _download_reference_mesh(url: str) -> Path:
         return cache_path
 
     logger.info(f"Downloading reference mesh from: {url}")
-    with urlopen(url, timeout=60) as resp:
-        cache_path.write_bytes(resp.read())
+    cache_path.write_bytes(_urlopen_with_retry(url, timeout=60))
     logger.info(f"Reference mesh cached at: {cache_path}")
     return cache_path
 
@@ -737,6 +758,28 @@ VALIDATOR_REGISTRY = {
 }
 
 
+def _extract_async_job_error_message(job: Any) -> str | None:
+    error = getattr(job, "error", None)
+    if error is None and isinstance(job, dict):
+        error = job.get("error")
+
+    if error is None:
+        return None
+
+    if isinstance(error, dict):
+        for key in ("message", "detail", "error"):
+            value = error.get(key)
+            if value:
+                return str(value)
+        return str(error)
+
+    message = getattr(error, "message", None)
+    if message:
+        return str(message)
+
+    return str(error)
+
+
 def get_generate_fn(
     model_path: str,
     modality: str,
@@ -796,10 +839,24 @@ def get_generate_fn(
         while True:
             page = client.videos.list()  # type: ignore[attr-defined]
             item = next((v for v in page.data if v.id == video_id), None)
+            status = getattr(item, "status", None) if item is not None else None
 
-            if item and getattr(item, "status", None) == "completed":
+            if status == "completed":
                 job_completed = True
                 break
+
+            if status == "failed":
+                error_message = (
+                    _extract_async_job_error_message(item) or "unknown error"
+                )
+                pytest.fail(
+                    f"{case_id}: video job {video_id} failed early: {error_message}"
+                )
+
+            if status in {"cancelled", "deleted"}:
+                pytest.fail(
+                    f"{case_id}: video job {video_id} ended with status={status}"
+                )
 
             if time.time() > deadline:
                 break
@@ -837,6 +894,15 @@ def get_generate_fn(
 
         # Validate output file
         expected_width, expected_height = parse_dimensions(size)
+        if (
+            extra_body is not None
+            and extra_body.get("enable_upscaling")
+            and expected_width
+            and expected_height
+        ):
+            scale = extra_body.get("upscaling_scale", 4)
+            expected_width *= scale
+            expected_height *= scale
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
@@ -871,9 +937,7 @@ def get_generate_fn(
         req_background = None  # Not specified in current request
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
 
         response = client.images.with_raw_response.generate(
             model=model_path,
@@ -898,6 +962,13 @@ def get_generate_fn(
 
         # Validate output file
         expected_width, expected_height = parse_dimensions(output_size)
+        if (
+            sampling_params.extras.get("enable_upscaling")
+            and expected_width
+            and expected_height
+        ):
+            expected_width *= sampling_params.extras.get("upscaling_scale", 4)
+            expected_height *= sampling_params.extras.get("upscaling_scale", 4)
         validate_image_file(
             tmp_path,
             expected_filename,
@@ -947,8 +1018,7 @@ def get_generate_fn(
 
         # Build extra_body for optional features
         extra_body = {"num_frames": sampling_params.num_frames}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body.update(sampling_params.extras)
 
         images = [open(image_path, "rb") for image_path in image_paths]
         try:
@@ -1076,22 +1146,18 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no text prompt configured")
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
         if sampling_params.num_frames:
             extra_body["num_frames"] = sampling_params.num_frames
-        if sampling_params.enable_frame_interpolation:
-            extra_body["enable_frame_interpolation"] = True
-            extra_body["frame_interpolation_exp"] = (
-                sampling_params.frame_interpolation_exp
-            )
 
         # Compute expected output frame count for validation
         expected_frame_count = None
-        if sampling_params.enable_frame_interpolation and sampling_params.num_frames:
+        if (
+            sampling_params.extras.get("enable_frame_interpolation")
+            and sampling_params.num_frames
+        ):
             n = sampling_params.num_frames
-            exp = sampling_params.frame_interpolation_exp
+            exp = sampling_params.extras.get("frame_interpolation_exp", 1)
             expected_frame_count = (n - 1) * (2**exp) + 1
 
         return _create_and_download_video(
@@ -1118,9 +1184,7 @@ def get_generate_fn(
                 pytest.skip(f"{case_id}: file missing: {image_path}")
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
@@ -1140,8 +1204,7 @@ def get_generate_fn(
 
         # Build extra_body for optional features
         extra_body = {"reference_url": sampling_params.image_path}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body.update(sampling_params.extras)
 
         return _create_and_download_video(
             client,
@@ -1170,9 +1233,7 @@ def get_generate_fn(
                 pytest.skip(f"{case_id}: file missing: {image_path}")
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
@@ -1186,6 +1247,7 @@ def get_generate_fn(
                 extra_body={
                     "fps": sampling_params.fps,
                     "num_frames": sampling_params.num_frames,
+                    **extra_body,
                 },
             )
 

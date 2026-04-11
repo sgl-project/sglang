@@ -1,5 +1,6 @@
 """This file contains the SGL programs used for unit testing."""
 
+import asyncio
 import json
 import re
 import time
@@ -350,6 +351,49 @@ def test_stream():
     out = ""
     for chunk in ret.text_iter("answer"):
         out += chunk
+
+
+def test_stream_logprobs():
+    @sgl.function
+    def qa(s, question):
+        s += sgl.system("You are a helpful assistant.")
+        s += sgl.user(question)
+        s += sgl.assistant(sgl.gen("answer", return_logprob=True))
+
+    async def collect_chunks():
+        ret = qa(
+            question="Compose an engaging travel blog post about a recent trip to Hawaii, highlighting cultural experiences and must-see attractions.",
+            stream=True,
+            temperature=0,
+            max_new_tokens=64,
+        )
+        chunks = []
+        async for chunk_text, meta_info in ret.text_async_iter(
+            "answer", return_meta_data=True
+        ):
+            chunks.append((chunk_text, meta_info))
+        return chunks
+
+    chunks = asyncio.run(collect_chunks())
+    assert len(chunks) > 0
+    prev_completion_tokens = 0
+    prev_output_token_logprobs_length = 0
+    for chunk_text, meta_info in chunks:
+        assert chunk_text
+        assert "output_token_logprobs" in meta_info
+        assert "output_token_logprobs_length" in meta_info
+        completion_tokens = meta_info["completion_tokens"]
+        output_token_logprobs_length = meta_info["output_token_logprobs_length"]
+        chunk_output_token_logprobs = meta_info["output_token_logprobs"]
+        assert completion_tokens == output_token_logprobs_length
+        assert len(chunk_output_token_logprobs) == (
+            completion_tokens - prev_completion_tokens
+        )
+        assert len(chunk_output_token_logprobs) == (
+            output_token_logprobs_length - prev_output_token_logprobs_length
+        )
+        prev_completion_tokens = completion_tokens
+        prev_output_token_logprobs_length = output_token_logprobs_length
 
 
 def test_regex():

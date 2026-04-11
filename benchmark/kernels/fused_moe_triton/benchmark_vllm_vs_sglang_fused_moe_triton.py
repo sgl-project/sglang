@@ -5,6 +5,7 @@ import torch
 import triton
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -190,8 +191,8 @@ def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
         )
     torch.cuda.synchronize()
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(
         lambda: api_func(
             x,
             w1,

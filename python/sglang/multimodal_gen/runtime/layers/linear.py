@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_group,
@@ -53,6 +54,8 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQLinearMethod",
     "FBGEMMFp8LinearMethod",
     "ModelOptFp8LinearMethod",
+    "ModelOptFp4LinearMethod",
+    "ComfyUIFp4LinearMethod",
     "IPEXAWQLinearMethod",
     "IPEXGPTQLinearMethod",
     "HQQMarlinMethod",
@@ -155,7 +158,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             F.linear(x, layer.weight, bias)
             if current_platform.is_amp_supported() or bias is None
             else F.linear(x, layer.weight, bias.to(x.dtype))
-        )  # NOTE: this line assumes that we are using amp when using cuda and is needed to account for the fact that amp isn't supported in mps
+        )  # NOTE: explicit dtype cast for bias is needed on platforms where amp isn't supported
         return output
 
 
@@ -194,6 +197,13 @@ class LinearBase(torch.nn.Module):
             self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+
+        if self.quant_method is not None:
+            wrap_method_with_debug_kernel_once(
+                self.quant_method,
+                "apply",
+                op_name=f"diffusion.quant_method.{self.quant_method.__class__.__name__}.apply",
+            )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
         raise NotImplementedError

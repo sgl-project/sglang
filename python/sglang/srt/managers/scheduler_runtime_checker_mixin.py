@@ -26,6 +26,16 @@ class SchedulerRuntimeCheckerMixin:
             return self.tree_cache.session_held_tokens()
         return 0
 
+    def _session_held_full_tokens(self: Scheduler) -> int:
+        if isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_full_tokens()
+        return 0
+
+    def _session_held_swa_tokens(self: Scheduler) -> int:
+        if isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_swa_tokens()
+        return 0
+
     def _session_held_req_count(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
             return self.tree_cache.session_held_req_count()
@@ -104,11 +114,20 @@ class SchedulerRuntimeCheckerMixin:
             swa_available_size,
             swa_evictable_size,
         ) = self._get_swa_token_info()
-        session_held = self._session_held_tokens()
-        memory_leak = (full_num_used - session_held) != 0 or swa_num_used != 0
+        session_held_full = self._session_held_full_tokens()
+        session_held_swa = self._session_held_swa_tokens()
+
+        # Streaming sessions hold tree locks during idle, so tree-protected
+        # tokens must be accounted for alongside session-held tokens.
+        full_protected = self.tree_cache.full_protected_size()
+        swa_protected = self.tree_cache.swa_protected_size()
+        full_leaked = full_num_used - full_protected - session_held_full
+        swa_leaked = swa_num_used - swa_protected - session_held_swa
+        memory_leak = full_leaked != 0 or swa_leaked != 0
         token_msg = (
-            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
-            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}, {session_held=}\n"
+            f"{full_leaked=}, {swa_leaked=}\n"
+            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {full_protected=}, {session_held_full=}\n"
+            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {swa_protected=}, {session_held_swa=}\n"
         )
         return memory_leak, token_msg
 
@@ -292,13 +311,14 @@ class SchedulerRuntimeCheckerMixin:
                 (
                     num_used,
                     _,
-                    token_usage,
-                    _,
+                    full_token_usage,
+                    mamba_usage,
                     _,
                     _,
                     _,
                     _,
                 ) = self._get_mamba_token_info()
+                token_usage = max(full_token_usage, mamba_usage)
             else:
                 num_used, token_usage, _, _ = self._get_token_info()
 
@@ -339,6 +359,8 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        if self.enable_hisparse and self.hisparse_coordinator.has_ongoing_staging():
+            return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return

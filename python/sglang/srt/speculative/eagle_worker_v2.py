@@ -12,15 +12,16 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
-from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLAMultiStepDraftBackend,
+    TRTLLMMLABackend,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -57,6 +58,7 @@ from sglang.srt.utils.common import (
     fast_topk,
     get_available_gpu_memory,
     is_cuda,
+    is_hip,
     is_npu,
     next_power_of_2,
 )
@@ -64,6 +66,7 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +148,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
         # Alias for better readability
@@ -251,6 +255,9 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.server_args.disable_cuda_graph:
             return
 
+        if self.server_args.model_impl == "mindspore":
+            return
+
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
@@ -274,18 +281,27 @@ class EagleDraftWorker(BaseDraftWorker):
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
+        supports_hip_aiter_draft_extend_graph = False
+        if _is_hip:
+            # Keep import local so non-HIP environments do not require aiter.
+            from sglang.srt.layers.attention.aiter_backend import (
+                AiterMultiStepDraftBackend,
+            )
+
+            supports_hip_aiter_draft_extend_graph = isinstance(
+                self.draft_attn_backend, AiterMultiStepDraftBackend
+            )
+
+        supports_cuda_draft_extend_graph = _is_cuda and (
+            isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
+            or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
+        )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
         if self.draft_extend_attn_backend and (
             _is_npu
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
-            )
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
-            )
+            or supports_cuda_draft_extend_graph
+            or supports_hip_aiter_draft_extend_graph
         ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -514,6 +530,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_runner.forward(forward_batch).logits_output
@@ -832,6 +849,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+
+        if batch.return_logprob and not batch.forward_mode.is_idle():
+            compute_spec_v2_logprobs(
+                batch, logits_output, predict, accept_index, self.speculative_num_steps
+            )
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
