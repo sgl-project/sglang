@@ -230,6 +230,7 @@ class SchedulerRuntimeCheckerMixin:
 
     @staticmethod
     def _check_pool_invariant(
+        pool_name: str,
         available: int,
         evictable: int,
         protected: int,
@@ -241,7 +242,7 @@ class SchedulerRuntimeCheckerMixin:
         total_accounted = available + evictable + protected + session_held + uncached
         leak = total_accounted != total
         msg = (
-            f"{total=}, {available=}, {evictable=}, "
+            f"[{pool_name}] {total=}, {available=}, {evictable=}, "
             f"{protected=}, {session_held=}, {uncached=}"
         )
         return leak, msg
@@ -268,6 +269,7 @@ class SchedulerRuntimeCheckerMixin:
             session_held = self._session_held_tokens()
             total = self.max_total_num_tokens
         return self._check_pool_invariant(
+            "full",
             ps.full_available_size,
             ps.full_evictable_size,
             protected,
@@ -280,6 +282,7 @@ class SchedulerRuntimeCheckerMixin:
         self: Scheduler, ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, str]:
         return self._check_pool_invariant(
+            "swa",
             ps.swa_available_size,
             ps.swa_evictable_size,
             self.tree_cache.swa_protected_size(),
@@ -290,6 +293,7 @@ class SchedulerRuntimeCheckerMixin:
 
     def _check_mamba_pool(self: Scheduler, ps: PoolStats) -> Tuple[bool, str]:
         leak, msg = self._check_pool_invariant(
+            "mamba",
             ps.mamba_available_size,
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
