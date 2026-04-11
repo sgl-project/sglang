@@ -814,7 +814,7 @@ async def list_external_corpora():
     return ORJSONResponse(
         {
             "success": result.success,
-            "corpus_ids": result.corpus_ids,
+            "corpus_token_counts": result.corpus_token_counts,
             "message": result.message,
         },
         status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
