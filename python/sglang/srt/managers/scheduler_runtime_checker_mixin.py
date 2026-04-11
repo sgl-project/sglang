@@ -402,11 +402,15 @@ class SchedulerRuntimeCheckerMixin:
             msg,
         )
 
-    def check_memory(self: Scheduler):
-        ps = self.get_pool_stats()
+    def self_check_during_idle(
+        self: Scheduler, ps: Optional[PoolStats] = None, uncached: int = 0
+    ):
+        """Check memory invariant across all pools. Used by both idle and busy paths."""
+        if ps is None:
+            ps = self.get_pool_stats()
 
         # Always check full/KV pool
-        full_leak, full_msg = self._check_full_pool(ps)
+        full_leak, full_msg = self._check_full_pool(ps, uncached=uncached)
         if full_leak:
             self._report_leak("full_pool", full_msg)
 
@@ -424,40 +428,42 @@ class SchedulerRuntimeCheckerMixin:
 
         self._check_req_pool()
 
+    def _maybe_log_idle_metrics(self: Scheduler):
+        """Collect and log metrics every 30 seconds during idle."""
         if (
-            self.current_scheduler_metrics_enabled
-            and time.perf_counter() > self.metrics_collector.last_log_time + 30
+            not self.current_scheduler_metrics_enabled
+            or time.perf_counter() <= self.metrics_collector.last_log_time + 30
         ):
-            # During idle time, also collect metrics every 30 seconds.
-            self.get_pool_stats().update_scheduler_stats(self.stats)
+            return
 
-            priority_enabled = self.enable_priority_scheduling
-            self.stats.num_running_reqs = QueueCount.from_reqs(
-                self.running_batch.reqs, priority_enabled
-            )
-            self.stats.gen_throughput = 0
-            self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.waiting_queue, priority_enabled
-            )
-            self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
-                )
-                self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, priority_enabled
-                )
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, priority_enabled
-                )
-                self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, priority_enabled
-                )
-            self.metrics_collector.log_stats(self.stats)
-        self._publish_kv_events()
+        self.get_pool_stats().update_scheduler_stats(self.stats)
 
-    def check_tree_cache(self: Scheduler):
+        priority_enabled = self.enable_priority_scheduling
+        self.stats.num_running_reqs = QueueCount.from_reqs(
+            self.running_batch.reqs, priority_enabled
+        )
+        self.stats.gen_throughput = 0
+        self.stats.num_queue_reqs = QueueCount.from_reqs(
+            self.waiting_queue, priority_enabled
+        )
+        self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+                self.disagg_prefill_bootstrap_queue.queue, priority_enabled
+            )
+            self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
+                self.disagg_prefill_inflight_queue, priority_enabled
+            )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
+                self.disagg_decode_prealloc_queue.queue, priority_enabled
+            )
+            self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
+                self.disagg_decode_transfer_queue.queue, priority_enabled
+            )
+        self.metrics_collector.log_stats(self.stats)
+
+    def _check_tree_cache(self: Scheduler):
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())
@@ -465,12 +471,15 @@ class SchedulerRuntimeCheckerMixin:
         ):
             self.tree_cache.sanity_check()
 
-    def self_check_during_idle(self: Scheduler):
+    def on_idle(self: Scheduler):
+        """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
             return
 
-        self.check_memory()
-        self.check_tree_cache()
+        self.self_check_during_idle()
+        self._check_tree_cache()
+        self._maybe_log_idle_metrics()
+        self._publish_kv_events()
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
 
