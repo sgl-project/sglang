@@ -53,7 +53,7 @@ const dim3 KernelConfigM256<T>::preferred_cluster(2, 4, 1);
 template <typename T>
 const dim3 KernelConfigM256<T>::fallback_cluster(2, 1, 1);
 
-// Default config(half_t/bfloat16_t) for M > 256
+// Config(half_t/bfloat16_t) for 256 < M <= 1024
 template <typename T>
 struct KernelConfigDefault {
   using OutputType = T;
@@ -66,9 +66,26 @@ struct KernelConfigDefault {
   const static dim3 fallback_cluster;
 };
 template <typename T>
-const dim3 KernelConfigDefault<T>::preferred_cluster(4, 4, 1);
+const dim3 KernelConfigDefault<T>::preferred_cluster(2, 4, 1);
 template <typename T>
 const dim3 KernelConfigDefault<T>::fallback_cluster(2, 1, 1);
+
+// Config(half_t/bfloat16_t) for M > 1024: 1x4 cluster reduces M-tail waste.
+template <typename T>
+struct KernelConfigLargeM {
+  using OutputType = T;
+  using MmaTileShape = Shape<_256, _256, _256>;
+  using ClusterShape = Shape<int, int, _1>;
+  using EpilogueTile = Shape<_128, _64>;
+  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
+  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100;
+  const static dim3 preferred_cluster;
+  const static dim3 fallback_cluster;
+};
+template <typename T>
+const dim3 KernelConfigLargeM<T>::preferred_cluster(1, 4, 1);
+template <typename T>
+const dim3 KernelConfigLargeM<T>::fallback_cluster(1, 2, 1);
 
 struct KernelConfigFp32 {
   using OutputType = float;
@@ -261,8 +278,12 @@ void cutlassFp4GemmDispatchSm100(
     runGemm<Fp4GemmSm100<KernelConfigM128<OutType>>>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
   } else if (m <= 256) {
     runGemm<Fp4GemmSm100<KernelConfigM256<OutType>>>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-  } else {
+  } else if (m <= 1024) {
+    // m in (256, 1024]: 2x4 cluster balances SM occupancy and data reuse
     runGemm<Fp4GemmSm100<KernelConfigDefault<OutType>>>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+  } else {
+    // m in (1024, inf): 1x4 cluster eliminates M-tail waste for FLUX-class shapes
+    runGemm<Fp4GemmSm100<KernelConfigLargeM<OutType>>>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
   }
 }
 

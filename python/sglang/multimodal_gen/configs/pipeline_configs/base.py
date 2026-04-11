@@ -169,6 +169,7 @@ class PipelineConfig:
     # controls the timestep embedding generation
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0
+    generator_device: str | None = None
     flow_shift: float | None = None
     disable_autocast: bool = False
 
@@ -351,6 +352,10 @@ class PipelineConfig:
     def postprocess_vae_encode(self, image_latents, vae):
         return image_latents
 
+    # called after postprocess_vae_encode, before generic scale/shift
+    def normalize_vae_encode(self, image_latents, vae):
+        return None
+
     # called after scale_and_shift, before vae decoding
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
@@ -419,6 +424,9 @@ class PipelineConfig:
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
+
+    def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
+        raise NotImplementedError("not yet implemented")
 
     @staticmethod
     def add_cli_args(

@@ -4,6 +4,7 @@ from typing import Dict, List, Tuple, Union
 import torch
 
 from sglang.srt.managers.schedule_batch import (
+    Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
@@ -53,6 +54,70 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             input_ids=input_ids.tolist(),
             mm_items=mm_items,
             im_token_id=self.mm_tokens.image_token_id,
+        )
+
+    def _num_image_tokens_from_grid(self, grid_thw: torch.Tensor) -> int:
+        # Kimi-K2.5 applies temporal pooling and spatial 2D merge in vision tower.
+        # The output sequence length per image is h*w/(merge_h*merge_w).
+        merge_h, merge_w = self.hf_config.vision_config.merge_kernel_size
+        _t, h, w = grid_thw.tolist()
+        return (h * w) // (merge_h * merge_w)
+
+    def get_mm_data(self, prompt, embeddings, **kwargs):
+        img_grid_thw = kwargs.get("img_grid_thw", None)
+
+        if not isinstance(prompt, list):
+            prompt = self._tokenizer.encode(prompt)
+
+        image_token_id = self.mm_tokens.image_token_id
+        image_token_counts = [
+            self._num_image_tokens_from_grid(grid) for grid in img_grid_thw
+        ]
+
+        input_ids = []
+        offsets = []
+        img_idx = 0
+
+        for token in prompt:
+            if token != image_token_id:
+                input_ids.append(token)
+                continue
+
+            if img_idx >= len(image_token_counts):
+                raise ValueError(
+                    "The number of image placeholders exceeds img_grid_thw entries."
+                )
+
+            num_tokens = image_token_counts[img_idx]
+            start = len(input_ids)
+            input_ids.extend([image_token_id] * num_tokens)
+            offsets.append((start, len(input_ids) - 1))
+            img_idx += 1
+
+        if img_idx != len(image_token_counts):
+            raise ValueError(
+                "The number of image placeholders does not match img_grid_thw entries."
+            )
+
+        image_embeddings = embeddings[Modality.IMAGE]
+        mm_items = []
+        consumed = 0
+        for start, end in offsets:
+            num_tokens = end - start + 1
+            embedding_slice = image_embeddings[consumed : consumed + num_tokens]
+            consumed += num_tokens
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[(start, end)],
+                    precomputed_embeddings=embedding_slice,
+                )
+            )
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_token_id=image_token_id,
         )
 
     def _process_and_collect_mm_items(

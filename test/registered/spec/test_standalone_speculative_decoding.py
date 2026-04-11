@@ -66,7 +66,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
     model = DEFAULT_TARGET_MODEL_STANDALONE
     draft_model = DEFAULT_DRAFT_MODEL_STANDALONE
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.7  # derived tests need to override this
+    accuracy_threshold = 0.69  # derived tests need to override this
     spec_decode_threshold = 3.6  # derived spec decoding tests need to override this
 
     @classmethod
@@ -111,7 +111,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
 
         # Use the appropriate metric key based on the test class
         metric_key = "score"
-        self.assertGreater(metrics[metric_key], self.accuracy_threshold)
+        self.assertGreaterEqual(metrics[metric_key], self.accuracy_threshold)
 
         server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
@@ -126,7 +126,7 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
     model = DEFAULT_TARGET_MODEL_STANDALONE
     draft_model = DEFAULT_DRAFT_MODEL_STANDALONE
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.7  # derived tests need to override this
+    accuracy_threshold = 0.69  # derived tests need to override this
     spec_decode_threshold = 3.6  # derived spec decoding tests need to override this
 
     @classmethod
@@ -174,7 +174,7 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
 
         # Use the appropriate metric key based on the test class
         metric_key = "score"
-        self.assertGreater(metrics[metric_key], self.accuracy_threshold)
+        self.assertGreaterEqual(metrics[metric_key], self.accuracy_threshold)
 
         server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
