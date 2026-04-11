@@ -164,7 +164,7 @@ class ModelSlimConfig(QuantizationConfig):
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            layer.scheme = self.get_moe_scheme(layer, prefix)
+            layer._init_routing, layer.w13_scheme, layer._act_function, layer.w2_scheme, layer._finalize_routing = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
         return None
 
@@ -204,6 +204,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
+            ("FLOAT", UnquantizedMoEMethod),
         ]
 
         moe_weight_suffixes = [".0.gate_proj.weight", ".0.w2.weight"]
@@ -317,7 +318,10 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.scheme.process_weights_after_loading(layer)
+        layer.w13_scheme.process_weights_after_loading(layer)
+        layer.w2_scheme.process_weights_after_loading(layer)
+        layer.w13_scheme.process_quant_params_after_loading(layer)
+        layer.w2_scheme.process_quant_params_after_loading(layer)
 
     def create_weights(
         self,
@@ -333,7 +337,15 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         the necessary parameters for the layer. See FusedMoEMethodBase for param
         details
         """
-        layer.scheme.create_weights(
+        layer.w13_scheme.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
+        layer.w2_scheme.create_weights(
             layer=layer,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -345,7 +357,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        return layer.scheme.create_moe_runner(layer, moe_runner_config)
+        return layer.create_moe_runner(layer, moe_runner_config)
 
     def apply(
         self,
@@ -361,7 +373,14 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
-        return scheme.apply_weights(layer, dispatch_output)
+
+        layer._init_routing()
+        layer.w13_scheme.apply_weights(layer, dispatch_output)
+        layer._act_function()
+        layer.w2_scheme.apply_weights(layer)
+        layer._finalize_routing()
+
+        return output
 
     def apply_without_routing_weights(
         self,

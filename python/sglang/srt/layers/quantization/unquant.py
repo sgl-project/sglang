@@ -9,6 +9,10 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.hardware_backend.npu.moe.torch_npu_kernels import (
+    TorchNpuKernelsQuantInfo,
+)
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -367,8 +371,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        moe_runner_config.quantization = "UnquantizedFusedMoEMethod"
         self.moe_runner_config = moe_runner_config
-        if self.use_flashinfer_trtllm_moe:
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = (
+                MoeRunnerBackend.TRITON_KERNELS
+                if self.use_triton_kernels
+                else MoeRunnerBackend.TRITON
+            )
+        if _is_npu:
+            backend = MoeRunnerBackend.TORCH_NPU_KERNELS
+        '''if self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -378,7 +392,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             backend = MoeRunnerBackend.TRITON_KERNELS
         else:
             backend = MoeRunnerBackend.TRITON
-        self.runner = MoeRunner(backend, moe_runner_config)
+        self.runner = MoeRunner(backend, moe_runner_config)'''
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -610,6 +624,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuKernelsQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_weight_bias=layer.w13_weight_bias if self.with_bias else None,
+            w2_weight_bias=layer.w2_weight_bias if self.with_bias else None,
+            activation=self.moe_runner_config.activation,
+        )
+        return self.runner.run(dispatch_output, quant_info)
+'''
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -689,6 +713,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
 
         return StandardCombineInput(hidden_states=final_hidden_states)
+'''
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")

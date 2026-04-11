@@ -6,6 +6,7 @@ ModelSlim was developed in the format of compressed_tensors and includes support
 - [x] W4A4 dynamic linear
 - [x] W8A8 static linear
 - [x] W8A8 dynamic linear
+- [x] W4A4 dynamic MOE
 - [x] W4A8 dynamic MOE
 - [x] W8A8 dynamic MOE
 

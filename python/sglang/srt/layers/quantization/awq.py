@@ -7,9 +7,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    npu_fused_experts,
-)
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -49,6 +46,9 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUWnA16MoEMethod,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -867,93 +867,42 @@ class AWQMoEMethod(FusedMoEMethodBase):
 class AWQMoEAscendMethod(AWQMoEMethod):
     def __init__(self, quant_config: AWQConfig):
         self.quant_config = quant_config
+        self.kernel = NPUWnA16MoEMethod()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13_qweight_tmp = torch.zeros_like(layer.w13_qweight.data)
-        w2_qweight_tmp = torch.zeros_like(layer.w2_qweight.data)
-        w13_qzeros_list = []
-        w2_qzeros_list = []
-        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
-        for i in range(0, self.quant_config.pack_factor):
-            shift_num = shifts[i] * 4
-            w13_qzeros_list.append(
-                (layer.w13_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w2_qzeros_list.append(
-                (layer.w2_qzeros.data.reshape(-1, 1) >> shift_num) & 0xF
-            )
-            w13_qweight_tmp.bitwise_or_(
-                ((layer.w13_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
-            w2_qweight_tmp.bitwise_or_(
-                ((layer.w2_qweight.data >> shift_num) * (2 ** (4 * i)))
-                & (0xF << (4 * i))
-            )
-
-        w13_qweight_tmp.bitwise_xor_(0x88888888)
-        w2_qweight_tmp.bitwise_xor_(0x88888888)
-
-        w13_qzeros_tmp = torch.cat(w13_qzeros_list, dim=-1).reshape(
-            layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1
-        )
-        w13_qzeros_tmp = -(w13_qzeros_tmp - 8)
-        w13_qzeros_tmp = w13_qzeros_tmp.to(layer.w13_scales.data.dtype)
-        w2_qzeros_tmp = torch.cat(w2_qzeros_list, dim=-1).reshape(
-            layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1
-        )
-        w2_qzeros_tmp = -(w2_qzeros_tmp - 8)
-        w2_qzeros_tmp = w2_qzeros_tmp.to(layer.w2_scales.data.dtype)
-
-        layer.register_parameter(
-            "w13_qzeros", torch.nn.Parameter(w13_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w13_qweight", torch.nn.Parameter(w13_qweight_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qzeros", torch.nn.Parameter(w2_qzeros_tmp, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_qweight", torch.nn.Parameter(w2_qweight_tmp, requires_grad=False)
-        )
+        self.kernel.process_weights_after_loading(layer)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
-        self.moe_runner_config = moe_runner_config
+        moe_runner_config.quantization = "AWQMoEAscendMethod"
+        self.kernel.create_moe_runner(layer, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+    ) -> CombineInput:
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        return self.kernel.apply(layer, dispatch_output)
 
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        topk_weights, topk_ids, _ = topk_output
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
-            hidden_states=x,
-            w13=layer.w13_qweight,
-            w13_scale=layer.w13_scales,
-            w13_offset=layer.w13_qzeros,
-            w2=layer.w2_qweight,
-            w2_scale=layer.w2_scales,
-            w2_offset=layer.w2_qzeros,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-            use_wna16=True,
-        )
-        return StandardCombineInput(hidden_states=output)
+    def apply_without_routing_weights(
+            self,
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        ):
+            return self.kernel.apply_without_routing_weights(
+                layer,
+                hidden_states,
+                hidden_states_scale,
+                group_list_type,
+                group_list,
+                output_dtype,
+            )
 
 
 # Register fake implementations for torch.compile support

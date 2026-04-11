@@ -49,6 +49,9 @@ class MoeRunnerConfig:
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
 
+    # Quantization
+    quantization: Optional[str] = None
+
 
 @dataclass
 class RunnerInput(ABC):

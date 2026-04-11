@@ -55,6 +55,10 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    NPUWnA16MoEMethod,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -606,6 +610,7 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
         self.moe_runner_config: Optional[MoeRunnerConfig] = None
+        self.kernel = NPUWnA16MoEMethod()
 
     def create_weights(
         self,
@@ -703,184 +708,39 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
     def create_moe_runner(
-        self,
-        layer: torch.nn.Module,
-        moe_runner_config: MoeRunnerConfig,
-        **extra_weight_attrs,
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
-        self.moe_runner_config = moe_runner_config
+        moe_runner_config.quantization = "GPTQMoEAscendMethod"
+        self.kernel.create_moe_runner(layer, moe_runner_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
-            -1, layer.w13_qzeros.shape[-1]
-        )
-        layer.w13_qzeros = torch.nn.Parameter(
-            unpack_from_int32(
-                w13_qzeros_2d,
-                self.quant_config.weight_bits,
-                packed_dim=1,
-            )
-            .reshape(layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1)
-            .to(layer.w13_scales.dtype),
-            requires_grad=False,
-        )
-        if not self.use_v2_format:
-            layer.w13_qzeros += 1
-
-        w2_qzeros_2d = layer.w2_qzeros.data.contiguous().reshape(
-            -1, layer.w2_qzeros.shape[-1]
-        )
-        layer.w2_qzeros = torch.nn.Parameter(
-            unpack_from_int32(
-                w2_qzeros_2d,
-                self.quant_config.weight_bits,
-                packed_dim=1,
-            )
-            .reshape(layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1)
-            .to(layer.w2_scales.dtype),
-            requires_grad=False,
-        )
-        if not self.use_v2_format:
-            layer.w2_qzeros += 1
-
-        w13_qweight_2d = (
-            layer.w13_qweight.data.transpose(-1, -2)
-            .contiguous()
-            .reshape(-1, layer.w13_qweight.shape[-2])
-        )
-        w13_qweight_tmp = unpack_from_int32(
-            w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1
-        )
-
-        if self.quant_config.weight_bits == 4:
-            group_size = self.quant_config.group_size
-            scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)
-
-            neg_mask = scale_expanded < 0
-
-            if neg_mask.any():
-                neg_mask = neg_mask.transpose(-1, -2)
-                neg_mask = neg_mask.contiguous().reshape(w13_qweight_tmp.shape)
-                w13_qweight_tmp[neg_mask] = -w13_qweight_tmp[neg_mask]
-
-                if w13_qweight_tmp.max() > 7:
-                    w13_qweight_tmp.clamp_(max=7)
-
-                layer.w13_scales.data.abs_()
-
-            layer.w13_qweight = torch.nn.Parameter(
-                torch_npu.npu_convert_weight_to_int4pack(
-                    w13_qweight_tmp.reshape(
-                        layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
-                    )
-                    .transpose(-1, -2)
-                    .contiguous()
-                    .reshape(-1, layer.w13_qweight.shape[2])
-                    .to(torch.int32)
-                )
-                .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
-                .contiguous(),
-                requires_grad=False,
-            )
-        # use int8 to store weight by default
-        else:
-            layer.w13_qweight = torch.nn.Parameter(
-                w13_qweight_tmp.reshape(
-                    layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
-                )
-                .transpose(-1, -2)
-                .contiguous(),
-                requires_grad=False,
-            )
-
-        w2_qweight_2d = (
-            layer.w2_qweight.data.transpose(-1, -2)
-            .contiguous()
-            .reshape(-1, layer.w2_qweight.shape[-2])
-        )
-        w2_qweight_tmp = unpack_from_int32(
-            w2_qweight_2d, self.quant_config.weight_bits, packed_dim=1
-        )
-
-        if self.quant_config.weight_bits == 4:
-            group_size = self.quant_config.group_size
-            scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
-
-            neg_mask = scale_expanded < 0
-
-            if neg_mask.any():
-                neg_mask = neg_mask.transpose(-1, -2)
-                neg_mask = neg_mask.contiguous().reshape(w2_qweight_tmp.shape)
-                w2_qweight_tmp[neg_mask] = -w2_qweight_tmp[neg_mask]
-
-                if w2_qweight_tmp.max() > 7:
-                    w2_qweight_tmp.clamp_(max=7)
-
-                layer.w2_scales.data.abs_()
-
-            layer.w2_qweight = torch.nn.Parameter(
-                torch_npu.npu_convert_weight_to_int4pack(
-                    w2_qweight_tmp.reshape(
-                        layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
-                    )
-                    .transpose(-1, -2)
-                    .contiguous()
-                    .reshape(-1, layer.w2_qweight.shape[2])
-                    .to(torch.int32)
-                )
-                .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
-                .contiguous(),
-                requires_grad=False,
-            )
-        # use int8 to store weight by default
-        else:
-            layer.w2_qweight = torch.nn.Parameter(
-                w2_qweight_tmp.reshape(
-                    layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
-                )
-                .transpose(-1, -2)
-                .contiguous(),
-                requires_grad=False,
-            )
+        self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+     ) -> CombineInput:
 
-        assert (
-            self.moe_runner_config is not None
-        ), "moe_runner_config is not set. Did you forget to call create_weights/create_moe_runner?"
+        return self.kernel.apply(layer, dispatch_output)
 
-        assert self.moe_runner_config.activation in ("silu", "swiglu"), (
-            f"Only SiLU/Swiglu activation is supported, "
-            f"got {self.moe_runner_config.activation!r}."
-        )
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-        topk_weights, topk_ids, _ = topk_output
-
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-
-        output = npu_fused_experts(
-            hidden_states=x,
-            w13=layer.w13_qweight,
-            w13_scale=layer.w13_scales,
-            w13_offset=layer.w13_qzeros,
-            w2=layer.w2_qweight,
-            w2_scale=layer.w2_scales,
-            w2_offset=layer.w2_qzeros,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-            use_wna16=True,
-        )
-
-        return StandardCombineInput(hidden_states=output)
+    def apply_without_routing_weights(
+            self,
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        ):
+            return self.kernel.apply_without_routing_weights(
+                layer,
+                hidden_states,
+                hidden_states_scale,
+                group_list_type,
+                group_list,
+                output_dtype,
+            )
 
 
 class GPTQMarlinLinearMethod(LinearMethodBase):
