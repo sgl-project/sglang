@@ -691,6 +691,14 @@ class DefaultModelLoader(BaseModelLoader):
                 model, self._get_all_weights(model_config, model), target_device
             )
 
+        server_args = get_global_server_args()
+        if server_args and server_args.heter_precision_config:
+            from sglang.srt.layers.moe.heter_moe import apply_heter_precision
+
+            apply_heter_precision(
+                model, server_args.heter_precision_config, target_device
+            )
+
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
 
