@@ -2030,6 +2030,8 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+        elif self.enable_kv_connector:
+            self.tree_cache.prefetch(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
