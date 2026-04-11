@@ -44,6 +44,7 @@ on:
           - nightly-8-gpu-qwen3-235b-rocm720
           - nightly-8-gpu-qwen35-rocm720
           - nightly-8-gpu-glm5-rocm720
+          - nightly-8-gpu-glm51-rocm720
           - nightly-8-gpu-minimax-m25-rocm720
           - nightly-1-gpu-zimage-turbo-rocm720
           - nightly-test-1-gpu-mi35x-rocm720
@@ -61,7 +62,7 @@ on:
           - nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720
           - nightly-8-gpu-mi35x-qwen35-rocm720
           - nightly-8-gpu-mi35x-glm5-rocm720
-          - nightly-8-gpu-mi35x-glm47-fp8-rocm720
+          - nightly-8-gpu-mi35x-glm51-rocm720
           - nightly-8-gpu-mi35x-minimax-m25-rocm720
       job_filter:
         description: 'Or type comma-separated job names (overrides dropdown if non-empty)'
@@ -621,7 +622,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # 8-GPU Qwen 3.5 (Accuracy) ROCm 7.2
+  # 8-GPU Qwen 3.5 (Accuracy + Performance combined) ROCm 7.2
   nightly-8-gpu-qwen35-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen35-rocm720,'))
     runs-on: linux-mi325-8gpu-sglang
@@ -653,7 +654,19 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # 8-GPU GLM-5 (Accuracy) ROCm 7.2
+      - name: Performance Test ROCm 7.2 (8-GPU Qwen 3.5 FP8)
+        timeout-minutes: 120
+        continue-on-error: true
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-qwen35-fp8 --nightly --timeout-per-file 5400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU GLM-5 (Accuracy + Performance combined) ROCm 7.2
   nightly-8-gpu-glm5-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-glm5-rocm720,'))
     runs-on: linux-mi325-8gpu-sglang
@@ -682,6 +695,62 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-glm5 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test ROCm 7.2 (8-GPU GLM-5)
+        timeout-minutes: 120
+        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-glm5 --nightly --timeout-per-file 5400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # 8-GPU GLM-5.1 (Accuracy + Performance combined) ROCm 7.2
+  nightly-8-gpu-glm51-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-glm51-rocm720,'))
+    runs-on: linux-mi325-8gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
+
+      - name: Accuracy Test ROCm 7.2 (8-GPU GLM-5.1 NSA)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-glm51 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test ROCm 7.2 (8-GPU GLM-5.1)
+        timeout-minutes: 120
+        continue-on-error: true
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-glm51 --nightly --timeout-per-file 5400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1219,7 +1288,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # MI35x 8-GPU Qwen 3.5 (Accuracy) ROCm 7.2
+  # MI35x 8-GPU Qwen 3.5 (Accuracy + Performance combined) ROCm 7.2
   nightly-8-gpu-mi35x-qwen35-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen35-rocm720,'))
     runs-on: linux-mi35x-gpu-8
@@ -1252,6 +1321,19 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU Qwen 3.5 FP8)
+        timeout-minutes: 120
+        continue-on-error: true
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-qwen35-fp8 --nightly --timeout-per-file 5400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # MI35x 8-GPU GLM-5 (Accuracy only) ROCm 7.2
   nightly-8-gpu-mi35x-glm5-rocm720:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm5-rocm720,'))
     runs-on: linux-mi35x-gpu-8
@@ -1285,9 +1367,9 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # MI35x 8-GPU GLM-4.7-FP8 (Accuracy) ROCm 7.2
-  nightly-8-gpu-mi35x-glm47-fp8-rocm720:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm47-fp8-rocm720,'))
+  # MI35x 8-GPU GLM-5.1 (Accuracy + Performance combined) ROCm 7.2
+  nightly-8-gpu-mi35x-glm51-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm51-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1304,17 +1386,28 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh
-          # Install tabulate for run_suite.py (missing in MI35x container)
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
-      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GLM-4.7-FP8)
-        timeout-minutes: 120
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GLM-5.1 NSA)
+        timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm47-fp8 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm51 --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test MI35x ROCm 7.2 (8-GPU GLM-5.1)
+        timeout-minutes: 120
+        continue-on-error: true
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-glm51 --nightly --timeout-per-file 5400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1421,6 +1514,7 @@ jobs:
       - nightly-8-gpu-qwen3-235b-rocm720
       - nightly-8-gpu-qwen35-rocm720
       - nightly-8-gpu-glm5-rocm720
+      - nightly-8-gpu-glm51-rocm720
       - nightly-8-gpu-minimax-m25-rocm720
       # MI30x ROCm 7.2 Diffusion Tests
       - nightly-1-gpu-zimage-turbo-rocm720
@@ -1440,7 +1534,7 @@ jobs:
       - nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720
       - nightly-8-gpu-mi35x-qwen35-rocm720
       - nightly-8-gpu-mi35x-glm5-rocm720
-      - nightly-8-gpu-mi35x-glm47-fp8-rocm720
+      - nightly-8-gpu-mi35x-glm51-rocm720
       - nightly-8-gpu-mi35x-minimax-m25-rocm720
     runs-on: ubuntu-latest
     steps:
