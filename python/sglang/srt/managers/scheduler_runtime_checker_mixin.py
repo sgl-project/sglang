@@ -402,30 +402,34 @@ class SchedulerRuntimeCheckerMixin:
             msg,
         )
 
-    def self_check_during_idle(
-        self: Scheduler, ps: Optional[PoolStats] = None, uncached: int = 0
-    ):
-        """Check memory invariant across all pools. Used by both idle and busy paths."""
-        if ps is None:
-            ps = self.get_pool_stats()
+    def _check_all_pools(
+        self: Scheduler, ps: PoolStats, uncached: int = 0
+    ) -> Tuple[bool, List[str]]:
+        """Check memory invariant across all pools. Returns (has_leak, messages)."""
+        has_leak = False
+        messages = []
 
-        # Always check full/KV pool
         full_leak, full_msg = self._check_full_pool(ps, uncached=uncached)
-        if full_leak:
-            self._report_leak("full_pool", full_msg)
+        has_leak |= full_leak
+        messages.append(full_msg)
 
-        # Check SWA sub-pool
         if self.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps)
-            if swa_leak:
-                self._report_leak("swa_pool", swa_msg)
+            has_leak |= swa_leak
+            messages.append(swa_msg)
 
-        # Check mamba sub-pool
         if self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             mamba_leak, mamba_msg = self._check_mamba_pool(ps)
-            if mamba_leak:
-                self._report_leak("mamba_pool", mamba_msg)
+            has_leak |= mamba_leak
+            messages.append(mamba_msg)
 
+        return has_leak, messages
+
+    def self_check_during_idle(self: Scheduler):
+        """Idle memory check: all pools + req pool."""
+        has_leak, messages = self._check_all_pools(self.get_pool_stats())
+        if has_leak:
+            self._report_leak("pool", "\n".join(messages))
         self._check_req_pool()
 
     def _maybe_log_idle_metrics(self: Scheduler):
@@ -501,18 +505,10 @@ def create_scheduler_watchdog(
     def dump_info() -> str:
         if scheduler.is_initializing or disable_request_logging():
             return ""
-        ps = scheduler.get_pool_stats()
-        _, full_msg = scheduler._check_full_pool(ps)
-        info_parts = [full_msg]
-        if scheduler.is_hybrid_swa:
-            _, swa_msg = scheduler._check_swa_pool(ps)
-            info_parts.append(swa_msg)
-        if scheduler.is_hybrid_ssm and scheduler.tree_cache.supports_mamba():
-            _, mamba_msg = scheduler._check_mamba_pool(ps)
-            info_parts.append(mamba_msg)
+        _, messages = scheduler._check_all_pools(scheduler.get_pool_stats())
         return (
             f"{scheduler.cur_batch.batch_size()=}\n"
-            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(info_parts)
+            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(messages)
         )
 
     return WatchdogRaw(
