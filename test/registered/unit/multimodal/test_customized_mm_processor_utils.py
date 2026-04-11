@@ -8,15 +8,7 @@ import unittest
 
 import sglang.srt.multimodal.customized_mm_processor_utils as cmmpu
 from sglang.test.test_utils import CustomTestCase
-
-try:
-    from transformers import PretrainedConfig, ProcessorMixin
-
-    _TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    PretrainedConfig = object  # type: ignore[assignment,misc]
-    ProcessorMixin = object  # type: ignore[assignment,misc]
-    _TRANSFORMERS_AVAILABLE = False
+from transformers import PretrainedConfig, ProcessorMixin
 
 
 class _DummyProcessor(ProcessorMixin):
@@ -29,7 +21,6 @@ class _DummyProcessor(ProcessorMixin):
         raise NotImplementedError()
 
 
-@unittest.skipIf(not _TRANSFORMERS_AVAILABLE, "transformers not available")
 class TestRegisterCustomizedProcessor(CustomTestCase):
     def setUp(self):
         super().setUp()
@@ -73,4 +64,6 @@ class TestRegisterCustomizedProcessor(CustomTestCase):
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()
