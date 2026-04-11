@@ -457,6 +457,28 @@ class OpenAIServingChat(OpenAIServingBase):
                     modalities,
                 )
 
+                # Normalize tool role content: OpenAI clients may send content
+                # as a list of content parts (e.g. [{"type":"text","text":"..."}])
+                # but most chat templates expect a plain string for tool messages.
+                # Only flatten when ALL items are pure OpenAI text parts; preserve
+                # lists with tool-semantic fields (e.g. "name", "output") that some
+                # templates intentionally iterate over.
+                if processed_msg["role"] == "tool" and isinstance(
+                    processed_msg.get("content"), list
+                ):
+                    parts = processed_msg["content"]
+                    is_openai_text_parts = all(
+                        (isinstance(p, dict) and p.get("type") == "text")
+                        or isinstance(p, str)
+                        for p in parts
+                    )
+                    if is_openai_text_parts:
+                        text_parts = [
+                            p.get("text", "") if isinstance(p, dict) else p
+                            for p in parts
+                        ]
+                        processed_msg["content"] = "\n".join(text_parts)
+
                 # per the Transformers docs & maintainers, tool call arguments in
                 # assistant-role messages with tool_calls need to be dicts not JSON str -
                 # this is how tool-use chat templates will expect them moving forwards
