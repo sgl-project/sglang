@@ -1070,7 +1070,11 @@ class DeepseekV2MoE(nn.Module):
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
-        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+        if (
+            hidden_states.shape[0] > 0
+            and self.num_fused_shared_experts == 0
+            and not self._enable_deepep_waterfill
+        ):
             return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
