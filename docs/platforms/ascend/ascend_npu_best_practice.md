@@ -2799,11 +2799,6 @@ TPOT: 10ms
 #### Model Deployment
 
 ```shell
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
 export SGLANG_SET_CPU_AFFINITY=1
 
 unset https_proxy
@@ -2811,10 +2806,6 @@ unset http_proxy
 unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
@@ -2872,11 +2863,6 @@ TPOT: 8ms
 #### Model Deployment
 
 ```shell
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
 export SGLANG_SET_CPU_AFFINITY=1
 
 unset https_proxy
@@ -2884,10 +2870,6 @@ unset http_proxy
 unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
@@ -2917,7 +2899,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 35000  \
-    --dp-size 8 --mem-fraction-static 0.7 --cuda-graph-bs 1 2 3 4 --dtype bfloat16
+    --tp-size 8 --mem-fraction-static 0.7 --cuda-graph-bs 1 2 3 4 --dtype bfloat16
 ```
 
 #### Benchmark
