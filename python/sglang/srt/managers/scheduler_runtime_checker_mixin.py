@@ -335,12 +335,21 @@ class SchedulerRuntimeCheckerMixin:
 
         return ret
 
-    def self_check_during_busy(self: Scheduler):
+    def _get_total_uncached_size(self: Scheduler) -> int:
+        """Sum uncached tokens across the current and running batches."""
         current_batch: ScheduleBatch = self.last_batch
+        uncached_size = self._get_batch_uncached_size(current_batch)
+        if (
+            current_batch.forward_mode.is_extend()
+            and self.running_batch is not None
+            and not self.running_batch.is_empty()
+        ):
+            uncached_size += self._get_batch_uncached_size(self.running_batch)
+        return uncached_size
 
-        if current_batch is None:
+    def self_check_during_busy(self: Scheduler):
+        if self.last_batch is None:
             return
-
         spec_topk = self.server_args.speculative_eagle_topk or 1
         if spec_topk > 1:
             warnings.warn(
@@ -348,27 +357,13 @@ class SchedulerRuntimeCheckerMixin:
             )
             return
 
-        pool_stats = self._get_token_info()
-        uncached_size = self._get_batch_uncached_size(current_batch)
-
-        if (
-            current_batch.forward_mode.is_extend()
-            and self.running_batch is not None
-            and not self.running_batch.is_empty()
-        ):
-            uncached_size += self._get_batch_uncached_size(self.running_batch)
+        uncached_size = self._get_total_uncached_size()
+        memory_leak, token_msg = self._check_radix_cache_memory(
+            self._get_token_info(), uncached_size=uncached_size
+        )
 
         if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
-            log_msg = (
-                f"[Mem Check (BUSY)] available_size={pool_stats.full_available_size}, "
-                f"evictable_size={pool_stats.full_evictable_size}, "
-                f"protected_size={self.tree_cache.protected_size()}, {uncached_size=}"
-            )
-            logger.info(log_msg)
-
-        memory_leak, token_msg = self._check_radix_cache_memory(
-            pool_stats, uncached_size=uncached_size
-        )
+            logger.info(f"[Mem Check (BUSY)] {token_msg}")
         assert not memory_leak, f"Mem Leak Detected! {token_msg}"
 
     def _check_req_pool(self: Scheduler):
