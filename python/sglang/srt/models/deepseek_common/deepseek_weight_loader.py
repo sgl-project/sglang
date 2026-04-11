@@ -192,6 +192,10 @@ class DeepseekV2WeightLoaderMixin:
                     # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                     if ("mlp.experts." in name) and name not in params_dict:
                         continue
+                    # q_a_proj / kv_a_proj_with_mqa must bypass stacked loading
+                    # and use the cache+concat fused A-proj path below.
+                    if param_name == "fused_qkv_a_proj_with_mqa":
+                        continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
