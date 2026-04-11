@@ -54,7 +54,7 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import MemoryPoolConfig
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
 
