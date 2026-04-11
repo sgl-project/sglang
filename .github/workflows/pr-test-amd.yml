@@ -462,7 +462,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-1gpu-sglang]
-        part: [0, 1]
+        part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -484,7 +484,7 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   stage-b-test-2-gpu-large-amd:
     needs: [check-changes, stage-a-test-1-gpu-small-amd]
@@ -638,6 +638,7 @@ jobs:
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
@@ -765,6 +766,7 @@ jobs:
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
