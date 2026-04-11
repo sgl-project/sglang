@@ -17,6 +17,7 @@ from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.observability.metrics_collector import SchedulerStats
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ class PoolStats:
             )
         return parts
 
-    def update_scheduler_stats(self, stats) -> None:
+    def update_scheduler_stats(self, stats: SchedulerStats) -> None:
         """Update pool-related fields on SchedulerStats."""
         num_used, _ = self.get_kv_token_stats()
         stats.num_used_tokens = num_used
