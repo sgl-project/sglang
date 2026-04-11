@@ -887,6 +887,8 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
+        if self.is_draft_model:
+            return None
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is not None and not isinstance(quant_cfg, dict):
             quant_cfg = quant_cfg.to_dict()
