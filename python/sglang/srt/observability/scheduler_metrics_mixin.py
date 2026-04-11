@@ -55,6 +55,7 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    num_pending_tokens: int = 0
 
     @classmethod
     def from_adder(
@@ -62,6 +63,7 @@ class PrefillStats:
         adder: PrefillAdder,
         running_reqs: List[Req],
         enable_priority_scheduling: bool = False,
+        num_pending_tokens: int = 0,
     ):
         return cls(
             log_input_tokens=adder.log_input_tokens,
@@ -71,6 +73,7 @@ class PrefillStats:
                 running_reqs, enable_priority_scheduling
             ),
             num_new_seqs=len(adder.can_run_list),
+            num_pending_tokens=num_pending_tokens,
         )
 
 
@@ -393,6 +396,7 @@ class SchedulerMetricsMixin:
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.waiting_queue)}, "
+            f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -862,6 +866,26 @@ class SchedulerMetricsMixin:
                     self.stats.token_usage / 0.9,
                 )
 
+    def _get_num_pending_tokens(self: Scheduler, chunk_deduct: int = 0) -> int:
+        """Get the total number of tokens pending prefill.
+
+        This includes tokens from waiting queue requests plus remaining tokens
+        from the currently chunked request.
+
+        Args:
+            chunk_deduct: extra tokens to subtract from the chunked request's
+                remaining count.  At batch-scheduling time the current chunk
+                has been planned but ``prefix_indices`` does not yet include it,
+                so callers pass ``extend_input_len`` here.  At query time
+                (``get_load``) ``prefix_indices`` is already up-to-date, so
+                the default 0 is correct.
+        """
+        num_pending_tokens = sum(req.seqlen for req in self.waiting_queue)
+        if self.chunked_req is not None:
+            req = self.chunked_req
+            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
+        return num_pending_tokens
+
     def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
         if self.is_hybrid_swa:
             full_num_used, swa_num_used, *_ = self._get_swa_token_info()
@@ -871,7 +895,9 @@ class SchedulerMetricsMixin:
         else:
             num_tokens = self._get_token_info()[0]
 
-        # Tokens in waiting queue, bootstrap queue, prealloc queue
+        num_pending_tokens = self._get_num_pending_tokens()
+
+        # Tokens and request count in waiting queue, bootstrap queue, prealloc queue
         waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
@@ -888,6 +914,7 @@ class SchedulerMetricsMixin:
             num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
+            num_pending_tokens=num_pending_tokens,
             ts_tic=time.perf_counter(),
         )
 

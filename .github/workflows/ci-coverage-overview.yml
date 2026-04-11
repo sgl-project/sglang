@@ -103,30 +103,35 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           grep -E '^=+.*passed' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
           echo "" >> $GITHUB_STEP_SUMMARY
-          # Coverage total
-          grep -E '^TOTAL ' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
+          # Coverage total, reformatted
+          awk '/^TOTAL / { for(i=1;i<=NF;i++) if($i~/^[0-9]+$/ || $i~/^[0-9]+%$/) a[++n]=$i; if(n>=3) printf "TOTAL   Stmts: %s   Miss: %s   Cover: %s\n", a[1], a[2], a[3] }' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-          # Partially covered core modules (1-49%) — most actionable for contributors
-          # Only show modules with testable logic; skip configs, models, layers, etc.
+          # Core modules with coverage < 50%, sorted by uncovered lines (descending)
           LOW_COV=$(awk '/^python\/.*%/ {
             for (i=1; i<=NF; i++) {
               if ($i ~ /^[0-9]+%$/) {
                 pct = $i + 0
-                if (pct >= 1 && pct < 50) printf "%-80s %5s  %s\n", $1, $(i-2), $i
+                if (pct >= 1 && pct < 50) {
+                  stmts = $(i-2) + 0
+                  miss = $(i-1) + 0
+                  printf "%d|%s|%d|%d|%d%%\n", miss, $1, stmts, miss, pct
+                }
                 break
               }
             }
           }' coverage_output.txt \
             | grep -E '/(mem_cache|managers|sampling|parser|observability|function_call|entrypoints|speculative|multimodal|utils)/' \
-            | head -40 || true)
+            | sort -t'|' -k1 -nr | cut -d'|' -f2- | head -40 || true)
           if [ -n "$LOW_COV" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "<details><summary>Core modules with coverage below 50% — good candidates for more unit tests</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "<details><summary>Top uncovered core modules (coverage < 50%, sorted by uncovered lines)</summary>" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "$LOW_COV" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "| File | Stmts | Miss | Cover |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|-------|------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "$LOW_COV" | while IFS='|' read -r file stmts miss pct; do
+              echo "| \`$file\` | $stmts | $miss | $pct |" >> $GITHUB_STEP_SUMMARY
+            done
             echo "</details>" >> $GITHUB_STEP_SUMMARY
           fi
 

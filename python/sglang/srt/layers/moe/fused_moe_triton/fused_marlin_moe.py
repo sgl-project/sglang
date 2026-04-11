@@ -8,9 +8,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import moe_sum_reduce
+    from sgl_kernel import moe_sum_reduce, silu_and_mul
 
-    from sglang.jit_kernel.activation import silu_and_mul
     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
@@ -22,13 +21,6 @@ def get_scalar_type(num_bits: int, has_zp: bool):
         return scalar_types.uint4
     else:
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
-
-
-def _get_fp4_scalar_type():
-    from sglang.srt.layers.quantization.utils import get_scalar_types
-
-    _, scalar_types = get_scalar_types()
-    return scalar_types.float4_e2m1f
 
 
 @register_custom_op(out_shape="hidden_states")
@@ -54,8 +46,6 @@ def fused_marlin_moe(
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
-    w1_global_scale: Optional[torch.Tensor] = None,
-    w2_global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -86,13 +76,6 @@ def fused_marlin_moe(
     """
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
-    # Detect FP4 Marlin mode (when global scales are provided)
-    _is_fp4_marlin = w1_global_scale is not None
-    if _is_fp4_marlin:
-        assert (
-            w2_global_scale is not None
-        ), "Both w1_global_scale and w2_global_scale must be provided for FP4 Marlin mode"
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
     assert hidden_states.shape[1] == w2.shape[2] // (
@@ -102,14 +85,12 @@ def fused_marlin_moe(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
-    # For FP4 Marlin, scales are in special float8_e4m3fn format (not input dtype)
-    if not _is_fp4_marlin:
-        assert (
-            hidden_states.dtype == w1_scale.dtype
-        ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
-        assert (
-            hidden_states.dtype == w2_scale.dtype
-        ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
+    assert (
+        hidden_states.dtype == w1_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
+    assert (
+        hidden_states.dtype == w2_scale.dtype
+    ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w2_scale.dtype ({w2_scale.dtype})"
     assert num_bits in [4, 8]
 
     M, K = hidden_states.shape
@@ -140,13 +121,8 @@ def fused_marlin_moe(
             max_workspace_size, dtype=torch.int, device=device, requires_grad=False
         )
 
-    # FP4 Marlin uses float4_e2m1f scalar type (not uint4b8/uint8b128)
-    if _is_fp4_marlin:
-        scalar_type1 = _get_fp4_scalar_type()
-        scalar_type2 = _get_fp4_scalar_type()
-    else:
-        scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
-        scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
+    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
+    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
 
     intermediate_cache2 = torch.empty(
         (M * topk_ids.shape[1], N),
@@ -174,7 +150,7 @@ def fused_marlin_moe(
         w1,
         None,  # b_bias_or_none
         w1_scale,
-        w1_global_scale,  # None for INT4/INT8, tensor for FP4 Marlin
+        None,  # global_scale_or_none
         w1_zeros,
         g_idx1,
         sort_indices1,
@@ -208,7 +184,7 @@ def fused_marlin_moe(
         w2,
         None,  # b_bias_or_none
         w2_scale,
-        w2_global_scale,  # None for INT4/INT8, tensor for FP4 Marlin
+        None,  # global_scale_or_none
         w2_zeros,
         g_idx2,
         sort_indices2,

@@ -33,19 +33,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 
-if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
-    from sgl_kernel.quantization import (
-        ggml_dequantize,
-        ggml_moe_a8,
-        ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
-        ggml_mul_mat_a8,
-        ggml_mul_mat_vec_a8,
-    )
-
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
-elif _is_musa:
+if _is_cuda or _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
@@ -200,11 +188,16 @@ def fused_moe_gguf(
     activation: str,
 ) -> torch.Tensor:
     def act(x: torch.Tensor):
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if activation == "silu":
-            return silu_and_mul(x)
+            silu_and_mul(out, x)
         elif activation == "gelu":
-            return gelu_and_mul(x)
-        raise ValueError(f"Unsupported activation: {activation}")
+            gelu_and_mul(out, x)
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+        return out
 
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
