@@ -230,6 +230,21 @@ class LTX2AVDenoisingStage(DenoisingStage):
         mask[:, valid:] = 0.0
         return mask
 
+    @staticmethod
+    def _get_ltx_prompt_attention_mask(
+        batch: Req,
+        *,
+        is_ltx23_variant: bool,
+        negative: bool = False,
+    ) -> torch.Tensor | None:
+        if is_ltx23_variant:
+            return None
+        return (
+            batch.negative_attention_mask
+            if negative
+            else batch.prompt_attention_mask
+        )
+
     @classmethod
     def _ltx2_calculate_guided_x0(
         cls,
@@ -572,7 +587,8 @@ class LTX2AVDenoisingStage(DenoisingStage):
         batch.ltx23_audio_replicated_for_sp = bool(replicate_audio_for_sp)
 
         if (
-            get_sp_world_size() > 1
+            is_ltx23_variant
+            and get_sp_world_size() > 1
             and isinstance(batch.audio_latents, torch.Tensor)
             and hasattr(server_args.pipeline_config, "shard_audio_latents_for_sp")
             and not replicate_audio_for_sp
@@ -791,9 +807,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         if use_official_cfg_path:
                             encoder_hidden_states = batch.prompt_embeds[0]
                             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                            # Official LTX pipelines rely on packed prompt embeddings
-                            # with padded positions zeroed out, not an explicit KV mask.
-                            encoder_attention_mask = None
+                            encoder_attention_mask = (
+                                self._get_ltx_prompt_attention_mask(
+                                    batch,
+                                    is_ltx23_variant=is_ltx23_variant,
+                                )
+                            )
                             if batch.do_classifier_free_guidance:
                                 latent_model_input = torch.cat(
                                     [latent_model_input] * 2, dim=0
@@ -815,6 +834,18 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     ],
                                     dim=0,
                                 )
+                                if encoder_attention_mask is not None:
+                                    encoder_attention_mask = torch.cat(
+                                        [
+                                            self._get_ltx_prompt_attention_mask(
+                                                batch,
+                                                is_ltx23_variant=is_ltx23_variant,
+                                                negative=True,
+                                            ),
+                                            encoder_attention_mask,
+                                        ],
+                                        dim=0,
+                                    )
                                 cfg_batch_size = int(latent_model_input.shape[0])
                                 timestep_video = self._repeat_batch_dim(
                                     timestep_video, cfg_batch_size
@@ -930,7 +961,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             # then apply CFG on denoised (x0) predictions.
                             encoder_hidden_states = batch.prompt_embeds[0]
                             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                            encoder_attention_mask = None
+                            encoder_attention_mask = (
+                                self._get_ltx_prompt_attention_mask(
+                                    batch,
+                                    is_ltx23_variant=is_ltx23_variant,
+                                )
+                            )
                             with set_forward_context(
                                 current_timestep=i, attn_metadata=attn_metadata
                             ):
@@ -971,7 +1007,13 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     neg_audio_encoder_hidden_states = (
                                         batch.negative_audio_prompt_embeds[0]
                                     )
-                                    neg_encoder_attention_mask = None
+                                    neg_encoder_attention_mask = (
+                                        self._get_ltx_prompt_attention_mask(
+                                            batch,
+                                            is_ltx23_variant=is_ltx23_variant,
+                                            negative=True,
+                                        )
+                                    )
 
                                     v_neg, a_v_neg = current_model(
                                         hidden_states=latent_model_input,
