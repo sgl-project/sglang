@@ -43,6 +43,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-2-gpu-large",
         "stage-b-test-4-gpu-b200",
         "stage-b-kernel-unit-1-gpu-large",
+        "stage-b-kernel-unit-1-gpu-b200",
         "stage-b-kernel-unit-8-gpu-h200",
         "stage-b-kernel-benchmark-1-gpu-large",
         "stage-c-test-4-gpu-h100",
@@ -84,6 +85,8 @@ NIGHTLY_SUITES = {
         "nightly-eval-vlm-2-gpu",
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
+        # GB300 (4x B200 NVL4) nightly suite
+        "nightly-4-gpu-gb300",
     ],
     HWBackend.AMD: [
         "nightly-amd",
@@ -103,8 +106,54 @@ NIGHTLY_SUITES = {
         "nightly-4-npu-a3",
         "nightly-8-npu-a3",
         "nightly-16-npu-a3",
+        "full-1-npu-a3",
+        "full-2-npu-a3",
+        "full-4-npu-a3",
+        "full-8-npu-a3",
+        "full-16-npu-a3",
     ],
 }
+
+
+OTHER_SUITES = {
+    HWBackend.CPU: [
+        "default",
+    ],
+    HWBackend.CUDA: [
+        "stress",
+        "weekly-8-gpu-h200",
+    ],
+}
+
+
+_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
+
+
+def _valid_suites_by_backend() -> dict:
+    """Build a mapping from backend to its set of valid suite names."""
+    result = {}
+    for suite_dict in (PER_COMMIT_SUITES, NIGHTLY_SUITES, OTHER_SUITES):
+        for backend, suites in suite_dict.items():
+            if backend not in result:
+                result[backend] = set()
+            result[backend].update(suites)
+    return result
+
+
+def validate_all_suites(all_tests: List[CIRegistry]):
+    """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
+    valid_by_backend = _valid_suites_by_backend()
+    errors = []
+    for t in all_tests:
+        if t.backend not in _SUITE_CHECKED_BACKENDS:
+            continue
+        valid = valid_by_backend.get(t.backend, set())
+        if t.suite not in valid:
+            errors.append(
+                f"  {t.filename}: backend={t.backend.name}, suite='{t.suite}'"
+            )
+    if errors:
+        raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
 
 
 def filter_tests(
@@ -203,6 +252,7 @@ def run_a_suite(args):
     sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
+    validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:

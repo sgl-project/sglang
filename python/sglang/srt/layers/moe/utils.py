@@ -26,6 +26,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    CUSTOMIZED = "customized"
 
     @classmethod
     def _missing_(cls, value):
@@ -56,6 +57,9 @@ class MoeA2ABackend(Enum):
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
+
+    def is_customized(self):
+        return self == MoeA2ABackend.CUSTOMIZED
 
 
 class MoeRunnerBackend(Enum):
@@ -248,6 +252,12 @@ def is_sbo_enabled() -> bool:
     if IS_SBO_ENABLED is None:
         IS_SBO_ENABLED = False
     return IS_SBO_ENABLED
+
+
+def is_deepep_class_backend() -> bool:
+    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+    b = get_moe_a2a_backend()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori()
 
 
 def get_tbo_token_distribution_threshold() -> float:

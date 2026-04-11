@@ -96,7 +96,7 @@ jobs:
           docker buildx build \
             --platform ${{ matrix.platform }} \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            --target framework \
+            --target framework_final \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ matrix.version }} \
             --build-arg BUILD_TYPE=${{ matrix.build_type }} \

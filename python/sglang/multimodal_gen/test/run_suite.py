@@ -28,15 +28,21 @@ _UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
     "Qwen-Image",
 )
 
+
+def _discover_unit_tests() -> list[str]:
+    """Auto-discover all test_*.py files in the unit/ directory."""
+    unit_dir = Path(__file__).resolve().parent / "unit"
+    if not unit_dir.is_dir():
+        return []
+    return sorted(
+        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
+    )
+
+
 SUITES = {
     # no GPU required; safe to run on any CPU-only runner
-    "unit": [
-        "../unit/test_sampling_params.py",
-        "../unit/test_storage.py",
-        "../unit/test_lora_format_adapter.py",
-        "../unit/test_server_args.py",
-        # add new unit tests here
-    ],
+    # Auto-discovered from test/unit/test_*.py
+    "unit": _discover_unit_tests(),
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
@@ -49,6 +55,17 @@ SUITES = {
         "test_server_2_gpu_a.py",
         "test_server_2_gpu_b.py",
         # add new 2-gpu test files here
+    ],
+    "component-accuracy-1-gpu": [
+        "test_accuracy_1_gpu_a.py",
+        "test_accuracy_1_gpu_b.py",
+    ],
+    "component-accuracy-2-gpu": [
+        "test_accuracy_2_gpu_a.py",
+        "test_accuracy_2_gpu_b.py",
+    ],
+    "1-gpu-b200": [
+        "test_server_c.py",
     ],
 }
 
@@ -69,6 +86,10 @@ suites_ascend = {
 
 SUITES.update(suites_ascend)
 STRICT_SUITES = {"unit"}
+COMPONENT_ACCURACY_SUITES = {
+    "component-accuracy-1-gpu",
+    "component-accuracy-2-gpu",
+}
 
 
 def parse_args():
@@ -78,7 +99,7 @@ def parse_args():
         type=str,
         required=True,
         choices=list(SUITES.keys()),
-        help="The test suite to run (e.g., 1-gpu, 2-gpu)",
+        help="The test suite to run (valid names are defined in SUITES)",
     )
     parser.add_argument(
         "--partition-id",
@@ -165,12 +186,14 @@ def collect_test_items(files, filter_expr=None):
     return test_items
 
 
-def run_pytest(files, filter_expr=None):
+def run_pytest(files, filter_expr=None, exitfirst=False):
     if not files:
         print("No files to run.")
         return 0
 
     base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
+    if exitfirst:
+        base_cmd.append("-x")
 
     # Add pytest -k filter if provided
     if filter_expr:
@@ -233,7 +256,9 @@ def run_pytest(files, filter_expr=None):
         )
 
         is_flaky_ci_assertion = (
-            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+            "SafetensorError" in full_output
+            or "FileNotFoundError" in full_output
+            or "TimeoutError" in full_output
         )
 
         is_oom_error = (
@@ -246,6 +271,52 @@ def run_pytest(files, filter_expr=None):
 
     print(f"Max retry exceeded")
     return returncode
+
+
+def partition_test_files(files, partition_id, total_partitions):
+    return [
+        file_path
+        for i, file_path in enumerate(files)
+        if i % total_partitions == partition_id
+    ]
+
+
+def run_component_accuracy_files(
+    files, suite: str, filter_expr=None, continue_on_error=False
+):
+    exit_code = 0
+    for file_path in files:
+        if suite == "component-accuracy-2-gpu":
+            cmd = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--nproc_per_node=2",
+                "-m",
+                "pytest",
+                "-s",
+                "-v",
+            ]
+        else:
+            cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
+
+        if filter_expr:
+            cmd.extend(["-k", filter_expr])
+        cmd.append(file_path)
+
+        print(f"Running command: {' '.join(cmd)}")
+        file_exit_code = subprocess.call(cmd)
+        if file_exit_code == 5:
+            print(
+                "No tests collected (exit code 5). This is expected when filters "
+                "deselect all tests in a file. Treating as success."
+            )
+            file_exit_code = 0
+        if file_exit_code != 0 and exit_code == 0:
+            exit_code = file_exit_code
+        if file_exit_code != 0 and not continue_on_error:
+            return file_exit_code
+    return exit_code
 
 
 def _is_in_ci() -> bool:
@@ -301,6 +372,49 @@ def main():
         print(f"No valid test files found for suite '{args.suite}'.")
         sys.exit(1 if args.suite in STRICT_SUITES else 0)
 
+    if args.suite in COMPONENT_ACCURACY_SUITES:
+        my_files = partition_test_files(
+            suite_files_abs, args.partition_id, args.total_partitions
+        )
+        partition_info = (
+            f"{args.partition_id + 1}/{args.total_partitions} "
+            f"(0-based id={args.partition_id})"
+        )
+        headers = ["Suite", "Partition"]
+        rows = [[args.suite, partition_info]]
+        msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+        msg += f"✅ Enabled {len(my_files)} file(s):\n"
+        for file_path in my_files:
+            msg += f"  - {file_path}\n"
+        print(msg, flush=True)
+        print(
+            f"Suite: {args.suite} | Partition: {args.partition_id}/{args.total_partitions}"
+        )
+        print(f"Selected {len(suite_files_abs)} files:")
+        for f in suite_files_abs:
+            print(f"  - {os.path.basename(f)}")
+
+        if not my_files:
+            print("No files assigned to this partition. Exiting success.")
+            sys.exit(0)
+
+        print(f"Running {len(my_files)} files in this shard: {', '.join(my_files)}")
+
+        exit_code = run_component_accuracy_files(
+            my_files,
+            suite=args.suite,
+            filter_expr=args.filter,
+            continue_on_error=args.continue_on_error,
+        )
+
+        msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+        msg += f"✅ Executed {len(my_files)} file(s):\n"
+        for file_path in my_files:
+            msg += f"  - {file_path}\n"
+        print(msg, flush=True)
+
+        sys.exit(exit_code)
+
     # 3. collect all test items and partition by items (not files)
     all_test_items = collect_test_items(suite_files_abs, filter_expr=args.filter)
 
@@ -338,7 +452,12 @@ def main():
     print(f"Running {len(my_items)} items in this shard: {', '.join(my_items)}")
 
     # 4. execute with the specific test items
-    exit_code = run_pytest(my_items)
+    # Fast-fail: stop on first failure unless --continue-on-error is set
+    exit_code = run_pytest(
+        my_items,
+        filter_expr=args.filter,
+        exitfirst=not args.continue_on_error,
+    )
 
     # Print tests again at the end for visibility
     msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"

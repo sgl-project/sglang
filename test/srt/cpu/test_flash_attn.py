@@ -1,14 +1,11 @@
 import unittest
 
-import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
 from utils import parametrize, precision
 
+from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.test.test_utils import CustomTestCase
-
-flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
-
 
 torch.manual_seed(1234)
 
