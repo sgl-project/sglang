@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=470, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=305, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
 
 
