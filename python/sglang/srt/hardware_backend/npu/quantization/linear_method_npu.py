@@ -113,10 +113,6 @@ class NPUW8A8MxFp8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUW4A4MxFp4LinearMethod(_NPULinearMethodBase):
-    def __init__(self, group_size: int = 32):
-        super().__init__()
-        self.group_size = group_size
-
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
         weight_scale = layer.weight_scale.data.transpose(-1, -2).contiguous()
@@ -148,7 +144,7 @@ class NPUW4A4MxFp4LinearMethod(_NPULinearMethodBase):
             pertoken_scale=x_scale,
             bias=bias,
             output_dtype=x.dtype,
-            group_sizes=(1, 1, self.group_size),
+            group_sizes=(1, 1, 32),
             scale_dtype=torch_npu.float8_e8m0fnu,
             pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
             x1_dtype=torch_npu.float4_e2m1fn_x2,

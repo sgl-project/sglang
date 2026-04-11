@@ -298,18 +298,21 @@ def mxfp4_gmm_npu(
     group_list_type: int,
     group_list: torch.Tensor,
     output_dtype=torch.bfloat16,
-    group_size: int = 32,
 ) -> torch.Tensor:
     group_list = group_list.to(torch.int64)
 
     if input_scale == None:
         x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
             input,
+            axis=1,
+            round_mode="rint",
             dst_type=torch_npu.float4_e2m1fn_x2,
-            round_mode="round",
+            block_size=32,
+            scale_alg=None,
         )
     else:
         x, x_scale = input, input_scale
+
 
     output = torch.ops.npu.npu_grouped_matmul(
         [x],
@@ -325,8 +328,8 @@ def mxfp4_gmm_npu(
         per_token_scale_dtype=torch_npu.float8_e8m0fnu,
         x_dtype=torch_npu.float4_e2m1fn_x2,
         weight_dtype=torch_npu.float4_e2m1fn_x2,
-        group_sizes=(1, 1, group_size),
     )[0]
+
     return output
 
 def npu_fused_experts_mxfp4(
@@ -338,7 +341,6 @@ def npu_fused_experts_mxfp4(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
-    group_size: int = 32,
 ):
     original_shape = hidden_states.shape
     original_dtype = hidden_states.dtype
@@ -370,61 +372,26 @@ def npu_fused_experts_mxfp4(
     row_ids = torch.arange(rows, device=hidden_states.device, dtype=torch.int64)
     valid_mask = row_ids < expert_tokens[-1]
     valid_mask_2d = valid_mask.unsqueeze(1)
-
-    if get_bool_env_var("ASCEND_USE_GROUPED_MATMUL_SWIGLU_QUANT_V2", "false"):
-        x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            hidden_states,
-            dst_type=torch_npu.float4_e2m1fn_x2,
-            round_mode="round",
-        )
-        out, out_scale = torch_npu.npu_grouped_matmul_swiglu_quant_v2(
-            x=x,
-            weight=[w13],
-            group_list=expert_tokens,
-            weight_scale=[w13_weight_scale],
-            x_scale=x_scale,
-            dequant_mode=2,
-            quant_mode=2,
-            dequant_dtype=torch.float32,
-            quant_dtype=torch_npu.float4_e2m1fn_x2,
-            x_dtype=torch_npu.float4_e2m1fn_x2,
-            weight_dtype=torch_npu.float4_e2m1fn_x2,
-            group_list_type=0,
-            weight_scale_dtype=torch_npu.float8_e8m0fnu,
-            x_scale_dtype=torch_npu.float8_e8m0fnu,
-        )
-        hidden_states = mxfp4_gmm_npu(
-            input=out,
-            input_scale=out_scale,
-            weight=w2,
-            weight_scale=w2_weight_scale,
-            group_list_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-            group_size=group_size,
-        )
-    else:
-        hidden_states = mxfp4_gmm_npu(
-            input=hidden_states,
-            input_scale=None,
-            weight=w13,
-            weight_scale=w13_weight_scale,
-            group_list_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-            group_size=group_size,
-        )
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        hidden_states = mxfp4_gmm_npu(
-            input=hidden_states,
-            input_scale=None,
-            weight=w2,
-            weight_scale=w2_weight_scale,
-            group_list_type=0,
-            group_list=expert_tokens,
-            output_dtype=original_dtype,
-            group_size=group_size,
-        )
+    
+    hidden_states = mxfp4_gmm_npu(
+        input=hidden_states,
+        input_scale=None,
+        weight=w13,
+        weight_scale=w13_weight_scale,
+        group_list_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states = mxfp4_gmm_npu(
+        input=hidden_states,
+        input_scale=None,
+        weight=w2,
+        weight_scale=w2_weight_scale,
+        group_list_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )
 
     hidden_states = hidden_states * valid_mask_2d.to(hidden_states.dtype)
 
@@ -910,26 +877,19 @@ class NPUW8A8MxFp8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
 
 class NPUW4A4MxFp4DynamicMoEMethod(_NPUFusedMoEMethodBase):
-    def __init__(self, group_size: int = 32):
+    def __init__(self):
         super().__init__()
-        self.group_size = group_size
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
+        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
 
         g_num, n_size, k_size = layer.w13_weight_scale.shape
-        layer.w13_weight_scale.data = (
-            layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
-            .transpose(1, 2)
-            .contiguous()
-        )
+        layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
         g_num, n_size, k_size = layer.w2_weight_scale.shape
-        layer.w2_weight_scale.data = (
-            layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
-            .transpose(1, 2)
-            .contiguous()
-        )
+        layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
+        layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2)
+        layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2)
 
     def apply(
         self,
@@ -953,7 +913,6 @@ class NPUW4A4MxFp4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
-            group_size=self.group_size,
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -974,7 +933,6 @@ class NPUW4A4MxFp4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             group_list_type=group_list_type,
             group_list=group_list,
             output_dtype=output_dtype,
-            group_size=self.group_size,
         )
 
         hidden_states = torch_npu.npu_swiglu(hidden_states)
@@ -987,7 +945,6 @@ class NPUW4A4MxFp4DynamicMoEMethod(_NPUFusedMoEMethodBase):
             group_list_type=group_list_type,
             group_list=group_list,
             output_dtype=output_dtype,
-            group_size=self.group_size,
         )
 
         return hidden_states
