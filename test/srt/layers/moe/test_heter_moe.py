@@ -1,7 +1,7 @@
 """Unit tests for heterogeneous-precision MoE.
 
-Tests policy logic (CPU-only) and kernel integration (GPU required).
-GPU tests are skipped if CUDA is not available.
+Tests policy logic and kernel integration. All tests require CUDA since
+the GPU-resident policies pre-allocate buffers on GPU at construction time.
 """
 
 import importlib.util
@@ -25,12 +25,13 @@ def _import_module_from_file(module_name: str, rel_path: str):
 _policy_mod = _import_module_from_file(
     "heter_policy", "sglang/srt/layers/moe/heter_policy.py"
 )
-HeterDispatchPlan = _policy_mod.HeterDispatchPlan
-BaseHeterPolicy = _policy_mod.BaseHeterPolicy
-TokenCountPolicy = _policy_mod.TokenCountPolicy
-FixedPolicy = _policy_mod.FixedPolicy
-RandomPolicy = _policy_mod.RandomPolicy
+HeterDispatchPolicy = _policy_mod.HeterDispatchPolicy
+ExpertLoadHeterDispatch = _policy_mod.ExpertLoadHeterDispatch
+ConfidenceThresholdHeterDispatch = _policy_mod.ConfidenceThresholdHeterDispatch
+RandomHeterDispatch = _policy_mod.RandomHeterDispatch
 create_policy = _policy_mod.create_policy
+_assign_by_score_gpu = _policy_mod._assign_by_score_gpu
+_build_group_labels = _policy_mod._build_group_labels
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 
@@ -60,121 +61,198 @@ if CUDA_AVAILABLE:
     _init_mock_server_args()
 
 
-# ─── Policy tests (CPU only) ─────────────────────────────────────────────
+# --- Policy tests (GPU required for pre-allocated buffers) ----------------
 
 
-class TestHeterDispatchPlan:
-    def test_validate_correct(self):
-        plan = HeterDispatchPlan(group_assignments=[[0, 1, 2], [3, 4, 5, 6, 7]])
-        plan.validate(num_experts=8)
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestAssignByScoreGpu:
+    def test_two_groups_topk_path(self):
+        scores = torch.tensor(
+            [1.0, 5.0, 2.0, 8.0, 3.0, 0.5, 7.0, 4.0], device="cuda"
+        )
+        buf = torch.empty(8, dtype=torch.long, device="cuda")
+        result = _assign_by_score_gpu(scores, 8, [0.75, 0.25], buf)
+        # Top 2 by score: experts 3 (8.0) and 6 (7.0) -> group 1
+        assert result[3].item() == 1
+        assert result[6].item() == 1
+        # Others -> group 0
+        assert result[0].item() == 0
+        assert result[5].item() == 0
 
-    def test_validate_missing_expert(self):
-        plan = HeterDispatchPlan(group_assignments=[[0, 1], [3, 4]])
-        with pytest.raises(AssertionError):
-            plan.validate(num_experts=5)
-
-    def test_validate_duplicate_expert(self):
-        plan = HeterDispatchPlan(group_assignments=[[0, 1, 2], [2, 3, 4]])
-        with pytest.raises(AssertionError):
-            plan.validate(num_experts=5)
-
-    def test_get_expert_to_group(self):
-        plan = HeterDispatchPlan(group_assignments=[[0, 3, 5], [1, 2, 4, 6, 7]])
-        mapping = plan.get_expert_to_group(8)
-        assert mapping[0] == 0
-        assert mapping[1] == 1
-        assert mapping[3] == 0
-        assert mapping[4] == 1
-
-
-class TestTokenCountPolicy:
-    def test_basic_assignment(self):
-        policy = TokenCountPolicy()
-        topk_ids = torch.tensor([[0, 1], [0, 2], [0, 3], [4, 5]])
-        plan = policy.assign(topk_ids, num_experts=8, group_ratios=[0.75, 0.25])
-        plan.validate(8)
-        assert len(plan.group_assignments) == 2
-        cold_group = plan.group_assignments[0]
-        hot_group = plan.group_assignments[1]
-        assert len(cold_group) == 6
-        assert len(hot_group) == 2
-        # Expert 0 appears 3 times (hottest) → should be in hot group
-        assert 0 in hot_group
-
-    def test_all_experts_one_group(self):
-        policy = TokenCountPolicy()
-        topk_ids = torch.tensor([[0, 1], [2, 3]])
-        plan = policy.assign(topk_ids, num_experts=4, group_ratios=[1.0])
-        plan.validate(4)
-        assert len(plan.group_assignments[0]) == 4
-
-    def test_even_split(self):
-        policy = TokenCountPolicy()
-        topk_ids = torch.tensor([[0, 1], [2, 3], [4, 5], [6, 7]])
-        plan = policy.assign(topk_ids, num_experts=8, group_ratios=[0.5, 0.5])
-        plan.validate(8)
-        assert len(plan.group_assignments[0]) == 4
-        assert len(plan.group_assignments[1]) == 4
+    def test_single_group(self):
+        scores = torch.ones(8, device="cuda")
+        buf = torch.empty(8, dtype=torch.long, device="cuda")
+        result = _assign_by_score_gpu(scores, 8, [1.0], buf)
+        assert (result == 0).all()
 
     def test_three_groups(self):
-        policy = TokenCountPolicy()
-        topk_ids = torch.randint(0, 16, (32, 4))
-        plan = policy.assign(topk_ids, num_experts=16, group_ratios=[0.5, 0.3, 0.2])
-        plan.validate(16)
-        assert len(plan.group_assignments) == 3
-        total = sum(len(g) for g in plan.group_assignments)
-        assert total == 16
+        scores = torch.arange(16, dtype=torch.float32, device="cuda")
+        buf = torch.empty(16, dtype=torch.long, device="cuda")
+        labels = _build_group_labels(16, [0.5, 0.3, 0.2], torch.device("cuda"))
+        result = _assign_by_score_gpu(scores, 16, [0.5, 0.3, 0.2], buf, labels)
+        # All 16 experts assigned, each to exactly one group
+        for gidx in range(3):
+            count = (result == gidx).sum().item()
+            assert count > 0
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestExpertLoadHeterDispatch:
+    def test_basic_dispatch(self):
+        policy = ExpertLoadHeterDispatch(
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            device=torch.device("cuda"),
+        )
+        topk_ids = torch.tensor([[0, 1], [0, 2], [0, 3], [4, 5]], device="cuda")
+        topk_weights = torch.rand(4, 2, device="cuda")
+        dispatches = policy.dispatch(topk_ids, topk_weights)
+        assert len(dispatches) == 2
+        for experts_g, scales_g in dispatches:
+            assert experts_g.shape == (4, 2)
+            assert scales_g.shape == (4, 2)
+
+    def test_hot_expert_in_high_precision_group(self):
+        policy = ExpertLoadHeterDispatch(
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            device=torch.device("cuda"),
+        )
+        # Expert 0 appears 3 times (hottest)
+        topk_ids = torch.tensor([[0, 1], [0, 2], [0, 3], [4, 5]], device="cuda")
+        topk_weights = torch.ones(4, 2, device="cuda") * 0.5
+        dispatches = policy.dispatch(topk_ids, topk_weights)
+        # Group 1 (high-precision) should contain expert 0
+        experts_g1, scales_g1 = dispatches[1]
+        # Where topk_ids == 0, group 1 experts should be 0 (not sentinel)
+        mask_expert0 = (topk_ids == 0)
+        assert (experts_g1[mask_expert0] == 0).all()
+
+    def test_sentinel_for_non_group(self):
+        policy = ExpertLoadHeterDispatch(
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            device=torch.device("cuda"),
+        )
+        topk_ids = torch.tensor([[0, 1], [2, 3]], device="cuda")
+        topk_weights = torch.ones(2, 2, device="cuda")
+        dispatches = policy.dispatch(topk_ids, topk_weights)
+        for experts_g, scales_g in dispatches:
+            sentinel_mask = (experts_g == 8)  # sentinel = num_experts
+            # Where sentinel, scale must be 0
+            assert (scales_g[sentinel_mask] == 0).all()
 
     def test_deterministic(self):
-        policy = TokenCountPolicy()
-        topk_ids = torch.tensor([[0, 1], [0, 2], [3, 4]])
-        plan1 = policy.assign(topk_ids, num_experts=8, group_ratios=[0.75, 0.25])
-        plan2 = policy.assign(topk_ids, num_experts=8, group_ratios=[0.75, 0.25])
-        assert plan1.group_assignments == plan2.group_assignments
+        policy = ExpertLoadHeterDispatch(
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            device=torch.device("cuda"),
+        )
+        topk_ids = torch.tensor([[0, 1], [0, 2], [3, 4]], device="cuda")
+        topk_weights = torch.rand(3, 2, device="cuda")
+        d1 = policy.dispatch(topk_ids, topk_weights)
+        d2 = policy.dispatch(topk_ids, topk_weights)
+        assert torch.equal(d1[0][0], d2[0][0])
+        assert torch.equal(d1[1][0], d2[1][0])
 
 
-class TestFixedPolicy:
-    def test_fixed_assignment(self):
-        fixed = [[0, 1, 2, 3], [4, 5, 6, 7]]
-        policy = FixedPolicy(fixed_assignments=fixed)
-        topk_ids = torch.randint(0, 8, (10, 2))
-        plan = policy.assign(topk_ids, num_experts=8, group_ratios=[0.5, 0.5])
-        assert plan.group_assignments == fixed
-
-
-class TestRandomPolicy:
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestRandomHeterDispatch:
     def test_reproducible(self):
-        p1 = RandomPolicy(seed=123)
-        p2 = RandomPolicy(seed=123)
-        ids = torch.randint(0, 8, (10, 2))
-        plan1 = p1.assign(ids, num_experts=8, group_ratios=[0.75, 0.25])
-        plan2 = p2.assign(ids, num_experts=8, group_ratios=[0.75, 0.25])
-        assert plan1.group_assignments == plan2.group_assignments
+        p1 = RandomHeterDispatch(
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            seed=123,
+            device=torch.device("cuda"),
+        )
+        p2 = RandomHeterDispatch(
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            seed=123,
+            device=torch.device("cuda"),
+        )
+        ids = torch.randint(0, 8, (10, 2), device="cuda")
+        weights = torch.rand(10, 2, device="cuda")
+        d1 = p1.dispatch(ids, weights)
+        d2 = p2.dispatch(ids, weights)
+        assert torch.equal(d1[0][0], d2[0][0])
 
     def test_different_seeds_differ(self):
-        p1 = RandomPolicy(seed=1)
-        p2 = RandomPolicy(seed=2)
-        ids = torch.randint(0, 128, (100, 8))
-        plan1 = p1.assign(ids, num_experts=128, group_ratios=[0.8, 0.2])
-        plan2 = p2.assign(ids, num_experts=128, group_ratios=[0.8, 0.2])
-        assert plan1.group_assignments != plan2.group_assignments
+        p1 = RandomHeterDispatch(
+            num_experts=128,
+            group_size_ratios=[0.8, 0.2],
+            seed=1,
+            device=torch.device("cuda"),
+        )
+        p2 = RandomHeterDispatch(
+            num_experts=128,
+            group_size_ratios=[0.8, 0.2],
+            seed=2,
+            device=torch.device("cuda"),
+        )
+        ids = torch.randint(0, 128, (100, 8), device="cuda")
+        weights = torch.rand(100, 8, device="cuda")
+        d1 = p1.dispatch(ids, weights)
+        d2 = p2.dispatch(ids, weights)
+        assert not torch.equal(d1[0][0], d2[0][0])
 
 
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestConfidenceThresholdHeterDispatch:
+    def test_basic_dispatch(self):
+        policy = ConfidenceThresholdHeterDispatch(
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            device=torch.device("cuda"),
+        )
+        topk_ids = torch.randint(0, 8, (10, 2), device="cuda")
+        topk_weights = torch.rand(10, 2, device="cuda")
+        dispatches = policy.dispatch(topk_ids, topk_weights)
+        assert len(dispatches) == 2
+
+    def test_fallback_without_signals(self):
+        policy = ConfidenceThresholdHeterDispatch(
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            device=torch.device("cuda"),
+        )
+        # _assign with None should fall back to random
+        result = policy._assign(None, None)
+        assert result.shape == (8,)
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 class TestCreatePolicy:
-    def test_create_token_count(self):
-        p = create_policy("token_count")
-        assert isinstance(p, TokenCountPolicy)
+    def test_create_expert_load(self):
+        p = create_policy(
+            "expert_load",
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            device=torch.device("cuda"),
+        )
+        assert isinstance(p, ExpertLoadHeterDispatch)
 
     def test_create_random(self):
-        p = create_policy("random", seed=99)
-        assert isinstance(p, RandomPolicy)
+        p = create_policy(
+            "random",
+            num_experts=8,
+            group_size_ratios=[0.75, 0.25],
+            seed=99,
+            device=torch.device("cuda"),
+        )
+        assert isinstance(p, RandomHeterDispatch)
 
     def test_unknown_policy(self):
         with pytest.raises(ValueError, match="Unknown heter policy"):
-            create_policy("nonexistent")
+            create_policy(
+                "nonexistent",
+                num_experts=8,
+                group_size_ratios=[0.5, 0.5],
+                device=torch.device("cuda"),
+            )
 
 
-# ─── HeterFusedMoE forward tests (GPU required) ──────────────────────────
+# --- HeterFusedMoE forward tests (GPU required) --------------------------
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
@@ -186,7 +264,7 @@ class TestHeterFusedMoEBF16Only:
 
         config = {
             "groups": [{"name": "all_bf16", "num_bits": 16, "size_ratio": 1.0}],
-            "policy": "token_count",
+            "policy": "expert_load",
         }
         layer = HeterFusedMoE(
             num_experts=num_experts,
@@ -240,7 +318,7 @@ class TestHeterFusedMoETwoGroupsBF16:
                 {"name": "cold", "num_bits": 16, "size_ratio": 0.75},
                 {"name": "hot", "num_bits": 16, "size_ratio": 0.25},
             ],
-            "policy": "token_count",
+            "policy": "expert_load",
         }
         layer = HeterFusedMoE(
             num_experts=num_experts,
@@ -263,7 +341,7 @@ class TestHeterFusedMoETwoGroupsBF16:
         assert out.shape == x.shape
 
     def test_two_groups_vs_one_group_different(self):
-        """Two BF16 groups with DIFFERENT weights should give different results than one group."""
+        """Two BF16 groups with DIFFERENT weights should give different results."""
         from sglang.srt.layers.moe.heter_moe import HeterFusedMoE
 
         torch.manual_seed(0)
@@ -273,7 +351,7 @@ class TestHeterFusedMoETwoGroupsBF16:
 
         one_group_cfg = {
             "groups": [{"name": "all", "num_bits": 16, "size_ratio": 1.0}],
-            "policy": "token_count",
+            "policy": "expert_load",
         }
         layer1 = HeterFusedMoE(
             8, 64, 32, 2, one_group_cfg, torch.bfloat16, torch.device("cuda")
@@ -286,7 +364,7 @@ class TestHeterFusedMoETwoGroupsBF16:
                 {"name": "cold", "num_bits": 16, "size_ratio": 0.75},
                 {"name": "hot", "num_bits": 16, "size_ratio": 0.25},
             ],
-            "policy": "token_count",
+            "policy": "expert_load",
         }
         layer2 = HeterFusedMoE(
             8, 64, 32, 2, two_group_cfg, torch.bfloat16, torch.device("cuda")
@@ -302,12 +380,7 @@ class TestHeterFusedMoETwoGroupsBF16:
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 class TestHeterFusedMoEInt8Group:
-    """DEPRECATED: INT8 path kept for functional correctness only.
-
-    Triton INT8 on A100 achieves ~6% of peak tensor core throughput.
-    See: https://github.com/triton-lang/triton/issues/2818
-    Use Marlin INT4 (num_bits=4) for production workloads.
-    """
+    """DEPRECATED: INT8 path kept for functional correctness only."""
 
     def _make_layer(self):
         from sglang.srt.layers.moe.heter_moe import HeterFusedMoE
@@ -317,7 +390,7 @@ class TestHeterFusedMoEInt8Group:
             warnings.simplefilter("ignore", DeprecationWarning)
             config = {
                 "groups": [{"name": "int8_all", "num_bits": 8, "size_ratio": 1.0}],
-                "policy": "token_count",
+                "policy": "expert_load",
             }
             layer = HeterFusedMoE(
                 num_experts=8,
