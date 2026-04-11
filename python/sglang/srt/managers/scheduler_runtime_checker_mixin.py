@@ -228,45 +228,76 @@ class SchedulerRuntimeCheckerMixin:
             swa_evictable_size=swa_evictable_size,
         )
 
-    def _check_hybrid_memory(self: Scheduler):
-        pool_stats = self._get_swa_token_info()
-        full_num_used = pool_stats.full_num_used
-        swa_num_used = pool_stats.swa_num_used
-        full_available_size = pool_stats.full_available_size
-        full_evictable_size = pool_stats.full_evictable_size
-        swa_available_size = pool_stats.swa_available_size
-        swa_evictable_size = pool_stats.swa_evictable_size
-        session_held_full = self._session_held_full_tokens()
-        session_held_swa = self._session_held_swa_tokens()
-
-        # Streaming sessions hold tree locks during idle, so tree-protected
-        # tokens must be accounted for alongside session-held tokens.
-        full_protected = self.tree_cache.full_protected_size()
-        swa_protected = self.tree_cache.swa_protected_size()
-        full_leaked = full_num_used - full_protected - session_held_full
-        swa_leaked = swa_num_used - swa_protected - session_held_swa
-        memory_leak = full_leaked != 0 or swa_leaked != 0
-        token_msg = (
-            f"{full_leaked=}, {swa_leaked=}\n"
-            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {full_protected=}, {session_held_full=}\n"
-            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {swa_protected=}, {session_held_swa=}\n"
+    @staticmethod
+    def _check_pool_invariant(
+        available: int,
+        evictable: int,
+        protected: int,
+        session_held: int,
+        total: int,
+        uncached: int = 0,
+    ) -> Tuple[bool, str]:
+        """Check: available + evictable + protected + session_held + uncached == total."""
+        total_accounted = available + evictable + protected + session_held + uncached
+        leak = total_accounted != total
+        msg = (
+            f"{total=}, {available=}, {evictable=}, "
+            f"{protected=}, {session_held=}, {uncached=}"
         )
-        return memory_leak, token_msg
+        return leak, msg
 
-    def _check_mamba_memory(self: Scheduler):
-        pool_stats = self._get_mamba_token_info()
-        full_num_used = pool_stats.full_num_used
-        mamba_num_used = pool_stats.mamba_num_used
-        full_available_size = pool_stats.full_available_size
-        full_evictable_size = pool_stats.full_evictable_size
-        mamba_available_size = pool_stats.mamba_available_size
-        mamba_evictable_size = pool_stats.mamba_evictable_size
-        session_held = self._session_held_tokens()
-        memory_leak = (
-            full_num_used != self.tree_cache.full_protected_size() + session_held
-            or mamba_num_used != self.tree_cache.mamba_protected_size()
+    def _check_full_pool(
+        self: Scheduler, ps: PoolStats, uncached: int = 0
+    ) -> Tuple[bool, str]:
+        if self.is_hybrid_swa or (
+            self.is_hybrid_ssm and self.tree_cache.supports_mamba()
+        ):
+            protected = self.tree_cache.full_protected_size()
+            session_held = (
+                self._session_held_full_tokens()
+                if self.is_hybrid_swa
+                else self._session_held_tokens()
+            )
+            total = (
+                self.full_tokens_per_layer
+                if self.is_hybrid_swa
+                else self.token_to_kv_pool_allocator.size
+            )
+        else:
+            protected = self.tree_cache.protected_size()
+            session_held = self._session_held_tokens()
+            total = self.max_total_num_tokens
+        return self._check_pool_invariant(
+            ps.full_available_size,
+            ps.full_evictable_size,
+            protected,
+            session_held,
+            total,
+            uncached,
         )
-        if memory_leak:
+
+    def _check_swa_pool(
+        self: Scheduler, ps: PoolStats, uncached: int = 0
+    ) -> Tuple[bool, str]:
+        return self._check_pool_invariant(
+            ps.swa_available_size,
+            ps.swa_evictable_size,
+            self.tree_cache.swa_protected_size(),
+            self._session_held_swa_tokens(),
+            self.swa_tokens_per_layer,
+            uncached,
+        )
+
+    def _check_mamba_pool(self: Scheduler, ps: PoolStats) -> Tuple[bool, str]:
+        leak, msg = self._check_pool_invariant(
+            ps.mamba_available_size,
+            ps.mamba_evictable_size,
+            self.tree_cache.mamba_protected_size(),
+            0,
+            self.req_to_token_pool.mamba_pool.size,
+        )
+        if leak:
+            # Page-level leak diagnosis for mamba
             free_full_pages = set(
                 self.token_to_kv_pool_allocator.free_pages.tolist()
                 + self.token_to_kv_pool_allocator.release_pages.tolist()
@@ -288,36 +319,11 @@ class SchedulerRuntimeCheckerMixin:
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )
-            token_msg = (
-                f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, leaked_full_pages={leaked_full_pages if len(leaked_full_pages) > 0 else None}, leaked_mamba_pages={leaked_mamba_pages if len(leaked_mamba_pages) > 0 else None}\n"
+            msg += (
+                f", leaked_full_pages={leaked_full_pages or None}"
+                f", leaked_mamba_pages={leaked_mamba_pages or None}"
             )
-        else:
-            token_msg = (
-                f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-                f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}\n"
-            )
-        return memory_leak, token_msg
-
-    def _check_radix_cache_memory(
-        self: Scheduler, ps: PoolStats, uncached_size: int = 0
-    ):
-        protected_size = self.tree_cache.protected_size()
-        session_held = self._session_held_tokens()
-        total_accounted = (
-            ps.full_available_size
-            + ps.full_evictable_size
-            + protected_size
-            + session_held
-            + uncached_size
-        )
-        memory_leak = total_accounted != self.max_total_num_tokens
-        token_msg = (
-            f"{self.max_total_num_tokens=}, available_size={ps.full_available_size}, "
-            f"evictable_size={ps.full_evictable_size}, {protected_size=}, "
-            f"{session_held=}, {uncached_size=}\n"
-        )
-        return memory_leak, token_msg
+        return leak, msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
         ret = 0
@@ -357,14 +363,12 @@ class SchedulerRuntimeCheckerMixin:
             )
             return
 
-        uncached_size = self._get_total_uncached_size()
-        memory_leak, token_msg = self._check_radix_cache_memory(
-            self._get_token_info(), uncached_size=uncached_size
-        )
+        uncached = self._get_total_uncached_size()
+        leak, msg = self._check_full_pool(self.get_pool_stats(), uncached=uncached)
 
         if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
-            logger.info(f"[Mem Check (BUSY)] {token_msg}")
-        assert not memory_leak, f"Mem Leak Detected! {token_msg}"
+            logger.info(f"[Mem Check (BUSY)] {msg}")
+        assert not leak, f"Mem Leak Detected! {msg}"
 
     def _check_req_pool(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -389,24 +393,34 @@ class SchedulerRuntimeCheckerMixin:
                 msg,
             )
 
-    def check_memory(self: Scheduler):
-        if self.is_hybrid_swa:
-            memory_leak, token_msg = self._check_hybrid_memory()
-        elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
-            memory_leak, token_msg = self._check_mamba_memory()
-        else:
-            memory_leak, token_msg = self._check_radix_cache_memory(
-                self._get_token_info()
-            )
+    def _report_leak(self: Scheduler, pool_name: str, token_msg: str):
+        msg = f"{pool_name} memory leak detected! {token_msg}"
+        raise_error_or_warn(
+            self,
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+            "count_memory_leak_warnings",
+            msg,
+        )
 
-        if memory_leak:
-            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
-            raise_error_or_warn(
-                self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
-                "count_memory_leak_warnings",
-                msg,
-            )
+    def check_memory(self: Scheduler):
+        ps = self.get_pool_stats()
+
+        # Always check full/KV pool
+        full_leak, full_msg = self._check_full_pool(ps)
+        if full_leak:
+            self._report_leak("full_pool", full_msg)
+
+        # Check SWA sub-pool
+        if self.is_hybrid_swa:
+            swa_leak, swa_msg = self._check_swa_pool(ps)
+            if swa_leak:
+                self._report_leak("swa_pool", swa_msg)
+
+        # Check mamba sub-pool
+        if self.is_hybrid_ssm and self.tree_cache.supports_mamba():
+            mamba_leak, mamba_msg = self._check_mamba_pool(ps)
+            if mamba_leak:
+                self._report_leak("mamba_pool", mamba_msg)
 
         self._check_req_pool()
 
@@ -480,18 +494,18 @@ def create_scheduler_watchdog(
     def dump_info() -> str:
         if scheduler.is_initializing or disable_request_logging():
             return ""
+        ps = scheduler.get_pool_stats()
+        _, full_msg = scheduler._check_full_pool(ps)
+        info_parts = [full_msg]
         if scheduler.is_hybrid_swa:
-            _, info_msg = scheduler._check_hybrid_memory()
-        elif scheduler.is_hybrid_ssm and scheduler.tree_cache.supports_mamba():
-            _, info_msg = scheduler._check_mamba_memory()
-        else:
-            _, info_msg = scheduler._check_radix_cache_memory(
-                scheduler._get_token_info()
-            )
+            _, swa_msg = scheduler._check_swa_pool(ps)
+            info_parts.append(swa_msg)
+        if scheduler.is_hybrid_ssm and scheduler.tree_cache.supports_mamba():
+            _, mamba_msg = scheduler._check_mamba_pool(ps)
+            info_parts.append(mamba_msg)
         return (
             f"{scheduler.cur_batch.batch_size()=}\n"
-            f"{scheduler.cur_batch.reqs=}\n"
-            f"{info_msg}"
+            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(info_parts)
         )
 
     return WatchdogRaw(
