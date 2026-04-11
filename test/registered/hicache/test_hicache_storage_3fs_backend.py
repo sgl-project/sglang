@@ -88,5 +88,75 @@ class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase
         run_eval_accuracy_test(self)
 
 
+# ---------------------------------------------------------------------------
+# Hybrid (v2) end-to-end test — PLAN.md §5 #10
+# ---------------------------------------------------------------------------
+
+
+try:
+    from sglang.test.test_utils import DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST
+
+    _HYBRID_MODEL = DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST
+except Exception:  # pragma: no cover
+    _HYBRID_MODEL = None
+
+
+@unittest.skipIf(
+    _HYBRID_MODEL is None,
+    "No hybrid (Mamba/linear-attention) test model registered in sglang.test.test_utils",
+)
+class TestHf3fsBackendHybrid(HiCacheStorage3FSBackendBaseMixin, CustomTestCase):
+    """End-to-end HiCache-Hf3fs hybrid test (KV + MAMBA pools).
+
+    Launches a hybrid/linear-attention model with the hf3fs storage backend
+    and confirms that the second run after a flush reports a non-zero cache
+    hit, proving the v2 path (batch_exists_v2 / batch_get_v2 / batch_set_v2)
+    is wired up end-to-end.
+    """
+
+    @classmethod
+    def _get_model_name(cls):
+        return _HYBRID_MODEL
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args["--tp-size"] = 1
+        server_args["--hicache-storage-prefetch-policy"] = "wait_complete"
+        return server_args, env_vars
+
+    def test_hybrid_cache_hit_after_flush(self):
+        """Prime the cache, flush, re-run the same prompt, expect a hit."""
+        import time
+
+        prompt = self.gen_prompt(768)
+
+        # Prime.
+        r1 = self.send_request(prompt, max_tokens=32)
+        self.assertIsNotNone(r1)
+
+        # Force eviction to disk and flush the device cache.
+        self.trigger_offloading_and_flush()
+
+        start = time.time()
+        r2 = self.send_request(prompt, max_tokens=32)
+        elapsed = time.time() - start
+
+        cached_tokens = self.get_cached_tokens(r2)
+        print(
+            f"[hybrid] second-run cached_tokens={cached_tokens} "
+            f"latency={elapsed:.3f}s"
+        )
+        # For a hybrid model, a non-trivial number of cached tokens on the
+        # second run proves that both KV and the auxiliary (mamba) pool
+        # were restored from 3FS.
+        self.assertGreater(
+            cached_tokens,
+            700,
+            "Expected a significant remote cache hit for the hybrid model; "
+            "this indicates the v2 path (KV + MAMBA) restored correctly.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
