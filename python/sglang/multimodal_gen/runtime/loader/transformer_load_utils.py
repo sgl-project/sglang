@@ -206,11 +206,8 @@ def resolve_transformer_safetensors_to_load(
             safetensors_list = [quantized_path]
         else:
             safetensors_list = _list_safetensors_files(quantized_path)
-            nunchaku_cfg = getattr(server_args, "nunchaku_config", None)
-            if (
-                isinstance(nunchaku_cfg, NunchakuConfig)
-                and len(safetensors_list) > 1
-            ):
+            nunchaku_cfg = server_args.nunchaku_config
+            if nunchaku_cfg is not None and len(safetensors_list) > 1:
                 safetensors_list = _filter_nunchaku_safetensors(
                     safetensors_list, nunchaku_cfg
                 )

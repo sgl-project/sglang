@@ -313,7 +313,7 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 fi
 
-if [ "$IS_BLACKWELL" = "1" ]; then
+if [ "$IS_BLACKWELL" = "1" ] && [[ "$OPTIONAL_DEPS" == *diffusion* ]]; then
     $PIP_CMD install nunchaku $PIP_INSTALL_SUFFIX
 fi
 
