@@ -112,6 +112,44 @@ class NPUW8A8MxFp8LinearMethod(_NPULinearMethodBase):
         return out.reshape(*orig_shape[:-1], out.shape[-1])
 
 
+class NPUW4A8MxFpLinearMethod(_NPULinearMethodBase):
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2).transpose(0, 1)
+        weight_scale = layer.weight_scale.data
+        weight_scale = weight_scale.reshape(weight_scale.shape[0], weight_scale.shape[1] // 2, 2).transpose(0, 1)
+        layer.weight_scale.data = weight_scale
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        weight=layer.weight
+        weight_scale=layer.weight_scale
+        group_sizes = (1, 1, 32)
+
+        orig_shape = x.shape
+        K = orig_shape[-1]
+        x = x.reshape(-1, K).contiguous()
+
+        x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+
+        out = torch.ops.npu.npu_quant_matmul(
+            x_fp8,
+            weight,
+            scale=weight_scale,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale=x_scale,
+            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+            bias=bias,
+            output_dtype=torch.bfloat16,
+            group_sizes=group_sizes,
+            x2_dtype=torch_npu.float4_e2m1fn_x2,
+        )
+        return out.reshape(*orig_shape[:-1], out.shape[-1])
+
+
 class NPUW4A4MxFp4LinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()

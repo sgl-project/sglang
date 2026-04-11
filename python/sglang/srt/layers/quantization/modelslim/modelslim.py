@@ -19,6 +19,8 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A4MxFp4,
     ModelSlimW4A4MxFp4MoE,
+    ModelSlimW4A8MxFp,
+    ModelSlimW4A8MxFpMoE,
     ModelSlimW4A8Int8MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
@@ -199,6 +201,10 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimW4A4MxFp4(
                 quant_config=self.quant_description, prefix=layer_name
             )
+        elif quant_type == "W4A8_MXFP":
+            return ModelSlimW4A8MxFp(
+                quant_config=self.quant_description, prefix=layer_name
+            )
         elif quant_type == "W8A8_MXFP8":
             return ModelSlimW8A8MxFp8(
                 quant_config=self.quant_description, prefix=layer_name
@@ -233,6 +239,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
             ("W8A8_MXFP8", ModelSlimW8A8MxFp8MoE),
+            ("W4A8_MXFP", ModelSlimW4A8MxFpMoE),
         ]
 
         moe_weight_suffixes = [".0.gate_proj.weight", ".0.w2.weight"]
