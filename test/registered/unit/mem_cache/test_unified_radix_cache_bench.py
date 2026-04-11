@@ -160,6 +160,7 @@ def create_bench_cache(
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
+            mamba_layer_ids=_non_full_layer_ids(),
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=3,
         )

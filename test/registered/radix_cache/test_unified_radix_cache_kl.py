@@ -34,7 +34,7 @@ MAMBA_TRACK_INTERVAL = 128
 SWA_MODEL = "openai/gpt-oss-20b"
 FULL_MODEL = "Qwen/Qwen3-32B"
 
-register_cuda_ci(est_time=1200, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=1200, suite="stage-c-test-4-gpu-h100")
 
 
 class UnifiedRadixTreeTestMixin:
@@ -48,8 +48,8 @@ class UnifiedRadixTreeTestMixin:
     prefill_cache_assert = None
     decode_cache_assert = None
 
-    gsm8k_threshold: float = 0.80
-    mmlu_threshold: float = 0.60
+    gsm8k_threshold: float = 0.93
+    mmlu_threshold: float = 0.8
     num_gsm8k_questions: int = 200
 
     def test_gsm8k(self):
@@ -176,7 +176,7 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                "2",
+                "4",
                 "--mem-fraction-static",
                 "0.80",
                 "--page-size",
@@ -212,9 +212,11 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                "2",
+                "4",
                 "--chunked-prefill-size",
                 "2048",
+                "--mem-fraction-static",
+                "0.85",
                 "--mamba-scheduler-strategy",
                 "extra_buffer",
                 "--mamba-track-interval",
@@ -234,6 +236,7 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     kl_threshold = 0.03
     gsm8k_threshold = 0.75
+    mmlu_threshold = 0.75
 
     @classmethod
     def setUpClass(cls):
@@ -245,12 +248,12 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--tp-size",
-                "2",
+                "4",
                 "--mem-fraction-static",
-                "0.80",
+                "0.7",
                 "--disable-piecewise-cuda-graph",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "0"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
