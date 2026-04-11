@@ -339,64 +339,41 @@ class SchedulerRuntimeCheckerMixin:
 
         return ret
 
-    def _get_batch_swa_uncached_sizes(
-        self: Scheduler, batch: ScheduleBatch
-    ) -> Tuple[int, int]:
-        """Get uncached sizes for both full and SWA pools in a single pass.
-
-        Returns:
-            (full_uncached, swa_uncached)
-
-        For full pool: uncached = allocated - cache_protected_len
-        For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
-        """
-        full_uncached = 0
-        swa_uncached = 0
-        for req in batch.reqs:
-            assert req.kv_committed_freed == req.kv_overallocated_freed
-            if req.kv_committed_freed or req.req_pool_idx is None:
-                continue
-
-            allocated_len = req.kv_allocated_len
-            if self.page_size > 1:
-                allocated_len = ceil_align(allocated_len, self.page_size)
-                assert req.cache_protected_len % self.page_size == 0
-
-            full_uncached += allocated_len - req.cache_protected_len
-            swa_uncached += allocated_len - max(
-                req.cache_protected_len, req.swa_evicted_seqlen
-            )
-
-        return full_uncached, swa_uncached
-
     def _get_total_uncached_sizes(self: Scheduler) -> Tuple[int, int]:
         """Sum uncached tokens for full and SWA pools across all active batches.
 
         Returns (full_uncached, swa_uncached). For non-SWA models, swa_uncached is 0.
+
+        For full pool: uncached = allocated - cache_protected_len
+        For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
         """
-        current_batch: ScheduleBatch = self.last_batch
-        if self.is_hybrid_swa:
-            full_uncached, swa_uncached = self._get_batch_swa_uncached_sizes(
-                current_batch
-            )
-            # Merge running_batch when it differs from current_batch
-            if (
-                self.running_batch is not None
-                and self.running_batch is not current_batch
-                and not self.running_batch.is_empty()
-            ):
-                f_unc, s_unc = self._get_batch_swa_uncached_sizes(self.running_batch)
-                full_uncached += f_unc
-                swa_uncached += s_unc
-        else:
-            full_uncached = self._get_batch_uncached_size(current_batch)
-            if (
-                current_batch.forward_mode.is_extend()
-                and self.running_batch is not None
-                and not self.running_batch.is_empty()
-            ):
-                full_uncached += self._get_batch_uncached_size(self.running_batch)
-            swa_uncached = 0
+        batches = [self.last_batch]
+        if (
+            self.running_batch is not None
+            and self.running_batch is not self.last_batch
+            and not self.running_batch.is_empty()
+        ):
+            batches.append(self.running_batch)
+
+        full_uncached = 0
+        swa_uncached = 0
+        for batch in batches:
+            for req in batch.reqs:
+                assert req.kv_committed_freed == req.kv_overallocated_freed
+                if req.kv_committed_freed or req.req_pool_idx is None:
+                    continue
+
+                allocated_len = req.kv_allocated_len
+                if self.page_size > 1:
+                    allocated_len = ceil_align(allocated_len, self.page_size)
+                    assert req.cache_protected_len % self.page_size == 0
+
+                full_uncached += allocated_len - req.cache_protected_len
+                if self.is_hybrid_swa:
+                    swa_uncached += allocated_len - max(
+                        req.cache_protected_len, req.swa_evicted_seqlen
+                    )
+
         return full_uncached, swa_uncached
 
     def self_check_during_busy(self: Scheduler):
