@@ -609,7 +609,7 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_piecewise_cuda_graph():
+        elif is_in_piecewise_cuda_graph() and self.pynccl_comm is not None:
             # For piecewise cuda graph, we use pynccl outplace allreduce
             outplace_all_reduce_method = "pynccl"
         if outplace_all_reduce_method is not None:
@@ -1724,6 +1724,7 @@ def initialize_model_parallel(
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    enable_symm_mem: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1884,7 +1885,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
@@ -1922,7 +1923,6 @@ def initialize_model_parallel(
     if moe_ep_size == tensor_model_parallel_size:
         _MOE_EP = _TP
     else:
-        # TODO(ch-wan): use split_group to save memory
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for moe_dp_idx in range(moe_dp_size):
@@ -1939,6 +1939,8 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
             group_name="moe_ep",
         )
 
@@ -1947,7 +1949,6 @@ def initialize_model_parallel(
     if moe_tp_size == tensor_model_parallel_size:
         _MOE_TP = _TP
     else:
-        # TODO(ch-wan): use split_group to save memory
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for ep_dp_combined_idx in range(moe_ep_size * moe_dp_size):
@@ -1965,6 +1966,8 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
             group_name="moe_tp",
         )
 

@@ -2,19 +2,30 @@
 Unit tests for TokenizerManager helper methods.
 
 This tests the refactored tokenization functionality including input format detection,
-tokenizer input preparation, and result extraction logic.
+tokenizer input preparation, result extraction logic, and ReqState text buffering.
 
 Usage:
 python3 -m unittest test_tokenizer_manager.TestInputFormatDetection
 python3 -m unittest test_tokenizer_manager.TestTokenizerInputPreparation
 python3 -m unittest test_tokenizer_manager.TestTokenizerResultExtraction
 python3 -m unittest test_tokenizer_manager.TestTokenizerManagerIntegration
+python3 -m unittest test_tokenizer_manager.TestReqStateTextBuffering
+python3 -m unittest test_tokenizer_manager.TestReqStateCrashDump
+python3 -m unittest test_tokenizer_manager.TestMakeReqState
 """
 
+import asyncio
 import unittest
 from unittest.mock import Mock, patch
 
-from sglang.srt.managers.tokenizer_manager import InputFormat, TokenizerManager
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import (
+    InputFormat,
+    ReqState,
+    TokenizerManager,
+    make_req_state,
+)
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -29,7 +40,7 @@ class TestInputFormatDetection(unittest.TestCase):
             self.port_args = PortArgs.init_new(self.server_args)
 
         with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
+            "sglang.srt.utils.network.get_zmq_socket"
         ), patch(
             "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
         ) as mock_tokenizer:
@@ -125,7 +136,7 @@ class TestTokenizerInputPreparation(unittest.TestCase):
             self.port_args = PortArgs.init_new(self.server_args)
 
         with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
+            "sglang.srt.utils.network.get_zmq_socket"
         ), patch(
             "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
         ) as mock_tokenizer:
@@ -183,7 +194,7 @@ class TestTokenizerResultExtraction(unittest.TestCase):
             self.port_args = PortArgs.init_new(self.server_args)
 
         with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
+            "sglang.srt.utils.network.get_zmq_socket"
         ), patch(
             "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
         ) as mock_tokenizer:
@@ -305,7 +316,7 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
             self.port_args = PortArgs.init_new(self.server_args)
 
         with patch("zmq.asyncio.Context"), patch(
-            "sglang.srt.utils.get_zmq_socket"
+            "sglang.srt.utils.network.get_zmq_socket"
         ), patch(
             "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
         ) as mock_tokenizer:
@@ -402,6 +413,95 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
             result_input_ids, [[101, 7592, 102], [101, 2088, 102], [101, 2774, 102]]
         )
         self.assertIsNone(result_token_type_ids)
+
+
+def _make_state(buffer_text: bool = False) -> ReqState:
+    """Create a minimal ReqState for testing."""
+    obj = Mock(spec=GenerateReqInput)
+    return ReqState(
+        out_list=[],
+        finished=False,
+        event=asyncio.Event(),
+        obj=obj,
+        time_stats=APIServerReqTimeStats(),
+        buffer_text=buffer_text,
+    )
+
+
+class TestReqStateTextBuffering(unittest.TestCase):
+    """Test ReqState.append_text / get_text in both buffering modes."""
+
+    def test_streaming_mode_concatenates_directly(self):
+        state = _make_state(buffer_text=False)
+        state.append_text("hello ")
+        state.append_text("world")
+        self.assertEqual(state.get_text(), "hello world")
+        self.assertEqual(state.text_chunks, [])
+
+    def test_buffer_mode_collects_chunks(self):
+        state = _make_state(buffer_text=True)
+        state.append_text("hello ")
+        state.append_text("world")
+        self.assertEqual(state.text, "")
+        self.assertEqual(state.get_text(), "hello world")
+
+
+class TestReqStateCrashDump(unittest.TestCase):
+    """Test ReqState.get_crash_dump_output."""
+
+    def test_empty_state(self):
+        state = _make_state(buffer_text=False)
+        self.assertEqual(state.get_crash_dump_output(), {})
+
+    def test_with_text_only(self):
+        state = _make_state(buffer_text=False)
+        state.append_text("partial output")
+        self.assertEqual(state.get_crash_dump_output(), {"text": "partial output"})
+
+    def test_with_output_ids_only(self):
+        state = _make_state(buffer_text=False)
+        state.output_ids = [1, 2, 3]
+        self.assertEqual(state.get_crash_dump_output(), {"output_ids": [1, 2, 3]})
+
+    def test_with_text_and_output_ids(self):
+        state = _make_state(buffer_text=False)
+        state.append_text("hello")
+        state.output_ids = [10, 20]
+        self.assertEqual(
+            state.get_crash_dump_output(),
+            {"text": "hello", "output_ids": [10, 20]},
+        )
+
+
+class TestMakeReqState(unittest.TestCase):
+    """Test make_req_state factory function."""
+
+    def _call(self, *, obj_stream=None):
+        if obj_stream is not None:
+            obj = Mock(spec=GenerateReqInput)
+            obj.stream = obj_stream
+        else:
+            obj = Mock(spec=EmbeddingReqInput)
+            del obj.stream
+        return make_req_state(
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            time_stats=APIServerReqTimeStats(),
+        )
+
+    def test_streaming_request_does_not_buffer(self):
+        state = self._call(obj_stream=True)
+        self.assertFalse(state.buffer_text)
+
+    def test_non_streaming_request_buffers(self):
+        state = self._call(obj_stream=False)
+        self.assertTrue(state.buffer_text)
+
+    def test_embedding_request_always_buffers(self):
+        state = self._call()
+        self.assertTrue(state.buffer_text)
 
 
 if __name__ == "__main__":
