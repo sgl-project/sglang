@@ -250,20 +250,14 @@ class SchedulerRuntimeCheckerMixin:
     def _check_full_pool(
         self: Scheduler, ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, str]:
-        if self.is_hybrid_swa or (
-            self.is_hybrid_ssm and self.tree_cache.supports_mamba()
-        ):
+        if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
-            session_held = (
-                self._session_held_full_tokens()
-                if self.is_hybrid_swa
-                else self._session_held_tokens()
-            )
-            total = (
-                self.full_tokens_per_layer
-                if self.is_hybrid_swa
-                else self.token_to_kv_pool_allocator.size
-            )
+            session_held = self._session_held_full_tokens()
+            total = self.full_tokens_per_layer
+        elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
+            protected = self.tree_cache.full_protected_size()
+            session_held = self._session_held_tokens()
+            total = self.token_to_kv_pool_allocator.size
         else:
             protected = self.tree_cache.protected_size()
             session_held = self._session_held_tokens()
