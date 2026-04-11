@@ -16,8 +16,7 @@ class ModelSlimW4A4MxFp4(ModelSlimLinearScheme):
         prefix: str,
     ):
         self.quant_config = quant_config
-        self.group_size = self.quant_config.get("group_size", 32)
-        self.kernel = NPUW4A4MxFp4LinearMethod(group_size=self.group_size)
+        self.kernel = NPUW4A4MxFp4LinearMethod()
 
     def create_weights(
         self,
@@ -46,7 +45,7 @@ class ModelSlimW4A4MxFp4(ModelSlimLinearScheme):
         weight_scale = BlockQuantScaleParameter(
             data=torch.zeros(
                 output_size_per_partition,
-                (input_size_per_partition + self.group_size - 1) // self.group_size,
+                (input_size_per_partition + 32 - 1) // 32,
                 dtype=torch.uint8,
             ),
             input_dim=1,

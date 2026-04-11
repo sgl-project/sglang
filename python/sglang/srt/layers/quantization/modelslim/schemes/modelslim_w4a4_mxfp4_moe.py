@@ -32,8 +32,7 @@ class ModelSlimW4A4MxFp4MoE(ModelSlimMoEScheme):
         prefix: str = None,
     ):
         self.quant_config = quant_config
-        self.group_size = self.quant_config.get("group_size", 32)
-        self.kernel = NPUW4A4MxFp4DynamicMoEMethod(group_size=self.group_size)
+        self.kernel = NPUW4A4MxFp4DynamicMoEMethod()
 
     def create_weights(
         self,
@@ -78,7 +77,7 @@ class ModelSlimW4A4MxFp4MoE(ModelSlimMoEScheme):
             torch.zeros(
                 num_experts,
                 2 * intermediate_size_per_partition,
-                (hidden_size + self.group_size - 1) // self.group_size,
+                (hidden_size + 32 - 1) // 32,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
@@ -89,8 +88,7 @@ class ModelSlimW4A4MxFp4MoE(ModelSlimMoEScheme):
             torch.zeros(
                 num_experts,
                 hidden_size,
-                (intermediate_size_per_partition + self.group_size - 1)
-                // self.group_size,
+                (intermediate_size_per_partition + 32 - 1) // 32,
                 dtype=torch.uint8,
             ),
             requires_grad=False,
