@@ -44,13 +44,17 @@ def launch_server(
     if execute_warmup_func is None:
         execute_warmup_func = _execute_server_warmup
 
-    tokenizer_manager, template_manager, port_args, scheduler_init_result = (
-        RayEngine._launch_subprocesses(
-            server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
+    (
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result,
+        subprocess_watchdog,
+    ) = RayEngine._launch_subprocesses(
+        server_args,
+        init_tokenizer_manager_func=init_tokenizer_manager_func,
+        run_scheduler_process_func=run_scheduler_process_func,
+        run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
     _setup_and_run_http_server(
@@ -59,6 +63,7 @@ def launch_server(
         template_manager,
         port_args,
         scheduler_init_result.scheduler_infos,
+        subprocess_watchdog,
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
     )

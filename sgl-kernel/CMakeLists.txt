@@ -260,13 +260,11 @@ endif()
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/allreduce/mscclpp_allreduce.cu"
-    "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
     "csrc/elementwise/activation.cu"
-    "csrc/elementwise/cast.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"

@@ -1,16 +1,15 @@
 import unittest
-from types import SimpleNamespace
 
 import requests
 
 from sglang import Engine
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=103, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=140, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=230, suite="stage-b-test-1-gpu-small-amd")
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -23,7 +22,11 @@ from sglang.test.test_utils import (
 )
 
 
-class TestTorchAO(CustomTestCase):
+class TestTorchAO(CustomTestCase, MMLUMixin):
+    mmlu_score_threshold = 0.60
+    mmlu_num_examples = 64
+    mmlu_num_threads = 32
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -38,18 +41,6 @@ class TestTorchAO(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        assert metrics["score"] >= 0.60
 
     def run_decode(self, max_new_tokens):
         response = requests.post(

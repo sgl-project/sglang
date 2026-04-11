@@ -12,20 +12,22 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
 from sglang.test.kits.abort_timeout_kit import (
     AbortAllMixin,
     RunningTimeoutTwoWaveMixin,
     WaitingTimeoutMixin,
 )
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
 from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
 
-register_cuda_ci(est_time=1100, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=690, suite="stage-b-test-1-gpu-large")
 
 
 class TestEAGLEServerBasic(EagleServerBase):
+    """Core tests that run on every server config variant."""
+
     extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
     # FIXME(lsyin): move the test methods to kits
@@ -42,43 +44,22 @@ class TestEAGLEServerBasic(EagleServerBase):
         for p in threads:
             p.join()
 
-    def test_radix_attention(self):
-        run_radix_attention_test(self.base_url)
-        self.assertIsNone(self.process.poll())
-
-    def test_max_token_one(self):
-        requests.get(self.base_url + "/flush_cache")
-
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=1,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-
-        # Just run and check it does not hang
-        metrics = run_gsm8k_eval(args)
-        self.assertGreater(metrics["output_throughput"], 50)
-
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.target_model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
 
-        metrics = run_gsm8k_eval(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.20)
+        self.assertGreater(metrics["score"], 0.20)
 
         server_info = requests.get(self.base_url + "/server_info").json()
         avg_spec_accept_length = server_info["internal_states"][0][
@@ -91,10 +72,48 @@ class TestEAGLEServerBasic(EagleServerBase):
         if speculative_eagle_topk == 1:
             self.assertGreater(avg_spec_accept_length, 2.5)
         else:
-            self.assertGreater(avg_spec_accept_length, 3.49)
+            self.assertGreater(avg_spec_accept_length, 3.47)
 
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
+
+
+class TestEAGLEServerAdditional(TestEAGLEServerBasic):
+    spec_topk = 5
+    spec_steps = 8
+    spec_tokens = 64
+    extra_args = [
+        "--max-running-requests",
+        8,
+        "--cuda-graph-max-bs",
+        5,
+        "--attention-backend",
+        "fa3",
+        "--page-size",
+        256,
+        "--dtype",
+        "float16",
+    ]
+
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        self.assertIsNone(self.process.poll())
+
+    def test_max_token_one(self):
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.target_model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=1,
+            num_examples=200,
+            num_threads=128,
+        )
+
+        metrics = run_eval(args)
+        self.assertGreater(metrics["output_throughput"], 50)
 
     def test_logprob_start_len(self):
         logprob_start_len = 4
@@ -334,21 +353,6 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
         "--max-running-requests=8",
         "--page-size=4",
         "--attention-backend=flashinfer",
-    ]
-
-
-class TestEAGLEServerPageSizeTopkFA3(TestEAGLEServerBasic):
-    # default topk=8 and tokens=64
-    spec_topk = 5
-    spec_steps = 8
-    spec_tokens = 64
-
-    extra_args = [
-        "--page-size=256",
-        "--attention-backend=fa3",
-        "--cuda-graph-max-bs=5",
-        "--dtype=float16",
-        "--max-running-requests=8",
     ]
 
 

@@ -54,7 +54,7 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import MemoryPoolConfig
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -439,12 +439,6 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
-        )
-
-    def get_remote_instance_transfer_engine_info(self):
-        return (
-            self.model_runner.remote_instance_transfer_engine_session_id,
-            self.model_runner.remote_instance_transfer_engine_weight_info,
         )
 
     def forward_batch_generation(

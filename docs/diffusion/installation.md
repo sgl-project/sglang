@@ -1,6 +1,6 @@
 # Install SGLang-Diffusion
 
-You can install SGLang-Diffusion using one of the methods below.
+You can install SGLang-Diffusion using one of the methods below. The standard installation already includes SGLang's optimized kernel stack, including both `sgl-kernel` and JIT kernels used by diffusion workloads.
 
 ## Standard Installation (NVIDIA GPUs)
 
@@ -84,7 +84,7 @@ pip install -e "python[all_musa]"
 
 ## Platform-Specific: Ascend NPU
 
-For Ascend NPU, please follow the [NPU installation guide](../platforms/ascend_npu.md).
+For Ascend NPU, please follow the [NPU installation guide](../platforms/ascend/ascend_npu.md).
 
 Quick test:
 

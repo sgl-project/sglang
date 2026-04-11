@@ -13,12 +13,11 @@ from urllib.parse import urlparse
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     find_available_port,
-    flush_cache_with_retry,
     popen_launch_server,
 )
 
@@ -180,30 +179,34 @@ class TestPPWithHiCache(unittest.TestCase):
 
         return False
 
-    def flush_cache(self) -> bool:
-        return flush_cache_with_retry(self.base_url)
+    def flush_cache(self):
+        res = requests.post(
+            f"{self.base_url}/flush_cache",
+            params={"timeout": 30},
+            timeout=40,
+        )
+        res.raise_for_status()
 
     def test_eval_accuracy(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=40,
-            max_new_tokens=256,
-            parallel=24,
-            host=f"http://{self.base_host}",
-            port=int(self.base_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=40,
+            num_threads=24,
         )
 
-        metrics_initial = run_eval_few_shot_gsm8k(args)
-        self.assertGreater(metrics_initial["accuracy"], 0.6)
+        metrics_initial = run_eval(args)
+        self.assertGreater(metrics_initial["score"], 0.6)
 
-        self.assertTrue(self.flush_cache())
-        time.sleep(2)
+        self.flush_cache()
 
-        metrics_cached = run_eval_few_shot_gsm8k(args)
-        self.assertGreater(metrics_cached["accuracy"], 0.6)
+        metrics_cached = run_eval(args)
+        self.assertGreater(metrics_cached["score"], 0.6)
 
-        accuracy_diff = abs(metrics_initial["accuracy"] - metrics_cached["accuracy"])
+        accuracy_diff = abs(metrics_initial["score"] - metrics_cached["score"])
         self.assertLess(accuracy_diff, 0.05)
 
 
