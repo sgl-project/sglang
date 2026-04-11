@@ -24,7 +24,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -820,6 +820,78 @@ class ServingChatTestCase(unittest.TestCase):
             )
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("must be an integer", context.exception.detail)
+
+
+class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
+    """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
+
+    def setUp(self):
+        tm = _MockTokenizerManager()
+        tm.server_args.tool_call_parser = "kimi_k2"
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+
+    def test_required_with_parser_uses_function_call_parser(self):
+        """tool_choice='required' should use FunctionCallParser when tool_call_parser is set."""
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            call_info = Mock()
+            call_info.name = "get_weather"
+            call_info.parameters = '{"location":"Tokyo"}'
+            call_info.tool_index = 0
+
+            parser_instance = ParserMock.return_value
+            parser_instance.has_tool_call.return_value = True
+            parser_instance.parse_non_stream.return_value = ("", [call_info])
+
+            finish_reason = {"type": "stop", "matched": None}
+            tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+            tool_calls, text, fr = self.chat._process_tool_calls(
+                text="<|tool_calls_section_begin|>...<|tool_calls_section_end|>",
+                tools=tools,
+                finish_reason=finish_reason,
+                tool_choice="required",
+            )
+
+            self.assertIsNotNone(tool_calls)
+            self.assertEqual(len(tool_calls), 1)
+            self.assertEqual(tool_calls[0].function.name, "get_weather")
+            self.assertEqual(fr["type"], "tool_calls")
+
+    def test_required_without_parser_falls_back_to_json(self):
+        """tool_choice='required' without parser should parse as JSON array."""
+        self.chat.tool_call_parser = None
+
+        finish_reason = {"type": "stop", "matched": None}
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+        tool_calls, text, fr = self.chat._process_tool_calls(
+            text='[{"name":"get_weather","parameters":{"location":"Tokyo"}}]',
+            tools=tools,
+            finish_reason=finish_reason,
+            tool_choice="required",
+        )
+
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].function.name, "get_weather")
+
+    def test_required_without_parser_invalid_json_returns_none(self):
+        """tool_choice='required' without parser and invalid JSON returns tool_calls=None."""
+        self.chat.tool_call_parser = None
+
+        finish_reason = {"type": "stop", "matched": None}
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+        tool_calls, text, fr = self.chat._process_tool_calls(
+            text="<|tool_calls_section_begin|>not json",
+            tools=tools,
+            finish_reason=finish_reason,
+            tool_choice="required",
+        )
+
+        self.assertIsNone(tool_calls)
 
 
 if __name__ == "__main__":

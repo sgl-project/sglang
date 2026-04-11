@@ -29,6 +29,7 @@ class CLIBase(unittest.TestCase):
     model_path: str = None
     extra_args = []
     data_type: DataType = None
+    log_level: str = "info"
     # tested on h100
 
     width: int = 720
@@ -60,7 +61,7 @@ class CLIBase(unittest.TestCase):
             "--prompt",
             "A curious raccoon",
             "--save-output",
-            "--log-level=debug",
+            f"--log-level={self.log_level}",
             f"--width={self.width}",
             f"--height={self.height}",
             f"--output-path={self.output_path}",
