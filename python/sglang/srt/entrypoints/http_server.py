@@ -1784,7 +1784,7 @@ async def sagemaker_chat_completions(
 @app.post(os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate"))
 async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):
     if not vertex_req.instances:
-        return []
+        return ORJSONResponse({"predictions": []})
     inputs = {}
     for input_key in ("text", "input_ids", "input_embeds"):
         if vertex_req.instances[0].get(input_key):
