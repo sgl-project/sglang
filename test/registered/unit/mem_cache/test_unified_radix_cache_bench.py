@@ -759,7 +759,7 @@ if __name__ == "__main__":
         default=["all"],
         help="insert match evict lock cache_finished all",
     )
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     for comp_name in args.components:
         components, tree_cls = _TREE_CONFIGS[comp_name]
