@@ -1,6 +1,8 @@
 """Unit tests for srt/multimodal/processors/base_processor.py — no server, no model weights."""
 
-from __future__ import annotations
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import dataclasses
 import enum
@@ -12,11 +14,7 @@ from unittest import mock
 import numpy as np
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
-
 
 # These stub classes mirror the real schedule_batch types and are injected into
 # the sys.modules stub so that base_processor.py uses the same classes as the tests.
@@ -44,10 +42,13 @@ class MultimodalInputFormat(enum.Enum):
 
 
 def _build_stub_modules() -> dict:
+    stubs = {}
+
     schedule_batch = types.ModuleType("sglang.srt.managers.schedule_batch")
     schedule_batch.Modality = Modality
     schedule_batch.MultimodalDataItem = MultimodalDataItem
     schedule_batch.MultimodalInputFormat = MultimodalInputFormat
+    stubs["sglang.srt.managers.schedule_batch"] = schedule_batch
 
     server_args = types.ModuleType("sglang.srt.server_args")
 
@@ -55,6 +56,7 @@ def _build_stub_modules() -> dict:
         rl_on_policy_target = None
 
     server_args.get_global_server_args = lambda: _Args()
+    stubs["sglang.srt.server_args"] = server_args
 
     utils = types.ModuleType("sglang.srt.utils")
     utils.envs = types.SimpleNamespace(
@@ -71,6 +73,7 @@ def _build_stub_modules() -> dict:
         warning=lambda *a, **k: None,
         exception=lambda *a, **k: None,
     )
+    stubs["sglang.srt.utils"] = utils
 
     cuda_ipc = types.ModuleType("sglang.srt.utils.cuda_ipc_transport_utils")
     cuda_ipc.MM_FEATURE_CACHE_SIZE = 0
@@ -91,16 +94,22 @@ def _build_stub_modules() -> dict:
 
     cuda_ipc.CudaIpcTensorTransportProxy = CudaIpcTensorTransportProxy
     cuda_ipc.MmItemMemoryPool = MmItemMemoryPool
+    stubs["sglang.srt.utils.cuda_ipc_transport_utils"] = cuda_ipc
 
-    return {
-        "sglang.srt.managers.schedule_batch": schedule_batch,
-        "sglang.srt.server_args": server_args,
-        "sglang.srt.utils": utils,
-        "sglang.srt.utils.cuda_ipc_transport_utils": cuda_ipc,
-    }
+    # Only stub transformers if it isn't already installed, since base_processor.py
+    # imports BaseImageProcessorFast from it at the top level.
+    if "transformers" not in sys.modules:
+        transformers_stub = types.ModuleType("transformers")
+        transformers_stub.BaseImageProcessorFast = type("BaseImageProcessorFast", (), {})
+        stubs["transformers"] = transformers_stub
+
+    return stubs
 
 
 with mock.patch.dict(sys.modules, _build_stub_modules()):
+    # Evict any cached copy so the stubs are applied even on re-import
+    # (e.g. when pytest collects with --import-mode=importlib).
+    sys.modules.pop("sglang.srt.multimodal.processors.base_processor", None)
     from sglang.srt.multimodal.processors.base_processor import (
         BaseMultiModalProcessorOutput,
         BaseMultimodalProcessor,

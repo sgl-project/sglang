@@ -1,6 +1,8 @@
 """Unit tests for srt/multimodal/mm_utils.py — no server, no model weights."""
 
-from __future__ import annotations
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import base64
 import os
@@ -31,10 +33,7 @@ if os.name == "nt" and "resource" not in sys.modules:
     sys.modules["resource"] = resource_stub
 
 from sglang.srt.multimodal import mm_utils
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 class TestEnsureNumpy(CustomTestCase):
@@ -235,14 +234,9 @@ class TestUnpadImageShape(CustomTestCase):
 
 class TestLoadImageFromBase64(CustomTestCase):
     def test_loads_valid_png(self):
-        img = Image.new("RGB", (2, 3), color=(123, 45, 67))
-        buf = torch.zeros(
-            1
-        )  # dummy to avoid importing io in hot path; use PIL save below
-        del buf
-
         import io
 
+        img = Image.new("RGB", (2, 3), color=(123, 45, 67))
         b = io.BytesIO()
         img.save(b, format="PNG")
         encoded = base64.b64encode(b.getvalue()).decode("ascii")

@@ -1,14 +1,13 @@
 """Unit tests for srt/multimodal/evs/evs_core.py — no server, no model weights."""
 
-from __future__ import annotations
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import torch
 
 from sglang.srt.multimodal.evs import evs_core
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 class TestComputeRetainedTokensCount(CustomTestCase):

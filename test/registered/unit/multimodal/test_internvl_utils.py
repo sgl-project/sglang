@@ -5,21 +5,20 @@ installed in the unit-test environment, these tests are skipped rather than
 failing import-time.
 """
 
-from __future__ import annotations
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import unittest
 
 import torch
 from PIL import Image
 
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
-
 try:
-    from sglang.srt.multimodal import internvl_utils  # noqa: E402
-except Exception:  # pragma: no cover
+    from sglang.srt.multimodal import internvl_utils
+except ImportError:  # pragma: no cover
     internvl_utils = None
 
 
