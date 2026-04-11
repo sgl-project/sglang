@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=80, suite="stage-c-test-deepep-4-gpu-h100")
+register_cuda_ci(est_time=77, suite="stage-c-test-deepep-4-gpu-h100")
 
 ib_devices = get_rdma_devices_args()
 
