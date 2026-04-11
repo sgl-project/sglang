@@ -201,7 +201,7 @@ class TestNgramSpeculativeDecodingFlashinfer(TestNgramSpeculativeDecodingBase):
         return outputs, self._get_accept_length()
 
     def test_weighted_sam_retains_accept_length_with_distractors(self):
-        """Benchmark weighted SAM allocation against the no-SAM and multi-SAM baselines."""
+        """Benchmark ranked trie/SAM matching against the no-SAM and multi-SAM baselines."""
         target_prompts = self._make_country_card_prompts(self.TARGET_COUNTRIES)
         distractor_prompt_families = [
             self._make_country_card_prompts(countries)
