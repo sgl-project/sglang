@@ -391,7 +391,7 @@ def alloc_extend_kernel_triton(
     out_indices,
     bs_upper: tl.constexpr,
     page_size: tl.constexpr,
-    max_num_extend_tokens: tl.constexpr,
+    max_num_extend_tokens,
     BLOCK_SIZE: tl.constexpr = 2048,
 ):
     pid = tl.program_id(0)

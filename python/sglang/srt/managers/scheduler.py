@@ -222,10 +222,11 @@ from sglang.srt.utils import (
     point_to_point_pyobj,
     require_mlp_sync,
     set_gpu_proc_affinity,
+    set_npu_david_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_npu, is_npu_before_atlas_a5
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -250,6 +251,7 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 
 
 @dataclass
@@ -3640,9 +3642,14 @@ def run_scheduler_process(
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(
-            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
-        )
+        if _is_npu and not _is_npu_before_atlas_a5:
+            set_npu_david_proc_affinity(
+                server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+            )
+        else:
+            set_gpu_proc_affinity(
+                server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+            )
     if not envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:

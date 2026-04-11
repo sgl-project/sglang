@@ -2069,6 +2069,114 @@ def set_gpu_proc_affinity(
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 
+def set_npu_david_proc_affinity(
+    pp_size: int,
+    tp_size: int,
+    nnodes: int,
+    npu_id: int
+):
+    def _get_target_node_core_cpu_map(target_node):
+        target_node_cores = {}
+        result = subprocess.run(
+            ['lscpu', '-e=CPU,CORE,NODE', '-J'], 
+            capture_output=True, text=True, check=True
+        )
+        json_out = json.loads(result.stdout)
+        cpu_info = json_out.get('cpus')
+        if not cpu_info:
+            logger.warning("Parse lscpu info failed!")
+            return target_node_cores
+
+        # TODO LKL: assert key exsits
+        for c in cpu_info:
+            node_val = c.get('node') if c.get('node') is not None else c.get('NODE')
+            core_val = c.get('core') if c.get('core') is not None else c.get('CORE')
+            cpu_val = c.get('cpu') if c.get('cpu') is not None else c.get('CPU')
+            
+            node = int(node_val)
+            if node == target_node:
+                core = int(core_val)
+                lcpu = int(cpu_val)
+                if core not in target_node_cores:
+                    target_node_cores[core] = []
+                target_node_cores[core].append(lcpu)
+
+        return target_node_cores
+    
+    def _bind_numa(target_node):
+        import ctypes.util
+        libnuma_path = ctypes.util.find_library("numa")
+        if not libnuma_path:
+            mem_msg = "libnuma not found, please install: sudo apt install libnuma1"
+        else:
+            libnuma = ctypes.CDLL(libnuma_path)
+            if libnuma.numa_available() == -1:
+                mem_msg = "NUMA not supported by system"
+            else:
+                libnuma.numa_allocate_nodemask.restype = ctypes.c_void_p
+                libnuma.numa_bitmask_setbit.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+                libnuma.numa_set_membind.argtypes = [ctypes.c_void_p]
+                libnuma.numa_bitmask_free.argtypes = [ctypes.c_void_p]
+
+                nodemask = libnuma.numa_allocate_nodemask()
+                libnuma.numa_bitmask_setbit(nodemask, target_node)
+                libnuma.numa_set_membind(nodemask)
+                libnuma.numa_bitmask_free(nodemask)
+                mem_msg = f"NUMA set success to {target_node}"
+        return mem_msg
+
+    pid = os.getpid()
+    p = psutil.Process(pid)
+    
+    # TODO LKL: remove hard code after 910D released
+    NPU_TO_NUMA = {
+        0: 0, 1: 0, 2: 0, 3: 0,
+        4: 2, 5: 2, 6: 2, 7: 2
+    }
+
+    target_node = NPU_TO_NUMA[npu_id]
+    target_node_cores = _get_target_node_core_cpu_map(target_node)
+
+    if not target_node_cores:
+        return
+
+    sorted_physical_cores = sorted(target_node_cores.keys())
+    npus_of_this_node = sorted([g for g, n in NPU_TO_NUMA.items() if n == target_node])
+    rank_in_node = npus_of_this_node.index(npu_id)
+    total_npus_in_node = len(npus_of_this_node)
+
+    nnodes_per_tp_group = max(nnodes // pp_size, 1)
+    tp_size_per_node = tp_size // nnodes_per_tp_group
+
+    total_node_cores = len(sorted_physical_cores)
+    cores_per_npu = total_node_cores // min(total_npus_in_node, tp_size_per_node)
+    start_idx = (rank_in_node * cores_per_npu) % total_node_cores
+    
+    if rank_in_node == total_npus_in_node - 1:
+        end_idx = total_node_cores
+    else:
+        end_idx = start_idx + cores_per_npu
+
+    bind_cpus = []
+    for core_id in sorted_physical_cores[start_idx:end_idx]:
+        bind_cpus.extend(target_node_cores[core_id])
+
+    p.cpu_affinity(sorted(bind_cpus))
+
+    mem_msg = "Not bind NUMA"
+    # if sys.platform == "linux":
+    #     try:
+    #         mem_msg = _bind_numa(target_node=target_node)
+    #     except Exception as e:
+    #         mem_msg = f"NUMA binding failed: {e}"
+
+    logging.info(
+        f"PID {pid} | NPU {npu_id} -> Bound to NUMA Node {target_node} | "
+        f"Allocated {len(bind_cpus)} logical cores (Physical cores {sorted_physical_cores[start_idx]}~{sorted_physical_cores[end_idx-1]}) | "
+        f"Core list: {sorted(bind_cpus)[0]}...{sorted(bind_cpus)[-1]} | {mem_msg}"
+    )
+
+
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
     b_ = x.shape[0]
     n_ = x.shape[1]
