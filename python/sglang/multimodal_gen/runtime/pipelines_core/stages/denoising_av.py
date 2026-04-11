@@ -240,9 +240,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
         if is_ltx23_variant:
             return None
         return (
-            batch.negative_attention_mask
-            if negative
-            else batch.prompt_attention_mask
+            batch.negative_attention_mask if negative else batch.prompt_attention_mask
         )
 
     @classmethod
