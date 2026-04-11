@@ -154,6 +154,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
