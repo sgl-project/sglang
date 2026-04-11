@@ -80,12 +80,66 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
-if _use_aiter and _is_gfx95_supported:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+if _use_aiter:
+    from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
+    from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
-    from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+    from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+
+    if _is_gfx95_supported:
+        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+
+        from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
+            fused_rms_mxfp4_quant,
+        )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
+
+
+def _fused_rmsnorm_fp8_per_token_quant(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    residual: Optional[torch.Tensor] = None,
+):
+    """Fused (optional residual-add +) RMSNorm + FP8 per-token quantization.
+
+    Only used with the aiter (ROCm) backend.
+
+    Args:
+        residual: if provided, computes hidden_states + residual before RMSNorm
+                  and returns updated residual_out as second element.
+
+    Returns:
+        If residual is None:  (out_fp8, scale)
+        If residual provided: ((out_fp8, scale), residual_out)
+    """
+    M, N = hidden_states.shape
+    out_fp8 = torch.empty((M, N), dtype=_aiter_fp8_dtype, device=hidden_states.device)
+    scale = torch.empty(M, dtype=torch.float32, device=hidden_states.device)
+    if residual is not None:
+        residual_out = torch.empty_like(hidden_states)
+        _aiter_add_rmsnorm_quant(
+            out_fp8,
+            hidden_states,
+            residual,
+            residual_out,
+            scale,
+            weight,
+            epsilon,
+            0,  # group_size=0 → per-token
+        )
+        return (out_fp8, scale.unsqueeze(1)), residual_out
+    else:
+        _aiter_rmsnorm_quant(
+            out_fp8,
+            hidden_states,
+            scale,
+            weight,
+            epsilon,
+            0,  # group_size=0 → per-token
+        )
+        return (out_fp8, scale.unsqueeze(1))
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
@@ -147,7 +201,6 @@ class ScatterMode(Enum):
 
 
 class AttentionInputs:
-
     def __init__(
         self,
         hidden_states: torch.Tensor,
@@ -311,8 +364,8 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
+                # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 if (
-                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                     not get_moe_a2a_backend().is_none()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 )
@@ -484,7 +537,7 @@ class LayerCommunicator:
                             None,
                             None,
                         )
-                    elif _use_aiter and _is_gfx95_supported and ("fp8" in quant_format):
+                    elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant.
                         # When NSA is active, also preserve the unquantized bf16
                         # output as a 3-tuple (fp8, scale, bf16) so the NSA
@@ -509,10 +562,16 @@ class LayerCommunicator:
                                 _unq_bf16,
                             )
 
+                    elif _use_aiter and (quant_format == "fp8_per_token"):
+                        hidden_states = _fused_rmsnorm_fp8_per_token_quant(
+                            hidden_states,
+                            self.input_layernorm.weight.data,
+                            self.input_layernorm.variance_epsilon,
+                        )
+
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
-
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states, *_, residual = fused_rms_mxfp4_quant(
                             hidden_states,
@@ -523,7 +582,7 @@ class LayerCommunicator:
                             None,
                             residual,
                         )
-                    elif _use_aiter and _is_gfx95_supported and ("fp8" in quant_format):
+                    elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
                         # with residual addition. When NSA is active, pack
                         # the unquantized bf16 as a 3-tuple (fp8, scale, bf16).
@@ -548,6 +607,15 @@ class LayerCommunicator:
                                 hidden_states[1],
                                 _unq_bf16,
                             )
+                    elif _use_aiter and (quant_format == "fp8_per_token"):
+                        if post_residual_addition is not None:
+                            residual = residual + post_residual_addition
+                        hidden_states, residual = _fused_rmsnorm_fp8_per_token_quant(
+                            hidden_states,
+                            self.input_layernorm.weight.data,
+                            self.input_layernorm.variance_epsilon,
+                            residual=residual,
+                        )
                     else:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states,
