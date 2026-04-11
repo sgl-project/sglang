@@ -464,6 +464,11 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
 
         messages = [{"role": "user", "content": "What is the capital of France?"}]
+        # strict=True ensures constrained decoding enforces the parameter schema.
+        # Without it, tool_choice="required" only guarantees a tool call is made
+        # but arguments are best-effort (may be empty on small models).
+        for tool in tools:
+            tool["function"]["strict"] = True
         response = client.chat.completions.create(
             model=self.model,
             max_tokens=2048,

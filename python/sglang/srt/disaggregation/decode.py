@@ -673,6 +673,21 @@ class DecodePreallocQueue:
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
+        # HiSparse physical constraint: max requests by device buffer capacity.
+        # Each admitted req needs padded_buffer_size from hisparse device pool.
+        # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
+        # only transfer_queue reqs are pending device buffer allocation.
+        hisparse_req_budget = float("inf")
+        if self.scheduler.enable_hisparse:
+            hisparse_avail = (
+                self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+            )
+            hisparse_req_budget = max(
+                0,
+                hisparse_avail // self.scheduler.hisparse_coordinator.padded_buffer_size
+                - len(self.transfer_queue.queue),
+            )
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -688,6 +703,9 @@ class DecodePreallocQueue:
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                break
+
+            if hisparse_req_budget <= 0:
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -714,6 +732,7 @@ class DecodePreallocQueue:
                 break
 
             allocatable_tokens -= required_tokens_for_request
+            hisparse_req_budget -= 1
             dst_kv_indices = self._pre_alloc(decode_req.req)
 
             origin_input_len = len(decode_req.req.origin_input_ids)
@@ -819,7 +838,14 @@ class DecodePreallocQueue:
             and len(self.scheduler.running_batch.reqs) > 0
             else 0
         )
-        available_size = self.token_to_kv_pool_allocator.available_size()
+        if self.scheduler.enable_hisparse:
+            # HiSparse pre-alloc only allocates logical indices (alloc_logical_only),
+            # so the logical pool is the binding constraint for admission control.
+            available_size = (
+                self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
@@ -1165,7 +1191,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                self.on_idle()
 
             # Update last_batch
             self.last_batch = batch
@@ -1198,7 +1224,7 @@ class SchedulerDisaggregationDecodeMixin:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
-                self.self_check_during_idle()
+                self.on_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
