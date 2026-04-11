@@ -122,22 +122,29 @@ class RadixAttention(nn.Module):
                 )
 
                 bridges = get_bridge_buffers()
-                if bridges is not None:
-                    n = q.shape[0]
-                    bq = bridges.q[:n].view(q.shape)
-                    bk = bridges.k[:n].view(k.shape) if k is not None else None
-                    bv = bridges.v[:n].view(v.shape) if v is not None else None
+                if bridges is not None and "k_rope" not in kwargs:
+                    bq = bridges.q.flatten()[: q.numel()].view(q.shape)
+                    bk = (
+                        bridges.k.flatten()[: k.numel()].view(k.shape)
+                        if k is not None
+                        else None
+                    )
+                    bv = (
+                        bridges.v.flatten()[: v.numel()].view(v.shape)
+                        if v is not None
+                        else None
+                    )
                     bq.copy_(q)
                     if bk is not None:
                         bk.copy_(k)
                     if bv is not None:
                         bv.copy_(v)
-                    output = bridges.output[:n]
-                    del (
-                        q,
-                        k,
-                        v,
-                    )  # release refs so originals can be freed in this segment
+                    n = q.shape[0]
+                    out_dim = self.tp_q_head_num * self.v_head_dim
+                    output = bridges.output.flatten()[: n * out_dim].view(
+                        n, out_dim
+                    )
+                    del q, k, v
                     breakable_unified_attention_with_output(
                         bq,
                         bk,
@@ -145,6 +152,7 @@ class RadixAttention(nn.Module):
                         output,
                         save_kv_cache,
                         self.layer_id,
+                        _attention_layer=self,
                         **kwargs,
                     )
                     return output
@@ -155,7 +163,14 @@ class RadixAttention(nn.Module):
                         else torch.empty_like(q)
                     )
                     breakable_unified_attention_with_output(
-                        q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                        q,
+                        k,
+                        v,
+                        output,
+                        save_kv_cache,
+                        self.layer_id,
+                        _attention_layer=self,
+                        **kwargs,
                     )
                     return output
             else:
@@ -192,12 +207,16 @@ def _unified_attention_with_output_impl(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    _attention_layer: Optional["RadixAttention"] = None,
 ) -> None:
     """Attention implementation shared by both torch.compile split-op and breakable CUDA graph paths."""
     context = get_forward_context()
     forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
+    if _attention_layer is not None:
+        attention_layer = _attention_layer
+    else:
+        attention_layers = context.attention_layers
+        attention_layer = attention_layers[layer_id]
 
     kwargs = {}
     if q_rope is not None:

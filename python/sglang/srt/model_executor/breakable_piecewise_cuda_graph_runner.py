@@ -89,11 +89,11 @@ class BridgeBuffers:
     while the bridge buffers persist at fixed addresses outside the graph.
     """
 
-    def __init__(self, max_tokens: int, attention_layer, device, dtype):
-        q_dim = attention_layer.tp_q_head_num * attention_layer.qk_head_dim
-        k_dim = attention_layer.tp_k_head_num * attention_layer.qk_head_dim
-        v_dim = attention_layer.tp_v_head_num * attention_layer.v_head_dim
-        out_dim = attention_layer.tp_q_head_num * attention_layer.v_head_dim
+    def __init__(self, max_tokens: int, attention_layers, device, dtype):
+        q_dim = max(l.tp_q_head_num * l.qk_head_dim for l in attention_layers)
+        k_dim = max(l.tp_k_head_num * l.qk_head_dim for l in attention_layers)
+        v_dim = max(l.tp_v_head_num * l.v_head_dim for l in attention_layers)
+        out_dim = max(l.tp_q_head_num * l.v_head_dim for l in attention_layers)
 
         self.q = torch.empty((max_tokens, q_dim), dtype=dtype, device=device)
         self.k = torch.empty((max_tokens, k_dim), dtype=dtype, device=device)
@@ -141,10 +141,19 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
         self.moe_fusions = model_runner.moe_fusions
 
         # Bridge buffers — one set, reused across all layers and token sizes.
-        attn_layer_0 = self.attention_layers[0]
+        # Scan ALL RadixAttention modules (not just attention_layers) to handle
+        # models like DeepSeek that have multiple attention objects per layer.
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        all_attn = [
+            m for m in model_runner.model.modules() if isinstance(m, RadixAttention)
+        ]
         set_bridge_buffers(
             BridgeBuffers(
-                self.max_num_tokens, attn_layer_0, self.device, model_runner.dtype
+                self.max_num_tokens,
+                all_attn,
+                self.device,
+                model_runner.dtype,
             )
         )
 
@@ -393,6 +402,13 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
             self.static_req_pool_indices[:bs].copy_(forward_batch.req_pool_indices)
             if forward_batch.orig_seq_lens is not None:
                 self.static_orig_seq_lens[:bs].copy_(forward_batch.orig_seq_lens)
+
+            # Restore Python-level model state that was set during capture
+            # but doesn't replay with CUDA graphs (e.g. DeepSeek MHA dispatch).
+            if hasattr(static_forward_batch, "set_attn_attend_prefix_cache"):
+                static_forward_batch.set_attn_attend_prefix_cache(False)
+                static_forward_batch.mha_return_lse = False
+                static_forward_batch.mha_one_shot = True
 
             # Set forward context and replay
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
