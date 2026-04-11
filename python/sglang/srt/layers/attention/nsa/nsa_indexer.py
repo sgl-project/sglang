@@ -762,6 +762,33 @@ class Indexer(MultiPlatformOp):
         )
         return metadata.topk_transform(dummy_logits, self.index_topk)
 
+    def _forward_decode_k_only(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+    ) -> None:
+        """Store indexer K cache during decode without computing Q or topk.
+
+        Used when the dense decode fallback is active (sequences shorter than
+        the decode threshold). The indexer K cache must still be updated so
+        that future decode steps with longer sequences can compute topk correctly.
+        """
+        key = self._get_k_bf16(x, positions, enable_dual_stream=False)
+
+        if not forward_batch.out_cache_loc.is_contiguous():
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+            act_quant=act_quant,
+        )
+        return None
+
     def _get_topk_ragged_with_cp(
         self,
         forward_batch: ForwardBatch,
@@ -1090,7 +1117,7 @@ class Indexer(MultiPlatformOp):
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
-        # Optimization: fast path when skipping topk computation
+        # Optimization: fast path when skipping topk computation (prefill/extend)
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
             return self._forward_cuda_k_only(
                 x,
@@ -1102,6 +1129,22 @@ class Indexer(MultiPlatformOp):
                 metadata,
                 return_indices,
             )
+
+        # Optimization: fast path for decode when sequences are short enough
+        # to skip sparse indexing entirely (dense MLA decode fallback)
+        if forward_batch.forward_mode.is_decode_or_idle():
+            backend = forward_batch.attn_backend
+            # Unwrap TBO wrapper to access the primary NSA backend's flag
+            if hasattr(backend, "primary"):
+                backend = backend.primary
+            if getattr(backend, "use_dense_decode", False):
+                return self._forward_decode_k_only(
+                    x,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    act_quant,
+                )
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()

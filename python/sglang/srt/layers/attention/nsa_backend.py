@@ -322,6 +322,7 @@ class NativeSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
+        self.use_dense_decode: bool = False
         self.nsa_prefill_impl: _NSA_IMPL_T = (
             model_runner.server_args.nsa_prefill_backend
         )
@@ -355,8 +356,13 @@ class NativeSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
-        # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        if self.device_sm_major >= 10 or self.nsa_decode_impl == "trtllm":
+        # Allocate global workspace buffer for TRT-LLM kernels
+        # (ragged attention on SM100/B200, trtllm decode, or dense decode fallback)
+        if (
+            self.device_sm_major >= 10
+            or self.nsa_decode_impl == "trtllm"
+            or envs.SGLANG_NSA_DECODE_DENSE_ATTN_KV_LEN_THRESHOLD.get() > 0
+        ):
             global global_workspace_buffer
             if global_workspace_buffer is None:
                 global_workspace_buffer = torch.empty(
@@ -410,6 +416,7 @@ class NativeSparseAttnBackend(
 
         # Centralized dispatch: decide all strategies for this batch
         self.set_nsa_prefill_impl(forward_batch)
+        self.set_nsa_decode_dense(forward_batch, max_seqlen_k)
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
@@ -1486,6 +1493,23 @@ class NativeSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "NSA is causal only"
 
+        # Dense decode path: skip sparse indexing, attend to all KV tokens
+        if self.use_dense_decode:
+            return self._forward_dense_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                metadata,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                cos_sin_cache,
+                is_neox,
+                llama_4_scaling,
+            )
+
         if self.nsa_decode_impl == "trtllm":
             return self._forward_trtllm(
                 q,
@@ -1917,6 +1941,108 @@ class NativeSparseAttnBackend(
         )
         return o
 
+    def _forward_dense_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Dense MLA decode — attend to all KV tokens without sparse indexing.
+
+        Used when all sequences in the batch are shorter than the dense decode
+        threshold, making the NSA indexer overhead unnecessary.
+        """
+        import flashinfer.decode
+
+        merge_query = q_rope is not None
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
+            assert q_rope is not None, "For FP8 path q_rope should not be None."
+            assert k_rope is not None, "For FP8 path k_rope should not be None."
+            assert (
+                cos_sin_cache is not None
+            ), "For FP8 path cos_sin_cache should not be None."
+
+            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+                q,
+                q_rope,
+                k.squeeze(1),
+                k_rope.squeeze(1),
+                forward_batch.positions,
+                cos_sin_cache,
+                is_neox,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            )
+            merge_query = False
+
+        if save_kv_cache:
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating kv cache, both k_nope and k_rope should be not None."
+            cache_loc = (
+                forward_batch.out_cache_loc
+                if not layer.is_cross_attention
+                else forward_batch.encoder_out_cache_loc
+            )
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                layer, cache_loc, k, k_rope
+            )
+
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
+
+        if merge_query:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope_reshaped = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            q_all = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+        else:
+            q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        if llama_4_scaling is not None:
+            q_all = q_all * llama_4_scaling
+
+        q_scale = 1.0
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        bmm1_scale = q_scale * k_scale * layer.scaling
+
+        batch_size = forward_batch.batch_size
+        q_all = q_all.view(batch_size, 1, layer.tp_q_head_num, layer.head_dim)
+
+        # Use the full page table (real_page_table) — attend to all KV tokens
+        block_tables = metadata.real_page_table.unsqueeze(1)
+
+        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q_all,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=metadata.cache_seqlens_int32,
+            max_seq_len=metadata.max_seq_len_k,
+            bmm1_scale=bmm1_scale,
+            # No sparse_mla_top_k — attend to all tokens densely
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+        )
+        # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
+        return out.squeeze(1)
+
     def _forward_trtllm(
         self,
         q: torch.Tensor,
@@ -2098,6 +2224,9 @@ class NativeSparseAttnBackend(
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
+            # Reset dense decode flag; for eager decode it's set by set_nsa_decode_dense.
+            # For CUDA graph capture/replay (forward_batch=None) this keeps sparse path.
+            self.use_dense_decode = False
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
@@ -2117,6 +2246,18 @@ class NativeSparseAttnBackend(
             else:
                 # bf16 kv cache
                 self.nsa_prefill_impl = "flashmla_sparse"
+
+    def set_nsa_decode_dense(self, forward_batch: ForwardBatch, max_seqlen_k: int):
+        """
+        Decide whether to use dense (non-sparse) MLA decode for this batch.
+        When all sequences are shorter than the threshold, skip the indexer
+        and use a dense MLA decode kernel that attends to all KV tokens.
+        """
+        if forward_batch.forward_mode.is_decode_or_idle():
+            threshold = envs.SGLANG_NSA_DECODE_DENSE_ATTN_KV_LEN_THRESHOLD.get()
+            self.use_dense_decode = max_seqlen_k <= threshold
+        else:
+            self.use_dense_decode = False
 
     def get_topk_transform_method(
         self, forward_mode: Optional[ForwardMode] = None

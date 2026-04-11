@@ -1573,6 +1573,13 @@ class ServerArgs:
                         logger.warning(
                             f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
                         )
+                # Auto-configure decode dense threshold to model's index_topk
+                if not envs.SGLANG_NSA_DECODE_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
+                    from sglang.srt.configs.model_config import get_nsa_index_topk
+
+                    envs.SGLANG_NSA_DECODE_DENSE_ATTN_KV_LEN_THRESHOLD.set(
+                        get_nsa_index_topk(hf_config)
+                    )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")

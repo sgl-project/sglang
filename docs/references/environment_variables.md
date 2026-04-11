@@ -97,6 +97,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA` | Precompute metadata that can be shared among different draft steps when MTP is enabled | `true` |
 | `SGLANG_USE_FUSED_METADATA_COPY` | Control whether to use fused metadata copy kernel for cuda graph replay  | `true` |
 | `SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` | When the maximum kv len in current prefill batch exceeds this value, the sparse mla kernel will be applied, else it falls back to dense MHA implementation. Default to the index topk of model (2048 for DeepSeek V3.2) | `2048` |
+| `SGLANG_NSA_DECODE_DENSE_ATTN_KV_LEN_THRESHOLD` | When the maximum kv len in current decode batch is below this value, the NSA indexer is skipped and a dense MLA decode kernel is used instead. This avoids the overhead of sparse indexing for short sequences. Default to the index topk of model (2048 for DeepSeek V3.2). Set to 0 to disable. Only effective in eager mode (non-CUDA-graph). | `2048` |
 
 
 ## Memory Management
