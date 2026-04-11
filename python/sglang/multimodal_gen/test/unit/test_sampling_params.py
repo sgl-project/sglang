@@ -1,11 +1,16 @@
 import argparse
 import math
 import unittest
+from unittest.mock import MagicMock, patch
 
 from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.sample.flux import (
+    Flux2KleinSamplingParams,
+    Flux2SamplingParams,
+    FluxSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
@@ -73,6 +78,11 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         self.assertEqual(params.height, 640)
         self.assertEqual(params.width, 768)
+
+    def test_flux_guidance_defaults_match_model_defaults(self):
+        self.assertEqual(FluxSamplingParams().guidance_scale, 3.5)
+        self.assertEqual(Flux2SamplingParams().guidance_scale, 4.0)
+        self.assertEqual(Flux2KleinSamplingParams().guidance_scale, 1.0)
 
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):
@@ -186,6 +196,40 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         target._merge_with_user_params(user, explicit_fields={"negative_prompt"})
 
         self.assertEqual(target.negative_prompt, SamplingParams.negative_prompt)
+
+    def test_cli_path_tracks_explicit_width_height_fields(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+        ):
+            implicit_size = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+            )
+            explicit_size = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+                width=768,
+                height=512,
+            )
+
+        implicit_fields = set(implicit_size.build_request_extra()["explicit_fields"])
+        explicit_fields = set(explicit_size.build_request_extra()["explicit_fields"])
+
+        self.assertNotIn("width", implicit_fields)
+        self.assertNotIn("height", implicit_fields)
+        self.assertIn("width", explicit_fields)
+        self.assertIn("height", explicit_fields)
 
 
 if __name__ == "__main__":

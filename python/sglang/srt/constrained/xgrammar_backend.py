@@ -23,6 +23,7 @@ from xgrammar import (
     CompiledGrammar,
     GrammarCompiler,
     GrammarMatcher,
+    StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
@@ -295,9 +296,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     )
                     for structure in structural_tag["structures"]
                 ]
-                ctx = self.grammar_compiler.compile_structural_tag(
+                new_tag = StructuralTag.from_legacy_structural_tag(
                     tags, structural_tag["triggers"]
                 )
+                new_tag.format.at_least_one = structural_tag.get("at_least_one", False)
+                ctx = self.grammar_compiler.compile_structural_tag(new_tag)
             else:
                 format_dict = structural_tag.get("format")
                 if isinstance(format_dict, dict):
@@ -313,6 +316,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         )
 
     def reset(self):
+        super().reset()
         self.grammar_compiler.clear_cache()
 
 
