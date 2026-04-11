@@ -675,6 +675,9 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        # Disable for token embedding overrides (dynamic per-request)
+        if forward_batch.replace_embeds is not None:
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -867,7 +870,20 @@ class CudaGraphRunner:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+
+        # Adjust for attention TP if needed (matching replay path in
+        # populate_from_forward_batch).
         buffers.num_token_non_padded[...] = num_tokens
+        if (
+            enable_num_token_non_padded(self.model_runner.server_args)
+            and self.require_gathered_buffer
+            and not self.nsa_enable_prefill_cp
+        ):
+            local = compute_local_num_token_non_padded(
+                global_num_token_non_padded=buffers.num_token_non_padded,
+                num_tokens_per_dp=num_tokens,
+            )
+            buffers.num_token_non_padded.copy_(local)
 
         # pipeline parallelism
         if self.pp_size > 1:

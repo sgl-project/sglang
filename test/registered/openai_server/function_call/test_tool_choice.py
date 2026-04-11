@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=250, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=194, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=258, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -348,8 +348,12 @@ class TestToolChoiceLlama32(CustomTestCase):
         self.assertEqual(found_name, "get_weather")
 
     def test_required_streaming_arguments_chunks_json(self):
-        """In streaming required mode, complete tool call arguments should be valid JSON when all chunks are combined"""
+        """In streaming required mode, complete tool call arguments should be valid JSON when all chunks are combined.
+        Uses strict=True so the grammar enforces the parameter schema."""
         tools = self.get_test_tools()
+        # Add strict=True so arguments are schema-constrained
+        for tool in tools:
+            tool["function"]["strict"] = True
         messages = self.get_test_messages()
 
         response = self.client.chat.completions.create(
@@ -406,13 +410,15 @@ class TestToolChoiceLlama32(CustomTestCase):
                 )
 
     def test_complex_parameters_required_non_streaming(self):
-        """Validate complex nested parameter schemas in non-streaming required mode"""
+        """Validate complex nested parameter schemas in non-streaming required mode.
+        Uses strict=True so the grammar enforces the parameter schema."""
         complex_tools = [
             {
                 "type": "function",
                 "function": {
                     "name": "analyze_data",
                     "description": "Analyze complex data structures",
+                    "strict": True,
                     "parameters": {
                         "type": "object",
                         "properties": {

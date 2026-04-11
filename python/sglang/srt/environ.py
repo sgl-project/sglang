@@ -331,6 +331,9 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
 
+    # MTHREADS & MUSA
+    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
@@ -524,6 +527,7 @@ class Envs:
 
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
+    SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
