@@ -331,6 +331,9 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
 
+    # MTHREADS & MUSA
+    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
@@ -469,6 +472,9 @@ class Envs:
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+
+    # Breakable CUDA Graph
+    SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)

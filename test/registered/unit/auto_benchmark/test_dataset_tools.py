@@ -15,7 +15,7 @@ from sglang.auto_benchmark_lib import infer_backend, prepare_dataset
 from sglang.benchmark.datasets.autobench import sample_autobench_requests
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=1, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
 
 
 class TestAutoBenchmarkDatasetTools(AutoBenchmarkTestCase):
