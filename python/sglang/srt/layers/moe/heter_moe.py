@@ -470,18 +470,11 @@ class HeterFusedMoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        topk_output_or_weights=None,
-        topk_ids_arg: Optional[torch.Tensor] = None,
-        router_logits_arg: Optional[torch.Tensor] = None,
+        topk_output,
     ) -> torch.Tensor:
-        if topk_ids_arg is not None:
-            topk_weights = topk_output_or_weights
-            topk_ids = topk_ids_arg
-            router_logits = router_logits_arg
-        else:
-            topk_weights = topk_output_or_weights.topk_weights
-            topk_ids = topk_output_or_weights.topk_ids
-            router_logits = topk_output_or_weights.router_logits
+        topk_weights = topk_output.topk_weights
+        topk_ids = topk_output.topk_ids
+        router_logits = topk_output.router_logits
 
         group_dispatches = self.policy.dispatch(topk_ids, topk_weights)
 
@@ -491,6 +484,15 @@ class HeterFusedMoE(nn.Module):
             group_ids, group_weights = group_dispatches[group_idx]
 
             num_bits = gcfg.get("num_bits", 16)
+
+            # Triton kernels (BF16/INT8) require sentinel=-1, not num_experts.
+            # Marlin INT4 handles num_experts sentinel natively.
+            if num_bits != 4:
+                group_ids = torch.where(
+                    group_ids == self.num_experts,
+                    torch.full_like(group_ids, -1),
+                    group_ids,
+                )
 
             if num_bits == 16:
                 group_out = outplace_fused_experts(

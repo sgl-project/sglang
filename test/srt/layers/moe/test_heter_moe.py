@@ -33,6 +33,18 @@ create_policy = _policy_mod.create_policy
 _assign_by_score_gpu = _policy_mod._assign_by_score_gpu
 _build_group_labels = _policy_mod._build_group_labels
 
+from types import SimpleNamespace
+
+
+def _make_topk_output(topk_weights, topk_ids, router_logits=None):
+    """Construct a TopKOutput-shaped shim for HeterFusedMoE.forward() tests."""
+    return SimpleNamespace(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=router_logits,
+    )
+
+
 CUDA_AVAILABLE = torch.cuda.is_available()
 
 
@@ -283,7 +295,7 @@ class TestHeterFusedMoEBF16Only:
         x = torch.randn(4, 64, dtype=torch.bfloat16, device="cuda")
         topk_w = torch.rand(4, 2, dtype=torch.bfloat16, device="cuda")
         topk_ids = torch.randint(0, 8, (4, 2), device="cuda")
-        out = layer(x, topk_w, topk_ids)
+        out = layer(x, _make_topk_output(topk_w, topk_ids))
         assert out.shape == x.shape
         assert out.dtype == x.dtype
 
@@ -292,7 +304,7 @@ class TestHeterFusedMoEBF16Only:
         x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
         topk_w = torch.ones(8, 2, dtype=torch.bfloat16, device="cuda") * 0.5
         topk_ids = torch.randint(0, 8, (8, 2), device="cuda")
-        out = layer(x, topk_w, topk_ids)
+        out = layer(x, _make_topk_output(topk_w, topk_ids))
         assert out.abs().sum() > 0, "Output should not be all zeros"
 
     def test_zero_weights_give_zero_output(self):
@@ -300,7 +312,7 @@ class TestHeterFusedMoEBF16Only:
         x = torch.randn(4, 64, dtype=torch.bfloat16, device="cuda")
         topk_w = torch.zeros(4, 2, dtype=torch.bfloat16, device="cuda")
         topk_ids = torch.randint(0, 8, (4, 2), device="cuda")
-        out = layer(x, topk_w, topk_ids)
+        out = layer(x, _make_topk_output(topk_w, topk_ids))
         assert out.abs().max() < 1e-3, (
             "Zero routing weights should give near-zero output"
         )
@@ -337,7 +349,7 @@ class TestHeterFusedMoETwoGroupsBF16:
         x = torch.randn(16, 64, dtype=torch.bfloat16, device="cuda")
         topk_w = torch.rand(16, 2, dtype=torch.bfloat16, device="cuda")
         topk_ids = torch.randint(0, 8, (16, 2), device="cuda")
-        out = layer(x, topk_w, topk_ids)
+        out = layer(x, _make_topk_output(topk_w, topk_ids))
         assert out.shape == x.shape
 
     def test_two_groups_vs_one_group_different(self):
@@ -357,7 +369,7 @@ class TestHeterFusedMoETwoGroupsBF16:
             8, 64, 32, 2, one_group_cfg, torch.bfloat16, torch.device("cuda")
         )
         layer1.init_fake_weights(seed=42)
-        out1 = layer1(x, topk_w, topk_ids)
+        out1 = layer1(x, _make_topk_output(topk_w, topk_ids))
 
         two_group_cfg = {
             "groups": [
@@ -370,7 +382,7 @@ class TestHeterFusedMoETwoGroupsBF16:
             8, 64, 32, 2, two_group_cfg, torch.bfloat16, torch.device("cuda")
         )
         layer2.init_fake_weights(seed=99)
-        out2 = layer2(x, topk_w, topk_ids)
+        out2 = layer2(x, _make_topk_output(topk_w, topk_ids))
 
         diff = (out1 - out2).abs().max().item()
         assert diff > 1e-4, (
@@ -409,8 +421,92 @@ class TestHeterFusedMoEInt8Group:
         x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
         topk_w = torch.rand(8, 2, dtype=torch.bfloat16, device="cuda")
         topk_ids = torch.randint(0, 8, (8, 2), device="cuda")
-        out = layer(x, topk_w, topk_ids)
+        out = layer(x, _make_topk_output(topk_w, topk_ids))
         assert out.shape == x.shape
+
+
+# --- Triton sentinel handling tests --------------------------------------
+#
+# heter-moe uses a uniform sentinel of `num_experts` (an out-of-range
+# expert ID) to mark tokens dispatched to other groups. These tests verify
+# that the Triton outplace_fused_experts kernel correctly filters those
+# slots so the Marlin and Triton paths can share one sentinel convention.
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+def test_triton_sentinel_num_experts():
+    """Verify outplace_fused_experts handles sentinel=num_experts (all tokens masked)."""
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import outplace_fused_experts
+
+    E, H, I = 8, 64, 32
+    w13 = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn(E, H, I, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(4, H, dtype=torch.bfloat16, device="cuda")
+    # All experts set to sentinel (num_experts=8)
+    topk_ids = torch.full((4, 2), E, dtype=torch.int64, device="cuda")
+    topk_weights = torch.zeros(4, 2, dtype=torch.bfloat16, device="cuda")
+    out = outplace_fused_experts(x, w13, w2, topk_weights, topk_ids)
+    assert out.shape == x.shape
+    assert out.abs().max() < 1e-3  # All-masked should give zero output
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+def test_triton_sentinel_partial_mask():
+    """Verify outplace_fused_experts works when some but not all tokens use sentinel."""
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import outplace_fused_experts
+
+    E, H, I = 8, 64, 32
+    torch.manual_seed(42)
+    w13 = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn(E, H, I, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(4, H, dtype=torch.bfloat16, device="cuda")
+    # Mixed: some valid expert IDs, some sentinel
+    topk_ids = torch.tensor(
+        [[0, E], [1, 2], [E, 3], [E, E]], dtype=torch.int64, device="cuda"
+    )
+    topk_weights = torch.tensor(
+        [[0.5, 0.0], [0.5, 0.5], [0.0, 0.5], [0.0, 0.0]],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    out = outplace_fused_experts(x, w13, w2, topk_weights, topk_ids)
+    assert out.shape == x.shape
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+def test_triton_sentinel_matches_zero_weight_masking():
+    """Sentinel-masking must be numerically equivalent to zero-weight-masking.
+
+    Exercises the large-batch path (numel >= 1024) and verifies that using
+    sentinel=num_experts produces identical output to keeping valid IDs but
+    zeroing their weights. This is the strongest guarantee that the Triton
+    kernel filters sentinel slots instead of accessing out-of-bounds weights.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import outplace_fused_experts
+
+    torch.manual_seed(7)
+    E, H, I = 8, 128, 64
+    N, topk = 1024, 4  # numel=4096 triggers the large-batch moe_align path
+    w13 = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn(E, H, I, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(N, H, dtype=torch.bfloat16, device="cuda")
+
+    ids_valid = torch.randint(0, E, (N, topk), dtype=torch.int64, device="cuda")
+    weights = torch.rand(N, topk, dtype=torch.bfloat16, device="cuda")
+    mask = torch.rand(N, topk, device="cuda") < 0.5
+    weights_masked = torch.where(mask, torch.zeros_like(weights), weights)
+
+    # A: valid expert IDs, zeroed weights where masked
+    out_a = outplace_fused_experts(x, w13, w2, weights_masked.clone(), ids_valid.clone())
+    # B: sentinel (num_experts) where masked, same zero weights
+    ids_sentinel = torch.where(mask, torch.full_like(ids_valid, E), ids_valid)
+    out_b = outplace_fused_experts(x, w13, w2, weights_masked.clone(), ids_sentinel)
+
+    # Should be bit-for-bit equal since sentinel slots must be skipped entirely.
+    diff = (out_a - out_b).abs().max().item()
+    assert diff < 1e-3, f"sentinel vs zero-weight masking not equivalent, diff={diff}"
 
 
 if __name__ == "__main__":
