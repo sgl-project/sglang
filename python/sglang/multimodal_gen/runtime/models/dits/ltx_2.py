@@ -496,6 +496,7 @@ class LTX2Attention(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_q",
         )
         self.to_k = ColumnParallelLinear(
             self.context_dim,
@@ -503,6 +504,7 @@ class LTX2Attention(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_k",
         )
         self.to_v = ColumnParallelLinear(
             self.context_dim,
@@ -510,6 +512,7 @@ class LTX2Attention(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_v",
         )
         self.to_gate_logits: ColumnParallelLinear | None = None
         if self.apply_gated_attention:
@@ -519,6 +522,7 @@ class LTX2Attention(nn.Module):
                 bias=True,
                 gather_output=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_gate_logits",
             )
 
         self.q_norm: nn.Module | None = None
@@ -546,6 +550,7 @@ class LTX2Attention(nn.Module):
                 bias=True,
                 input_is_parallel=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_out.0",
             ),
             nn.Identity(),
         )
@@ -682,6 +687,7 @@ class LTX2FeedForward(nn.Module):
         dim: int,
         dim_out: int | None = None,
         mult: int = 4,
+        prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
@@ -690,11 +696,21 @@ class LTX2FeedForward(nn.Module):
         inner_dim = int(dim * mult)
 
         self.proj_in = ColumnParallelLinear(
-            dim, inner_dim, bias=True, gather_output=True, quant_config=quant_config
+            dim,
+            inner_dim,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_in",
         )
         self.act = nn.GELU(approximate="tanh")
         self.proj_out = ColumnParallelLinear(
-            inner_dim, dim_out, bias=True, gather_output=True, quant_config=quant_config
+            inner_dim,
+            dim_out,
+            bias=True,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_out",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -820,9 +836,17 @@ class LTX2TransformerBlock(nn.Module):
         )
 
         # 4. Feedforward layers
-        self.ff = LTX2FeedForward(dim, dim_out=dim, quant_config=quant_config)
+        self.ff = LTX2FeedForward(
+            dim,
+            dim_out=dim,
+            prefix=f"{prefix}.ff",
+            quant_config=quant_config,
+        )
         self.audio_ff = LTX2FeedForward(
-            audio_dim, dim_out=audio_dim, quant_config=quant_config
+            audio_dim,
+            dim_out=audio_dim,
+            prefix=f"{prefix}.audio_ff",
+            quant_config=quant_config,
         )
 
         # 5. Modulation Parameters
@@ -1194,6 +1218,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="patchify_proj",
         )
         self.audio_patchify_proj = ColumnParallelLinear(
             arch.audio_in_channels,
@@ -1201,6 +1226,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="audio_patchify_proj",
         )
 
         # 2. Prompt embeddings
@@ -1376,7 +1402,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                         getattr(arch, "force_sdpa_v2a_cross_attention", False)
                     ),
                     supported_attention_backends=self._supported_attention_backends,
-                    prefix=config.prefix,
+                    prefix=f"transformer_blocks.{idx}",
                     quant_config=quant_config,
                 )
                 for idx in range(arch.num_layers)
@@ -1393,6 +1419,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="proj_out",
         )
 
         self.audio_norm_out = nn.LayerNorm(
@@ -1404,6 +1431,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="audio_proj_out",
         )
 
         self.out_channels_raw = arch.out_channels // (
