@@ -31,7 +31,6 @@ if not is_cpu():
 
 logger = logging.getLogger(__name__)
 
-
 # Kernel to track mamba states if needed based on track mask
 @triton.jit
 def track_mamba_state_if_needed_kernel(

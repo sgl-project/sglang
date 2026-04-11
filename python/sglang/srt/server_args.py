@@ -178,7 +178,14 @@ NSA_CHOICES = [
     "trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
+RADIX_EVICTION_POLICY_CHOICES = [
+    "lru",
+    "lfu",
+    "slru",
+    "marconi",
+    "marconi-fixed",
+    "seglen",
+]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -363,6 +370,7 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    marconi_eff_weight: float = 0.5
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -4305,7 +4313,13 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used, 'marconi' enables FLOP-aware eviction for hybrid SSM models, 'marconi-fixed' uses the nearest non-tombstoned Mamba ancestor when computing Marconi utility, and 'seglen' ranks by replay length to the nearest reusable Mamba ancestor.",
+        )
+        parser.add_argument(
+            "--marconi-eff-weight",
+            type=float,
+            default=ServerArgs.marconi_eff_weight,
+            help="Weight for FLOP efficiency term in Marconi eviction score [0.0, 2.0]. Only used when --radix-eviction-policy is marconi or marconi-fixed.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",
