@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=319, suite="stage-c-test-8-gpu-h200")
 
 NEMOTRON_3_SUPER_BF16_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
 
