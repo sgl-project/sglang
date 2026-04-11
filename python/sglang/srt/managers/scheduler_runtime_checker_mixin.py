@@ -109,7 +109,7 @@ class PoolStats:
         """Update pool-related fields on SchedulerStats."""
         num_used, _ = self.get_kv_token_stats()
         stats.num_used_tokens = num_used
-        stats.token_usage = self.get_max_pool_usage()
+        stats.token_usage = round(self.get_max_pool_usage(), 2)
         stats.full_token_usage = self.full_token_usage
         if self.is_hybrid_swa:
             stats.swa_token_usage = self.swa_token_usage
