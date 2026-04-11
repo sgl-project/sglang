@@ -2165,15 +2165,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        # Add A-proj fusion mapping when q_lora_rank is enabled
-        # q_a_proj + kv_a_proj_with_mqa -> fused_qkv_a_proj_with_mqa
-        if self.fuse_qkv_a_proj:
-            self.stacked_params_mapping.extend(
-                [
-                    ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
-                    ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
-                ]
-            )
         self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
