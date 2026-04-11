@@ -127,8 +127,13 @@ class TestTransformerQuantHelpers(unittest.TestCase):
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_metadata_from_safetensors_file"
     )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
+        side_effect=lambda path, **kw: path,
+    )
     def test_resolve_transformer_quant_load_spec_keeps_nunchaku_hook(
         self,
+        _mock_download,
         mock_metadata,
         _mock_quant_metadata,
         _mock_nvfp4,
