@@ -426,12 +426,6 @@ class SchedulerRuntimeCheckerMixin:
 
         return has_leak, messages
 
-    def self_check_during_idle(self: Scheduler):
-        """Idle memory check: all pools."""
-        has_leak, messages = self._check_all_pools(self.get_pool_stats())
-        if has_leak:
-            self._report_leak("pool", "\n".join(messages))
-
     def _maybe_log_idle_metrics(self: Scheduler):
         """Collect and log metrics every 30 seconds during idle."""
         if (
@@ -481,7 +475,9 @@ class SchedulerRuntimeCheckerMixin:
             return
 
         # memory leak check
-        self.self_check_during_idle()
+        has_leak, messages = self._check_all_pools(self.get_pool_stats())
+        if has_leak:
+            self._report_leak("pool", "\n".join(messages))
         self._check_req_pool()
 
         # tree cache sanity check
