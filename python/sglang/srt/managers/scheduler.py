@@ -365,6 +365,7 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.max_output_tokens = envs.SGLANG_MAX_OUTPUT_TOKENS.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
@@ -1662,12 +1663,16 @@ class Scheduler(
             self.external_corpus_manager.check_pending_load()
 
     def init_req_max_new_tokens(self, req):
+        max_new_tokens = (
+            req.sampling_params.max_new_tokens
+            if req.sampling_params.max_new_tokens is not None
+            else 1 << 30
+        )
+        if self.max_output_tokens is not None and self.max_output_tokens > 0:
+            max_new_tokens = min(max_new_tokens, self.max_output_tokens)
+
         req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
+            max_new_tokens,
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
 
