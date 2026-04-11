@@ -630,8 +630,8 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            if self.is_hybrid_swa and self.rem_swa_tokens < _rem_tokens:
-                _rem_tokens = int(self.rem_swa_tokens)
+            if self.is_hybrid_swa:
+                _rem_tokens = min(_rem_tokens, int(self.rem_swa_tokens))
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
