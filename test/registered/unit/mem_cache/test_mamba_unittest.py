@@ -499,15 +499,12 @@ class TestMamba(unittest.TestCase):
         # --- Step 1: Simulate chunked prefill with pending_radix_mamba_slot ---
         req1 = make_dummy_req()
         assert req1.mamba_pool_idx is not None
-        # After alloc: 1 working slot consumed
-        self.assertEqual(mamba_pool.available_size(), initial_mamba_avail - 1)
-
-        # Simulate the scheduler allocating a pending radix slot (what prepare_for_extend does)
-        pending_slot = mamba_pool.alloc(1)
-        self.assertIsNotNone(pending_slot)
-        req1.pending_radix_mamba_slot = pending_slot
-        # Now: 1 working + 1 pending = 2 slots consumed
+        # After alloc: 1 working + 1 pending (pre-allocated by HybridReqToTokenPool.alloc)
+        self.assertIsNotNone(req1.pending_radix_mamba_slot)
         self.assertEqual(mamba_pool.available_size(), initial_mamba_avail - 2)
+
+        # Use the pre-allocated pending slot
+        pending_slot = req1.pending_radix_mamba_slot
 
         # Write distinctive data into the pending slot to verify it survives
         # ownership transfer. We write to the conv state of layer 0.
@@ -587,9 +584,9 @@ class TestMamba(unittest.TestCase):
         # Simulate a decode phase: req2 matched prefix [1,2,3,4,5] and decoded [6,7]
         req2.origin_input_ids = [1, 2, 3, 4, 5]
         req2.output_ids = [6, 7]
-        new_pending = mamba_pool.alloc(1)
+        # Use the pre-allocated pending slot from make_dummy_req
+        new_pending = req2.pending_radix_mamba_slot
         self.assertIsNotNone(new_pending)
-        req2.pending_radix_mamba_slot = new_pending
         mamba_pool.mamba_cache.conv[0][:, new_pending[0]] = 99.0
         req2.mamba_last_track_seqlen = 7
         req2.kv_committed_len = 7
@@ -644,7 +641,10 @@ class TestMamba(unittest.TestCase):
         req3.origin_input_ids = [1, 2, 3, 4, 5, 6, 7]
         req3.output_ids = [8]  # short output, no tracking occurred
         req3.mamba_last_track_seqlen = None
-        req3.pending_radix_mamba_slot = None
+        # Free the pre-allocated pending slot to simulate no tracking
+        if req3.pending_radix_mamba_slot is not None:
+            mamba_pool.free(req3.pending_radix_mamba_slot)
+            req3.pending_radix_mamba_slot = None
         req3.cache_protected_len = 7
         req3.kv_committed_len = 8
         req3.kv_allocated_len = 8
@@ -673,9 +673,8 @@ class TestMamba(unittest.TestCase):
         # --- Step 5: free_mamba_cache with both working + pending ---
         req4 = make_dummy_req()
         tree.dec_lock_ref(req4.last_node)
-        pending_slot4 = mamba_pool.alloc(1)
-        self.assertIsNotNone(pending_slot4)
-        req4.pending_radix_mamba_slot = pending_slot4
+        # req4 already has a pre-allocated pending slot from make_dummy_req
+        self.assertIsNotNone(req4.pending_radix_mamba_slot)
         avail_before = mamba_pool.available_size()
 
         req_to_token_pool.free_mamba_cache(req4)
