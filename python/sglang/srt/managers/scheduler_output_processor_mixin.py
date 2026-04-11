@@ -588,7 +588,7 @@ class SchedulerOutputProcessorMixin:
                 actual_seq_len = req.seqlen - 1
                 if (
                     actual_seq_len // mamba_track_interval
-                    != (actual_seq_len - result.accept_length_per_req_cpu[i])
+                    != (actual_seq_len - result.accept_length_per_req_cpu[i] - 1)
                     // mamba_track_interval
                 ):
                     req.mamba_next_track_idx = (

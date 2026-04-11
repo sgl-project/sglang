@@ -47,6 +47,13 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
         required=False,
         help="Path to dump the performance metrics (JSON) for the run.",
     )
+    parser.add_argument(
+        "--output-file-path",
+        type=str,
+        default=None,
+        required=False,
+        help="Convenience alias that sets both --output-path and --output-file-name.",
+    )
 
     parser = ServerArgs.add_cli_args(parser)
     parser = SamplingParams.add_cli_args(parser)
@@ -58,6 +65,18 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     )
 
     return parser
+
+
+def _apply_output_file_path_override(
+    args: argparse.Namespace, sampling_params_kwargs: dict
+):
+    output_file_path = args.output_file_path
+    if not output_file_path:
+        return
+
+    output_path = os.path.dirname(output_file_path) or "."
+    sampling_params_kwargs["output_path"] = output_path
+    sampling_params_kwargs["output_file_name"] = os.path.basename(output_file_path)
 
 
 def maybe_dump_performance(
@@ -129,6 +148,7 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
         )
 
     sampling_params_kwargs.update(SamplingParams.get_cli_args(args))
+    _apply_output_file_path_override(args, sampling_params_kwargs)
     sampling_params_kwargs["request_id"] = generate_request_id()
 
     # Handle diffusers-specific kwargs passed via CLI
