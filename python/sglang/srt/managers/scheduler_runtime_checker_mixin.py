@@ -476,12 +476,23 @@ class SchedulerRuntimeCheckerMixin:
         if not self.is_fully_idle():
             return
 
-        self.self_check_during_idle()  # memory leak check
-        self._check_tree_cache()  # tree cache sanity check
-        self._maybe_log_idle_metrics()  # metrics every 30s
-        self._publish_kv_events()  # kv event publishing
-        self.new_token_ratio = self.init_new_token_ratio  # reset token ratio
-        self.maybe_sleep_on_idle()  # sleep until next event
+        # memory leak check
+        self.self_check_during_idle()
+
+        # tree cache sanity check
+        self._check_tree_cache()
+
+        # metrics every 30s
+        self._maybe_log_idle_metrics()
+
+        # kv event publishing
+        self._publish_kv_events()
+
+        # reset token ratio
+        self.new_token_ratio = self.init_new_token_ratio
+
+        # sleep until next event
+        self.maybe_sleep_on_idle()
 
 
 def create_scheduler_watchdog(
