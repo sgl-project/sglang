@@ -39,6 +39,10 @@ class SuffixAutomaton {
     return !loaded_;
   }
 
+  int64_t tokenCount() const {
+    return pos_;
+  }
+
   Result buildRecency(
       const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
 
