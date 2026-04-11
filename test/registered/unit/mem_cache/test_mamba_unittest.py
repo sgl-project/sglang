@@ -531,8 +531,9 @@ class TestMamba(unittest.TestCase):
         # cache_unfinished_req should transfer pending slot to radix tree
         tree.cache_unfinished_req(req1, chunked=True)
 
-        # After cache_unfinished_req: pending slot is now owned by radix tree
-        self.assertIsNone(req1.pending_radix_mamba_slot)
+        # After cache_unfinished_req: old pending slot transferred to radix tree,
+        # new one pre-allocated for next chunk/decode.
+        self.assertIsNotNone(req1.pending_radix_mamba_slot)
         # Working slot still alive
         self.assertIsNotNone(req1.mamba_pool_idx)
 
@@ -764,7 +765,10 @@ class TestMamba(unittest.TestCase):
         req_to_token_pool.write((req.req_pool_idx, slice(0, 3)), kv1)
         tree.cache_unfinished_req(req, chunked=True)
 
-        self.assertIsNone(req.pending_radix_mamba_slot)
+        # cache_unfinished_req transfers the old pending slot to the radix tree
+        # and pre-allocates a new one for the next chunk.
+        self.assertIsNotNone(req.pending_radix_mamba_slot)
+        self.assertFalse(torch.equal(req.pending_radix_mamba_slot, pending1))
 
         # Verify chunk 1 mamba state is in radix tree
         result1 = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
@@ -777,9 +781,8 @@ class TestMamba(unittest.TestCase):
         )
 
         # Chunk 2: tokens [1,2,3,4,5,6]
-        pending2 = mamba_pool.alloc(1)
-        self.assertIsNotNone(pending2)
-        req.pending_radix_mamba_slot = pending2
+        # Use the pre-allocated pending slot from cache_unfinished_req
+        pending2 = req.pending_radix_mamba_slot
         mamba_pool.mamba_cache.conv[0][:, pending2[0]] = 20.0
 
         req.fill_ids = [1, 2, 3, 4, 5, 6]
@@ -791,7 +794,9 @@ class TestMamba(unittest.TestCase):
         req_to_token_pool.write((req.req_pool_idx, slice(3, 6)), kv2)
         tree.cache_unfinished_req(req, chunked=True)
 
-        self.assertIsNone(req.pending_radix_mamba_slot)
+        # Again, old pending transferred to tree, new one pre-allocated
+        self.assertIsNotNone(req.pending_radix_mamba_slot)
+        self.assertFalse(torch.equal(req.pending_radix_mamba_slot, pending2))
 
         # Verify chunk 2 mamba state is in radix tree (should supersede chunk 1's)
         result2 = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 5, 6])))
