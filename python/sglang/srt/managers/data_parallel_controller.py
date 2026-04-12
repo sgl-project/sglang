@@ -577,7 +577,7 @@ class DataParallelController:
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        estimated_tokens = len(req.origin_input_ids)
+        estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
