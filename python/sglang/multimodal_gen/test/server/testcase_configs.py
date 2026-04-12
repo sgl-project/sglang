@@ -4,12 +4,13 @@ Configuration and data structures for diffusion performance tests.
 Usage:
 
 pytest python/sglang/multimodal_gen/test/server/test_server_a.py
-# for a single testcase, look for the name of the testcases in DIFFUSION_CASES
+# for a single testcase, look for the name of the testcase in ONE_GPU_CASES_A,
+# ONE_GPU_CASES_B, ONE_GPU_CASES_C, TWO_GPU_CASES_A, or TWO_GPU_CASES_B
 pytest python/sglang/multimodal_gen/test/server/test_server_a.py -k qwen_image_t2i
 
 
 To add a new testcase:
-1. add your testcase with case-id: `my_new_test_case_id` to DIFFUSION_CASES
+1. add your testcase with case-id: `my_new_test_case_id` to the appropriate `*_CASES_*` list
 2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
@@ -109,6 +110,7 @@ class ScenarioConfig:
     expected_e2e_ms: float
     expected_avg_denoise_ms: float
     expected_median_denoise_ms: float
+    estimated_full_test_time_s: float | None = None
 
 
 @dataclass
@@ -140,6 +142,7 @@ class BaselineConfig:
                 expected_e2e_ms=float(cfg["expected_e2e_ms"]),
                 expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
                 expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
             )
 
         return cls(
@@ -164,6 +167,7 @@ class BaselineConfig:
                 expected_e2e_ms=float(cfg["expected_e2e_ms"]),
                 expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
                 expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+                estimated_full_test_time_s=cfg.get("estimated_full_test_time_s"),
             )
 
         self.scenarios.update(scenarios_new)
