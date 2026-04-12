@@ -20,8 +20,10 @@ on:
         default: false
 
 concurrency:
-  group: xpu-runner-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  # Each PR has its own group, so new commits cancel old runs for the same PR
+  # But different PRs and nightly tests run independently or queue on the runner
+  group: pr-xpu-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # ==================== Check Changes ==================== #

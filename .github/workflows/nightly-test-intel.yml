@@ -3,12 +3,13 @@ name: Nightly Test (Intel)
 on:
   schedule:
     # Nightly test at 19:15 Beijing Time (UTC+8) = 11:15 UTC
-    - cron: '16 11 * * *'
+    - cron: '15 11 * * *'
   push:
     branches:
       - main
     paths:
       - "python/sglang/version.py"
+      - ".github/workflows/nightly-test-intel.yml"
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -19,9 +20,9 @@ on:
         default: ""
 
 concurrency:
-  # Share concurrency group with PR tests so they queue during nightly runs
-  group: xpu-runner-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  # Nightly has its own group, won't be cancelled by PR tests
+  group: nightly-xpu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   nightly-test:
