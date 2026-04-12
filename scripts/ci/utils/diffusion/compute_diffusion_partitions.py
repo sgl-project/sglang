@@ -107,11 +107,7 @@ def lpt_partition(
 def build_matrix(partition_count: int) -> dict:
     if partition_count <= 0:
         return {"include": []}
-    return {
-        "include": [
-            {"part": i, "total": partition_count} for i in range(partition_count)
-        ]
-    }
+    return {"include": [{"part": i} for i in range(partition_count)]}
 
 
 def build_partition_plan(
@@ -147,6 +143,14 @@ def output_github_value(name: str, value: dict) -> None:
         with open(github_output, "a", encoding="utf-8") as f:
             f.write(f"{name}={value_json}\n")
     print(f"{name}={value_json}")
+
+
+def output_github_scalar(name: str, value: str) -> None:
+    github_output = os.environ.get("GITHUB_OUTPUT")
+    if github_output:
+        with open(github_output, "a", encoding="utf-8") as f:
+            f.write(f"{name}={value}\n")
+    print(f"{name}={value}")
 
 
 def print_suite_summary(
@@ -267,6 +271,7 @@ def main():
 
         output_name = SUITE_OUTPUT_NAMES[suite_name]
         output_github_value(f"matrix-{output_name}", build_matrix(partition_count))
+        output_github_scalar(f"partition-count-{output_name}", str(partition_count))
         output_github_value(
             f"plan-{output_name}", build_partition_plan(suite_name, partitions)
         )

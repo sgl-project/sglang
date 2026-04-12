@@ -62,6 +62,8 @@ jobs:
     outputs:
       matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
       matrix-2gpu: ${{ steps.compute.outputs.matrix-2gpu }}
+      partition-count-1gpu: ${{ steps.compute.outputs['partition-count-1gpu'] }}
+      partition-count-2gpu: ${{ steps.compute.outputs['partition-count-2gpu'] }}
       plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
       plan-2gpu: ${{ steps.compute.outputs.plan-2gpu }}
     steps:
@@ -132,7 +134,7 @@ jobs:
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions ${{ matrix.total }} \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-1gpu'] }} \
             --partition-plan-json "$PARTITION_PLAN_JSON" \
             $CONTINUE_ON_ERROR_FLAG
 
@@ -202,7 +204,7 @@ jobs:
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions ${{ matrix.total }} \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }} \
             --partition-plan-json "$PARTITION_PLAN_JSON" \
             $CONTINUE_ON_ERROR_FLAG
 
