@@ -661,6 +661,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        output_ids_accum: Dict[int, List[int]] = {}
 
         stream_started = False
         try:
@@ -684,6 +685,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+
+                # Accumulate output token IDs for return_token_ids feature.
+                # output_ids is always cumulative in non-incremental streaming
+                # (same as routed_experts — just overwrite each chunk).
+                if request.return_token_ids:
+                    output_ids_accum[index] = list(content.get("output_ids") or [])
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -894,6 +901,31 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
+            # Send token IDs if requested (covers all choices after generation is complete)
+            if request.return_token_ids and output_ids_accum:
+                n_choices = request.n or 1
+                prompt_ids = getattr(adapted_request, "input_ids", None)
+                # Only include prompt_ids for non-multimodal requests (flat list of ints)
+                if (
+                    isinstance(prompt_ids, list)
+                    and prompt_ids
+                    and isinstance(prompt_ids[0], list)
+                ):
+                    prompt_ids = None
+                token_ids_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[],
+                    model=request.model,
+                    sglext=SglExt(
+                        completion_token_ids=[
+                            output_ids_accum.get(i, []) for i in range(n_choices)
+                        ],
+                        prompt_token_ids=prompt_ids,
+                    ),
+                )
+                yield f"data: {token_ids_chunk.model_dump_json()}\n\n"
+
             # Additional usage chunk
             if include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
@@ -938,10 +970,22 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
+        prompt_token_ids = None
+        if request.return_token_ids:
+            input_ids = getattr(adapted_request, "input_ids", None)
+            # Only include for non-multimodal requests (flat list of ints)
+            if (
+                isinstance(input_ids, list)
+                and input_ids
+                and not isinstance(input_ids[0], list)
+            ):
+                prompt_token_ids = input_ids
+
         response = self._build_chat_response(
             request,
             ret,
             int(time.time()),
+            prompt_token_ids=prompt_token_ids,
         )
 
         return response
@@ -951,6 +995,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         ret: List[Dict[str, Any]],
         created: int,
+        prompt_token_ids: Optional[List[int]] = None,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
         choices = []
@@ -962,10 +1007,17 @@ class OpenAIServingChat(OpenAIServingBase):
             first_ret, request
         )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or request.return_token_ids:
+            completion_token_ids = None
+            if request.return_token_ids:
+                completion_token_ids = [
+                    ret_item.get("output_ids", []) for ret_item in ret
+                ]
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                completion_token_ids=completion_token_ids,
+                prompt_token_ids=prompt_token_ids if request.return_token_ids else None,
             )
 
         for idx, ret_item in enumerate(ret):

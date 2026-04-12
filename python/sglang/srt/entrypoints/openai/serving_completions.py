@@ -224,6 +224,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        output_ids_accum = {}
 
         stream_started = False
         try:
@@ -248,6 +249,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+
+                if request.return_token_ids:
+                    # output_ids is always cumulative in non-incremental streaming; just overwrite
+                    output_ids_accum[index] = list(content.get("output_ids") or [])
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -389,6 +394,21 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     )
                     yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
+            if request.return_token_ids and output_ids_accum:
+                n_choices = request.n or 1
+                completion_token_ids = [
+                    output_ids_accum.get(i, []) for i in range(n_choices)
+                ]
+                token_ids_chunk = CompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=created,
+                    object="text_completion",
+                    choices=[],
+                    model=request.model,
+                    sglext=SglExt(completion_token_ids=completion_token_ids),
+                )
+                yield f"data: {token_ids_chunk.model_dump_json()}\n\n"
+
             # Handle final usage chunk
             if include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
@@ -435,10 +455,21 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
+        prompt_token_ids = None
+        if request.return_token_ids:
+            input_ids = getattr(adapted_request, "input_ids", None)
+            if (
+                input_ids is not None
+                and len(input_ids) > 0
+                and not isinstance(input_ids[0], list)
+            ):
+                prompt_token_ids = list(input_ids)
+
         response = self._build_completion_response(
             request,
             ret,
             int(time.time()),
+            prompt_token_ids=prompt_token_ids,
         )
 
         return response
@@ -448,6 +479,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         request: CompletionRequest,
         ret: List[Dict[str, Any]],
         created: int,
+        prompt_token_ids: Optional[List[int]] = None,
     ) -> CompletionResponse:
         """Build completion response from generation results"""
         choices = []
@@ -465,11 +497,18 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        completion_token_ids = None
+        if request.return_token_ids:
+            completion_token_ids = [
+                list(ret_item.get("output_ids") or []) for ret_item in ret
+            ]
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or request.return_token_ids:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                prompt_token_ids=prompt_token_ids if request.return_token_ids else None,
+                completion_token_ids=completion_token_ids,
             )
 
         for idx, ret_item in enumerate(ret):
