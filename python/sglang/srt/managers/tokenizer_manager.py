@@ -1269,12 +1269,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 out = out_list[-1]
 
             # Resolve deferred text for non-incremental streaming.
-            # _handle_batch_output omits "text" from intermediate chunks to
-            # avoid O(n) string rebuild per step (O(n^2) total).
-            # Guard: only for BatchStrOutput requests (which accumulate text).
-            if is_stream and not incremental_stream and "text" not in out:
-                if state.text or state.text_chunks:
-                    out["text"] = state.get_text()
+            # _handle_batch_output sets "text": None on intermediate chunks
+            # to avoid O(n) string rebuild per step (O(n^2) total).
+            if (
+                is_stream
+                and not incremental_stream
+                and "text" in out
+                and out["text"] is None
+            ):
+                out["text"] = state.get_text()
 
             if finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_time` has not been set yet).
@@ -1730,8 +1733,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     else:
                         # Non-incremental intermediate: pass reference (no
                         # copy) and defer text to _wait_one_response to avoid
-                        # O(n) per-step cost that compounds to O(n²).
+                        # O(n) per-step cost that compounds to O(n^2).
                         out_dict = {
+                            "text": None,
                             "output_ids": state.output_ids,
                             "meta_info": meta_info,
                         }
