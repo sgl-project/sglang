@@ -13,10 +13,13 @@
 # ==============================================================================
 
 import json
+import logging
 import os
 from typing import Dict, Optional
 
 from huggingface_hub import snapshot_download
+
+logger = logging.getLogger(__name__)
 
 
 class LoRAConfig:
@@ -25,6 +28,7 @@ class LoRAConfig:
         path: Optional[str] = None,
         config_dict: Optional[Dict] = None,
         added_tokens_config: Optional[Dict] = None,
+        base_vocab_size: Optional[int] = None,
     ) -> None:
         self.path = path
 
@@ -38,17 +42,41 @@ class LoRAConfig:
         self.target_modules = self.hf_config["target_modules"]
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
+
+        # Filter fake added tokens: tokens with ID < base_vocab_size are already
+        # part of the base vocabulary and should not be treated as added tokens.
+        # This commonly happens when added_tokens.json is copied from the base
+        # model's tokenizer.
+        if self.added_tokens_config and base_vocab_size is not None:
+            self.added_tokens_config = {
+                token: token_id
+                for token, token_id in self.added_tokens_config.items()
+                if token_id >= base_vocab_size
+            }
+
         self.lora_added_tokens_size = (
             len(self.added_tokens_config) if self.added_tokens_config is not None else 0
         )
+
+        if self.lora_added_tokens_size > 0:
+            raise ValueError(
+                f"LoRA adapter has {self.lora_added_tokens_size} added tokens, "
+                f"but added tokens are not supported yet. "
+                f"Added tokens: {self.added_tokens_config}"
+            )
 
     @classmethod
     def from_dict(
         cls,
         config_dict: Dict,
         added_tokens_config: Optional[Dict] = None,
+        base_vocab_size: Optional[int] = None,
     ) -> "LoRAConfig":
-        return cls(config_dict=config_dict, added_tokens_config=added_tokens_config)
+        return cls(
+            config_dict=config_dict,
+            added_tokens_config=added_tokens_config,
+            base_vocab_size=base_vocab_size,
+        )
 
     def get_lora_config(self, dummy=False):
         if dummy:
@@ -82,9 +110,5 @@ class LoRAConfig:
             with open(added_tokens_path, "r") as f:
                 return json.load(f)
         except json.JSONDecodeError as e:
-            # Log warning but don't crash if JSON is malformed
-            import logging
-
-            logger = logging.getLogger(__name__)
             logger.warning(f"Failed to parse added_tokens.json: {e}")
             return None

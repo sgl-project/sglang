@@ -23,7 +23,7 @@ from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=30, suite="stage-a-cpu-only", nightly=True)
+register_cpu_ci(est_time=30, suite="stage-a-test-cpu", nightly=True)
 
 
 class TestBuildTokenIndexSGLangThd:

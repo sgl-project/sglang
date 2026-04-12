@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=600, suite="nightly-4-gpu-b200", nightly=True)
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:
@@ -49,17 +49,17 @@ class FlashinferTrtllmGenMoeBackendFP8Base:
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreater(metrics["score"], 0.93)
 
 
 class FlashinferTrtllmGenMoeBackendBF16Base:
@@ -97,17 +97,17 @@ class FlashinferTrtllmGenMoeBackendBF16Base:
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreater(metrics["score"], 0.93)
 
 
 class FlashinferTrtllmGenMoeBackendMXFP8Base:
@@ -144,17 +144,17 @@ class FlashinferTrtllmGenMoeBackendMXFP8Base:
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreater(metrics["score"], 0.93)
 
 
 class TestFlashinferTrtllmGenMoeBackendFP8(
@@ -183,6 +183,12 @@ class TestFlashinferTrtllmGenMoeBackendFP8Routed(
 
 class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
     FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm_routed"
+
+
+class TestFlashinferTrtllmGenMoeBackendBF16Routed(
+    FlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm_routed"
 

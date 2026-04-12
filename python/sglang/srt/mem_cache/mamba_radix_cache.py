@@ -74,6 +74,7 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.mamba_value: Optional[torch.Tensor] = None
+        self.mamba_host_value: Optional[torch.Tensor] = None
         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
         # full_lock_ref is always >= mamba_lock_ref.
@@ -86,6 +87,7 @@ class TreeNode:
 
         self.hit_count = 0
         self.host_ref_counter = 0
+        self.host_mamba_ref_counter = 0
         # store the host indices of KV cache
         self.host_value = None
         # store hash values of each pages
@@ -98,6 +100,8 @@ class TreeNode:
         self.next = None
         self.mamba_prev = None
         self.mamba_next = None
+        self.host_mamba_prev = None
+        self.host_mamba_next = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -107,19 +111,38 @@ class TreeNode:
         return self.value is None
 
     @property
+    def mamba_evicted(self):
+        return self.mamba_value is None
+
+    @property
     def backuped(self):
         return self.host_value is not None
 
+    @property
+    def mamba_backuped(self):
+        return self.mamba_host_value is not None
+
     def protect_host(self):
-        """Protect the host value from eviction."""
+        """Protect the host KV value from eviction."""
         self.host_ref_counter += 1
 
     def release_host(self):
-        """Release the host value, allowing it to be evicted."""
+        """Release the host KV value, allowing it to be evicted."""
         if self.host_ref_counter > 0:
             self.host_ref_counter -= 1
         else:
             raise RuntimeError("Host reference counter is already zero.")
+
+    def protect_host_mamba(self):
+        """Protect the host mamba value from eviction."""
+        self.host_mamba_ref_counter += 1
+
+    def release_host_mamba(self):
+        """Release the host mamba value, allowing it to be evicted."""
+        if self.host_mamba_ref_counter > 0:
+            self.host_mamba_ref_counter -= 1
+        else:
+            raise RuntimeError("Host mamba reference counter is already zero.")
 
     def get_last_hash_value(self) -> Optional[str]:
         """Returns the hash value of the last page in this node."""

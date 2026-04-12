@@ -21,7 +21,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=2, suite="stage-a-test-small-1-gpu-amd")
+register_amd_ci(est_time=2, suite="stage-a-test-1-gpu-small-amd")
 
 device = get_device()
 

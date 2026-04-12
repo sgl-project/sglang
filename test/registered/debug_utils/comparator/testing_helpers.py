@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
     est_time=0,
-    suite="stage-a-cpu-only",
+    suite="stage-a-test-cpu",
     nightly=True,
     disabled="helper module, no tests",
 )

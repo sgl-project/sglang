@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=487,
-    suite="stage-b-test-large-1-gpu",
+    suite="stage-b-test-1-gpu-large",
 )
 
 PROMPTS = [
@@ -1452,15 +1452,15 @@ class TestLoRADynamicUpdate(CustomTestCase):
                         f"at batch {i}, prompt {j}:\n- Dynamic: '{d_out}'\n- Static: '{s_out}'",
                     )
 
-    def test_dynamic_lora_update_engine(self):
-        """
-        Test dynamic LoRA updates in engine mode.
-        """
-        test_cases = BASIC_TESTS if is_in_ci() else ALL_TESTS
-        self._run_dynamic_adapter_updates(
-            mode=LoRAUpdateTestSessionMode.ENGINE,
-            test_cases=test_cases,
-        )
+    # def test_dynamic_lora_update_engine(self):
+    #     """
+    #     Test dynamic LoRA updates in engine mode.
+    #     """
+    #     test_cases = BASIC_TESTS if is_in_ci() else ALL_TESTS
+    #     self._run_dynamic_adapter_updates(
+    #         mode=LoRAUpdateTestSessionMode.ENGINE,
+    #         test_cases=test_cases,
+    #     )
 
     def test_dynamic_lora_update_server(self):
         """

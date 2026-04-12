@@ -23,7 +23,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=60, suite="stage-a-cpu-only", nightly=True)
+register_cpu_ci(est_time=60, suite="stage-a-test-cpu", nightly=True)
 
 _PUBLISH_DIR: Path = Path("/tmp/comparator_manual_verify")
 _PNG_MAGIC: bytes = b"\x89PNG"

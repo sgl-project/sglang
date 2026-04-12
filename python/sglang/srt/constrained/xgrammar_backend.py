@@ -23,6 +23,7 @@ from xgrammar import (
     CompiledGrammar,
     GrammarCompiler,
     GrammarMatcher,
+    StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
@@ -104,11 +105,7 @@ class XGrammarGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if (
-            logits.device.type == "cuda"
-            or logits.device.type == "npu"
-            or logits.device.type == "xpu"
-        ):
+        if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
@@ -299,9 +296,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     )
                     for structure in structural_tag["structures"]
                 ]
-                ctx = self.grammar_compiler.compile_structural_tag(
+                new_tag = StructuralTag.from_legacy_structural_tag(
                     tags, structural_tag["triggers"]
                 )
+                new_tag.format.at_least_one = structural_tag.get("at_least_one", False)
+                ctx = self.grammar_compiler.compile_structural_tag(new_tag)
             else:
                 format_dict = structural_tag.get("format")
                 if isinstance(format_dict, dict):
@@ -317,6 +316,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         )
 
     def reset(self):
+        super().reset()
         self.grammar_compiler.clear_cache()
 
 
