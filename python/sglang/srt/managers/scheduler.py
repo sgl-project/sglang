@@ -1850,9 +1850,9 @@ class Scheduler(
 
         elif (
             session_id in self.session_controller
-            and not self.session_controller.get(session_id).pending_close
+            and not self.session_controller.get(session_id).close_on_finish
         ):
-            # Session exists and is not pending close: create request from session
+            # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
             req = session.create_req(
                 recv_req,
@@ -1869,7 +1869,13 @@ class Scheduler(
                 return
 
         else:
-            # Session ID provided but session not found
+            # Session not found, or session is closing
+            if session_id in self.session_controller:
+                error_msg = (
+                    f"Invalid request: close was requested for session {session_id}"
+                )
+            else:
+                error_msg = f"Invalid request: session id {session_id} does not exist"
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1878,9 +1884,7 @@ class Scheduler(
                 vocab_size=self.model_config.vocab_size,
             )
             req.tokenizer = self.tokenizer
-            req.set_finish_with_abort(
-                f"Invalid request: session id {session_id} does not exist"
-            )
+            req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return

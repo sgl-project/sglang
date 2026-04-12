@@ -93,7 +93,7 @@ class Session:
         self.timeout = timeout
         self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
-        self.pending_close: bool = False
+        self.close_on_finish: bool = False
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
@@ -305,8 +305,8 @@ class SessionController:
             # session for deferred cleanup: the request keeps its session
             # reference so cache_finished_req takes the streaming path,
             # and we schedule release_session for after it completes.
-            if not session.pending_close:
-                session.pending_close = True
+            if not session.close_on_finish:
+                session.close_on_finish = True
                 logger.info(
                     "Deferring session close for %s (active request still decoding)",
                     session_id,
@@ -347,14 +347,14 @@ class SessionController:
             pending = [
                 sid
                 for sid, session in self.sessions.items()
-                if session.pending_close and self._all_requests_finished(session)
+                if session.close_on_finish and self._all_requests_finished(session)
             ]
             for sid in pending:
                 log_info_on_rank0(
                     logger, f"Deferred close ready for session {sid}, releasing."
                 )
-                # Reset pending_close so _close proceeds with the release.
-                self.sessions[sid].pending_close = False
+                # Reset close_on_finish so _close proceeds with the release.
+                self.sessions[sid].close_on_finish = False
                 self._close(sid)
 
             timed_out = [
