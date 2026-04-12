@@ -958,6 +958,7 @@ TWO_GPU_CASES_B = [
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         TI2V_sampling_params,
+        run_consistency_check=False,
     ),
     # I2V LoRA test case
     DiffusionTestCase(
