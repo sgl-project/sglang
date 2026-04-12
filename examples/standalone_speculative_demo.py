@@ -49,7 +49,7 @@ CONFIGS = {
     "llama-70b": dict(
         target="meta-llama/Llama-3.1-70B-Instruct",
         draft="meta-llama/Llama-3.1-8B-Instruct",
-        base_engine=dict(mem_fraction_static=0.7, tp_size=2),
+        base_engine=dict(mem_fraction_static=0.95, tp_size=2),
         spec_kwargs=dict(
             speculative_algorithm="STANDALONE",
             speculative_num_steps=4,
