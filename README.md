@@ -6,7 +6,7 @@
 [![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/carlosfundora/sglang-1-bit-turbo/blob/main/LICENSE)
 ---
 
-## SGLang 1-Bit Turbo EAGLE — AMD ROCm Inference with Aggressive Quantization and Speculative Decoding
+## SGLang 1-Bit Turbo — AMD ROCm Inference with PrismML Quantization + Speculative Decoding Support
 
 A fork of [SGLang](https://github.com/sgl-project/sglang) that brings high-performance inference to AMD consumer GPUs (RX 6000/7000 series) with integrated support for extreme KV cache compression, speculative decoding, and 1-bit quantized model serving.
 
