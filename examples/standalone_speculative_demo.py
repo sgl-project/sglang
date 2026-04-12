@@ -48,6 +48,7 @@ SPEC_CONFIG = dict(
     speculative_eagle_topk=2,
     speculative_num_draft_tokens=7,
     mem_fraction_static=0.7,
+    tp_size=2,
 )
 
 
@@ -105,6 +106,7 @@ def run_server_mode(use_spec: bool):
         "--port", str(port),
         "--host", "127.0.0.1",
         "--mem-fraction-static", str(SPEC_CONFIG["mem_fraction_static"]),
+        "--tp-size", str(SPEC_CONFIG["tp_size"]),
         "--cuda-graph-max-bs", str(len(PROMPTS)),
         "--log-level", "warning",
     ]
