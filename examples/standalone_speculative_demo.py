@@ -32,7 +32,7 @@ BASE_ENGINE_KWARGS = dict(
     model_path=TARGET_MODEL,
     cuda_graph_max_bs=len(PROMPTS),
     mem_fraction_static=0.5,
-    tp_size=2,
+    # tp_size=2,
 )
 
 SPEC_KWARGS = dict(
