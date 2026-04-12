@@ -424,6 +424,13 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_audio_valid_token_count = int(valid_local_frames)
         return audio_latents, True
 
+    def can_shard_audio_latents_for_sp(self, audio_latents) -> bool:
+        return (
+            get_sp_world_size() > 1
+            and isinstance(audio_latents, torch.Tensor)
+            and audio_latents.ndim == 3
+        )
+
     def gather_audio_latents_for_sp(self, audio_latents, batch):
         if get_sp_world_size() <= 1:
             return audio_latents
@@ -433,10 +440,49 @@ class LTX2PipelineConfig(PipelineConfig):
         audio_latents = sequence_model_parallel_all_gather(
             audio_latents.contiguous(), dim=1
         )
-        orig_num_frames = int(getattr(batch, "sp_audio_orig_num_frames", 0))
+        orig_num_frames = int(batch.sp_audio_orig_num_frames)
         if orig_num_frames > 0:
             audio_latents = audio_latents[:, :orig_num_frames, :]
         return audio_latents
+
+    def prepare_video_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        latent_model_input,
+        *,
+        num_frames,
+        height,
+        width,
+    ):
+        if not batch.did_sp_shard_latents:
+            return None
+        return model.rope.prepare_video_coords(
+            batch_size=int(latent_model_input.shape[0]),
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            device=latent_model_input.device,
+            fps=batch.fps,
+            start_frame=int(batch.sp_video_start_frame),
+        )
+
+    def prepare_audio_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        audio_latent_model_input,
+        *,
+        num_frames,
+    ):
+        if not batch.did_sp_shard_audio_latents:
+            return None
+        return model.audio_rope.prepare_audio_coords(
+            batch_size=int(audio_latent_model_input.shape[0]),
+            num_frames=num_frames,
+            device=audio_latent_model_input.device,
+            start_frame=int(batch.sp_audio_start_frame),
+        )
 
     def maybe_pack_audio_latents(self, latents, batch_size, batch):
         # If already packed (3D shape [B, T, C*F]), skip packing

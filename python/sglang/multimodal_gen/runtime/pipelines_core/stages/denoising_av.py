@@ -234,7 +234,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
     def _should_use_ltx23_legacy_one_stage(
         cls,
         server_args: ServerArgs,
-        pipeline: object | None,
+        pipeline_name: str | None,
     ) -> bool:
         if not is_ltx23_native_variant(
             server_args.pipeline_config.vae_config.arch_config
@@ -242,7 +242,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
             return False
         if server_args.pipeline_class_name == "LTX2TwoStagePipeline":
             return False
-        return getattr(pipeline, "pipeline_name", None) != "LTX2TwoStagePipeline"
+        return pipeline_name != "LTX2TwoStagePipeline"
 
     @classmethod
     def _should_shard_ltx23_legacy_one_stage_audio_latents(
@@ -256,8 +256,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 server_args.pipeline_config.vae_config.arch_config
             )
             and cls._should_use_ltx23_legacy_one_stage(server_args, None)
-            and isinstance(batch.audio_latents, torch.Tensor)
-            and hasattr(server_args.pipeline_config, "shard_audio_latents_for_sp")
+            and server_args.pipeline_config.can_shard_audio_latents_for_sp(
+                batch.audio_latents
+            )
         )
 
     @classmethod
@@ -571,9 +572,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
         audio_scheduler = copy.deepcopy(self.scheduler)
         batch.ltx23_audio_replicated_for_sp = False
         batch.did_sp_shard_audio_latents = False
-        if self._should_shard_ltx23_legacy_one_stage_audio_latents(
-            batch, server_args
-        ):
+        if self._should_shard_ltx23_legacy_one_stage_audio_latents(batch, server_args):
             batch.audio_latents, batch.did_sp_shard_audio_latents = (
                 server_args.pipeline_config.shard_audio_latents_for_sp(
                     batch, batch.audio_latents
@@ -677,35 +676,20 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 f"Unexpected audio latents rank: {audio_latent_model_input.ndim}, shape={tuple(audio_latent_model_input.shape)}"
                             )
 
-                        video_coords = None
-                        audio_coords = None
-                        if getattr(batch, "did_sp_shard_latents", False) and hasattr(
-                            current_model, "rope"
-                        ):
-                            video_coords = current_model.rope.prepare_video_coords(
-                                batch_size=int(latent_model_input.shape[0]),
-                                num_frames=latent_num_frames,
-                                height=latent_height,
-                                width=latent_width,
-                                device=latent_model_input.device,
-                                fps=batch.fps,
-                                start_frame=int(
-                                    getattr(batch, "sp_video_start_frame", 0)
-                                ),
-                            )
-                        if getattr(
-                            batch, "did_sp_shard_audio_latents", False
-                        ) and hasattr(current_model, "audio_rope"):
-                            audio_coords = (
-                                current_model.audio_rope.prepare_audio_coords(
-                                    batch_size=int(audio_latent_model_input.shape[0]),
-                                    num_frames=audio_num_frames_latent,
-                                    device=audio_latent_model_input.device,
-                                    start_frame=int(
-                                        getattr(batch, "sp_audio_start_frame", 0)
-                                    ),
-                                )
-                            )
+                        video_coords = server_args.pipeline_config.prepare_video_rope_coords_for_sp(
+                            current_model,
+                            batch,
+                            latent_model_input,
+                            num_frames=latent_num_frames,
+                            height=latent_height,
+                            width=latent_width,
+                        )
+                        audio_coords = server_args.pipeline_config.prepare_audio_rope_coords_for_sp(
+                            current_model,
+                            batch,
+                            audio_latent_model_input,
+                            num_frames=audio_num_frames_latent,
+                        )
 
                         timestep = t_device.expand(int(latent_model_input.shape[0]))
                         if do_ti2v and denoise_mask is not None:
@@ -1190,7 +1174,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
         )
         phase = batch.extra.get("ltx2_phase")
         use_ltx23_legacy_one_stage = self._should_use_ltx23_legacy_one_stage(
-            server_args, self.pipeline
+            server_args, self.pipeline.pipeline_name
         )
         stage = (
             phase
@@ -1216,8 +1200,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
         if (
             is_ltx23_variant
             and get_sp_world_size() > 1
-            and isinstance(batch.audio_latents, torch.Tensor)
-            and hasattr(server_args.pipeline_config, "shard_audio_latents_for_sp")
+            and server_args.pipeline_config.can_shard_audio_latents_for_sp(
+                batch.audio_latents
+            )
             and not replicate_audio_for_sp
             and not use_ltx23_legacy_one_stage
         ):
@@ -1340,35 +1325,20 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         video_coords = None
                         audio_coords = None
                         if not use_ltx23_legacy_one_stage:
-                            if getattr(
-                                batch, "did_sp_shard_latents", False
-                            ) and hasattr(current_model, "rope"):
-                                video_coords = current_model.rope.prepare_video_coords(
-                                    batch_size=int(latent_model_input.shape[0]),
-                                    num_frames=latent_num_frames,
-                                    height=latent_height,
-                                    width=latent_width,
-                                    device=latent_model_input.device,
-                                    fps=batch.fps,
-                                    start_frame=int(
-                                        getattr(batch, "sp_video_start_frame", 0)
-                                    ),
-                                )
-                            if getattr(
-                                batch, "did_sp_shard_audio_latents", False
-                            ) and hasattr(current_model, "audio_rope"):
-                                audio_coords = (
-                                    current_model.audio_rope.prepare_audio_coords(
-                                        batch_size=int(
-                                            audio_latent_model_input.shape[0]
-                                        ),
-                                        num_frames=audio_num_frames_latent,
-                                        device=audio_latent_model_input.device,
-                                        start_frame=int(
-                                            getattr(batch, "sp_audio_start_frame", 0)
-                                        ),
-                                    )
-                                )
+                            video_coords = server_args.pipeline_config.prepare_video_rope_coords_for_sp(
+                                current_model,
+                                batch,
+                                latent_model_input,
+                                num_frames=latent_num_frames,
+                                height=latent_height,
+                                width=latent_width,
+                            )
+                            audio_coords = server_args.pipeline_config.prepare_audio_rope_coords_for_sp(
+                                current_model,
+                                batch,
+                                audio_latent_model_input,
+                                num_frames=audio_num_frames_latent,
+                            )
 
                         batch_size = int(latent_model_input.shape[0])
                         video_num_tokens = int(latent_model_input.shape[1])
@@ -1997,11 +1967,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
         # batch.audio_latents is audio latents.
 
         audio_latents = batch.audio_latents
-        if (
-            getattr(batch, "did_sp_shard_audio_latents", False)
-            and isinstance(audio_latents, torch.Tensor)
-            and hasattr(server_args.pipeline_config, "gather_audio_latents_for_sp")
-        ):
+        if batch.did_sp_shard_audio_latents and isinstance(audio_latents, torch.Tensor):
             audio_latents = server_args.pipeline_config.gather_audio_latents_for_sp(
                 audio_latents, batch
             )
