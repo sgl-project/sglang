@@ -51,8 +51,7 @@ backend.
 ## Validated ModelOpt Checkpoints
 
 This section is the canonical support matrix for diffusion ModelOpt checkpoints
-that have been brought up and verified in SGLang. Keep the FP8 and NVFP4 rows
-here instead of duplicating them in workflow skills.
+that have been brought up and verified in SGLang.
 
 ### FP8
 
