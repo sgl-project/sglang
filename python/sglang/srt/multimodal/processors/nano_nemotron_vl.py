@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from math import sqrt
 
 import numpy as np
@@ -18,8 +19,13 @@ import torch
 from PIL import Image
 
 from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
+from sglang.srt.models.parakeet import ParakeetExtractor
 from sglang.srt.multimodal.evs import EVSProcessor
 from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
 from sglang.srt.multimodal.processors.base_processor import (
@@ -27,6 +33,8 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.utils.common import sample_video_frames
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_NUM_TILES = 12
 NUM_VIDEO_TILES = 1
@@ -63,11 +71,37 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
 
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(self.IMG_START_TOKEN)
         self.img_end_token_id = tokenizer.convert_tokens_to_ids(self.IMG_END_TOKEN)
+
+        # Audio support: initialize Parakeet extractor if sound_config is present
+        self.audio_extractor: ParakeetExtractor | None = None
+        self.AUDIO_CONTEXT_TOKEN = getattr(
+            hf_config, "audio_context_token", "<so_embedding>"
+        )
+        self.AUDIO_START_TOKEN = getattr(
+            hf_config, "audio_start_token", "<so_start>"
+        )
+        self.AUDIO_END_TOKEN = getattr(hf_config, "audio_end_token", "<so_end>")
+
+        audio_token_str = None
+        audio_token_id = None
+        if getattr(hf_config, "sound_config", None) is not None:
+            self.audio_extractor = ParakeetExtractor(hf_config.sound_config)
+            audio_token_str = self.AUDIO_CONTEXT_TOKEN
+            audio_token_id = tokenizer.convert_tokens_to_ids(self.AUDIO_CONTEXT_TOKEN)
+            self.audio_start_token_id = tokenizer.convert_tokens_to_ids(
+                self.AUDIO_START_TOKEN
+            )
+            self.audio_end_token_id = tokenizer.convert_tokens_to_ids(
+                self.AUDIO_END_TOKEN
+            )
+
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMG_CONTEXT_TOKEN,
             image_token_id=tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT_TOKEN),
             video_token=self.VIDEO_CONTEXT_TOKEN,
             video_token_id=tokenizer.convert_tokens_to_ids(self.VIDEO_CONTEXT_TOKEN),
+            audio_token=audio_token_str,
+            audio_token_id=audio_token_id,
         ).build(_image_processor)
 
         # Normalization config (mean/std) and tiling behavior
@@ -112,15 +146,26 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         timestamps = [i * frame_duration_ms / 1000.0 for i in frames]
         return video_array, timestamps
 
+    def render_audio(self, *, num_tokens: int):
+        return (
+            f"{self.AUDIO_START_TOKEN}"
+            f"{self.AUDIO_CONTEXT_TOKEN * num_tokens}"
+            f"{self.AUDIO_END_TOKEN}"
+        )
+
     async def process_mm_data_async(
-        self, image_data, input_text, request_obj, **kwargs
+        self, image_data, audio_data, input_text, request_obj, **kwargs
     ):
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
+            audio_data=audio_data if self.audio_extractor else None,
             multimodal_tokens=self.mm_tokens,
             discard_alpha_channel=True,
+            audio_sample_rate=(
+                self.audio_extractor.sampling_rate if self.audio_extractor else None
+            ),
         )
 
         videos = [self.parse_video(video) for video in base_output.videos]
@@ -176,6 +221,43 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                 )
             video_feature = torch.cat(preprocessed_videos, dim=0)
 
+        # Process audio data through the Parakeet feature extractor
+        audio_items: list[MultimodalDataItem] = []
+        if base_output.audios and self.audio_extractor is not None:
+            extractor = self.audio_extractor
+            for audio in base_output.audios:
+                num_tokens = extractor.audio_token_count(len(audio))
+                rendered = self.render_audio(num_tokens=num_tokens)
+                prompt = prompt.replace(self.AUDIO_CONTEXT_TOKEN, rendered, 1)
+
+            all_audios = list(base_output.audios)
+            extracted = extractor(
+                all_audios,
+                sampling_rate=extractor.sampling_rate,
+                return_tensors="pt",
+            )
+            input_features = extracted.input_features
+            attention_mask = extracted.attention_mask
+            clip_counts = extracted.audio_num_clips
+
+            clip_offset = 0
+            for audio_idx, num_clips in enumerate(clip_counts):
+                audio_features = input_features[
+                    clip_offset : clip_offset + num_clips
+                ]
+                audio_mask = attention_mask[clip_offset : clip_offset + num_clips]
+                clip_offset += num_clips
+                audio_items.append(
+                    MultimodalDataItem(
+                        modality=Modality.AUDIO,
+                        feature=audio_features,
+                        model_specific_data={
+                            "feature_attention_mask": audio_mask,
+                            "audio_num_clips": num_clips,
+                        },
+                    )
+                )
+
         prompt_ids = self.tokenizer(
             prompt, add_special_tokens=False, return_tensors="pt"
         )["input_ids"].flatten()
@@ -193,6 +275,13 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         # Cleanup:
         prompt_ids[prompt_ids == self.PLACEHOLDER_ID] = self.img_start_token_id
 
+        # Compute audio offsets
+        if audio_items:
+            audio_token_id = self.mm_tokens.audio_token_id
+            audio_offsets_list = self.get_mm_items_offset(prompt_ids, audio_token_id)
+            for item, offset in zip(audio_items, audio_offsets_list):
+                item.offsets = [offset]
+
         prompt_ids_list = prompt_ids.tolist()
 
         items = create_data_items(
@@ -202,6 +291,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             video_offsets=video_offsets,
             input_ids_list=prompt_ids_list,
         )
+        items.extend(audio_items)
 
         return MultimodalProcessorOutput(
             input_ids=prompt_ids_list,
@@ -210,4 +300,11 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             im_end_id=self.img_end_token_id,
             im_token_id=self.mm_tokens.image_token_id,
             video_token_id=self.mm_tokens.image_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id if audio_items else None,
+            audio_start_id=(
+                self.audio_start_token_id if audio_items else None
+            ),
+            audio_end_id=(
+                self.audio_end_token_id if audio_items else None
+            ),
         )
