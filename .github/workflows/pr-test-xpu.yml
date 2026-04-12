@@ -20,7 +20,7 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-xpu-${{ inputs.ref || github.ref }}
+  group: xpu-runner-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
@@ -120,7 +120,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && cd /home/sdp/sglang/test/srt && python3 run_suite.py --suite per-commit-xpu"
+          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && cd /home/sdp/sglang/test && python3 run_suite.py --hw xpu --suite per-commit-xpu"
       - name: Cleanup container
         if: always()
         run: |

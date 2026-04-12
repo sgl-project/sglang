@@ -19,6 +19,7 @@ HW_MAPPING = {
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
     "npu": HWBackend.NPU,
+    "xpu": HWBackend.XPU,
 }
 
 # Per-commit test suites (run on every PR)
@@ -61,6 +62,9 @@ PER_COMMIT_SUITES = {
         "stage-b-test-2-npu-a2",
         "stage-b-test-4-npu-a3",
         "stage-b-test-16-npu-a3",
+    ],
+    HWBackend.XPU: [
+        "per-commit-xpu",
     ],
 }
 
@@ -111,6 +115,9 @@ NIGHTLY_SUITES = {
         "full-4-npu-a3",
         "full-8-npu-a3",
         "full-16-npu-a3",
+    ],
+    HWBackend.XPU: [
+        "nightly-xpu",
     ],
 }
 

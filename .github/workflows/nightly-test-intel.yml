@@ -2,7 +2,8 @@ name: Nightly Test (Intel)
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    # Nightly test at 19:15 Beijing Time (UTC+8) = 11:15 UTC
+    - cron: '16 11 * * *'
   push:
     branches:
       - main
@@ -18,16 +19,75 @@ on:
         default: ""
 
 concurrency:
-  group: nightly-test-intel-${{ inputs.ref || github.ref }}
+  # Share concurrency group with PR tests so they queue during nightly runs
+  group: xpu-runner-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
-  # Placeholder for Intel GPU tests
-  # Add Intel-specific nightly test workflows here when available
+  nightly-test:
+    runs-on: intel-bmg
+    env:
+      HF_HOME: /home/sdp/.cache/huggingface
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
 
-  placeholder:
-    if: github.repository == 'sgl-project/sglang'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_nightly:bmg .
+
+      - name: Run container
+        id: start_container
+        run: |
+          container_id=$(docker run -dt \
+            --group-add 992 \
+            --group-add $(getent group video | cut -d: -f3) \
+            -v ${HF_HOME}:/root/.cache/huggingface \
+            --device /dev/dri \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
+            xpu_sglang_nightly:bmg)
+          echo "Started container: $container_id"
+          echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
+
+      - name: Install Dependency
+        timeout-minutes: 20
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
+          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
+
+      - name: Run Nightly E2E tests
+        timeout-minutes: 60
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && cd /home/sdp/sglang/test && python3 run_suite.py --hw xpu --nightly --suite nightly-xpu --continue-on-error"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker rm -f "$cid" || true
+
+  finish:
+    if: always()
+    needs: [nightly-test]
     runs-on: ubuntu-latest
     steps:
-      - name: Placeholder
-        run: echo "Intel nightly tests will be added here"
+      - name: Check job status
+        run: |
+          result="${{ needs.nightly-test.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "Job failed with result: $result"
+            exit 1
+          fi
+          echo "All jobs completed successfully (result: $result)"
+          exit 0
