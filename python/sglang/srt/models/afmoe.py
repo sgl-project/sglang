@@ -245,16 +245,29 @@ class AfmoeMoE(nn.Module):
             )
 
         renormalize = self.route_norm if self.score_func == "sigmoid" else False
-        self.topk = TopK(
-            top_k=self.top_k,
-            renormalize=renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            num_expert_group=self.n_group if self.use_grouped_topk else None,
-            topk_group=self.topk_group if self.use_grouped_topk else None,
-            custom_routing_function=custom_routing_fn,
-            correction_bias=correction_bias,
-            routed_scaling_factor=self.route_scale,
-        )
+        if not _is_npu:
+            self.topk = TopK(
+                top_k=self.top_k,
+                renormalize=renormalize,
+                use_grouped_topk=self.use_grouped_topk,
+                num_expert_group=self.n_group if self.use_grouped_topk else None,
+                topk_group=self.topk_group if self.use_grouped_topk else None,
+                custom_routing_function=custom_routing_fn,
+                correction_bias=correction_bias,
+                routed_scaling_factor=self.route_scale,
+            )
+        else:
+            self.topk = TopK(
+                top_k=self.top_k,
+                renormalize=False,
+                use_grouped_topk=self.use_grouped_topk,
+                num_expert_group=self.n_group if self.use_grouped_topk else None,
+                topk_group=self.topk_group if self.use_grouped_topk else None,
+                custom_routing_function=custom_routing_fn,
+                correction_bias=self.expert_bias,
+                scoring_func=self.score_func,
+                routed_scaling_factor=self.route_scale,
+            )
 
     def pack_params(self) -> None:
         w1: list[torch.Tensor] = []
@@ -347,8 +360,8 @@ class AfmoeAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        rope_theta = config.rope_theta
-        rope_scaling = config.rope_scaling
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.rotary_dim = int(self.head_dim * partial_rotary_factor)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
