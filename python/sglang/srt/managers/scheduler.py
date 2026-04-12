@@ -2903,7 +2903,9 @@ class Scheduler(
 
         pending_req, deadline = self._pending_flush
 
-        if self.is_fully_idle():
+        if self.is_fully_idle() or (
+            self._engine_paused and self.running_batch.is_empty()
+        ):
             success = self.flush_cache()
             self._pending_flush = None
             self.send_to_tokenizer.send_output(
@@ -2966,7 +2968,9 @@ class Scheduler(
         if timeout_s <= 0.0:
             return FlushCacheReqOutput(success=self.flush_cache())
 
-        if self.is_fully_idle():
+        if self.is_fully_idle() or (
+            self._engine_paused and self.running_batch.is_empty()
+        ):
             return FlushCacheReqOutput(success=self.flush_cache())
 
         self._pending_flush = (recv_req, time.monotonic() + timeout_s)
@@ -3131,7 +3135,10 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        if self.is_fully_idle():
+        can_flush = self.is_fully_idle() or (
+            self._engine_paused and self.running_batch.is_empty()
+        )
+        if can_flush:
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()

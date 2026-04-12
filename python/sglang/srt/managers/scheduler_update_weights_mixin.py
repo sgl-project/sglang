@@ -43,6 +43,21 @@ logger = logging.getLogger(__name__)
 
 class SchedulerUpdateWeightsMixin:
 
+    def _quiesce_for_weight_update(self: Scheduler):
+        """Drain in-flight forward work before any NCCL weight mutation.
+
+        Overlap mode launches forward passes on forward_stream. If those NCCL TP
+        ops are still in flight when a different NCCL communicator (e.g. miles-pp_0
+        broadcast) starts on the same GPUs, NCCL hangs.  Synchronising the stream
+        and running a TP CPU barrier ensures every rank is quiescent before we touch
+        model weights.
+        """
+        if getattr(self, "enable_overlap", False):
+            self.forward_stream.synchronize()
+        self.schedule_stream.synchronize()
+        if getattr(self, "tp_cpu_group", None) is not None:
+            torch.distributed.barrier(group=self.tp_cpu_group)
+
     def update_weights_from_disk(
         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
     ):
@@ -75,6 +90,7 @@ class SchedulerUpdateWeightsMixin:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        self._quiesce_for_weight_update()
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
             if recv_req.flush_cache:
@@ -88,6 +104,7 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
+        self._quiesce_for_weight_update()
         if recv_req.disable_draft_model:
             worker = self.tp_worker
         else:
@@ -107,6 +124,7 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
     ):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        self._quiesce_for_weight_update()
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
         if success:
             if recv_req.flush_cache:
