@@ -264,12 +264,13 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # clone a fresh copy to /sgl-workspace/aiter
     docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
-    # checkout correct version
+    # checkout correct version and install requirements
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
         git checkout ${REPO_AITER_COMMIT} && \
-        git submodule update --init --recursive
+        git submodule update --init --recursive && \
+        pip install -r requirements.txt
     "
 
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then

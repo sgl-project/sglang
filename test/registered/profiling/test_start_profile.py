@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=41, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=40, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 OUTPUT_DIR = "./profiler_dir"
