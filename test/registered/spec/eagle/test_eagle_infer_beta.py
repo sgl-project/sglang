@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=283, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=333, suite="stage-b-test-1-gpu-small")
 
 
 class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):

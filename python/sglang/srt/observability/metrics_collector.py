@@ -79,6 +79,8 @@ class SchedulerStats:
     # Basics
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_used_tokens: int = 0
+    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
+    # not just KV token usage. Rename requires API deprecation.
     token_usage: float = 0.0
     full_token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
