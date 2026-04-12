@@ -60,16 +60,11 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 _is_npu = is_npu()
-_is_cuda = is_cuda()
 
-if _is_cuda:
+if not _is_npu:
     from sglang.srt.layers.moe.fused_moe_triton import fused_moe
-elif _is_npu:
-    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-        fused_moe_npu,
-    )
 else:
-    from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import fused_moe_npu as fused_moe
 
 
 def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]:
@@ -286,10 +281,6 @@ class AfmoeMoE(nn.Module):
         for data, param in zip(w2s, w2):
             param.data = data
         self.w2 = self.w2.view(len(w2), *w2s[0].shape)
-        if not _is_cuda and not _is_npu:
-            self.w13_weight = self.w1
-            self.w2_weight = self.w2
-            self.num_experts = self.n_routed_experts
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -301,27 +292,16 @@ class AfmoeMoE(nn.Module):
 
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        if _is_cuda or _is_npu:
-            final_hidden_states = self.fused_moe_method(
-                hidden_states,
-                w1=self.w1,
-                w2=self.w2,
-                topk_output=topk_output,
-                moe_runner_config=MoeRunnerConfig(
-                    inplace=True,
-                    routed_scaling_factor=self.route_scale,
-                ),
-            )
-        else:
-            final_hidden_states = self.fused_moe_method(
-                layer=self,
-                x=hidden_states,
-                topk_output=topk_output,
-                moe_runner_config=MoeRunnerConfig(
-                    inplace=True,
-                    routed_scaling_factor=self.route_scale,
-                ),
-            )
+        final_hidden_states = fused_moe(
+            hidden_states,
+            w1=self.w1,
+            w2=self.w2,
+            topk_output=topk_output,
+            moe_runner_config=MoeRunnerConfig(
+                inplace=True,
+                routed_scaling_factor=self.route_scale,
+            ),
+        )
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
