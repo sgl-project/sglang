@@ -400,6 +400,7 @@ class AutoRoundConfig(QuantizationConfig):
                 "bits": weight_bits,
                 "group_size": group_size,
                 "sym": sym,
+                "desc_act": False,
                 "lm_head": False,
             }
             return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
