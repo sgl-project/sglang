@@ -252,6 +252,7 @@ class SessionAwareCache(BasePrefixCache):
         # If the session's KV is shrinking (e.g. client sent a shorter
         # prompt after an abort), free the orphaned tail pages before
         # save_from_req overwrites the slot's committed length.
+        # Never free tree-protected tokens — those are managed by the tree.
         if (
             not is_first
             and slot.is_holding_kv
@@ -261,11 +262,15 @@ class SessionAwareCache(BasePrefixCache):
             new_end = req.kv_committed_len
             if self.page_size > 1:
                 new_end = ceil_align(new_end, self.page_size)
+            new_end = max(new_end, slot.cache_protected_len)
             if new_end < old_end:
                 kv_indices = self.req_to_token_pool.req_to_token[
                     slot.req_pool_idx, new_end:old_end
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
+            slot.cache_protected_len = min(
+                slot.cache_protected_len, req.kv_committed_len
+            )
 
         slot.save_from_req(req, is_first=is_first)
 
