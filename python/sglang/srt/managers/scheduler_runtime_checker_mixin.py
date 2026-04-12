@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
@@ -323,22 +322,6 @@ class SchedulerRuntimeCheckerMixin:
             )
         return leak, msg
 
-    def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
-        ret = 0
-        for req in batch.reqs:
-            assert req.kv_committed_freed == req.kv_overallocated_freed
-            uncached_len = 0
-            if not req.kv_committed_freed:
-                allocated_len = req.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
-                uncached_len = allocated_len - req.cache_protected_len
-
-            ret += uncached_len
-
-        return ret
-
     def _get_total_uncached_sizes(self: Scheduler) -> Tuple[int, int]:
         """Sum uncached tokens for full and SWA pools across all active batches.
 
@@ -347,10 +330,11 @@ class SchedulerRuntimeCheckerMixin:
         For full pool: uncached = allocated - cache_protected_len
         For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
         """
+        # After decode: running_batch IS last_batch (same object), count once.
+        # After prefill: they differ, both hold uncached tokens.
         batches = [self.last_batch]
         if (
-            self.running_batch is not None
-            and self.running_batch is not self.last_batch
+            self.running_batch not in (None, self.last_batch)
             and not self.running_batch.is_empty()
         ):
             batches.append(self.running_batch)
