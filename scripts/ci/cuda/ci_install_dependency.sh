@@ -218,9 +218,9 @@ mark_step_done "Uninstall Flashinfer"
 # Install main package
 # ------------------------------------------------------------------------------
 # Install the main package
-EXTRAS="dev"
+EXTRAS="dev,runai,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
-    EXTRAS="dev,${OPTIONAL_DEPS}"
+    EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
 source "$(dirname "$0")/cache_nvidia_wheels.sh"
@@ -304,7 +304,7 @@ if [ "$CU_VERSION" = "cu130" ]; then
 else
     NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
 fi
-$PIP_CMD install mooncake-transfer-engine==0.3.10 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.10.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
@@ -358,6 +358,10 @@ mark_step_done "Fix other dependencies"
 # can delete the .pth file without reliably recreating it (pip race condition).
 $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --no-deps --force-reinstall $PIP_INSTALL_SUFFIX || true
 
+# Download kernels from kernels community
+kernels download python || true
+kernels lock python || true
+mv python/kernels.lock ${HOME}/.cache/sglang || true
 
 # Install human-eval
 pip install "setuptools==70.0.0"

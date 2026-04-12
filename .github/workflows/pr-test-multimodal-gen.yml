@@ -9,6 +9,9 @@ on:
       sgl_kernel:
         required: true
         type: string
+      b200_runner:
+        required: true
+        type: string
       continue_on_error:
         required: false
         type: string
@@ -47,20 +50,57 @@ env:
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == 'true' }}
 
 jobs:
-  multimodal-gen-test-1-gpu:
+  compute-diffusion-partitions:
     if: |
       (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
+      (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
       (
         !inputs.target_stage &&
-        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
         inputs.multimodal_gen == 'true'
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
+      matrix-2gpu: ${{ steps.compute.outputs.matrix-2gpu }}
+      partition-count-1gpu: ${{ steps.compute.outputs['partition-count-1gpu'] }}
+      partition-count-2gpu: ${{ steps.compute.outputs['partition-count-2gpu'] }}
+      plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
+      plan-2gpu: ${{ steps.compute.outputs.plan-2gpu }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Compute partitions
+        id: compute
+        run: |
+          python scripts/ci/utils/diffusion/compute_diffusion_partitions.py --min-time 1200 --target-time 1800 --max-time 2400 --max-partitions 10
+
+  multimodal-gen-test-1-gpu:
+    needs: compute-diffusion-partitions
+    if: |
+      always() &&
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
+      (
+        (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+          inputs.multimodal_gen == 'true'
+        )
       )
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      matrix:
-        part: [0, 1]
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-1gpu) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -88,33 +128,48 @@ jobs:
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-1gpu'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             $CONTINUE_ON_ERROR_FLAG
 
-      - uses: ./.github/actions/upload-cuda-coredumps
+      - name: Upload execution report
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-report-1gpu-${{ matrix.part }}
+          path: python/sglang/multimodal_gen/test/execution_report_*.json
+          retention-days: 1
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-test-2-gpu:
+    needs: compute-diffusion-partitions
     if: |
-      (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
+      always() &&
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
       (
-        !inputs.target_stage &&
-        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-        inputs.multimodal_gen == 'true'
+        (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
+        (
+          !inputs.target_stage &&
+          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+          inputs.multimodal_gen == 'true'
+        )
       )
     runs-on: 2-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      matrix:
-        part: [0, 1]
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -143,16 +198,26 @@ jobs:
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             $CONTINUE_ON_ERROR_FLAG
 
-      - uses: ./.github/actions/upload-cuda-coredumps
+      - name: Upload execution report
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-report-2gpu-${{ matrix.part }}
+          path: python/sglang/multimodal_gen/test/execution_report_*.json
+          retention-days: 1
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -166,6 +231,10 @@ jobs:
       )
     runs-on: 1-gpu-h100
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -193,19 +262,19 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd python
-          if [ "${{ inputs.continue_on_error }}" = "true" ]; then
-            exit_code=0
-            python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_a.py || exit_code=$?
-            python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_b.py || exit_code=$?
-            exit $exit_code
-          fi
-          python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_a.py
-          python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_b.py
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite component-accuracy-1-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2 \
+            $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-component-accuracy-2-gpu:
     if: |
@@ -217,6 +286,10 @@ jobs:
       )
     runs-on: 2-gpu-h100
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -244,19 +317,66 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd python
-          if [ "${{ inputs.continue_on_error }}" = "true" ]; then
-            exit_code=0
-            torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_a.py || exit_code=$?
-            torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_b.py || exit_code=$?
-            exit $exit_code
-          fi
-          torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_a.py
-          torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_b.py
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite component-accuracy-2-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2 \
+            $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
+  multimodal-gen-test-1-b200:
+    if: |
+      (inputs.target_stage == 'multimodal-gen-test-1-b200') ||
+      (
+        !inputs.target_stage &&
+        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+        inputs.multimodal_gen == 'true'
+      )
+    runs-on: ${{ inputs.b200_runner }}
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion server tests
+        timeout-minutes: 240
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 1-gpu-b200 \
+            $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
 
   multimodal-gen-unit-test:
     if: |
@@ -296,3 +416,37 @@ jobs:
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py --suite unit
+
+  diffusion-coverage-check:
+    needs: [multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
+    if: |
+      always() &&
+      inputs.multimodal_gen == 'true' &&
+      (
+        needs.multimodal-gen-test-1-gpu.result == 'success' ||
+        needs.multimodal-gen-test-1-gpu.result == 'failure' ||
+        needs.multimodal-gen-test-2-gpu.result == 'success' ||
+        needs.multimodal-gen-test-2-gpu.result == 'failure'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download all execution reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports/
+          pattern: diffusion-report-*
+          merge-multiple: true
+
+      - name: Verify coverage
+        run: |
+          python scripts/ci/utils/diffusion/verify_diffusion_coverage.py --reports-dir reports/
