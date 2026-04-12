@@ -4962,13 +4962,6 @@ class ServerArgs:
             "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
             "By default this is auto-detected from adapter weights.",
         )
-        parser.add_argument(
-            "--lora-strict-loading",
-            default=ServerArgs.lora_strict_loading,
-            action=argparse.BooleanOptionalAction,
-            help="Enable strict loading for LoRA adapters. "
-            "When set, mismatched or missing keys in the adapter weights will raise an error.",
-        )
 
         # Kernel backend
         parser.add_argument(
