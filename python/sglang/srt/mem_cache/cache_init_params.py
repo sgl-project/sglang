@@ -39,3 +39,6 @@ class CacheInitParams:
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
+
+    # Weight for the segment-length term in seglen eviction.
+    seglen_eff_weight: float = 0.5

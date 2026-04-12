@@ -753,6 +753,12 @@ class Scheduler(
             or _registry_needs_mamba
         )
 
+        if server_args.radix_eviction_policy == "seglen" and not self.is_hybrid_ssm:
+            raise ValueError(
+                "--radix-eviction-policy=seglen is only supported when using "
+                "MambaRadixCache for hybrid models."
+            )
+
         self.sliding_window_size = None
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -789,6 +795,7 @@ class Scheduler(
                 else self.tp_cpu_group
             ),
             eviction_policy=server_args.radix_eviction_policy,
+            seglen_eff_weight=server_args.seglen_eff_weight,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),

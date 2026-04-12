@@ -63,6 +63,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+_NORMALIZE_EPSILON = 1e-9
+
+
 class TreeNode:
 
     counter = 0
@@ -431,6 +434,8 @@ class MambaRadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.eviction_policy = params.eviction_policy
+        self.seglen_eff_weight = params.seglen_eff_weight
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -774,6 +779,18 @@ class MambaRadixCache(BasePrefixCache):
 
     def evict_mamba(self, mamba_num: int) -> int:
         """Evict mamba states. Returns the number of mamba states evicted."""
+        if self.eviction_policy == "seglen":
+            return self._evict_mamba_seglen(mamba_num)
+        return self._evict_mamba_lru(mamba_num)
+
+    def evict_full(self, full_num_tokens: int) -> int:
+        """Evict full KV cache. Returns the number of tokens evicted."""
+        if self.eviction_policy == "seglen":
+            return self._evict_full_seglen(full_num_tokens)
+        return self._evict_full_lru(full_num_tokens)
+
+    def _evict_mamba_lru(self, mamba_num: int) -> int:
+        """Evict mamba states using pure LRU. Returns the number of mamba states evicted."""
         if self.disable or mamba_num <= 0:
             return 0
         # get the least recently used node that is not locked, doesn't have to be a leaf
@@ -807,7 +824,7 @@ class MambaRadixCache(BasePrefixCache):
 
         return mamba_num_evicted
 
-    def evict_full(self, full_num_tokens: int) -> int:
+    def _evict_full_lru(self, full_num_tokens: int) -> int:
         """Evict full KV cache. Returns the number of tokens evicted."""
         if self.disable or full_num_tokens <= 0:
             return 0
@@ -829,6 +846,134 @@ class MambaRadixCache(BasePrefixCache):
                 x_next = self.full_lru_list.get_leaf_lru_no_lock()
 
             x = x_next
+
+        return full_num_evicted
+
+    def _get_mamba_recompute_length(self, node: TreeNode) -> int:
+        """Return replay length from the nearest reusable Mamba ancestor to this node."""
+        recompute_length = 0
+        cur = node
+        while cur != self.root_node:
+            recompute_length += len(cur.key)
+            cur = cur.parent
+            if cur.mamba_value is not None:
+                break
+        return recompute_length
+
+    def _collect_unlocked_candidates(self, leaf_only: bool) -> List[TreeNode]:
+        """Collect unlocked eviction candidates from the mamba or full LRU list."""
+        candidates = []
+        if leaf_only:
+            x = self.full_lru_list.get_leaf_lru_no_lock()
+            while self.full_lru_list.in_list(x):
+                candidates.append(x)
+                x = self.full_lru_list.get_prev_leaf_no_lock(x)
+        else:
+            x = self.mamba_lru_list.get_lru_no_lock()
+            while self.mamba_lru_list.in_list(x):
+                # Only nodes with <=1 children are eligible for mamba eviction.
+                if len(x.children) <= 1:
+                    candidates.append(x)
+                x = self.mamba_lru_list.get_prev_no_lock(x)
+        return candidates
+
+    def _pick_best_candidate_with_efficiency(
+        self, candidates: List[TreeNode], efficiencies: List[float]
+    ) -> Optional[TreeNode]:
+        """Pick the best candidate using a normalized segment-length and recency score."""
+        if not candidates:
+            return None
+
+        assert len(candidates) == len(
+            efficiencies
+        ), "Candidate and efficiency lengths must match"
+
+        def _normalize(values):
+            min_v = min(values)
+            max_v = max(values)
+            span = max_v - min_v
+            if span <= _NORMALIZE_EPSILON:
+                return [0.5] * len(values)
+            return [(v - min_v) / span for v in values]
+
+        current_time = TreeNode.last_access_time_counter_float
+        recencies = [
+            1.0 / (float(current_time - node.last_access_time) + 1e-8)
+            for node in candidates
+        ]
+        norm_eff = _normalize(efficiencies)
+        norm_rec = _normalize(recencies)
+        return min(
+            (
+                (
+                    self.seglen_eff_weight * eff_score + rec_score,
+                    node,
+                )
+                for node, eff_score, rec_score in zip(
+                    candidates, norm_eff, norm_rec, strict=True
+                )
+            ),
+            key=lambda item: item[0],
+        )[1]
+
+    def _evict_mamba_seglen(self, mamba_num: int) -> int:
+        """Evict mamba states using replay length from the nearest live anchor."""
+        if self.disable or mamba_num <= 0:
+            return 0
+
+        mamba_num_evicted = 0
+
+        while mamba_num_evicted < mamba_num:
+            candidates = self._collect_unlocked_candidates(leaf_only=False)
+            if not candidates:
+                break
+
+            x = self._pick_best_candidate_with_efficiency(
+                candidates,
+                [float(self._get_mamba_recompute_length(node)) for node in candidates],
+            )
+
+            assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
+            assert (
+                len(x.mamba_value) == 1
+            ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
+            assert x != self.root_node, f"root node is not evictable, {x.id=}"
+
+            if len(x.children) > 0:
+                # Internal node: free mamba only, tombstone.
+                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                mamba_num_evicted += len(x.mamba_value)
+                self.mamba_lru_list.remove_node(x)
+                self._tombstone_internal_node(x)
+            else:
+                # Leaf node: free both KV + mamba, delete.
+                _, mamba_evicted_delta, _, _ = self._evict_leaf_node(x, True)
+                mamba_num_evicted += mamba_evicted_delta
+
+        return mamba_num_evicted
+
+    def _evict_full_seglen(self, full_num_tokens: int) -> int:
+        """Evict full KV cache using replay length from the nearest live anchor."""
+        if self.disable or full_num_tokens <= 0:
+            return 0
+
+        full_num_evicted = 0
+
+        while full_num_evicted < full_num_tokens:
+            candidates = self._collect_unlocked_candidates(leaf_only=True)
+            if not candidates:
+                break
+
+            x = self._pick_best_candidate_with_efficiency(
+                candidates,
+                [float(self._get_mamba_recompute_length(node)) for node in candidates],
+            )
+
+            assert (
+                x != self.root_node
+            ), f"root node should not exist in full lru list, {x.id=}"
+            full_num_evicted_delta, _, _, _ = self._evict_leaf_node(x, False)
+            full_num_evicted += full_num_evicted_delta
 
         return full_num_evicted
 
@@ -1015,20 +1160,25 @@ class MambaRadixCache(BasePrefixCache):
         cow_mamba = params.cow_mamba
         req = params.req
 
-        # update time for matched nodes, and make nodes closer to root to be least recently used
-        # this allows mamba to evict nodes closer to root first
         node_update = last_node
-        self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
-        self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+        if self.eviction_policy == "seglen":
+            if last_node != self.root_node:
+                last_node.last_access_time = get_last_access_time()
+                self.full_lru_list.reset_node_mru(last_node)
+                if last_node.mamba_value is not None:
+                    self.mamba_lru_list.reset_node_mru(last_node)
+        else:
+            self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+            self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
-        # This last_access_time is for sanity check, can be deleted after validation in production
-        cur_time = get_last_access_time()
-        while node_update:
-            node_update.last_access_time = cur_time
-            cur_time -= (
-                0.00001  # assuming less than 100000 nodes in a branch of the tree
-            )
-            node_update = node_update.parent
+            # This last_access_time is for sanity check, can be deleted after validation in production
+            cur_time = get_last_access_time()
+            while node_update:
+                node_update.last_access_time = cur_time
+                cur_time -= (
+                    0.00001  # assuming less than 100000 nodes in a branch of the tree
+                )
+                node_update = node_update.parent
 
         # Calculate the branching point. It is defined as the last aligned position that
         # does not have a mamba value.
