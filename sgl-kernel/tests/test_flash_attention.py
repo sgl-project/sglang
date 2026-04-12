@@ -1,6 +1,7 @@
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/test_flash_attn.py
 import itertools
 import math
+import sys
 from typing import Optional
 
 import pytest
@@ -1365,4 +1366,4 @@ def test_flash_attn_varlen_output(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

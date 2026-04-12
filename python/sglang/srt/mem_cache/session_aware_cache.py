@@ -58,6 +58,11 @@ class SessionSlot:
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
+    # True while the slot's KV has been restored to an active request.
+    # Prevents double-counting in token accounting (the request's tokens
+    # are already tracked via uncached_size in the busy mem check).
+    is_active: bool = False
+
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
@@ -65,6 +70,7 @@ class SessionSlot:
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
+        self.is_active = False
         self.req_pool_idx = req.req_pool_idx
         self.kv_committed_len = req.kv_committed_len
         self.kv_allocated_len = req.kv_allocated_len
@@ -97,6 +103,8 @@ class SessionSlot:
         req.mamba_next_track_idx = self.mamba_next_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
+
+        self.is_active = True
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
         # from the slot. During chunked prefill, a request may be rejected by
@@ -181,8 +189,10 @@ class SessionAwareCache(BasePrefixCache):
 
         slot.restore_to_req(req)
 
-        max_prefix_len = len(params.key.token_ids)
-        prefix_len = min(req.kv_committed_len, max_prefix_len)
+        # logprob_start_len is already forced to -1 for streaming sessions
+        # (in Req.init_next_round_input), so the prefix key is not truncated
+        # and we can directly reuse the committed KV length.
+        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
@@ -267,10 +277,14 @@ class SessionAwareCache(BasePrefixCache):
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
 
     def session_held_tokens(self) -> int:
-        """Total KV tokens held by session slots, not tracked by the tree."""
+        """Total KV tokens held by session slots, not tracked by the tree.
+
+        Excludes active slots whose tokens are already counted as part of
+        the running request's uncached_size in the busy mem check.
+        """
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv:
+            if slot.is_holding_kv and not slot.is_active:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - slot.cache_protected_len
         return total
@@ -283,7 +297,7 @@ class SessionAwareCache(BasePrefixCache):
         """Total SWA tokens held by session slots, not tracked by the tree."""
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv:
+            if slot.is_holding_kv and not slot.is_active:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - max(
                     slot.cache_protected_len, slot.swa_evicted_seqlen
@@ -292,7 +306,7 @@ class SessionAwareCache(BasePrefixCache):
 
     def session_held_req_count(self) -> int:
         """Number of req pool slots held by session slots."""
-        return sum(s.is_holding_kv for s in self.slots.values())
+        return sum(s.is_holding_kv and not s.is_active for s in self.slots.values())
 
     # -- Pass-through methods --
 

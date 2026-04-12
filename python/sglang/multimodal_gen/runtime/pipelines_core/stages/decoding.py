@@ -236,8 +236,10 @@ class DecodingStage(PipelineStage):
             output=frames,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
             trajectory_decoded=trajectory_decoded,
             metrics=batch.metrics,
+            noise_pred=None,
         )
 
         # Keep VAE resident during warmup; the real request needs it next.

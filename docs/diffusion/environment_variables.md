@@ -1,3 +1,5 @@
+# Environment Variables
+
 ## Apple MPS
 
 | Environment Variable | Default | Description                                                  |
@@ -40,3 +42,15 @@ These variables configure S3-compatible cloud storage for automatically uploadin
 | `SGLANG_S3_REGION_NAME`         | us-east-1 | AWS region name                                      |
 | `SGLANG_S3_ACCESS_KEY_ID`       | not set | AWS Access Key ID                                      |
 | `SGLANG_S3_SECRET_ACCESS_KEY`   | not set | AWS Secret Access Key                                  |
+
+## CUDA Crash Debugging
+
+These variables enable kernel API logging and optional input/output dumps around diffusion CUDA kernel call boundaries. They are useful when tracking down CUDA crashes such as illegal memory access, device-side assert, or shape mismatches in custom kernels.
+
+| Environment Variable | Default | Description |
+|----------------------|---------|-------------|
+| `SGLANG_KERNEL_API_LOGLEVEL` | `0` | Controls crash-debug kernel API logging. `1` logs API names, `3` logs tensor metadata, `5` adds tensor statistics, and `10` also writes dump snapshots. |
+| `SGLANG_KERNEL_API_LOGDEST` | `stdout` | Destination for crash-debug kernel API logs. Use `stdout`, `stderr`, or a file path. `%i` is replaced with the process PID. |
+| `SGLANG_KERNEL_API_DUMP_DIR` | `sglang_kernel_api_dumps` | Output directory for level-10 kernel API dumps. `%i` is replaced with the process PID. |
+| `SGLANG_KERNEL_API_DUMP_INCLUDE` | not set | Comma-separated wildcard patterns for kernel API names to include in level-10 dumps. |
+| `SGLANG_KERNEL_API_DUMP_EXCLUDE` | not set | Comma-separated wildcard patterns for kernel API names to exclude from level-10 dumps. |

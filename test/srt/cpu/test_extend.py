@@ -118,8 +118,8 @@ class TestExtendAttention(CustomTestCase):
             v_extend[extend_start:extend_end] = v_buffer[
                 extend_start_in_buffer:extend_end_in_buffer
             ]
-            q_extend[extend_start:extend_end] = torch.randn(
-                (b_seq_len_extend[i], H_Q, D), dtype=dtype
+            q_extend[extend_start:extend_end] = (
+                torch.randn((b_seq_len_extend[i], H_Q, D), dtype=dtype) * 20
             )
 
         # q_extend, k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors

@@ -4,7 +4,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # Image API protocol models
@@ -24,6 +24,8 @@ class ImageResponse(BaseModel):
 
 
 class ImageGenerationsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt: str
     model: Optional[str] = None
     n: Optional[int] = 1
@@ -53,6 +55,8 @@ class ImageGenerationsRequest(BaseModel):
     upscaling_model_path: Optional[str] = None
     upscaling_scale: Optional[int] = 4
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    # Performance profiling
+    perf_dump_path: Optional[str] = None
 
 
 # Video API protocol models
@@ -88,6 +92,8 @@ class VideoGenerationsRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
+    width: Optional[int] = None
+    height: Optional[int] = None
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
@@ -109,6 +115,8 @@ class VideoGenerationsRequest(BaseModel):
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    # Performance profiling
+    perf_dump_path: Optional[str] = None
 
 
 class VideoListResponse(BaseModel):

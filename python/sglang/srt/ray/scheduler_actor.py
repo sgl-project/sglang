@@ -105,6 +105,10 @@ class SchedulerActor:
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop. Blocks until shutdown."""
         try:
+            import torch
+
+            # Need to set the GPU id for the event loop for nccl to work
+            torch.cuda.set_device(self.scheduler.gpu_id)
             self.scheduler.run_event_loop()
         except Exception as e:
             logger.error(f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}")
