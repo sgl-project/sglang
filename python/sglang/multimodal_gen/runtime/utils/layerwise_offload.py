@@ -63,6 +63,11 @@ class LayerwiseOffloadManager:
         self._gpu_layers: Set[int] = set()
         # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
         self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
+        # layer_idx -> estimated bytes of consolidated GPU weights for this layer
+        self._layer_total_bytes: Dict[int, int] = {}
+        # layers that stay on GPU across denoising steps to reduce repeated H2D copies
+        self._persistent_gpu_layers: Set[int] = set()
+        self._persistent_gpu_bytes: int = 0
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
@@ -111,9 +116,13 @@ class LayerwiseOffloadManager:
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
             self._weight_metadata[layer_idx] = {}
+            layer_total_bytes = 0
 
             for dtype, weights in dtype_to_params.items():
                 total_numel = sum(t.numel() for _, t in weights)
+                layer_total_bytes += (
+                    total_numel * torch.tensor([], dtype=dtype).element_size()
+                )
 
                 # create concatenated CPU buffer (in pinned memory)
                 cpu_buffer = torch.empty(
@@ -139,13 +148,20 @@ class LayerwiseOffloadManager:
                     current_offset += numel
 
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+            self._layer_total_bytes[layer_idx] = layer_total_bytes
+
+        self._plan_persistent_layers()
 
         # prefetch the first layer for warm-up
         self.prepare_for_next_req(non_blocking=False)
+        self._materialize_persistent_layers()
 
         self.register_forward_hooks()
         logger.info(
-            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, total num layers: {self.num_layers}"
+            "LayerwiseOffloadManager initialized with num prefetched layer: "
+            f"{self.prefetch_size}, total num layers: {self.num_layers}, "
+            f"persistent gpu layers: {len(self._persistent_gpu_layers)} "
+            f"({self._persistent_gpu_bytes / (1024**2):.1f} MiB)"
         )
 
     def prepare_for_next_req(self, non_blocking=True):
@@ -164,6 +180,78 @@ class LayerwiseOffloadManager:
         else:
             target = self._named_buffers[name]
         return target
+
+    def _plan_persistent_layers(self) -> None:
+        if not self.enabled or not self._layer_total_bytes:
+            return
+
+        free_bytes, total_bytes = torch.get_device_module().mem_get_info(self.device)
+        max_layer_bytes = max(self._layer_total_bytes.values())
+
+        # Keep a conservative runtime headroom for activations and in-flight prefetch.
+        transient_reserve = int((self.prefetch_size + 1) * max_layer_bytes * 3)
+        base_reserve = max(
+            2 * 1024**3,  # 2 GiB
+            int(total_bytes * 0.08),
+            transient_reserve,
+        )
+        if free_bytes <= base_reserve:
+            return
+
+        budget_bytes = int((free_bytes - base_reserve) * 0.9)
+        if budget_bytes <= 0:
+            return
+
+        keep_layers: List[int] = []
+        used_bytes = 0
+        for i in range(self.num_layers):
+            layer_bytes = self._layer_total_bytes.get(i, 0)
+            if layer_bytes <= 0:
+                continue
+            if used_bytes + layer_bytes > budget_bytes:
+                break
+            keep_layers.append(i)
+            used_bytes += layer_bytes
+
+        self._persistent_gpu_layers = set(keep_layers)
+        self._persistent_gpu_bytes = used_bytes
+
+    def _materialize_persistent_layers(self) -> None:
+        if (
+            not self.enabled
+            or self.copy_stream is None
+            or not self._persistent_gpu_layers
+            or self.device is None
+        ):
+            return
+
+        for layer_idx in sorted(self._persistent_gpu_layers):
+            if layer_idx in self._gpu_layers:
+                continue
+            try:
+                self.prefetch_layer(layer_idx, non_blocking=False)
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower():
+                    raise
+                logger.warning(
+                    "Auto persistent layer residency hit OOM at layer %d. "
+                    "Falling back to currently loaded persistent set.",
+                    layer_idx,
+                )
+                torch.get_device_module().empty_cache()
+                break
+
+        if self.copy_stream is not None:
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+
+        kept_layers = set(
+            i for i in self._persistent_gpu_layers if i in self._gpu_layers
+        )
+        if len(kept_layers) != len(self._persistent_gpu_layers):
+            self._persistent_gpu_layers = kept_layers
+            self._persistent_gpu_bytes = sum(
+                self._layer_total_bytes.get(i, 0) for i in self._persistent_gpu_layers
+            )
 
     @torch.compiler.disable
     def prefetch_layer(self, layer_idx: int, non_blocking: bool = True) -> None:
@@ -221,6 +309,9 @@ class LayerwiseOffloadManager:
         self._prefetch_events.pop(layer_idx, None)
 
         if layer_idx not in self._gpu_layers:
+            return
+
+        if layer_idx in self._persistent_gpu_layers:
             return
 
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
