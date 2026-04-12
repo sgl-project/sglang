@@ -666,6 +666,7 @@ class LoRAMemoryPool:
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     if self.experts_shared_outer_loras and name == "gate_up_proj_moe":
                         if weights is None:
+                            representative_weight = None
                             buffer_view = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
                             ]
@@ -677,6 +678,7 @@ class LoRAMemoryPool:
                                     f"gate_up_proj_moe lora_A has expert_dim="
                                     f"{weights.shape[0]} (expected 1)."
                                 )
+                            representative_weight = weights[0]
                             buffer_view = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
                             ]
@@ -689,6 +691,7 @@ class LoRAMemoryPool:
                                     f"{len(weights)} entries (expected 1)."
                                 )
                             rep = next(iter(weights.values()))
+                            representative_weight = rep
                             buffer_view = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
                             ]
