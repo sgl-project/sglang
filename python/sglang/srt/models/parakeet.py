@@ -94,7 +94,7 @@ class ProjectedParakeet(nn.Module):
             if name.startswith("sound_encoder.encoder.feature_extractor."):
                 continue
             if name.startswith("sound_encoder."):
-                target_name = name[len("sound_encoder."):]
+                target_name = name[len("sound_encoder.") :]
             elif name.startswith("sound_projection."):
                 target_name = f"projection.{name[len('sound_projection.'):]}"
             else:
