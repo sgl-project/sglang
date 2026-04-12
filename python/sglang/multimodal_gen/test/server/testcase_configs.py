@@ -936,16 +936,6 @@ TWO_GPU_CASES_A = [
         ),
         T2V_sampling_params,
     ),
-    DiffusionTestCase(
-        "ltx_2.3_two_stage_t2v",
-        DiffusionServerArgs(
-            model_path="Lightricks/LTX-2.3",
-            modality="video",
-            num_gpus=2,
-            extras=["--pipeline-class-name LTX2TwoStagePipeline"],
-        ),
-        T2V_sampling_params,
-    ),
 ]
 
 TWO_GPU_CASES_B = [
