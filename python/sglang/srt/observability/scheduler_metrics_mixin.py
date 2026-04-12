@@ -422,6 +422,15 @@ class SchedulerMetricsMixin:
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            now = time.perf_counter()
+            queue_waits = [
+                now - r.time_stats.wait_queue_entry_time
+                for r in self.waiting_queue
+                if r.time_stats.wait_queue_entry_time > 0
+            ]
+            self.stats.avg_request_queue_latency = (
+                sum(queue_waits) / len(queue_waits) if queue_waits else 0.0
+            )
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
 
@@ -599,6 +608,15 @@ class SchedulerMetricsMixin:
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            now = time.perf_counter()
+            queue_waits = [
+                now - r.time_stats.wait_queue_entry_time
+                for r in self.waiting_queue
+                if r.time_stats.wait_queue_entry_time > 0
+            ]
+            self.stats.avg_request_queue_latency = (
+                sum(queue_waits) / len(queue_waits) if queue_waits else 0.0
+            )
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
 
