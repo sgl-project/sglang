@@ -1140,7 +1140,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
         use_ltx23_legacy_one_stage = self._should_use_ltx23_legacy_one_stage(
             server_args, self.pipeline
         )
-        stage = phase if phase is not None else ("stage1" if use_ltx23_legacy_one_stage else "one_stage")
+        stage = (
+            phase
+            if phase is not None
+            else ("stage1" if use_ltx23_legacy_one_stage else "one_stage")
+        )
         audio_latents = batch.audio_latents
         audio_scheduler = copy.deepcopy(self.scheduler)
 
@@ -1284,9 +1288,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         video_coords = None
                         audio_coords = None
                         if not use_ltx23_legacy_one_stage:
-                            if getattr(batch, "did_sp_shard_latents", False) and hasattr(
-                                current_model, "rope"
-                            ):
+                            if getattr(
+                                batch, "did_sp_shard_latents", False
+                            ) and hasattr(current_model, "rope"):
                                 video_coords = current_model.rope.prepare_video_coords(
                                     batch_size=int(latent_model_input.shape[0]),
                                     num_frames=latent_num_frames,
@@ -1303,7 +1307,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             ) and hasattr(current_model, "audio_rope"):
                                 audio_coords = (
                                     current_model.audio_rope.prepare_audio_coords(
-                                        batch_size=int(audio_latent_model_input.shape[0]),
+                                        batch_size=int(
+                                            audio_latent_model_input.shape[0]
+                                        ),
                                         num_frames=audio_num_frames_latent,
                                         device=audio_latent_model_input.device,
                                         start_frame=int(
@@ -1369,19 +1375,23 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             a2v_cross_attention_mask = None
                             v2a_cross_attention_mask = None
                         else:
-                            video_self_attention_mask = self._build_ltx2_sp_padding_mask(
-                                batch,
-                                seq_len=video_num_tokens,
-                                batch_size=batch_size,
-                                key="sp_video_valid_token_count",
-                                device=latent_model_input.device,
+                            video_self_attention_mask = (
+                                self._build_ltx2_sp_padding_mask(
+                                    batch,
+                                    seq_len=video_num_tokens,
+                                    batch_size=batch_size,
+                                    key="sp_video_valid_token_count",
+                                    device=latent_model_input.device,
+                                )
                             )
-                            audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
-                                batch,
-                                seq_len=audio_num_frames_latent,
-                                batch_size=batch_size,
-                                key="sp_audio_valid_token_count",
-                                device=audio_latent_model_input.device,
+                            audio_self_attention_mask = (
+                                self._build_ltx2_sp_padding_mask(
+                                    batch,
+                                    seq_len=audio_num_frames_latent,
+                                    batch_size=batch_size,
+                                    key="sp_audio_valid_token_count",
+                                    device=audio_latent_model_input.device,
+                                )
                             )
                             a2v_cross_attention_mask = audio_self_attention_mask
                             v2a_cross_attention_mask = video_self_attention_mask
