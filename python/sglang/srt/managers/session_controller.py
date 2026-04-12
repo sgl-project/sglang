@@ -292,14 +292,14 @@ class SessionController:
     def _close(self, session_id: str):
         session = self.sessions[session_id]
         req = None
-        has_active_request = False
+        has_unfinished_request = False
         if session.streaming and session.req_nodes:
             assert len(session.req_nodes) == 1
             req = next(iter(session.req_nodes.values())).req
             if not req.finished():
-                has_active_request = True
+                has_unfinished_request = True
 
-        if has_active_request:
+        if has_unfinished_request:
             # An in-flight request is still decoding on this session's KV
             # memory. Freeing now would corrupt the scheduler. Mark the
             # session for deferred cleanup: the request keeps its session
