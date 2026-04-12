@@ -37,7 +37,7 @@ Extreme KV cache quantization modes that dramatically reduce VRAM usage, enablin
 | `--kv-cache-dtype tq3` | 3-bit | ~81% |
 | `--kv-cache-dtype tq2` | 2-bit | ~87% |
 
-### 🦅 EAGLE3 Speculative Decoding
+### 🦅 EAGLE3 / P-EAGLE Speculative Decoding
 Full integration of [EAGLE3](https://github.com/SafeAILab/EAGLE) (Lossless Acceleration of LLM Decoding by Feature Extrapolation) by [Yuhui Li et al. / SafeAILab](https://github.com/SafeAILab/EAGLE) for speculative decoding on ROCm:
 - 3-layer feature extraction + 1-layer decoder draft model architecture
 - Probabilistic tree sampling via three-tier fallback: HIP C++ → Triton → PyTorch
