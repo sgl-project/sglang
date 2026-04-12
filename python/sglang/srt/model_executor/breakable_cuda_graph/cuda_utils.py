@@ -20,6 +20,8 @@ except ImportError:
 
 
 def _cudaGetErrorString(error):
+    if rt is None:
+        return "<cuda.bindings not available>"
     err, msg = rt.cudaGetErrorString(error)
     if err != rt.cudaError_t.cudaSuccess:
         return "<unknown>"
@@ -29,6 +31,16 @@ def _cudaGetErrorString(error):
 
 
 def checkCudaErrors(result):
+    if rt is None:
+        raise RuntimeError(
+            "cuda.bindings is not available. "
+            "Install it with: pip install cuda-python"
+        )
+    if rt is None:
+        raise RuntimeError(
+            "cuda.bindings is not available. "
+            "Install it with: pip install cuda-python"
+        )
     if result[0] != rt.cudaError_t.cudaSuccess:
         raise RuntimeError(
             f"CUDA error {int(result[0])}({_cudaGetErrorString(result[0])})"

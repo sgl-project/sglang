@@ -366,6 +366,20 @@ def _resolve_quant_config_from_transformer_override(
     transformer_weights_path: str,
 ) -> Optional[QuantizationConfig]:
     """Resolve quant config from an override transformer repo or directory."""
+    expanded_path = os.path.expanduser(transformer_weights_path)
+    if os.path.isfile(expanded_path):
+        return None
+
+    # A single local safetensors file does not carry a directory-level config.json.
+    # Let downstream metadata probing handle it instead of misrouting it through HF.
+    if expanded_path.endswith(".safetensors") and (
+        os.path.isabs(expanded_path)
+        or expanded_path.startswith(".")
+        or os.sep in expanded_path
+        or (os.path.altsep and os.path.altsep in expanded_path)
+    ):
+        return None
+
     override_quantized_path = maybe_download_model(transformer_weights_path)
     if not os.path.isdir(override_quantized_path):
         return None

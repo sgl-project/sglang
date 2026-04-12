@@ -98,7 +98,8 @@
             },
             "expected_e2e_ms": 14959.11,
             "expected_avg_denoise_ms": 285.67,
-            "expected_median_denoise_ms": 286.1
+            "expected_median_denoise_ms": 286.1,
+            "estimated_full_test_time_s": 129.1
         },
         "qwen_image_t2i_2_gpus": {
             "stages_ms": {
@@ -228,7 +229,8 @@
             },
             "expected_e2e_ms": 7798.99,
             "expected_avg_denoise_ms": 150.77,
-            "expected_median_denoise_ms": 152.45
+            "expected_median_denoise_ms": 152.45,
+            "estimated_full_test_time_s": 78.1
         },
         "flux_2_image_t2i": {
             "stages_ms": {
@@ -294,7 +296,8 @@
             },
             "expected_e2e_ms": 329129.82,
             "expected_avg_denoise_ms": 489.43,
-            "expected_median_denoise_ms": 497.53
+            "expected_median_denoise_ms": 497.53,
+            "estimated_full_test_time_s": 185.9
         },
         "flux_2_klein_image_t2i": {
             "stages_ms": {
@@ -600,7 +603,8 @@
             },
             "expected_e2e_ms": 1292.92,
             "expected_avg_denoise_ms": 83.75,
-            "expected_median_denoise_ms": 93.58
+            "expected_median_denoise_ms": 93.58,
+            "estimated_full_test_time_s": 49.8
         },
         "zimage_image_t2i_fp8": {
             "stages_ms": {
@@ -624,7 +628,8 @@
             },
             "expected_e2e_ms": 1370.28,
             "expected_avg_denoise_ms": 85.97,
-            "expected_median_denoise_ms": 95.83
+            "expected_median_denoise_ms": 95.83,
+            "estimated_full_test_time_s": 49.8
         },
         "zimage_image_t2i_multi_lora": {
             "stages_ms": {
@@ -738,7 +743,8 @@
             },
             "expected_e2e_ms": 39706.9,
             "expected_avg_denoise_ms": 762.57,
-            "expected_median_denoise_ms": 765.44
+            "expected_median_denoise_ms": 765.44,
+            "estimated_full_test_time_s": 178.8
         },
         "qwen_image_t2i_cache_dit_enabled": {
             "stages_ms": {
@@ -1336,7 +1342,8 @@
             },
             "expected_e2e_ms": 42660.88,
             "expected_avg_denoise_ms": 788.2,
-            "expected_median_denoise_ms": 790.72
+            "expected_median_denoise_ms": 790.72,
+            "estimated_full_test_time_s": 149.1
         },
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
@@ -1355,7 +1362,8 @@
             },
             "expected_e2e_ms": 7722.91,
             "expected_avg_denoise_ms": 165.42,
-            "expected_median_denoise_ms": 165.66
+            "expected_median_denoise_ms": 165.66,
+            "estimated_full_test_time_s": 75.3
         },
         "fast_hunyuan_video": {
             "stages_ms": {
@@ -1434,7 +1442,8 @@
             },
             "expected_e2e_ms": 144621.32,
             "expected_avg_denoise_ms": 3434.22,
-            "expected_median_denoise_ms": 3428.99
+            "expected_median_denoise_ms": 3428.99,
+            "estimated_full_test_time_s": 427.9
         },
         "turbo_wan2_2_i2v_a14b_2gpu": {
             "stages_ms": {
@@ -2024,7 +2033,8 @@
             },
             "expected_e2e_ms": 24895.28,
             "expected_avg_denoise_ms": 596.59,
-            "expected_median_denoise_ms": 599.66
+            "expected_median_denoise_ms": 599.66,
+            "estimated_full_test_time_s": 139.8
         },
         "fsdp-inference": {
             "stages_ms": {
