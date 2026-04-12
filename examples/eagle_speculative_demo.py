@@ -25,8 +25,8 @@ import argparse
 import time
 
 # ── 修改为你本地已下载的模型路径 ──────────────────────────────────────────
-TARGET_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-DRAFT_MODEL = "lmzheng/sglang-EAGLE3-Llama-3.1-8B-Instruct"
+TARGET_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DRAFT_MODEL = "lmzheng/sglang-EAGLE3-Qwen2.5-7B-Instruct"
 # ─────────────────────────────────────────────────────────────────────────
 
 PROMPTS = [
@@ -47,7 +47,7 @@ SAMPLING_PARAMS = {
 
 # ── EAGLE 超参数 ──────────────────────────────────────────────────────────
 EAGLE_CONFIG = dict(
-    speculative_algorithm="EAGLE",   # 或 "EAGLE3"（对应 EAGLE3 draft 模型）
+    speculative_algorithm="EAGLE3",
     speculative_draft_model_path=DRAFT_MODEL,
     speculative_num_steps=3,          # draft 树深度
     speculative_eagle_topk=4,         # 每步 top-k 分支数
