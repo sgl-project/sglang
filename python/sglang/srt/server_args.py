@@ -1744,6 +1744,15 @@ class ServerArgs:
                     )
 
                 if (
+                    self.attention_backend is None
+                    and self.decode_attention_backend is None
+                ):
+                    self.decode_attention_backend = "aiter"
+                    logger.info(
+                        "Use aiter as decode attention backend on ROCm for DeepseekV3ForCausalLM (MLA)"
+                    )
+
+                if (
                     self.quantization == "modelopt_fp4"
                     and self.speculative_algorithm == "EAGLE"
                     and (
