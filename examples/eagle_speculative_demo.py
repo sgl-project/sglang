@@ -22,7 +22,10 @@ EAGLE Speculative Decoding Demo
 """
 
 import argparse
+import os
 import time
+
+os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 
 # ── 修改为你本地已下载的模型路径 ──────────────────────────────────────────
 TARGET_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
@@ -53,6 +56,9 @@ EAGLE_CONFIG = dict(
     speculative_eagle_topk=4,
     speculative_num_draft_tokens=16,
     dtype="float16",
+    mem_fraction_static=0.7,
+    chunked_prefill_size=128,
+    max_running_requests=8,
 )
 # ─────────────────────────────────────────────────────────────────────────
 
