@@ -572,13 +572,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
         audio_scheduler = copy.deepcopy(self.scheduler)
         batch.ltx23_audio_replicated_for_sp = False
         batch.did_sp_shard_audio_latents = False
-        if self._should_shard_ltx23_legacy_one_stage_audio_latents(batch, server_args):
-            batch.audio_latents, batch.did_sp_shard_audio_latents = (
-                server_args.pipeline_config.shard_audio_latents_for_sp(
-                    batch, batch.audio_latents
-                )
-            )
-            audio_latents = batch.audio_latents
 
         latent_num_frames_for_model = self._get_video_latent_num_frames_for_model(
             batch=batch, server_args=server_args, latents=latents
@@ -676,20 +669,8 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 f"Unexpected audio latents rank: {audio_latent_model_input.ndim}, shape={tuple(audio_latent_model_input.shape)}"
                             )
 
-                        video_coords = server_args.pipeline_config.prepare_video_rope_coords_for_sp(
-                            current_model,
-                            batch,
-                            latent_model_input,
-                            num_frames=latent_num_frames,
-                            height=latent_height,
-                            width=latent_width,
-                        )
-                        audio_coords = server_args.pipeline_config.prepare_audio_rope_coords_for_sp(
-                            current_model,
-                            batch,
-                            audio_latent_model_input,
-                            num_frames=audio_num_frames_latent,
-                        )
+                        video_coords = None
+                        audio_coords = None
 
                         timestep = t_device.expand(int(latent_model_input.shape[0]))
                         if do_ti2v and denoise_mask is not None:
@@ -1173,8 +1154,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         )
         phase = batch.extra.get("ltx2_phase")
+        pipeline = self.pipeline() if self.pipeline else None
+        pipeline_name = (
+            getattr(pipeline, "pipeline_name", None)
+            if pipeline is not None
+            else None
+        )
         use_ltx23_legacy_one_stage = self._should_use_ltx23_legacy_one_stage(
-            server_args, self.pipeline.pipeline_name
+            server_args, pipeline_name
         )
         stage = (
             phase
