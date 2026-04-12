@@ -67,6 +67,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.model_runner = model_runner = eagle_worker.model_runner
             self.forward_mode = ForwardMode.DRAFT_EXTEND
 
+        self.device = model_runner.device
+        self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -216,9 +218,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         try:
             with model_capture_mode():
                 self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+        except (RuntimeError, Exception) as e:
+            # gfxgRAPH: if all graph captures failed, allow eager fallback
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Draft extend cuda graph capture failed: %s — will use eager fallback for all batch sizes",
+                str(e)[:200],
             )
 
     def can_run(self, forward_batch: ForwardBatch):
@@ -237,6 +243,21 @@ class EAGLEDraftExtendCudaGraphRunner:
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
+
+        # gfxgRAPH: check that the graph was actually captured (not None from failed capture)
+        if is_bs_supported and not self.disable_padding:
+            import bisect
+
+            padded_idx = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
+            if padded_idx < len(self.capture_bs):
+                padded_key = self.capture_bs[padded_idx]
+                if self.graphs.get(padded_key) is None:
+                    is_bs_supported = False
+            else:
+                is_bs_supported = False
+        elif is_bs_supported and self.disable_padding:
+            if self.graphs.get(cuda_graph_bs) is None:
+                is_bs_supported = False
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph

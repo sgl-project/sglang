@@ -243,23 +243,15 @@ class LlamaModel(nn.Module):
         # zero-padding 2560 to 7680 and projecting through fc produces garbage logits → 0% accept.
         if hidden_states.shape[-1] != self.fc.out_features:
             # RESCALE: the EAGLE3 head was trained on full-precision (fp16/bf16) aux hidden
-            # states with per-layer norm ~150-250 for a 2560-dim vector.  Q1_0_G128
-            # dequantised hidden states have norms ~3000-4000 per layer (23-30× larger),
-            # causing the fc output to explode and the midlayer to produce near-uniform
-            # logits (~6e-5 per token → 0% acceptance).  Scale back to training distribution.
+            # states.  Q1_0_G128 dequantised hidden states have ~25× larger norms,
+            # causing fc output to explode → 0% acceptance.  Scale back to training dist.
             # TODO: remove once EAGLE3 head is retrained on quantised hidden states.
-            import sys
-            _hs_norm = hidden_states.float().norm(dim=-1).mean().item()
-            print(f"[E3-SCALE] PRE-SCALE hs.shape={list(hidden_states.shape)} hs.norm={_hs_norm:.1f} fc.in={self.fc.in_features} fc.out={self.fc.out_features}", file=sys.stderr, flush=True)
             hidden_states = hidden_states * (1.0 / 25.0)
             hidden_states = torch.clamp(hidden_states, -100.0, 100.0)
-            _hs_norm2 = hidden_states.float().norm(dim=-1).mean().item()
-            print(f"[E3-SCALE] POST-SCALE hs.norm={_hs_norm2:.1f}", file=sys.stderr, flush=True)
 
             expected_in = self.fc.in_features
             current_in = hidden_states.shape[-1]
             if current_in != expected_in:
-                # Safety: handle unexpected intermediate sizes (e.g., partial aux capture)
                 if current_in < expected_in:
                     hidden_states = F.pad(hidden_states, (0, expected_in - current_in))
                 else:
@@ -267,10 +259,6 @@ class LlamaModel(nn.Module):
             if hidden_states.dtype != self.fc.weight.dtype:
                 hidden_states = hidden_states.to(self.fc.weight.dtype)
             hidden_states = self.fc(hidden_states)
-            import sys
-            _fc_norm = hidden_states.float().norm(dim=-1).mean().item()
-            _emb_norm = embeds.float().norm(dim=-1).mean().item()
-            print(f"[E3-SCALE] POST-FC fc_out.norm={_fc_norm:.1f} embeds.norm={_emb_norm:.1f}", file=sys.stderr, flush=True)
 
         # idle batch
         if hidden_states.shape[0] == 0:
