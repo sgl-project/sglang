@@ -235,6 +235,14 @@ class LMCRadixCache(RadixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
+        # Strip thinking tokens: consistent with radix tree truncation in base
+        # class. Output KV entries are already freed by super(), so we must not
+        # pass stale indices to LMCache.
+        if is_insert and req.reasoning_tokens > 0 and req.strip_thinking_from_cache:
+            prompt_len = min(len(req.origin_input_ids), len(token_ids))
+            token_ids = token_ids[:prompt_len]
+            kv_indices = kv_indices[:prompt_len]
+
         match_result = self.match_prefix(
             MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
         )

@@ -313,6 +313,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_insert:
             insert_params = InsertParams(prev_prefix_len=req.cache_protected_len)
 
+            # TODO: Add strip_thinking_from_cache gating here when unified cache
+            # supports reasoning parsers. Without this, thinking tokens from
+            # deepseek-r1 style parsers will pollute the cache with unreachable
+            # entries (see radix_cache.py:486 for reference implementation).
+
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
             for comp in self._components_tuple:

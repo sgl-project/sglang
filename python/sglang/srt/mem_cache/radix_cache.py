@@ -479,6 +479,17 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
+        # Strip thinking tokens: their KV entries are unreachable in multi-turn
+        # and answer tokens have wrong RoPE positions for cache reuse.
+        # Gated by strip_thinking_from_cache: some parsers (e.g.
+        # minimax-append-think) need thinking tokens in the cache.
+        if is_insert and req.reasoning_tokens > 0 and req.strip_thinking_from_cache:
+            prompt_len = min(len(req.origin_input_ids), len(token_ids))
+            # Free output token KV entries that won't be inserted into the cache
+            self.token_to_kv_pool_allocator.free(kv_indices[prompt_len:])
+            token_ids = token_ids[:prompt_len]
+            kv_indices = kv_indices[:prompt_len]
+
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = page_align_keys(keys, self.page_size)

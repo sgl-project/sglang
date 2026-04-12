@@ -19,6 +19,13 @@ class StreamingParseResult:
 class BaseReasoningFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
+    # Whether to strip thinking tokens from the radix cache on completion.
+    # True for most parsers (e.g. deepseek-r1): thinking tokens create
+    # unreachable cache entries with wrong RoPE positions.
+    # Override to False for parsers like minimax-append-think where
+    # thinking tokens are part of the visible output and should be cached.
+    strip_thinking_from_cache: bool = True
+
     def __init__(
         self,
         think_start_token: str,
@@ -394,6 +401,10 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     """
     Append `<think>` token to the beginning of the text.
     """
+
+    # Thinking tokens are prepended to visible output and must be cached
+    # for correct multi-turn prefix matching.
+    strip_thinking_from_cache: bool = False
 
     def __init__(
         self,

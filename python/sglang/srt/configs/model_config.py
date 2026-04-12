@@ -242,6 +242,9 @@ class ModelConfig:
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
         self.think_end_id: Optional[int] = None
+        # Whether to strip thinking tokens from radix cache on completion.
+        # Controlled per-parser; False for minimax-append-think.
+        self.strip_thinking_from_cache: bool = True
 
         # multimodal
         self.image_token_id = getattr(

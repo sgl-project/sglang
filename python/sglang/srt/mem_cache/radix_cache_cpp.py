@@ -177,6 +177,18 @@ class RadixCacheCpp(BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ].to(dtype=torch.int64, copy=True)
 
+        # Strip thinking tokens: their KV entries are unreachable in multi-turn
+        # and answer tokens have wrong RoPE positions for cache reuse.
+        # Gated by strip_thinking_from_cache: some parsers (e.g.
+        # minimax-append-think) need thinking tokens in the cache.
+        if is_insert and req.reasoning_tokens > 0 and req.strip_thinking_from_cache:
+            prompt_len = min(len(req.origin_input_ids), len(token_ids))
+            # Free output token KV entries that won't be inserted into the cache
+            self.token_to_kv_pool_allocator.free(kv_indices[prompt_len:])
+            token_ids = token_ids[:prompt_len]
+            kv_indices = kv_indices[:prompt_len]
+            kv_committed_len = prompt_len
+
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size

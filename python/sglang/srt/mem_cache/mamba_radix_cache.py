@@ -530,6 +530,17 @@ class MambaRadixCache(BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
+        # Strip thinking tokens: their KV entries are unreachable in multi-turn
+        # and answer tokens have wrong RoPE positions for cache reuse.
+        # Gated by strip_thinking_from_cache: some parsers (e.g.
+        # minimax-append-think) need thinking tokens in the cache.
+        if is_insert and req.reasoning_tokens > 0 and req.strip_thinking_from_cache:
+            prompt_len = min(len(req.origin_input_ids), len(token_ids))
+            # Free output token KV entries that won't be inserted into the cache
+            self.token_to_kv_pool_allocator.free(kv_indices[prompt_len:])
+            token_ids = token_ids[:prompt_len]
+            kv_indices = kv_indices[:prompt_len]
+
         if is_insert:
             cache_len = (
                 req.mamba_last_track_seqlen
@@ -538,6 +549,8 @@ class MambaRadixCache(BasePrefixCache):
             )
             if cache_len is None:
                 cache_len = 0
+            # Clamp to truncated length after thinking token strip
+            cache_len = min(cache_len, len(token_ids))
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
