@@ -89,7 +89,14 @@ class BridgeBuffers:
     while the bridge buffers persist at fixed addresses outside the graph.
     """
 
-    def __init__(self, max_tokens: int, attention_layers, device, dtype):
+    def __init__(
+        self,
+        max_tokens: int,
+        attention_layers,
+        device,
+        dtype,
+        hidden_size: int = 0,
+    ):
         q_dim = max(l.tp_q_head_num * l.qk_head_dim for l in attention_layers)
         k_dim = max(l.tp_k_head_num * l.qk_head_dim for l in attention_layers)
         v_dim = max(l.tp_v_head_num * l.v_head_dim for l in attention_layers)
@@ -99,6 +106,20 @@ class BridgeBuffers:
         self.k = torch.empty((max_tokens, k_dim), dtype=dtype, device=device)
         self.v = torch.empty((max_tokens, v_dim), dtype=dtype, device=device)
         self.output = torch.empty((max_tokens, out_dim), dtype=dtype, device=device)
+
+        # Mamba bridge buffers — used by hybrid-Mamba models (e.g. NemotronH)
+        # to break BCG around the mamba mixer, which has Python-level state
+        # updates that aren't CUDA-graph-replay-safe.
+        if hidden_size > 0:
+            self.mamba_hidden = torch.empty(
+                (max_tokens, hidden_size), dtype=dtype, device=device
+            )
+            self.mamba_output = torch.empty(
+                (max_tokens, hidden_size), dtype=dtype, device=device
+            )
+        else:
+            self.mamba_hidden = None
+            self.mamba_output = None
 
 
 class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
@@ -148,12 +169,16 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
         all_attn = [
             m for m in model_runner.model.modules() if isinstance(m, RadixAttention)
         ]
+        # Provide hidden_size so BridgeBuffers can allocate mamba bridges for
+        # hybrid-Mamba models. Falls back to 0 for non-mamba-bearing configs.
+        hidden_size = getattr(model_runner.model_config, "hidden_size", 0) or 0
         set_bridge_buffers(
             BridgeBuffers(
                 self.max_num_tokens,
                 all_attn,
                 self.device,
                 model_runner.dtype,
+                hidden_size=hidden_size,
             )
         )
 
@@ -359,6 +384,16 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
                     f"mem_delta={mem_after - mem_before:.3f} GB, "
                     f"mem_total={mem_after:.3f} GB"
                 )
+
+    def can_run(self, forward_batch: "ForwardBatch"):
+        # BCG graphs are captured with batch_size=1 (see _build_capture_forward_batch);
+        # the captured logits-gather / sampler path yields bs=1 outputs. Multi-req
+        # prefill would silently return wrong-shaped logits, corrupting downstream
+        # output_ids and breaking the subsequent decode step. Reject here so the
+        # caller falls back to the eager extend path.
+        if forward_batch.batch_size > 1:
+            return False
+        return super().can_run(forward_batch)
 
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
