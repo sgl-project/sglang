@@ -71,7 +71,7 @@ jobs:
   build-and-test:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: intel-bmg
+    runs-on: sglang-bmg
     env:
       HF_HOME: /home/sdp/.cache/huggingface
     steps:

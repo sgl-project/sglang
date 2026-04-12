@@ -25,7 +25,7 @@ concurrency:
 
 jobs:
   nightly-test:
-    runs-on: intel-bmg
+    runs-on: sglang-bmg
     env:
       HF_HOME: /home/sdp/.cache/huggingface
     steps:
