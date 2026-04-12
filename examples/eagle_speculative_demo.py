@@ -25,8 +25,8 @@ import argparse
 import time
 
 # ── 修改为你本地已下载的模型路径 ──────────────────────────────────────────
-TARGET_MODEL = "Qwen/Qwen3-4B"
-DRAFT_MODEL = "AngelSlim/Qwen3-4B_eagle3"
+TARGET_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DRAFT_MODEL = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
 # ─────────────────────────────────────────────────────────────────────────
 
 PROMPTS = [
