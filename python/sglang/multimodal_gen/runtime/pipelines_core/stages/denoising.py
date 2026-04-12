@@ -855,9 +855,21 @@ class DenoisingStage(PipelineStage):
         # image_latent must be sharded consistently with latents when it is
         # concatenated along the sequence dimension in the denoising loop.
         if batch.image_latent is not None:
+            sp_video_metadata = {
+                name: getattr(batch, name)
+                for name in (
+                    "sp_video_latent_num_frames",
+                    "sp_video_start_frame",
+                    "sp_video_tokens_per_frame",
+                    "sp_video_valid_token_count",
+                )
+                if hasattr(batch, name)
+            }
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
                 batch, batch.image_latent
             )
+            for name, value in sp_video_metadata.items():
+                setattr(batch, name, value)
 
     def _postprocess_sp_latents(
         self,
