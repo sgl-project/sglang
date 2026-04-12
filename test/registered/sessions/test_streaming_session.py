@@ -206,11 +206,6 @@ async def _leak_run_all(base_url: str, tokenizer: Any) -> None:
                 assert resp.status == 200
 
 
-# ===================================================================
-# Test class
-# ===================================================================
-
-
 class TestStreamingSession(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -232,10 +227,6 @@ class TestStreamingSession(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    # ------------------------------------------------------------------
-    # KV cache mechanics
-    # ------------------------------------------------------------------
 
     def test_kv_cache_inheritance(self, gen_len=12):
         """Verify KV inheritance, radix cache insertion, and flush reclamation."""
@@ -348,10 +339,6 @@ class TestStreamingSession(CustomTestCase):
             "After session close + flush, cache should be fully reclaimed",
         )
 
-    # ------------------------------------------------------------------
-    # Logprob leak tests
-    # ------------------------------------------------------------------
-
     def test_leak_logprob_none(self) -> None:
         """Streaming sessions without logprobs must not leak tokens."""
         _logprob_assert_no_leak(self.base_url, self.tokenizer)
@@ -368,10 +355,6 @@ class TestStreamingSession(CustomTestCase):
             return_logprob=True,
             logprob_start_len=0,
         )
-
-    # ------------------------------------------------------------------
-    # Chunked prefill leak test
-    # ------------------------------------------------------------------
 
     def test_leak_chunked_prefill(self) -> None:
         """Concurrent multi-turn streaming sessions then idle health check."""
@@ -401,11 +384,6 @@ class TestStreamingSession(CustomTestCase):
         )
 
 
-# ===================================================================
-# Variant: mixed chunked prefill
-# ===================================================================
-
-
 class TestStreamingSessionMixedChunk(TestStreamingSession):
     """Streaming session with --enable-mixed-chunk."""
 
@@ -430,11 +408,6 @@ class TestStreamingSessionMixedChunk(TestStreamingSession):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-
-# ===================================================================
-# Variant: retract decode
-# ===================================================================
 
 
 @unittest.skip("streaming session + retract has a token leak — tracked separately")
@@ -463,11 +436,6 @@ class TestStreamingSessionRetract(TestStreamingSession):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-
-# ===================================================================
-# Variant: retract decode + mixed chunked prefill
-# ===================================================================
 
 
 @unittest.skip("streaming session + retract has a token leak — tracked separately")
