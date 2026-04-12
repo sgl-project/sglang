@@ -1,6 +1,6 @@
 """
-EAGLE Speculative Decoding Benchmark (Llama-3.1-8B)
-====================================================
+EAGLE3 Speculative Decoding Benchmark (Llama-3.1-8B)
+=====================================================
 自动连续跑两遍（baseline → EAGLE3 speculative），最后输出速度对比。
 
 常用 EAGLE 模型对（target → draft）：
@@ -82,9 +82,8 @@ if __name__ == "__main__":
     t_base = benchmark(use_spec=False)
     t_spec = benchmark(use_spec=True)
 
-    speedup = t_base / t_spec
     print(f"\n{'='*60}")
     print(f"  Baseline      : {t_base:.2f} s")
     print(f"  EAGLE3 spec   : {t_spec:.2f} s")
-    print(f"  Speedup       : {speedup:.2f}x")
+    print(f"  Speedup       : {t_base / t_spec:.2f}x")
     print(f"{'='*60}")
