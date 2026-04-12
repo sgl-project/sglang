@@ -353,7 +353,8 @@ class DataParallelController:
             rep_socket.close()
             if self.server_args.elastic_ep_backend is not None:
                 threading.Thread(
-                    target=self._reply_ports_as_server, args=(endpoint, worker_ports),
+                    target=self._reply_ports_as_server,
+                    args=(endpoint, worker_ports),
                     daemon=True,
                 ).start()
 

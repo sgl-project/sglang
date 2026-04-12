@@ -133,8 +133,6 @@ def _maybe_create_message_queue(group) -> None:
 
     from sglang.srt.distributed.device_communicators.shm_broadcast import MessageQueue
 
-    if group.mq_broadcaster is not None:
-        group.mq_broadcaster.close()
     group.mq_broadcaster = MessageQueue.create_from_process_group(
         group.cpu_group, 1 << 22, 6
     )

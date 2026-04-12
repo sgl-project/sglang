@@ -1731,7 +1731,7 @@ def initialize_model_parallel(
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
-enable_symm_mem: bool = False,
+    enable_symm_mem: bool = False,
     recovered_rank: bool = False,
 ) -> None:
     """
