@@ -1,7 +1,9 @@
 """
-Standalone Speculative Decoding Demo (Qwen) — Benchmark
-=========================================================
-自动连续跑两遍（baseline → speculative），最后输出速度对比。
+Standalone Speculative Decoding Benchmark (Qwen)
+=================================================
+对比 baseline vs speculative decoding 在以下两个维度的速度差异：
+  1. 不同 batch size（1 / 4 / 8）
+  2. 逐条串行推理（模拟在线 chat 场景）
 
 运行方式：
   python standalone_speculative_demo.py
@@ -42,39 +44,51 @@ SPEC_KWARGS = dict(
 )
 
 
-def benchmark(use_spec: bool) -> float:
-    label = "STANDALONE spec" if use_spec else "Baseline"
-    print(f"\n{'='*60}")
-    print(f"  [{label}] 启动中...")
-    print(f"{'='*60}")
-
+def run_engine(use_spec: bool):
     kwargs = {**BASE_ENGINE_KWARGS}
     if use_spec:
         kwargs.update(SPEC_KWARGS)
-
     llm = sgl.Engine(**kwargs)
-    llm.generate(PROMPTS[:1], SAMPLING_PARAMS)          # 预热
+    llm.generate(PROMPTS[:1], SAMPLING_PARAMS)  # 预热
+    return llm
 
+
+def bench_batch(llm, batch_size: int) -> float:
+    prompts = PROMPTS[:batch_size]
     t0 = time.perf_counter()
-    outputs = llm.generate(PROMPTS, SAMPLING_PARAMS)
-    elapsed = time.perf_counter() - t0
-    llm.shutdown()
+    llm.generate(prompts, SAMPLING_PARAMS)
+    return time.perf_counter() - t0
 
-    for prompt, out in zip(PROMPTS, outputs):
-        print(f"\nPrompt : {prompt}")
-        print(f"Output : {out['text'].strip()[:200]}...")   # 截断避免刷屏
 
-    print(f"\n[{label}] Wall time: {elapsed:.2f} s  ({len(PROMPTS)} requests)")
-    return elapsed
+def bench_serial(llm) -> float:
+    t0 = time.perf_counter()
+    for p in PROMPTS:
+        llm.generate([p], SAMPLING_PARAMS)
+    return time.perf_counter() - t0
 
 
 if __name__ == "__main__":
-    t_base = benchmark(use_spec=False)
-    t_spec = benchmark(use_spec=True)
+    BATCH_SIZES = [1, 4, 8]
 
-    speedup = t_base / t_spec
-    print(f"\n{'='*60}")
-    print(f"  Baseline      : {t_base:.2f} s")
-    print(f"  Speculative   : {t_spec:.2f} s")
-    print(f"  Speedup       : {speedup:.2f}x")
-    print(f"{'='*60}")
+    print("Loading baseline engine...")
+    llm_base = run_engine(use_spec=False)
+    base_batch  = {bs: bench_batch(llm_base, bs) for bs in BATCH_SIZES}
+    base_serial = bench_serial(llm_base)
+    llm_base.shutdown()
+
+    print("Loading speculative engine...")
+    llm_spec = run_engine(use_spec=True)
+    spec_batch  = {bs: bench_batch(llm_spec, bs) for bs in BATCH_SIZES}
+    spec_serial = bench_serial(llm_spec)
+    llm_spec.shutdown()
+
+    # ── 结果汇总 ──────────────────────────────────────────────
+    print(f"\n{'='*55}")
+    print(f"  {'场景':<20} {'Baseline':>10} {'Spec':>10} {'Speedup':>10}")
+    print(f"  {'-'*50}")
+    for bs in BATCH_SIZES:
+        speedup = base_batch[bs] / spec_batch[bs]
+        print(f"  {'Batch bs='+str(bs):<20} {base_batch[bs]:>9.2f}s {spec_batch[bs]:>9.2f}s {speedup:>9.2f}x")
+    speedup_serial = base_serial / spec_serial
+    print(f"  {'Serial (8 req)':<20} {base_serial:>9.2f}s {spec_serial:>9.2f}s {speedup_serial:>9.2f}x")
+    print(f"{'='*55}")
