@@ -35,6 +35,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.multimodal.evs import EVS, EVSConfig
 from sglang.srt.utils import add_prefix
@@ -83,6 +84,19 @@ class NemotronH_Nano_VL_V2(EVS):
             ReLU2(),
             nn.Linear(vision_projection_hidden_size, llm_hidden_size, bias=False),
         ).to(self.language_model.config.torch_dtype)
+
+        self.sound_encoder: ProjectedParakeet | None = None
+        if getattr(config, "sound_config", None) is not None:
+            logger.info(
+                "Found sound config, initializing sound encoder for Nemotron AVLM"
+            )
+            self.sound_encoder = ProjectedParakeet(
+                config.sound_config,
+                dtype=self.language_model.config.torch_dtype,
+                llm_hidden_size=llm_hidden_size,
+                max_model_len=getattr(config, "max_model_len", 8192),
+            )
+
         self.config = config
 
     def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
@@ -91,6 +105,12 @@ class NemotronH_Nano_VL_V2(EVS):
         im_end_id: int = mm_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
+
+        audio_start_id = getattr(mm_inputs, "audio_start_id", None)
+        audio_end_id = getattr(mm_inputs, "audio_end_id", None)
+        if audio_start_id is not None and audio_end_id is not None:
+            media_token_pairs.append((audio_start_id, audio_end_id))
+
         helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
         return helper.pad_input_tokens(input_ids, mm_inputs)
@@ -166,6 +186,54 @@ class NemotronH_Nano_VL_V2(EVS):
         video_features = self.extract_feature(pixel_values)
         return video_features
 
+    def get_audio_feature(self, items: list[MultimodalDataItem]):
+        """
+        Encode audio features through the Parakeet sound encoder.
+
+        Each item carries mel spectrogram features, an attention mask, and a
+        clip count. Multiple clips per audio item are grouped and concatenated
+        (trimmed to valid output lengths) to form a single embedding per item.
+        """
+        assert self.sound_encoder is not None
+
+        all_features = []
+        all_masks = []
+        all_num_clips = []
+        for item in items:
+            all_features.append(item.feature)
+            all_masks.append(item.feature_attention_mask)
+            all_num_clips.append(item.audio_num_clips)
+
+        input_audio_features = torch.cat(all_features, dim=0)
+        feature_attention_mask = torch.cat(all_masks, dim=0)
+
+        target_device = next(self.sound_encoder.parameters()).device
+        input_audio_features = input_audio_features.to(
+            dtype=self.language_model.config.torch_dtype, device=target_device
+        )
+        feature_attention_mask = feature_attention_mask.to(device=target_device)
+
+        sound_embeds = self.sound_encoder(input_audio_features, feature_attention_mask)
+
+        valid_input_lens = feature_attention_mask.sum(dim=1)
+        valid_output_lens = (
+            self.sound_encoder.encoder._get_subsampling_output_length(valid_input_lens)
+            .long()
+            .tolist()
+        )
+
+        grouped_embeds = []
+        clip_offset = 0
+        for num_clips in all_num_clips:
+            embeds = []
+            for clip_idx in range(clip_offset, clip_offset + num_clips):
+                valid_len = valid_output_lens[clip_idx]
+                embeds.append(sound_embeds[clip_idx, :valid_len])
+            grouped_embeds.append(torch.cat(embeds, dim=0))
+            clip_offset += num_clips
+
+        return torch.cat(grouped_embeds, dim=0)
+
     @torch.no_grad()
     def forward(
         self,
@@ -174,15 +242,19 @@ class NemotronH_Nano_VL_V2(EVS):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
     ):
+        data_embedding_funcs = {
+            Modality.IMAGE: self.get_image_feature,
+            Modality.VIDEO: self.get_video_feature,
+        }
+        if self.sound_encoder is not None:
+            data_embedding_funcs[Modality.AUDIO] = self.get_audio_feature
+
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
             multimodal_model=self,
-            data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature,
-                Modality.VIDEO: self.get_video_feature,
-            },
+            data_embedding_funcs=data_embedding_funcs,
             positions=positions,
         )
         return hidden_states
@@ -199,9 +271,13 @@ class NemotronH_Nano_VL_V2(EVS):
         def is_vision_weights(name: str) -> bool:
             return name.startswith("vision_model.radio_model.")
 
+        def is_sound_weights(name: str) -> bool:
+            return name.startswith("sound")
+
         # Separate weights by component
         llm_weights = []
         vision_weights = []
+        sound_weights = []
 
         for name, w in weights:
             if is_llm(name):
@@ -215,10 +291,15 @@ class NemotronH_Nano_VL_V2(EVS):
                     default_weight_loader(param, w)
             elif is_vision_weights(name):
                 # Convert: vision_model.radio_model.* → radio_model.*
-                hf_key = name[len("vision_model.") :]  # Remove "vision_model." prefix
+                hf_key = name[len("vision_model."):]
                 vision_weights.append((hf_key, w))
+            elif is_sound_weights(name):
+                sound_weights.append((name, w))
+
         self.language_model.load_weights(llm_weights)
         self.vision_model.load_weights(vision_weights)
+        if self.sound_encoder is not None and len(sound_weights) > 0:
+            self.sound_encoder.load_weights(sound_weights)
 
 
 EntryClass = [NemotronH_Nano_VL_V2]
