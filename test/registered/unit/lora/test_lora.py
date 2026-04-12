@@ -143,6 +143,46 @@ class TestLoRAAdapter(CustomTestCase):
             qkv_b,
         )
 
+    def test_fuses_deepseek_mla_q_a_and_kv_a_proj_weights(self):
+        """DeepSeek MLA q_a and kv_a LoRA weights are fused into one qkv_a entry."""
+        adapter = self._make_adapter(["q_a_proj", "kv_a_proj_with_mqa"])
+
+        q_a_lora_a = torch.full((2, 4), 1.0)
+        kv_a_lora_a = torch.full((2, 4), 2.0)
+        q_a_lora_b = torch.full((3, 2), 3.0)
+        kv_a_lora_b = torch.full((3, 2), 4.0)
+
+        adapter.initialize_weights_from_tensors(
+            {
+                "base_model.model.model.layers.0.self_attn.q_a_proj.lora_A.weight": q_a_lora_a,
+                "base_model.model.model.layers.0.self_attn.kv_a_proj_with_mqa.lora_A.weight": kv_a_lora_a,
+                "base_model.model.model.layers.0.self_attn.q_a_proj.lora_B.weight": q_a_lora_b,
+                "base_model.model.model.layers.0.self_attn.kv_a_proj_with_mqa.lora_B.weight": kv_a_lora_b,
+            }
+        )
+
+        layer_weights = adapter.layers[0].weights
+        self.assertNotIn(
+            "base_model.model.model.layers.0.self_attn.q_a_proj.lora_A.weight",
+            layer_weights,
+        )
+        self.assertNotIn(
+            "base_model.model.model.layers.0.self_attn.kv_a_proj_with_mqa.lora_A.weight",
+            layer_weights,
+        )
+        torch.testing.assert_close(
+            layer_weights[
+                "base_model.model.model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.lora_A.weight"
+            ],
+            torch.cat((q_a_lora_a, kv_a_lora_a), dim=0),
+        )
+        torch.testing.assert_close(
+            layer_weights[
+                "base_model.model.model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.lora_B.weight"
+            ],
+            torch.cat((q_a_lora_b, kv_a_lora_b), dim=0),
+        )
+
     def test_normalizes_gate_up_proj_and_missing_up_proj(self):
         """gate_proj is stacked with a zero up_proj when the adapter omits up_proj."""
         adapter = self._make_adapter(["gate_proj"])
@@ -197,6 +237,66 @@ class TestLoRAAdapter(CustomTestCase):
                 "base_model.model.model.layers.1.mlp.gate_up_proj.lora_B.weight"
             ],
             gate_up_b,
+        )
+
+    def test_renames_moe_expert_w_weights_before_gate_up_normalization(self):
+        """MoE expert w1/w3/w2 names map to gate/up/down projection names."""
+        adapter = self._make_adapter(["gate_proj", "up_proj", "down_proj"])
+
+        w1_a = torch.full((2, 4), 1.0)
+        w3_a = torch.full((2, 4), 2.0)
+        w2_a = torch.full((2, 5), 3.0)
+        w1_b = torch.full((5, 2), 4.0)
+        w3_b = torch.full((5, 2), 5.0)
+        w2_b = torch.full((4, 2), 6.0)
+
+        adapter.initialize_weights_from_tensors(
+            {
+                "base_model.model.model.layers.0.mlp.experts.0.w1.lora_A.weight": w1_a,
+                "base_model.model.model.layers.0.mlp.experts.0.w3.lora_A.weight": w3_a,
+                "base_model.model.model.layers.0.mlp.experts.0.w2.lora_A.weight": w2_a,
+                "base_model.model.model.layers.0.mlp.experts.0.w1.lora_B.weight": w1_b,
+                "base_model.model.model.layers.0.mlp.experts.0.w3.lora_B.weight": w3_b,
+                "base_model.model.model.layers.0.mlp.experts.0.w2.lora_B.weight": w2_b,
+            }
+        )
+
+        layer_weights = adapter.layers[0].weights
+        self.assertNotIn(
+            "base_model.model.model.layers.0.mlp.experts.0.w1.lora_A.weight",
+            layer_weights,
+        )
+        self.assertNotIn(
+            "base_model.model.model.layers.0.mlp.experts.0.w3.lora_A.weight",
+            layer_weights,
+        )
+        self.assertNotIn(
+            "base_model.model.model.layers.0.mlp.experts.0.w2.lora_A.weight",
+            layer_weights,
+        )
+        torch.testing.assert_close(
+            layer_weights[
+                "base_model.model.model.layers.0.mlp.experts.0.gate_up_proj.lora_A.weight"
+            ],
+            torch.cat((w1_a, w3_a), dim=0),
+        )
+        torch.testing.assert_close(
+            layer_weights[
+                "base_model.model.model.layers.0.mlp.experts.0.gate_up_proj.lora_B.weight"
+            ],
+            torch.cat((w1_b, w3_b), dim=0),
+        )
+        torch.testing.assert_close(
+            layer_weights[
+                "base_model.model.model.layers.0.mlp.experts.0.down_proj.lora_A.weight"
+            ],
+            w2_a,
+        )
+        torch.testing.assert_close(
+            layer_weights[
+                "base_model.model.model.layers.0.mlp.experts.0.down_proj.lora_B.weight"
+            ],
+            w2_b,
         )
 
     def test_embedding_weights_are_filtered_by_target_modules_and_unembed_is_remapped(
