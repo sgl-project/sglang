@@ -90,9 +90,8 @@ A novel speculative decoding algorithm that uses background CPU threads to pre-c
 - **Context window diversity**: Multi-worker mode assigns different context windows per worker (full, half, double, offset) for draft diversity
 
 **Benchmarks (Bonsai-4B Q1_0_G128, RX 6700 XT):**
-- PHANTOM: **10.5–10.9 t/s** (stable)
-- NGRAM on same model: 3.3–4.4 t/s
-- Baseline (no speculation): 12.4 t/s
+- PHANTOM: **+10.5–10.9 t/s** (stable)
+- NGRAM on same model: +3.3–4.4 t/s
 
 ### 🛠️ RDNA2 Crash Fixes (1–12)
 
