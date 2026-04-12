@@ -67,9 +67,39 @@ jobs:
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
+          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN}'
+
+      - name: Clone sgl-kernel-xpu
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "cd /home/sdp && git clone https://github.com/sgl-project/sgl-kernel-xpu.git"
+
+      - name: Run Sglang Kernel Cases
+        timeout-minutes: 20
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && cd /home/sdp/sgl-kernel-xpu/tests && python3 run_suite.py --suite per-commit"
+
+      - name: Run Sglang Kernel Benchmarks
+        timeout-minutes: 30
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && \
+            cd /home/sdp/sgl-kernel-xpu/benchmark && \
+            python3 bench_flash_attn.py 2>&1 | tee flash.log && \
+            python3 bench_flash_mla_decode.py 2>&1 | tee mla.log && \
+            python3 bench_moe_topk_softmax.py 2>&1 | tee moe.log && \
+            python3 bench_fused_moe.py 2>&1 | tee fused_moe.log && \
+            python3 bench_moe_sum_reduce.py 2>&1 | tee moe_sum_reduce.log && \
+            python3 bench_moe_fused_gate.py 2>&1 | tee moe_fused_gate.log && \
+            python3 bench_merge_states_v2.py 2>&1 | tee merge_states.log && \
+            python3 bench_swiglu_alpha_limit.py 2>&1 | tee swiglu_alpha_limit.log && \
+            python3 bench_fused_qk_norm_rope.py 2>&1 | tee fused_qk_norm_rope.log && \
+            python3 bench_per_token_group_quant_8bit.py 2>&1 | tee per_token_group_quant_8bit.log && \
+            python3 bench_per_token_group_quant_mxfp4.py 2>&1 | tee per_token_group_quant_mxfp4.log && \
+            python3 bench_per_token_group_quant_8bit_v2.py 2>&1 | tee per_token_group_quant_8bit_v2.log"
 
       - name: Run Nightly E2E tests
         timeout-minutes: 60
