@@ -42,6 +42,9 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
+    ErnieImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinPipelineConfig,
     Flux2PipelineConfig,
@@ -74,6 +77,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
     Flux2SamplingParams,
@@ -910,6 +914,19 @@ def _register_configs():
         hf_model_paths=[
             "FireRedTeam/FireRed-Image-Edit-1.0",
             "FireRedTeam/FireRed-Image-Edit-1.1",
+        ],
+    )
+
+    # ErnieImage
+    register_configs(
+        sampling_param_cls=ErnieImageSamplingParams,
+        pipeline_config_cls=ErnieImagePipelineConfig,
+        hf_model_paths=[
+            "baidu/ERNIE-Image",
+            "baidu/ERNIE-Image-Turbo",
+        ],
+        model_detectors=[
+            lambda hf_id: "ernie-image" in hf_id.lower(),
         ],
     )
 
