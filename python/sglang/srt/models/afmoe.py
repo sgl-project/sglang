@@ -57,14 +57,16 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.utils import add_prefix, is_npu
 
 _is_npu = is_npu()
 
 if not _is_npu:
     from sglang.srt.layers.moe.fused_moe_triton import fused_moe
 else:
-    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import fused_moe_npu as fused_moe
+    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+        fused_moe_npu as fused_moe,
+    )
 
 
 def get_attention_sliding_window_size(config: PretrainedConfig) -> Optional[int]:
@@ -206,12 +208,6 @@ class AfmoeMoE(nn.Module):
                 for idx in range(self.n_routed_experts)
             ]
         )
-        if _is_cuda:
-            self.fused_moe_method = fused_moe
-        elif _is_npu:
-            self.fused_moe_method = fused_moe_npu
-        else:
-            self.fused_moe_method = moe_forward_native
 
         self.pack_params()
 
