@@ -381,13 +381,6 @@ def fused_moe_npu(
         expanded_src_to_dst_row=expanded_row_idx,
         export_for_source_row=topk_ids,
     )
-
-    if (
-        moe_runner_config.routed_scaling_factor is not None
-        and abs(moe_runner_config.routed_scaling_factor - 1.0) > 1e-2
-    ):
-        final_hidden_states *= moe_runner_config.routed_scaling_factor
-
     return final_hidden_states
 
 
