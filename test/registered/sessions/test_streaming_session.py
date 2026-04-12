@@ -17,6 +17,7 @@ from typing import Any, Optional
 import aiohttp
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -205,35 +206,27 @@ async def _leak_run_all(base_url: str, tokenizer: Any) -> None:
                 assert resp.status == 200
 
 
-# ===================================================================
-# Test class
-# ===================================================================
-
-
 class TestStreamingSession(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-streaming-session",
-                "--chunked-prefill-size",
-                "512",
-            ],
-        )
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--chunked-prefill-size",
+                    "512",
+                ],
+            )
         cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    # ------------------------------------------------------------------
-    # KV cache mechanics
-    # ------------------------------------------------------------------
 
     def test_kv_cache_inheritance(self, gen_len=12):
         """Verify KV inheritance, radix cache insertion, and flush reclamation."""
@@ -346,10 +339,6 @@ class TestStreamingSession(CustomTestCase):
             "After session close + flush, cache should be fully reclaimed",
         )
 
-    # ------------------------------------------------------------------
-    # Logprob leak tests
-    # ------------------------------------------------------------------
-
     def test_leak_logprob_none(self) -> None:
         """Streaming sessions without logprobs must not leak tokens."""
         _logprob_assert_no_leak(self.base_url, self.tokenizer)
@@ -366,10 +355,6 @@ class TestStreamingSession(CustomTestCase):
             return_logprob=True,
             logprob_start_len=0,
         )
-
-    # ------------------------------------------------------------------
-    # Chunked prefill leak test
-    # ------------------------------------------------------------------
 
     def test_leak_chunked_prefill(self) -> None:
         """Concurrent multi-turn streaming sessions then idle health check."""
@@ -397,6 +382,89 @@ class TestStreamingSession(CustomTestCase):
             "Server unhealthy after streaming session close — "
             "likely a token memory leak from streaming session lifecycle.",
         )
+
+
+class TestStreamingSessionMixedChunk(TestStreamingSession):
+    """Streaming session with --enable-mixed-chunk."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--chunked-prefill-size",
+                    "512",
+                    "--enable-mixed-chunk",
+                ],
+            )
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+
+@unittest.skip("streaming session + retract has a token leak — tracked separately")
+class TestStreamingSessionRetract(TestStreamingSession):
+    """Streaming session under retract decode pressure."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_TEST_RETRACT.override(
+            True
+        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--chunked-prefill-size",
+                    "128",
+                ],
+            )
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+
+@unittest.skip("streaming session + retract has a token leak — tracked separately")
+class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
+    """Streaming session under retract decode with --enable-mixed-chunk."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_TEST_RETRACT.override(
+            True
+        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--chunked-prefill-size",
+                    "128",
+                    "--enable-mixed-chunk",
+                ],
+            )
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":

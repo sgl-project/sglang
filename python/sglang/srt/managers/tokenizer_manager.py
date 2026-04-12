@@ -1268,6 +1268,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             else:
                 out = out_list[-1]
 
+            # Resolve deferred text for non-incremental streaming.
+            # _handle_batch_output sets "text": None on intermediate chunks
+            # to avoid O(n) string rebuild per step (O(n^2) total).
+            if (
+                is_stream
+                and not incremental_stream
+                and "text" in out
+                and out["text"] is None
+            ):
+                out["text"] = state.get_text()
+
             if finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_time` has not been set yet).
                 # Record response sent time right before we log finished results and metrics.
@@ -1708,15 +1719,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         output_token_ids = delta_output_ids
                         _slice_streaming_output_meta_info(meta_info, output_offset)
                         state.last_output_offset = len(state.output_ids)
-                        output_text = delta_text
+                        out_dict = {
+                            "text": delta_text,
+                            "output_ids": output_token_ids,
+                            "meta_info": meta_info,
+                        }
+                    elif state.finished:
+                        out_dict = {
+                            "text": state.get_text(),
+                            "output_ids": state.output_ids.copy(),
+                            "meta_info": meta_info,
+                        }
                     else:
-                        output_token_ids = state.output_ids.copy()
-                        output_text = state.get_text()
-                    out_dict = {
-                        "text": output_text,
-                        "output_ids": output_token_ids,
-                        "meta_info": meta_info,
-                    }
+                        # Non-incremental intermediate: pass reference (no
+                        # copy) and defer text to _wait_one_response to avoid
+                        # O(n) per-step cost that compounds to O(n^2).
+                        out_dict = {
+                            "text": None,
+                            "output_ids": state.output_ids,
+                            "meta_info": meta_info,
+                        }
                 elif state.finished:
                     out_dict = {
                         "text": state.get_text(),
@@ -1739,12 +1761,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         output_token_ids = delta_output_ids
                         _slice_streaming_output_meta_info(meta_info, output_offset)
                         state.last_output_offset = len(state.output_ids)
+                        out_dict = {
+                            "output_ids": output_token_ids,
+                            "meta_info": meta_info,
+                        }
+                    elif state.finished:
+                        out_dict = {
+                            "output_ids": state.output_ids.copy(),
+                            "meta_info": meta_info,
+                        }
                     else:
-                        output_token_ids = state.output_ids.copy()
-                    out_dict = {
-                        "output_ids": output_token_ids,
-                        "meta_info": meta_info,
-                    }
+                        out_dict = {
+                            "output_ids": state.output_ids,
+                            "meta_info": meta_info,
+                        }
                 elif state.finished:
                     out_dict = {
                         "output_ids": state.output_ids.copy(),
