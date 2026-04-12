@@ -118,8 +118,6 @@ class PoolStats:
 
 class SchedulerRuntimeCheckerMixin:
     def _alive_streaming_session_count(self: Scheduler) -> int:
-        if not hasattr(self, "session_controller"):
-            return 0
         return sum(
             1
             for session in self.session_controller.sessions.values()
