@@ -33,7 +33,7 @@ MNK_FACTORS = [
 
 @pytest.mark.parametrize("k_chunk", MARLIN_K_CHUNKS)
 @pytest.mark.parametrize("n_chunk", MARLIN_N_CHUNKS)
-@pytest.mark.parametrize("quant_type", [scalar_types.uint4b8])
+@pytest.mark.parametrize("quant_type", [scalar_types.uint4b8, scalar_types.uint8b128])
 @pytest.mark.parametrize("group_size", [-1, 32, 64, 128])
 @pytest.mark.parametrize("act_order", [False, True])
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
