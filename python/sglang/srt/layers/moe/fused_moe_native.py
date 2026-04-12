@@ -97,24 +97,11 @@ def moe_forward_native(
     new_x = torch.empty_like(outs)
 
     new_x[idxs] = outs
-    if (
-        moe_runner_config.routed_scaling_factor is None
-        or abs(moe_runner_config.routed_scaling_factor - 1.0) < 1e-5
-    ):
-        final_out = (
-            new_x.view(*topk_ids.shape, -1)
-            .type(topk_weights.dtype)
-            .mul_(topk_weights.unsqueeze(dim=-1))
-            .sum(dim=1)
-            .type(new_x.dtype)
-        )
-    else:
-        final_out = (
-            new_x.view(*topk_ids.shape, -1)
-            .type(topk_weights.dtype)
-            .mul_(topk_weights.unsqueeze(dim=-1))
-            .sum(dim=1)
-            .type(new_x.dtype)
-            * moe_runner_config.routed_scaling_factor
-        )
+    final_out = (
+        new_x.view(*topk_ids.shape, -1)
+        .type(topk_weights.dtype)
+        .mul_(topk_weights.unsqueeze(dim=-1))
+        .sum(dim=1)
+        .type(new_x.dtype)
+    )
     return final_out
