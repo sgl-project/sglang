@@ -627,13 +627,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
-                        current_model, current_guidance_scale = (
-                            self._select_and_manage_model(
-                                t_int=t_int,
-                                boundary_timestep=boundary_timestep,
-                                server_args=server_args,
-                                batch=batch,
-                            )
+                        (
+                            current_model,
+                            current_guidance_scale,
+                        ) = self._select_and_manage_model(
+                            t_int=t_int,
+                            boundary_timestep=boundary_timestep,
+                            server_args=server_args,
+                            batch=batch,
                         )
 
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
@@ -748,12 +749,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             model_video = model_video.float()
                             model_audio = model_audio.float()
                             if batch.do_classifier_free_guidance:
-                                model_video_uncond, model_video_text = (
-                                    model_video.chunk(2)
-                                )
-                                model_audio_uncond, model_audio_text = (
-                                    model_audio.chunk(2)
-                                )
+                                (
+                                    model_video_uncond,
+                                    model_video_text,
+                                ) = model_video.chunk(2)
+                                (
+                                    model_audio_uncond,
+                                    model_audio_text,
+                                ) = model_audio.chunk(2)
                                 model_video = model_video_uncond + (
                                     batch.guidance_scale
                                     * (model_video_text - model_video_uncond)
@@ -1155,11 +1158,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
         )
         phase = batch.extra.get("ltx2_phase")
         pipeline = self.pipeline() if self.pipeline else None
-        pipeline_name = (
-            getattr(pipeline, "pipeline_name", None)
-            if pipeline is not None
-            else None
-        )
+        pipeline_name = pipeline.pipeline_name if pipeline is not None else None
         use_ltx23_legacy_one_stage = self._should_use_ltx23_legacy_one_stage(
             server_args, pipeline_name
         )
@@ -1193,10 +1192,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
             and not replicate_audio_for_sp
             and not use_ltx23_legacy_one_stage
         ):
-            batch.audio_latents, batch.did_sp_shard_audio_latents = (
-                server_args.pipeline_config.shard_audio_latents_for_sp(
-                    batch, batch.audio_latents
-                )
+            (
+                batch.audio_latents,
+                batch.did_sp_shard_audio_latents,
+            ) = server_args.pipeline_config.shard_audio_latents_for_sp(
+                batch, batch.audio_latents
             )
             audio_latents = batch.audio_latents
         else:
@@ -1263,13 +1263,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
-                        current_model, current_guidance_scale = (
-                            self._select_and_manage_model(
-                                t_int=t_int,
-                                boundary_timestep=boundary_timestep,
-                                server_args=server_args,
-                                batch=batch,
-                            )
+                        (
+                            current_model,
+                            current_guidance_scale,
+                        ) = self._select_and_manage_model(
+                            t_int=t_int,
+                            boundary_timestep=boundary_timestep,
+                            server_args=server_args,
+                            batch=batch,
                         )
 
                         # Predict noise residual
@@ -1448,13 +1449,13 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     }
                                 )
                             if skip_video_self_attn_blocks is not None:
-                                kwargs["skip_video_self_attn_blocks"] = (
-                                    skip_video_self_attn_blocks
-                                )
+                                kwargs[
+                                    "skip_video_self_attn_blocks"
+                                ] = skip_video_self_attn_blocks
                             if skip_audio_self_attn_blocks is not None:
-                                kwargs["skip_audio_self_attn_blocks"] = (
-                                    skip_audio_self_attn_blocks
-                                )
+                                kwargs[
+                                    "skip_audio_self_attn_blocks"
+                                ] = skip_audio_self_attn_blocks
                             if disable_a2v_cross_attn:
                                 kwargs["disable_a2v_cross_attn"] = True
                             if disable_v2a_cross_attn:
@@ -1556,12 +1557,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             model_video = model_video.float()
                             model_audio = model_audio.float()
                             if batch.do_classifier_free_guidance:
-                                model_video_uncond, model_video_text = (
-                                    model_video.chunk(2)
-                                )
-                                model_audio_uncond, model_audio_text = (
-                                    model_audio.chunk(2)
-                                )
+                                (
+                                    model_video_uncond,
+                                    model_video_text,
+                                ) = model_video.chunk(2)
+                                (
+                                    model_audio_uncond,
+                                    model_audio_text,
+                                ) = model_audio.chunk(2)
                                 model_video = model_video_uncond + (
                                     batch.guidance_scale
                                     * (model_video_text - model_video_uncond)
@@ -1968,10 +1971,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
             batch.latents = latents
             batch.audio_latents = audio_latents
         else:
-            latents, audio_latents = (
-                server_args.pipeline_config._unpad_and_unpack_latents(
-                    latents, audio_latents, batch, self.vae, self.audio_vae
-                )
+            (
+                latents,
+                audio_latents,
+            ) = server_args.pipeline_config._unpad_and_unpack_latents(
+                latents, audio_latents, batch, self.vae, self.audio_vae
             )
 
             batch.latents = latents
