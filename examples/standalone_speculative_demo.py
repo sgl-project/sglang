@@ -12,7 +12,7 @@ Standalone Speculative Decoding Benchmark (Qwen)
 import time
 import sglang as sgl
 
-TARGET_MODEL = "Qwen/Qwen2.5-72B-Instruct"
+TARGET_MODEL = "Qwen/Qwen2.5-32B-Instruct"
 DRAFT_MODEL  = "Qwen/Qwen2.5-7B-Instruct"
 
 PROMPTS = [
