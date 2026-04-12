@@ -1,33 +1,29 @@
 """
-EAGLE Speculative Decoding Demo
-================================
-两种使用方式：
-  1. 离线推理（sgl.Engine，最简单）
-  2. 在线服务 + OpenAI 客户端
+Standalone Speculative Decoding Demo (Qwen)
+============================================
+使用 Qwen2.5-7B-Instruct 作为 target，Qwen2.5-1.5B-Instruct 作为 draft，
+采用 STANDALONE 算法（draft 模型无需专门训练，直接使用小模型）。
 
-常用 EAGLE 模型对（target → draft）：
-  meta-llama/Llama-3.1-8B-Instruct  → jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B
-  Qwen/Qwen3-4B                      → AngelSlim/Qwen3-4B_eagle3
-  Qwen/Qwen3-1.7B                    → AngelSlim/Qwen3-1.7B_eagle3
+两种使用方式：
+  1. 离线推理（sgl.Engine）
+  2. 在线服务 + OpenAI 客户端
 
 运行方式：
   # 离线模式（默认）
-  python eagle_speculative_demo.py
+  python standalone_speculative_demo.py
 
   # 在线服务模式
-  python eagle_speculative_demo.py --mode server
+  python standalone_speculative_demo.py --mode server
 
   # 关闭 speculative decoding，用于对比基线速度
-  python eagle_speculative_demo.py --no-spec
+  python standalone_speculative_demo.py --no-spec
 """
 
 import argparse
 import time
 
-# ── 修改为你本地已下载的模型路径 ──────────────────────────────────────────
-TARGET_MODEL = "Qwen/Qwen3-4B"
-DRAFT_MODEL = "AngelSlim/Qwen3-4B_eagle3"
-# ─────────────────────────────────────────────────────────────────────────
+TARGET_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+DRAFT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 PROMPTS = [
     "Explain the theory of relativity in simple terms.",
@@ -45,15 +41,14 @@ SAMPLING_PARAMS = {
     "max_new_tokens": 256,
 }
 
-# ── EAGLE 超参数 ──────────────────────────────────────────────────────────
-EAGLE_CONFIG = dict(
-    speculative_algorithm="EAGLE3",
+SPEC_CONFIG = dict(
+    speculative_algorithm="STANDALONE",
     speculative_draft_model_path=DRAFT_MODEL,
-    speculative_num_steps=3,          # draft 树深度
-    speculative_eagle_topk=4,         # 每步 top-k 分支数
-    speculative_num_draft_tokens=16,  # 最终 draft token 总数（树节点数）
+    speculative_num_steps=4,
+    speculative_eagle_topk=2,
+    speculative_num_draft_tokens=7,
+    mem_fraction_static=0.7,
 )
-# ─────────────────────────────────────────────────────────────────────────
 
 
 def run_offline(use_spec: bool):
@@ -65,12 +60,12 @@ def run_offline(use_spec: bool):
         cuda_graph_max_bs=len(PROMPTS),
     )
     if use_spec:
-        engine_kwargs.update(EAGLE_CONFIG)
-        print(f"[EAGLE] target={TARGET_MODEL}")
-        print(f"        draft={DRAFT_MODEL}")
-        print(f"        steps={EAGLE_CONFIG['speculative_num_steps']}  "
-              f"topk={EAGLE_CONFIG['speculative_eagle_topk']}  "
-              f"draft_tokens={EAGLE_CONFIG['speculative_num_draft_tokens']}\n")
+        engine_kwargs.update(SPEC_CONFIG)
+        print(f"[STANDALONE] target={TARGET_MODEL}")
+        print(f"             draft={DRAFT_MODEL}")
+        print(f"             steps={SPEC_CONFIG['speculative_num_steps']}  "
+              f"topk={SPEC_CONFIG['speculative_eagle_topk']}  "
+              f"draft_tokens={SPEC_CONFIG['speculative_num_draft_tokens']}\n")
     else:
         print(f"[Baseline] target={TARGET_MODEL} (no speculative decoding)\n")
 
@@ -84,12 +79,6 @@ def run_offline(use_spec: bool):
     outputs = llm.generate(PROMPTS, SAMPLING_PARAMS)
     elapsed = time.perf_counter() - t0
 
-    total_tokens = sum(len(o["meta_info"]["completion_tokens"])
-                       if "completion_tokens" in o.get("meta_info", {})
-                       else o["meta_info"].get("completion_tokens", 0)
-                       for o in outputs)
-
-    # 打印结果
     for prompt, output in zip(PROMPTS, outputs):
         print("=" * 60)
         print(f"Prompt : {prompt}")
@@ -115,21 +104,23 @@ def run_server_mode(use_spec: bool):
         "--model-path", TARGET_MODEL,
         "--port", str(port),
         "--host", "127.0.0.1",
+        "--mem-fraction-static", str(SPEC_CONFIG["mem_fraction_static"]),
+        "--cuda-graph-max-bs", str(len(PROMPTS)),
+        "--log-level", "warning",
     ]
     if use_spec:
         cmd += [
-            "--speculative-algorithm", EAGLE_CONFIG["speculative_algorithm"],
+            "--speculative-algorithm", SPEC_CONFIG["speculative_algorithm"],
             "--speculative-draft-model-path", DRAFT_MODEL,
-            "--speculative-num-steps", str(EAGLE_CONFIG["speculative_num_steps"]),
-            "--speculative-eagle-topk", str(EAGLE_CONFIG["speculative_eagle_topk"]),
-            "--speculative-num-draft-tokens", str(EAGLE_CONFIG["speculative_num_draft_tokens"]),
+            "--speculative-num-steps", str(SPEC_CONFIG["speculative_num_steps"]),
+            "--speculative-eagle-topk", str(SPEC_CONFIG["speculative_eagle_topk"]),
+            "--speculative-num-draft-tokens", str(SPEC_CONFIG["speculative_num_draft_tokens"]),
         ]
 
     print("Starting SGLang server...")
     print("Command:", " ".join(cmd))
     server = subprocess.Popen(cmd)
 
-    # 等待服务就绪
     import socket
     for _ in range(120):
         try:
@@ -168,7 +159,7 @@ def run_server_mode(use_spec: bool):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="EAGLE Speculative Decoding Demo")
+    parser = argparse.ArgumentParser(description="Standalone Speculative Decoding Demo")
     parser.add_argument("--mode", choices=["offline", "server"], default="offline",
                         help="offline: sgl.Engine;  server: launch HTTP server + OpenAI client")
     parser.add_argument("--no-spec", action="store_true",
@@ -183,6 +174,5 @@ def main():
         run_server_mode(use_spec)
 
 
-# sgl.Engine 使用 spawn 多进程，必须保护入口点
 if __name__ == "__main__":
     main()
