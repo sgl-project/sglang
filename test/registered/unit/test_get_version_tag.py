@@ -22,6 +22,7 @@ TAG_ONLY_DESCRIBE_COMMAND = (
     'git_describe_command = ["python3", "python/tools/get_version_tag.py", '
     '"--tag-only"]'
 )
+FALLBACK_VERSION = 'fallback_version = "0.0.0.dev0"'
 
 
 def _load_module(name, path):
@@ -64,6 +65,7 @@ class TestGetVersionTag(unittest.TestCase):
                 content = path.read_text()
                 self.assertIn(DESCRIBE_COMMAND, content)
                 self.assertNotIn(TAG_ONLY_DESCRIBE_COMMAND, content)
+                self.assertIn(FALLBACK_VERSION, content)
 
     def test_tag_only_cli_mode_remains_available_for_callers_that_need_latest_tag(self):
         with patch.object(
