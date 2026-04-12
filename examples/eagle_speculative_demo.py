@@ -49,9 +49,10 @@ SAMPLING_PARAMS = {
 EAGLE_CONFIG = dict(
     speculative_algorithm="EAGLE3",
     speculative_draft_model_path=DRAFT_MODEL,
-    speculative_num_steps=3,          # draft 树深度
-    speculative_eagle_topk=4,         # 每步 top-k 分支数
-    speculative_num_draft_tokens=16,  # 最终 draft token 总数（树节点数）
+    speculative_num_steps=3,
+    speculative_eagle_topk=4,
+    speculative_num_draft_tokens=16,
+    dtype="float16",
 )
 # ─────────────────────────────────────────────────────────────────────────
 
