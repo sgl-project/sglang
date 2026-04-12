@@ -1270,9 +1270,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output omits "text" from intermediate chunks to
-            # avoid O(n) string rebuild per step (O(n²) total).
+            # avoid O(n) string rebuild per step (O(n^2) total).
+            # Guard: only for BatchStrOutput requests (which accumulate text).
             if is_stream and not incremental_stream and "text" not in out:
-                out["text"] = state.get_text()
+                if state.text or state.text_chunks:
+                    out["text"] = state.get_text()
 
             if finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_time` has not been set yet).
