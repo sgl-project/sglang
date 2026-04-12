@@ -1449,13 +1449,13 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     }
                                 )
                             if skip_video_self_attn_blocks is not None:
-                                kwargs[
-                                    "skip_video_self_attn_blocks"
-                                ] = skip_video_self_attn_blocks
+                                kwargs["skip_video_self_attn_blocks"] = (
+                                    skip_video_self_attn_blocks
+                                )
                             if skip_audio_self_attn_blocks is not None:
-                                kwargs[
-                                    "skip_audio_self_attn_blocks"
-                                ] = skip_audio_self_attn_blocks
+                                kwargs["skip_audio_self_attn_blocks"] = (
+                                    skip_audio_self_attn_blocks
+                                )
                             if disable_a2v_cross_attn:
                                 kwargs["disable_a2v_cross_attn"] = True
                             if disable_v2a_cross_attn:
