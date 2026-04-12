@@ -41,7 +41,12 @@ jobs:
 
       - name: Build Docker image
         run: |
+          REPO="https://github.com/${{ github.repository }}.git"
+          BRANCH="${{ inputs.ref || github.ref_name }}"
+          echo "Building with REPO=$REPO, BRANCH=$BRANCH"
           docker build \
+            --build-arg SG_LANG_REPO=$REPO \
+            --build-arg SG_LANG_BRANCH=$BRANCH \
             --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_nightly:bmg .
 
       - name: Run container
