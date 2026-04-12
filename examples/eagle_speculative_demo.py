@@ -91,11 +91,6 @@ def run_offline(use_spec: bool):
     outputs = llm.generate(PROMPTS, SAMPLING_PARAMS)
     elapsed = time.perf_counter() - t0
 
-    total_tokens = sum(len(o["meta_info"]["completion_tokens"])
-                       if "completion_tokens" in o.get("meta_info", {})
-                       else o["meta_info"].get("completion_tokens", 0)
-                       for o in outputs)
-
     # 打印结果
     for prompt, output in zip(PROMPTS, outputs):
         print("=" * 60)
