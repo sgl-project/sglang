@@ -323,6 +323,11 @@ class SessionAwareCache(BasePrefixCache):
         protected_len = slot.cache_protected_len
         lock_node = slot.last_node
 
+        # TODO: re-match logic disabled — match_prefix has side effects
+        # (splits) that disturb tree accounting. Directly using
+        # slot.last_node + cache_protected_len is safe after split analysis.
+        return protected_len, lock_node
+
         if (
             req is None
             or not slot.is_holding_kv
