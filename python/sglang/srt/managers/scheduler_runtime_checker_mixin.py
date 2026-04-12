@@ -117,7 +117,7 @@ class PoolStats:
 
 
 class SchedulerRuntimeCheckerMixin:
-    def _active_streaming_session_count(self: Scheduler) -> int:
+    def _alive_streaming_session_count(self: Scheduler) -> int:
         if not hasattr(self, "session_controller"):
             return 0
         return sum(
@@ -460,7 +460,7 @@ class SchedulerRuntimeCheckerMixin:
             return
 
         self.get_pool_stats().update_scheduler_stats(self.stats)
-        self.stats.num_streaming_sessions = self._active_streaming_session_count()
+        self.stats.num_streaming_sessions = self._alive_streaming_session_count()
         self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
         priority_enabled = self.enable_priority_scheduling
