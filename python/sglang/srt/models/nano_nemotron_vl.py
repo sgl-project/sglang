@@ -291,7 +291,7 @@ class NemotronH_Nano_VL_V2(EVS):
                     default_weight_loader(param, w)
             elif is_vision_weights(name):
                 # Convert: vision_model.radio_model.* → radio_model.*
-                hf_key = name[len("vision_model."):]
+                hf_key = name[len("vision_model.") :]
                 vision_weights.append((hf_key, w))
             elif is_sound_weights(name):
                 sound_weights.append((name, w))

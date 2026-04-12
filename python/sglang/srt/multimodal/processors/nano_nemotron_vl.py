@@ -77,9 +77,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         self.AUDIO_CONTEXT_TOKEN = getattr(
             hf_config, "audio_context_token", "<so_embedding>"
         )
-        self.AUDIO_START_TOKEN = getattr(
-            hf_config, "audio_start_token", "<so_start>"
-        )
+        self.AUDIO_START_TOKEN = getattr(hf_config, "audio_start_token", "<so_start>")
         self.AUDIO_END_TOKEN = getattr(hf_config, "audio_end_token", "<so_end>")
 
         audio_token_str = None
@@ -242,9 +240,7 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
 
             clip_offset = 0
             for audio_idx, num_clips in enumerate(clip_counts):
-                audio_features = input_features[
-                    clip_offset : clip_offset + num_clips
-                ]
+                audio_features = input_features[clip_offset : clip_offset + num_clips]
                 audio_mask = attention_mask[clip_offset : clip_offset + num_clips]
                 clip_offset += num_clips
                 audio_items.append(
@@ -301,10 +297,6 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             im_token_id=self.mm_tokens.image_token_id,
             video_token_id=self.mm_tokens.image_token_id,
             audio_token_id=self.mm_tokens.audio_token_id if audio_items else None,
-            audio_start_id=(
-                self.audio_start_token_id if audio_items else None
-            ),
-            audio_end_id=(
-                self.audio_end_token_id if audio_items else None
-            ),
+            audio_start_id=(self.audio_start_token_id if audio_items else None),
+            audio_end_id=(self.audio_end_token_id if audio_items else None),
         )
