@@ -158,6 +158,7 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:num_running_reqs",
             "sglang:num_used_tokens",
             "sglang:token_usage",
+            "sglang:gpu_cache_usage_perc",
             "sglang:gen_throughput",
             "sglang:num_queue_reqs",
             "sglang:num_grammar_queue_reqs",

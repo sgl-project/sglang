@@ -17,6 +17,9 @@ sglang:generation_tokens_total{model_name="meta-llama/Llama-3.1-8B-Instruct"} 7.
 # HELP sglang:token_usage The token usage
 # TYPE sglang:token_usage gauge
 sglang:token_usage{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.28
+# HELP sglang:gpu_cache_usage_perc GPU KV cache usage percentage (0.0-1.0). Compatible with vLLM's gpu_cache_usage_perc.
+# TYPE sglang:gpu_cache_usage_perc gauge
+sglang:gpu_cache_usage_perc{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.28
 # HELP sglang:cache_hit_rate The cache hit rate
 # TYPE sglang:cache_hit_rate gauge
 sglang:cache_hit_rate{model_name="meta-llama/Llama-3.1-8B-Instruct"} 0.007507552643049313
