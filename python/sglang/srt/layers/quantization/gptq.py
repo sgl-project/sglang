@@ -52,7 +52,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -62,13 +62,14 @@ if TYPE_CHECKING:
     )
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import gptq_gemm, gptq_shuffle
 
     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 
-_is_npu = is_npu()
 
 if _is_npu:
     import torch_npu
@@ -194,7 +195,9 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half] if not _is_npu else [torch.half, torch.bfloat16]
+        return (
+            [torch.half] if not (_is_npu or _is_cpu) else [torch.half, torch.bfloat16]
+        )
 
     @classmethod
     # Need to figure it out
@@ -246,6 +249,8 @@ class GPTQConfig(QuantizationConfig):
             return None
 
         if isinstance(layer, FusedMoE):
+            if _is_cpu:
+                return GPTQMarlinMoEMethod(self)
             raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
         else:
             return get_linear_quant_method(
@@ -1310,12 +1315,16 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         self.is_k_full = (not self.quant_config.desc_act) or layer.moe_tp_size == 1
 
         if self.quant_config.group_size != -1:
-            scales_size13 = hidden_size // self.quant_config.group_size
+            scales_size13 = (
+                hidden_size + self.quant_config.group_size - 1
+            ) // self.quant_config.group_size
             if self.quant_config.desc_act:
                 w2_scales_size = intermediate_size_per_partition
             else:
                 w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
-            scales_size2 = w2_scales_size // self.quant_config.group_size
+            scales_size2 = (
+                w2_scales_size + self.quant_config.group_size - 1
+            ) // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
             scales_size13 = 1
@@ -1368,6 +1377,30 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_scales, extra_weight_attrs)
         # dont shard the w2 scales when running act order
         set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
+        # up_proj bias
+        w13_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_bias", w13_bias)
+        set_weight_attrs(w13_bias, extra_weight_attrs)
+        # down_proj scales
+        w2_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_bias", w2_bias)
+        set_weight_attrs(w2_bias, extra_weight_attrs)
+        # dont shard the w2 scales when running act order
+        set_weight_attrs(w2_bias, {"load_full_w2": self.quant_config.desc_act})
         # up_proj scales
         w13_qzeros = torch.nn.Parameter(
             torch.empty(
