@@ -101,7 +101,7 @@ sglang generate --model-path Lightricks/LTX-2.3 \
   --enable-torch-compile --warmup --save-output
 ```
 
-Note: use this as the native `LTX2Pipeline` baseline for `LTX-2.3`. It keeps the validated one-stage resolution and explicit `LTX-2.3` sampling defaults.
+Note: use this as the native `LTX2Pipeline` baseline for `LTX-2.3`. It keeps the validated one-stage resolution and explicit `LTX-2.3` sampling defaults, and matches the `ltx23-one-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
 
 ### Benchmark target, 2 GPUs: LTX-2.3 two-stage
 
@@ -117,7 +117,7 @@ sglang generate --model-path Lightricks/LTX-2.3 \
   --enable-torch-compile --warmup --save-output
 ```
 
-Note: this is the recommended benchmark command for the new `LTX-2.3` two-stage path. It uses the native `LTX2TwoStagePipeline` and matches the `ltx23` benchmark preset in `sglang-diffusion-benchmark-profile`.
+Note: this is the recommended benchmark command for the new `LTX-2.3` two-stage path. It uses the native `LTX2TwoStagePipeline` and matches the `ltx23-two-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
 
 ### Maximum speed, image model, single GPU, lossless
 
