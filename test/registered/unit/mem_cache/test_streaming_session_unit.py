@@ -2,11 +2,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
-from sglang.srt.mem_cache.session_aware_cache import SessionSlot
-from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache, SessionSlot
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
 
 
 class _FakeAllocator:
@@ -44,7 +46,9 @@ class _FakeInnerCache:
 
 
 class _FakeReq:
-    def __init__(self, session_id: str, req_pool_idx: int, committed: int, allocated: int):
+    def __init__(
+        self, session_id: str, req_pool_idx: int, committed: int, allocated: int
+    ):
         self.session = SimpleNamespace(session_id=session_id, streaming=True)
         self.req_pool_idx = req_pool_idx
         self.kv_committed_len = committed
@@ -84,7 +88,9 @@ def test_streaming_release_kv_cache_trims_overallocated_tail(monkeypatch):
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
-    tree_cache = SessionAwareCache(_FakeInnerCache(req_to_token_pool, allocator, page_size))
+    tree_cache = SessionAwareCache(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
     req = _FakeReq("session-a", req_pool_idx=0, committed=17, allocated=40)
 
     monkeypatch.setattr(
@@ -236,7 +242,9 @@ def test_aborted_streaming_turn_preserves_slot_and_accounting(monkeypatch):
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
-    tree_cache = SessionAwareCache(_FakeInnerCache(req_to_token_pool, allocator, page_size))
+    tree_cache = SessionAwareCache(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=48,

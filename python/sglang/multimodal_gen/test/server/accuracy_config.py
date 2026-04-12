@@ -73,14 +73,6 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "HF reference transformer cannot be materialized from the video_dit repo layout"
         )
     },
-    "ltx_2.3_one_stage_ti2v": {
-        ComponentType.VAE: ComponentSkip(
-            "LTX-2.3 VAE component diverges from the HF reference after local overlay materialization; weight transfer matched 96/176 (54.55%), below the minimum threshold for trustworthy comparison"
-        ),
-        ComponentType.TRANSFORMER: ComponentSkip(
-            "LTX-2.3 transformer component does not match the HF reference architecture after local overlay materialization; scale_shift_table parameters load as [9, ...] in the checkpoint but [6, ...] in the reference model"
-        ),
-    },
     "qwen_image_t2i_cache_dit_enabled": {
         ComponentType.VAE: ComponentSkip(
             "Representative VAE accuracy is already covered by qwen_image_t2i for the same source component and topology"
