@@ -47,7 +47,7 @@ SPEC_CONFIG = dict(
     speculative_num_steps=4,
     speculative_eagle_topk=2,
     speculative_num_draft_tokens=7,
-    mem_fraction_static=0.7,
+    mem_fraction_static=0.5,
     tp_size=2,
 )
 
