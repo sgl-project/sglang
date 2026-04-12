@@ -4,7 +4,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # Image API protocol models
@@ -24,6 +24,8 @@ class ImageResponse(BaseModel):
 
 
 class ImageGenerationsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt: str
     model: Optional[str] = None
     n: Optional[int] = 1
@@ -35,6 +37,8 @@ class ImageGenerationsRequest(BaseModel):
     output_format: Optional[str] = None  # png | jpeg | webp
     user: Optional[str] = None
     # SGLang extensions
+    width: Optional[int] = None
+    height: Optional[int] = None
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     true_cfg_scale: Optional[float] = (
@@ -46,7 +50,13 @@ class ImageGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
+    # Upscaling
+    enable_upscaling: Optional[bool] = False
+    upscaling_model_path: Optional[str] = None
+    upscaling_scale: Optional[int] = 4
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    # Performance profiling
+    perf_dump_path: Optional[str] = None
 
 
 # Video API protocol models
@@ -82,6 +92,8 @@ class VideoGenerationsRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
+    width: Optional[int] = None
+    height: Optional[int] = None
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
@@ -95,10 +107,16 @@ class VideoGenerationsRequest(BaseModel):
     frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×
     frame_interpolation_scale: Optional[float] = 1.0
     frame_interpolation_model_path: Optional[str] = None
+    # Upscaling
+    enable_upscaling: Optional[bool] = False
+    upscaling_model_path: Optional[str] = None
+    upscaling_scale: Optional[int] = 4
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    # Performance profiling
+    perf_dump_path: Optional[str] = None
 
 
 class VideoListResponse(BaseModel):

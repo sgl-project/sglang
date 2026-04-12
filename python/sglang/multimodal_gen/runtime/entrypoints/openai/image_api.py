@@ -36,6 +36,15 @@ router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
 
 
+def _get_extra_field(request, field_name):
+    """Get a field from model_extra, with fallback to nested extra_body dict."""
+    extra = request.model_extra or {}
+    value = extra.get(field_name)
+    if value is None and isinstance(extra.get("extra_body"), dict):
+        value = extra["extra_body"].get(field_name)
+    return value
+
+
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
     """Read and base64-encode each file. Must be called before cloud upload deletes them."""
     result = []
@@ -119,6 +128,8 @@ async def generations(
             request_id,
             prompt=request.prompt,
             size=request.size,
+            width=request.width,
+            height=request.height,
             num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
@@ -131,6 +142,11 @@ async def generations(
             enable_teacache=request.enable_teacache,
             output_compression=request.output_compression,
             output_quality=request.output_quality,
+            enable_upscaling=request.enable_upscaling,
+            upscaling_model_path=request.upscaling_model_path,
+            upscaling_scale=request.upscaling_scale,
+            perf_dump_path=request.perf_dump_path,
+            use_pe=_get_extra_field(request, "use_pe"),
         )
         batch = prepare_request(
             server_args=server_args,
@@ -205,6 +221,9 @@ async def edits(
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_upscaling: Optional[bool] = Form(False),
+    upscaling_model_path: Optional[str] = Form(None),
+    upscaling_scale: Optional[int] = Form(4),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
@@ -260,6 +279,9 @@ async def edits(
             num_frames=num_frames,
             output_compression=output_compression,
             output_quality=output_quality,
+            enable_upscaling=enable_upscaling,
+            upscaling_model_path=upscaling_model_path,
+            upscaling_scale=upscaling_scale,
         )
         batch = prepare_request(
             server_args=server_args,

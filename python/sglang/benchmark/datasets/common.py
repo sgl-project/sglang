@@ -54,6 +54,9 @@ class BaseDataset(ABC):
 
 
 def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:
+    # full_len=0 is valid for embedding benchmarks where no output tokens are generated
+    if full_len <= 0:
+        return [0] * num
     return np.random.randint(
         max(int(full_len * range_ratio), 1),
         full_len + 1,

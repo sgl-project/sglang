@@ -4,6 +4,7 @@ from typing import Dict, List, Union
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
@@ -46,9 +47,9 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+        )

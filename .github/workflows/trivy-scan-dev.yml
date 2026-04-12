@@ -1,0 +1,85 @@
+name: Trivy Scan Dev Docker Images
+
+on:
+  # Run daily after nightly dev builds (which run at midnight UTC)
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to scan (e.g., dev, dev-cu13, latest)"
+        required: false
+        default: ""
+
+jobs:
+  scan:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: x64-docker-build-node
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ inputs.tag && fromJSON(format('["{0}"]', inputs.tag)) || fromJSON('["dev", "dev-cu13"]') }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: 'docker.io/lmsysorg/sglang:${{ matrix.tag }}'
+          scanners: 'vuln'
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.tag }}.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          skip-dirs: 'usr/local/go,opt/nvidia'
+
+      - name: Upload Trivy scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles(format('trivy-results-{0}.sarif', matrix.tag)) != ''
+        with:
+          sarif_file: 'trivy-results-${{ matrix.tag }}.sarif'
+          category: 'trivy-${{ matrix.tag }}'
+
+      - name: Run Trivy (table output for logs)
+        if: success()
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: 'docker.io/lmsysorg/sglang:${{ matrix.tag }}'
+          scanners: 'vuln'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          skip-dirs: 'usr/local/go,opt/nvidia'
+
+      - name: Scan summary
+        if: always()
+        run: |
+          IMAGE="docker.io/lmsysorg/sglang:${{ matrix.tag }}"
+          SARIF="trivy-results-${{ matrix.tag }}.sarif"
+
+          echo "## Trivy Scan: \`${{ matrix.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ! -f "${SARIF}" ]; then
+            echo "**Status:** Scan failed — no SARIF output produced" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          VULN_COUNT=$(python3 -c "
+          import json
+          data = json.load(open('${SARIF}'))
+          print(sum(len(run.get('results', [])) for run in data.get('runs', [])))
+          ")
+
+          echo "- **Image**: \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Findings**: ${VULN_COUNT}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${VULN_COUNT}" = "0" ]; then
+            echo "- **Result**: No CRITICAL/HIGH unfixed vulnerabilities found" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **Result**: Found ${VULN_COUNT} finding(s) — check the Security tab for details" >> "$GITHUB_STEP_SUMMARY"
+          fi

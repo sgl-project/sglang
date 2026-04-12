@@ -45,7 +45,7 @@ namespace {
     }                                                                    \
   }()
 
-// dispatch: bfloat16, float16, int8_t, fp8_e4m3
+// dispatch: bfloat16, float16, int8_t, fp8_e4m3, uint8_t(mxfp4/int4)
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
   [&] {                                                          \
     switch (TYPE) {                                              \
@@ -65,48 +65,53 @@ namespace {
         using packed_t = at::Float8_e4m3fn;                      \
         return __VA_ARGS__();                                    \
       }                                                          \
+      case at::ScalarType::Byte: {                               \
+        using packed_t = uint8_t;                                \
+        return __VA_ARGS__();                                    \
+      }                                                          \
       default:                                                   \
         TORCH_CHECK(false, "Unsupported floating data type.\n"); \
     }                                                            \
   }()
 
+// Helper MICRO for CPU_DISPATCH_FLOATING_TYPES_EXT:
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: defined as PARAM_T input
+#define CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, PARAM_T, ...)   \
+  switch (TYPE1) {                                           \
+    case at::ScalarType::BFloat16: {                         \
+      using scalar_t = at::BFloat16;                         \
+      using param_t = PARAM_T;                               \
+      return __VA_ARGS__();                                  \
+    }                                                        \
+    case at::ScalarType::Half: {                             \
+      using scalar_t = at::Half;                             \
+      using param_t = PARAM_T;                               \
+      return __VA_ARGS__();                                  \
+    }                                                        \
+    case at::ScalarType::Float: {                            \
+      using scalar_t = float;                                \
+      using param_t = PARAM_T;                               \
+      return __VA_ARGS__();                                  \
+    }                                                        \
+    default:                                                 \
+      TORCH_CHECK(false, "Unsupported floating data type."); \
+  }
+
 // dispatch with mixed dtypes (TYPE1, TYPE2):
 //   TYPE1: the primary dtype (input, output, weight);
 //   TYPE2: the secondary dtype (bias, etc.).
-#define CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...) \
-  [&] {                                                            \
-    if (TYPE2 == at::kFloat) {                                     \
-      switch (TYPE1) {                                             \
-        case at::ScalarType::BFloat16: {                           \
-          using scalar_t = at::BFloat16;                           \
-          using param_t = float;                                   \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        case at::ScalarType::Half: {                               \
-          using scalar_t = at::Half;                               \
-          using param_t = float;                                   \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        default:                                                   \
-          TORCH_CHECK(false, "Unsupported floating data type.\n"); \
-      }                                                            \
-    } else {                                                       \
-      TORCH_CHECK(TYPE1 == TYPE2);                                 \
-      switch (TYPE1) {                                             \
-        case at::ScalarType::BFloat16: {                           \
-          using scalar_t = at::BFloat16;                           \
-          using param_t = at::BFloat16;                            \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        case at::ScalarType::Half: {                               \
-          using scalar_t = at::Half;                               \
-          using param_t = at::Half;                                \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        default:                                                   \
-          TORCH_CHECK(false, "Unsupported floating data type.\n"); \
-      }                                                            \
-    }                                                              \
+#define CPU_DISPATCH_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...)            \
+  [&] {                                                               \
+    if (TYPE2 == at::kFloat) {                                        \
+      CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, float, __VA_ARGS__)        \
+    } else if (TYPE2 == at::ScalarType::BFloat16) {                   \
+      CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, at::BFloat16, __VA_ARGS__) \
+    } else if (TYPE2 == at::ScalarType::Half) {                       \
+      CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, at::Half, __VA_ARGS__)     \
+    } else {                                                          \
+      TORCH_CHECK(false, "Unsupported floating data type.");          \
+    }                                                                 \
   }()
 
 #define UNUSED(x) (void)(x)
@@ -127,6 +132,8 @@ namespace {
 #define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
+#define CHECK_GT(a, b) TORCH_CHECK((a) > (b), "CHECK_GT(" #a ", " #b ") failed. ", a, " vs ", b)
+#define CHECK_GE(a, b) TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
 
 template <bool is_only_lastdim_contiguous>
 static inline void CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const at::IntArrayRef sizes, at::ScalarType st) {
@@ -138,7 +145,6 @@ static inline void CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const at::I
     CHECK_INPUT(tensor);
   }
 }
-#define CHECK_GE(a, b) TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
 
 // [NB] Parallel Routines
 //

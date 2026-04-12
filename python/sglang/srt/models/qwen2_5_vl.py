@@ -463,6 +463,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
+            cu_window_seqlens = cu_window_seqlens.to("cpu")
         # transformers
         x = x.unsqueeze(1)
         for layer_num, blk in enumerate(self.blocks):

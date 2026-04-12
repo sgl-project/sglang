@@ -1,8 +1,15 @@
 import itertools
+import sys
 
 import pytest
 import torch
 import triton
+
+from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=37, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=148, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def sglang_aot_qknorm(
@@ -61,9 +68,10 @@ def torch_impl_qknorm(
 
 BS_LIST = [2**n for n in range(0, 14)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
-N_K_LIST = [2, 4]
-N_Q_LIST = [8, 16]
-HEAD_DIM_LIST = [64, 128, 256, 512, 1024]
+BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 4109])
+N_K_LIST = get_ci_test_range([2, 4], [2, 4])
+N_Q_LIST = get_ci_test_range([8, 16], [8, 16])
+HEAD_DIM_LIST = get_ci_test_range([64, 128, 256, 512, 1024], [64, 256, 1024])
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
@@ -90,4 +98,4 @@ def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

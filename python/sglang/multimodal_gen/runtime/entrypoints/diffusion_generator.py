@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating images/videos using
 diffusion models.
 """
 
+import dataclasses
 import multiprocessing as mp
 import os
 import time
@@ -154,6 +155,24 @@ class DiffGenerator:
             f"{self.server_args.scheduler_endpoint}."
         )
 
+    @staticmethod
+    def _resolve_image_paths_per_prompt(
+        prompts: list[str], image_paths: str | list[str] | None
+    ) -> list[str | list[str] | None]:
+        if len(prompts) <= 1:
+            return [image_paths]
+
+        if not isinstance(image_paths, list) or len(image_paths) <= 1:
+            return [image_paths for _ in prompts]
+
+        if len(image_paths) != len(prompts):
+            raise ValueError(
+                "When using multiple prompts with multiple input images, "
+                "provide either one shared image or exactly one image per prompt."
+            )
+
+        return [[image_path] for image_path in image_paths]
+
     def generate(
         self,
         sampling_params_kwargs: dict | None = None,
@@ -164,16 +183,37 @@ class DiffGenerator:
         multiple prompts, or None when every request failed.
         """
         # 1. prepare requests
-        prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
-        sampling_params = SamplingParams.from_user_sampling_params_args(
+        prompts = self._resolve_prompts(
+            sampling_params_kwargs.get("prompt"),
+            sampling_params_kwargs.get("prompt_path"),
+        )
+        user_output_file_name = sampling_params_kwargs.get("output_file_name")
+
+        if len(prompts) > 1 and user_output_file_name is not None:
+            raise ValueError(
+                "Cannot use multiple prompts with a fixed output_file_name. "
+                "Either remove --output-file-name or use a single prompt."
+            )
+
+        sampling_params_orig = SamplingParams.from_user_sampling_params_args(
             self.server_args.model_path,
             server_args=self.server_args,
             **sampling_params_kwargs,
         )
 
         requests: list[Req] = []
-        for p in prompts:
-            sampling_params.prompt = p
+        image_paths_per_prompt = self._resolve_image_paths_per_prompt(
+            prompts, sampling_params_orig.image_path
+        )
+
+        for i, p in enumerate(prompts):
+            sampling_params = dataclasses.replace(
+                sampling_params_orig,
+                prompt=p,
+                output_file_name=user_output_file_name,
+                image_path=image_paths_per_prompt[i],
+            )
+            sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
                 sampling_params=sampling_params,
@@ -216,6 +256,7 @@ class DiffGenerator:
                         ),
                         trajectory_latents=output_batch.trajectory_latents,
                         trajectory_timesteps=output_batch.trajectory_timesteps,
+                        rollout_trajectory_data=output_batch.rollout_trajectory_data,
                         trajectory_decoded=output_batch.trajectory_decoded,
                     )
 
@@ -263,6 +304,9 @@ class DiffGenerator:
                         frame_interpolation_exp=req.frame_interpolation_exp,
                         frame_interpolation_scale=req.frame_interpolation_scale,
                         frame_interpolation_model_path=req.frame_interpolation_model_path,
+                        enable_upscaling=req.enable_upscaling,
+                        upscaling_model_path=req.upscaling_model_path,
+                        upscaling_scale=req.upscaling_scale,
                     )
 
                     for idx in range(len(samples_out)):
@@ -294,10 +338,14 @@ class DiffGenerator:
             return None
         return results[0] if len(results) == 1 else results
 
-    def _resolve_prompts(self, prompt: str | list[str] | None) -> list[str]:
+    def _resolve_prompts(
+        self,
+        prompt: str | list[str] | None,
+        prompt_path: str | None = None,
+    ) -> list[str]:
         """Collect prompts from the argument or from a prompt file."""
-        if self.server_args.prompt_file_path is not None:
-            path = self.server_args.prompt_file_path
+        path = prompt_path or self.server_args.prompt_file_path
+        if path is not None:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Prompt text file not found: {path}")
             with open(path, encoding="utf-8") as f:
@@ -505,13 +553,15 @@ class DiffGenerator:
         self.shutdown()
 
     def __del__(self):
-        if self.owns_scheduler_client:
+        owns_scheduler_client = bool(getattr(self, "owns_scheduler_client", False))
+        local_scheduler_process = getattr(self, "local_scheduler_process", None)
+        if owns_scheduler_client:
             logger.warning(
                 "Generator was garbage collected without being shut down. "
                 "Attempting to shut down the local server and client."
             )
             self.shutdown()
-        elif self.local_scheduler_process:
+        elif local_scheduler_process:
             logger.warning(
                 "Generator was garbage collected without being shut down. "
                 "Attempting to shut down the local server."

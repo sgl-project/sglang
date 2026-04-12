@@ -1,6 +1,6 @@
-# Caching Acceleration for Diffusion Models
+# Caching Acceleration
 
-SGLang provides multiple caching acceleration strategies for Diffusion Transformer (DiT) models. These strategies can significantly reduce inference time by skipping redundant computation.
+SGLang provides two complementary caching strategies for Diffusion Transformer (DiT) models. Both reduce denoising cost by skipping redundant computation, but they operate at different levels.
 
 ## Overview
 
@@ -10,8 +10,6 @@ SGLang supports two complementary caching approaches:
 |----------|-------|-----------|----------|
 | **Cache-DiT** | Block-level | Skip individual transformer blocks dynamically | Advanced, higher speedup |
 | **TeaCache** | Timestep-level | Skip entire denoising steps based on L1 similarity | Simple, built-in |
-
-
 
 ## Cache-DiT
 
@@ -53,6 +51,13 @@ See [teacache.md](teacache.md) for detailed documentation.
 - Z-Image
 
 For Flux and Qwen models, TeaCache is automatically disabled when CFG is enabled.
+
+```{toctree}
+:maxdepth: 1
+
+cache_dit
+teacache
+```
 
 ## References
 

@@ -422,7 +422,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         image = load_image(batch.image_path[0])
         image = image.convert("RGBA")
         image_size = image.size
-        resolution = 640  # TODO: support user-specified resolution
+        resolution = server_args.pipeline_config.resolution
         calculated_width, calculated_height = calculate_dimensions(
             resolution * resolution, image_size[0] / image_size[1]
         )

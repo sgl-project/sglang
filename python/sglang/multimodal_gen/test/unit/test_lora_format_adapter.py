@@ -208,6 +208,18 @@ def _run_all_tests() -> List[Dict]:
         )
     )
 
+    # AI-Toolkit Flux LoRA (non-diffusers → diffusers).
+    results.append(
+        run_single_test(
+            name="AI-Toolkit Flux LoRA",
+            repo_id="fal/flux-2-klein-4b-spritesheet-lora",
+            filename="flux-spritesheet-lora.safetensors",
+            local_name="flux_spritesheet_lora.safetensors",
+            expected_before=LoRAFormat.AI_TOOLKIT_FLUX,
+            expected_after=LoRAFormat.STANDARD,
+        )
+    )
+
     # Classic Kohya/A1111 SD LoRA (non-diffusers SD → diffusers).
     results.append(
         run_single_test(

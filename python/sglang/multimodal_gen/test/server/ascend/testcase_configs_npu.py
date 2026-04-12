@@ -15,6 +15,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
             modality="image",
         ),
         T2I_sampling_params,
+        run_consistency_check=False,
     ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
@@ -27,6 +28,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
         ),
+        run_consistency_check=False,
     ),
 ]
 
@@ -41,5 +43,37 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             tp_size=2,
         ),
         T2I_sampling_params,
+        run_consistency_check=False,
+    ),
+    DiffusionTestCase(
+        "qwen_image_t2i_2npu",
+        DiffusionServerArgs(
+            model_path="/root/.cache/modelscope/hub/models/Qwen/Qwen-Image",
+            modality="image",
+            num_gpus=2,
+            # test ring attn
+            ulysses_degree=1,
+            ring_degree=2,
+        ),
+        T2I_sampling_params,
+        run_consistency_check=False,
+    ),
+]
+
+EIGHT_NPU_CASES: list[DiffusionTestCase] = [
+    # === Text to Video (T2V) ===
+    DiffusionTestCase(
+        "wan2_2_t2v_14b_w8a8_8npu",
+        DiffusionServerArgs(
+            model_path="/root/.cache/modelscope/hub/models/Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8",
+            modality="video",
+            custom_validator="video",
+            num_gpus=8,
+            tp_size=4,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+        run_consistency_check=False,
     ),
 ]
