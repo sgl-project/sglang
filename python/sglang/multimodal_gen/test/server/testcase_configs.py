@@ -950,14 +950,14 @@ TWO_GPU_CASES_B = [
         TI2V_sampling_params,
     ),
     DiffusionTestCase(
-        "ltx_2.3_two_stage_i2v",
+        "ltx_2.3_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             modality="video",
             num_gpus=2,
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
-        TI2V_sampling_params,
+        T2V_sampling_params,
     ),
     # I2V LoRA test case
     DiffusionTestCase(
