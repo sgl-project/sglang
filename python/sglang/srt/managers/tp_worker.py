@@ -426,6 +426,12 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.token_to_kv_pool.size,
         )
 
+    def cleanup_requests(self, req_ids: List[str]):
+        """Release backend-specific per-request runtime state."""
+
+    def clear_runtime_state(self):
+        """Release backend-specific runtime state for all requests."""
+
     def is_dllm(self):
         return self.dllm_algorithm is not None
 

@@ -90,6 +90,7 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 req.time_stats.set_quick_finish_time()
                 release_kv_cache(req, self.tree_cache)
+                self.tp_worker.cleanup_requests([req.rid])
 
         # Note: Logprobs should be handled on the prefill engine.
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -189,6 +190,7 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
+                        self.tp_worker.cleanup_requests([req.rid])
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
@@ -314,6 +316,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        self.tp_worker.cleanup_requests([req.rid])
                         req.time_stats.set_completion_time()
                     else:
                         self.tree_cache.cache_unfinished_req(req)
@@ -551,6 +554,7 @@ class SchedulerOutputProcessorMixin:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
+            self.tp_worker.cleanup_requests([req.rid])
             req.time_stats.set_completion_time()
 
         self.maybe_collect_customized_info(i, req, logits_output)
