@@ -216,16 +216,17 @@ class TestStreamingSession(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-streaming-session",
-                "--chunked-prefill-size",
-                "512",
-            ],
-        )
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--chunked-prefill-size",
+                    "512",
+                ],
+            )
         cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
@@ -412,17 +413,18 @@ class TestStreamingSessionMixedChunk(TestStreamingSession):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-streaming-session",
-                "--chunked-prefill-size",
-                "512",
-                "--enable-mixed-chunk",
-            ],
-        )
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--chunked-prefill-size",
+                    "512",
+                    "--enable-mixed-chunk",
+                ],
+            )
         cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
@@ -442,17 +444,18 @@ class TestStreamingSessionNoRadixCache(TestStreamingSession):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-streaming-session",
-                "--chunked-prefill-size",
-                "512",
-                "--disable-radix-cache",
-            ],
-        )
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--chunked-prefill-size",
+                    "512",
+                    "--disable-radix-cache",
+                ],
+            )
         cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
@@ -476,18 +479,19 @@ class TestStreamingSessionMixedChunkNoRadixCache(TestStreamingSession):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-streaming-session",
-                "--chunked-prefill-size",
-                "512",
-                "--enable-mixed-chunk",
-                "--disable-radix-cache",
-            ],
-        )
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--chunked-prefill-size",
+                    "512",
+                    "--enable-mixed-chunk",
+                    "--disable-radix-cache",
+                ],
+            )
         cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
