@@ -278,6 +278,7 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+
         # Speculative decoding
         self.spec_accept_length = Gauge(
             name="sglang:spec_accept_length",
