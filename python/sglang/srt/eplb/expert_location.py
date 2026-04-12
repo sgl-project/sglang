@@ -326,6 +326,10 @@ def broadcast_global_expert_location_metadata(
 
     This is used in Elastic EP rank recovery to ensure that all ranks (including
     newly recovered ones) share exactly the same expert location metadata.
+
+    Note: The caller must ensure src_rank is a healthy rank. In recovery scenarios,
+    this function is called after try_recover_ranks succeeds, at which point all
+    ranks (including src_rank=0) have recovered and are ready.
     """
     metadata = get_global_expert_location_metadata()
     assert metadata is not None

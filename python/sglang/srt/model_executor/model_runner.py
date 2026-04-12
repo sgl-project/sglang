@@ -1432,6 +1432,9 @@ enable_symm_mem=self.server_args.enable_symm_mem,
                 )
 
     def maybe_recover_ep_ranks(self):
+        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
+            return
+
         tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
         tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
         tp_active_ranks &= tp_active_ranks_cpu
@@ -1439,13 +1442,16 @@ enable_symm_mem=self.server_args.enable_symm_mem,
             i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
         ]
 
+        # try_recover_ranks polls peer state via Mooncake EP backend.
+        # Mooncake's internal semantics guarantee that all ranks observe
+        # consistent peer readiness state, so collective operations below
+        # are safe even though polling appears local.
         if ranks_to_recover and try_recover_ranks(ranks_to_recover):
             self.forward_pass_id = 0
             self.eplb_manager.reset_generator()
             broadcast_global_expert_location_metadata()
             ElasticEPStateManager.instance().reset()
 
-            # Sync with tp_worker's broadcast_pyobj
             broadcast_pyobj(
                 [self.server_args.random_seed],
                 self.tp_size * self.pp_rank + self.tp_rank,

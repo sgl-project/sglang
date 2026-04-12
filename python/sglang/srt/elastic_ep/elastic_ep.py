@@ -104,11 +104,13 @@ def _get_process_group_backend(process_group, device: str):
 
 
 def _iter_live_parallel_groups() -> Iterator[parallel_state.GroupCoordinator]:
-    # Group coordinators are registered as weak references in parallel_state.
+    groups = []
     for group_ref in parallel_state._groups.values():
         group = group_ref()
         if group is not None:
-            yield group
+            groups.append(group)
+    for group in sorted(groups, key=lambda x: x.unique_name):
+        yield group
 
 
 def _map_global_to_group_local_ranks(
