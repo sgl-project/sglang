@@ -74,7 +74,7 @@ class NgramVerifyInput(SpecInput):
         self.retrive_next_token = retrive_next_token
         self.retrive_next_sibling = retrive_next_sibling
         self.draft_token_num = draft_token_num
-        self.device = draft_token.device
+        self.device = draft_token.device if draft_token is not None else None
         self.grammar = grammar
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:

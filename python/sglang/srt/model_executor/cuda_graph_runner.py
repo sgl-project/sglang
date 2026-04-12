@@ -735,10 +735,22 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
         is_bs_supported = (
-            graph_key in self.graphs
+            (graph_key in self.graphs and self.graphs[graph_key] is not None)
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
+        # When capture fails for a batch size (e.g. NGRAM on RDNA2), the
+        # graph is None. Reject so SGLang routes through the non-graph path.
+        if is_bs_supported and not self.disable_padding:
+            padded_idx = bisect.bisect_left(self.capture_bs, cuda_graph_bs)
+            if padded_idx < len(self.capture_bs):
+                padded_key = self.capture_bs[padded_idx]
+                if self.enable_pdmux:
+                    padded_key = f"{get_current_stream_idx()}_{padded_key}"
+                if self.graphs.get(padded_key) is None:
+                    is_bs_supported = False
+            else:
+                is_bs_supported = False
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -844,14 +856,27 @@ class CudaGraphRunner:
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                    # For pd_multiplexing, we need to save the graph and output buffers
                     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                    self.graphs[key] = graph
-                    self.output_buffers[key] = output_buffers
+                    try:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward, stream_idx)
+                        self.graphs[key] = graph
+                        self.output_buffers[key] = output_buffers
+                    except (RuntimeError, Exception) as e:
+                        err_msg = str(e)
+                        if "StreamCaptureUnsupported" in err_msg or "stream is capturing" in err_msg:
+                            logger.warning(
+                                "Graph capture failed for bs=%d (%s) — "
+                                "this batch size will use eager fallback",
+                                bs, err_msg.split('\n')[0][:120],
+                            )
+                            self.graphs[key] = None
+                            self.output_buffers[key] = None
+                            self.device_module.synchronize()
+                        else:
+                            raise
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -878,6 +903,28 @@ class CudaGraphRunner:
             enable=self.model_runner.server_args.enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
+
+        # On HIP with gfxGRAPH: use BridgedCUDAGraph's high-level capture
+        # which bridges CUDA Graph parity gaps (conditional nodes, dynamic
+        # shapes, nested capture) and auto-falls-back to eager on failure.
+        # The low-level capture_begin/capture_end path bypasses the bridging
+        # and will fail with hipErrorStreamCaptureUnsupported on RDNA2
+        # when speculative decoding (NGRAM/EAGLE) is active.
+        if _is_hip and hasattr(graph, 'capture') and callable(getattr(graph, 'capture', None)):
+            out = None
+            with graph.capture(model_fn=run_once_fn):
+                out = run_once_fn()
+            # If capture failed (exception suppressed by gfxGRAPH __exit__),
+            # out is None. Propagate the failure so the caller can skip this
+            # batch size and let SGLang route it through the non-graph path.
+            if out is None:
+                torch.cuda.synchronize()
+                raise RuntimeError(
+                    "hipErrorStreamCaptureUnsupported: gfxGRAPH capture failed, "
+                    "this batch size will use the direct (non-graph) forward path"
+                )
+            return out
+
         graph_fn = (
             partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
             if memory_saver_adapter.enabled
@@ -1226,7 +1273,13 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
-        self.graphs[graph_key].replay()
+        graph = self.graphs.get(graph_key)
+        if graph is None:
+            raise RuntimeError(
+                f"No captured graph for batch size {self.bs} (key={graph_key}). "
+                "This batch should have been routed through the non-graph forward path."
+            )
+        graph.replay()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
