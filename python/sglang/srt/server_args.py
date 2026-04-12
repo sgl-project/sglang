@@ -3630,9 +3630,6 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        if self.enable_breakable_cuda_graph:
-            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.set("0")
-
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
