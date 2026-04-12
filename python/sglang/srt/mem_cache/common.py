@@ -490,6 +490,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     is_streaming_session = (
         isinstance(tree_cache, SessionAwareCache)
         and getattr(req, "session", None) is not None
+        and req.session.streaming
     )
     is_aborted_streaming = is_streaming_session and isinstance(
         getattr(req, "finished_reason", None), FINISH_ABORT
