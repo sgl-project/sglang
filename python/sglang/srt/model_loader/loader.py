@@ -197,6 +197,7 @@ def _get_quantization_config(
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     remap_prefix = getattr(model_class, "remap_prefix", None)
+    # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
     if _is_npu:
         packed_modules_mapping.update(
             {
@@ -2288,6 +2289,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     ):
         """Load weights via ModelExpress coordination + TransferEngine RDMA."""
         try:
+            import grpc
+            from modelexpress import p2p_pb2
             from modelexpress.client import MxClient
         except ImportError as exc:
             raise ImportError(
@@ -2303,6 +2306,13 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         tp_rank = load_config.tp_rank
         model_name = load_config.modelexpress_model_name
 
+        target_device = torch.device(device_config.device)
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
         logger.info(
             "ModelExpress: registering memory regions for tp_rank=%d...", tp_rank
         )
@@ -2310,39 +2320,63 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             model, transfer_engine
         )
 
-        # Wait for seed to be ready via ModelExpress
+        # Build SourceIdentity matching the seed's identity
+        identity = p2p_pb2.SourceIdentity(
+            model_name=model_name,
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+            tensor_parallel_size=load_config.modelexpress_tp_size or 1,
+            pipeline_parallel_size=load_config.modelexpress_pp_size or 1,
+            expert_parallel_size=load_config.modelexpress_ep_size or 1,
+            dtype=load_config.modelexpress_dtype or "",
+            quantization=load_config.modelexpress_quantization or "",
+        )
+
+        # Query MX server for a READY source matching our identity and rank
         mx_client = MxClient(server_url=load_config.modelexpress_url)
         try:
             logger.info(
-                "ModelExpress: waiting for seed ready (model=%s)...",
+                "ModelExpress: looking for seed (model=%s, rank=%d)...",
                 model_name,
+                tp_rank,
             )
-            ready, session_id, metadata_hash = mx_client.wait_for_ready(
-                model_name,
-                worker_id=tp_rank,
-            )
-            if not ready:
+            try:
+                resp = mx_client.list_sources(
+                    identity=identity,
+                    status_filter=p2p_pb2.SOURCE_STATUS_READY,
+                )
+            except grpc.RpcError as e:
                 raise RuntimeError(
-                    f"ModelExpress: timed out waiting for seed ready "
-                    f"(model={model_name}, worker={tp_rank})"
+                    f"ModelExpress: cannot reach server at "
+                    f"{load_config.modelexpress_url}: "
+                    f"{e.code()}: {e.details()}"
+                ) from e
+
+            source_ref = None
+            for inst in resp.instances:
+                if inst.worker_rank == tp_rank:
+                    source_ref = inst
+                    break
+
+            if source_ref is None:
+                raise RuntimeError(
+                    f"ModelExpress: no READY source found for "
+                    f"model={model_name}, rank={tp_rank}. "
+                    f"Ensure the seed instance is running and has published metadata."
                 )
 
-            response = mx_client.get_metadata(model_name)
+            # Fetch full metadata for the discovered worker
+            response = mx_client.get_metadata(
+                mx_source_id=source_ref.mx_source_id,
+                worker_id=source_ref.worker_id,
+            )
             if not response.found:
                 raise RuntimeError(
-                    f"ModelExpress: no metadata found for model={model_name}"
+                    f"ModelExpress: no metadata found for "
+                    f"source_id={source_ref.mx_source_id}, "
+                    f"worker_id={source_ref.worker_id}"
                 )
 
-            # Find the worker matching our tp_rank
-            source_worker = None
-            for w in response.workers:
-                if w.worker_rank == tp_rank:
-                    source_worker = w
-                    break
-            if source_worker is None:
-                raise RuntimeError(
-                    f"ModelExpress: no worker metadata for rank={tp_rank}"
-                )
+            source_worker = response.worker
 
             # Extract session_id from oneof backend_metadata
             backend_field = source_worker.WhichOneof("backend_metadata")
