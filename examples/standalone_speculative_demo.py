@@ -12,8 +12,8 @@ Standalone Speculative Decoding Benchmark (Qwen)
 import time
 import sglang as sgl
 
-TARGET_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-DRAFT_MODEL  = "Qwen/Qwen2.5-1.5B-Instruct"
+TARGET_MODEL = "Qwen/Qwen2.5-72B-Instruct"
+DRAFT_MODEL  = "Qwen/Qwen2.5-7B-Instruct"
 
 PROMPTS = [
     "Explain the theory of relativity in simple terms.",
@@ -31,8 +31,8 @@ SAMPLING_PARAMS = {"temperature": 0, "max_new_tokens": 256}
 BASE_ENGINE_KWARGS = dict(
     model_path=TARGET_MODEL,
     cuda_graph_max_bs=len(PROMPTS),
-    mem_fraction_static=0.5,
-    # tp_size=2,
+    mem_fraction_static=0.7,
+    tp_size=2,
 )
 
 SPEC_KWARGS = dict(
