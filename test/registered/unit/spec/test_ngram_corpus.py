@@ -13,7 +13,7 @@ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=18, suite="stage-a-test-cpu")
 
 
 def _make_corpus(match_type="BFS", **kwargs):
@@ -925,8 +925,10 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             "b", [[10, 20, 30, 40, 50]]
         )
         corpus.commit_external_corpus_load("b", loaded_token_count)
-        ids = corpus.list_external_corpora()
-        self.assertEqual(sorted(ids), ["a", "b"])
+        token_counts = corpus.list_external_corpora()
+        self.assertEqual(sorted(token_counts.keys()), ["a", "b"])
+        self.assertEqual(token_counts["a"], 5)
+        self.assertEqual(token_counts["b"], 5)
 
     def test_remove(self):
         corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
@@ -937,12 +939,12 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         )
         corpus.commit_external_corpus_load("b", loaded_token_count)
         corpus.remove_external_corpus("a")
-        self.assertEqual(corpus.list_external_corpora(), ["b"])
+        self.assertEqual(list(corpus.list_external_corpora().keys()), ["b"])
 
     def test_remove_nonexistent_is_noop(self):
         corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
         corpus.remove_external_corpus("nonexistent")
-        self.assertEqual(corpus.list_external_corpora(), [])
+        self.assertEqual(corpus.list_external_corpora(), {})
 
     def test_multi_sam_candidates(self):
         corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
@@ -983,8 +985,8 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             external_sam_budget=3,
             external_corpus_documents=[[1, 2, 3, 4, 5]],
         )
-        ids = corpus.list_external_corpora()
-        self.assertIn("test_corpus", ids)
+        token_counts = corpus.list_external_corpora()
+        self.assertIn("test_corpus", token_counts)
 
     def test_remove_frees_token_budget(self):
         """Removing a corpus should free its tokens from the total budget."""
@@ -1008,7 +1010,7 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         # Now there's room for a new corpus.
         loaded_token_count = corpus.load_external_corpus_named("c", [[100, 200, 300]])
         corpus.commit_external_corpus_load("c", loaded_token_count)
-        self.assertEqual(sorted(corpus.list_external_corpora()), ["b", "c"])
+        self.assertEqual(sorted(corpus.list_external_corpora().keys()), ["b", "c"])
 
     def test_duplicate_corpus_id_is_rejected(self):
         """Adding a duplicate corpus_id should fail without replacing the original corpus."""
@@ -1024,7 +1026,7 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             corpus.load_external_corpus_named("a", [[10, 20, 30]])
 
         self.assertEqual(corpus.remaining_token_budget, 5)
-        self.assertEqual(corpus.list_external_corpora(), ["a"])
+        self.assertEqual(list(corpus.list_external_corpora().keys()), ["a"])
 
         # The original corpus must still be usable for matching.
         ids, masks = _batch_get(corpus, [[1, 2, 3]])
@@ -1051,7 +1053,7 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         with self.assertRaises(ValueError):
             corpus.load_external_corpus_named("b", [[10, 20, 30, 40, 50, 60]])
 
-        self.assertEqual(corpus.list_external_corpora(), ["a"])
+        self.assertEqual(list(corpus.list_external_corpora().keys()), ["a"])
         self.assertEqual(corpus.remaining_token_budget, 5)
 
         # "a" must still be usable for matching.
@@ -1106,7 +1108,7 @@ class TestMultiSamHttpMock(CustomTestCase):
         )
         tm.list_external_corpora = AsyncMock(
             return_value=ListExternalCorporaReqOutput(
-                success=True, corpus_ids=["a", "b"]
+                success=True, corpus_token_counts={"a": 100, "b": 200}
             )
         )
         set_global_state(mock_state)
@@ -1152,7 +1154,7 @@ class TestMultiSamHttpMock(CustomTestCase):
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         self.assertTrue(data["success"])
-        self.assertEqual(sorted(data["corpus_ids"]), ["a", "b"])
+        self.assertEqual(data["corpus_token_counts"], {"a": 100, "b": 200})
 
 
 if __name__ == "__main__":

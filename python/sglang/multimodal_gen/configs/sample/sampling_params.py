@@ -197,6 +197,9 @@ class SamplingParams:
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
 
+    # Prompt enhancement (ErnieImage)
+    use_pe: bool | None = None
+
     def _set_output_file_ext(self):
         # add extension if needed
         if not any(
