@@ -45,17 +45,12 @@ class SchedulerUpdateWeightsMixin:
 
     def _quiesce_for_weight_update(self: Scheduler):
         """Drain in-flight forward work before any NCCL weight mutation.
-
-        Overlap mode launches forward passes on forward_stream. If those NCCL TP
-        ops are still in flight when a different NCCL communicator (e.g. miles-pp_0
-        broadcast) starts on the same GPUs, NCCL hangs.  Synchronising the stream
-        and running a TP CPU barrier ensures every rank is quiescent before we touch
-        model weights.
+        Synchronize forward_stream and schedule_stream to ensure all ranks are quiescent.
         """
-        if getattr(self, "enable_overlap", False):
+        if self.enable_overlap:
             self.forward_stream.synchronize()
         self.schedule_stream.synchronize()
-        if getattr(self, "tp_cpu_group", None) is not None:
+        if self.tp_cpu_group is not None:
             torch.distributed.barrier(group=self.tp_cpu_group)
 
     def update_weights_from_disk(
