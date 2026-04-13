@@ -1305,46 +1305,51 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
 
 
 def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
-    """Register this encoder server's URL with the bootstrap server.
+    """Register this encoder server's URL with one or more prefill servers.
 
-    Called after the encoder is initialized. Retries on failure to handle
-    the case where the bootstrap server may not be ready immediately.
+    Called after the encoder is initialized.  Iterates over all URLs in
+    ``server_args.encoder_register_urls`` and registers with each.
+    Retries on failure to handle the case where a prefill server may not
+    be ready immediately.
     """
     import time
 
     import requests as http_requests
 
     encoder_url = server_args.url()
-    bootstrap_url = server_args.encoder_register_url
-    register_endpoint = f"{bootstrap_url}/register_encoder_url"
     payload = {"url": encoder_url}
-
     max_retries = 5
     retry_delay = 2.0
-    for attempt in range(max_retries):
-        try:
-            resp = http_requests.post(register_endpoint, json=payload, timeout=5)
-            if resp.status_code == 200:
-                logger.info(
-                    f"Registered encoder URL '{encoder_url}' with bootstrap server at {bootstrap_url}"
-                )
-                return
-            else:
-                logger.warning(
-                    f"Failed to register encoder URL (attempt {attempt + 1}/{max_retries}): "
-                    f"{resp.status_code}, {resp.text}"
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to register encoder URL (attempt {attempt + 1}/{max_retries}): {e}"
-            )
-        if attempt < max_retries - 1:
-            time.sleep(retry_delay)
 
-    logger.error(
-        f"Could not register encoder URL '{encoder_url}' with bootstrap server "
-        f"after {max_retries} attempts. Encoder discovery may be incomplete."
-    )
+    for bootstrap_url in server_args.encoder_register_urls:
+        register_endpoint = f"{bootstrap_url}/register_encoder_url"
+        registered = False
+        for attempt in range(max_retries):
+            try:
+                resp = http_requests.post(register_endpoint, json=payload, timeout=5)
+                if resp.status_code == 200:
+                    logger.info(
+                        f"Registered encoder URL '{encoder_url}' with prefill server at {bootstrap_url}"
+                    )
+                    registered = True
+                    break
+                else:
+                    logger.warning(
+                        f"Failed to register with {bootstrap_url} (attempt {attempt + 1}/{max_retries}): "
+                        f"{resp.status_code}, {resp.text}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to register with {bootstrap_url} (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+
+        if not registered:
+            logger.error(
+                f"Could not register encoder URL '{encoder_url}' with {bootstrap_url} "
+                f"after {max_retries} attempts. Encoder discovery may be incomplete."
+            )
 
 
 def launch_server(server_args: ServerArgs):
@@ -1372,8 +1377,8 @@ def launch_server(server_args: ServerArgs):
         ).start()
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
 
-    # Register this encoder's URL with the bootstrap server if configured.
-    if server_args.encoder_register_url:
+    # Register this encoder's URL with prefill server(s) if configured.
+    if server_args.encoder_register_urls:
         _register_encoder_url_with_bootstrap(server_args)
 
     uvicorn.run(app, host=server_args.host, port=server_args.port)

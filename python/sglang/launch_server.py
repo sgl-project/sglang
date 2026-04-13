@@ -51,7 +51,7 @@ if __name__ == "__main__":
     warnings.warn(
         "'python -m sglang.launch_server' is still supported, but "
         "'sglang serve' is the recommended entrypoint.\n"
-        "  Example: sglang serve --model-path <model> [options]",
+        "  Example: sglang serve --model-path MODEL_NAME_OR_PATH [options]",
         UserWarning,
         stacklevel=1,
     )

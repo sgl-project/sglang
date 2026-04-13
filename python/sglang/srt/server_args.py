@@ -709,9 +709,9 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
-    encoder_bootstrap_port: Optional[int] = None
+    # Auto-populated to self.url() when --language-only is set.  Not a CLI arg.
     encoder_bootstrap_url: Optional[str] = None
-    encoder_register_url: Optional[str] = None
+    encoder_register_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
@@ -3309,24 +3309,21 @@ class ServerArgs:
         if (
             self.language_only
             and len(self.encoder_urls) == 0
-            and not self.encoder_bootstrap_url
-            and not self.encoder_bootstrap_port
         ):
-            raise ValueError(
-                "requires at least one encoder urls to be set via --encoder-urls, "
-                "or a bootstrap URL via --encoder-bootstrap-url, "
-                "or start a local bootstrap server via --encoder-bootstrap-port"
+            import logging as _logging
+
+            _logging.getLogger(__name__).info(
+                "--language-only is set without --encoder-urls. Encoders will "
+                "register dynamically via the embedded bootstrap endpoints, or "
+                "per-request epd_bootstrap_addr (nEmP mode)."
             )
 
-        # Eagerly compute encoder_bootstrap_url from encoder_bootstrap_port so that
-        # sub-processes (e.g. the scheduler) inherit the correct URL in their copy
-        # of server_args.  This must happen before any subprocess is spawned.
-        if (
-            self.language_only
-            and self.encoder_bootstrap_port
-            and not self.encoder_bootstrap_url
-        ):
-            self.encoder_bootstrap_url = self.url(port=self.encoder_bootstrap_port)
+        # When --language-only is set the main HTTP server embeds the bootstrap
+        # endpoints (register / unregister / list).  Auto-set encoder_bootstrap_url
+        # to point at ourselves so that encode_receiver discovers encoders via
+        # the same server without requiring a separate bootstrap process.
+        if self.language_only:
+            self.encoder_bootstrap_url = self.url()
 
         # Validate IB devices when mooncake backend is used
         if (
@@ -5877,26 +5874,14 @@ class ServerArgs:
             help="List of encoder server urls.",
         )
         parser.add_argument(
-            "--encoder-bootstrap-port",
-            type=int,
-            default=ServerArgs.encoder_bootstrap_port,
-            help="Port to start the encoder bootstrap server on (language-only/prefill side). "
-            "When set, a dedicated EncoderBootstrapServer is started to allow encoders to "
-            "register dynamically. Encoders use --encoder-register-url to register with it.",
-        )
-        parser.add_argument(
-            "--encoder-bootstrap-url",
+            "--encoder-register-urls",
+            nargs="+",
             type=str,
-            default=ServerArgs.encoder_bootstrap_url,
-            help="URL of the encoder bootstrap server to discover encoder URLs dynamically. "
-            "When set, --encoder-urls is optional for --language-only mode.",
-        )
-        parser.add_argument(
-            "--encoder-register-url",
-            type=str,
-            default=ServerArgs.encoder_register_url,
-            help="Encoder bootstrap server URL to register this encoder's URL with, "
-            "for dynamic encoder discovery. Used with --encoder-only servers.",
+            default=[],
+            help="One or more prefill server URLs to register this encoder with "
+            "on startup, for dynamic encoder discovery. "
+            "Example: --encoder-register-urls http://prefill0:30002 http://prefill1:30003. "
+            "Used with --encoder-only servers.",
         )
         parser.add_argument(
             "--enable-adaptive-dispatch-to-encoder",
@@ -6058,6 +6043,12 @@ class ServerArgs:
         args.moe_dp_size = args.moe_data_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+
+        # encoder_bootstrap_url is auto-derived (not a CLI arg), so it won't
+        # be in the argparse namespace.  Set it to its default so the generic
+        # getattr below doesn't raise AttributeError.
+        if not hasattr(args, "encoder_bootstrap_url"):
+            args.encoder_bootstrap_url = None
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
