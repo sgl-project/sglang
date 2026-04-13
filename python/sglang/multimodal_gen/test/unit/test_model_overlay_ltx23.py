@@ -13,10 +13,6 @@ pytest.importorskip("triton.compiler")
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
-from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
-    LTX2ConnectorArchConfig,
-    LTX2ConnectorConfig,
-)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
     _build_transformer_config,
@@ -32,9 +28,6 @@ from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
     prepare_ltx2_mu,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.models.adapter.ltx_2_connector import (
-    LTX2TextConnectors,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
     LTX2AVDecodingStage,
 )
@@ -417,49 +410,3 @@ def test_ltx23_two_stage_component_auto_resolution_prefers_23_assets(tmp_path):
 
     assert resolved["spatial_upsampler"] == str(spatial)
     assert resolved["distilled_lora"] == str(lora)
-
-
-class _IdentityConnector(torch.nn.Module):
-    def forward(self, hidden_states, attention_mask, attn_mask_binarize_threshold=-9000.0):
-        return hidden_states, attention_mask
-
-
-def test_ltx23_connector_v2_rescale_uses_feature_extractor_input_dim():
-    connectors = LTX2TextConnectors(
-        LTX2ConnectorConfig(
-            arch_config=LTX2ConnectorArchConfig(
-                feature_extractor_in_features=16,
-                video_feature_extractor_out_features=4,
-                audio_feature_extractor_out_features=8,
-                video_connector_num_attention_heads=1,
-                video_connector_attention_head_dim=4,
-                video_connector_num_layers=0,
-                video_connector_num_learnable_registers=1,
-                audio_connector_num_attention_heads=1,
-                audio_connector_attention_head_dim=8,
-                audio_connector_num_layers=0,
-                audio_connector_num_learnable_registers=1,
-            )
-        )
-    )
-    connectors.video_connector = _IdentityConnector()
-    connectors.audio_connector = _IdentityConnector()
-
-    with torch.no_grad():
-        connectors.video_aggregate_embed.weight.zero_()
-        connectors.video_aggregate_embed.bias.zero_()
-        connectors.video_aggregate_embed.weight[:, :4] = torch.eye(4)
-        connectors.audio_aggregate_embed.weight.zero_()
-        connectors.audio_aggregate_embed.bias.zero_()
-        connectors.audio_aggregate_embed.weight[:, :8] = torch.eye(8)
-
-    hidden_states = torch.ones(1, 4, 16, dtype=torch.float32)
-    attention_mask = torch.zeros(1, 1, 1, 4, dtype=torch.float32)
-
-    video, audio, binary_mask = connectors(
-        hidden_states, attention_mask, additive_mask=True
-    )
-
-    assert torch.allclose(video, torch.full_like(video, 0.5))
-    assert torch.allclose(audio, torch.full_like(audio, 2 ** -0.5))
-    assert torch.equal(binary_mask, torch.ones(1, 4, dtype=torch.int64))

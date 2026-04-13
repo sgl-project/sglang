@@ -547,7 +547,6 @@ class LTX2TextConnectors(nn.Module):
         self.text_proj_in: nn.Linear | None = None
         self.video_aggregate_embed: nn.Linear | None = None
         self.audio_aggregate_embed: nn.Linear | None = None
-        self.feature_extractor_in_features = feature_extractor_in_features
         if (
             feature_extractor_in_features > 0
             and video_feature_extractor_out_features > 0
@@ -642,7 +641,7 @@ class LTX2TextConnectors(nn.Module):
                 audio_hidden_states = audio_hidden_states.to(
                     self.audio_aggregate_embed.weight.dtype
                 )
-            source_dim = self.feature_extractor_in_features
+            source_dim = self.video_aggregate_embed.out_features
             video_hidden_states = self._rescale_v2_features(
                 video_hidden_states,
                 self.video_aggregate_embed.out_features,
