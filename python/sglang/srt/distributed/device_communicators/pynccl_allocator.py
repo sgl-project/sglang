@@ -255,7 +255,7 @@ class SymmetricMemoryContext:
     def __enter__(self):
         assert (
             self.group_coordinator.pynccl_comm is not None
-        ), f"Symmetric memory requires pynccl to be enabled in group '{group_coordinator.unique_name}'"
+        ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
 
         if self.is_graph_capture:
             assert (
