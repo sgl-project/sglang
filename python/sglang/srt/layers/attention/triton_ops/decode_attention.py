@@ -476,6 +476,10 @@ def _decode_grouped_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
+    # BLOCK_H=16: benchmarked vs adaptive BLOCK_H=next_power_of_2(kv_group_num).
+    # BLOCK_H=8 for kv_group_num=7 was -2% on RDNA2 — larger tiles give better
+    # scalar FMA ILP despite 56% row waste. RDNA2 has no matrix instructions,
+    # so tl.dot decomposes to per-element FMA where bigger tiles help.
     BLOCK_H = 16
     MAX_KV_SPLITS = max_kv_splits
     grid = (
