@@ -83,6 +83,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         beta_fast: int = 32,
         beta_slow: int = 1,
         truncate: bool = True,
+        mscale: float = None,
+        mscale_all_dim: float = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -91,7 +93,17 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.beta_slow = beta_slow
         self.truncate = truncate
         # Get n-d magnitude scaling corrected for interpolation
-        self.mscale = float(yarn_get_mscale_simple(self.scaling_factor) * attn_factor)
+        # Match HuggingFace's logic: if both mscale and mscale_all_dim are provided,
+        # compute the ratio; otherwise fall back to the simple formula.
+        if mscale is not None and mscale_all_dim is not None:
+            self.mscale = float(
+                yarn_get_mscale(scaling_factor, mscale)
+                / yarn_get_mscale(scaling_factor, mscale_all_dim)
+            )
+        else:
+            self.mscale = float(
+                yarn_get_mscale_simple(self.scaling_factor) * attn_factor
+            )
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
