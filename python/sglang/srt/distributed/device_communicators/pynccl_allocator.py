@@ -106,10 +106,9 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
     // entire memory pool is destroyed. If this assumption does not hold,
     // we will encounter asymmetry issues between GPUs. For now, we clear
     // all tracking state when the pool is destroyed.
-    untrack_segment(ptr);
     std::lock_guard<std::mutex> lock(g_segment_mutex);
     g_segments = std::vector<Segment>();
-    g_comm_registration_index = std::unordered_map<void*, size_t>();
+    g_comm_registration_index = std::unordered_map<uintptr_t, size_t>();
 }
 
 // Register all tracked segments with a communicator.
