@@ -329,6 +329,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
                         require_reasoning=self._get_reasoning_from_request(request),
+                        bootstrap_host=request.bootstrap_host,
+                        bootstrap_port=request.bootstrap_port,
+                        bootstrap_room=request.bootstrap_room,
+                        data_parallel_rank=request.data_parallel_rank,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -1792,6 +1796,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
+                bootstrap_host=adapted_request.bootstrap_host,
+                bootstrap_port=adapted_request.bootstrap_port,
+                bootstrap_room=adapted_request.bootstrap_room,
+                data_parallel_rank=adapted_request.data_parallel_rank,
             )
 
             # Update sampling params with reduced max_tokens
