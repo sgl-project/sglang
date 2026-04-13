@@ -3,6 +3,9 @@ import torch
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_dump import (
+    maybe_save_ltx23_ti2v_tensor,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -114,6 +117,7 @@ class LTX2UpsampleStage(PipelineStage):
         device = get_local_torch_device()
         latents = self._upsample_video_latents(batch.latents, server_args, device)
         logger.info("Upsampled video latents: %s", list(latents.shape))
+        maybe_save_ltx23_ti2v_tensor("sglang_upsampled_video_latents", latents)
         self._restore_full_resolution(batch)
         self._pack_video_latents(batch, latents, server_args)
         logger.info(
@@ -123,4 +127,8 @@ class LTX2UpsampleStage(PipelineStage):
             batch.width,
         )
         self._repack_audio_latents(batch, server_args)
+        maybe_save_ltx23_ti2v_tensor("sglang_stage2_input_video_latents_packed", batch.latents)
+        maybe_save_ltx23_ti2v_tensor(
+            "sglang_stage2_input_audio_latents_packed", batch.audio_latents
+        )
         return batch

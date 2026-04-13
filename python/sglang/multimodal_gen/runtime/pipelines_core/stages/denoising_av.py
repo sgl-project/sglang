@@ -7,6 +7,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_dump import (
+    maybe_save_ltx23_ti2v_tensor,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
 )
@@ -83,6 +86,14 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             )
             batch.latents = latents
             batch.audio_latents = audio_latents
+
+        phase = batch.extra.get("ltx2_phase")
+        if phase == "stage1":
+            maybe_save_ltx23_ti2v_tensor("sglang_stage1_video_latent", batch.latents)
+            maybe_save_ltx23_ti2v_tensor("sglang_stage1_audio_latent", batch.audio_latents)
+        elif phase == "stage2":
+            maybe_save_ltx23_ti2v_tensor("sglang_stage2_video_latents", batch.latents)
+            maybe_save_ltx23_ti2v_tensor("sglang_stage2_audio_latents", batch.audio_latents)
 
         if isinstance(self.transformer, OffloadableDiTMixin):
             for manager in self.transformer.layerwise_offload_managers:
