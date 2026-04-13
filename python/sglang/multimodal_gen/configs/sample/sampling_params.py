@@ -197,6 +197,9 @@ class SamplingParams:
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
 
+    # Prompt enhancement (ErnieImage)
+    use_pe: bool | None = None
+
     def _set_output_file_ext(self):
         # add extension if needed
         if not any(
@@ -267,6 +270,9 @@ class SamplingParams:
         diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
         if diffusers_kwargs:
             extra["diffusers_kwargs"] = diffusers_kwargs
+        explicit_fields = getattr(self, "_explicit_fields", None)
+        if explicit_fields is not None:
+            extra["explicit_fields"] = sorted(explicit_fields)
         return extra
 
     def apply_request_extra(self, req: Any) -> None:
@@ -608,6 +614,7 @@ class SamplingParams:
         sampling_params._merge_with_user_params(
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
         )
+        sampling_params._explicit_fields = set(user_kwargs.keys())
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)

@@ -19,6 +19,7 @@ import torch.nn as nn
 from einops import rearrange
 from tqdm.auto import tqdm
 
+from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -206,8 +207,25 @@ class DenoisingStage(PipelineStage):
             compile_kwargs["mode"] = mode
             logger.info(f"Compiling transformer with mode: {mode}")
 
+        if self._needs_nvfp4_jit_prewarm(module):
+            logger.info(
+                "Prewarming NVFP4 JIT modules before torch.compile to avoid "
+                "Dynamo tracing JIT initialization."
+            )
+            prewarm_nvfp4_jit_modules()
+
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(**compile_kwargs)
+
+    @staticmethod
+    def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
+        for submodule in module.modules():
+            quant_method = getattr(submodule, "quant_method", None)
+            if quant_method is None:
+                continue
+            if type(quant_method).__name__ == "ModelOptFp4LinearMethod":
+                return True
+        return False
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -855,9 +873,21 @@ class DenoisingStage(PipelineStage):
         # image_latent must be sharded consistently with latents when it is
         # concatenated along the sequence dimension in the denoising loop.
         if batch.image_latent is not None:
+            sp_video_metadata = {
+                name: getattr(batch, name)
+                for name in (
+                    "sp_video_latent_num_frames",
+                    "sp_video_start_frame",
+                    "sp_video_tokens_per_frame",
+                    "sp_video_valid_token_count",
+                )
+                if hasattr(batch, name)
+            }
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
                 batch, batch.image_latent
             )
+            for name, value in sp_video_metadata.items():
+                setattr(batch, name, value)
 
     def _postprocess_sp_latents(
         self,
