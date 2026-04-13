@@ -61,10 +61,13 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -243,7 +246,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # materialize a real ParallelLMHead on the last rank and route the
         # checkpoint embedding into it during load_weights.
         text_tie = getattr(text_config, "tie_word_embeddings", True)
-        if self.pp_group.world_size == 1 and text_tie:
+        if (
+            self.pp_group.world_size == 1
+            and text_tie
+            and not (_is_cpu and _is_cpu_amx_available)
+        ):
             self.lm_head = self.language_model.embed_tokens
         elif self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -674,6 +681,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             self.language_model.embed_tokens
             if self.pp_group.world_size == 1
             and getattr(self.config.text_config, "tie_word_embeddings", True)
+            and not (_is_cpu and _is_cpu_amx_available)
             else self.lm_head
         )
         return self.logits_processor(
@@ -1016,6 +1024,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+                        if (
+                            self.config.tie_word_embeddings
+                            and name == "language_model.embed_tokens.weight"
+                            and _is_cpu
+                            and _is_cpu_amx_available
+                        ):
+                            param_lm_head = params_dict["lm_head.weight"]
+                            weight_loader = getattr(
+                                param_lm_head, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param_lm_head, loaded_weight)
                         loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
