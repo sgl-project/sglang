@@ -185,7 +185,7 @@ class SDARAttention(nn.Module):
             alt_stream=self.alt_stream,
         )
         q, k = self.rotary_emb(
-            positions,
+            positions.contiguous(),
             q,
             k,
             fused_set_kv_buffer_arg=(
@@ -220,7 +220,7 @@ class SDARAttention(nn.Module):
             alt_stream=self.alt_stream,
         )
         q, k = self.rotary_emb(
-            positions,
+            positions.contiguous(),
             q,
             k,
             fused_set_kv_buffer_arg=(
