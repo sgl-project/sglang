@@ -76,9 +76,7 @@ struct Segment {
 // Thread-safe segment tracking
 // Segment tracking using std::vector for FIFO order.
 // g_segments is maintained in insertion order (oldest first).
-// g_ptr_to_index provides O(1) lookup for untrack operations.
 static std::vector<Segment> g_segments;
-static std::unordered_map<void*, size_t> g_ptr_to_index;
 static std::mutex g_segment_mutex;
 
 // Track which segments have been registered with each communicator.
@@ -88,32 +86,7 @@ static std::unordered_map<uintptr_t, size_t> g_comm_registration_index;
 // Add a segment to the tracking (appends to end, maintaining FIFO order)
 static void track_segment(void* ptr, size_t size) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
-    size_t index = g_segments.size();
     g_segments.emplace_back(ptr, size);
-    g_ptr_to_index[ptr] = index;
-}
-
-// Remove a segment from the tracking (O(1) using swap-and-pop)
-static void untrack_segment(void* ptr) {
-    std::lock_guard<std::mutex> lock(g_segment_mutex);
-    auto it = g_ptr_to_index.find(ptr);
-    if (it == g_ptr_to_index.end()) {
-        return;
-    }
-    size_t index = it->second;
-    size_t last_index = g_segments.size() - 1;
-
-    // If not the last element, swap with the last element
-    if (index != last_index) {
-        // Swap the segment at index with the last segment
-        g_segments[index] = g_segments[last_index];
-        // Update the index map for the swapped segment's pointer
-        g_ptr_to_index[g_segments[index].ptr] = index;
-    }
-
-    // Remove the last element
-    g_segments.pop_back();
-    g_ptr_to_index.erase(it);
 }
 
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
@@ -128,9 +101,15 @@ void* nccl_alloc_plug(size_t size, int device, void* stream) {
 }
 
 void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
-    // Untrack the segment before freeing
-    untrack_segment(ptr);
     ncclResult_t err = ncclMemFree(ptr);
+    // NOTE: We assume that no individual allocation will be freed until the
+    // entire memory pool is destroyed. If this assumption does not hold,
+    // we will encounter asymmetry issues between GPUs. For now, we clear
+    // all tracking state when the pool is destroyed.
+    untrack_segment(ptr);
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    g_segments = std::vector<Segment>();
+    g_comm_registration_index = std::unordered_map<void*, size_t>();
 }
 
 // Register all tracked segments with a communicator.
@@ -142,11 +121,7 @@ int nccl_allocator_register_segments_with_comm(uintptr_t comm_ptr) {
     ncclComm_t comm = reinterpret_cast<ncclComm_t>(comm_ptr);
 
     // Get the starting index for this communicator
-    size_t start_index = 0;
-    auto it = g_comm_registration_index.find(comm_ptr);
-    if (it != g_comm_registration_index.end()) {
-        start_index = it->second;
-    }
+    size_t start_index = g_comm_registration_index[comm_ptr];
 
     // Register all segments from start_index to the current end
     for (size_t i = start_index; i < g_segments.size(); ++i) {
@@ -168,7 +143,7 @@ int nccl_allocator_register_segments_with_comm(uintptr_t comm_ptr) {
 """
 
 _allocator = None
-_shared_mem_pool = None
+_mem_pool = None
 _graph_pool_id = None
 _cur_device = None
 _active_symmetric_memory_context = None
@@ -209,7 +184,7 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     All groups share the same pool to avoid memory fragmentation.
     Comm registration is handled at context exit time.
     """
-    global _allocator, _shared_mem_pool, _cur_device, _nccl_allocator_lib
+    global _allocator, _mem_pool, _cur_device, _nccl_allocator_lib
     if _allocator is None:
         import torch.utils.cpp_extension
 
@@ -240,10 +215,10 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
             "nccl_alloc_plug",
             "nccl_free_plug",
         ).allocator()
-        _shared_mem_pool = torch.cuda.MemPool(_allocator)
+        _mem_pool = torch.cuda.MemPool(_allocator)
         _cur_device = torch.cuda.current_device()
 
-    return _shared_mem_pool
+    return _mem_pool
 
 
 class SymmetricMemoryContext:
@@ -269,7 +244,6 @@ class SymmetricMemoryContext:
         group_coordinator: GroupCoordinator,
     ):
         self.group_coordinator = group_coordinator
-        self.group_name = group_coordinator.unique_name
         self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
         self.is_graph_capture = torch.cuda.is_current_stream_capturing()
         self.exited = False
@@ -281,7 +255,7 @@ class SymmetricMemoryContext:
     def __enter__(self):
         assert (
             self.group_coordinator.pynccl_comm is not None
-        ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_name}'"
+        ), f"Symmetric memory requires pynccl to be enabled in group '{group_coordinator.unique_name}'"
 
         if self.is_graph_capture:
             assert (
@@ -334,7 +308,6 @@ class SymmetricMemoryContext:
         2. Only registering new segments (avoiding re-registration)
         3. Thread-safe access to the segment registry
         """
-        global _nccl_allocator_lib
 
         # Setup the C function signature
         register_func = _nccl_allocator_lib.nccl_allocator_register_segments_with_comm
@@ -343,7 +316,10 @@ class SymmetricMemoryContext:
 
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
-        register_func(self._comm_ptr)
+        result = register_func(self._comm_ptr)
+        assert (
+            result == 0
+        ), f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
@@ -364,12 +340,12 @@ _debug_seen_traces: set = set()
 def is_tensor_in_symmetric_mempool(tensor: torch.Tensor) -> bool:
     """Check if a tensor's storage is allocated in the NCCL symmetric memory pool."""
 
-    if _shared_mem_pool is None:
+    if _mem_pool is None:
         return False  # Pool not initialized
 
     data_ptr = tensor.untyped_storage().data_ptr()
 
-    for segment in _shared_mem_pool.snapshot():
+    for segment in _mem_pool.snapshot():
         for block in segment["blocks"]:
             if block["address"] == data_ptr:
                 return True

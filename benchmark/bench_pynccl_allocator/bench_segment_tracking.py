@@ -119,8 +119,6 @@ def bench_with_various_segment_counts(
     """
     Run benchmarks with various numbers of tracked segments.
     """
-    import gc
-
     print("=" * 80)
     print("Benchmark: Segment Registration CPU Overhead")
     print("=" * 80)
@@ -138,9 +136,6 @@ def bench_with_various_segment_counts(
     for num_segments in segment_counts:
         # Clean up previous segments
         all_tensors = []
-
-        # Force garbage collection to free previous segments
-        gc.collect()
 
         # Allocate segments (this initializes _nccl_allocator_lib via get_nccl_mem_pool)
         tensors, mem_pool = setup_segments(num_segments, segment_size)
