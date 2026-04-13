@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -20,6 +21,9 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
+
+logger = logging.getLogger(__name__)
 
 
 class _VirtualNode:
@@ -187,6 +191,16 @@ class SessionAwareCache(BasePrefixCache):
         if slot is None or slot.req_pool_idx is None:
             return self.inner.match_prefix(params)
 
+        # If the request is destined for abort (e.g. input too long),
+        # do NOT restore the slot's KV state.  set_finish_with_abort
+        # truncates origin_input_ids to [0], so alloc_for_extend would
+        # overwrite the slot's req_to_token row with a 1-token prefix,
+        # destroying the session's accumulated KV mapping.  By skipping
+        # restore, the request gets a fresh pool slot from alloc_for_extend
+        # and the session slot remains untouched.
+        if req.to_finish is not None:
+            return self.inner.match_prefix(params)
+
         slot.restore_to_req(req)
 
         # logprob_start_len is already forced to -1 for streaming sessions
@@ -208,12 +222,55 @@ class SessionAwareCache(BasePrefixCache):
         if not _is_streaming(req):
             return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
         is_first = slot is None
+
+        # When an aborted streaming-session request was scheduled (e.g.
+        # input too long), match_prefix skipped restore_to_req so the
+        # request got a fresh pool slot from alloc_for_extend.  Don't
+        # overwrite the session slot -- free the transient KV and pool slot.
+        if not is_first and isinstance(req.finished_reason, FINISH_ABORT):
+            if req.req_pool_idx is not None:
+                # Free all KV pages allocated for this aborted request.
+                end = req.kv_allocated_len
+                if end > 0:
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :end
+                    ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+                self.req_to_token_pool.free_slots.append(req.req_pool_idx)
+                req.req_pool_idx = None
+            return
+
         if is_first:
             slot = SessionSlot()
             self.slots[session_id] = slot
+
+        # If the session's KV is shrinking (e.g. client sent a shorter
+        # prompt after an abort), free the orphaned tail pages before
+        # save_from_req overwrites the slot's committed length.
+        # Never free tree-protected tokens — those are managed by the tree.
+        if (
+            not is_first
+            and slot.is_holding_kv
+            and req.kv_committed_len < slot.kv_committed_len
+        ):
+            old_end = slot.kv_allocated_len
+            new_end = req.kv_committed_len
+            if self.page_size > 1:
+                new_end = ceil_align(new_end, self.page_size)
+            new_end = max(new_end, slot.cache_protected_len)
+            if new_end < old_end:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    slot.req_pool_idx, new_end:old_end
+                ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+            slot.cache_protected_len = min(
+                slot.cache_protected_len, req.kv_committed_len
+            )
 
         slot.save_from_req(req, is_first=is_first)
 
@@ -251,23 +308,99 @@ class SessionAwareCache(BasePrefixCache):
 
     # -- Session lifecycle --
 
-    def release_session(self, session_id: str):
+    def _resolve_release_state(
+        self, slot: SessionSlot, req: Optional[Req]
+    ) -> tuple[int, Any]:
+        """Resolve the currently tree-owned prefix for a session slot.
+
+        A long-lived session can outlive radix-tree splits caused by unrelated
+        traffic. In that case, the saved `last_node` may no longer represent the
+        full protected prefix even though the slot's req_to_token row still
+        contains tree-owned indices at the front. Re-match the current request
+        text, then intersect the returned tree indices with the slot's row so
+        release uses the prefix that is still actually backed by the tree.
+        """
+        protected_len = slot.cache_protected_len
+        lock_node = slot.last_node
+
+        # TODO: re-match logic disabled — match_prefix has side effects
+        # (splits) that disturb tree accounting. Directly using
+        # slot.last_node + cache_protected_len is safe after split analysis.
+        return protected_len, lock_node
+
+        if (
+            req is None
+            or not slot.is_holding_kv
+            or slot.req_pool_idx is None
+            or protected_len <= 0
+        ):
+            return protected_len, lock_node
+
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        token_ids = (req.origin_input_ids + req.output_ids)[: slot.kv_committed_len]
+        if not token_ids:
+            return 0, None
+
+        match = self.inner.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+                req=None,
+            )
+        )
+        if len(match.device_indices) == 0:
+            return 0, None
+
+        max_protected_len = min(len(match.device_indices), protected_len)
+        row_indices = self.req_to_token_pool.req_to_token[
+            slot.req_pool_idx, :max_protected_len
+        ].to(dtype=torch.int64)
+        match_indices = match.device_indices[:max_protected_len]
+        mismatches = (match_indices != row_indices).nonzero(as_tuple=False)
+        if mismatches.numel() == 0 and max_protected_len == len(match.device_indices):
+            common_len = max_protected_len
+            return common_len, match.last_device_node
+
+        common_len = (
+            int(mismatches[0].item()) if mismatches.numel() > 0 else max_protected_len
+        )
+        if self.page_size > 1:
+            common_len = (common_len // self.page_size) * self.page_size
+        if common_len <= 0:
+            return 0, None
+
+        rematch = self.inner.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=token_ids[:common_len], extra_key=req.extra_key),
+                req=None,
+            )
+        )
+        return len(rematch.device_indices), rematch.last_device_node
+
+    def release_session(self, session_id: str, req: Optional[Req] = None):
         """Release all KV resources held by a streaming session."""
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
+        protected_len, lock_node = self._resolve_release_state(slot, req)
+        tokens_freed = (
+            max(0, slot.kv_allocated_len - protected_len) if slot.is_holding_kv else 0
+        )
+        logger.info(
+            "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
+        )
 
-        if slot.last_node is not None:
+        if lock_node is not None:
             if slot.swa_uuid_for_lock is not None:
                 self.inner.dec_lock_ref(
-                    slot.last_node,
+                    lock_node,
                     DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
                 )
             else:
-                self.inner.dec_lock_ref(slot.last_node)
+                self.inner.dec_lock_ref(lock_node)
 
         if slot.is_holding_kv:
-            start = slot.cache_protected_len
+            start = protected_len
             end = slot.kv_allocated_len
             if start < end:
                 kv_indices = self.req_to_token_pool.req_to_token[

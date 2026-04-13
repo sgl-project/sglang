@@ -10,8 +10,12 @@ Usage:
 """
 
 import asyncio
+import json
+import os
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -65,6 +69,21 @@ LEAK_FILLER = (
     "A wizard's job is to vex chumps quickly in fog. "
     "We promptly judged antique ivory buckles for the next prize. "
 ) * 20
+
+# ---------------------------------------------------------------------------
+# Abort-heavy chunked prefill leak repro constants
+# ---------------------------------------------------------------------------
+
+ABORT_REPRO_CONTEXT_LEN = 512
+ABORT_REPRO_PAGE_SIZE = 16
+ABORT_REPRO_GEN_LEN = 8
+ABORT_REPRO_SESSIONS = 4
+ABORT_REPRO_WARMUP_TURNS = 2
+ABORT_REPRO_ROUNDS = 8
+ABORT_REPRO_STREAM_TOKENS = 150
+ABORT_REPRO_ABORT_TOKENS = 320
+ABORT_REPRO_NON_STREAMING_TOKENS = 96
+ABORT_REPRO_CHUNKED_PREFILL_SIZE = 128
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +223,198 @@ async def _leak_run_all(base_url: str, tokenizer: Any) -> None:
                 base_url + "/close_session", json={"session_id": sid}
             ) as resp:
                 assert resp.status == 200
+
+
+def _make_token_sized_ids(
+    tokenizer: Any, prefix: str, min_tokens: int, max_tokens: Optional[int] = None
+) -> list[int]:
+    text = prefix
+    chunk = " pack quartz wizard sphinx zebra fox " * 16
+    token_ids = tokenizer.encode(text)
+    while len(token_ids) < min_tokens:
+        text += chunk
+        token_ids = tokenizer.encode(text)
+    if max_tokens is not None:
+        token_ids = token_ids[:max_tokens]
+    return token_ids
+
+
+async def _abort_repro_generate(
+    base_url: str,
+    session: aiohttp.ClientSession,
+    input_ids: list[int],
+    max_new_tokens: int,
+    session_params: Optional[dict[str, Any]] = None,
+    expect_abort: bool = False,
+) -> Optional[dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "input_ids": input_ids,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": max_new_tokens,
+            "no_stop_trim": True,
+            "skip_special_tokens": False,
+        },
+    }
+    if session_params:
+        payload["session_params"] = session_params
+
+    async with session.post(base_url + "/generate", json=payload) as resp:
+        text = await resp.text()
+        if expect_abort:
+            if resp.status == 200:
+                data = json.loads(text)
+                finish_reason = data.get("meta_info", {}).get("finish_reason", {})
+                assert finish_reason.get("type") == "abort", text
+                assert "maximum allowed length" in finish_reason.get(
+                    "message", ""
+                ), text
+                return data
+            assert resp.status == 400, text
+            assert "maximum allowed length" in text, text
+            return None
+
+        assert resp.status == 200, text
+        data = json.loads(text)
+        finish_reason = data.get("meta_info", {}).get("finish_reason", {})
+        assert finish_reason.get("type") != "abort", text
+        return data
+
+
+def _read_tail(path: str, num_lines: int = 120) -> str:
+    if not path or not os.path.exists(path):
+        return "<missing log>"
+    lines = Path(path).read_text(errors="replace").splitlines()
+    return "\n".join(lines[-num_lines:])
+
+
+async def _abort_repro_run_all(base_url: str, tokenizer: Any) -> None:
+    timeout = aiohttp.ClientTimeout(total=300)
+    async with aiohttp.ClientSession(timeout=timeout) as http:
+        session_ids = []
+        for _ in range(ABORT_REPRO_SESSIONS):
+            async with http.post(
+                base_url + "/open_session",
+                json={"capacity_of_str_len": 50000, "streaming": True},
+            ) as resp:
+                assert resp.status == 200, await resp.text()
+                session_ids.append(await resp.json())
+
+        try:
+            for warmup_turn in range(ABORT_REPRO_WARMUP_TURNS):
+                warmup_tasks = []
+                for session_idx, session_id in enumerate(session_ids):
+                    input_ids = _make_token_sized_ids(
+                        tokenizer,
+                        prefix=f"[warmup={warmup_turn} session={session_idx}]",
+                        min_tokens=ABORT_REPRO_STREAM_TOKENS,
+                        max_tokens=ABORT_REPRO_STREAM_TOKENS + 8,
+                    )
+                    warmup_tasks.append(
+                        _abort_repro_generate(
+                            base_url,
+                            http,
+                            input_ids,
+                            ABORT_REPRO_GEN_LEN,
+                            session_params={"id": session_id, "rid": None},
+                        )
+                    )
+                await asyncio.gather(*warmup_tasks)
+
+            for round_idx in range(ABORT_REPRO_ROUNDS):
+                mixed_tasks = []
+                for session_idx, session_id in enumerate(session_ids):
+                    input_ids = _make_token_sized_ids(
+                        tokenizer,
+                        prefix=f"[round={round_idx} ok session={session_idx}]",
+                        min_tokens=ABORT_REPRO_STREAM_TOKENS,
+                        max_tokens=ABORT_REPRO_STREAM_TOKENS + 8,
+                    )
+                    mixed_tasks.append(
+                        _abort_repro_generate(
+                            base_url,
+                            http,
+                            input_ids,
+                            ABORT_REPRO_GEN_LEN,
+                            session_params={"id": session_id, "rid": None},
+                        )
+                    )
+
+                for ns_idx in range(2):
+                    input_ids = _make_token_sized_ids(
+                        tokenizer,
+                        prefix=f"[round={round_idx} ns={ns_idx}]",
+                        min_tokens=ABORT_REPRO_NON_STREAMING_TOKENS,
+                        max_tokens=ABORT_REPRO_NON_STREAMING_TOKENS + 8,
+                    )
+                    mixed_tasks.append(
+                        _abort_repro_generate(
+                            base_url,
+                            http,
+                            input_ids,
+                            ABORT_REPRO_GEN_LEN,
+                        )
+                    )
+                await asyncio.gather(*mixed_tasks)
+
+                abort_tasks = []
+                for session_idx, session_id in enumerate(session_ids):
+                    input_ids = _make_token_sized_ids(
+                        tokenizer,
+                        prefix=f"[round={round_idx} abort session={session_idx}]",
+                        min_tokens=ABORT_REPRO_ABORT_TOKENS,
+                    )
+                    abort_tasks.append(
+                        _abort_repro_generate(
+                            base_url,
+                            http,
+                            input_ids,
+                            ABORT_REPRO_GEN_LEN,
+                            session_params={"id": session_id, "rid": None},
+                            expect_abort=True,
+                        )
+                    )
+                await asyncio.gather(*abort_tasks)
+
+                recovery_tasks = []
+                for session_idx, session_id in enumerate(session_ids):
+                    input_ids = _make_token_sized_ids(
+                        tokenizer,
+                        prefix=f"[round={round_idx} recover session={session_idx}]",
+                        min_tokens=ABORT_REPRO_NON_STREAMING_TOKENS,
+                        max_tokens=ABORT_REPRO_NON_STREAMING_TOKENS + 8,
+                    )
+                    recovery_tasks.append(
+                        _abort_repro_generate(
+                            base_url,
+                            http,
+                            input_ids,
+                            ABORT_REPRO_GEN_LEN,
+                            session_params={"id": session_id, "rid": None},
+                        )
+                    )
+                recovery_results = await asyncio.gather(*recovery_tasks)
+                for result in recovery_results:
+                    assert result is not None
+                    assert result["meta_info"]["cached_tokens"] > 0, result
+
+                health = requests.get(base_url + "/health", timeout=10)
+                if health.status_code != 200:
+                    raise RuntimeError(
+                        f"server unhealthy after round={round_idx}: "
+                        f"{health.status_code} {health.text}"
+                    )
+        finally:
+            for session_id in session_ids:
+                async with http.post(
+                    base_url + "/close_session", json={"session_id": session_id}
+                ) as resp:
+                    assert resp.status == 200, await resp.text()
+
+
+# ===================================================================
+# Test class
+# ===================================================================
 
 
 class TestStreamingSession(CustomTestCase):
@@ -465,6 +676,95 @@ class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+
+class TestStreamingSessionAbortLeakRepro(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.stdout = tempfile.NamedTemporaryFile(
+            prefix="streaming-session-abort-repro.",
+            suffix=".stdout.log",
+            delete=False,
+            mode="w+",
+            encoding="utf-8",
+        )
+        cls.stderr = tempfile.NamedTemporaryFile(
+            prefix="streaming-session-abort-repro.",
+            suffix=".stderr.log",
+            delete=False,
+            mode="w+",
+            encoding="utf-8",
+        )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-streaming-session",
+                "--chunked-prefill-size",
+                str(ABORT_REPRO_CHUNKED_PREFILL_SIZE),
+                "--context-length",
+                str(ABORT_REPRO_CONTEXT_LEN),
+                "--page-size",
+                str(ABORT_REPRO_PAGE_SIZE),
+                "--max-running-requests",
+                "32",
+                "--log-level",
+                "info",
+            ],
+            return_stdout_stderr=(cls.stdout, cls.stderr),
+        )
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        for handle in (cls.stdout, cls.stderr):
+            path = handle.name
+            handle.close()
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_abort_heavy_chunked_prefill_does_not_leak(self) -> None:
+        requests.post(self.base_url + "/flush_cache")
+
+        asyncio.run(_abort_repro_run_all(self.base_url, self.tokenizer))
+
+        for i in range(3):
+            ids = self.tokenizer.encode(f"Post-session cleanup request {i}.")
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": ids,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 4},
+                },
+                timeout=30,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        time.sleep(5)
+        self.assertIsNone(
+            self.process.poll(),
+            "Server crashed during abort-heavy streaming session repro.\n"
+            f"---- stderr tail ----\n{_read_tail(self.stderr.name)}",
+        )
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(
+            health.status_code,
+            200,
+            "Server unhealthy after abort-heavy streaming session cleanup.\n"
+            f"---- stderr tail ----\n{_read_tail(self.stderr.name)}",
+        )
+
+        stderr_tail = _read_tail(self.stderr.name)
+        self.assertNotIn(
+            "token_to_kv_pool_allocator memory leak detected",
+            stderr_tail,
+            stderr_tail,
+        )
 
 
 if __name__ == "__main__":

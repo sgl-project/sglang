@@ -148,6 +148,7 @@ class SchedulerMetricsMixin:
                 labels=labels,
                 enable_lora=self.enable_lora,
                 enable_hierarchical_cache=self.enable_hierarchical_cache,
+                enable_streaming_session=self.server_args.enable_streaming_session,
                 server_args=self.server_args,
             )
             self.enable_mfu_metrics = bool(self.server_args.enable_mfu_metrics)
@@ -602,6 +603,8 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
+            self.stats.num_streaming_sessions = self._alive_streaming_session_count()
+            self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate
