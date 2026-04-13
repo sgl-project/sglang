@@ -934,6 +934,14 @@ class LTX2DenoisingStage(DenoisingStage):
                 batch.audio_prompt_embeds[0],
             )
             maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_encoder_hidden_states_video_neg",
+                batch.negative_prompt_embeds[0],
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_encoder_hidden_states_audio_neg",
+                batch.negative_audio_prompt_embeds[0],
+            )
+            maybe_save_ltx23_ti2v_tensor(
                 f"{dump_step0_prefix}_denoise_mask_video", ctx.denoise_mask
             )
             maybe_save_ltx23_ti2v_tensor(
