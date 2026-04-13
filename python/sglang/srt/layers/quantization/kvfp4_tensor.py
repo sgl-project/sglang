@@ -149,19 +149,13 @@ class BlockFP4KVQuantizeUtil:
         return scaled.view(b, m, n).to(dtype)
 
 
-# Backward-compatible alias (used by memory_pool.py and existing tests)
-KVFP4QuantizeUtil = BlockFP4KVQuantizeUtil
-
-
 class NVFP4KVQuantizeUtil:
     """Utility class for NVFP4 quantization and dequantization with two-level scaling
     (global FP32 + block FP8 E4M3).
 
     Quantize formula:  x_fp4 * block_scale * global_scale = x_bf16
-
-    Uses FlashInfer's ``nvfp4_kv_quantize`` and ``nvfp4_kv_dequantize`` kernels.
-    Falls back to ``fp4_quantize`` for quantization on SM90 (Hopper) where
-    ``nvfp4_kv_quantize`` is not available.
+    - Quantize: via FlashInfer ``fp4_quantize`` (available on SM90+)
+    - Dequantize: pure PyTorch E2M1 LUT lookup
     """
 
     @staticmethod
@@ -180,6 +174,8 @@ class NVFP4KVQuantizeUtil:
                 block_scales: shape [B, M, N/16], dtype float8_e4m3fn
                 global_scale: passthrough
         """
+        from flashinfer import fp4_quantize
+
         b, m, n = tensor.shape
         tensor_2d = tensor.reshape(b * m, n)
 
@@ -190,24 +186,16 @@ class NVFP4KVQuantizeUtil:
         elif global_scale.dim() == 0:
             global_scale = global_scale.unsqueeze(0)
 
-        try:
-            from flashinfer import nvfp4_kv_quantize
-
-            fp4_2d, scales_2d = nvfp4_kv_quantize(tensor_2d, global_scale)
-        except (ImportError, AttributeError):
-            # Fallback: fp4_quantize available on SM90+
-            from flashinfer import fp4_quantize
-
-            global_scale_inv = 1.0 / global_scale
-            fp4_2d, scales_2d = fp4_quantize(
-                tensor_2d,
-                global_scale_inv,
-                sf_vec_size=16,
-                sf_use_ue8m0=False,
-                is_sf_swizzled_layout=False,
-                is_sf_8x4_layout=False,
-                enable_pdl=None,
-            )
+        global_scale_inv = 1.0 / global_scale
+        fp4_2d, scales_2d = fp4_quantize(
+            tensor_2d,
+            global_scale_inv,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+            is_sf_8x4_layout=False,
+            enable_pdl=None,
+        )
 
         fp4_data = fp4_2d.view(b, m, fp4_2d.shape[-1])
         block_scales = scales_2d.view(b, m, scales_2d.shape[-1]).view(
@@ -234,6 +222,7 @@ class NVFP4KVQuantizeUtil:
             Dequantized tensor of shape [B, M, N]
         """
         b, m, n_half = quant_tensor.shape
+        n = n_half * 2
 
         if isinstance(global_scale, (int, float)):
             global_scale = torch.tensor(
@@ -242,27 +231,20 @@ class NVFP4KVQuantizeUtil:
         elif global_scale.dim() == 0:
             global_scale = global_scale.unsqueeze(0)
 
-        quant_2d = quant_tensor.view(torch.uint8).reshape(b * m, n_half)
-        scales_2d = block_scales.view(torch.uint8).reshape(b * m, -1)
+        # Unpack two FP4 values from each uint8
+        fp4_vals = torch.empty(b, m, n, dtype=torch.uint8, device=quant_tensor.device)
+        fp4_vals[..., 0::2] = quant_tensor & 0x0F
+        fp4_vals[..., 1::2] = (quant_tensor >> 4) & 0x0F
 
-        try:
-            from flashinfer import nvfp4_kv_dequantize
+        # E2M1 LUT: 0x0-0x7 positive, 0x8-0xF negative
+        float_vals = E2M1_VALUES[fp4_vals.long()]
 
-            output_2d = nvfp4_kv_dequantize(
-                quant_2d, scales_2d, global_scale, output_dtype=dtype
-            )
-        except (ImportError, AttributeError):
-            # Pure PyTorch fallback
-            n = n_half * 2
-            fp4_vals = torch.empty(
-                b * m, n, dtype=torch.uint8, device=quant_tensor.device
-            )
-            fp4_vals[..., 0::2] = quant_2d & 0x0F
-            fp4_vals[..., 1::2] = (quant_2d >> 4) & 0x0F
-            float_vals = E2M1_VALUES[fp4_vals.long()]
-            reshaped = float_vals.view(b * m, -1, 16)
-            block_scales_float = scales_2d.view(torch.float8_e4m3fn).float()
-            scaled = reshaped * block_scales_float.unsqueeze(-1)
-            output_2d = (scaled.view(b * m, n) * global_scale).to(dtype)
+        # Block-wise scaling
+        reshaped = float_vals.view(b, m * n // 16, 16)
+        block_scales_float = block_scales.float().unsqueeze(-1)
+        scaled = reshaped * block_scales_float
 
-        return output_2d.reshape(b, m, -1)
+        # Apply global scale
+        dequantized = scaled.view(b, m, n) * global_scale
+
+        return dequantized.to(dtype)

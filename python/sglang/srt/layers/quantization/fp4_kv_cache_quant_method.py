@@ -33,9 +33,8 @@ class FP4KVCacheQuantMethod(ABC):
     Owns the quantize/dequantize computation.  The Pool owns the buffers and
     orchestrates the batch dequant loop.  Backends only do view/reshape.
 
-    Note: These methods are called during prefill (extend) only, not during
-    CUDA graph capture or decode. Decode reads raw FP4 buffers directly via
-    the XQA kernel. Therefore CUDA graph compatibility is not required here.
+    All operations (quantize_and_store, dequantize_prev_kv) use FlashInfer
+    kernels or pure tensor ops, so they are CUDA-graph compatible.
     """
 
     name: str
@@ -186,7 +185,10 @@ class NVFP4KVMethod(FP4KVCacheQuantMethod):
                 if hasattr(layer, "v_scale") and layer.v_scale is not None
                 else 1.0
             )
-            # SM100 requires E2M1_MAX adjustment to align FP4 range with hardware expectations
+            # SM100 checkpoint convention: global scales are stored *without*
+            # the E2M1 representable max (6.0), so we multiply it back in.
+            # SM120 checkpoints already include this factor.  The FP4 data
+            # type itself is identical on both architectures.
             if self.sm_version == 100:
                 k_scale *= E2M1_MAX
                 v_scale *= E2M1_MAX
