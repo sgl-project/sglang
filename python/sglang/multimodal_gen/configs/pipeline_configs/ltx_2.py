@@ -118,6 +118,23 @@ def is_ltx23_native_variant(arch_config: object) -> bool:
     return str(getattr(arch_config, "ltx_variant", "ltx_2")) == "ltx_2_3"
 
 
+def sync_ltx23_runtime_vae_markers(
+    arch_config: object,
+    loaded_vae_config: object | None,
+) -> None:
+    if loaded_vae_config is None:
+        return
+    for key in (
+        "ltx_variant",
+        "condition_encoder_subdir",
+        "video_decoder_variant",
+        "video_decoder_config",
+    ):
+        value = getattr(loaded_vae_config, key, None)
+        if value is not None:
+            setattr(arch_config, key, value)
+
+
 def _gemma_postprocess_func(
     outputs: BaseEncoderOutput,
     text_inputs: dict,
