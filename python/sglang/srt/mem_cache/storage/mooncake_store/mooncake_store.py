@@ -827,22 +827,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     # ---- Async support ----
 
-    @property
-    def supports_async(self) -> bool:
-        return hasattr(self.store, "create_async_context")
-
-    def create_async_context(self, max_concurrency: int):
-        if not self.supports_async:
+    def create_async_session(self, max_concurrency: int):
+        if not hasattr(self.store, "create_async_context"):
             return None
-        return self.store.create_async_context(max_concurrency)
+        ctx = self.store.create_async_context(max_concurrency)
+        if ctx is None:
+            return None
+        return _MooncakeAsyncSession(ctx, self)
 
-    def async_submit(self, ctx, keys, host_indices, extra_info=None):
-        if self.extra_backend_tag is not None:
-            keys = [f"{self.extra_backend_tag}_{key}" for key in keys]
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
-            keys, host_indices
-        )
-        return ctx.submit(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
@@ -858,3 +850,41 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
         return storage_metrics
+
+
+class _MooncakeAsyncSession:
+    """Async session wrapping C++ AsyncGetContext.
+    Encapsulates preprocess/postprocess so callers get clean per-page bools."""
+
+    def __init__(self, ctx, store: "MooncakeBaseStore"):
+        self._ctx = ctx
+        self._store = store
+
+    @property
+    def INVALID_TOKEN(self):
+        return self._ctx.INVALID_TOKEN
+
+    @property
+    def in_flight(self):
+        return self._ctx.in_flight
+
+    def submit(self, keys, host_indices, extra_info=None):
+        """Submit async batch get. Returns token or INVALID_TOKEN.
+        Handles key tagging and preprocess internally."""
+        if self._store.extra_backend_tag is not None:
+            keys = [f"{self._store.extra_backend_tag}_{key}" for key in keys]
+        key_strs, buffer_ptrs, buffer_sizes = self._store._batch_preprocess(
+            keys, host_indices
+        )
+        return self._ctx.submit(key_strs, buffer_ptrs, buffer_sizes)
+
+    def wait_any(self):
+        """Block until any operation completes.
+        Returns (token, List[bool]) where bools indicate per-page success."""
+        token, raw_results = self._ctx.wait_any()
+        if token == self._ctx.INVALID_TOKEN:
+            return token, []
+        # C++ returns 0=success, -1=failure. _batch_postprocess expects >0 for success.
+        adjusted = [1 if r >= 0 else -1 for r in raw_results]
+        page_results = self._store._batch_postprocess(adjusted, is_set_operate=False)
+        return token, page_results

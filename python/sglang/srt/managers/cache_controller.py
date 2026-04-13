@@ -892,7 +892,6 @@ class HiCacheController:
         """
         use_async = (
             self.storage_backend is not None
-            and self.storage_backend.supports_async
             and self.async_prefetch_concurrency > 1
         )
         if use_async:
@@ -915,80 +914,157 @@ class HiCacheController:
             except Empty:
                 continue
 
-    def _prefetch_io_async_loop(self):
-        """Concurrent IO with async backend using AsyncGetContext."""
-        ctx = self.storage_backend.create_async_context(
-            self.async_prefetch_concurrency
-        )
-        if ctx is None:
-            logger.warning("Failed to create async context, falling back to sync")
-            self._prefetch_io_sync_loop()
-            return
+    # ---- Async prefetch constants and helpers ----
 
-        INVALID_TOKEN = 2**64 - 1
-        token_to_op = {}
+    _SUBMIT_OK = 0     # Batch submitted successfully
+    _SUBMIT_DONE = 1   # Operation finished (all batches done or terminated)
+    _SUBMIT_FULL = 2   # Concurrency full, retry later
 
-        while not self.storage_stop_event.is_set():
-            # Phase 1: Submit new operations up to concurrency limit
-            while True:
-                block = (ctx.in_flight == 0)
-                try:
-                    operation = self.prefetch_buffer.get(
-                        block=block, timeout=1
-                    )
-                except Empty:
-                    break
-                if operation is None:
-                    continue
+    class _AsyncOpState:
+        """Tracks per-operation batch progress in async prefetch."""
+        __slots__ = ["operation", "batch_idx", "prefix_keys", "terminated"]
+        def __init__(self, operation):
+            self.operation = operation
+            self.batch_idx = 0
+            self.prefix_keys = (
+                operation.prefix_keys.copy() if operation.prefix_keys else None
+            )
+            self.terminated = False
 
-                token = self.storage_backend.async_submit(
-                    ctx, operation.hash_value, operation.host_indices,
-                    HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys),
-                )
-                if token == INVALID_TOKEN:
-                    # Concurrency full, put back and go to wait
-                    logger.info(f"async prefetch: concurrency full, in_flight={ctx.in_flight}")
-                    self.prefetch_buffer.put(operation)
-                    break
-                logger.info(f"async prefetch: submitted token={token} keys={len(operation.hash_value)} in_flight={ctx.in_flight}")
-                token_to_op[token] = operation
-
-            # Phase 2: Wait for any completion
-            if ctx.in_flight > 0:
-                token, results = ctx.wait_any()
-                if token == INVALID_TOKEN:
-                    continue  # shutting down
-                operation = token_to_op.pop(token, None)
-                if operation is not None:
-                    self._process_async_results(operation, results)
-                    logger.info(f"async prefetch: completed token={token} completed_tokens={operation.completed_tokens}/{len(operation.hash_value)*self.page_size}")
-
-    def _process_async_results(self, operation, results):
-        """Process results from async batch get, update completed_tokens.
-        C++ async path returns 0 for success, -1 for failure (not byte counts).
-        Need to convert to per-page results matching the storage layout."""
-        # Convert 0/-1 to positive/negative so _batch_postprocess works
-        # _batch_postprocess checks > 0 for success, so map 0 -> 1, -1 -> -1
-        adjusted = [1 if r >= 0 else -1 for r in results]
-        page_results = self.storage_backend._batch_postprocess(
-            adjusted, is_set_operate=False
-        )
-        success_pages = 0
+    @staticmethod
+    def _count_consecutive_true(page_results):
+        """Count consecutive True values from the start of a list."""
+        count = 0
         for ok in page_results:
             if not ok:
                 break
-            success_pages += 1
+            count += 1
+        return count
 
-        inc = success_pages * self.page_size
-        operation.increment(inc)
+    def _async_submit_batch(self, session, token_map, op_state):
+        """Submit the next batch for an operation.
+        Returns _SUBMIT_OK, _SUBMIT_DONE, or _SUBMIT_FULL."""
+        op = op_state.operation
+        i = op_state.batch_idx
+        if i >= len(op.hash_value) or op_state.terminated:
+            return self._SUBMIT_DONE
+        end = min(i + self.storage_batch_size, len(op.hash_value))
+        batch_hashes = op.hash_value[i:end]
+        batch_host_indices = op.host_indices[
+            i * self.page_size : end * self.page_size
+        ]
+        extra_info = HiCacheStorageExtraInfo(prefix_keys=op_state.prefix_keys)
+        token = session.submit(batch_hashes, batch_host_indices, extra_info)
+        if token == session.INVALID_TOKEN:
+            return self._SUBMIT_FULL
+        token_map[token] = op_state
+        return self._SUBMIT_OK
 
-        if success_pages < len(operation.hash_value):
-            logger.info(f"async prefetch: partial success {success_pages}/{len(operation.hash_value)} pages, marking terminate")
-            operation.mark_terminate()
+    def _async_drain_pending(self, session, token_map, pending_ops):
+        """Phase 1a: Submit next batch for operations waiting in pending_ops.
+        Returns updated pending_ops list."""
+        still_pending = []
+        for op_state in pending_ops:
+            submit_result = self._async_submit_batch(session, token_map, op_state)
+            if submit_result == self._SUBMIT_OK:
+                pass
+            elif submit_result == self._SUBMIT_DONE:
+                self.append_host_mem_release(
+                    op_state.operation.host_indices[
+                        op_state.operation.completed_tokens:
+                    ]
+                )
+            else:
+                still_pending.append(op_state)
+        return still_pending
 
-        self.append_host_mem_release(
-            operation.host_indices[operation.completed_tokens :]
+    def _async_fill_from_buffer(self, session, token_map, pending_ops):
+        """Phase 1b: Take new operations from prefetch_buffer, submit first batch."""
+        while True:
+            block = (session.in_flight == 0 and len(pending_ops) == 0)
+            try:
+                operation = self.prefetch_buffer.get(block=block, timeout=1)
+            except Empty:
+                break
+            if operation is None:
+                continue
+
+            op_state = self._AsyncOpState(operation)
+            submit_result = self._async_submit_batch(session, token_map, op_state)
+            if submit_result == self._SUBMIT_FULL:
+                self.prefetch_buffer.put(operation)
+                break
+            elif submit_result == self._SUBMIT_DONE:
+                self.append_host_mem_release(operation.host_indices)
+                continue
+
+    def _async_handle_completion(self, session, token_map, pending_ops):
+        """Phase 2: Wait for any batch to complete, process results."""
+        if session.in_flight == 0:
+            return
+
+        token, page_results = session.wait_any()
+        if token == session.INVALID_TOKEN:
+            return
+
+        op_state = token_map.pop(token, None)
+        if op_state is None:
+            return
+
+        op = op_state.operation
+        batch_start = op_state.batch_idx
+        batch_end = min(
+            batch_start + self.storage_batch_size, len(op.hash_value)
         )
+        batch_size = batch_end - batch_start
+
+        success_pages = self._count_consecutive_true(page_results)
+        op.increment(success_pages * self.page_size)
+
+        if success_pages < batch_size:
+            op_state.terminated = True
+            op.mark_terminate()
+            self.append_host_mem_release(
+                op.host_indices[op.completed_tokens:]
+            )
+            logger.debug(
+                f"async prefetch: batch failed "
+                f"{success_pages}/{batch_size} pages, terminated"
+            )
+        else:
+            if op_state.prefix_keys is not None and len(op_state.prefix_keys) > 0:
+                op_state.prefix_keys += op.hash_value[batch_start:batch_end]
+            op_state.batch_idx = batch_end
+
+            if batch_end >= len(op.hash_value):
+                self.append_host_mem_release(
+                    op.host_indices[op.completed_tokens:]
+                )
+            else:
+                pending_ops.append(op_state)
+
+    def _prefetch_io_async_loop(self):
+        """Concurrent IO with async backend using AsyncGetContext.
+
+        Each operation is split into batches of storage_batch_size.
+        Batches within an operation are submitted sequentially (next batch
+        only after previous completes). Different operations run concurrently.
+        """
+        session = self.storage_backend.create_async_session(
+            self.async_prefetch_concurrency
+        )
+        if session is None:
+            logger.warning("Failed to create async session, falling back to sync")
+            self._prefetch_io_sync_loop()
+            return
+
+        token_map = {}
+        pending_ops = []
+
+        while not self.storage_stop_event.is_set():
+            pending_ops = self._async_drain_pending(session, token_map, pending_ops)
+            self._async_fill_from_buffer(session, token_map, pending_ops)
+            self._async_handle_completion(session, token_map, pending_ops)
 
     def prefetch_rate_limited(self) -> bool:
         """
