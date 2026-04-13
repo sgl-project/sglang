@@ -246,7 +246,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | Argument                                              | Defaults  | Options                                                       | Server supported |
 |-------------------------------------------------------|-----------|---------------------------------------------------------------|:----------------:|
 | `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                                     |      A2, A3      |
-| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep(Not supported currently)`     |      A2, A3      |
+| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep`(Not supported currently)     |      A2, A3      |
 | `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                                              |      A2, A3      |
 | `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                                        | Special for GPU  |
 | `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)                                | Special for GPU  |
