@@ -12,7 +12,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=12, suite="stage-b-test-1-gpu-large")
 
 
 class TestFusedMOE(CustomTestCase):
