@@ -62,11 +62,6 @@ class SessionSlot:
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
-    # True while the slot's KV has been restored to an active request.
-    # Prevents double-counting in token accounting (the request's tokens
-    # are already tracked via uncached_size in the busy mem check).
-    is_active: bool = False
-
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
@@ -74,7 +69,6 @@ class SessionSlot:
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
-        self.is_active = False
         self.req_pool_idx = req.req_pool_idx
         self.kv_committed_len = req.kv_committed_len
         self.kv_allocated_len = req.kv_allocated_len
@@ -107,8 +101,6 @@ class SessionSlot:
         req.mamba_next_track_idx = self.mamba_next_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
-
-        self.is_active = True
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
         # from the slot. During chunked prefill, a request may be rejected by
