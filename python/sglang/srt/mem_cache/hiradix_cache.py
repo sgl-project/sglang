@@ -70,6 +70,15 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
+            if server_args.hicache_storage_backend is not None:
+                raise ValueError(
+                    "HiCache L3 storage backend (e.g. mooncake) is not yet supported "
+                    "for models with NSA (Native Sparse Attention). The L3 storage "
+                    "layer does not handle the NSA indexer cache "
+                    "(index_k_with_scale_buffer). Please remove "
+                    "--hicache-storage-backend to use L2-only hierarchical cache, "
+                    "which is fully supported."
+                )
             self.token_to_kv_pool_host = NSATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -88,7 +97,10 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError(
+                f"HiRadixCache only supports MHA, MLA, and NSA KV pools, "
+                f"got {type(self.kv_cache).__name__}"
+            )
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
