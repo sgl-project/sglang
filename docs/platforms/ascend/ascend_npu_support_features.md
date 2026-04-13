@@ -281,7 +281,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 | Argument                                        | Defaults        | Options                                                                        | Server supported |
 |-------------------------------------------------|-----------------|--------------------------------------------------------------------------------|:----------------:|
-| `--enable-hierarchical-`<br/>`cache`            | `False`         | bool flag<br/> (set to enable).<br/> Currently, mamba cache are not supported. |      A2, A3      |
+| `--enable-hierarchical-`<br/>`cache`            | `False`         | bool flag<br/> (set to enable).<br/> Currently, Mamba cache is not supported. |      A2, A3      |
 | `--hicache-ratio`                               | `2.0`           | Type: float                                                                    |      A2, A3      |
 | `--hicache-size`                                | `0`             | Type: int                                                                      |      A2, A3      |
 | `--hicache-write-policy`                        | `write_through` | Currently only `write_back` supported                                          |      A2, A3      |
