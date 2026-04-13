@@ -1407,11 +1407,11 @@ class LTX2DenoisingStage(DenoisingStage):
                 f"{dump_step0_prefix}_audio_latents_after", ctx.audio_latents
             )
 
-            if ctx.is_ltx23_variant and step.step_index in dump_steps:
-                dump_prefix = f"{ctx.stage}_step{step.step_index}"
-                maybe_save_ltx23_ti2v_tensor(
-                    f"{dump_prefix}_video_latents_after", ctx.latents
-                )
+        if ctx.is_ltx23_variant and step.step_index in dump_steps:
+            dump_prefix = f"{ctx.stage}_step{step.step_index}"
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_prefix}_video_latents_after", ctx.latents
+            )
             maybe_save_ltx23_ti2v_tensor(
                 f"{dump_prefix}_audio_latents_after", ctx.audio_latents
             )
