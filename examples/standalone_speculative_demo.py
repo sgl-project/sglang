@@ -65,7 +65,7 @@ CONFIGS = {
     "sdar-8b": dict(
         target="JetLM/SDAR-8B-Chat",
         draft="JetLM/SDAR-1.7B-Chat",
-        base_engine=dict(mem_fraction_static=0.8, tp_size=1, trust_remote_code=True),
+        base_engine=dict(mem_fraction_static=0.85, tp_size=4, trust_remote_code=True),
         spec_kwargs=dict(
             speculative_algorithm="STANDALONE",
             speculative_num_steps=4,
@@ -106,6 +106,9 @@ def bench_serial(llm) -> float:
 
 
 if __name__ == "__main__":
+    import gc
+    import torch
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", choices=list(CONFIGS), default="qwen-32b",
@@ -123,6 +126,8 @@ if __name__ == "__main__":
     base_batch  = {bs: bench_batch(llm_base, bs) for bs in BATCH_SIZES}
     base_serial = bench_serial(llm_base)
     llm_base.shutdown()
+    gc.collect()
+    torch.cuda.empty_cache()
 
     print("Loading speculative engine...")
     llm_spec = run_engine(cfg, use_spec=True)
