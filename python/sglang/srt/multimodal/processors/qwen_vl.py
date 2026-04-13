@@ -490,6 +490,81 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mrope_position_delta=mrope_position_delta,
         )
 
+    async def compute_pad_and_mrope_only(
+        self,
+        image_data: List[Union[str, bytes]],
+        audio_data,
+        input_text,
+        request_obj,
+        **kwargs,
+    ):
+        # Image-only Qwen2/3-VL fast path: smart_resize -> grid_thw -> pad
+        # input_ids -> reuse compute_mrope_positions for delta. Falls back for
+        # video / audio / unsupported types.
+        if request_obj.video_data or request_obj.audio_data or audio_data:
+            return None
+        if not image_data:
+            return None
+        if self.model_type not in (
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        ):
+            return None
+
+        base_output = self.load_mm_data(
+            prompt=input_text,
+            image_data=image_data,
+            multimodal_tokens=self.mm_tokens,
+        )
+        images = base_output.images
+        if not images:
+            return None
+
+        patch_size = self.hf_config.vision_config.patch_size
+        spatial_merge_size = self.hf_config.vision_config.spatial_merge_size
+        factor = patch_size * spatial_merge_size
+
+        image_grids = []
+        for image in images:
+            if isinstance(image, torch.Tensor):
+                h, w = int(image.shape[1]), int(image.shape[2])
+            elif isinstance(image, dict):
+                return None
+            else:
+                w, h = image.size  # PIL .size is lazy, no pixel decode
+            try:
+                resized_h, resized_w = smart_resize(h, w, factor=factor)
+            except Exception:
+                return None
+            image_grids.append((1, resized_h // patch_size, resized_w // patch_size))
+
+        image_grid_thw = torch.tensor(image_grids, dtype=torch.long)
+        input_ids, offsets, _ = self.build_input_ids(
+            base_output.input_text, img_grid_thw=image_grid_thw
+        )
+
+        mm_items: List[MultimodalDataItem] = []
+        for i, offset in enumerate(offsets):
+            item = MultimodalDataItem(modality=Modality.IMAGE, offsets=[offset])
+            item.model_specific_data["image_grid_thw"] = image_grid_thw[i : i + 1]
+            mm_items.append(item)
+
+        mrope_positions, mrope_position_delta = self.compute_mrope_positions(
+            input_ids, mm_items
+        )
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=[],
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            im_token_id=self.mm_tokens.image_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],

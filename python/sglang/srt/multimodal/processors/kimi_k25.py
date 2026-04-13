@@ -382,6 +382,60 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             im_token_id=self.mm_tokens.image_token_id,
         )
 
+    async def compute_pad_and_mrope_only(
+        self,
+        image_data: List[Union[str, bytes, Dict]],
+        audio_data,
+        input_text,
+        request_obj,
+        **kwargs,
+    ):
+        # K2.5 has no M-RoPE; only need to expand image placeholder tokens via
+        # navit_resize_config (pure math on (W, H)).
+        if not image_data:
+            return None
+
+        base_output = self.load_mm_data(
+            prompt=input_text,
+            image_data=image_data,
+            multimodal_tokens=self.mm_tokens,
+        )
+        images = base_output.images
+        if not images:
+            return None
+
+        proc = self._processor  # KimiGPUProcessorWrapper
+        image_token = self.mm_tokens.image_token
+
+        num_tokens_list = []
+        for image in images:
+            w, h = _get_image_dimensions(image)
+            config = navit_resize_config(
+                w,
+                h,
+                proc._patch_size,
+                proc._merge_kernel_size,
+                proc._in_patch_limit,
+                proc._patch_limit_on_one_side,
+                proc._fixed_output_tokens,
+            )
+            num_tokens_list.append(config["num_tokens"])
+
+        parts = base_output.input_text.split(image_token)
+        if len(parts) - 1 != len(num_tokens_list):
+            return None
+        expanded_text = parts[0]
+        for n_tokens, part in zip(num_tokens_list, parts[1:]):
+            expanded_text += image_token * n_tokens + part
+
+        input_ids = self._processor.tokenizer.encode(expanded_text)
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=[],
+            im_token_id=self.mm_tokens.image_token_id,
+        )
+
     def _num_image_tokens_from_grid(self, grid_thw: torch.Tensor) -> int:
         # Kimi-K2.5 applies temporal pooling and spatial 2D merge in vision tower.
         # The output sequence length per image is h*w/(merge_h*merge_w).
