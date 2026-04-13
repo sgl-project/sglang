@@ -185,10 +185,13 @@ class NVFP4KVMethod(FP4KVCacheQuantMethod):
                 if hasattr(layer, "v_scale") and layer.v_scale is not None
                 else 1.0
             )
-            # SM100 checkpoint convention: global scales are stored *without*
-            # the E2M1 representable max (6.0), so we multiply it back in.
-            # SM120 checkpoints already include this factor.  The FP4 data
-            # type itself is identical on both architectures.
+            # SM100 uses TRT-LLM XQA kernels that expect KV scales as
+            # amax / 448, but the calibrated checkpoint stores amax / (6 * 448).
+            # We multiply by E2M1_MAX (6.0) to bridge the gap.  SM120 uses a
+            # different kernel path where scales already include this factor.
+            # The FP4 data type itself is identical on both architectures.
+            # Reference: TRT-LLM FP8QDQLinearMethod.process_weights_after_loading_fused_qkv_linear
+            # https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/modules/linear.py
             if self.sm_version == 100:
                 k_scale *= E2M1_MAX
                 v_scale *= E2M1_MAX

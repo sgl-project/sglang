@@ -154,8 +154,8 @@ class NVFP4KVQuantizeUtil:
     (global FP32 + block FP8 E4M3).
 
     Quantize formula:  x_fp4 * block_scale * global_scale = x_bf16
-    - Quantize: via FlashInfer ``fp4_quantize`` (available on SM90+)
-    - Dequantize: pure PyTorch E2M1 LUT lookup
+    - Quantize: ``nvfp4_kv_quantize`` (SM100+), fallback ``fp4_quantize`` (SM90)
+    - Dequantize: ``nvfp4_kv_dequantize`` (SM100+)
     """
 
     @staticmethod
@@ -163,6 +163,9 @@ class NVFP4KVQuantizeUtil:
         tensor: torch.Tensor, global_scale: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize BF16/FP16 tensor to NVFP4 format.
+
+        Requires SM90+.  Uses ``nvfp4_kv_quantize`` on SM100+ (native PTX),
+        falls back to ``fp4_quantize`` on SM90.
 
         Args:
             tensor: Input tensor of shape [B, M, N]
@@ -174,7 +177,9 @@ class NVFP4KVQuantizeUtil:
                 block_scales: shape [B, M, N/16], dtype float8_e4m3fn
                 global_scale: passthrough
         """
-        from flashinfer import fp4_quantize
+        from sglang.srt.utils import is_sm90_supported
+
+        assert is_sm90_supported(), "NVFP4 KV cache quantize requires SM90+ GPU"
 
         b, m, n = tensor.shape
         tensor_2d = tensor.reshape(b * m, n)
@@ -186,16 +191,25 @@ class NVFP4KVQuantizeUtil:
         elif global_scale.dim() == 0:
             global_scale = global_scale.unsqueeze(0)
 
-        global_scale_inv = 1.0 / global_scale
-        fp4_2d, scales_2d = fp4_quantize(
-            tensor_2d,
-            global_scale_inv,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=False,
-            is_sf_8x4_layout=False,
-            enable_pdl=None,
-        )
+        try:
+            from flashinfer import nvfp4_kv_quantize
+
+            # nvfp4_kv_quantize takes global_scale directly (not inverted)
+            fp4_2d, scales_2d = nvfp4_kv_quantize(tensor_2d, global_scale)
+        except (ImportError, AttributeError, RuntimeError):
+            # Fallback: fp4_quantize available on SM90+
+            from flashinfer import fp4_quantize
+
+            global_scale_inv = 1.0 / global_scale
+            fp4_2d, scales_2d = fp4_quantize(
+                tensor_2d,
+                global_scale_inv,
+                sf_vec_size=16,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=False,
+                is_sf_8x4_layout=False,
+                enable_pdl=None,
+            )
 
         fp4_data = fp4_2d.view(b, m, fp4_2d.shape[-1])
         block_scales = scales_2d.view(b, m, scales_2d.shape[-1]).view(
@@ -210,7 +224,9 @@ class NVFP4KVQuantizeUtil:
         global_scale: torch.Tensor,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        """Dequantize NVFP4 tensor to BF16/FP16.
+        """Dequantize NVFP4 tensor to BF16/FP16 via FlashInfer ``nvfp4_kv_dequantize``.
+
+        Requires SM100+.
 
         Args:
             quant_tensor: Packed FP4 data of shape [B, M, N/2] (uint8)
@@ -221,8 +237,13 @@ class NVFP4KVQuantizeUtil:
         Returns:
             Dequantized tensor of shape [B, M, N]
         """
+        from flashinfer import nvfp4_kv_dequantize
+
+        from sglang.srt.utils import is_sm100_supported
+
+        assert is_sm100_supported(), "NVFP4 KV cache dequantize requires SM100+ GPU"
+
         b, m, n_half = quant_tensor.shape
-        n = n_half * 2
 
         if isinstance(global_scale, (int, float)):
             global_scale = torch.tensor(
@@ -231,20 +252,11 @@ class NVFP4KVQuantizeUtil:
         elif global_scale.dim() == 0:
             global_scale = global_scale.unsqueeze(0)
 
-        # Unpack two FP4 values from each uint8
-        fp4_vals = torch.empty(b, m, n, dtype=torch.uint8, device=quant_tensor.device)
-        fp4_vals[..., 0::2] = quant_tensor & 0x0F
-        fp4_vals[..., 1::2] = (quant_tensor >> 4) & 0x0F
+        quant_2d = quant_tensor.view(torch.uint8).reshape(b * m, n_half)
+        scales_2d = block_scales.view(torch.uint8).reshape(b * m, -1)
 
-        # E2M1 LUT: 0x0-0x7 positive, 0x8-0xF negative
-        float_vals = E2M1_VALUES[fp4_vals.long()]
+        output_2d = nvfp4_kv_dequantize(
+            quant_2d, scales_2d, global_scale, output_dtype=dtype
+        )
 
-        # Block-wise scaling
-        reshaped = float_vals.view(b, m * n // 16, 16)
-        block_scales_float = block_scales.float().unsqueeze(-1)
-        scaled = reshaped * block_scales_float
-
-        # Apply global scale
-        dequantized = scaled.view(b, m, n) * global_scale
-
-        return dequantized.to(dtype)
+        return output_2d.reshape(b, m, -1)
