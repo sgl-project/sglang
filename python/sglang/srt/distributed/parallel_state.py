@@ -594,6 +594,7 @@ class GroupCoordinator:
                 or not self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
         ):
+            self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
@@ -601,7 +602,6 @@ class GroupCoordinator:
         outplace_all_reduce_method = None
         if (
             self.ca_comm is not None
-            and (self.pymscclpp_comm is None or self.pymscclpp_comm.disabled)
             and not self.ca_comm.disabled
             and (
                 self.pymscclpp_comm is None
@@ -628,7 +628,7 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_piecewise_cuda_graph():
+        elif is_in_piecewise_cuda_graph() and self.pynccl_comm is not None:
             # For piecewise cuda graph, we use pynccl outplace allreduce
             outplace_all_reduce_method = "pynccl"
         if outplace_all_reduce_method is not None:
