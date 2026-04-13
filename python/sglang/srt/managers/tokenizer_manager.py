@@ -33,6 +33,7 @@ from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import pybase64
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -45,6 +46,7 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
+from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -145,11 +147,32 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
-    last_text_offset: int = 0
+
+    # Accumulate text lazily so incremental streaming can emit the incoming
+    # delta directly without rebuilding the full output prefix.
+    text: str = ""
+    text_chunks: List[str] = dataclasses.field(default_factory=list)
+
+    def append_text(self, chunk: str):
+        if chunk:
+            self.text_chunks.append(chunk)
+
+    def get_text(self) -> str:
+        if self.text_chunks:
+            self.text += "".join(self.text_chunks)
+            self.text_chunks.clear()
+        return self.text
+
+    def get_crash_dump_output(self) -> Dict[Any, Any]:
+        out = {}
+        if self.text or self.text_chunks:
+            out["text"] = self.get_text()
+        if self.output_ids:
+            out["output_ids"] = self.output_ids.copy()
+        return out
 
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
-    text: str = ""
     output_ids: List[int] = dataclasses.field(default_factory=list)
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
     input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
@@ -1000,6 +1023,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 bootstrap_room=obj.bootstrap_room,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
+                positional_embed_overrides=obj.positional_embed_overrides,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
@@ -1015,12 +1039,24 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 num_items_assigned=obj.num_items_assigned,
             )
         elif isinstance(obj, EmbeddingReqInput):
+            # Resolve unresolved embed overrides now that input_ids are available
+            positional_embed_overrides = obj.positional_embed_overrides
+            if (
+                positional_embed_overrides is None
+                and obj.embed_overrides is not None
+                and obj.embed_override_token_id is not None
+            ):
+                positional_embed_overrides = self._resolve_embed_overrides(
+                    input_ids, obj.embed_override_token_id, obj.embed_overrides
+                )
+
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text,
                 input_ids,
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
+                positional_embed_overrides=positional_embed_overrides,
                 rid=obj.rid,
                 priority=obj.priority,
                 dimensions=obj.dimensions,
@@ -1032,6 +1068,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
+
+    @staticmethod
+    def _resolve_embed_overrides(
+        input_ids: List[int],
+        token_id: int,
+        embeds: List[torch.Tensor],
+    ) -> PositionalEmbeds:
+        """Resolve placeholder positions in input_ids and create PositionalEmbeds.
+
+        Scans input_ids for occurrences of token_id and pairs them with the
+        provided embedding tensors.
+        """
+        positions = [idx for idx, tok in enumerate(input_ids) if tok == token_id]
+        if len(positions) != len(embeds):
+            raise ValueError(
+                f"input contains {len(positions)} occurrences of "
+                f"embed_override_token_id={token_id}, "
+                f"but embed_overrides has {len(embeds)} entries."
+            )
+        return PositionalEmbeds(embeds=embeds, positions=positions)
 
     async def _batch_tokenize_and_process(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1211,6 +1267,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     out["meta_info"] = _merge_incremental_stream_meta_info(out_list)
             else:
                 out = out_list[-1]
+
+            # Resolve deferred text for non-incremental streaming.
+            # _handle_batch_output sets "text": None on intermediate chunks
+            # to avoid O(n) string rebuild per step (O(n^2) total).
+            if (
+                is_stream
+                and not incremental_stream
+                and "text" in out
+                and out["text"] is None
+            ):
+                out["text"] = state.get_text()
 
             if finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_time` has not been set yet).
@@ -1634,53 +1701,93 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
+            state.finished = recv_obj.finished_reasons[i] is not None
             if isinstance(recv_obj, BatchStrOutput):
-                state.text += recv_obj.output_strs[i]
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.incremental_streaming_output and is_stream:
-                    output_offset = state.last_output_offset
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[output_offset:]
-                    _slice_streaming_output_meta_info(meta_info, output_offset)
-                    state.last_output_offset = len(state.output_ids)
-                    output_text = state.text[state.last_text_offset :]
-                    state.last_text_offset = len(state.text)
+                incremental = (
+                    self.server_args.incremental_streaming_output and is_stream
+                )
+                delta_text = recv_obj.output_strs[i]
+                delta_output_ids = recv_obj.output_ids[i]
+                output_offset = state.last_output_offset
+                state.append_text(delta_text)
+                state.output_ids.extend(delta_output_ids)
+
+                if is_stream:
+                    if incremental:
+                        output_token_ids = delta_output_ids
+                        _slice_streaming_output_meta_info(meta_info, output_offset)
+                        state.last_output_offset = len(state.output_ids)
+                        out_dict = {
+                            "text": delta_text,
+                            "output_ids": output_token_ids,
+                            "meta_info": meta_info,
+                        }
+                    elif state.finished:
+                        out_dict = {
+                            "text": state.get_text(),
+                            "output_ids": state.output_ids.copy(),
+                            "meta_info": meta_info,
+                        }
+                    else:
+                        # Non-incremental intermediate: pass reference (no
+                        # copy) and defer text to _wait_one_response to avoid
+                        # O(n) per-step cost that compounds to O(n^2).
+                        out_dict = {
+                            "text": None,
+                            "output_ids": state.output_ids,
+                            "meta_info": meta_info,
+                        }
+                elif state.finished:
+                    out_dict = {
+                        "text": state.get_text(),
+                        "output_ids": state.output_ids.copy(),
+                        "meta_info": meta_info,
+                    }
                 else:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids.copy()
-                    output_text = state.text
-
-                out_dict = {
-                    "text": output_text,
-                    "output_ids": output_token_ids,
-                    "meta_info": meta_info,
-                }
-
+                    out_dict = None
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.incremental_streaming_output and is_stream:
-                    output_offset = state.last_output_offset
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[output_offset:]
-                    _slice_streaming_output_meta_info(meta_info, output_offset)
-                    state.last_output_offset = len(state.output_ids)
-                else:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids.copy()
+                incremental = (
+                    self.server_args.incremental_streaming_output and is_stream
+                )
+                delta_output_ids = recv_obj.output_ids[i]
+                output_offset = state.last_output_offset
+                state.output_ids.extend(delta_output_ids)
 
-                out_dict = {
-                    "output_ids": output_token_ids,
-                    "meta_info": meta_info,
-                }
+                if is_stream:
+                    if incremental:
+                        output_token_ids = delta_output_ids
+                        _slice_streaming_output_meta_info(meta_info, output_offset)
+                        state.last_output_offset = len(state.output_ids)
+                        out_dict = {
+                            "output_ids": output_token_ids,
+                            "meta_info": meta_info,
+                        }
+                    elif state.finished:
+                        out_dict = {
+                            "output_ids": state.output_ids.copy(),
+                            "meta_info": meta_info,
+                        }
+                    else:
+                        out_dict = {
+                            "output_ids": state.output_ids,
+                            "meta_info": meta_info,
+                        }
+                elif state.finished:
+                    out_dict = {
+                        "output_ids": state.output_ids.copy(),
+                        "meta_info": meta_info,
+                    }
+                else:
+                    out_dict = None
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
-
-            state.finished = recv_obj.finished_reasons[i] is not None
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
@@ -1719,8 +1826,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 if self.server_args.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
-            state.out_list.append(out_dict)
-            state.event.set()
+            if out_dict is not None:
+                state.out_list.append(out_dict)
+                state.event.set()
 
             # Log metrics and dump
             if self.enable_metrics and state.obj.log_metrics:
@@ -2132,7 +2240,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 unfinished_requests.append(
                     (
                         state.obj,
-                        state.out_list[-1] if state.out_list else {},
+                        (
+                            state.out_list[-1]
+                            if state.out_list
+                            else state.get_crash_dump_output()
+                        ),
                         convert_time_to_realtime(state.time_stats.created_time),
                         convert_time_to_realtime(state.time_stats.finished_time),
                     )
@@ -2242,7 +2354,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         if is_stream:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
-            "text": state.text,
+            "text": state.get_text(),
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
@@ -2253,9 +2365,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         self.send_to_scheduler.send_pyobj(ranks)
 
     def _handle_open_session_req_output(self, recv_obj):
-        self.session_futures[recv_obj.session_id].set_result(
-            recv_obj.session_id if recv_obj.success else None
-        )
+        future = self.session_futures.get(recv_obj.session_id)
+        if future is None:
+            logger.warning(
+                "Open session response arrived after waiter cleanup: %s",
+                recv_obj.session_id,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj.session_id if recv_obj.success else None)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.server_args.dp_size == 1:
