@@ -174,6 +174,35 @@ class TestFreeGroupInterop(unittest.TestCase):
         self.assertEqual(len(result), 10)
 
 
+class TestBackupRestore(unittest.TestCase):
+    """backup_state must flush pending before snapshotting."""
+
+    def test_backup_flushes_pending(self):
+        alloc = _make_allocator(size=10)
+        slots = alloc.alloc(3)
+        alloc.free(slots)
+        self.assertEqual(alloc._pending_free_count, 3)
+
+        state = alloc.backup_state()
+        # pending must be flushed into free_pages before snapshot
+        self.assertEqual(alloc._pending_free_count, 0)
+        free_pages, _ = state
+        self.assertEqual(len(free_pages), 10)  # all slots back
+
+    def test_restore_after_pending_free(self):
+        alloc = _make_allocator(size=10)
+        snapshot = alloc.backup_state()
+
+        slots = alloc.alloc(5)
+        alloc.free(slots)  # pending, not yet flushed
+
+        alloc.restore_state(snapshot)
+        # after restore, pending is stale — available_size must reflect snapshot
+        alloc._pending_free = []
+        alloc._pending_free_count = 0
+        self.assertEqual(alloc.available_size(), 10)
+
+
 class TestNeedSortPath(unittest.TestCase):
     """need_sort=True uses release_pages staging — pending flush must go there."""
 

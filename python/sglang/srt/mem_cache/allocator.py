@@ -68,6 +68,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.free_pages, self.release_pages = state
 
     def backup_state(self):
+        if hasattr(self, "_pending_free"):
+            self._flush_pending_free()
         return (self.free_pages, self.release_pages)
 
     def free_group_begin(self):
