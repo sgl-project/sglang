@@ -48,7 +48,6 @@ from sglang.srt.compilation.piecewise_context_manager import (
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -587,7 +586,14 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled() and (self.pymscclpp_comm is None or not self.pymscclpp_comm.should_mscclpp_allreduce(input_)):
+        if (
+            self.pynccl_comm is not None
+            and self.is_symmetric_memory_enabled()
+            and (
+                self.pymscclpp_comm is None
+                or not self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+            )
+        ):
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
@@ -597,7 +603,10 @@ class GroupCoordinator:
             self.ca_comm is not None
             and (self.pymscclpp_comm is None or self.pymscclpp_comm.disabled)
             and not self.ca_comm.disabled
-            and (self.pymscclpp_comm is None or not self.pymscclpp_comm.should_mscclpp_allreduce(input_))
+            and (
+                self.pymscclpp_comm is None
+                or not self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+            )
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"

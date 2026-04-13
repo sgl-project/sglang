@@ -1,19 +1,12 @@
-import bisect
 import importlib
 import logging
-import math
-import os
-import ipaddress
-import netifaces as ni
 from contextlib import contextmanager
-from enum import IntEnum
 from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
-import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.compilation.piecewise_context_manager import (
     get_pcg_capture_stream,
     is_in_pcg_torch_compile,
@@ -110,7 +103,10 @@ class PyMscclppCommunicator:
                 navitve_algorithms_config.append(
                     (algo, [32, 48, 64, 128], [256, 512, 768, 1024])
                 )
-            if self.symm_mem_enabled and algo.name == "default_allreduce_nvls_zero_copy":
+            if (
+                self.symm_mem_enabled
+                and algo.name == "default_allreduce_nvls_zero_copy"
+            ):
                 algo.set_message_size_range(512 << 10, 4 << 30)
                 navitve_algorithms_config.append(
                     (algo, [4, 8, 12, 16, 32], [256, 512, 768, 1024])

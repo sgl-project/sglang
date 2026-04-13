@@ -64,7 +64,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+from sglang.srt.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+)
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
@@ -82,7 +85,6 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     kill_process_tree,
-    maybe_reindex_device_id,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
