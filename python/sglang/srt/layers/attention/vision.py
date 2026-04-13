@@ -758,6 +758,7 @@ class VisionAttention(nn.Module):
         prefix: str = "",
         proj_bias: bool = True,
         num_dummy_heads: int = 0,
+        num_kv_heads: Optional[int] = None,
         qkv_bias: bool = True,
         qk_normalization: bool = False,
         qk_normalization_by_head_size: bool = False,
@@ -779,11 +780,16 @@ class VisionAttention(nn.Module):
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
+        # Default to MHA (num_kv_heads == num_heads) when not specified, so
+        # existing callers are unaffected. Pass num_kv_heads explicitly to
+        # enable grouped-query attention (GQA).
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
         self.num_attention_heads_per_partition = dist_utils.divide(
             num_dummy_heads + num_heads, self.tp_size
         )
         self.num_attention_kv_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_heads, self.tp_size
+            num_dummy_heads + num_kv_heads, self.tp_size
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
@@ -837,7 +843,7 @@ class VisionAttention(nn.Module):
                 hidden_size=embed_dim,
                 head_size=self.head_size,
                 total_num_heads=num_dummy_heads + num_heads,
-                total_num_kv_heads=num_dummy_heads + num_heads,
+                total_num_kv_heads=num_dummy_heads + num_kv_heads,
                 bias=qkv_bias,
                 quant_config=quant_config,
                 tp_rank=self.tp_rank,
@@ -1069,19 +1075,20 @@ class VisionAttention(nn.Module):
             sin = rotary_pos_emb_sin
 
         if cos is not None and sin is not None:
-            original_shape = q.shape
+            original_q_shape = q.shape
+            original_k_shape = k.shape
 
-            # [total_tokens, head, head_size]
+            # [total_tokens, head, head_size] / [total_tokens, kv_head, head_size]
             q = q.view(-1, head, self.head_size)
-            k = k.view(-1, head, self.head_size)
+            k = k.view(-1, kv_head, self.head_size)
 
             if cos.size(-1) * 2 == self.head_size:
                 cos = torch.cat([cos, cos], dim=-1)
                 sin = torch.cat([sin, sin], dim=-1)
 
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
-            q = q.view(original_shape)
-            k = k.view(original_shape)
+            q = q.view(original_q_shape)
+            k = k.view(original_k_shape)
 
         if q.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]
