@@ -33,6 +33,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
     DenoisingStepState,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_dump import (
+    maybe_save_ltx23_ti2v_tensor,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -863,6 +866,38 @@ class LTX2DenoisingStage(DenoisingStage):
                 kwargs["disable_v2a_cross_attn"] = True
             return kwargs
 
+        should_dump_stage2_step0 = (
+            ctx.is_ltx23_variant and ctx.stage == "stage2" and step.step_index == 0
+        )
+        if should_dump_stage2_step0:
+            maybe_save_ltx23_ti2v_tensor(
+                "stage2_step0_video_latents_noised", latent_model_input
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                "stage2_step0_audio_latents_noised", audio_latent_model_input
+            )
+            maybe_save_ltx23_ti2v_tensor("stage2_step0_timestep_video", timestep_video)
+            maybe_save_ltx23_ti2v_tensor("stage2_step0_timestep_audio", timestep_audio)
+            maybe_save_ltx23_ti2v_tensor(
+                "stage2_step0_prompt_timestep_video", prompt_timestep_video
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                "stage2_step0_prompt_timestep_audio", prompt_timestep_audio
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                "stage2_step0_encoder_hidden_states_video", batch.prompt_embeds[0]
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                "stage2_step0_encoder_hidden_states_audio",
+                batch.audio_prompt_embeds[0],
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                "stage2_step0_denoise_mask_video", ctx.denoise_mask
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                "stage2_step0_clean_latent_video", ctx.clean_latent
+            )
+
         # 5. Run the branch-specific LTX forward path and apply CFG/guider logic.
         prompt_attention_mask = self._get_ltx_prompt_attention_mask(
             batch,
@@ -943,6 +978,13 @@ class LTX2DenoisingStage(DenoisingStage):
                         encoder_attention_mask=encoder_attention_mask,
                     )
                 )
+            if should_dump_stage2_step0:
+                maybe_save_ltx23_ti2v_tensor(
+                    "stage2_step0_model_video_raw", model_video
+                )
+                maybe_save_ltx23_ti2v_tensor(
+                    "stage2_step0_model_audio_raw", model_audio
+                )
 
             model_video = model_video.float()
             model_audio = model_audio.float()
@@ -1004,6 +1046,9 @@ class LTX2DenoisingStage(DenoisingStage):
 
         v_pos = v_pos.float()
         a_v_pos = a_v_pos.float()
+        if should_dump_stage2_step0:
+            maybe_save_ltx23_ti2v_tensor("stage2_step0_model_video_raw", v_pos)
+            maybe_save_ltx23_ti2v_tensor("stage2_step0_model_audio_raw", a_v_pos)
         if v_neg is not None:
             v_neg = v_neg.float()
         if a_v_neg is not None:
@@ -1022,6 +1067,9 @@ class LTX2DenoisingStage(DenoisingStage):
         denoised_audio = self._ltx2_velocity_to_x0(
             ctx.audio_latents, a_v_pos, sigma_val
         )
+        if should_dump_stage2_step0:
+            maybe_save_ltx23_ti2v_tensor("stage2_step0_video_x0", denoised_video)
+            maybe_save_ltx23_ti2v_tensor("stage2_step0_audio_x0", denoised_audio)
         denoised_video_neg = None
         denoised_audio_neg = None
         denoised_video_perturbed = None
