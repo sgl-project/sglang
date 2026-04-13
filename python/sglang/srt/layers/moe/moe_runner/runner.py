@@ -106,10 +106,8 @@ class MoeRunner:
                     _runner_input.topk_output.topk_ids,
                 )
             else:
-                hidden_states, topk_ids = (
-                    _runner_input.hidden_states,
-                    _runner_input.topk_ids,
-                )
+                hidden_states = _runner_input.hidden_states
+                topk_ids = getattr(_runner_input, "topk_ids", None)
             if self.lora_enabled and lora_info is not None:
                 return build_lora_hooks(
                     hidden_states,
@@ -142,11 +140,6 @@ class MoeRunner:
             dispatch_output, quant_info, self.config, running_state
         )
 
-        hooks = _maybe_build_lora_hooks(runner_input)
-
-        runner_output = self.runner_core.run(
-            runner_input, quant_info, running_state, hooks=hooks
-        )
         hooks = _maybe_build_lora_hooks(runner_input)
 
         runner_output = self.runner_core.run(
