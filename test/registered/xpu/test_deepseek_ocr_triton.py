@@ -6,18 +6,16 @@ import os
 import unittest
 from pathlib import Path
 
+# Import base test class
+from test_deepseek_ocr import TestDeepSeekOCR
 from transformers import AutoTokenizer
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
-
-# Import base test class
-from test_deepseek_ocr import TestDeepSeekOCR
 
 # Register for per-commit XPU tests
 register_xpu_ci(est_time=360, suite="per-commit-xpu")

@@ -55,8 +55,10 @@ class TestLlamaTP1(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="xpu",
             other_args=[
-                "--attention-backend", "intel_xpu",
-                "--tp", "1",
+                "--attention-backend",
+                "intel_xpu",
+                "--tp",
+                "1",
                 "--trust-remote-code",
             ],
         )
@@ -93,9 +95,7 @@ class TestLlamaTP1(CustomTestCase):
             self.base_url + "/v1/chat/completions",
             json={
                 "model": self.model,
-                "messages": [
-                    {"role": "user", "content": "Say hello in one word."}
-                ],
+                "messages": [{"role": "user", "content": "Say hello in one word."}],
                 "temperature": 0,
                 "max_tokens": 16,
             },
@@ -123,8 +123,10 @@ class TestLlamaTP2(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="xpu",
             other_args=[
-                "--attention-backend", "intel_xpu",
-                "--tp", "2",
+                "--attention-backend",
+                "intel_xpu",
+                "--tp",
+                "2",
                 "--trust-remote-code",
             ],
         )
@@ -161,9 +163,7 @@ class TestLlamaTP2(CustomTestCase):
             self.base_url + "/v1/chat/completions",
             json={
                 "model": self.model,
-                "messages": [
-                    {"role": "user", "content": "Say hello in one word."}
-                ],
+                "messages": [{"role": "user", "content": "Say hello in one word."}],
                 "temperature": 0,
                 "max_tokens": 16,
             },
