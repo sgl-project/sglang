@@ -769,9 +769,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
             is_decode_disagg = self.disaggregation_mode == DisaggregationMode.DECODE
 
-            # On D, try the per-model fast path that skips processor.__call__.
-            # Returns a MultimodalProcessorOutput compatible with the existing
-            # downstream code, or None to fall back to the full path below.
+            # On D, try the fast path that skips processor.__call__.
             if is_decode_disagg:
                 mm_inputs = await self.mm_processor.compute_pad_and_mrope_only(
                     image_data=obj.image_data,
@@ -831,9 +829,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     if isinstance(item, MultimodalDataItem):
                         item.set_pad_value()
 
-            # On D, drop mm_inputs unless we need to forward an M-RoPE delta to
-            # the scheduler. This covers (a) the K2.5 lightweight case (no
-            # M-RoPE; input_ids already padded) and (b) text-only edge paths.
+            # On D, drop mm_inputs unless we need to forward an M-RoPE delta.
             if (
                 is_decode_disagg
                 and mm_inputs is not None
