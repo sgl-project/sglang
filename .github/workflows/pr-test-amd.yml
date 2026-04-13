@@ -98,6 +98,7 @@ jobs:
     secrets: inherit
   check-changes:
     needs: [call-gate]
+    if: always()
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
@@ -337,13 +338,14 @@ jobs:
   # For scheduled runs: wait jobs are skipped, enabling parallel execution of all stages.
 
   wait-for-stage-a-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
       !(inputs.target_stage || inputs.target_stage_select) &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true')
+      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       stage_a_result: ${{ steps.wait.outputs.result }}
@@ -812,14 +814,15 @@ jobs:
 
 
   wait-for-stage-b-amd:
-    needs: [check-changes, wait-for-stage-a-amd]
+    needs: [check-changes, call-gate, wait-for-stage-a-amd]
     if: |
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
       !(inputs.target_stage || inputs.target_stage_select) &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.wait-for-stage-a-amd.result == 'success' || needs.wait-for-stage-a-amd.result == 'skipped')
+      (needs.wait-for-stage-a-amd.result == 'success' || needs.wait-for-stage-a-amd.result == 'skipped') &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       stage_b_result: ${{ steps.wait.outputs.result }}
@@ -1103,8 +1106,10 @@ jobs:
         multimodal-gen-test-1-gpu-amd,
         multimodal-gen-test-2-gpu-amd,
 
+        wait-for-stage-a-amd,
         stage-a-test-1-gpu-small-amd,
         jit-kernel-unit-test-amd,
+        wait-for-stage-b-amd,
         stage-b-test-1-gpu-small-amd,
         stage-b-test-1-gpu-small-amd-nondeterministic,
         stage-b-test-1-gpu-small-amd-mi35x,
