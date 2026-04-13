@@ -444,8 +444,13 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 input_, num_partitions=self.base_layer.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
+        bias_ = (
+            None
+            if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
+            else self.base_layer.bias
+        )
         output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
+            self.base_layer, input_parallel, bias=bias_
         )
         if not self.merged and not self.disable_lora:
             lora_dtype = lora_A.dtype
@@ -467,20 +472,14 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             )
 
         if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
-            output_ = tensor_model_parallel_all_reduce(output_parallel)
+            output_ = tensor_model_parallel_all_reduce(
+                output_parallel, tp_group=self.base_layer.tp_group
+            )
         else:
             output_ = output_parallel
 
-        if not self.base_layer.skip_bias_add:
-            output = (
-                output_ + self.base_layer.bias
-                if self.base_layer.bias is not None
-                else output_
-            )
-            output_bias = None
-        else:
-            output = output_
-            output_bias = self.base_layer.bias
+        output = output_
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
