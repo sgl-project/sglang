@@ -48,7 +48,6 @@ Use the `--disable-custom-all-reduce` and `--enable-mscclpp` flags to select MSC
 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B \
     --tp-size 8 \
-    --disable-custom-all-reduce \
     --enable-mscclpp
 ```
 
