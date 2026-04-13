@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
 from typing import TYPE_CHECKING, AsyncGenerator, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from sglang.srt.observability.req_time_stats import monotonic_time
 
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
@@ -313,8 +314,7 @@ class AnthropicServing:
         raw_request: Request,
     ) -> JSONResponse:
         """Handle non-streaming Anthropic request by delegating to OpenAI handler."""
-        received_time = time.time()
-        received_time_perf = time.perf_counter()
+        received_time = monotonic_time()
 
         # Validate
         error_msg = self.openai_serving_chat._validate_request(chat_request)
@@ -327,15 +327,12 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            validation_time = time.perf_counter() - received_time_perf
             adapted_request, processed_request = (
                 self.openai_serving_chat._convert_to_internal_request(
                     chat_request, raw_request
                 )
             )
-            adapted_request.validation_time = validation_time
             adapted_request.received_time = received_time
-            adapted_request.received_time_perf = received_time_perf
 
             # Get response from OpenAI handler
             response = await self.openai_serving_chat._handle_non_streaming_request(
@@ -369,8 +366,7 @@ class AnthropicServing:
         raw_request: Request,
     ) -> Union[StreamingResponse, JSONResponse]:
         """Handle streaming Anthropic request."""
-        received_time = time.time()
-        received_time_perf = time.perf_counter()
+        received_time = monotonic_time()
 
         # Validate
         error_msg = self.openai_serving_chat._validate_request(chat_request)
@@ -382,15 +378,12 @@ class AnthropicServing:
             )
 
         try:
-            validation_time = time.perf_counter() - received_time_perf
             adapted_request, processed_request = (
                 self.openai_serving_chat._convert_to_internal_request(
                     chat_request, raw_request
                 )
             )
-            adapted_request.validation_time = validation_time
             adapted_request.received_time = received_time
-            adapted_request.received_time_perf = received_time_perf
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
