@@ -1524,7 +1524,7 @@ jobs:
       - nightly-8-gpu-qwen35
       - nightly-8-gpu-glm5
       - nightly-8-gpu-glm51
-          - nightly-8-gpu-minimax-m27
+      - nightly-8-gpu-minimax-m27
       # MI30x Diffusion Tests
       - nightly-1-gpu-zimage-turbo
       # MI35x jobs
