@@ -3,7 +3,44 @@
 import uuid
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+ANTHROPIC_WEB_SEARCH_TOOL_TYPES = frozenset(
+    {"web_search_20250305", "web_search_20260209"}
+)
+
+
+def validate_search_result_parts(
+    source: object, title: object, content: object
+) -> list[str]:
+    if not isinstance(source, str):
+        raise ValueError("search_result source must be a string")
+    if not source:
+        raise ValueError("search_result source must be non-empty")
+    if not isinstance(title, str):
+        raise ValueError("search_result title must be a string")
+    if not title:
+        raise ValueError("search_result title must be non-empty")
+    if not isinstance(content, list):
+        raise ValueError("search_result content must be a list")
+
+    text_parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            raise ValueError("search_result content blocks must be dictionaries")
+        if item.get("type") != "text":
+            raise ValueError("search_result content blocks must be text")
+        text = item.get("text")
+        if not isinstance(text, str):
+            raise ValueError("search_result text must be a string")
+        if not text:
+            raise ValueError("search_result text must be non-empty")
+        text_parts.append(text)
+
+    if not text_parts:
+        raise ValueError("search_result content must include at least one text block")
+
+    return text_parts
 
 
 class AnthropicError(BaseModel):
@@ -33,11 +70,18 @@ class AnthropicContentBlock(BaseModel):
     """Content block in message"""
 
     type: Literal[
-        "text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking"
+        "text",
+        "image",
+        "tool_use",
+        "tool_result",
+        "thinking",
+        "redacted_thinking",
+        "search_result",
     ]
     text: Optional[str] = None
     # For image content
-    source: Optional[dict[str, Any]] = None
+    source: Optional[dict[str, Any] | str] = None
+    title: Optional[str] = None
     # For tool use/result
     id: Optional[str] = None
     tool_use_id: Optional[str] = None
@@ -48,6 +92,14 @@ class AnthropicContentBlock(BaseModel):
     # For thinking content
     thinking: Optional[str] = None
     signature: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_search_result(self) -> "AnthropicContentBlock":
+        if self.type != "search_result":
+            return self
+
+        validate_search_result_parts(self.source, self.title, self.content)
+        return self
 
 
 class AnthropicMessage(BaseModel):
@@ -62,16 +114,40 @@ class AnthropicTool(BaseModel):
 
     name: str
     description: Optional[str] = None
-    input_schema: dict[str, Any]
+    type: Optional[str] = None
+    input_schema: Optional[dict[str, Any]] = None
+    allowed_callers: Optional[list[str]] = None
+    allowed_domains: Optional[list[str]] = None
+    blocked_domains: Optional[list[str]] = None
+    cache_control: Optional[dict[str, Any]] = None
+    defer_loading: Optional[bool] = None
+    max_uses: Optional[int] = None
+    strict: Optional[bool] = None
+    user_location: Optional[dict[str, Any]] = None
 
     @field_validator("input_schema")
     @classmethod
-    def validate_input_schema(cls, v):
+    def validate_input_schema(cls, v: object) -> dict[str, Any] | None:
+        if v is None:
+            return v
         if not isinstance(v, dict):
             raise ValueError("input_schema must be a dictionary")
         if "type" not in v:
             v["type"] = "object"
         return v
+
+    @model_validator(mode="after")
+    def validate_tool_shape(self) -> "AnthropicTool":
+        if not self.name:
+            raise ValueError("tool name must be non-empty")
+
+        if self.type in ANTHROPIC_WEB_SEARCH_TOOL_TYPES:
+            return self
+
+        if self.input_schema is None:
+            raise ValueError("input_schema is required for custom tools")
+
+        return self
 
 
 class AnthropicToolChoice(BaseModel):

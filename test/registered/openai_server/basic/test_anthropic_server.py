@@ -35,53 +35,8 @@ register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestAnthropicServer(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.messages_url = cls.base_url + "/v1/messages"
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def _make_request(self, payload, stream=False):
-        """Send a request to the /v1/messages endpoint."""
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
-        return requests.post(
-            self.messages_url,
-            headers=headers,
-            json=payload,
-            stream=stream,
-        )
-
-    def _default_payload(self, **overrides):
-        """Build a default Anthropic Messages request payload."""
-        payload = {
-            "model": self.model,
-            "max_tokens": 64,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "What is the capital of France? Answer in a few words.",
-                }
-            ],
-        }
-        payload.update(overrides)
-        return payload
-
-    # ---- Non-streaming tests ----
+class TestAnthropicRequestConversion(unittest.TestCase):
+    model = "test-model"
 
     def test_tool_result_image_content_conversion(self):
         """Tool-result image blocks should be preserved as OpenAI image_url content."""
@@ -146,6 +101,291 @@ class TestAnthropicServer(CustomTestCase):
             tool_message["content"][0]["image_url"]["url"],
             "data:image/png;base64,abcd",
         )
+
+    def test_search_result_content_conversion(self):
+        """search_result blocks should be flattened into deterministic text content."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "search_result",
+                            "source": "https://example.com",
+                            "title": "Example Domain",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Example Domain is for use in illustrative examples.",
+                                }
+                            ],
+                        },
+                        {"type": "text", "text": "Summarize this."},
+                    ],
+                }
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+        converted = chat_request.model_dump()
+
+        first_message = converted["messages"][0]
+        self.assertEqual(first_message["role"], "user")
+        self.assertIsInstance(first_message["content"], list)
+        self.assertEqual(first_message["content"][0]["type"], "text")
+        self.assertIn("Title: Example Domain", first_message["content"][0]["text"])
+        self.assertIn("Source: https://example.com", first_message["content"][0]["text"])
+        self.assertEqual(first_message["content"][1]["text"], "Summarize this.")
+
+    def test_search_result_tool_result_conversion(self):
+        """search_result blocks inside tool_result should become tool text content."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "web_search",
+                            "input": {"query": "example"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {
+                                    "type": "search_result",
+                                    "source": "https://example.com",
+                                    "title": "Example Domain",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Example Domain is for use in illustrative examples.",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+        converted = chat_request.model_dump()
+
+        tool_message = converted["messages"][1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertEqual(tool_message["tool_call_id"], "toolu_1")
+        self.assertIn("Title: Example Domain", tool_message["content"])
+        self.assertIn("Source: https://example.com", tool_message["content"])
+
+    def test_web_search_tool_without_input_schema_conversion(self):
+        """Anthropic built-in web_search tools should synthesize a query schema."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Search for example.com",
+                }
+            ],
+            tools=[
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 5,
+                }
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
+        converted = chat_request.model_dump()
+
+        tool_definition = converted["tools"][0]["function"]
+        self.assertEqual(tool_definition["name"], "web_search")
+        self.assertEqual(tool_definition["parameters"]["required"], ["query"])
+        self.assertEqual(
+            tool_definition["parameters"]["properties"]["query"]["type"], "string"
+        )
+        self.assertEqual(converted["tool_choice"], "auto")
+
+    def test_custom_tool_without_input_schema_rejected(self):
+        """Custom Anthropic tools must provide input_schema."""
+        with self.assertRaises(ValueError):
+            AnthropicMessagesRequest(
+                model=self.model,
+                max_tokens=64,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "Call the tool.",
+                    }
+                ],
+                tools=[
+                    {
+                        "name": "custom_tool",
+                    }
+                ],
+            )
+
+    def test_invalid_search_result_rejected(self):
+        """Malformed search_result blocks should fail validation."""
+        with self.assertRaises(ValueError):
+            AnthropicMessagesRequest(
+                model=self.model,
+                max_tokens=64,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "search_result",
+                                "source": "https://example.com",
+                                "title": "Example Domain",
+                                "content": [],
+                            }
+                        ],
+                    }
+                ],
+            )
+
+    def test_tool_use_requires_id(self):
+        """tool_use blocks must include an id."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "web_search",
+                            "input": {"query": "example"},
+                        }
+                    ],
+                }
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        with self.assertRaisesRegex(ValueError, "tool_use must include id"):
+            serving._convert_to_chat_completion_request(anthropic_request)
+
+    def test_tool_result_requires_tool_use_id(self):
+        """tool_result blocks must include tool_use_id."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "content": "result",
+                        }
+                    ],
+                }
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        with self.assertRaisesRegex(ValueError, "tool_result must include tool_use_id"):
+            serving._convert_to_chat_completion_request(anthropic_request)
+
+    def test_tool_result_rejects_unknown_content_block(self):
+        """tool_result content blocks must use supported Anthropic types."""
+        anthropic_request = AnthropicMessagesRequest(
+            model=self.model,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {
+                                    "type": "unknown",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        )
+
+        serving = AnthropicServing(openai_serving_chat=object())
+        with self.assertRaisesRegex(
+            ValueError, "unsupported tool_result content block type"
+        ):
+            serving._convert_to_chat_completion_request(anthropic_request)
+
+
+class TestAnthropicServer(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.messages_url = cls.base_url + "/v1/messages"
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def _make_request(self, payload, stream=False):
+        """Send a request to the /v1/messages endpoint."""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        return requests.post(
+            self.messages_url,
+            headers=headers,
+            json=payload,
+            stream=stream,
+        )
+
+    def _default_payload(self, **overrides):
+        """Build a default Anthropic Messages request payload."""
+        payload = {
+            "model": self.model,
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the capital of France? Answer in a few words.",
+                }
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    # ---- Non-streaming tests ----
 
     def test_simple_messages(self):
         """Test basic non-streaming message request."""
@@ -532,6 +772,35 @@ class TestAnthropicServer(CustomTestCase):
             tokens_no_system,
             "Adding system message should increase token count",
         )
+
+    def test_count_tokens_accepts_web_search_tool(self):
+        """count_tokens should accept Anthropic built-in web_search tools."""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": "Search for example.com"},
+            ],
+            "tools": [
+                {
+                    "type": "web_search_20260209",
+                    "name": "web_search",
+                    "max_uses": 3,
+                }
+            ],
+        }
+        resp = requests.post(
+            self.base_url + "/v1/messages/count_tokens",
+            headers=headers,
+            json=payload,
+        )
+        self.assertEqual(resp.status_code, 200, f"Response: {resp.text}")
+        body = resp.json()
+        self.assertIn("input_tokens", body)
+        self.assertGreater(body["input_tokens"], 0)
 
     # ---- Helpers ----
 

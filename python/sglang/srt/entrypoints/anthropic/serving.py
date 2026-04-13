@@ -16,6 +16,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.anthropic.protocol import (
+    ANTHROPIC_WEB_SEARCH_TOOL_TYPES,
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
@@ -25,7 +26,9 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
     AnthropicStreamEvent,
+    AnthropicTool,
     AnthropicUsage,
+    validate_search_result_parts,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -53,6 +56,128 @@ STOP_REASON_MAP = {
 def _wrap_sse_event(data: str, event_type: str) -> str:
     """Format an Anthropic SSE event with event type and data lines."""
     return f"event: {event_type}\ndata: {data}\n\n"
+
+
+def _convert_anthropic_image_source_to_openai_part(source: Optional[dict]) -> Optional[dict]:
+    if not isinstance(source, dict):
+        return None
+
+    source_type = source.get("type")
+    if source_type == "base64":
+        media_type = source.get("media_type", "image/png")
+        data = source.get("data", "")
+        if not data:
+            return None
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{media_type};base64,{data}",
+            },
+        }
+
+    url = source.get("url")
+    if not url:
+        return None
+    return {
+        "type": "image_url",
+        "image_url": {
+            "url": url,
+        },
+    }
+
+
+def _anthropic_search_result_to_openai_text(block: AnthropicContentBlock) -> str:
+    if block.type != "search_result":
+        raise ValueError("search result blocks must have type=search_result")
+
+    result_text = "\n".join(
+        validate_search_result_parts(block.source, block.title, block.content)
+    )
+    return "\n".join(
+        [
+            "[Search Result]",
+            f"Title: {block.title}",
+            f"Source: {block.source}",
+            "Content:",
+            result_text,
+        ]
+    )
+
+
+def _convert_tool_result_content(
+    content: Optional[str | list[dict[str, object]]],
+) -> tuple[str | list[dict], str]:
+    if isinstance(content, list):
+        tool_content_parts = []
+        tool_text_parts = []
+
+        for item in content:
+            if not isinstance(item, dict):
+                raise ValueError("tool_result content blocks must be dictionaries")
+
+            item_type = item.get("type")
+            if item_type == "text":
+                text = item.get("text")
+                if not isinstance(text, str):
+                    raise ValueError("tool_result text blocks must include string text")
+                tool_text_parts.append(text)
+                tool_content_parts.append({"type": "text", "text": text})
+            elif item_type == "search_result":
+                search_result = AnthropicContentBlock.model_validate(item)
+                search_result_text = _anthropic_search_result_to_openai_text(search_result)
+                tool_text_parts.append(search_result_text)
+                tool_content_parts.append({"type": "text", "text": search_result_text})
+            elif item_type == "image":
+                image_part = _convert_anthropic_image_source_to_openai_part(
+                    item.get("source")
+                )
+                if image_part is None:
+                    raise ValueError("tool_result image blocks must include a valid source")
+                tool_content_parts.append(image_part)
+            else:
+                raise ValueError(
+                    f"unsupported tool_result content block type: {item_type}"
+                )
+
+        tool_text = "\n".join(tool_text_parts)
+        if len(tool_content_parts) == 1 and tool_content_parts[0]["type"] == "text":
+            return tool_content_parts[0]["text"], tool_text
+        if tool_content_parts:
+            return tool_content_parts, tool_text
+        return "", tool_text
+
+    tool_text = str(content) if content else ""
+    return tool_text, tool_text
+
+
+def _convert_anthropic_tool_to_openai_tool(tool: AnthropicTool) -> Tool:
+    parameters = tool.input_schema
+    if parameters is None:
+        if tool.type not in ANTHROPIC_WEB_SEARCH_TOOL_TYPES:
+            raise ValueError(f"unsupported anthropic tool definition: {tool.type or tool.name}")
+        parameters = {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query",
+                }
+            },
+            "required": ["query"],
+        }
+
+    description = tool.description
+    if not description and tool.type in ANTHROPIC_WEB_SEARCH_TOOL_TYPES:
+        description = "Anthropic web search tool"
+
+    return Tool(
+        type="function",
+        function={
+            "name": tool.name,
+            "description": description or "",
+            "parameters": parameters,
+        },
+    )
 
 
 class AnthropicServing:
@@ -92,73 +217,6 @@ class AnthropicServing:
         """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
         openai_messages = []
 
-        def _convert_anthropic_image_source_to_openai_part(
-            source: Optional[dict],
-        ) -> Optional[dict]:
-            if not isinstance(source, dict):
-                return None
-
-            source_type = source.get("type")
-            if source_type == "base64":
-                media_type = source.get("media_type", "image/png")
-                data = source.get("data", "")
-                if not data:
-                    return None
-                return {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{media_type};base64,{data}",
-                    },
-                }
-
-            url = source.get("url")
-            if url:
-                return {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": url,
-                    },
-                }
-
-            return None
-
-        def _convert_tool_result_content(
-            content: Optional[str | list[dict]],
-        ) -> tuple[str | list[dict], str]:
-            if isinstance(content, list):
-                tool_content_parts = []
-                tool_text_parts = []
-
-                for item in content:
-                    if not isinstance(item, dict):
-                        continue
-
-                    item_type = item.get("type")
-                    if item_type == "text":
-                        text = item.get("text", "")
-                        if text:
-                            tool_text_parts.append(text)
-                            tool_content_parts.append({"type": "text", "text": text})
-                    elif item_type == "image":
-                        image_part = _convert_anthropic_image_source_to_openai_part(
-                            item.get("source")
-                        )
-                        if image_part is not None:
-                            tool_content_parts.append(image_part)
-
-                tool_text = "\n".join(tool_text_parts)
-                if (
-                    len(tool_content_parts) == 1
-                    and tool_content_parts[0]["type"] == "text"
-                ):
-                    return tool_content_parts[0]["text"], tool_text
-                if tool_content_parts:
-                    return tool_content_parts, tool_text
-                return "", tool_text
-
-            tool_text = str(content) if content else ""
-            return tool_text, tool_text
-
         # Add system message if provided
         if anthropic_request.system:
             if isinstance(anthropic_request.system, str):
@@ -188,6 +246,10 @@ class AnthropicServing:
                 if block.type == "text" and block.text:
                     content_parts.append({"type": "text", "text": block.text})
 
+                elif block.type == "search_result":
+                    search_result_text = _anthropic_search_result_to_openai_text(block)
+                    content_parts.append({"type": "text", "text": search_result_text})
+
                 elif block.type == "image" and block.source:
                     image_part = _convert_anthropic_image_source_to_openai_part(
                         block.source
@@ -196,11 +258,15 @@ class AnthropicServing:
                         content_parts.append(image_part)
 
                 elif block.type == "tool_use":
+                    if not block.id:
+                        raise ValueError("tool_use must include id")
+                    if not block.name:
+                        raise ValueError("tool_use must include name")
                     tool_call = {
-                        "id": block.id or f"call_{uuid.uuid4().hex}",
+                        "id": block.id,
                         "type": "function",
                         "function": {
-                            "name": block.name or "",
+                            "name": block.name,
                             "arguments": json.dumps(block.input or {}),
                         },
                     }
@@ -211,10 +277,10 @@ class AnthropicServing:
                         block.content
                     )
 
-                    # Use tool_use_id (per spec) with fallback to id
-                    tool_call_id = block.tool_use_id or block.id or ""
+                    tool_call_id = block.tool_use_id
+                    if not tool_call_id:
+                        raise ValueError("tool_result must include tool_use_id")
 
-                    # Tool results from user become separate tool messages
                     if msg.role == "user":
                         openai_messages.append(
                             {
@@ -273,16 +339,7 @@ class AnthropicServing:
         if anthropic_request.tools:
             tools = []
             for tool in anthropic_request.tools:
-                tools.append(
-                    Tool(
-                        type="function",
-                        function={
-                            "name": tool.name,
-                            "description": tool.description or "",
-                            "parameters": tool.input_schema,
-                        },
-                    )
-                )
+                tools.append(_convert_anthropic_tool_to_openai_tool(tool))
             chat_request.tools = tools
 
         # Convert tool choice
