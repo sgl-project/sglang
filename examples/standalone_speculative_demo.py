@@ -65,7 +65,7 @@ CONFIGS = {
     "sdar-8b": dict(
         target="JetLM/SDAR-8B-Chat",
         draft="JetLM/SDAR-1.7B-Chat",
-        base_engine=dict(mem_fraction_static=0.8, tp_size=1),
+        base_engine=dict(mem_fraction_static=0.8, tp_size=1, trust_remote_code=True),
         spec_kwargs=dict(
             speculative_algorithm="STANDALONE",
             speculative_num_draft_tokens=5,
