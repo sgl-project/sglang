@@ -90,7 +90,7 @@ class NgramCorpus:
         old_count = self._corpus_token_counts.pop(corpus_id, 0)
         self._total_loaded_tokens -= old_count
 
-    def list_external_corpora(self) -> List[str]:
+    def list_external_corpora(self) -> Dict[str, int]:
         return self._obj.list_corpora()
 
     def reset(self):
