@@ -6550,9 +6550,6 @@ class ServerArgs:
                 "(e.g., DeepSeek V3.2, GLM-5). "
             )
 
-            assert (
-                self.disable_radix_cache
-            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
             for attr, label in [
                 ("nsa_prefill_backend", "prefill"),
                 ("nsa_decode_backend", "decode"),

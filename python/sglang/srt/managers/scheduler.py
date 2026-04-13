@@ -767,6 +767,9 @@ class Scheduler(
         self.disable_radix_cache = server_args.disable_radix_cache or (
             self.model_config.is_multimodal and uses_transformers_backend
         )
+        self.enable_hisparse_radix_cache = (
+            self.enable_hisparse and not self.disable_radix_cache
+        )
         if self.disable_radix_cache and not server_args.disable_radix_cache:
             logger.warning(
                 "Radix cache is disabled for multimodal models with the "
@@ -800,7 +803,11 @@ class Scheduler(
             sliding_window_size=self.sliding_window_size,
         )
 
-        if effective_chunked_prefill_size is not None and self.disable_radix_cache:
+        if self.enable_hisparse_radix_cache:
+            from sglang.srt.mem_cache.hisparse_radix_cache import HiSparseRadixCache
+
+            self.tree_cache = HiSparseRadixCache(params)
+        elif effective_chunked_prefill_size is not None and self.disable_radix_cache:
             if not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
@@ -880,6 +887,12 @@ class Scheduler(
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            if self.enable_hisparse_radix_cache:
+                self.tree_cache.set_host_pool(self.hisparse_coordinator.mem_pool_host)
+                self.hisparse_coordinator.set_host_radix_cache(self.tree_cache)
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache.cache_controller.layer_done_counter
+                )
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -2400,7 +2413,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption:
@@ -2579,7 +2592,7 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hisparse_radix_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
