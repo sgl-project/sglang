@@ -18,3 +18,10 @@ def maybe_save_ltx23_ti2v_tensor(name: str, value: torch.Tensor | None) -> None:
     if out_dir is None or value is None:
         return
     torch.save(value.detach().cpu(), out_dir / f"{name}.pt")
+
+
+def get_ltx23_ti2v_dump_steps() -> set[int]:
+    raw = os.environ.get("LTX23_SGLANG_TI2V_DUMP_STEPS")
+    if not raw:
+        return set()
+    return {int(part.strip()) for part in raw.split(",") if part.strip()}

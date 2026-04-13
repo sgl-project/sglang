@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStepState,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_dump import (
+    get_ltx23_ti2v_dump_steps,
     maybe_save_ltx23_ti2v_tensor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -1085,6 +1086,15 @@ class LTX2DenoisingStage(DenoisingStage):
             ctx.latents = self.post_forward_for_ti2v_task(
                 batch, server_args, ctx.reserved_frames_mask, ctx.latents, ctx.z
             )
+            dump_steps = get_ltx23_ti2v_dump_steps()
+            if ctx.is_ltx23_variant and step.step_index in dump_steps:
+                dump_prefix = f"{ctx.stage}_step{step.step_index}"
+                maybe_save_ltx23_ti2v_tensor(
+                    f"{dump_prefix}_video_latents_after", ctx.latents
+                )
+                maybe_save_ltx23_ti2v_tensor(
+                    f"{dump_prefix}_audio_latents_after", ctx.audio_latents
+                )
             return
 
         encoder_hidden_states = batch.prompt_embeds[0]
@@ -1340,6 +1350,16 @@ class LTX2DenoisingStage(DenoisingStage):
             )
             maybe_save_ltx23_ti2v_tensor(
                 f"{dump_step0_prefix}_audio_latents_after", ctx.audio_latents
+            )
+
+        dump_steps = get_ltx23_ti2v_dump_steps()
+        if ctx.is_ltx23_variant and step.step_index in dump_steps:
+            dump_prefix = f"{ctx.stage}_step{step.step_index}"
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_prefix}_video_latents_after", ctx.latents
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_prefix}_audio_latents_after", ctx.audio_latents
             )
 
     def _record_trajectory(
