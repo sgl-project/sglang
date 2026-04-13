@@ -1,5 +1,5 @@
 """
-python3 -m unittest test_chunked_prefill.TestChunkedPrefill.test_mixed_chunked_prefill_without_radix_cache
+python3 -m unittest test_mixed_chunked_prefill.TestMixedChunkedPrefill.test_mixed_chunked_prefill_without_radix_cache
 """
 
 import unittest
@@ -11,7 +11,7 @@ register_cuda_ci(est_time=360, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=312, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestChunkedPrefill(CustomTestCase):
+class TestMixedChunkedPrefill(CustomTestCase):
     def test_mixed_chunked_prefill(self):
         run_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=True)
 
