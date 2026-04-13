@@ -104,6 +104,11 @@ class DenoisingStage(PipelineStage):
     the initial noise into the final output.
     """
 
+    @property
+    def requires_per_output_execution(self) -> bool:
+        # This stage's result differs per output and cannot be shared.
+        return True
+
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
     ) -> None:
@@ -1098,6 +1103,7 @@ class DenoisingStage(PipelineStage):
         # to avoid device-sync caused by timestep comparison
         is_warmup = batch.is_warmup
         self.scheduler.set_begin_index(0)
+        self.scheduler._step_index = None
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
         with torch.autocast(

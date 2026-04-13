@@ -56,6 +56,11 @@ class DecodingStage(PipelineStage):
     output format (e.g., pixel values).
     """
 
+    @property
+    def requires_per_output_execution(self) -> bool:
+        # This stage's result differs per output and cannot be shared.
+        return True
+
     def __init__(self, vae, pipeline=None, component_name: str = "vae") -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
