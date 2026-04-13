@@ -47,19 +47,6 @@ def _nvfp4_arch_env():
     return override_jit_cuda_arch(major, minor, suffix="a")
 
 
-@torch.compiler.disable
-def prewarm_nvfp4_jit_modules(
-    *, include_expert_quant: bool = False, include_blockwise_moe: bool = False
-) -> None:
-    """Materialize NVFP4 JIT modules before torch.compile traces the model."""
-    _jit_nvfp4_quant_module()
-    _jit_nvfp4_scaled_mm_module()
-    if include_expert_quant:
-        _jit_nvfp4_expert_quant_module()
-    if include_blockwise_moe:
-        _jit_nvfp4_blockwise_moe_module()
-
-
 @cache_once
 def _jit_nvfp4_quant_module() -> Module:
     with _nvfp4_arch_env():
