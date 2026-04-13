@@ -201,7 +201,9 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half] if not (_is_npu or _is_cpu) else [torch.half, torch.bfloat16]
+        return (
+            [torch.half] if not (_is_npu or _is_cpu) else [torch.half, torch.bfloat16]
+        )
 
     @classmethod
     # Need to figure it out
@@ -1171,6 +1173,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
             bias=bias,
         )
 
+
 class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GPTQConfig):
@@ -1319,6 +1322,7 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
         set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
+
     def create_moe_runner(
         self,
         layer: torch.nn.Module,
@@ -1368,6 +1372,7 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
+
 
 def unpack_from_int32(
     weight: torch.Tensor,
@@ -1746,7 +1751,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
 
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_qweight,
