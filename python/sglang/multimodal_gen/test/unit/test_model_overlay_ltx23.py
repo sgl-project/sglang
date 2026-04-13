@@ -36,6 +36,8 @@ from sglang.multimodal_gen.runtime.models.adapter.ltx_2_connector import (
 )
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
     LTX2AudioVideoRotaryPosEmbed,
+    apply_interleaved_rotary_emb,
+    apply_split_rotary_emb,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
@@ -269,6 +271,53 @@ def test_ltx23_rope_respects_requested_output_dtype():
     assert sin_bf16.dtype == torch.bfloat16
     assert torch.allclose(cos_bf16.float(), cos_fp32, atol=2e-3, rtol=0.0)
     assert torch.allclose(sin_bf16.float(), sin_fp32, atol=2e-3, rtol=0.0)
+
+
+def test_ltx23_interleaved_rotary_matches_bfloat16_reference_math():
+    x = torch.tensor(
+        [[[0.3125, -0.4375, 1.2188, -1.3438]]],
+        dtype=torch.bfloat16,
+    )
+    cos = torch.tensor(
+        [[[0.9844, 0.9844, 0.9023, 0.9023]]],
+        dtype=torch.bfloat16,
+    )
+    sin = torch.tensor(
+        [[[0.1768, 0.1768, -0.4316, -0.4316]]],
+        dtype=torch.bfloat16,
+    )
+    x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)
+    rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
+    expected = x * cos + rotated * sin
+
+    actual = apply_interleaved_rotary_emb(x, (cos, sin))
+
+    assert actual.dtype == torch.bfloat16
+    assert torch.equal(actual, expected)
+
+
+def test_ltx23_split_rotary_matches_bfloat16_reference_math():
+    x = torch.tensor(
+        [[[[0.1250, -0.2500, 0.3750, -0.5000]]]],
+        dtype=torch.bfloat16,
+    )
+    cos = torch.tensor([[[[0.9688, 0.8125]]]], dtype=torch.bfloat16)
+    sin = torch.tensor([[[[0.2471, -0.5820]]]], dtype=torch.bfloat16)
+
+    split_x = x.reshape(*x.shape[:-1], 2, x.shape[-1] // 2)
+    first_x = split_x[..., :1, :]
+    second_x = split_x[..., 1:, :]
+    expected = split_x * cos.unsqueeze(-2)
+    expected_first = expected[..., :1, :]
+    expected_second = expected[..., 1:, :]
+    expected_first.addcmul_(-sin.unsqueeze(-2), second_x)
+    expected_second.addcmul_(sin.unsqueeze(-2), first_x)
+    expected = expected.reshape_as(x)
+
+    actual = apply_split_rotary_emb(x, (cos, sin))
+
+    assert actual.dtype == torch.bfloat16
+    assert torch.equal(actual, expected)
 
 
 def test_ltx23_connector_repack_renames_qk_norm_keys():
