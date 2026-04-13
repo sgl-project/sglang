@@ -235,6 +235,8 @@ class LTX2DenoisingStage(DenoisingStage):
         state = {"done": False}
 
         def wrapped(*args, **kwargs):
+            if not state["done"] and args and isinstance(args[0], torch.Tensor):
+                maybe_save_ltx23_ti2v_tensor(f"{name}_arg0", args[0])
             out = original_forward(*args, **kwargs)
             if not state["done"]:
                 if isinstance(out, tuple):
