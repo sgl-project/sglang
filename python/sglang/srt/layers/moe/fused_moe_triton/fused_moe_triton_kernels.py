@@ -335,6 +335,7 @@ def fused_moe_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    add_mask_ptr,
     # Matrix dimensions
     N,
     K,
@@ -377,6 +378,7 @@ def fused_moe_kernel(
     c_sorted: tl.constexpr,
     filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
+    FUSE_ADD_TO_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
 ):
@@ -441,18 +443,20 @@ def fused_moe_kernel(
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
-        write_zeros_to_output(
-            c_ptr,
-            stride_cm,
-            stride_cn,
-            pid_n,
-            N,
-            offs_token,
-            token_mask,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            compute_type,
-        )
+        if not FUSE_ADD_TO_OUTPUT:
+            # skip the zero-write to preserve existing values.
+            write_zeros_to_output(
+                c_ptr,
+                stride_cm,
+                stride_cn,
+                pid_n,
+                N,
+                offs_token,
+                token_mask,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                compute_type,
+            )
         return
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
@@ -604,7 +608,15 @@ def fused_moe_kernel(
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    if FUSE_SUM_ALL_REDUCE:
+    if FUSE_ADD_TO_OUTPUT:
+        # Accumulate into existing output with per-token mask.
+        offs_token_out = offs_token // ROUTER_TOPK
+        add_mask = tl.load(add_mask_ptr + offs_token_out, mask=token_mask, other=False)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & add_mask[:, None] & (offs_cn[None, :] < N)
+        existing = tl.load(c_ptrs, mask=c_mask, other=0.0)
+        tl.store(c_ptrs, existing + accumulator, mask=c_mask)
+    elif FUSE_SUM_ALL_REDUCE:
         offs_token_out = offs_token // ROUTER_TOPK
         c_ptrs = (
             c_ptr + stride_cm * offs_token_out[:, None] + stride_cn * offs_cn[None, :]
@@ -717,6 +729,8 @@ def invoke_fused_moe_kernel(
     filter_expert: bool = True,
     fuse_sum_all_reduce: bool = False,
     router_topk: int = 1,
+    fuse_add_to_output: bool = False,
+    add_output_mask: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -786,6 +800,13 @@ def invoke_fused_moe_kernel(
 
     if fuse_sum_all_reduce:
         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
+    if fuse_add_to_output:
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when fuse_add_to_output=True"
 
     if (
         (use_int8_w8a16 or use_int4_w4a16)
@@ -870,6 +891,7 @@ def invoke_fused_moe_kernel(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
+            add_output_mask,
             B.shape[1],
             B.shape[2] - padded_size,
             sorted_token_ids.shape[0],
@@ -901,6 +923,7 @@ def invoke_fused_moe_kernel(
             c_sorted=c_sorted,
             filter_expert=filter_expert,
             swap_ab=swap_ab,
+            FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             **config,

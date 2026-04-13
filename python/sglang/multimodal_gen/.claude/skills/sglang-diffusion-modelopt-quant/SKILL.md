@@ -21,7 +21,7 @@ This skill owns the ModelOpt-to-SGLang bridge. It is not a generic kernel-tuning
 - Use ModelOpt's official `quantize.py` as the PTQ source of truth.
 - Keep the workflow generic. Put model-specific fallback logic in small isolated branches, not in the main conversion path.
 - Benchmark only when BF16 and quantized commands are identical except for the checkpoint override being tested.
-- For diffusion FP8, pin `dit_cpu_offload=false` and `dit_layerwise_offload=false`.
+- For diffusion FP8, keep `dit_cpu_offload=false`. `dit_layerwise_offload=true` is valid on the fixed path when you want lower DiT residency.
 - For multi-transformer pipelines, use per-component overrides when different components need different checkpoints.
 - When a branch is missing the validated helper tools, refresh `python/sglang/multimodal_gen/tools/convert_modelopt_fp8_checkpoint.py` and `python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py` instead of inventing one-off scripts elsewhere.
 - After validating a new ModelOpt quant path, update both the FP8 and NVFP4 support tables in this skill before closing the task.
@@ -51,7 +51,7 @@ This repo now contains:
 - diffusion-side ModelOpt FP8 linear loading
 - diffusion-side NVFP4 loading from ModelOpt exports
 - FLUX.2 packed-QKV detection that distinguishes packed NVFP4 checkpoints from standard diffusers exports
-- automatic protection against incompatible FP8 offload modes
+- automatic protection against incompatible FP8 CPU offload while keeping layerwise DiT offload available
 - FP8 export conversion:
   [`python/sglang/multimodal_gen/tools/convert_modelopt_fp8_checkpoint.py`](../../../tools/convert_modelopt_fp8_checkpoint.py)
 - trajectory similarity validation:
@@ -274,18 +274,18 @@ Do not turn one validated model quirk into a generic rule unless another family 
 Current diffusion ModelOpt FP8 support requires:
 
 - `dit_cpu_offload=false`
-- `dit_layerwise_offload=false`
+- `dit_layerwise_offload` may be enabled when you want lower DiT residency
 
 Reason:
 
 - the FP8 linear path depends on a CUTLASS-compatible weight layout after loading
-- the offload and restore path does not preserve that layout
-- in particular, layerwise offload can flatten and rebuild FP8 weights in a way that breaks the column-major requirement used by the FP8 GEMM path
+- `dit_cpu_offload` is still treated conservatively
+- the fixed layerwise offload path now preserves non-contiguous tensor strides instead of flattening and rebuilding FP8 weights into a contiguous layout
 
 Runtime behavior:
 
-- SGLang currently force-disables these two flags when it detects `modelopt_fp8`
-- benchmark commands should still pin them explicitly so the command line itself makes the comparison rule obvious
+- SGLang still force-disables `dit_cpu_offload` when it detects `modelopt_fp8`
+- benchmark commands should still pin offload flags explicitly so the command line itself makes the comparison rule obvious
 
 ## Claim Discipline
 

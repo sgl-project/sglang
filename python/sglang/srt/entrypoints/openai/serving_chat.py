@@ -738,7 +738,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     stream_started = True
 
                 offset = stream_offsets.get(index, 0)
-                delta = content["text"][offset:]
+                if self.tokenizer_manager.server_args.incremental_streaming_output:
+                    # content["text"] is already the incremental delta
+                    delta = content["text"]
+                else:
+                    delta = content["text"][offset:]
                 stream_offsets[index] = len(content["text"])
 
                 # Handle reasoning content

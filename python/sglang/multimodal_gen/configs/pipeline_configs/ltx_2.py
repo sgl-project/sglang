@@ -19,7 +19,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
-    sequence_model_parallel_all_gather,
 )
 
 
@@ -345,6 +344,7 @@ class LTX2PipelineConfig(PipelineConfig):
         latent_frames, tokens_per_frame = (
             self._infer_video_latent_frames_and_tokens_per_frame(batch, seq_len)
         )
+        orig_latent_frames = int(latent_frames)
 
         # Pad whole frames so `latent_frames` is divisible by `sp_world_size`.
         pad_frames = (sp_world_size - (latent_frames % sp_world_size)) % sp_world_size
@@ -360,6 +360,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
         local_frames = int(latent_frames) // int(sp_world_size)
         start_frame = int(sp_rank) * int(local_frames)
+        valid_local_frames = max(
+            min(int(orig_latent_frames) - int(start_frame), int(local_frames)), 0
+        )
         start = int(start_frame) * int(tokens_per_frame)
         end = int(start) + int(local_frames) * int(tokens_per_frame)
         latents = latents[:, start:end, :]
@@ -368,6 +371,9 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_video_latent_num_frames = int(local_frames)
         batch.sp_video_start_frame = int(start_frame)
         batch.sp_video_tokens_per_frame = int(tokens_per_frame)
+        batch.sp_video_valid_token_count = int(valid_local_frames) * int(
+            tokens_per_frame
+        )
 
         return latents, True
 
@@ -376,8 +382,109 @@ class LTX2PipelineConfig(PipelineConfig):
         if get_sp_world_size() <= 1:
             return latents
         if isinstance(latents, torch.Tensor) and latents.ndim == 3:
-            return sequence_model_parallel_all_gather(latents.contiguous(), dim=1)
+            return self._gather_sp_tensor(latents, dim=1)
         return super().gather_latents_for_sp(latents, batch=batch)
+
+    def shard_audio_latents_for_sp(self, batch, audio_latents):
+        sp_world_size = get_sp_world_size()
+        if sp_world_size <= 1:
+            return audio_latents, False
+        if not (isinstance(audio_latents, torch.Tensor) and audio_latents.ndim == 3):
+            return audio_latents, False
+
+        sp_rank = get_sp_parallel_rank()
+        seq_len = int(audio_latents.shape[1])
+        batch.sp_audio_orig_num_frames = int(seq_len)
+
+        pad_frames = (sp_world_size - (seq_len % sp_world_size)) % sp_world_size
+        if pad_frames:
+            pad = torch.zeros(
+                (audio_latents.shape[0], pad_frames, audio_latents.shape[2]),
+                device=audio_latents.device,
+                dtype=audio_latents.dtype,
+            )
+            audio_latents = torch.cat([audio_latents, pad], dim=1)
+            seq_len += int(pad_frames)
+
+        local_frames = seq_len // sp_world_size
+        start_frame = sp_rank * local_frames
+        end_frame = start_frame + local_frames
+        valid_local_frames = max(
+            min(
+                int(batch.sp_audio_orig_num_frames) - int(start_frame),
+                int(local_frames),
+            ),
+            0,
+        )
+        audio_latents = audio_latents[:, start_frame:end_frame, :]
+
+        batch.sp_audio_latent_num_frames = int(local_frames)
+        batch.sp_audio_start_frame = int(start_frame)
+        batch.sp_audio_valid_token_count = int(valid_local_frames)
+        return audio_latents, True
+
+    def can_shard_audio_latents_for_sp(self, audio_latents) -> bool:
+        return (
+            get_sp_world_size() > 1
+            and isinstance(audio_latents, torch.Tensor)
+            and audio_latents.ndim == 3
+        )
+
+    def gather_audio_latents_for_sp(self, audio_latents, batch):
+        """Gather packed audio latents after SP and trim any pad-only tail tokens."""
+        if get_sp_world_size() <= 1:
+            return audio_latents
+        if not (isinstance(audio_latents, torch.Tensor) and audio_latents.ndim == 3):
+            return audio_latents
+
+        audio_latents = self._gather_sp_tensor(
+            audio_latents,
+            dim=1,
+        )
+        return self._trim_sp_gather_padding(
+            audio_latents,
+            orig_len=getattr(batch, "sp_audio_orig_num_frames", None),
+            dim=1,
+        )
+
+    def prepare_video_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        latent_model_input,
+        *,
+        num_frames,
+        height,
+        width,
+    ):
+        if not batch.did_sp_shard_latents:
+            return None
+        return model.rope.prepare_video_coords(
+            batch_size=int(latent_model_input.shape[0]),
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            device=latent_model_input.device,
+            fps=batch.fps,
+            start_frame=int(batch.sp_video_start_frame),
+        )
+
+    def prepare_audio_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        audio_latent_model_input,
+        *,
+        num_frames,
+    ):
+        if not batch.did_sp_shard_audio_latents:
+            return None
+        return model.audio_rope.prepare_audio_coords(
+            batch_size=int(audio_latent_model_input.shape[0]),
+            num_frames=num_frames,
+            device=audio_latent_model_input.device,
+            start_frame=int(batch.sp_audio_start_frame),
+        )
 
     def maybe_pack_audio_latents(self, latents, batch_size, batch):
         # If already packed (3D shape [B, T, C*F]), skip packing
