@@ -255,7 +255,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--ep-num-redundant-experts`                          | `0`       | Type: int                                                                 |      A2, A3      |
 | `--ep-dispatch-algorithm`                             | `None`    | `static`,<br/> `dynamic`,<br/> `fake`                                     |      A2, A3      |
 | `--init-expert-location`                              | `trivial` | `trivial`,<br/> `<path.pt>`,<br/> `<path.json>`,<br/> `<json_string>`     |      A2, A3      |
-| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              |      A2, A3      |
+| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)                                            |      A2, A3      |
 | `--eplb-algorithm`                                    | `deepseek`| `auto`,<br/> `deepseek`                                                   |      A2, A3      |
 | `--eplb-rebalance-num-iterations`                     | `1000`    | Type: int                                                                 |      A2, A3      |
 | `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                                                 |      A2, A3      |
