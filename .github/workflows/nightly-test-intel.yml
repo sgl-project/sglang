@@ -178,7 +178,7 @@ jobs:
         run: |
           xpu_result="${{ needs.nightly-test-xpu.result }}"
           cpu_result="${{ needs.nightly-test-cpu.result }}"
-          
+
           failed=false
           if [ "$xpu_result" != "success" ] && [ "$xpu_result" != "skipped" ]; then
             echo "XPU job failed with result: $xpu_result"
@@ -188,7 +188,7 @@ jobs:
             echo "CPU job failed with result: $cpu_result"
             failed=true
           fi
-          
+
           if [ "$failed" = true ]; then
             exit 1
           fi
