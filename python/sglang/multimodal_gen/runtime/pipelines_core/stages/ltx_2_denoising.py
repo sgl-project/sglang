@@ -906,46 +906,50 @@ class LTX2DenoisingStage(DenoisingStage):
                 dump_step0_prefix = "stage1_step0"
             elif ctx.stage == "stage2":
                 dump_step0_prefix = "stage2_step0"
-        if dump_step0_prefix is not None:
+        dump_steps = get_ltx23_ti2v_dump_steps()
+        dump_guidance_prefix = dump_step0_prefix
+        if ctx.is_ltx23_variant and step.step_index in dump_steps:
+            dump_guidance_prefix = f"{ctx.stage}_step{step.step_index}"
+        if dump_guidance_prefix is not None:
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_video_latents_noised", latent_model_input
+                f"{dump_guidance_prefix}_video_latents_noised", latent_model_input
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_audio_latents_noised", audio_latent_model_input
+                f"{dump_guidance_prefix}_audio_latents_noised", audio_latent_model_input
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_timestep_video", timestep_video
+                f"{dump_guidance_prefix}_timestep_video", timestep_video
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_timestep_audio", timestep_audio
+                f"{dump_guidance_prefix}_timestep_audio", timestep_audio
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_prompt_timestep_video", prompt_timestep_video
+                f"{dump_guidance_prefix}_prompt_timestep_video", prompt_timestep_video
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_prompt_timestep_audio", prompt_timestep_audio
+                f"{dump_guidance_prefix}_prompt_timestep_audio", prompt_timestep_audio
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_encoder_hidden_states_video",
+                f"{dump_guidance_prefix}_encoder_hidden_states_video",
                 batch.prompt_embeds[0],
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_encoder_hidden_states_audio",
+                f"{dump_guidance_prefix}_encoder_hidden_states_audio",
                 batch.audio_prompt_embeds[0],
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_encoder_hidden_states_video_neg",
+                f"{dump_guidance_prefix}_encoder_hidden_states_video_neg",
                 batch.negative_prompt_embeds[0],
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_encoder_hidden_states_audio_neg",
+                f"{dump_guidance_prefix}_encoder_hidden_states_audio_neg",
                 batch.negative_audio_prompt_embeds[0],
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_denoise_mask_video", ctx.denoise_mask
+                f"{dump_guidance_prefix}_denoise_mask_video", ctx.denoise_mask
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_clean_latent_video", ctx.clean_latent
+                f"{dump_guidance_prefix}_clean_latent_video", ctx.clean_latent
             )
 
         # 5. Run the branch-specific LTX forward path and apply CFG/guider logic.
@@ -1142,12 +1146,12 @@ class LTX2DenoisingStage(DenoisingStage):
 
         v_pos = v_pos.float()
         a_v_pos = a_v_pos.float()
-        if dump_step0_prefix is not None:
+        if dump_guidance_prefix is not None:
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_model_video_raw", v_pos
+                f"{dump_guidance_prefix}_model_video_raw", v_pos
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_model_audio_raw", a_v_pos
+                f"{dump_guidance_prefix}_model_audio_raw", a_v_pos
             )
         if v_neg is not None:
             v_neg = v_neg.float()
@@ -1167,12 +1171,12 @@ class LTX2DenoisingStage(DenoisingStage):
         denoised_audio = self._ltx2_velocity_to_x0(
             ctx.audio_latents, a_v_pos, sigma_val
         )
-        if dump_step0_prefix is not None:
+        if dump_guidance_prefix is not None:
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_video_x0", denoised_video
+                f"{dump_guidance_prefix}_video_x0", denoised_video
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_audio_x0", denoised_audio
+                f"{dump_guidance_prefix}_audio_x0", denoised_audio
             )
         denoised_video_neg = None
         denoised_audio_neg = None
@@ -1192,18 +1196,18 @@ class LTX2DenoisingStage(DenoisingStage):
             denoised_audio_neg = self._ltx2_velocity_to_x0(
                 ctx.audio_latents, a_v_neg, sigma_val
             )
-            if dump_step0_prefix is not None:
+            if dump_guidance_prefix is not None:
                 maybe_save_ltx23_ti2v_tensor(
-                    f"{dump_step0_prefix}_model_video_raw_neg", v_neg
+                    f"{dump_guidance_prefix}_model_video_raw_neg", v_neg
                 )
                 maybe_save_ltx23_ti2v_tensor(
-                    f"{dump_step0_prefix}_model_audio_raw_neg", a_v_neg
+                    f"{dump_guidance_prefix}_model_audio_raw_neg", a_v_neg
                 )
                 maybe_save_ltx23_ti2v_tensor(
-                    f"{dump_step0_prefix}_video_x0_neg", denoised_video_neg
+                    f"{dump_guidance_prefix}_video_x0_neg", denoised_video_neg
                 )
                 maybe_save_ltx23_ti2v_tensor(
-                    f"{dump_step0_prefix}_audio_x0_neg", denoised_audio_neg
+                    f"{dump_guidance_prefix}_audio_x0_neg", denoised_audio_neg
                 )
         if stage1_guider_params is not None:
             video_skip = self._ltx2_should_skip_step(
@@ -1240,19 +1244,19 @@ class LTX2DenoisingStage(DenoisingStage):
                 denoised_audio_perturbed = self._ltx2_velocity_to_x0(
                     ctx.audio_latents, a_v_ptb.float(), sigma_val
                 )
-                if dump_step0_prefix is not None:
+                if dump_guidance_prefix is not None:
                     maybe_save_ltx23_ti2v_tensor(
-                        f"{dump_step0_prefix}_model_video_raw_perturbed", v_ptb
+                        f"{dump_guidance_prefix}_model_video_raw_perturbed", v_ptb
                     )
                     maybe_save_ltx23_ti2v_tensor(
-                        f"{dump_step0_prefix}_model_audio_raw_perturbed", a_v_ptb
+                        f"{dump_guidance_prefix}_model_audio_raw_perturbed", a_v_ptb
                     )
                     maybe_save_ltx23_ti2v_tensor(
-                        f"{dump_step0_prefix}_video_x0_perturbed",
+                        f"{dump_guidance_prefix}_video_x0_perturbed",
                         denoised_video_perturbed,
                     )
                     maybe_save_ltx23_ti2v_tensor(
-                        f"{dump_step0_prefix}_audio_x0_perturbed",
+                        f"{dump_guidance_prefix}_audio_x0_perturbed",
                         denoised_audio_perturbed,
                     )
 
@@ -1279,19 +1283,19 @@ class LTX2DenoisingStage(DenoisingStage):
                 denoised_audio_modality = self._ltx2_velocity_to_x0(
                     ctx.audio_latents, a_v_mod.float(), sigma_val
                 )
-                if dump_step0_prefix is not None:
+                if dump_guidance_prefix is not None:
                     maybe_save_ltx23_ti2v_tensor(
-                        f"{dump_step0_prefix}_model_video_raw_modality", v_mod
+                        f"{dump_guidance_prefix}_model_video_raw_modality", v_mod
                     )
                     maybe_save_ltx23_ti2v_tensor(
-                        f"{dump_step0_prefix}_model_audio_raw_modality", a_v_mod
+                        f"{dump_guidance_prefix}_model_audio_raw_modality", a_v_mod
                     )
                     maybe_save_ltx23_ti2v_tensor(
-                        f"{dump_step0_prefix}_video_x0_modality",
+                        f"{dump_guidance_prefix}_video_x0_modality",
                         denoised_video_modality,
                     )
                     maybe_save_ltx23_ti2v_tensor(
-                        f"{dump_step0_prefix}_audio_x0_modality",
+                        f"{dump_guidance_prefix}_audio_x0_modality",
                         denoised_audio_modality,
                     )
 
@@ -1353,12 +1357,12 @@ class LTX2DenoisingStage(DenoisingStage):
                 denoised_audio - denoised_audio_neg
             )
 
-        if dump_step0_prefix is not None:
+        if dump_guidance_prefix is not None:
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_video_x0_guided_pre_mask", denoised_video
+                f"{dump_guidance_prefix}_video_x0_guided_pre_mask", denoised_video
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_audio_x0_guided_pre_mask", denoised_audio
+                f"{dump_guidance_prefix}_audio_x0_guided_pre_mask", denoised_audio
             )
 
         if ctx.denoise_mask is not None and ctx.clean_latent is not None:
@@ -1366,12 +1370,12 @@ class LTX2DenoisingStage(DenoisingStage):
                 denoised_video * ctx.denoise_mask
                 + ctx.clean_latent.float() * (1.0 - ctx.denoise_mask)
             )
-        if dump_step0_prefix is not None:
+        if dump_guidance_prefix is not None:
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_video_x0_guided", denoised_video
+                f"{dump_guidance_prefix}_video_x0_guided", denoised_video
             )
             maybe_save_ltx23_ti2v_tensor(
-                f"{dump_step0_prefix}_audio_x0_guided", denoised_audio
+                f"{dump_guidance_prefix}_audio_x0_guided", denoised_audio
             )
 
         # 6. Convert x0 predictions back to velocity and update both latent streams.
@@ -1403,12 +1407,11 @@ class LTX2DenoisingStage(DenoisingStage):
                 f"{dump_step0_prefix}_audio_latents_after", ctx.audio_latents
             )
 
-        dump_steps = get_ltx23_ti2v_dump_steps()
-        if ctx.is_ltx23_variant and step.step_index in dump_steps:
-            dump_prefix = f"{ctx.stage}_step{step.step_index}"
-            maybe_save_ltx23_ti2v_tensor(
-                f"{dump_prefix}_video_latents_after", ctx.latents
-            )
+            if ctx.is_ltx23_variant and step.step_index in dump_steps:
+                dump_prefix = f"{ctx.stage}_step{step.step_index}"
+                maybe_save_ltx23_ti2v_tensor(
+                    f"{dump_prefix}_video_latents_after", ctx.latents
+                )
             maybe_save_ltx23_ti2v_tensor(
                 f"{dump_prefix}_audio_latents_after", ctx.audio_latents
             )
