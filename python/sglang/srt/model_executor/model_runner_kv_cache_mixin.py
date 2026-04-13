@@ -348,7 +348,6 @@ class ModelRunnerKVCacheMixin:
                     pool_kwargs["kv_cache_dim"] = self.calculate_mla_kv_cache_dim()
                     self.token_to_kv_pool = NPUHiSparseTokenToKVPool(**pool_kwargs)
                 else:
-                    print(f"model_runner_kv_cache_mixin NPUMLATokenToKVPool")
                     self.token_to_kv_pool = NPUMLATokenToKVPool(**pool_kwargs)
             else:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -555,6 +554,24 @@ class ModelRunnerKVCacheMixin:
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
                     )
+                elif self.enable_hisparse and is_nsa_model:
+                    from sglang.srt.mem_cache.hisparse_memory_pool import (
+                        HiSparseTokenToKVPoolAllocator,
+                    )
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    hisparse_cfg = parse_hisparse_config(self.server_args)
+                    self.token_to_kv_pool_allocator = (
+                        HiSparseTokenToKVPoolAllocator(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                            host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                        )
+                    )    
                 else:
                     from sglang.srt.hardware_backend.npu.allocator_npu import (
                         NPUPagedTokenToKVPoolAllocator,

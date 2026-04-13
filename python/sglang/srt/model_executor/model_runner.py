@@ -693,7 +693,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
             if is_nsa_model:
-                print(f"model_runner is_nsa_model")
                 hisparse_cfg = parse_hisparse_config(self.server_args)
                 self.hisparse_coordinator = HiSparseCoordinator(
                     req_to_token_pool=self.req_to_token_pool,

@@ -934,7 +934,6 @@ class MLATokenToKVPoolHost(HostKVCache):
                         element_dim=self.kv_cache_dim,
                     )
                 elif _is_npu:
-                    # NPU torch fallback: device pool has separate k/v buffers
                     self._npu_load_mla_layer(
                         device_pool, host_indices, device_indices, layer_id
                     )
@@ -1076,6 +1075,10 @@ class MLATokenToKVPoolHost(HostKVCache):
                         cache_dst_stride_bytes=self.token_stride_size,
                         cache_src_stride_bytes=self.token_stride_size,
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
+                    )
+                elif _is_npu:
+                    self._npu_backup_mla_all_layer(
+                        device_pool, host_indices, device_indices
                     )
                 else:
                     transfer_kv_all_layer_mla(

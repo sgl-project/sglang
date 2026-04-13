@@ -6566,11 +6566,11 @@ class ServerArgs:
                             f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
                         )
 
-            if self.kv_cache_dtype != "bfloat16":
-                raise ValueError(
-                    f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
-                    f"Please use --kv-cache-dtype=bfloat16."
-                )
+                if self.kv_cache_dtype != "bfloat16":
+                    raise ValueError(
+                        f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
+                        f"Please use --kv-cache-dtype=bfloat16."
+                    )
 
         assert (
             self.schedule_conservativeness >= 0

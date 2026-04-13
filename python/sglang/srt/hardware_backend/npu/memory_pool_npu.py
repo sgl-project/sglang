@@ -407,28 +407,24 @@ class NPUHiSparseTokenToKVPool(NPUMLATokenToKVPool):
             end_layer=end_layer,
         )
         # Override kv_cache_dim if provided (for FP8 NSA models)
-        # print(f"memory_pool_npu NPUHiSparseTokenToKVPool init")
         if kv_cache_dim is not None:
             self.kv_cache_dim = kv_cache_dim
         self.bytes_per_token = self.kv_cache_dim * dtype.itemsize
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         """Register the logical-to-hisparse-device index mapping."""
-        # print(f"memory_pool_npu NPUHiSparseTokenToKVPool register_mapping")
         self.full_to_hisparse_device_index_mapping = (
             full_to_hisparse_device_index_mapping
         )
 
     def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
         """Translate logical token indices to Hisparse device buffer indices."""
-        # print(f"memory_pool_npu NPUHiSparseTokenToKVPool translate_loc_to_hisparse_device")
         return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
             torch.int32
         )
 
     def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
         """Internal version without dtype conversion."""
-        # print(f"memory_pool_npu NPUHiSparseTokenToKVPool _translate_loc_to_hisparse_device")
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
     def set_kv_buffer(
@@ -438,7 +434,6 @@ class NPUHiSparseTokenToKVPool(NPUMLATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        # print(f"memory_pool_npu NPUHiSparseTokenToKVPool set_kv_buffer")
         loc = self.translate_loc_to_hisparse_device(loc)
         super().set_kv_buffer(layer, loc, cache_k, cache_v)
 
@@ -449,7 +444,6 @@ class NPUHiSparseTokenToKVPool(NPUMLATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        print(f"memory_pool_npu NPUHiSparseTokenToKVPool set_mla_kv_buffer")
         loc = self.translate_loc_to_hisparse_device(loc)
         super().set_mla_kv_buffer(layer, loc, cache_k_rope, cache_v_rope)
 
@@ -459,7 +453,6 @@ class NPUHiSparseTokenToKVPool(NPUMLATokenToKVPool):
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
     ):  
-        print(f"memory_pool_npu NPUHiSparseTokenToKVPool get_mla_kv_buffer")
         loc = self.translate_loc_to_hisparse_device(loc)
         return super().get_mla_kv_buffer(layer, loc, dst_dtype)
 
@@ -469,7 +462,6 @@ class NPUHiSparseTokenToKVPool(NPUMLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
-        # print(f"memory_pool_npu NPUHiSparseTokenToKVPool set_index_k_buffer")
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
         
