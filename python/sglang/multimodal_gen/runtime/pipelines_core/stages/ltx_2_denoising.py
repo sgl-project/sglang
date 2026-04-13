@@ -167,6 +167,7 @@ class LTX2DenoisingStage(DenoisingStage):
         image_latent: torch.Tensor,
         num_img_tokens: int,
         zero_clean_latent: bool,
+        clean_latent_background: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         latents = latents.clone()
         conditioned = image_latent[:, :num_img_tokens, :].to(
@@ -179,7 +180,11 @@ class LTX2DenoisingStage(DenoisingStage):
             dtype=torch.float32,
         )
         denoise_mask[:, :num_img_tokens, :] = 0.0
-        if zero_clean_latent:
+        if clean_latent_background is not None:
+            clean_latent = clean_latent_background.detach().clone().to(
+                device=latents.device, dtype=latents.dtype
+            )
+        elif zero_clean_latent:
             clean_latent = torch.zeros_like(latents)
         else:
             clean_latent = latents.detach().clone()
@@ -642,6 +647,14 @@ class LTX2DenoisingStage(DenoisingStage):
         if do_ti2v:
             if not (isinstance(ctx.latents, torch.Tensor) and ctx.latents.ndim == 3):
                 raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")
+            clean_latent_background = getattr(
+                batch, "ltx2_ti2v_clean_latent_background", None
+            )
+            if not (
+                isinstance(clean_latent_background, torch.Tensor)
+                and clean_latent_background.shape == ctx.latents.shape
+            ):
+                clean_latent_background = None
             # Keep conditioned tokens clean and reuse the mask during every step update.
             ctx.latents, ctx.denoise_mask, ctx.clean_latent = (
                 self._prepare_ltx2_ti2v_clean_state(
@@ -649,6 +662,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     image_latent=batch.image_latent,
                     num_img_tokens=int(getattr(batch, "ltx2_num_image_tokens", 0)),
                     zero_clean_latent=ctx.is_ltx23_variant,
+                    clean_latent_background=clean_latent_background,
                 )
             )
         return ctx

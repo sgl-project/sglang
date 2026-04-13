@@ -156,6 +156,19 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the distilled refinement schedule on top of the shared AV denoiser."""
         batch.extra["ltx2_phase"] = "stage2"
+        original_clean_latent_background = getattr(
+            batch, "ltx2_ti2v_clean_latent_background", None
+        )
+        if (
+            is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config)
+            and batch.image_path is not None
+            and isinstance(batch.latents, torch.Tensor)
+        ):
+            # Official two-stage TI2V keeps the upsampled stage-2 latent as the
+            # clean background and only overwrites the conditioned frame tokens.
+            batch.ltx2_ti2v_clean_latent_background = batch.latents.detach().clone()
+        else:
+            batch.ltx2_ti2v_clean_latent_background = None
         if self._should_reset_stage2_generators(server_args):
             self._reset_stage2_generators(batch)
         noise_scale = self.distilled_sigmas[0].to(batch.latents.device)
@@ -214,5 +227,6 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             batch.timesteps = original_batch_timesteps
             batch.num_inference_steps = original_batch_num_inference_steps
             batch.do_classifier_free_guidance = original_do_cfg
+            batch.ltx2_ti2v_clean_latent_background = original_clean_latent_background
 
         return batch
