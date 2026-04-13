@@ -267,9 +267,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
 
     @staticmethod
     def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:
-        return is_ltx23_native_variant(
-            server_args.pipeline_config.vae_config.arch_config
-        )
+        return False
 
     def initialize_pipeline(self, server_args: ServerArgs):
         super().initialize_pipeline(server_args)
