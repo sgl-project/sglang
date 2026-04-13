@@ -21,6 +21,7 @@ import yaml
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
+from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
@@ -298,17 +299,19 @@ class ServerArgs:
         if self.tp_size != 1 or self.sp_degree <= 1:
             return
 
-        enabled = False
+        enabled_encoders = []
         for text_encoder_config in self.pipeline_config.text_encoder_configs:
-            if isinstance(text_encoder_config, T5Config):
+            if isinstance(text_encoder_config, (T5Config, Gemma3Config)):
                 text_encoder_config.parallel_folding = True
-                enabled = True
-                text_encoder_config.parallel_folding_mode = "sp"
+                if not getattr(text_encoder_config, "parallel_folding_mode", None):
+                    text_encoder_config.parallel_folding_mode = "sp"
+                enabled_encoders.append(type(text_encoder_config).__name__)
 
-        if enabled:
+        if enabled_encoders:
             logger.info(
-                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
+                "Enabled text encoder parallel folding (mode=sp) for %s encoders=%s (tp_size=%s, sp_degree=%s).",
                 self.__class__.__name__,
+                enabled_encoders,
                 self.tp_size,
                 self.sp_degree,
             )

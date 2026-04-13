@@ -12,6 +12,7 @@ from transformers import AutoModel
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
+from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
@@ -233,6 +234,11 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
             encoder_config.update_model_arch(model_config)
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
+        if isinstance(encoder_config, Gemma3Config):
+            vision_cfg = getattr(encoder_config, "vision_config", None)
+            if vision_cfg is not None:
+                vision_cfg.parallel_folding = encoder_config.parallel_folding
+                vision_cfg.parallel_folding_mode = encoder_config.parallel_folding_mode
         # TODO(will): add support for other dtypes
         return self.load_model(
             component_model_path,
