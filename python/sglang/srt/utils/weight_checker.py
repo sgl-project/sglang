@@ -38,7 +38,7 @@ class WeightChecker:
 
     def _reset_tensors(self):
         for name, param in self._model_state():
-            if "cos_sin_cache" in name or "freqs_cis" in name:
+            if "cos_sin_cache" in name or "freqs_cis" in name or "_weight_fp32" in name:
                 continue
             param.copy_(_random_like(param))
 
@@ -131,6 +131,7 @@ def _postprocess_tensors(
     non_persistent_buffer_patterns = [
         "cos_sin_cache",  # RoPE cache
         "inv_freq",  # RoPE inverse frequency (if it exists as buffer)
+        "_weight_fp32",  # FP32 cache of gate weight (e.g. Glm4MoeGate)
     ]
 
     for name in raw:
