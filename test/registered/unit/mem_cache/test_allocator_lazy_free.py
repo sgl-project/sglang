@@ -11,40 +11,15 @@ Usage:
     python -m pytest test_allocator_lazy_free.py -v
 """
 
-import sys
 import unittest
 from unittest.mock import MagicMock
 
 import torch
 
-try:
-    from sglang.test.ci.ci_register import register_cpu_ci
-    from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-    register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
-except ModuleNotFoundError:
-    # Fallback: load allocator directly when sglang is not installed
-    import importlib.util, os
+from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.test.ci.ci_register import register_cpu_ci
 
-    _root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
-    sys.path.insert(0, os.path.join(_root, "python"))
-
-    # Stub heavy deps so the module can be imported without a full sglang install
-    for _mod in ["triton", "triton.language", "sglang.srt.utils"]:
-        sys.modules.setdefault(_mod, MagicMock())
-
-    # Provide only the symbols allocator.py actually uses from sglang.srt.utils
-    _utils_mock = sys.modules["sglang.srt.utils"]
-    _utils_mock.get_bool_env_var = lambda *a, **kw: False
-    _utils_mock.get_num_new_pages = MagicMock()
-    _utils_mock.next_power_of_2 = lambda n: 1 << (n - 1).bit_length()
-
-    spec = importlib.util.spec_from_file_location(
-        "allocator",
-        os.path.join(_root, "python/sglang/srt/mem_cache/allocator.py"),
-    )
-    _mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(_mod)
-    TokenToKVPoolAllocator = _mod.TokenToKVPoolAllocator
+register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
 def _make_allocator(size=64, need_sort=False, device="cpu"):
