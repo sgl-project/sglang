@@ -11,15 +11,16 @@ Usage:
     python -m pytest test_allocator_lazy_free.py -v
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+
 import unittest
 from unittest.mock import MagicMock
 
 import torch
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
 def _make_allocator(size=64, need_sort=False, device="cpu"):
