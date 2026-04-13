@@ -5,7 +5,7 @@
 # Required environment (caller must export or set):
 #   UNINSTALL_JIT_CACHE          — literal true/false (skip download when false)
 #   FLASHINFER_PYTHON_REQUIRED   — e.g. from python/pyproject.toml (flashinfer_python)
-#   CU_VERSION                   — e.g. cu130
+#   CU_VERSION                   — e.g. cu129
 #   PIP_CMD                      — e.g. "pip" or "uv pip"
 #   PIP_INSTALL_SUFFIX           — extra pip args for this runner
 set -euxo pipefail
