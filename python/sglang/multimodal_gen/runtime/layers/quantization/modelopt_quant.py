@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -21,12 +22,20 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 )
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_linear,
+    cutlass_fp8_supported,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     pad_nvfp4_activation_for_cutlass,
     pad_nvfp4_weight,
     slice_nvfp4_output,
 )
-from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.quantization.utils import (
+    convert_to_channelwise,
+    is_layer_skipped,
+    requantize_with_max_scale,
+)
 from sglang.srt.layers.utils.common import copy_or_rebind_param
 from sglang.srt.utils.common import round_up
 
@@ -82,14 +91,83 @@ class ModelOptQuantConfig(QuantizationConfig):
     def override_quantization_method(cls, hf_quant_config, user_quant) -> Optional[str]:
         if hf_quant_config is None:
             return None
-        quant_algo = hf_quant_config.get("quant_algo", "").upper()
-        if user_quant == "modelopt":
-            if not ("NVFP4" in quant_algo or "FP4" in quant_algo):
-                logger.warning(
-                    f"Unsupported quant_algo '{quant_algo}' for 'modelopt'; defaulting to modelopt_fp4."
-                )
+
+        quant_algo = (
+            hf_quant_config.get("quant_algo")
+            or hf_quant_config.get("quantization", {}).get("quant_algo")
+            or ""
+        ).upper()
+        if user_quant in {"modelopt", "modelopt_fp8"} and "FP8" in quant_algo:
+            return "modelopt_fp8"
+        if user_quant in {"modelopt", "modelopt_fp4"} and (
+            "NVFP4" in quant_algo or "FP4" in quant_algo
+        ):
             return "modelopt_fp4"
         return None
+
+    def is_layer_excluded(self, prefix: str) -> bool:
+        for pattern in self.exclude_modules:
+            regex_str = re.escape(pattern).replace(r"\*", r".*")
+            if re.fullmatch(regex_str, prefix):
+                return True
+        return False
+
+
+class ModelOptFp8Config(ModelOptQuantConfig):
+    """Config class for ModelOpt FP8 diffusion checkpoints."""
+
+    def __init__(
+        self,
+        is_checkpoint_fp8_serialized: bool = False,
+        exclude_modules: Optional[List[str]] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+    ) -> None:
+        super().__init__(exclude_modules, packed_modules_mapping)
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        if is_checkpoint_fp8_serialized:
+            logger.warning(
+                "Detected ModelOpt FP8 checkpoint. The format is experimental and subject to change."
+            )
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "modelopt_fp8"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.bfloat16, torch.half]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 89
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "ModelOptFp8Config":
+        quant_method = config.get("quant_algo")
+        exclude_modules = config.get("ignore")
+        if quant_method is None:
+            try:
+                quantization_section = cls.get_from_keys(config, ["quantization"])
+                quant_method = quantization_section.get("quant_algo")
+                exclude_modules = quantization_section.get("exclude_modules")
+            except ValueError as exc:
+                raise ValueError(
+                    "Cannot find 'quant_algo' in the model's quantization config."
+                ) from exc
+
+        if quant_method is None or "FP8" not in quant_method:
+            raise ValueError(
+                "ModelOptFp8Config only supports static FP8 quantization in SGLang diffusion."
+            )
+
+        return cls(
+            is_checkpoint_fp8_serialized=True,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
+        )
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        return self._get_quant_method(layer, prefix, Linear=ModelOptFp8LinearMethod)
 
 
 class ModelOptFp4Config(ModelOptQuantConfig):
@@ -101,6 +179,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         group_size: int = None,
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        checkpoint_uses_packed_qkv: bool = False,
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -110,6 +189,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "format is experimental and subject to change."
             )
         self.group_size = group_size
+        self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
 
     @classmethod
     def get_name(cls) -> str:
@@ -193,28 +273,98 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             group_size=group_size,
             exclude_modules=exclude_modules,
             packed_modules_mapping=config.get("packed_modules_mapping"),
+            checkpoint_uses_packed_qkv=config.get("checkpoint_uses_packed_qkv", False),
         )
-
-    def is_layer_excluded(self, prefix: str):
-        import regex as re
-
-        fused_patterns = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
-        prefix_split = prefix.split(".")
-        for pattern in self.exclude_modules:
-            regex_str = pattern.replace(".", r"\.").replace("*", r".*")
-            pattern_split = pattern.split(".")
-            if re.fullmatch(regex_str, prefix):
-                return True
-            elif (
-                pattern_split[-1] in fused_patterns
-                and pattern_split[-1] in prefix_split[-1]
-            ):
-                assert len(prefix_split) == 5 and len(pattern_split) == 5
-                return True
-        return False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         return self._get_quant_method(layer, prefix, Linear=ModelOptFp4LinearMethod)
+
+
+class ModelOptFp8LinearMethod(LinearMethodBase):
+    """Linear method for ModelOpt static FP8 checkpoints."""
+
+    def __init__(self, quant_config: ModelOptFp8Config):
+        self.quant_config = quant_config
+        self.cutlass_fp8_supported = cutlass_fp8_supported()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        del input_size, output_size
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else params_dtype
+        )
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=weight_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            for scale_name in ["weight_scale", "input_scale"]:
+                layer.register_parameter(
+                    scale_name,
+                    PerTensorScaleParameter(
+                        data=torch.full(
+                            (len(output_partition_sizes),),
+                            torch.finfo(torch.float32).min,
+                            dtype=torch.float32,
+                        ),
+                        weight_loader=weight_loader,
+                    ),
+                )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        max_w_scale, quantized_weight = requantize_with_max_scale(
+            layer.weight, layer.weight_scale, layer.logical_widths
+        )
+        # Preserve the parameter subclass metadata while rebinding to the
+        # transposed FP8 view expected by the runtime.
+        layer.weight.data = quantized_weight.t().detach()
+        layer.weight.requires_grad_(False)
+        if self.cutlass_fp8_supported:
+            max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
+        copy_or_rebind_param(layer, "weight_scale", max_w_scale)
+        copy_or_rebind_param(layer, "input_scale", layer.input_scale.max())
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return apply_fp8_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            input_scale=layer.input_scale,
+            bias=bias,
+            cutlass_fp8_supported=self.cutlass_fp8_supported,
+        )
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):

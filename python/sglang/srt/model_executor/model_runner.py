@@ -24,6 +24,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
@@ -136,12 +137,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    MemoryPoolConfig,
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -839,6 +840,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
+        # Build SourceIdentity for this instance
+        identity = p2p_pb2.SourceIdentity(
+            model_name=model_name,
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+            tensor_parallel_size=self.server_args.tp_size,
+            pipeline_parallel_size=self.server_args.pp_size,
+            expert_parallel_size=self.server_args.ep_size,
+            dtype=self.server_args.dtype or "",
+            quantization=self.server_args.quantization or "",
+        )
+
         # Build tensor descriptors from weight_info dict
         tensors = []
         for name, (addr, numel, element_size) in weight_info.items():
@@ -857,27 +869,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             tensors=tensors,
         )
 
+        # Generate a unique worker_id for this running instance
+        worker_id = str(uuid.uuid4())
+
         mx_client = MxClient(server_url=mx_url)
         try:
             logger.info(
                 "ModelExpress source: publishing metadata for model=%s, "
-                "tp_rank=%d, session=%s, %d tensors",
+                "tp_rank=%d, session=%s, %d tensors, worker_id=%s",
                 model_name,
                 self.tp_rank,
                 session_id,
                 len(tensors),
+                worker_id,
             )
-            mx_client.publish_metadata(model_name, [worker])
-            mx_client.publish_ready(
-                model_name,
-                worker_id=self.tp_rank,
-                session_id=mx_client.session_id,
-                metadata_hash="",
+            mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
+            mx_client.update_status(
+                mx_source_id=mx_source_id,
+                worker_id=worker_id,
+                worker_rank=self.tp_rank,
+                status=p2p_pb2.SOURCE_STATUS_READY,
             )
             logger.info(
-                "ModelExpress source: published ready for model=%s, tp_rank=%d",
+                "ModelExpress source: published ready for model=%s, "
+                "tp_rank=%d, mx_source_id=%s",
                 model_name,
                 self.tp_rank,
+                mx_source_id,
             )
         finally:
             mx_client.close()
@@ -1027,6 +1045,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
+                enable_symm_mem=self.server_args.enable_symm_mem,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -1172,6 +1191,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             modelexpress_url=self.server_args.modelexpress_url,
             modelexpress_model_name=self.server_args.modelexpress_model_name
             or self.server_args.model_path,
+            modelexpress_tp_size=self.server_args.tp_size,
+            modelexpress_pp_size=self.server_args.pp_size,
+            modelexpress_ep_size=self.server_args.ep_size,
+            modelexpress_dtype=self.server_args.dtype,
+            modelexpress_quantization=self.server_args.quantization or "",
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
@@ -1937,7 +1961,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return min(self.swa_max_total_num_tokens, self.max_total_num_tokens)
+            return self.full_max_total_num_tokens
         else:
             return self.max_total_num_tokens
 
@@ -2148,6 +2172,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
             # "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
+            "flashinfer_cutedsl",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
         ]:
@@ -2738,6 +2763,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+        if (
+            forward_batch.replace_embeds is not None
+            and forward_batch.replace_positions is not None
+        ):
+            # Token embedding overrides: get base embeddings, scatter replacements
+            if "input_embeds" not in kwargs:
+                embed_layer = self.model.get_input_embeddings()
+                kwargs["input_embeds"] = embed_layer(forward_batch.input_ids)
+            kwargs["input_embeds"][forward_batch.replace_positions] = (
+                forward_batch.replace_embeds.to(kwargs["input_embeds"].dtype)
+            )
         if not self.is_generation:
             kwargs["get_embedding"] = True
 

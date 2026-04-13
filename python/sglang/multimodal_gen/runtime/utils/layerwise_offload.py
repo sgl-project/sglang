@@ -56,6 +56,9 @@ class LayerwiseOffloadManager:
         # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
         # stores the consolidated weight from a same layer, of same dtype
         self._consolidated_cpu_weights: Dict[int, Dict[torch.dtype, torch.Tensor]] = {}
+        # layer_idx -> {name: pinned_cpu_tensor_with_original_stride}
+        # stores tensors whose original non-contiguous stride/layout must be preserved
+        self._strided_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
         # layer_idx -> {name: {dtype, offset, numel, shape}}
         # stores the offset and numel of each weight from a same layer, of same dtype
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
@@ -88,6 +91,21 @@ class LayerwiseOffloadManager:
             self._offload_placeholders[dtype] = placeholder
         return placeholder
 
+    @staticmethod
+    def _get_alignment_numel(dtype: torch.dtype, alignment_bytes: int = 32) -> int:
+        element_size = torch.empty((), dtype=dtype).element_size()
+        return max(1, alignment_bytes // element_size)
+
+    @classmethod
+    def _align_numel_offset(
+        cls, offset: int, dtype: torch.dtype, alignment_bytes: int = 32
+    ) -> int:
+        alignment_numel = cls._get_alignment_numel(dtype, alignment_bytes)
+        remainder = offset % alignment_numel
+        if remainder == 0:
+            return offset
+        return offset + alignment_numel - remainder
+
     @torch.compiler.disable
     def _initialize(self) -> None:
         if not self.enabled:
@@ -110,10 +128,49 @@ class LayerwiseOffloadManager:
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
+            self._strided_cpu_weights[layer_idx] = {}
             self._weight_metadata[layer_idx] = {}
 
             for dtype, weights in dtype_to_params.items():
-                total_numel = sum(t.numel() for _, t in weights)
+                contiguous_weights: List[Tuple[str, torch.Tensor]] = []
+                for name, weight in weights:
+                    if weight.is_contiguous():
+                        contiguous_weights.append((name, weight))
+                        continue
+
+                    # Preserve non-contiguous layouts such as the transposed FP8
+                    # weight views expected by CUTLASS kernels.
+                    cpu_tensor = torch.empty_strided(
+                        size=weight.shape,
+                        stride=weight.stride(),
+                        dtype=dtype,
+                        pin_memory=self.pin_cpu_memory,
+                    )
+                    cpu_tensor.copy_(weight)
+                    self._strided_cpu_weights[layer_idx][name] = cpu_tensor
+                    self._weight_metadata[layer_idx][name] = {
+                        "dtype": dtype,
+                        "shape": weight.shape,
+                        "stride": weight.stride(),
+                        "preserve_strides": True,
+                    }
+                    weight.data = self._get_shared_empty_tensor(dtype)
+
+                if not contiguous_weights:
+                    continue
+
+                current_offset = 0
+                aligned_offsets: Dict[str, int] = {}
+                for name, weight in contiguous_weights:
+                    # Some fused diffusion kernels require tensor base pointers to
+                    # satisfy a 32-byte alignment contract. Reusing one flat buffer
+                    # is still fine, but each logical tensor slice must start on an
+                    # aligned offset inside that buffer.
+                    current_offset = self._align_numel_offset(current_offset, dtype)
+                    aligned_offsets[name] = current_offset
+                    current_offset += weight.numel()
+
+                total_numel = current_offset
 
                 # create concatenated CPU buffer (in pinned memory)
                 cpu_buffer = torch.empty(
@@ -121,8 +178,8 @@ class LayerwiseOffloadManager:
                 )
 
                 # offload weights to the buffer
-                current_offset = 0
-                for name, weight in weights:
+                for name, weight in contiguous_weights:
+                    current_offset = aligned_offsets[name]
                     numel = weight.numel()
                     cpu_buffer[current_offset : current_offset + numel].copy_(
                         weight.flatten()
@@ -132,6 +189,8 @@ class LayerwiseOffloadManager:
                         "offset": current_offset,
                         "numel": numel,
                         "shape": weight.shape,
+                        "stride": weight.stride(),
+                        "preserve_strides": False,
                     }
 
                     weight.data = self._get_shared_empty_tensor(dtype)
@@ -190,21 +249,38 @@ class LayerwiseOffloadManager:
                 gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
                 gpu_buffers[dtype] = gpu_buffer
 
-        # record the prefetch event of this layer
+            # restore model's weights by their metadata using the same copy stream
+            # so the recorded event covers both flat-buffer and stride-preserving copies.
+            for name, meta in self._weight_metadata[layer_idx].items():
+                target = self.get_target_with_name(name)
+                if meta.get("preserve_strides", False):
+                    # Recreate the original view layout instead of flatten+view.
+                    # ModelOpt FP8 relies on a transposed runtime weight layout,
+                    # so preserving stride is part of correctness, not just an
+                    # optimization detail.
+                    cpu_tensor = self._strided_cpu_weights[layer_idx][name]
+                    gpu_tensor = torch.empty_strided(
+                        size=meta["shape"],
+                        stride=meta["stride"],
+                        dtype=meta["dtype"],
+                        device=self.device,
+                    )
+                    gpu_tensor.copy_(cpu_tensor, non_blocking=non_blocking)
+                    target.data = gpu_tensor
+                    continue
+
+                dtype = meta["dtype"]
+                gpu_buffer = gpu_buffers[dtype]
+
+                # map the parameter's data to the correct slice of the GPU buffer
+                target.data = gpu_buffer[
+                    meta["offset"] : meta["offset"] + meta["numel"]
+                ].view(meta["shape"])
+
+        # record the prefetch event of this layer after all copies are enqueued
         event = torch.get_device_module().Event()
         event.record(self.copy_stream)
         self._prefetch_events[layer_idx] = event
-
-        # restore model's weights by their metadata using gpu buffer
-        for name, meta in self._weight_metadata[layer_idx].items():
-            dtype = meta["dtype"]
-            gpu_buffer = gpu_buffers[dtype]
-
-            # map the parameter's data to the correct slice of the GPU buffer
-            target = self.get_target_with_name(name)
-            target.data = gpu_buffer[
-                meta["offset"] : meta["offset"] + meta["numel"]
-            ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
 
@@ -266,6 +342,10 @@ class LayerwiseOffloadManager:
         # Collect current GPU weights and write back to CPU buffer
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
+            if meta.get("preserve_strides", False):
+                self._strided_cpu_weights[layer_idx][name].copy_(target.data.cpu())
+                continue
+
             gpu_weight = target.data.flatten().cpu()
 
             dtype = meta["dtype"]
@@ -331,12 +411,17 @@ class LayerwiseOffloadManager:
                 )
 
             dtype = meta["dtype"]
-            offset = meta["offset"]
-            numel = meta["numel"]
-            cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
-            cpu_buffer[offset : offset + numel].copy_(
-                loaded_weight.to(dtype=dtype).flatten()
-            )
+            if meta.get("preserve_strides", False):
+                self._strided_cpu_weights[layer_idx][name].copy_(
+                    loaded_weight.to(dtype=dtype)
+                )
+            else:
+                offset = meta["offset"]
+                numel = meta["numel"]
+                cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+                cpu_buffer[offset : offset + numel].copy_(
+                    loaded_weight.to(dtype=dtype).flatten()
+                )
 
             # If this layer is currently on GPU, update the live parameter.
             if layer_idx in self._gpu_layers:
@@ -358,6 +443,14 @@ class LayerwiseOffloadManager:
         """
         for layer_idx in sorted(self._weight_metadata):
             for name, meta in self._weight_metadata[layer_idx].items():
+                if meta.get("preserve_strides", False):
+                    # Some quantized weights rely on a non-contiguous layout.
+                    # Yield the strided tensor directly instead of rebuilding it
+                    # from the flat buffer, which would silently lose the
+                    # original stride information.
+                    yield name, self._strided_cpu_weights[layer_idx][name]
+                    continue
+
                 dtype = meta["dtype"]
                 offset = meta["offset"]
                 numel = meta["numel"]

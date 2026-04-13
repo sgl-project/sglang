@@ -394,17 +394,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.local_rank = storage_config.tp_rank
                 self.pp_rank = storage_config.pp_rank
                 self.pp_size = storage_config.pp_size
+                self.attn_cp_rank = storage_config.attn_cp_rank
+                self.attn_cp_size = storage_config.attn_cp_size
                 self.enable_storage_metrics = storage_config.enable_storage_metrics
             else:
                 self.is_mla_backend = False
                 self.local_rank = 0
                 self.pp_rank = 0
                 self.pp_size = 1
+                self.attn_cp_rank = 0
+                self.attn_cp_size = 1
 
             self.enable_pp = self.pp_size > 1
-            if self.enable_pp:
-                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
-                self.mla_suffix = f"{self.pp_rank}"
+            self.enable_cp = self.attn_cp_size > 1
+            if self.enable_pp or self.enable_cp:
+                self.mha_suffix = (
+                    f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
+                )
+                self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
@@ -417,9 +424,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
-                if self.enable_pp:
+                if self.enable_pp or self.enable_cp:
                     self.mha_suffix = [
-                        f"{rank}_{self.pp_rank}" for rank in target_ranks
+                        f"{rank}_{self.pp_rank}_{self.attn_cp_rank}"
+                        for rank in target_ranks
                     ]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
