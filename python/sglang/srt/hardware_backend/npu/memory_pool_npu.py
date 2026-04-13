@@ -144,6 +144,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
+        assert loc.numel() == cache_k.shape[0], f"{loc.numel()=} vs {cache_k.shape[0]=}"
         if self.use_fia:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
@@ -369,3 +370,160 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
         )
+
+
+class NPUSingleBufferTokenToKVPool(MHATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        slot_dim: int,
+        head_num: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        assert head_num == 1
+        super(MHATokenToKVPool, self).__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+        self.slot_dim = slot_dim
+
+        self.custom_mem_pool = None
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # The padded slot 0 is used for writing dummy outputs.
+            self.kv_buffer = torch.zeros(
+                (
+                    layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    head_num,
+                    self.slot_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            if dtype == torch.int8:
+                self.dequant_scale_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        head_num,
+                        1,
+                    ),
+                    dtype=torch.float16,
+                    device=self.device,
+                )
+            else:
+                self.dequant_scale_buffer = None
+
+        self._finalize_allocation_log(size)
+
+    def get_kv_size_bytes(self):
+        kv_size_bytes = 0
+        for cache in self.kv_buffer:
+            kv_size_bytes += get_tensor_size_bytes(cache)
+        if self._is_scale_buffer_available():
+            for cache in self.dequant_scale_buffer:
+                kv_size_bytes += get_tensor_size_bytes(cache)
+        return kv_size_bytes
+
+    def get_kv_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.kv_buffer[layer_id - self.start_layer]
+
+    def get_scale_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.dequant_scale_buffer[layer_id - self.start_layer]
+
+    def set_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache: torch.Tensor,
+        scale: torch.Tensor = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        if cache.dtype != self.dtype:
+            # raise ValueError(f"{cache.dtype=}, {self.dtype=}")
+            cache = cache.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache = cache.view(self.store_dtype)
+        if scale is not None:
+            assert (
+                self.dequant_scale_buffer is not None
+                and scale.dtype == self.dequant_scale_buffer.dtype
+            )
+            torch_npu.npu_scatter_nd_update_(
+                self.dequant_scale_buffer[layer_id - self.start_layer].view(
+                    -1, 1, self.dequant_scale_buffer.shape[-1]
+                ),
+                loc.view(-1, 1),
+                scale.view(-1, 1, self.dequant_scale_buffer.shape[-1]),
+            )
+        assert loc.numel() == cache.shape[0], f"{loc.numel()=} vs {cache.shape[0]=}"
+
+        # kv_buffer[layer](size+page_size, 1, slot_dim); loc(num_tokens, 1); cache(num_tokens, 1, slot_dim)
+        torch_npu.npu_scatter_nd_update_(
+            self.kv_buffer[layer_id - self.start_layer].view(-1, 1, self.slot_dim),
+            loc.view(-1, 1),
+            cache.view(-1, 1, self.slot_dim),
+        )
+
+    def move_kv_cache(
+        self,
+        tgt_loc: torch.Tensor,
+        src_loc: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+
+        tgt_page = tgt_loc_flat // self.page_size
+        tgt_offset = tgt_loc_flat % self.page_size
+        src_page = src_loc_flat // self.page_size
+        src_offset = src_loc_flat % self.page_size
+        if layer_id_override is None:
+            self.kv_buffer[:, tgt_page, tgt_offset] = self.kv_buffer[
+                :, src_page, src_offset
+            ]
+        else:
+            self.kv_buffer[layer_id_override, tgt_page, tgt_offset] = self.kv_buffer[
+                layer_id_override, src_page, src_offset
+            ]
+
+    def get_contiguous_buf_infos(self):
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_item_lens = [self.kv_buffer[i][0].nbytes for i in range(self.layer_num)]
+        if self._is_scale_buffer_available():
+            kv_data_ptrs += [self.dequant_scale_buffer[i].data_ptr() for i in range(self.layer_num)]
+            kv_data_lens += [self.dequant_scale_buffer[i].nbytes for i in range(self.layer_num)]
+            kv_item_lens += [self.dequant_scale_buffer[i][0].nbytes for i in range(self.layer_num)]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def _is_scale_buffer_available(self):
+        return self.dtype == torch.int8 and self.dequant_scale_buffer is not None

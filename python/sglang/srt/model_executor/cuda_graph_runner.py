@@ -60,6 +60,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
+    KvLen,
+    OutCacheLoc,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
 )
@@ -125,7 +127,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
+    kv_seq_lens: KvLen
+    kv_seq_lens_cpu: KvLen
     out_cache_loc: torch.Tensor
+    out_cache_loc_dsv4: OutCacheLoc
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -160,12 +165,20 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
     ) -> "DecodeInputBuffers":
+        # dsv4
+        kv_seq_lens_cpu = KvLen.from_data(max_bs, seq_len_fill_value, dtype=torch.int32)
+    
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            # dsv4
+            kv_seq_lens = kv_seq_lens_cpu.to(device)
+            out_cache_loc_dsv4 = OutCacheLoc.from_data(
+                max_num_token, dtype=cache_loc_dtype
+            )
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -236,7 +249,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
+            kv_seq_lens=kv_seq_lens,
+            kv_seq_lens_cpu=kv_seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
@@ -862,7 +878,13 @@ class CudaGraphRunner:
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+
+        kv_seq_lens = buffers.kv_seq_lens.update(bs)
+        kv_seq_lens_cpu = buffers.kv_seq_lens_cpu.update(bs)
+
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        out_cache_loc_dsv4 = buffers.out_cache_loc_dsv4.update(num_tokens)
+
         positions = buffers.positions[:num_tokens]
         if self.is_encoder_decoder:
             encoder_lens = buffers.encoder_lens[:bs]
@@ -950,13 +972,16 @@ class CudaGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            kv_seq_lens=kv_seq_lens,
             seq_lens_cpu=seq_lens_cpu,
+            kv_seq_lens_cpu=kv_seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=seq_lens,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
             seq_lens_sum=seq_lens.sum().item(),
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
@@ -1155,6 +1180,8 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
+            positions=forward_batch.positions,
         )
 
         # Store fields

@@ -747,6 +747,7 @@ class Scheduler(
         _registry_needs_mamba = (
             _spec.uses_mamba_radix_cache if _spec is not None else False
         )
+        self.is_hybrid_swa_c4_c128 = self.tp_worker.is_hybrid_swa_c4_c128
         self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
@@ -759,6 +760,15 @@ class Scheduler(
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
             )
+        if self.is_hybrid_swa_c4_c128:
+            self.sliding_window_size = self.tp_worker.sliding_window_size
+            (
+                self.swa_tokens_per_layer,
+                self.c4_token_per_layer,
+                self.c128_token_per_layer,
+                self.c4_state_token_per_layer,
+                self.c128_state_token_per_layer,
+            ) = self.tp_worker.get_tokens_per_layer_info()
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
@@ -799,14 +809,19 @@ class Scheduler(
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:
-            if not self.is_hybrid_swa:
-                from sglang.srt.mem_cache.chunk_cache import ChunkCache
-
-                self.tree_cache = ChunkCache(params)
-            else:
+            if self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
                 self.tree_cache = SWAChunkCache(params)
+            elif self.is_hybrid_swa_c4_c128:
+                from sglang.srt.mem_cache.chunk_cache import SWAC4C128ChunkCache
+
+                params.sliding_window_size = self.model_config.sliding_window_size
+                self.tree_cache = SWAC4C128ChunkCache(params)
+            else:
+                from sglang.srt.mem_cache.chunk_cache import ChunkCache
+
+                self.tree_cache = ChunkCache(params)
         else:
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():

@@ -40,6 +40,89 @@ class AscendKVManager(MooncakeKVManager):
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
             )
 
+    def send_kvcache_multi_kv(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: dict[str, npt.NDArray[np.int32]],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: dict[str, npt.NDArray[np.int32]],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ):
+        # Group all types of kv indices
+        prefill_kv_blocks = {}
+        dst_kv_blocks = {}
+        for kv_type in ["swa", "c4", "c4_state", "c128", "c128_state"]:
+            prefill_kv_idx_one_type = prefill_kv_indices[kv_type]
+            dst_kv_idx_one_type = dst_kv_indices[kv_type]
+            p_kv_blocks, d_kv_blocks = group_concurrent_contiguous(
+                prefill_kv_idx_one_type, dst_kv_idx_one_type
+            )
+            prefill_kv_blocks[kv_type] = p_kv_blocks
+            dst_kv_blocks[kv_type] = d_kv_blocks
+
+        num_layers = len(self.kv_args.kv_data_ptrs)
+        layers_params = [
+            (
+                layer_id,
+                self.kv_args.kv_data_ptrs[layer_id],
+                dst_kv_ptrs[layer_id],
+                self.kv_args.kv_item_lens[layer_id],
+            )
+            for layer_id in range(num_layers)
+        ]
+
+        def set_transfer_blocks(
+            layer_id: int, src_ptr: int, dst_ptr: int, item_len: int
+        ) -> List[Tuple[int, int, int]]:
+            transfer_blocks = []
+            # get kv type(c4, swa, c128, ...) of this layer
+            kv_type = self.kv_args.kv_type_map[layer_id]
+            for prefill_index, decode_index in zip(
+                prefill_kv_blocks[kv_type], dst_kv_blocks[kv_type]
+            ):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
+                transfer_blocks.append((src_addr, dst_addr, length))
+            return transfer_blocks
+
+        # Worker function for processing a single layer
+        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+        # Worker function for processing all layers in a batch
+        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
+            transfer_blocks = []
+            for layer_id, src_ptr, dst_ptr, item_len in layers_params:
+                transfer_blocks.extend(
+                    set_transfer_blocks(layer_id, src_ptr, dst_ptr, item_len)
+                )
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(
+                    process_layer,
+                    src_ptr,
+                    dst_ptr,
+                    item_len,
+                )
+                for (src_ptr, dst_ptr, item_len) in layers_params
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                status = future.result()
+                if status != 0:
+                    for f in futures:
+                        f.cancel()
+                    return status
+        else:
+            # Combining all layers' params in one batch transfer is more efficient
+            # compared to using multiple threads
+            return process_layers(layers_params)
+
+        return 0
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
@@ -48,6 +131,15 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
+        if isinstance(prefill_kv_indices, dict):
+            return self.send_kvcache_multi_kv(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                executor,
+            )
+
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices

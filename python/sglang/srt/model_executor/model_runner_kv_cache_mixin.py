@@ -337,6 +337,39 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+            elif self.is_hybrid_swa_c4_c128:
+                from sglang.srt.hardware_backend.npu.hybrid_swa_c4_c128_memory_pool import (
+                    SWAC4C128KVPool,
+                )
+
+                if not self.is_draft_worker and self.model.quant_config is not None:
+                    li_kv_dtype = self.model.quant_config.li_kv_dtype
+                else:
+                    li_kv_dtype = "bf16"
+                kwargs = {
+                    "index_head_dim": self.model_config.hf_text_config.index_head_dim,
+                    "li_kv_dtype": li_kv_dtype,
+                }
+                self.token_to_kv_pool = SWAC4C128KVPool(
+                    size=self.full_max_total_num_tokens,
+                    size_swa=self.swa_max_total_num_tokens,
+                    size_c4=self.c4_max_total_num_tokens,
+                    size_c128=self.c128_max_total_num_tokens,
+                    size_c4_state=self.c4_state_max_total_num_tokens,
+                    size_c128_state=self.c128_state_max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+                    c4_attention_layer_ids=self.model_config.c4_attention_layer_ids,
+                    c128_attention_layer_ids=self.model_config.c128_attention_layer_ids,
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                    **kwargs,
+                )
             else:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
@@ -542,6 +575,24 @@ class ModelRunnerKVCacheMixin:
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
                     )
+                elif self.is_hybrid_swa_c4_c128:
+                    from sglang.srt.hardware_backend.npu.hybrid_swa_c4_c128_memory_pool import (
+                        SWAC4C128TokenToKVPoolAllocator,
+                    )
+
+                    self.token_to_kv_pool_allocator = SWAC4C128TokenToKVPoolAllocator(
+                        size=self.full_max_total_num_tokens,
+                        size_swa=self.swa_max_total_num_tokens,
+                        size_c4=self.c4_max_total_num_tokens,
+                        size_c128=self.c128_max_total_num_tokens,
+                        size_c4_state=self.c4_state_max_total_num_tokens,
+                        size_c128_state=self.c128_state_max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
                 else:
                     from sglang.srt.hardware_backend.npu.allocator_npu import (
                         NPUPagedTokenToKVPoolAllocator,
@@ -667,9 +718,26 @@ class ModelRunnerKVCacheMixin:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         self.max_total_num_tokens = config.max_total_num_tokens
         self.max_running_requests = config.max_running_requests
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa or self.is_hybrid_swa_c4_c128:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
+        if self.is_hybrid_swa_c4_c128:
+            if not self.spec_algorithm.is_none() and self.is_draft_worker:
+                # self.full_max_total_num_tokens = token_capacity
+                # self.swa_max_total_num_tokens = 2 * max_num_reqs * page_size
+                self.c4_max_total_num_tokens = 0
+                self.c128_max_total_num_tokens = 0
+                self.c4_state_max_total_num_tokens = 0
+                self.c128_state_max_total_num_tokens = 0
+            else:
+                self.c4_max_total_num_tokens = config.c4_max_total_num_tokens
+                self.c128_max_total_num_tokens = config.c128_max_total_num_tokens
+                self.c4_state_max_total_num_tokens = (
+                    config.c4_state_max_total_num_tokens
+                )
+                self.c128_state_max_total_num_tokens = (
+                    config.c128_state_max_total_num_tokens
+                )
 
         self._init_pools()
 

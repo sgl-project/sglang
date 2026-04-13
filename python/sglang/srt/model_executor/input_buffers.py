@@ -7,6 +7,10 @@ from typing import Dict
 import torch
 
 from sglang.srt.utils import is_npu
+from sglang.srt.model_executor.forward_batch_info import (
+    KvLen,
+    OutCacheLoc,
+)
 
 _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
 
@@ -57,6 +61,17 @@ class ForwardInputBuffers:
                         f"{name}.{sub_name}", sub_buffer
                     )
                     buffer[sub_name] = new_buffer
+            elif isinstance(buffer, (OutCacheLoc, KvLen)):
+                for ff in fields(buffer):
+                    sub_name = ff.name
+                    sub_buffer = getattr(buffer, sub_name)
+                    assert isinstance(
+                        sub_buffer, torch.Tensor
+                    ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
+                    new_buffer = self._share_one_buffer(
+                        f"{name}.{sub_name}", sub_buffer
+                    )
+                    setattr(buffer, sub_name, new_buffer)
             else:
                 assert isinstance(
                     buffer, torch.Tensor

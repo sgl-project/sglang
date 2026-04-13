@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -22,6 +23,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    KvLen,
+    OutCacheLoc,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -79,6 +82,7 @@ class EAGLEDraftCudaGraphRunner:
         )
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.enable_spec_overlap_reflow = envs.SGLANG_SPEC_ENABLE_OVERLAP_REFLOW.get()
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -98,6 +102,11 @@ class EAGLEDraftCudaGraphRunner:
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
         self.extend_seq_lens_cpu = [self.seq_len_fill_value] * self.max_bs
+
+        # dsv4
+        self.kv_seq_lens_cpu = KvLen.from_data(
+            self.max_bs, self.seq_len_fill_value, dtype=torch.int32
+        )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -121,6 +130,12 @@ class EAGLEDraftCudaGraphRunner:
             hidden_states = torch.zeros(
                 (self.max_bs, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
+            )
+
+            # dsv4
+            self.kv_seq_lens = self.kv_seq_lens_cpu.to(model_runner.device)
+            self.out_cache_loc_dsv4 = OutCacheLoc.from_data(
+                self.max_num_token, dtype=self._cache_loc_dtype()
             )
 
             if self.require_gathered_buffer:
@@ -149,6 +164,9 @@ class EAGLEDraftCudaGraphRunner:
             mrope_positions=mrope_positions,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
+            # kv_seq_lens=self.kv_seq_lens,
+            # kv_seq_lens_cpu=self.kv_seq_lens_cpu,
+            # out_cache_loc_dsv4=self.out_cache_loc_dsv4,
             extend_seq_lens=extend_seq_lens,
             topk_p=topk_p,
             topk_index=topk_index,
@@ -233,6 +251,11 @@ class EAGLEDraftCudaGraphRunner:
         topk_p = buffers.topk_p[:num_seqs]
         topk_index = buffers.topk_index[:num_seqs]
 
+        # dsv4
+        kv_seq_lens_cpu = self.kv_seq_lens_cpu.update(num_seqs)
+        kv_seq_lens = self.kv_seq_lens.update(num_seqs)
+        out_cache_loc_dsv4 = self.out_cache_loc_dsv4.update(num_tokens)
+
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -304,6 +327,9 @@ class EAGLEDraftCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
+            kv_seq_lens=kv_seq_lens,
+            kv_seq_lens_cpu=kv_seq_lens_cpu,
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
@@ -329,7 +355,10 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.eagle_worker.draft_forward(forward_batch)
+            if self.enable_spec_overlap_reflow:
+                ret = self.eagle_worker.draft_forward_v2(forward_batch)
+            else:
+                ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -348,85 +377,90 @@ class EAGLEDraftCudaGraphRunner:
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         # Keep the variables name for readability
+        if self.enable_spec_overlap_reflow:
+            ret_topk_p_list, ret_topk_index_list = (t[:raw_bs] for t in out)
+            return ret_topk_p_list, ret_topk_index_list
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
         return parent_list, top_scores_index, draft_tokens
 
-    def replay(self, forward_batch: ForwardBatch):
+    def replay(self, forward_batch: ForwardBatch, skip_attn_backend_init=False):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
+        if not skip_attn_backend_init:
+            # self.replay_prepare(forward_batch)
+            raw_bs = forward_batch.batch_size
+            raw_num_token = raw_bs * self.num_tokens_per_bs
 
-        raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+            # Pad
+            if self.require_mlp_tp_gather:
+                max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+                max_batch_size = (
+                    max_num_tokens // self.num_tokens_per_bs
+                    if self.model_runner.spec_algorithm.is_eagle()
+                    or self.model_runner.spec_algorithm.is_standalone()
+                    else max_num_tokens
+                )
+                index = bisect.bisect_left(self.capture_bs, max_batch_size)
+            else:
+                index = bisect.bisect_left(self.capture_bs, raw_bs)
 
-        # Pad
-        if self.require_mlp_tp_gather:
-            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            max_batch_size = (
-                max_num_tokens // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                else max_num_tokens
-            )
-            index = bisect.bisect_left(self.capture_bs, max_batch_size)
-        else:
-            index = bisect.bisect_left(self.capture_bs, raw_bs)
-
-        bs = self.capture_bs[index]
-        if bs != raw_bs:
-            buffers.seq_lens.fill_(self.seq_len_fill_value)
-            buffers.out_cache_loc.zero_()
-            buffers.positions.zero_()
-
-        num_tokens = bs * self.num_tokens_per_bs
-
-        # Common inputs
-        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
-            forward_batch.out_cache_loc
-        )
-        buffers.positions[:raw_num_token].copy_(forward_batch.positions)
-        buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
-        buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
-        buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-
-        # TODO(ch-wan): support num_token_non_padded
-        if self.require_gathered_buffer:
-            buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
-
-        # Attention backend
-        if bs != raw_bs:
-            forward_batch.batch_size = bs
-            forward_batch.seq_lens = buffers.seq_lens[:bs]
-            forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
-            forward_batch.positions = buffers.positions[:num_tokens]
-
-        if forward_batch.seq_lens_cpu is not None:
+            bs = self.capture_bs[index]
             if bs != raw_bs:
-                buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
-            buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-            forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+                buffers.seq_lens.fill_(self.seq_len_fill_value)
+                buffers.out_cache_loc.zero_()
+                buffers.positions.zero_()
 
-        self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-            forward_batch, bs
-        )
-        self.raw_bs = raw_bs
-        self.bs = bs
-        # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
+            num_tokens = bs * self.num_tokens_per_bs
+
+            # Common inputs
+            buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+            buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
+                forward_batch.out_cache_loc
+            )
+            buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+            buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
+            buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
+            buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+            buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+
+            # TODO(ch-wan): support num_token_non_padded
+            if self.require_gathered_buffer:
+                buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
+                buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
+
+            # Attention backend
+            if bs != raw_bs:
+                forward_batch.batch_size = bs
+                forward_batch.seq_lens = buffers.seq_lens[:bs]
+                forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
+                forward_batch.positions = buffers.positions[:num_tokens]
+
+            if forward_batch.seq_lens_cpu is not None:
+                if bs != raw_bs:
+                    buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+                buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+                forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+
+            self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+                forward_batch, bs
+            )
+            self.raw_bs = raw_bs
+            self.bs = bs
+            self.raw_num_token = raw_num_token
+            # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
 
         # Replay
         self._replay(forward_batch)
-        out = self.output_buffers[bs]
+        out = self.output_buffers[self.bs]
 
-        if bs != raw_bs:
-            out = self._postprocess_output_to_raw_bs(out, raw_bs)
-            forward_batch.batch_size = raw_bs
-            forward_batch.positions = buffers.positions[:raw_num_token]
-            forward_batch.seq_lens = buffers.seq_lens[:raw_bs]
-            forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
+        if self.bs != self.raw_bs:
+            out = self._postprocess_output_to_raw_bs(out, self.raw_bs)
+            forward_batch.batch_size = self.raw_bs
+            forward_batch.positions = buffers.positions[:self.raw_num_token]
+            forward_batch.seq_lens = buffers.seq_lens[:self.raw_bs]
+            forward_batch.req_pool_indices = buffers.req_pool_indices[:self.raw_bs]
             if forward_batch.seq_lens_cpu is not None:
-                forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
+                forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:self.raw_bs]
 
         return out

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.jit_kernel.fused_store_index_cache import (
@@ -39,7 +42,11 @@ if _is_cuda:
 
 if is_npu():
     import torch_npu
-    from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
+    from sglang.srt.hardware_backend.npu.utils import (
+        get_had_pow2,
+        get_indexer_weight_stream,
+    )
+    from sglang.srt.hardware_backend.npu.attention.ascend_backend import get_kv_indices
 
 from sglang.srt.distributed import (
     get_attn_context_model_parallel_rank,
@@ -53,18 +60,26 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_prefill_cp_in_seq_split,
 )
 from sglang.srt.layers.communicator import ScatterMode
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_bool_env_var
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
 
+logger = logging.getLogger(__name__)
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
@@ -154,6 +169,391 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def apply_hadamard(inp, hadamard_matrix):
+    init_shape = inp.shape
+    inp = inp.view(-1, hadamard_matrix.shape[0])
+    return inp.matmul(hadamard_matrix).view(init_shape).to(torch.bfloat16)
+
+
+class Compressor(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        head_dim: int,
+        rope_head_dim: int,
+        layer_id: int,
+        compress_ratio: int = 4,
+        prefix: str = "",
+        quant_config: Optional[QuantizationConfig] = None,
+        rotate: bool = False,
+        norm_eps: float = 1e-6,
+        from_indexer: bool = False,
+    ):
+        super().__init__()
+        self.prefix = prefix
+        self.quant_config = quant_config
+        try:
+            self.li_kv_dtype = quant_config.li_kv_dtype
+        except:
+            self.li_kv_dtype = "bf16"
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.rope_head_dim = rope_head_dim
+        self.nope_head_dim = head_dim - rope_head_dim
+        self.compress_ratio = compress_ratio
+        self.overlap = compress_ratio == 4
+        self.rotate = rotate
+        coff = 1 + self.overlap
+        self.layer_id = layer_id
+        self.from_indexer = from_indexer
+        self.ape = nn.Parameter(
+            torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32)
+        )
+        # wkv and wgate in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for convenient.
+        # The first half of dimensions for overlapping compression and second half for normal compression.
+        self.wkv = ReplicatedLinear(
+            self.hidden_size,
+            coff * self.head_dim,
+            bias=False,
+            quant_config=None,
+            params_dtype=torch.bfloat16,
+        )
+        self.wgate = ReplicatedLinear(
+            self.hidden_size,
+            coff * self.head_dim,
+            bias=False,
+            quant_config=None,
+            params_dtype=torch.bfloat16,
+        )
+        self.norm = RMSNorm(self.head_dim, norm_eps)
+        self.kv_cache = None
+        self.rotary_emb = None
+        self.register_buffer("hadamard_matrix", get_had_pow2(self.head_dim))
+
+    def overlap_transform(self, tensor: torch.Tensor, value=0):
+        b, s, _, _ = tensor.size()
+        ratio, d = self.compress_ratio, self.head_dim
+        new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)
+        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
+        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
+        return new_tensor
+
+    def forward_ori(
+        self, x: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        ratio, overlap, d = self.compress_ratio, self.overlap, self.head_dim
+        dtype = x.dtype
+        x = x.float()
+        kv = self.wkv(x)[0]
+        score = self.wgate(x)[0]
+        seq_lens = forward_batch.seq_lens_cpu
+        positions_bk = positions
+        kv_bk = kv
+        score_bk = score
+        seqlen_offset = 0
+        is_prefill = forward_batch.forward_mode.is_prefill()
+        kv_out_list = []
+        kv_state_to_be_cached, score_state_to_be_cached = [], []
+        out_cache_loc_list = []
+        if self.overlap:
+            page_table = forward_batch.attn_backend.forward_metadata.c4_state_page_table
+        else:
+            page_table = (
+                forward_batch.attn_backend.forward_metadata.c128_state_page_table
+            )
+        # prefill: calculate cutoff datga and store state cache, decoder store cur state cache and when compress calculate kv and store compress kv
+        for idx, seqlen in enumerate(seq_lens):
+            if seqlen == 0:
+                continue
+            if is_prefill:  # start_pos == 0
+                positions = positions_bk[seqlen_offset : seqlen_offset + seqlen]
+                out_cache_loc = forward_batch.out_cache_loc[
+                    seqlen_offset : seqlen_offset + seqlen
+                ]
+                should_compress = seqlen >= ratio
+                remainder = seqlen % ratio
+                cutoff = seqlen - remainder
+                positions = positions[:cutoff:ratio]
+                offset = ratio if overlap else 0
+                kv = kv_bk[seqlen_offset : seqlen_offset + seqlen]
+                score = score_bk[seqlen_offset : seqlen_offset + seqlen]
+
+                if overlap and cutoff >= ratio:
+                    kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
+                    score_state_to_be_cached.append(
+                        score[cutoff - ratio : cutoff] + self.ape
+                    )
+                    out_cache_loc_list.append(out_cache_loc[cutoff - ratio : cutoff])
+                if remainder > 0:
+                    kv, state_remainder = kv.split([cutoff, remainder], dim=0)
+                    score, score_remainder = score.split([cutoff, remainder], dim=0)
+                    kv_state_to_be_cached.append(state_remainder)
+                    score_state_to_be_cached.append(
+                        score_remainder + self.ape[:remainder]
+                    )
+                    out_cache_loc_list.append(out_cache_loc[-remainder:])
+
+                kv = kv.unflatten(0, (-1, ratio))
+                score = score.unflatten(0, (-1, ratio)) + self.ape
+                if overlap:
+                    kv = self.overlap_transform(kv.unsqueeze(0), 0).squeeze(0)
+                    score = self.overlap_transform(
+                        score.unsqueeze(0), float("-inf")
+                    ).squeeze(0)
+                kv = (kv * score.softmax(dim=1)).sum(dim=1)
+                seqlen_offset += seqlen
+            else:  # decode
+                start_pos = seqlen - 1
+                should_compress = (start_pos + 1) % self.compress_ratio == 0
+                positions = positions_bk[idx : idx + 1] + (1 - self.compress_ratio)
+                kv = kv_bk[idx : idx + 1]
+                score = score_bk[idx : idx + 1]
+                score += self.ape[start_pos % ratio]
+                if ratio == 4:
+                    loc = forward_batch.attn_backend.forward_metadata.c4_state_loc
+                else:
+                    loc = forward_batch.attn_backend.forward_metadata.c128_state_loc
+                forward_batch.token_to_kv_pool.set_compress_state_buffer(
+                    self.layer_id,
+                    loc[idx : idx + 1],
+                    kv.view(1, 1, -1),
+                    score.view(1, 1, -1),
+                    None,
+                    self.from_indexer,
+                )
+                if should_compress:
+                    if overlap:
+                        kv_indices = get_kv_indices(
+                            forward_batch, 2 * ratio, page_table, idx, seqlen
+                        )
+                        kv_state, score_state = (
+                            forward_batch.token_to_kv_pool.get_compress_state_buffer(
+                                self.layer_id, self.from_indexer, kv_indices
+                            )
+                        )  # [2*r, 1, dim]
+                        assert kv_state.shape[0] == 2 * ratio
+                        kv_state = kv_state.squeeze(1)
+                        score_state = score_state.squeeze(1)
+                        kv_state = torch.cat(
+                            [kv_state[:ratio, :d], kv_state[ratio:, d:]], dim=0
+                        )
+                        score_state = torch.cat(
+                            [score_state[:ratio, :d], score_state[ratio:, d:]], dim=0
+                        )
+                        kv = (kv_state * score_state.softmax(dim=0)).sum(
+                            dim=0, keepdim=True
+                        )  # [1, dim]
+                    else:  # r=ratio=128
+                        kv_indices = get_kv_indices(
+                            forward_batch, ratio, page_table, idx, seqlen
+                        )
+                        kv_state, score_state = (
+                            forward_batch.token_to_kv_pool.get_compress_state_buffer(
+                                self.layer_id, self.from_indexer, kv_indices
+                            )
+                        )  # [r, 1, dim]
+                        assert kv_state.shape[0] == ratio
+                        kv = (kv_state[:, 0] * score_state[:, 0].softmax(dim=0)).sum(
+                            dim=0, keepdim=True
+                        )  # [1, dim]
+
+            if not should_compress:
+                continue
+            kv = self.norm(kv.to(dtype))
+            self.rotary_emb(
+                kv[..., -self.rope_head_dim :], None, None, False, positions
+            )
+            if self.rotate:
+                # kv = rotate_activation(kv)
+                kv = apply_hadamard(kv, self.hadamard_matrix)
+            kv_out_list.append(kv)
+
+        if len(kv_state_to_be_cached) > 0:
+            kv_state_to_be_cached = torch.cat(kv_state_to_be_cached, dim=0).unsqueeze(1)
+            score_state_to_be_cached = torch.cat(
+                score_state_to_be_cached, dim=0
+            ).unsqueeze(1)
+            if ratio == 4:
+                state_loc = forward_batch.attn_backend.forward_metadata.c4_state_loc
+            else:
+                state_loc = forward_batch.attn_backend.forward_metadata.c128_state_loc
+            forward_batch.token_to_kv_pool.set_compress_state_buffer(
+                self.layer_id,
+                state_loc,
+                kv_state_to_be_cached,
+                score_state_to_be_cached,
+                None,
+                self.from_indexer,
+            )
+        if len(kv_out_list) > 0:
+            kv_to_be_cached = torch.cat(kv_out_list, dim=0)
+            self.compressor_epilog(kv_to_be_cached, forward_batch)
+        if is_prefill and not get_bool_env_var("USE_PA_PREFILL"):
+            return kv_out_list
+        else:
+            return None
+
+    def forward_fusion(
+        self, x: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        ratio, overlap, d = self.compress_ratio, self.overlap, self.head_dim
+        assert x.dtype == torch.bfloat16
+        is_prefill = (
+            forward_batch.forward_mode.is_prefill()
+            and not forward_batch.forward_mode.is_target_verify()
+        )
+
+        batch_size = forward_batch.batch_size
+        cu_seqlens = (
+            forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q_cmp
+        )
+        # decode:
+        # seq_lens = [1, 0] --> cu_seqlens= [0, 0+1, 0+1+0]
+
+        # PREFILL:
+        # seq_len = [7]  --> 压1个
+        # pos = [0]
+        # cos/sin shape = [min(T, T//4+BS)=2, dim]
+        # 输出 kv shape[0] = cos.shape[0]
+        # kv = kv[:1], loc.shape= [1]
+
+        if ratio == 4:
+            positions_cmp = (
+                forward_batch.attn_backend.forward_metadata.positions_cmp_padding_c4
+            )
+        else:
+            positions_cmp = (
+                forward_batch.attn_backend.forward_metadata.positions_cmp_padding_c128
+            )
+        if not forward_batch.attn_backend.graph_mode:
+            compress_tokens_padded = min(
+                cu_seqlens[-1], cu_seqlens[-1] // ratio + batch_size
+            )
+            assert positions_cmp.numel() == compress_tokens_padded
+
+        # shape=[kv_compressed_tokens, D], kv_compressed_tokens=min(T, T//ratio + bs)
+        # TODO: FIX MAGIC NUMBER
+        if self.layer_id == 2:  # the first layer of C4
+            self.rotary_emb.get_cos_sin_with_c4_cmpposition(positions_cmp)
+        if self.layer_id == 3:  # the first layer of C128
+            self.rotary_emb.get_cos_sin_with_c128_cmpposition(positions_cmp)
+        if ratio == 4:
+            cos = self.rotary_emb.c4_cmp_position_cos_layer_cache
+            sin = self.rotary_emb.c4_cmp_position_sin_layer_cache
+        else:
+            cos = self.rotary_emb.c128_cmp_position_cos_layer_cache
+            sin = self.rotary_emb.c128_cmp_position_sin_layer_cache
+
+        if ratio == 4:
+            page_table = forward_batch.attn_backend.forward_metadata.c4_state_page_table
+        else:
+            page_table = (
+                forward_batch.attn_backend.forward_metadata.c128_state_page_table
+            )
+
+        kv_state, score_state = (
+            forward_batch.token_to_kv_pool.get_compress_state_buffer(
+                self.layer_id, self.from_indexer
+            )
+        )  # [page_num, page_size, 1, (1+overlap)*dim]
+        kv_state = kv_state.squeeze(-2).view(
+            -1, forward_batch.token_to_kv_pool.page_size, kv_state.shape[-1]
+        )
+        score_state = score_state.squeeze(-2).view(
+            -1, forward_batch.token_to_kv_pool.page_size, score_state.shape[-1]
+        )
+
+        coff = 1 + overlap
+        assert kv_state.dtype == torch.float32
+        assert (
+            kv_state.shape[-1] == coff * d
+        ), f"slot_dim={kv_state.shape[-1]} != (1+overlap)*dim={coff * d}"
+
+        start_pos = forward_batch.attn_backend.forward_metadata.start_pos
+        seqused = forward_batch.attn_backend.forward_metadata.seqused
+        cmpr_input_kwargs = {
+            "x": x,
+            "wkv": self.wkv.weight,
+            "wgate": self.wgate.weight,
+            "kv_state": kv_state,
+            "score_state": score_state,
+            "ape": self.ape,
+            "norm_weight": self.norm.weight.to(torch.bfloat16),
+            "rope_cos": cos,
+            "rope_sin": sin,
+            "kv_block_table": page_table,
+            "score_block_table": page_table,
+            "cu_seqlens": cu_seqlens,  # only required for tnd
+            "seqused": seqused,  # None: use all
+            "start_pos": start_pos,  # does not accept None
+            "rope_head_dim": self.rope_head_dim,
+            "cmp_ratio": ratio,
+            "coff": coff,
+            "norm_eps": self.norm.variance_epsilon,
+            "rotary_mode": 2,  # 1: halRf; 2: interleave
+        }
+        kv = torch.ops.custom.compressor(**cmpr_input_kwargs)[
+            0
+        ]  # (kv_compressed_tokens, self.head_dim)
+
+        if ratio == 4:
+            loc = forward_batch.attn_backend.forward_metadata.c4_loc
+        else:
+            loc = forward_batch.attn_backend.forward_metadata.c128_loc
+        if is_prefill and loc.numel() < kv.shape[0]:
+            kv = kv[: loc.numel()]
+
+        if forward_batch.attn_backend.graph_mode or kv.shape[0] > 0:
+            if self.rotate:
+                kv = apply_hadamard(kv, self.hadamard_matrix)
+            self.compressor_epilog(kv, forward_batch)
+
+        # split kv tensor to list
+        if is_prefill and not get_bool_env_var("USE_PA_PREFILL"):
+            dim = kv.shape[-1]
+            kv_out_list = [kv.new_empty((0, dim)) for _ in range(batch_size)]
+            offset = 0
+            for idx, seqlen in enumerate(forward_batch.seq_lens_cpu):
+                cutoff = seqlen - seqlen % ratio
+                out_lens = cutoff // ratio
+                if out_lens > 0:
+                    kv_out_list[idx] = kv[offset : offset + out_lens]
+                    offset += out_lens
+            assert offset == kv.shape[0], (offset, kv.shape[0])
+        else:
+            return None
+        return kv_out_list
+
+    def forward(
+        self, x: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        if forward_batch.forward_mode.is_idle():
+            return None
+        use_fused_compressor = get_bool_env_var("USE_FUSED_COMPRESSOR")
+        if use_fused_compressor:
+            return self.forward_fusion(x, positions, forward_batch)
+        else:
+            return self.forward_ori(x, positions, forward_batch)
+
+    def compressor_epilog(self, kv: torch.Tensor, forward_batch: ForwardBatch):
+        if self.li_kv_dtype == "int8" and self.from_indexer:
+            kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
+            kv_scale = kv_scale.to(torch.float16)
+        else:
+            kv_scale = None
+        if self.compress_ratio == 4:
+            loc = forward_batch.attn_backend.forward_metadata.c4_loc
+        else:
+            loc = forward_batch.attn_backend.forward_metadata.c128_loc
+        forward_batch.token_to_kv_pool.set_compress_buffer(
+            self.layer_id,
+            loc,
+            kv,
+            kv_scale,
+            self.from_indexer,
+        )
+
+
 class Indexer(MultiPlatformOp):
     def __init__(
         self,
@@ -173,16 +573,25 @@ class Indexer(MultiPlatformOp):
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        compress_ratio: int = 1,
+        window_size: int = 128,
     ):
         super().__init__()
+        self.quant_config = quant_config
+        try:
+            self.li_kv_dtype = quant_config.li_kv_dtype
+        except:
+            self.li_kv_dtype = "bf16"
         self.hidden_size = hidden_size
         self.n_heads = index_n_heads
+        self.n_local_heads = self.n_heads
         self.head_dim = index_head_dim
         self.rope_head_dim = rope_head_dim
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.compress_ratio = compress_ratio
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attn_context_model_parallel_world_size()
@@ -198,31 +607,70 @@ class Indexer(MultiPlatformOp):
         else:
             self.logits_with_pp_recv = False
 
-        self.wq_b = ReplicatedLinear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wq_b", prefix),
-        )
+        if self.index_topk == 512:
+            self.is_dsv4 = True
+        if self.is_dsv4 or _is_cuda:
+            weights_proj_dtype = torch.bfloat16
+        else:
+            # NOTE: weights_proj in the checkpoint is stored in bf16, while the parameters here are stored in fp32 for convenience
+            weights_proj_dtype = torch.float32
 
-        self.wk = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wk", prefix),
-        )
-        self.weights_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.n_heads,
-            bias=False,
-            params_dtype=torch.bfloat16 if _is_cuda else torch.float32,
-            prefix=add_prefix("weights_proj", prefix),
-        )
-        self.k_norm = LayerNorm(
-            self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
-        )
+        self.attn_tp_rank = get_attention_tp_rank()
+        self.attn_tp_size = get_attention_tp_size()
+        self.enable_indexer_tp = get_bool_env_var("ENABLE_INDEXER_TP")
+        assert not (
+            self.enable_indexer_tp and self.li_kv_dtype == "int8"
+        )  # indexer fused op does not support tp.
+        if self.enable_indexer_tp:
+            self.n_local_heads = self.n_heads // self.attn_tp_size
+            self.wq_b = ColumnParallelLinear(
+                self.q_lora_rank,
+                self.n_heads * self.head_dim,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=quant_config,
+                prefix=add_prefix("wq_b", prefix),
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+            )
+            self.weights_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.n_heads,
+                bias=False,
+                params_dtype=weights_proj_dtype,
+                prefix=add_prefix("weights_proj", prefix),
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+            )
+        else:
+            self.wq_b = ReplicatedLinear(
+                self.q_lora_rank,
+                self.n_heads * self.head_dim,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=quant_config,
+                prefix=add_prefix("wq_b", prefix),
+            )
+            self.weights_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.n_heads,
+                bias=False,
+                params_dtype=weights_proj_dtype,
+                prefix=add_prefix("weights_proj", prefix),
+            )
+
+        if not self.is_dsv4:
+            self.wk = ReplicatedLinear(
+                self.hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wk", prefix),
+            )
+            self.k_norm = LayerNorm(
+                self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+            )
+
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -235,6 +683,21 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        if self.is_dsv4:
+            self.compressor = Compressor(
+                self.hidden_size,
+                self.head_dim,
+                rope_head_dim,
+                layer_id=layer_id,
+                compress_ratio=self.compress_ratio,
+                rotate=True,
+                quant_config=quant_config,
+                prefix=add_prefix("compressor", prefix),
+                from_indexer=True,
+            )
+            self.compressor.rotary_emb = self.rotary_emb
+            self.register_buffer("hadamard_matrix", get_had_pow2(self.head_dim))
+            self.window_size = window_size
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -1259,6 +1722,18 @@ class Indexer(MultiPlatformOp):
         layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
+
+        # indxer for dsv4
+        if self.is_dsv4:
+            topk_idxs = self.forward_npu_dsv4(
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+            )
+            return topk_idxs
+
         if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = forward_batch.attn_backend.forward_metadata.seq_lens
         else:
@@ -1512,6 +1987,204 @@ class Indexer(MultiPlatformOp):
                 sparse_mode=3,
             )
             return topk_indices[0]
+
+    def forward_npu_dsv4(
+        self,
+        x: torch.Tensor,  # [b*s, 4096]
+        q_lora: torch.Tensor,  # [b*s, 1024]
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> torch.Tensor:
+        bs = x.shape[0]
+        ratio = self.compress_ratio
+
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend()
+        )
+
+        # q path
+        q = self.wq_b(q_lora)[0]  # [bs, n_local_heads*128]
+        q = q.view(bs, self.n_local_heads, self.head_dim)  # [bs, n_local_heads, 128]
+        if get_bool_env_var("USE_ROPE_PARTIAL_IN_PLACE_TRITON") and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            from sglang.srt.models.deepseek_v4 import triton_apply_rope_partial_in_place
+
+            q = triton_apply_rope_partial_in_place(
+                q,
+                self.rotary_emb.position_sin_layer_cache,
+                self.rotary_emb.position_cos_layer_cache,
+            )
+        elif get_bool_env_var("USE_ROPE_PARTIAL_IN_PLACE_ASCENDC"):
+            torch.ops.custom.inplace_partial_rotary_mul(
+                q.unsqueeze(2),  # [t, 1, n, d]
+                self.rotary_emb.position_cos_layer_cache,  # [t, 1, 1, d]
+                self.rotary_emb.position_sin_layer_cache,  # [t, 1, 1, d]
+                rotary_mode="interleave",
+                partial_slice=[
+                    self.head_dim - self.rope_head_dim,
+                    self.head_dim,
+                ],  # [64, 124]
+            )
+        else:
+            self.rotary_emb(
+                q[..., -self.rope_head_dim :],
+                self.rotary_emb.position_sin_layer_cache,
+                self.rotary_emb.position_cos_layer_cache,
+            )
+        q = apply_hadamard(q, self.hadamard_matrix)  # [bs, n_local_heads, 128]
+
+        # weight_proj path
+        x = x.view(-1, self.hidden_size)  # [bs, 4096]
+        weights = self.weights_proj(x)[0]
+        weights = weights * (
+            self.softmax_scale * self.n_heads**-0.5
+        )  # [t, n_local_heads]
+
+        # # compressor path, rotate=True 内部对kv做hadamard变换
+        self.compressor(x, positions, forward_batch)  # 放c4 index compress + state
+
+        seqlens_cpu = forward_batch.seq_lens_cpu
+
+        if self.li_kv_dtype == "int8":
+            li_cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
+                layer_id, True
+            )
+            li_key_dequant_scale = (
+                forward_batch.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                    layer_id, True
+                )
+            )
+            topk_idxs = self.forward_npu_dsv4_fusion(
+                q, li_cmp_kv, li_key_dequant_scale, weights, forward_batch
+            )
+            return topk_idxs
+
+        end_pos = forward_batch.seq_lens.cumsum(dim=0)
+
+        page_table = forward_batch.attn_backend.forward_metadata.c4_page_table
+        topk_idxs = []
+        for i, start in enumerate(end_pos):
+            kv_indices = get_kv_indices(
+                forward_batch,
+                seqlens_cpu[i] // ratio,
+                page_table,
+                i,
+                seqlens_cpu[i] // ratio,
+            )
+            if is_prefill:
+                start = 0 if i == 0 else end_pos[i - 1]
+                end = end_pos[i]
+                # q [start:end,...] [s,64,128]
+                # kv_cache [sep_len[i]//4,128]
+                # weights [start:end,...] [s, 64]
+                kv_cache_value = forward_batch.token_to_kv_pool.get_compress_buffer(  # 使用c4 index compress blocktable; int8量化
+                    layer_id, True, kv_indices
+                )
+                index_score = torch.einsum(
+                    "shd,td->sht",
+                    q[start:end, ...],
+                    kv_cache_value.squeeze(1),
+                )  # [s,64,seq_len[i]//4]
+                index_score = (
+                    index_score.relu_() * weights.unsqueeze(-1)[start:end, ...]
+                ).sum(
+                    dim=1
+                )  # [s, seq_len[i]//4]
+                if self.enable_indexer_tp and self.attn_tp_size > 1:
+                    get_attention_tp_group().all_reduce(index_score)
+
+                mask = (
+                    torch.arange(seqlens_cpu[i] // ratio, device=x.device).repeat(
+                        seqlens_cpu[i], 1
+                    )
+                    >= torch.arange(1, seqlens_cpu[i] + 1, device=x.device).unsqueeze(1)
+                    // ratio
+                )  # [s, seq_len[i]//4]
+                index_score += torch.where(
+                    mask, float("-inf"), 0
+                )  # [seqlen, seqlen//4]
+                topk_idx = index_score.topk(
+                    min(self.index_topk, seqlens_cpu[i] // ratio), dim=-1
+                )[1]
+                mask = (
+                    topk_idx
+                    >= torch.arange(1, seqlens_cpu[i] + 1, device=x.device).unsqueeze(1)
+                    // ratio
+                )
+                topk_idx = torch.where(mask, -1, topk_idx)
+            else:
+                kv_cache_value = forward_batch.token_to_kv_pool.get_compress_buffer(
+                    layer_id, True, kv_indices
+                )
+                index_score = torch.einsum(
+                    "shd,td->sht",
+                    q[i : i + 1, ...],  # [1, 64, seqlens[i]//4]
+                    kv_cache_value.squeeze(1),  # [seqlens[i]//4, 128]
+                )  # [1, 64, seqlens[i]//4]
+                index_score = (index_score.relu_() * weights.unsqueeze(-1)[i]).sum(
+                    dim=1
+                )  # [1, seq_len[i]//4]
+                topk_idx = index_score.topk(
+                    min(self.index_topk, seqlens_cpu[i] // ratio), dim=-1
+                )[1]
+
+            # padding to self.index_topk=512
+            topk_idx = F.pad(
+                topk_idx,
+                (0, self.index_topk - topk_idx.shape[-1]),
+                mode="constant",
+                value=-1,
+            )
+            topk_idxs.append(topk_idx)
+        topk_idxs = torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)  # [T,512]
+
+        return topk_idxs
+
+    def forward_npu_dsv4_fusion(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        q, q_scale = torch_npu.npu_dynamic_quant(q)  # q: [T,N,D]
+        li_quant_metadata = forward_batch.attn_backend.forward_metadata.kernel_metadata[
+            "li_quant_metadata"
+        ]
+        actual_seq_lengths_q = (
+            forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q
+        )
+        actual_seq_lengths_kv = (
+            forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv
+        )
+        c4_page_table = forward_batch.attn_backend.forward_metadata.c4_page_table
+        li_input_kwargs = {
+            "query": q,
+            "key": k,
+            "key_dequant_scale": k_scale.squeeze(-2),
+            "actual_seq_lengths_query": actual_seq_lengths_q,
+            "actual_seq_lengths_key": actual_seq_lengths_kv,
+            "block_table": c4_page_table,
+            "layout_query": "TND",
+            "layout_key": "PA_BSND",
+            "weights": weights.to(torch.float16),
+            "query_dequant_scale": q_scale.to(torch.float16),
+            "cmp_ratio": 4,
+            "query_quant_mode": 0,
+            "key_quant_mode": 0,
+            "sparse_mode": 3,
+            "sparse_count": self.index_topk,
+            "metadata": li_quant_metadata,
+        }
+        topk_idxs, _ = torch.ops.custom.npu_quant_lightning_indexer(**li_input_kwargs)
+        return topk_idxs.view(-1, self.index_topk)
 
     def do_npu_cp_balance_indexer(
         self,

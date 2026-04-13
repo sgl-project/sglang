@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    get_swa_c4_c128_kv_indices_by_req,
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
@@ -52,6 +53,10 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.hardware_backend.npu.hybrid_swa_c4_c128_memory_pool import (
+    SWAC4C128KVPool,
+    SWAC4C128TokenToKVPoolAllocator,
+)
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -143,16 +148,44 @@ class PrefillBootstrapQueue:
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
-        )
+        kv_args.kv_type_map = dict()
+        main_model_kv_len = 0
+        if isinstance(self.token_to_kv_pool, SWAC4C128KVPool):
+            kv_data_ptrs, kv_data_lens, kv_item_lens, buf_map = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
+            for i in range(buf_map["swa_begin"], buf_map["swa_end"]):
+                kv_args.kv_type_map[i] = "swa"
+            for i in range(buf_map["c4_begin"], buf_map["c4_end"]):
+                kv_args.kv_type_map[i] = "c4"
+            for i in range(buf_map["c4_state_begin"], buf_map["c4_state_end"]):
+                kv_args.kv_type_map[i] = "c4_state"
+            for i in range(buf_map["c128_begin"], buf_map["c128_end"]):
+                kv_args.kv_type_map[i] = "c128"
+            for i in range(buf_map["c128_state_begin"], buf_map["c128_state_end"]):
+                kv_args.kv_type_map[i] = "c128_state"
+            main_model_kv_len = buf_map["c128_state_end"]
+        else:
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
 
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
-            )
+            if isinstance(self.draft_token_to_kv_pool, SWAC4C128KVPool):
+                draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens, buf_map = (
+                    self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                )
+                draft_kv_data_ptrs = draft_kv_data_ptrs[: buf_map["swa_end"]]
+                draft_kv_data_lens = draft_kv_data_lens[: buf_map["swa_end"]]
+                draft_kv_item_lens = draft_kv_item_lens[: buf_map["swa_end"]]
+                for i in range(buf_map["swa_begin"], buf_map["swa_end"]):
+                    kv_args.kv_type_map[i + main_model_kv_len] = "swa"
+            else:
+                draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
+                    self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
@@ -767,6 +800,14 @@ class SchedulerDisaggregationPrefillMixin:
             .cpu()
             .numpy()
         )
+        if isinstance(self.token_to_kv_pool_allocator, SWAC4C128TokenToKVPoolAllocator):
+            (
+                swa_kv_indices,
+                c4_kv_indices,
+                c128_kv_indices,
+                c4_state_kv_indices,
+                c128_state_kv_indices,
+            ) = get_swa_c4_c128_kv_indices_by_req(req, self.req_to_token_pool)
         req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
@@ -814,7 +855,21 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = kv_to_page_indices(state_indices, page_size)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
-        if len(page_indices) == 0:
+        if isinstance(self.token_to_kv_pool_allocator, SWAC4C128TokenToKVPoolAllocator):
+            page_dict = {}
+            page_dict["full"] = page_indices
+            page_dict["swa"] = kv_to_page_indices(swa_kv_indices, page_size)
+            page_dict["c4"] = kv_to_page_indices(c4_kv_indices, page_size)
+            page_dict["c128"] = kv_to_page_indices(c128_kv_indices, page_size)
+            page_dict["c4_state"] = kv_to_page_indices(c4_state_kv_indices, page_size)
+            page_dict["c128_state"] = kv_to_page_indices(
+                c128_state_kv_indices, page_size
+            )
+            page_indices = page_dict
+
+        if (isinstance(page_indices, dict) and len(page_indices["swa"]) == 0) or len(
+            page_indices
+        ) == 0:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )

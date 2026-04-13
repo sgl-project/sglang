@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -7,6 +8,8 @@ from sglang.srt.mem_cache.allocator import (
     alloc_extend_naive,
 )
 from sglang.srt.utils import get_num_new_pages, next_power_of_2
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -40,14 +43,17 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         num_new_pages = (
-            (seq_lens + self.roundup) // self.page_size
-            - (prefix_lens + self.roundup) // self.page_size
+            (seq_lens_cpu + self.roundup) // self.page_size
+            - (prefix_lens_cpu + self.roundup) // self.page_size
         ).sum()
         num_new_pages_item = num_new_pages.item()
         if self.need_sort and num_new_pages_item > len(self.free_pages):
             self.merge_and_sort_free()
 
         if num_new_pages_item > len(self.free_pages):
+            logger.info(
+                f"[alloc_extend] fail: {num_new_pages_item=}, {self.free_pages}"
+            )
             return None
 
         if num_new_pages_item < 200:
@@ -91,7 +97,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         self.free_pages = self.free_pages[num_new_pages_item:]
-        return out_indices.int()
+        return out_indices.long()
 
     def alloc_decode(
         self,
@@ -114,6 +120,9 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         if num_new_pages > len(self.free_pages):
+            logger.info(
+                f"[alloc_decoder] fail: {num_new_pages=}, {self.free_pages=}, {self.size=}"
+            )
             return None
 
         need_new_pages = (seq_lens % self.page_size == 1).int()
@@ -130,7 +139,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         self.free_pages = self.free_pages[num_new_pages:]
-        return out_indices.int()
+        return out_indices.long()
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -138,8 +147,12 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             device = free_index.device
-            free_page_indices = torch.unique(free_index.cpu() // self.page_size)
-            free_page_indices = free_page_indices.to(device)
+            free_page_indices = torch.unique(free_index // self.page_size)
+            if self.debug_mode:
+                assert torch.all(
+                    free_page_indices > 0
+                ), f"[free]: fail free_page_indices > 0, {free_index=}"
+            free_page_indices = free_page_indices
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:

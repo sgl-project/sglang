@@ -109,8 +109,9 @@ class RadixAttention(nn.Module):
             # For cross-layer sharing, kv can be None
             assert v is not None
             if "k_rope" not in kwargs:
-                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
-                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+                if isinstance(k, torch.Tensor):
+                    k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+                    v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 

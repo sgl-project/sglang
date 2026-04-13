@@ -286,6 +286,37 @@ def _load_deepseek_v32_model(
     )
 
 
+def _load_deepseek_v4_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    # first get the local path
+    local_path = download_from_hf(model_path)
+    # then load the config file in json
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        config_json = json.load(f)
+
+    config_json["architectures"] = ["DeepseekV4ForCausalLM"]
+    config_json["model_type"] = "deepseek_v3"
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
+    os.makedirs(tmp_path, exist_ok=True)
+
+    unique_path = os.path.join(tmp_path, f"deepseek_v4_{os.getpid()}")
+    with open(unique_path, "w") as f:
+        json.dump(config_json, f)
+
+    return AutoConfig.from_pretrained(
+        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+
+
 # Temporary hack for Mistral Large
 @lru_cache(maxsize=2)
 def _load_mistral_large_3_for_causal_LM(
@@ -515,11 +546,22 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except ValueError as e:
-            if not "deepseek_v32" in str(e):
+            if "deepseek_v4" in str(e):
+                config = _load_deepseek_v4_model(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            elif "deepseek_v32" in str(e):
+                config = _load_deepseek_v32_model(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
                 raise e
-            config = _load_deepseek_v32_model(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
         except KeyError as e:
             # Transformers v5 may register a built-in config class that
             # conflicts with sglang's custom one (e.g. NemotronHConfig
@@ -546,6 +588,7 @@ def get_config(
                     config._name_or_path = model
                 else:
                     raise
+
 
     if (
         config.architectures is not None

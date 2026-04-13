@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    get_swa_c4_c128_kv_indices_by_req,
     is_mla_backend,
     kv_to_page_indices,
     poll_and_all_reduce,
@@ -50,6 +51,10 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.hybrid_swa_c4_c128_memory_pool import (
+    SWAC4C128KVPool,
+    SWAC4C128TokenToKVPoolAllocator,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -64,10 +69,12 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.forward_batch_info import KvLen, LastLoc, OutCacheLoc
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -127,11 +134,140 @@ class DecodeReqToTokenPool:
                 dtype=torch.int32,
                 device=device,
             )
+            if get_bool_env_var("IS_DEEPSEEK_V4", "False"):
+                self.req_to_token_swa = torch.zeros(
+                    (size + pre_alloc_size, max_context_len),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.req_to_token_c4 = torch.zeros(
+                    (size + pre_alloc_size, max_context_len // 4),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.req_to_token_c128 = torch.zeros(
+                    (size + pre_alloc_size, max_context_len // 128),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.req_to_token_c4_state = torch.zeros(
+                    (size + pre_alloc_size, max_context_len),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self.req_to_token_c128_state = torch.zeros(
+                    (size + pre_alloc_size, max_context_len),
+                    dtype=torch.int32,
+                    device=device,
+                )
 
         self.free_slots = list(range(size + pre_alloc_size))
 
+    def get_all_locs_by_req(self, req: Req):
+        kv_indices = self.req_to_token[req.req_pool_idx, : req.kv_committed_len]
+        if not get_bool_env_var("IS_DEEPSEEK_V4", "False"):
+            return kv_indices
+
+        swa_kv_indices = self.req_to_token_swa[
+            req.req_pool_idx, req.swa_alloc_offset : req.kv_committed_len
+        ]
+        c4_kv_indices = self.req_to_token_c4[
+            req.req_pool_idx, : req.c4_kv_committed_len
+        ]
+        c128_kv_indices = self.req_to_token_c128[
+            req.req_pool_idx, : req.c128_kv_committed_len
+        ]
+        c4_state_kv_indices = self.req_to_token_c4_state[
+            req.req_pool_idx, req.c4_alloc_offset : req.kv_committed_len
+        ]
+        c128_state_kv_indices = self.req_to_token_c128_state[
+            req.req_pool_idx, req.c128_alloc_offset : req.kv_committed_len
+        ]
+
+        return (
+            kv_indices,
+            swa_kv_indices,
+            c4_kv_indices,
+            c128_kv_indices,
+            c4_state_kv_indices,
+            c128_state_kv_indices,
+        )
+
+    def get_all_locs_by_kv_lens(
+        self, req: Req, kv_committed_len, c4_kv_committed_len, c128_kv_committed_len
+    ):
+        if not get_bool_env_var("IS_DEEPSEEK_V4", "False"):
+            raise NotImplementedError(
+                "Only DEEPSEEK_V4 does not support get_all_locs_by_kv_lens"
+            )
+        kv_indices = self.req_to_token[req.req_pool_idx, :kv_committed_len]
+        swa_kv_indices = self.req_to_token_swa[
+            req.req_pool_idx, req.swa_alloc_offset : kv_committed_len
+        ]
+        c4_kv_indices = self.req_to_token_c4[req.req_pool_idx, :c4_kv_committed_len]
+        c128_kv_indices = self.req_to_token_c128[
+            req.req_pool_idx, :c128_kv_committed_len
+        ]
+        c4_state_kv_indices = self.req_to_token_c4_state[
+            req.req_pool_idx, req.c4_alloc_offset : kv_committed_len
+        ]
+        c128_state_kv_indices = self.req_to_token_c128_state[
+            req.req_pool_idx, req.c128_alloc_offset : kv_committed_len
+        ]
+        return (
+            kv_indices,
+            swa_kv_indices,
+            c4_kv_indices,
+            c128_kv_indices,
+            c4_state_kv_indices,
+            c128_state_kv_indices,
+        )
+
     def write(self, indices, values):
         self.req_to_token[indices] = values
+
+    def write_swa(self, indices, values):
+        if self.req_to_token_swa is not None:
+            self.req_to_token_swa[indices] = values
+
+    def write_c4(self, indices, values):
+        if self.req_to_token_c4 is not None:
+            self.req_to_token_c4[indices] = values
+
+    def write_c128(self, indices, values):
+        if self.req_to_token_c128 is not None:
+            self.req_to_token_c128[indices] = values
+
+    def write_c4_state(self, indices, values):
+        if self.req_to_token_c4_state is not None:
+            self.req_to_token_c4_state[indices] = values
+
+    def write_c128_state(self, indices, values):
+        if self.req_to_token_c128_state is not None:
+            self.req_to_token_c128_state[indices] = values
+
+    def write_all_locs_by_req(self, req: Req, kv_loc: OutCacheLoc):
+        self.write(
+            (req.req_pool_idx, slice(0, req.kv_committed_len)), kv_loc.out_full_loc
+        )
+        self.write_swa(
+            (req.req_pool_idx, slice(req.swa_alloc_offset, req.kv_committed_len)),
+            kv_loc.out_swa_loc,
+        )
+        self.write_c4(
+            (req.req_pool_idx, slice(0, req.c4_kv_committed_len)), kv_loc.out_c4_loc
+        )
+        self.write_c128(
+            (req.req_pool_idx, slice(0, req.c128_kv_committed_len)), kv_loc.out_c128_loc
+        )
+        self.write_c4_state(
+            (req.req_pool_idx, slice(req.c4_alloc_offset, req.kv_committed_len)),
+            kv_loc.out_c4_state_loc,
+        )
+        self.write_c128_state(
+            (req.req_pool_idx, slice(req.c128_alloc_offset, req.kv_committed_len)),
+            kv_loc.out_c128_state_loc,
+        )
 
     def available_size(self):
         return len(self.free_slots)
@@ -324,6 +460,10 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 host_pool.get_contiguous_buf_infos()
             )
+        elif isinstance(self.token_to_kv_pool, SWAC4C128KVPool):
+            kv_data_ptrs, kv_data_lens, kv_item_lens, _ = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
         else:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
@@ -331,9 +471,17 @@ class DecodePreallocQueue:
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
-            )
+            if isinstance(self.draft_token_to_kv_pool, SWAC4C128KVPool):
+                draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens, buf_map = (
+                    self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                )
+                draft_kv_data_ptrs = draft_kv_data_ptrs[: buf_map["swa_end"]]
+                draft_kv_data_lens = draft_kv_data_lens[: buf_map["swa_end"]]
+                draft_kv_item_lens = draft_kv_item_lens[: buf_map["swa_end"]]
+            else:
+                draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
+                    self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
@@ -659,6 +807,8 @@ class DecodePreallocQueue:
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
+
+        # todo c4c128 calculate
         allocatable_tokens = self._allocatable_tokens(
             retractable_tokens=retractable_tokens, count_retracted=True
         )
@@ -776,6 +926,30 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            if isinstance(self.token_to_kv_pool, SWAC4C128KVPool):
+                (
+                    swa_kv_indices,
+                    c4_kv_indices,
+                    c128_kv_indices,
+                    c4_state_kv_indices,
+                    c128_state_kv_indices,
+                ) = get_swa_c4_c128_kv_indices_by_req(
+                    decode_req.req, self.req_to_token_pool
+                )
+                page_dict = dict()
+                page_dict["full"] = page_indices
+                page_dict["swa"] = kv_to_page_indices(swa_kv_indices, page_size)
+                page_dict["c4"] = kv_to_page_indices(c4_kv_indices, page_size)
+                page_dict["c128"] = kv_to_page_indices(c128_kv_indices, page_size)
+                page_dict["c4_state"] = kv_to_page_indices(
+                    c4_state_kv_indices, page_size
+                )
+                page_dict["c128_state"] = kv_to_page_indices(
+                    c128_state_kv_indices, page_size
+                )
+                page_indices = page_dict
+
+            # todo c4c128 index
             decode_req.kv_receiver.send_metadata(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
@@ -889,23 +1063,59 @@ class DecodePreallocQueue:
             host_indices = host_indices.to(device=coordinator.device)
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
         elif self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+            if isinstance(
+                self.token_to_kv_pool_allocator, SWAC4C128TokenToKVPoolAllocator
+            ):
+                kv_loc = self.token_to_kv_pool_allocator.alloc(
+                    fill_len,
+                    torch.tensor([fill_len], dtype=torch.int32),
+                    is_prefill=True,
+                )
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
-            device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
+            if isinstance(
+                self.token_to_kv_pool_allocator, SWAC4C128TokenToKVPoolAllocator
+            ):
+                device = self.token_to_kv_pool_allocator.device
 
-        assert (
-            kv_loc is not None
-        ), "KV cache is full! There is a bug in memory estimation."
+                prefix_kv_seq_lens_cpu = KvLen.from_data(1, 0, torch.int64)
+                prefix_kv_seq_lens = prefix_kv_seq_lens_cpu.to(device)
+                last_loc = LastLoc.from_data(1, -1, torch.int64)
+                kv_seq_lens, kv_seq_lens_cpu, extend_num_kv = req.get_kv_len()
 
-        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                    prefix_lens=prefix_kv_seq_lens,
+                    prefix_lens_cpu=prefix_kv_seq_lens_cpu,
+                    seq_lens=kv_seq_lens,
+                    seq_lens_cpu=kv_seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=extend_num_kv,
+                )
+                assert (
+                    kv_loc is not None
+                ), "KV cache if swa_c4_c128 pool is full! There is a bug in memory estimation."
+
+                self.req_to_token_pool.write_all_locs_by_req(req, kv_loc)
+
+            else:
+                device = self.token_to_kv_pool_allocator.device
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                    last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                    extend_num_tokens=fill_len,
+                )
+
+                assert (
+                    kv_loc is not None
+                ), "KV cache is full! There is a bug in memory estimation."
+
+                self.req_to_token_pool.write(
+                    (req.req_pool_idx, slice(0, len(kv_loc))), kv_loc
+                )
 
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids

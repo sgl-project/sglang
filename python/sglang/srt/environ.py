@@ -449,6 +449,7 @@ class Envs:
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
     SGLANG_SPEC_NAN_DETECTION = EnvBool(False)
     SGLANG_SPEC_OOB_DETECTION = EnvBool(False)
+    SGLANG_SPEC_ENABLE_OVERLAP_REFLOW = EnvBool(False)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
@@ -525,6 +526,9 @@ class Envs:
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
+
+    # Chat Template
+    SGLANG_ENABLE_THINKING = EnvBool(False)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)

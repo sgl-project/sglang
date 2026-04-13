@@ -73,8 +73,11 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ExtendNumTokens,
     ForwardBatch,
     ForwardMode,
+    KvLen,
+    OutCacheLoc,
 )
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
@@ -615,8 +618,26 @@ class Req(ReqDllmMixin):
         self.positional_embed_overrides = positional_embed_overrides
 
         # For req-level memory management
-        self.kv_committed_len = 0
-        self.kv_allocated_len = 0
+        seq_len = len(self.origin_input_ids) + len(self.output_ids)
+        self.kv_committed_len = seq_len
+        self.kv_allocated_len = self.kv_committed_len
+
+        # for dsv4
+        tail = seq_len % 128
+        swa_alloc_len = seq_len if seq_len < 128 else 128 + tail
+        self.swa_alloc_offset = seq_len - swa_alloc_len
+
+        self.c4_kv_committed_len = seq_len // 4
+        self.c4_kv_allocated_len = self.c4_kv_committed_len
+
+        self.c128_kv_committed_len = seq_len // 128
+        self.c128_kv_allocated_len = self.c128_kv_committed_len
+
+        c4_alloc_len = tail + 128 if (tail <= 3 and seq_len >= 128) else tail
+        self.c4_alloc_offset = seq_len - c4_alloc_len
+        c128_alloc_len = seq_len % 128
+        self.c128_alloc_offset = seq_len - c128_alloc_len
+
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
@@ -898,6 +919,36 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    def get_kv_len(self):
+        tail = self.kv_committed_len % 128
+        swa_alloc_len = (
+            self.kv_committed_len if self.kv_committed_len < 128 else 128 + tail
+        )
+        c4_state_alloc_len = (
+            tail + 128 if (tail <= 3 and self.kv_committed_len >= 128) else tail
+        )
+        c128_state_alloc_len = self.kv_committed_len % 128
+        kv_seq_lens_list = [
+            [self.kv_committed_len],
+            [swa_alloc_len],
+            [self.c4_kv_committed_len],
+            [self.c128_kv_committed_len],
+            [c4_state_alloc_len],
+            [c128_state_alloc_len],
+        ]
+        kv_seq_lens_cpu = KvLen.from_list(kv_seq_lens_list, dtype=torch.int64)
+        kv_seq_lens = kv_seq_lens_cpu.to("npu")
+
+        extend_num_kv = ExtendNumTokens(
+            self.kv_committed_len,
+            swa_alloc_len,
+            self.c4_kv_committed_len,
+            self.c128_kv_committed_len,
+            c4_state_alloc_len,
+            c128_state_alloc_len,
+        )
+        return kv_seq_lens, kv_seq_lens_cpu, extend_num_kv
+
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
         assert (
@@ -905,6 +956,20 @@ class Req(ReqDllmMixin):
         ), f"Committed KV cache already freed ({self.kv_committed_len=})"
         self.kv_committed_freed = True
         return self.kv_committed_len
+
+    def pop_committed_swa_c4_c128_kv_cache(self) -> int:
+        """Return the length of committed KV cache and mark them as freed."""
+        assert (
+            not self.kv_committed_freed
+        ), f"Committed KV cache already freed ({self.kv_committed_len=}, \
+                {self.c4_kv_committed_len=}, {self.c128_kv_committed_len=})"
+        self.kv_committed_freed = True
+
+        return (
+            self.kv_committed_len,
+            self.c4_kv_committed_len,
+            self.c128_kv_committed_len,
+        )
 
     def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
         """Return the range of over-allocated KV cache and mark them as freed."""
@@ -917,6 +982,26 @@ class Req(ReqDllmMixin):
         ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
+
+    def pop_overallocated_kv_cache_swa_c4_c128(self) -> Tuple[int, int]:
+        """Return the range of over-allocated KV cache and mark them as freed."""
+
+        # NOTE: This function is called when there is over-allocation of KV cache.
+        # Over-allocation: we allocate more KV cache than the committed length.
+        # e.g., speculative decoding may allocate more KV cache than actually used.
+        assert (
+            not self.kv_overallocated_freed
+        ), f"Overallocated KV cache already freed, ({self.kv_committed_len=}, \
+                {self.c4_kv_committed_len=}, {self.c128_kv_committed_len=})"
+        self.kv_overallocated_freed = True
+        return (
+            self.kv_committed_len,
+            self.kv_allocated_len,
+            self.c4_kv_committed_len,
+            self.c4_kv_allocated_len,
+            self.c128_kv_committed_len,
+            self.c128_kv_allocated_len,
+        )
 
     def update_spec_acceptance_histogram(self, accepted_draft_tokens: int):
         """Update the speculative decoding acceptance histogram.
@@ -1218,9 +1303,19 @@ class Req(ReqDllmMixin):
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
+        self.c4_kv_committed_len = 0
+        self.c4_kv_allocated_len = 0
+        self.c128_kv_committed_len = 0
+        self.c128_kv_allocated_len = 0
+
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
         self.swa_evicted_seqlen = 0
+
+        self.swa_alloc_offset = 0
+        self.c4_alloc_offset = 0
+        self.c128_alloc_offset = 0
+
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -1351,6 +1446,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    out_cache_loc_dsv4: OutCacheLoc = None  # shape: [b], int64
+    kv_seq_lens: KvLen = None
+    kv_seq_lens_cpu: KvLen = None
+    extend_num_kv: ExtendNumTokens = None
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
@@ -1623,10 +1722,67 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
-            self
+        swa_seq_lens = []
+        c4_seq_lens = []
+        c128_seq_lens = []
+        c4_state_seq_lens = []
+        c128_state_seq_lens = []
+        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+            assert seq_len - pre_len == req.extend_input_len
+            # update req-level memory management fields
+            req.kv_committed_len = seq_len
+            req.kv_allocated_len = seq_len
+            # for dsv4, TODO: len(r.fill_ids) != req.kv_committed_len
+            tail = seq_len % 128
+            swa_alloc_len = seq_len if seq_len < 128 else 128 + tail
+            swa_seq_lens.append(swa_alloc_len)
+            req.swa_alloc_offset = seq_len - swa_alloc_len
+            c4_seq_lens.append(req.c4_kv_committed_len)
+            c128_seq_lens.append(req.c128_kv_committed_len)
+            c4_alloc_len = tail + 128 if (tail <= 3 and seq_len >= 128) else tail
+            c4_state_seq_lens.append(c4_alloc_len)
+            req.c4_alloc_offset = seq_len - c4_alloc_len
+            c128_alloc_len = seq_len % 128
+            c128_state_seq_lens.append(c128_alloc_len)
+            req.c128_alloc_offset = seq_len - c128_alloc_len
+
+        kv_seq_lens_list = [
+            seq_lens,
+            swa_seq_lens,
+            c4_seq_lens,
+            c128_seq_lens,
+            c4_state_seq_lens,
+            c128_state_seq_lens,
+        ]
+        kv_seq_lens_cpu = KvLen.from_list(kv_seq_lens_list, dtype=torch.int64)
+        kv_seq_lens = kv_seq_lens_cpu.to(device=self.device)
+
+        full_extend_num_tokens = sum(seq_lens)  # TODO: prefix
+        swa_extend_num_tokens = sum(swa_seq_lens)
+        c4_extend_num_tokens = sum(c4_seq_lens)
+        c128_extend_num_tokens = sum(c128_seq_lens)
+        c4_state_extend_num_tokens = sum(c4_state_seq_lens)
+        c128_state_extend_num_tokens = sum(c128_state_seq_lens)
+
+        extend_num_kv = ExtendNumTokens(
+            full_extend_num_tokens,
+            swa_extend_num_tokens,
+            c4_extend_num_tokens,
+            c128_extend_num_tokens,
+            c4_state_extend_num_tokens,
+            c128_state_extend_num_tokens,
         )
+
+        self.kv_seq_lens = kv_seq_lens
+        self.kv_seq_lens_cpu = kv_seq_lens_cpu
+        self.extend_num_kv = extend_num_kv
+        # Allocate memory
+        (
+            out_cache_loc,
+            req_pool_indices_tensor,
+            req_pool_indices,
+        ) = alloc_for_extend(self)
+        assert isinstance(out_cache_loc, OutCacheLoc)
 
         # Set fields
         input_embeds = []
@@ -1789,7 +1945,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
-        self.out_cache_loc = out_cache_loc
+        self.out_cache_loc = out_cache_loc.out_full_loc
+        self.out_cache_loc_dsv4 = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds, pin_memory=_pin).to(
                 self.device, non_blocking=True
@@ -2096,8 +2253,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
+        self.kv_seq_lens_cpu = KvLen.from_data(0)
+        self.kv_seq_lens = self.kv_seq_lens_cpu.to(self.device)
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.out_cache_loc_dsv4 = OutCacheLoc.from_data(0)
         self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
@@ -2166,14 +2326,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
-
         # Update req-level memory management fields
+        c4_extend_num_kv = []
+        c128_extend_num_kv = []
         for req in self.reqs:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
+            if req.kv_committed_len % 4 == 0:
+                c4_extend_num_kv.append(1)
+                req.c4_kv_committed_len += 1
+                req.c4_kv_allocated_len += 1
+            else:
+                c4_extend_num_kv.append(0)
+            if req.kv_committed_len % 128 == 0:
+                c128_extend_num_kv.append(1)
+                req.c128_kv_committed_len += 1
+                req.c128_kv_allocated_len += 1
+            else:
+                c128_extend_num_kv.append(0)
+
+        # Allocate memory
+        self.out_cache_loc_dsv4 = alloc_for_decode(
+            self, c4_extend_num_kv, c128_extend_num_kv, token_per_req=1
+        )
+        self.out_cache_loc = self.out_cache_loc_dsv4.out_full_loc
 
         # Update seq_lens after allocation
         if self.enable_overlap:
@@ -2181,11 +2358,60 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens = self.seq_lens + 1
             self.seq_lens_cpu = self.seq_lens_cpu + 1
             self.orig_seq_lens = self.orig_seq_lens + 1
+
+            self.kv_seq_lens.full_kv_len = self.kv_seq_lens.full_kv_len + 1
+            self.kv_seq_lens.swa_kv_len = self.kv_seq_lens.swa_kv_len + 1
+            self.kv_seq_lens.c4_kv_len = self.seq_lens // 4
+            self.kv_seq_lens.c128_kv_len = self.seq_lens // 128
+            self.kv_seq_lens.c4_state_kv_len = self.kv_seq_lens.c4_state_kv_len + 1
+            self.kv_seq_lens.c128_state_kv_len = self.kv_seq_lens.c128_state_kv_len + 1
+
+            self.kv_seq_lens_cpu.full_kv_len = self.kv_seq_lens_cpu.full_kv_len + 1
+            self.kv_seq_lens_cpu.swa_kv_len = self.kv_seq_lens_cpu.swa_kv_len + 1
+            self.kv_seq_lens_cpu.c4_kv_len = self.seq_lens_cpu // 4
+            self.kv_seq_lens_cpu.c128_kv_len = self.seq_lens_cpu // 128
+            self.kv_seq_lens_cpu.c4_state_kv_len = (
+                self.kv_seq_lens_cpu.c4_state_kv_len + 1
+            )
+            self.kv_seq_lens_cpu.c128_state_kv_len = (
+                self.kv_seq_lens_cpu.c128_state_kv_len + 1
+            )
         else:
             # A faster in-place version
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
+            self.kv_seq_lens.full_kv_len.add_(1)
+            self.kv_seq_lens_cpu.full_kv_len.add_(1)
+            self.kv_seq_lens.swa_kv_len.add_(1)
+            self.kv_seq_lens_cpu.swa_kv_len.add_(1)
+
+            c4_should_compress = (
+                self.seq_lens % 4 == 0
+            )  # same as c4_extend_num_kv, can be optimilzed
+            c4_should_compress_cpu = self.seq_lens_cpu % 4 == 0
+            self.kv_seq_lens.c4_kv_len.add_(
+                c4_should_compress.to(self.kv_seq_lens.c4_kv_len.dtype)
+            )
+            self.kv_seq_lens_cpu.c4_kv_len.add_(
+                c4_should_compress_cpu.to(self.kv_seq_lens_cpu.c4_kv_len.dtype)
+            )
+
+            c128_should_compress = (
+                self.seq_lens % 128 == 0
+            )  # same as c128_extend_num_kv, can be optimilzed
+            c128_should_compress_cpu = self.seq_lens_cpu % 128 == 0
+            self.kv_seq_lens.c128_kv_len.add_(
+                c128_should_compress.to(self.kv_seq_lens.c128_kv_len.dtype)
+            )
+            self.kv_seq_lens_cpu.c128_kv_len.add_(
+                c128_should_compress_cpu.to(self.kv_seq_lens_cpu.c128_kv_len.dtype)
+            )
+
+            self.kv_seq_lens.c4_state_kv_len.add_(1)
+            self.kv_seq_lens_cpu.c4_state_kv_len.add_(1)
+            self.kv_seq_lens.c128_state_kv_len.add_(1)
+            self.kv_seq_lens_cpu.c128_state_kv_len.add_(1)
         self.seq_lens_sum += bs
 
         if self.hisparse_coordinator is not None:
@@ -2280,8 +2506,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
+
+        self.kv_seq_lens = self.kv_seq_lens.index_(keep_indices_device)
+        self.kv_seq_lens_cpu = self.kv_seq_lens_cpu.index_(keep_indices)
+
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
+        self.out_cache_loc_dsv4.clear()
         self.seq_lens_sum = self.seq_lens.sum().item()
 
         if self.output_ids is not None:
@@ -2337,8 +2568,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
+        self.kv_seq_lens = self.kv_seq_lens.cat_data(other.kv_seq_lens)
+        self.kv_seq_lens_cpu = self.kv_seq_lens_cpu.cat_data(other.kv_seq_lens_cpu)
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
+        self.out_cache_loc_dsv4.clear()
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
@@ -2394,6 +2628,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens=self.seq_lens,
             orig_seq_lens=self.orig_seq_lens,
             out_cache_loc=self.out_cache_loc,
+            out_cache_loc_dsv4=self.out_cache_loc_dsv4,
+            kv_seq_lens=self.kv_seq_lens,
+            kv_seq_lens_cpu=self.kv_seq_lens_cpu,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
@@ -2459,6 +2696,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
+            out_cache_loc_dsv4=self.out_cache_loc_dsv4,
+            kv_seq_lens=self.kv_seq_lens,
+            kv_seq_lens_cpu=self.kv_seq_lens_cpu,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
@@ -2504,6 +2744,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
+        elif self.tree_cache.supports_swa_c4c128():
+            self.token_to_kv_pool_allocator.free_group_begin()
+            for idx, req in enumerate(self.reqs):
+                if self.forward_mode.is_decode():
+                    self.tree_cache.evict_swa_c4c128_state(req, req.seqlen - 1)
+                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                    pre_len = self.prefix_lens[idx]
+                    self.tree_cache.evict_swa_c4c128_state(req, pre_len)
+            self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
@@ -2555,7 +2804,10 @@ class ModelWorkerBatch:
     # The sequence length
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool_allocator
-    out_cache_loc: torch.Tensor
+    out_cache_loc: torch.Tensor  # shape: [b], int64
+    out_cache_loc_dsv4: OutCacheLoc
+    kv_seq_lens: KvLen
+    kv_seq_lens_cpu: KvLen
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int

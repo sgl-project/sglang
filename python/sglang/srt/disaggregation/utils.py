@@ -556,3 +556,22 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.input_top_logprobs_idx = []
         req.input_token_ids_logprobs_val = []
         req.input_token_ids_logprobs_idx = []
+
+
+def get_swa_c4_c128_kv_indices_by_req(req, req_to_token_pool):
+    (
+        _,
+        swa_kv_indices,
+        c4_kv_indices,
+        c128_kv_indices,
+        c4_state_kv_indices,
+        c128_state_kv_indices,
+    ) = req_to_token_pool.get_all_locs_by_req(req)
+
+    return (
+        swa_kv_indices.cpu().numpy(),
+        c4_kv_indices.cpu().numpy(),
+        c128_kv_indices.cpu().numpy(),
+        c4_state_kv_indices.cpu().numpy(),
+        c128_state_kv_indices.cpu().numpy(),
+    )

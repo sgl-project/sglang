@@ -14,15 +14,22 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,18 +43,17 @@ class MemoryPoolConfig:
 
     mem_fraction_static: Optional[float] = None
 
+    c4_max_total_num_tokens: int = 0
+    c128_max_total_num_tokens: int = 0
+    c4_state_max_total_num_tokens: int = 0
+    c128_state_max_total_num_tokens: int = 0
+
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
             msg = "Not enough memory. Please try to increase --mem-fraction-static."
             if self.mem_fraction_static is not None:
                 msg += f" Current value: mem_fraction_static={self.mem_fraction_static}"
             raise RuntimeError(msg)
-
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
-logger = logging.getLogger(__name__)
 
 
 class MemoryPoolConfigurator:
@@ -284,11 +290,178 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
+class HybridSWAC4C128PoolConfigurator(MemoryPoolConfigurator):
+    """Configurator for hybrid sliding window attention models (deepseekv4).
+
+    Splits available memory between full attention and SWA pools.
+    Does NOT inherit DefaultPoolConfigurator — different coeff model.
+    """
+
+    def __init__(self, mr: ModelRunner):
+        model_config = mr.model_config
+        kv_cache_dtype = mr.kv_cache_dtype
+        kv_size = torch._utils._element_size(kv_cache_dtype)
+        tp_size = get_attention_tp_size()
+
+        self._full_layers_num = len(model_config.full_attention_layer_ids)
+        self._swa_layers_num = len(model_config.swa_attention_layer_ids)
+        self._c4_layers_num = len(model_config.c4_attention_layer_ids)
+        self._c128_layers_num = len(model_config.c128_attention_layer_ids)
+        assert self._full_layers_num == 0
+        assert (
+            self._swa_layers_num > 0
+        ), "Hybrid SWA model must have at least one SWA layer"
+
+        assert model_config.head_dim == 512
+        assert model_config.index_head_dim == 128
+
+        self.index_head_dim = model_config.index_head_dim
+        self.head_dim = model_config.head_dim
+        self.li_kv_dtype_ratio = 1  # int8 / bf16: 0.5, bf16 / bf16: 1
+        try:
+            if mr.model.quant_config.li_kv_dtype == "int8":
+                self.li_kv_dtype_ratio = 0.5
+        except:
+            pass
+        self.state_dtype_ratio = 2  # fp32 / bf16: 2, bf16 / bf16: 1
+
+        max_num_reqs = mr.server_args.max_running_requests
+        if mr.server_args.disaggregation_mode == "decode":
+            pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
+            pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
+            max_num_reqs += pre_alloc_size
+        # todo: optimize for variable-length sequences
+        dp_batch_size_imbalance_ratio = 2
+        self.max_num_reqs = max_num_reqs // mr.dp_size * dp_batch_size_imbalance_ratio
+
+        # Full layer per-token memory (bytes)
+        self._full_per_token = (
+            model_config.get_num_kv_heads(tp_size) * model_config.head_dim * kv_size
+        )
+
+        # SWA layer per-token memory (bytes)
+        self._swa_per_token = self._full_per_token
+
+        # Bytes per token of max_total_num_tokens.
+        #
+        # Hybrid (full_layers > 0): max_total = full_tokens, so cell_size accounts
+        # for both pools: F*nf + r*S*ns (where swa_tokens = full_tokens * r).
+        #
+        # All-SWA (full_layers == 0): max_total = swa_tokens directly. The ratio
+        # is meaningless here -- there is no full pool to relate to, and every
+        # token beyond the sliding window can be evicted. So cell_size = S*ns,
+        # with no ratio factor applied.
+        self._cell_size = self._swa_per_token * self._swa_layers_num
+        logger.info(
+            f"[HybridSWAC4C128PoolConfigurator] {self.max_num_reqs=}, {self._full_per_token=}, {self._cell_size=}"
+        )
+
+    def _solve_pool_sizes(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        """Core computation: split max_total_num_tokens into full/swa pool sizes."""
+
+        def align_page_size(x: int) -> int:
+            return (x // page_size) * page_size
+
+        token_capacity = max_total_num_tokens  # todo
+        # Algorithm:
+        # Existing token_capacity is per layer and assume all layers have the same number of tokens.
+        # - Find total # of tokens available across layers.
+        # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+        # assert swa_layers_num == model_config.num_hidden_layers
+        total_tokens = token_capacity * self._swa_layers_num  # slot_dim = 512
+        # todo redundant c4 c128 kv cache
+        c4_c128_ratio, full_c4_ratio = 24, 4
+        full_c128_ratio = c4_c128_ratio * full_c4_ratio
+
+        # we assume that compress_state_buffer size is proportional to the max number of requests.
+        ratio = 1.8  # TODO(zyj), ranges in [1,2]
+        c4_state_max_total_num_tokens = (
+            max(2, int(math.ceil(ratio * 8 / page_size)) + 1)
+            * self.max_num_reqs
+            * page_size
+        )
+        c128_state_max_total_num_tokens = (
+            max(2, int(math.ceil(ratio * 128 / page_size)) + 1)
+            * self.max_num_reqs
+            * page_size
+        )
+        swa_max_total_num_tokens = 2 * self.max_num_reqs * page_size
+
+        # Solve the equations:
+        # 1. swa_max_total_num_tokens * swa_layers_num * 512 + c4_max_total_num_tokens * c4_layers_num * (512+128 *li_kv_dtype_ratio) + \
+        # c128_max_total_num_tokens*c128_layers_num * (512) + c4_state_max_total_num_tokens * c4_layers_num * (512*4+128*4) + \
+        # c128_state_max_total_num_tokens * c128_layers_num * (128*2) = total_tokens * 512
+        # 2. c4_max_total_num_tokens : c128_max_total_num_tokens = 32 : 1
+        denominator = int(
+            c4_c128_ratio
+            * self._c4_layers_num
+            * (
+                self.head_dim
+                + self.index_head_dim * self.li_kv_dtype_ratio
+                + int(self.li_kv_dtype_ratio == 0.5)
+            )
+            + self._c128_layers_num * self.head_dim
+        )
+        c128_max_total_num_tokens = int(
+            (
+                total_tokens * self.head_dim
+                - c4_state_max_total_num_tokens
+                * self._c4_layers_num
+                * (self.head_dim + self.index_head_dim)
+                * 4
+                * self.state_dtype_ratio
+                - c128_state_max_total_num_tokens
+                * self._c128_layers_num
+                * self.index_head_dim
+                * 2
+                * self.state_dtype_ratio
+                - swa_max_total_num_tokens * self._swa_layers_num * self.head_dim
+            )
+            / denominator
+        )
+
+        c4_max_total_num_tokens = int(c128_max_total_num_tokens * c4_c128_ratio)
+        c4_max_total_num_tokens = align_page_size(c4_max_total_num_tokens)
+        c128_max_total_num_tokens = align_page_size(c128_max_total_num_tokens)
+        swa_max_total_num_tokens = align_page_size(swa_max_total_num_tokens)
+        assert c128_max_total_num_tokens > 0
+        full_max_total_num_tokens = int(c128_max_total_num_tokens * full_c128_ratio)
+
+        logger.info(
+            f"Use sliding window memory pool. full_layer_tokens={full_max_total_num_tokens}, swa_layer_tokens={swa_max_total_num_tokens}"
+        )
+
+        return MemoryPoolConfig(
+            max_total_num_tokens=full_max_total_num_tokens,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+            c4_max_total_num_tokens=c4_max_total_num_tokens,
+            c128_max_total_num_tokens=c128_max_total_num_tokens,
+            c4_state_max_total_num_tokens=c4_state_max_total_num_tokens,
+            c128_state_max_total_num_tokens=c128_state_max_total_num_tokens,
+        )
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        max_total_num_tokens = int(available_bytes // self._cell_size)
+        return self._solve_pool_sizes(max_total_num_tokens, page_size)
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        return self._solve_pool_sizes(max_total_num_tokens, page_size)
+
+
 def create_memory_pool_configurator(
     mr: ModelRunner,
 ) -> MemoryPoolConfigurator:
     """Factory: select the right configurator for the model architecture."""
     if mr.is_hybrid_swa:
         return HybridSWAPoolConfigurator(mr)
+    if mr.is_hybrid_swa_c4_c128:
+        return HybridSWAC4C128PoolConfigurator(mr)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(mr)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch_npu
 from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
@@ -23,7 +25,11 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    OutCacheLoc,
+)
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var
 
@@ -44,6 +50,54 @@ def _reshape_kv_for_fia_nz(
 
 
 logger = logging.getLogger(__name__)
+
+
+def dsv4_sparse_attn(
+    query_states: torch.Tensor,
+    kv_states: torch.Tensor,
+    sinks: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+):
+    query_states = query_states.transpose(1, 2)
+    kv_states = kv_states.unsqueeze(1)
+    attn_weights = torch.matmul(query_states, kv_states.transpose(2, 3)) * softmax_scale
+    topk_idxs = topk_idxs.to(query_states.device)
+    index_mask = torch.full(
+        (query_states.shape[0], 1, query_states.shape[2], kv_states.shape[2] + 1),
+        fill_value=torch.finfo(torch.float32).min,
+        dtype=torch.float32,
+        device="npu",
+    ).scatter_(-1, topk_idxs.unsqueeze(1), 0)
+
+    attn_weights = attn_weights + index_mask[..., :-1]
+
+    sinks = sinks.reshape(1, -1, 1, 1).expand(
+        query_states.shape[0], -1, query_states.shape[-2], -1
+    )
+    combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+    combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+    probs = nn.functional.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    del combined_logits
+    scores = probs[..., :-1].to(kv_states.dtype)
+    attn_output = torch.matmul(scores, kv_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output
+
+
+def get_kv_indices(forward_batch, kv_len, page_table, idx, seqlen):
+    logic_start = max(0, seqlen - kv_len)
+    logic_end = seqlen
+    if forward_batch.attn_backend.page_size == 1:
+        kv_indices = page_table[idx, logic_start:logic_end]
+    else:
+        page_size = forward_batch.attn_backend.page_size
+        logic_pos = torch.arange(logic_start, logic_end, device=page_table.device)
+        block_id = logic_pos // page_size
+        offset_in_block = logic_pos % page_size
+        physical_block_id = page_table[idx, block_id]
+        kv_indices = physical_block_id * page_size + offset_in_block
+    return kv_indices
 
 
 @dataclass
@@ -67,6 +121,30 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+
+    # dsv4
+    kernel_metadata = None
+    start_pos = None
+
+    swa_page_table = None
+    c4_page_table = None
+    c128_page_table = None
+    c4_state_page_table = None
+    c128_state_page_table = None
+
+    swa_loc = None
+    swa_loc_local = None
+    swa_kv_tobe_scatter_index = None
+    c4_loc = None
+    c128_loc = None
+    c128_state_loc = None
+    c4_state_loc = None
+
+    actual_seq_lengths_q_pa = None
+    positions_cmp_padding_c4 = None
+    positions_cmp_padding_c128 = None
+    seqused = None
+    actual_seq_lengths_q_cmp = None
 
 
 class AscendAttnMaskBuilder:
@@ -214,11 +292,24 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = None
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
+        self.speculative_step_offset = speculative_step_id + 1
         self.speculative_step_offset_npu = torch.tensor(
             speculative_step_id + 1, device="npu"
         )
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
+        self.is_dsv4 = (
+            "DeepseekV4ForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "DeepseekV4ForCausalLMNextN"
+            in model_runner.model_config.hf_config.architectures
+        )
+        self.is_dsv4_nextn = (
+            "DeepseekV4ForCausalLMNextN"
+            in model_runner.model_config.hf_config.architectures
+        )
+
+        self.config = model_runner.model_config
+        assert (self.is_dsv4 and self.page_size in [1, 128]) or (not self.is_dsv4)
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
@@ -244,6 +335,15 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_swa = model_runner.req_to_token_pool.req_to_token_swa
+        self.req_to_token_c4 = model_runner.req_to_token_pool.req_to_token_c4
+        self.req_to_token_c128 = model_runner.req_to_token_pool.req_to_token_c128
+        self.req_to_token_c4_state = (
+            model_runner.req_to_token_pool.req_to_token_c4_state
+        )
+        self.req_to_token_c128_state = (
+            model_runner.req_to_token_pool.req_to_token_c128_state
+        )
         self.graph_mode = False
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -278,6 +378,18 @@ class AscendAttnBackend(AttentionBackend):
                 if num >= self.tp_q_head_num:
                     self.q_head_num_padding = num
                     break
+        if self.is_dsv4:
+            self.token_to_kv_pool = model_runner.token_to_kv_pool
+            self.compress_ratios = model_runner.model_config.hf_config.compress_ratios
+            self.index_topk = model_runner.model_config.hf_config.index_topk
+            self.index_n_heads = model_runner.model_config.hf_config.index_n_heads
+            self.index_head_dim = model_runner.model_config.hf_config.index_head_dim
+            assert (
+                self.index_topk == 512
+                and self.index_n_heads == 64
+                and self.index_head_dim == 128
+            )
+            assert self.use_fia
 
         # dllm model config
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -297,7 +409,123 @@ class AscendAttnBackend(AttentionBackend):
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        pass
+        positions = spec_info.positions
+        self.forward_metadata.positions_cmp_padding_c4.fill_(0)
+        self.forward_metadata.positions_cmp_padding_c128.fill_(0)
+        if positions.numel() > 0:
+            request_num = positions.shape[0] // self.speculative_num_draft_tokens
+            start_positions = (
+                self.forward_metadata.seq_lens_cpu[:request_num]
+                - self.speculative_num_draft_tokens
+                + 1
+            )
+            abs_positions = start_positions.view(-1, 1) + torch.arange(
+                self.speculative_num_draft_tokens,
+            ).view(1, -1)
+            mask_c4 = (abs_positions % 4) != 0
+            mask_c128 = (abs_positions % 128) != 0
+            gather_shape_c4 = min(
+                positions.shape[0],
+                self.forward_metadata.positions_cmp_padding_c4.shape[0],
+            )
+            gather_shape_c128 = min(
+                positions.shape[0],
+                self.forward_metadata.positions_cmp_padding_c128.shape[0],
+            )
+            sorted_indices_c4 = (
+                torch.argsort(mask_c4.flatten(), dim=0, stable=True)[:gather_shape_c4]
+                .pin_memory()
+                .to(device=positions.device, non_blocking=True)
+            )
+            sorted_indices_c128 = (
+                torch.argsort(mask_c128.flatten(), dim=0, stable=True)[
+                    :gather_shape_c128
+                ]
+                .pin_memory()
+                .to(device=positions.device, non_blocking=True)
+            )
+            self.forward_metadata.positions_cmp_padding_c4[:gather_shape_c4] = (
+                torch.gather(positions, 0, sorted_indices_c4)
+            )
+            self.forward_metadata.positions_cmp_padding_c128[:gather_shape_c128] = (
+                torch.gather(positions, 0, sorted_indices_c128)
+            )
+
+    def compute_kernel_metadata(
+        self,
+        batch_size: int,
+        forward_metadata: ForwardMetadata,
+        max_seqlen_q: int,
+        is_nextn=False,
+    ):
+        fa_common_kwargs = {
+            "cu_seqlens_q": forward_metadata.actual_seq_lengths_q_pa,  # just for TND: 0,1,2,3,4,5; B+1
+            "seqused_kv": forward_metadata.actual_seq_lengths_kv,  # num of key elements used, DT_INT32, kv_len TODO: 确认压缩的怎么填
+            "cmp_ratio": 1,  # no support 1, None.   TODO repair this after package updated
+            "ori_mask_mode": 4,  # sliding window
+            "cmp_mask_mode": 3,  # causal
+            "ori_win_left": self.config.sliding_window_size - 1,
+            "ori_win_right": 0,
+            "layout_q": "TND",  # "BSND" , "TND"
+            "layout_kv": "PA_ND",  # "PA_ND"
+        }
+        tp_size = get_attention_tp_size()
+        q_head_num = self.config.get_num_attention_heads(tp_size)
+        kv_head_num = self.config.get_total_num_kv_heads()
+        c1a_metadata_kwargs = {
+            "batch_size": batch_size,  # If tnd layout, set None. TODO repair this after package updated
+            "num_heads_q": q_head_num,
+            "num_heads_kv": kv_head_num,
+            "head_dim": self.config.head_dim,  # TODO: qzd
+            "has_ori_kv": True,
+            "has_cmp_kv": False,  # True, False; False means no compressor kv cache
+        }
+        kernel_metadata = {}
+        c1a_metadata_kwargs = c1a_metadata_kwargs | fa_common_kwargs
+        c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+            **c1a_metadata_kwargs
+        )
+        kernel_metadata.update({"c1a_metadata": c1a_metadata})
+        if not is_nextn:
+            # scfa_metadata
+            c4a_metadata_kwargs = {
+                "cmp_ratio": 4,
+                "has_cmp_kv": True,
+                "cmp_topk": self.index_topk,
+            }
+            c4a_metadata_kwargs = c1a_metadata_kwargs | c4a_metadata_kwargs
+            c4a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                **c4a_metadata_kwargs
+            )
+            kernel_metadata.update({"c4a_metadata": c4a_metadata})
+
+            # cfa_metadata
+            c128a_metadata_kwargs = {"cmp_ratio": 128, "has_cmp_kv": True}
+            c128a_metadata_kwargs = c1a_metadata_kwargs | c128a_metadata_kwargs
+
+            c128a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                **c128a_metadata_kwargs
+            )
+            kernel_metadata.update({"c128a_metadata": c128a_metadata})
+
+            # li_quant_metadata
+            li_quant_metadata = torch.ops.custom.npu_quant_lightning_indexer_metadata(
+                device=str(forward_metadata.actual_seq_lengths_q.device),
+                actual_seq_lengths_query=forward_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_key=forward_metadata.actual_seq_lengths_kv,
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+                layout_query="TND",
+                cmp_ratio=4,  # only c4a have li module
+                key_quant_mode=0,  # 0:per-token-head
+                query_quant_mode=0,  # 0:per-token-head
+                num_heads_q=self.index_n_heads,
+                num_heads_k=1,  # MQA: num_heads_kv=1
+                head_dim=self.index_head_dim,
+            )
+            kernel_metadata.update({"li_quant_metadata": li_quant_metadata})
+        return kernel_metadata
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -310,30 +538,28 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.spec_info is not None
         ):
             seq_lens_max += self.speculative_step_id + 1
-        self.forward_metadata.block_tables = (
-            forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, :seq_lens_max
-            ][:, :: self.page_size]
-            // self.page_size
-        )
-        if self.is_hybrid_swa:
-            self.forward_metadata.block_tables_swa = (
-                (
-                    self.full_to_swa_index_mapping[
-                        forward_batch.req_to_token_pool.req_to_token[
-                            forward_batch.req_pool_indices, :seq_lens_max
-                        ]
-                    ][:, :: self.page_size]
-                    // self.page_size
-                )
-                .to(torch.int32)
-                .contiguous()
-            )
+
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
                 forward_batch.extend_seq_lens.cpu().int()
             )
+            self.forward_metadata.actual_seq_lengths_q = (
+                forward_batch.extend_seq_lens.cumsum(0).int()
+            )
+            if self.is_dsv4:
+                self.forward_metadata.actual_seq_lengths_q_pa = torch.cat(
+                    [
+                        torch.tensor([0], dtype=torch.int32, device="npu"),
+                        self.forward_metadata.actual_seq_lengths_q,
+                    ],
+                    dim=0,
+                )  # [0,seq1,seq1+seq2,...]
+                self.forward_metadata.actual_seq_lengths_q_cmp = (
+                    self.forward_metadata.actual_seq_lengths_q_pa.clone()
+                )
+                max_seqlen_q = seq_lens_max
+
         if forward_batch.seq_lens is not None:
             self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
         else:
@@ -349,6 +575,351 @@ class AscendAttnBackend(AttentionBackend):
         ):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
+        if forward_batch.forward_mode.is_decode():
+            self.forward_metadata.actual_seq_lengths_q = torch.arange(
+                1, forward_batch.batch_size + 1, device="npu", dtype=torch.int32
+            )
+            if self.is_dsv4:
+                self.forward_metadata.actual_seq_lengths_q_pa = torch.arange(
+                    0, forward_batch.batch_size + 1, device="npu", dtype=torch.int32
+                )
+                self.forward_metadata.actual_seq_lengths_q_cmp = (
+                    self.forward_metadata.actual_seq_lengths_q_pa.clone()
+                )
+                max_seqlen_q = 1
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            self.forward_metadata.actual_seq_lengths_q = torch.arange(
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens * forward_batch.batch_size
+                + self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                device="npu",
+                dtype=torch.int32,
+            )
+            if self.is_dsv4:
+                self.forward_metadata.actual_seq_lengths_q_pa = torch.arange(
+                    0,
+                    forward_batch.batch_size * self.speculative_num_draft_tokens
+                    + self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device="npu",
+                    dtype=torch.int32,
+                )
+                self.forward_metadata.actual_seq_lengths_q_cmp = (
+                    self.forward_metadata.actual_seq_lengths_q_pa.clone()
+                )
+                max_seqlen_q = self.speculative_num_draft_tokens
+
+        self.forward_metadata.actual_seq_lengths_kv = forward_batch.seq_lens.clone().to(
+            torch.int32
+        )
+
+        # compute page_table
+        self.forward_metadata.block_tables = (
+            forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :seq_lens_max
+            ]
+        )
+
+        if self.is_dsv4:
+            if forward_batch.forward_mode.is_extend():
+                num_pages_swa = (
+                    forward_batch.seq_lens_cpu + (self.page_size - 1)
+                ) // self.page_size
+                cum_num_pages_swa = num_pages_swa.cumsum(0)
+                page_offset = 0
+                swa_kv_tobe_scatter_index = []
+                self.forward_metadata.swa_page_table = torch.zeros_like(
+                    self.forward_metadata.block_tables
+                )
+                for idx, seq_len in enumerate(forward_batch.seq_lens_cpu):
+                    if seq_len == 0:
+                        continue
+                    positions_per_bs = (
+                        torch.arange(seq_len, dtype=torch.int32, device="npu")
+                        + page_offset * self.page_size
+                    )
+                    swa_kv_tobe_scatter_index.append(positions_per_bs)
+                    page_offset = cum_num_pages_swa[idx]
+                    self.forward_metadata.swa_page_table[
+                        idx, : positions_per_bs.numel()
+                    ].copy_(positions_per_bs)
+                self.forward_metadata.swa_kv_tobe_scatter_index = torch.cat(
+                    swa_kv_tobe_scatter_index
+                )
+            else:
+                self.forward_metadata.swa_page_table = (
+                    forward_batch.req_to_token_pool.req_to_token_swa[
+                        forward_batch.req_pool_indices, :seq_lens_max
+                    ]
+                )
+
+            # compute loc for compressor and swa
+            if (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+            ):  # prefill
+                c4_offset = 0
+                swa_offset = 0
+                full_offset = 0
+                c4_out_loc_list = []
+                swa_out_loc_list = []
+                swa_kv_local_list = []
+                save_swa_lens = forward_batch.seq_lens.clip(
+                    max=self.config.sliding_window_size
+                )
+                for idx, (seqlen, c4_state_seqlen, swa_seqlen) in enumerate(
+                    zip(
+                        forward_batch.seq_lens,
+                        forward_batch.kv_seq_lens_cpu.c4_state_kv_len,
+                        forward_batch.kv_seq_lens_cpu.swa_kv_len,
+                    )
+                ):
+                    c4_end = c4_offset + c4_state_seqlen
+                    c4_state_out_cache_loc = (
+                        forward_batch.out_cache_loc_dsv4.out_c4_state_loc[
+                            c4_offset:c4_end
+                        ]
+                    )
+                    ratio = 4
+                    remainder = seqlen % ratio
+                    cutoff = seqlen - remainder
+                    last_num = 0
+                    if cutoff >= ratio:
+                        last_num += ratio
+                    last_num += remainder
+                    c4_out_loc_list.append(c4_state_out_cache_loc[-last_num:])
+                    c4_offset += c4_state_seqlen
+
+                    swa_end = swa_offset + swa_seqlen
+                    swa_out_cache_loc = forward_batch.out_cache_loc_dsv4.out_swa_loc[
+                        swa_offset:swa_end
+                    ]
+                    if seqlen > self.config.sliding_window_size:
+                        swa_out_cache_loc = swa_out_cache_loc[
+                            -self.config.sliding_window_size :
+                        ]
+                    swa_out_loc_list.append(swa_out_cache_loc)
+
+                    end = full_offset + seqlen
+                    swa_kv_local_list.append(
+                        torch.arange(
+                            end - save_swa_lens[idx],
+                            end,
+                            dtype=torch.int64,
+                            device="npu",
+                        )
+                    )
+                    swa_offset += swa_seqlen
+                    full_offset += seqlen
+                c4_out_cache_loc = torch.cat(c4_out_loc_list, dim=0)
+                swa_out_cache_loc = torch.cat(swa_out_loc_list, dim=0)
+                swa_loc_local = torch.cat(swa_kv_local_list, dim=0)
+                self.forward_metadata.swa_loc_local = (
+                    swa_loc_local  # for prefill swa cache gather index
+                )
+
+                self.forward_metadata.swa_loc = swa_out_cache_loc
+                self.forward_metadata.c4_state_loc = c4_out_cache_loc
+            else:  # decoder/verify
+                self.forward_metadata.swa_loc = (
+                    forward_batch.out_cache_loc_dsv4.out_swa_loc
+                )
+                self.forward_metadata.c4_state_loc = (
+                    forward_batch.out_cache_loc_dsv4.out_c4_state_loc
+                )
+
+            if not self.is_dsv4_nextn:
+                self.forward_metadata.c4_page_table = (
+                    forward_batch.req_to_token_pool.req_to_token_c4[
+                        forward_batch.req_pool_indices, : max(1, seq_lens_max // 4)
+                    ]
+                )
+
+                self.forward_metadata.c128_page_table = (
+                    forward_batch.req_to_token_pool.req_to_token_c128[
+                        forward_batch.req_pool_indices, : max(1, seq_lens_max // 128)
+                    ]
+                )
+
+                self.forward_metadata.c4_state_page_table = (
+                    forward_batch.req_to_token_pool.req_to_token_c4_state[
+                        forward_batch.req_pool_indices, :seq_lens_max
+                    ]
+                )
+
+                self.forward_metadata.c128_state_page_table = (
+                    forward_batch.req_to_token_pool.req_to_token_c128_state[
+                        forward_batch.req_pool_indices, :seq_lens_max
+                    ]
+                )
+                self.forward_metadata.c4_loc = (
+                    forward_batch.out_cache_loc_dsv4.out_c4_loc
+                )
+                self.forward_metadata.c128_loc = (
+                    forward_batch.out_cache_loc_dsv4.out_c128_loc
+                )
+                self.forward_metadata.c128_state_loc = (
+                    forward_batch.out_cache_loc_dsv4.out_c128_state_loc
+                )
+
+            # compute compressor metadata
+            if get_bool_env_var("USE_FUSED_COMPRESSOR") and not self.is_dsv4_nextn:
+                if forward_batch.forward_mode.is_decode():
+                    # pad to (bs,) shape
+                    self.forward_metadata.c4_loc = F.pad(
+                        self.forward_metadata.c4_loc,
+                        (
+                            0,
+                            forward_batch.batch_size
+                            - self.forward_metadata.c4_loc.numel(),
+                        ),
+                        value=0,
+                    )
+                    self.forward_metadata.c128_loc = F.pad(
+                        self.forward_metadata.c128_loc,
+                        (
+                            0,
+                            forward_batch.batch_size
+                            - self.forward_metadata.c128_loc.numel(),
+                        ),
+                        value=0,
+                    )
+
+                    t = self.forward_metadata.actual_seq_lengths_q[-1]
+                    self.forward_metadata.positions_cmp_padding_c4 = torch.zeros(
+                        min(t, t // 4 + forward_batch.batch_size),
+                        dtype=torch.int64,
+                        device="npu",
+                    )
+                    self.forward_metadata.positions_cmp_padding_c128 = torch.zeros(
+                        min(t, t // 128 + forward_batch.batch_size),
+                        dtype=torch.int64,
+                        device="npu",
+                    )
+
+                    valid = forward_batch.seq_lens > 0
+                    positions_last = torch.clamp(forward_batch.seq_lens - 1, min=0)
+                    should_compress = ((forward_batch.seq_lens % 4) == 0) & valid
+                    positions_cmp = positions_last[should_compress].to(torch.int64) + (
+                        1 - 4
+                    )
+                    self.forward_metadata.positions_cmp_padding_c4[
+                        : positions_cmp.shape[0]
+                    ].copy_(positions_cmp)
+
+                    should_compress = ((forward_batch.seq_lens % 128) == 0) & valid
+                    positions_cmp = positions_last[should_compress].to(torch.int64) + (
+                        1 - 128
+                    )
+                    self.forward_metadata.positions_cmp_padding_c128[
+                        : positions_cmp.shape[0]
+                    ].copy_(positions_cmp)
+                    self.forward_metadata.start_pos = positions_last.to(torch.int32)
+                    self.forward_metadata.seqused = valid.to(torch.int32)
+                elif forward_batch.forward_mode.is_prefill():
+                    t = self.forward_metadata.actual_seq_lengths_q[-1]
+                    self.forward_metadata.positions_cmp_padding_c4 = torch.zeros(
+                        min(t, t // 4 + forward_batch.batch_size),
+                        dtype=torch.int64,
+                        device="npu",
+                    )
+                    self.forward_metadata.positions_cmp_padding_c128 = torch.zeros(
+                        min(t, t // 128 + forward_batch.batch_size),
+                        dtype=torch.int64,
+                        device="npu",
+                    )
+                    positions_cmp_dict = {
+                        "4": [],
+                        "128": [],
+                    }
+                    for idx in range(
+                        self.forward_metadata.actual_seq_lengths_q_cmp.numel() - 1
+                    ):
+                        start = self.forward_metadata.actual_seq_lengths_q_cmp[idx]
+                        end = self.forward_metadata.actual_seq_lengths_q_cmp[idx + 1]
+                        seq_len = end - start
+                        if seq_len == 0:
+                            continue
+                        positions = forward_batch.positions[start:end]
+                        for ratio, positions_cmp_list in positions_cmp_dict.items():
+                            ratio = int(ratio)
+                            cutoff = seq_len - (seq_len % ratio)
+                            if cutoff > 0:
+                                positions_cmp_list.append(positions[:cutoff:ratio])
+                    for key, value in positions_cmp_dict.items():
+                        if len(value) > 0:
+                            value = torch.cat(value, dim=0).long()
+                            if key == "4":
+                                positions_cmp_padding = (
+                                    self.forward_metadata.positions_cmp_padding_c4
+                                )
+                            else:
+                                positions_cmp_padding = (
+                                    self.forward_metadata.positions_cmp_padding_c128
+                                )
+                            assert value.numel() <= positions_cmp_padding.numel()
+                            positions_cmp_padding[: value.shape[0]].copy_(value)
+
+                    self.forward_metadata.start_pos = torch.zeros(
+                        forward_batch.batch_size, device="npu", dtype=torch.int32
+                    )  # TODO support chunk prefill
+                    self.forward_metadata.seqused = None
+
+        # Convert the page table to a strided format which is needed by FA3 API
+        if self.page_size > 1:
+            self.forward_metadata.block_tables = (
+                self.forward_metadata.block_tables[:, :: self.page_size]
+                // self.page_size
+            )
+            if self.is_hybrid_swa:
+                self.forward_metadata.block_tables_swa = (
+                    (
+                        self.full_to_swa_index_mapping[
+                            forward_batch.req_to_token_pool.req_to_token[
+                                forward_batch.req_pool_indices, :seq_lens_max
+                            ]
+                        ][:, :: self.page_size]
+                        // self.page_size
+                    )
+                    .to(torch.int32)
+                    .contiguous()
+                )
+            if self.is_dsv4:
+                self.forward_metadata.swa_page_table = (
+                    self.forward_metadata.swa_page_table[:, :: self.page_size]
+                    // self.page_size
+                )
+                if not self.is_dsv4_nextn:
+                    self.forward_metadata.c4_page_table = (
+                        self.forward_metadata.c4_page_table[:, :: self.page_size]
+                        // self.page_size
+                    )
+                    self.forward_metadata.c128_page_table = (
+                        self.forward_metadata.c128_page_table[:, :: self.page_size]
+                        // self.page_size
+                    )
+                    self.forward_metadata.c4_state_page_table = (
+                        self.forward_metadata.c4_state_page_table[:, :: self.page_size]
+                        // self.page_size
+                    )
+                    self.forward_metadata.c128_state_page_table = (
+                        self.forward_metadata.c128_state_page_table[
+                            :, :: self.page_size
+                        ]
+                        // self.page_size
+                    )
+
+        if self.is_dsv4:
+            self.forward_metadata.kernel_metadata = self.compute_kernel_metadata(
+                forward_batch.batch_size,
+                self.forward_metadata,
+                max_seqlen_q,
+                is_nextn=self.is_dsv4_nextn,
+            )
 
         if forward_batch.forward_mode.is_target_verify():
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
@@ -390,11 +961,36 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.graph_metadata = {
-            "block_tables": torch.empty(
+            "block_tables": torch.zeros(
                 (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
                 dtype=torch.int32,
                 device=self.device,
             ),
+            "swa_page_table": torch.zeros(
+                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                dtype=torch.int32,
+                device=self.device,
+            ).fill_(-1),
+            "c4_page_table": torch.zeros(
+                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                dtype=torch.int32,
+                device=self.device,
+            ).fill_(-1),
+            "c128_page_table": torch.zeros(
+                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                dtype=torch.int32,
+                device=self.device,
+            ).fill_(-1),
+            "c4_state_page_table": torch.zeros(
+                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                dtype=torch.int32,
+                device=self.device,
+            ).fill_(-1),
+            "c128_state_page_table": torch.zeros(
+                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                dtype=torch.int32,
+                device=self.device,
+            ).fill_(-1),
         }
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
@@ -434,6 +1030,13 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
+            include_v2=True
+        ):
+            tokens_per_bs = self.speculative_num_draft_tokens
+        else:
+            tokens_per_bs = 1
+
         if (
             forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
@@ -494,6 +1097,79 @@ class AscendAttnBackend(AttentionBackend):
                 device=seq_lens.device,
             )
 
+        if self.is_dsv4:
+            metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
+            c4_padding_num = min(
+                bs * tokens_per_bs,
+                bs * tokens_per_bs // 4 + bs,
+            )
+            c128_padding_num = min(
+                bs * tokens_per_bs,
+                bs * tokens_per_bs // 128 + bs,
+            )
+            metadata.swa_loc = torch.zeros(bs * tokens_per_bs, dtype=torch.int64).npu()
+            if not self.is_dsv4_nextn:
+                metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
+                metadata.c128_page_table = self.graph_metadata["c128_page_table"][
+                    :bs, :
+                ]
+                metadata.c4_state_page_table = self.graph_metadata[
+                    "c4_state_page_table"
+                ][:bs, :]
+                metadata.c128_state_page_table = self.graph_metadata[
+                    "c128_state_page_table"
+                ][:bs, :]
+                metadata.c4_loc = torch.zeros(c4_padding_num, dtype=torch.int64).npu()
+                metadata.c4_state_loc = torch.zeros(
+                    bs * tokens_per_bs, dtype=torch.int64
+                ).npu()
+                metadata.c128_loc = torch.zeros(
+                    c128_padding_num, dtype=torch.int64
+                ).npu()
+                metadata.c128_state_loc = torch.zeros(
+                    bs * tokens_per_bs, dtype=torch.int64
+                ).npu()
+
+            metadata.actual_seq_lengths_q = torch.arange(
+                tokens_per_bs,
+                tokens_per_bs * bs + tokens_per_bs,
+                tokens_per_bs,
+                device="npu",
+                dtype=torch.int32,
+            )
+            metadata.actual_seq_lengths_q_pa = torch.arange(
+                0,
+                bs * tokens_per_bs + tokens_per_bs,
+                tokens_per_bs,
+                device="npu",
+                dtype=torch.int32,
+            )
+            metadata.actual_seq_lengths_kv = seq_lens.clone().to(torch.int32)
+
+            metadata.actual_seq_lengths_q_cmp = torch.zeros(
+                bs + 1, dtype=torch.int32, device=self.device
+            )
+
+            kernel_metadata = {}
+            c_metadata = torch.zeros(1024, dtype=torch.int32).npu()
+
+            kernel_metadata["c1a_metadata"] = c_metadata.clone()
+            if not self.is_dsv4_nextn:
+                kernel_metadata["c4a_metadata"] = c_metadata.clone()
+                kernel_metadata["c128a_metadata"] = c_metadata.clone()
+                kernel_metadata["li_quant_metadata"] = c_metadata.clone()
+
+                metadata.start_pos = torch.zeros(bs, dtype=torch.int32).npu()
+                metadata.seqused = torch.zeros(bs, dtype=torch.int32).npu()
+                metadata.positions_cmp_padding_c4 = torch.zeros(
+                    c4_padding_num, dtype=torch.int32
+                ).npu()
+                metadata.positions_cmp_padding_c128 = torch.zeros(
+                    c128_padding_num, dtype=torch.int32
+                ).npu()
+
+            metadata.kernel_metadata = kernel_metadata
+
         self.graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
@@ -509,6 +1185,8 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc_dsv4: OutCacheLoc = None,
+        positions: torch.Tensor = None,
     ):
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
@@ -516,30 +1194,171 @@ class AscendAttnBackend(AttentionBackend):
             max_len += self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
-        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        if not self.is_dsv4:
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
-        if self.is_hybrid_swa:
-            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
-                self.full_to_swa_index_mapping[
-                    self.req_to_token[req_pool_indices[:bs], :max_len]
-                ][:, :: self.page_size]
-                // self.page_size
+            kv_indices = self.req_to_token[req_pool_indices[:bs], :max_len]
+            if self.is_hybrid_swa:
+                metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
+                    self.full_to_swa_index_mapping[
+                        self.req_to_token[req_pool_indices[:bs], :max_len]
+                    ][:, :: self.page_size]
+                    // self.page_size
+                )
+                metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+                metadata.block_tables_swa[bs:, :].fill_(0)
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                kv_indices[:, :: self.page_size] // self.page_size
             )
-            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables_swa[bs:, :].fill_(0)
-        metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
-            // self.page_size
-        )
-
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
+            seq_lens_cpu = seq_lens_cpu + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            seq_lens = seq_lens + self.speculative_step_offset_npu
-        metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+            seq_lens = seq_lens + self.speculative_step_offset
+            seq_lens_cpu = seq_lens_cpu + self.speculative_step_offset
+
+        metadata.seq_lens_cpu = seq_lens_cpu
+
+        seq_len_for_this_batch = seq_lens[:bs].to(torch.int32)
+        metadata.seq_lens[:bs].copy_(seq_len_for_this_batch)
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
+            include_v2=True
+        ):
+            tokens_per_bs = self.speculative_num_draft_tokens
+        else:
+            tokens_per_bs = 1
+        if self.is_dsv4:
+            metadata.actual_seq_lengths_kv.fill_(0)
+            metadata.actual_seq_lengths_kv[:bs].copy_(seq_len_for_this_batch)
+            if not self.is_dsv4_nextn:
+                if positions.numel() > 0:
+                    metadata.start_pos.copy_(
+                        torch.clamp(seq_lens - tokens_per_bs, min=0).to(torch.int32)
+                    )
+                else:
+                    metadata.start_pos.fill_(0)
+                last_token_idx = metadata.actual_seq_lengths_q_pa[:-1]
+
+                if forward_mode.is_target_verify():
+                    valid = (
+                        seq_lens - self.speculative_num_draft_tokens
+                    ) > 0  # pre-seq_lens
+                else:
+                    valid = seq_lens > 0
+
+                metadata.seqused.copy_((valid.to(torch.int32)) * tokens_per_bs)
+
+                metadata.actual_seq_lengths_q_cmp.copy_(
+                    metadata.actual_seq_lengths_q_pa
+                )
+
+                if not forward_mode.is_target_verify():
+                    metadata.positions_cmp_padding_c4.fill_(0)
+                    if positions.numel() > 0:
+                        positions_last = positions[last_token_idx]
+                        should_compress = ((seq_lens % 4) == 0) & valid
+                        positions_cmp = positions_last[should_compress] + (1 - 4)
+                        metadata.positions_cmp_padding_c4[
+                            : positions_cmp.shape[0]
+                        ].copy_(positions_cmp)
+
+                    metadata.positions_cmp_padding_c128.fill_(0)
+                    if positions.numel() > 0:
+                        should_compress = ((seq_lens % 128) == 0) & valid
+                        positions_cmp = positions_last[should_compress] + (1 - 128)
+                        metadata.positions_cmp_padding_c128[
+                            : positions_cmp.shape[0]
+                        ].copy_(positions_cmp)
+                assert req_pool_indices.numel() == bs
+
+            req_pool_indices = req_pool_indices[:bs]
+            src = (
+                self.req_to_token_swa[req_pool_indices, :max_len][:, :: self.page_size]
+                // self.page_size
+            )
+            metadata.swa_page_table.fill_(-1)
+            metadata.swa_page_table[: src.shape[0], : src.shape[1]].copy_(src)
+
+            swa_loc = out_cache_loc_dsv4.out_swa_loc
+            metadata.swa_loc[: swa_loc.shape[0]].copy_(swa_loc)
+            metadata.swa_loc[swa_loc.shape[0] :].fill_(0)
+
+            if not self.is_dsv4_nextn:
+                src = (
+                    self.req_to_token_c4[req_pool_indices, : max_len // 4][
+                        :, :: self.page_size
+                    ]
+                    // self.page_size
+                )
+                metadata.c4_page_table.fill_(-1)
+                metadata.c4_page_table[: src.shape[0], : src.shape[1]].copy_(src)
+
+                src = (
+                    self.req_to_token_c128[req_pool_indices, : max_len // 128][
+                        :, :: self.page_size
+                    ]
+                    // self.page_size
+                )
+                metadata.c128_page_table.fill_(-1)
+                metadata.c128_page_table[: src.shape[0], : src.shape[1]].copy_(src)
+
+                src = (
+                    self.req_to_token_c4_state[req_pool_indices, :max_len][
+                        :, :: self.page_size
+                    ]
+                    // self.page_size
+                )
+                metadata.c4_state_page_table.fill_(-1)
+                metadata.c4_state_page_table[: src.shape[0], : src.shape[1]].copy_(src)
+
+                src = (
+                    self.req_to_token_c128_state[req_pool_indices[:bs], :max_len][
+                        :, :: self.page_size
+                    ]
+                    // self.page_size
+                )
+                metadata.c128_state_page_table.fill_(-1)
+                metadata.c128_state_page_table[: src.shape[0], : src.shape[1]].copy_(
+                    src
+                )
+
+                c4_loc = out_cache_loc_dsv4.out_c4_loc
+                metadata.c4_loc[: c4_loc.shape[0]].copy_(c4_loc)
+                metadata.c4_loc[c4_loc.shape[0] :].fill_(
+                    0
+                )  # 0: put padding data at the first location, which is unused position
+
+                c128_loc = out_cache_loc_dsv4.out_c128_loc
+                metadata.c128_loc[: c128_loc.shape[0]].copy_(c128_loc)
+                metadata.c128_loc[c128_loc.shape[0] :].fill_(0)
+
+                c4_state_loc = out_cache_loc_dsv4.out_c4_state_loc
+                metadata.c4_state_loc[: c4_state_loc.shape[0]].copy_(c4_state_loc)
+                metadata.c4_state_loc[c4_state_loc.shape[0] :].fill_(0)
+
+                c128_state_loc = out_cache_loc_dsv4.out_c128_state_loc
+                metadata.c128_state_loc[: c128_state_loc.shape[0]].copy_(c128_state_loc)
+                metadata.c128_state_loc[c128_state_loc.shape[0] :].fill_(0)
+
+            kernel_metadata = self.compute_kernel_metadata(
+                bs, metadata, max_seqlen_q=tokens_per_bs, is_nextn=self.is_dsv4_nextn
+            )
+            metadata.kernel_metadata["c1a_metadata"].copy_(
+                kernel_metadata["c1a_metadata"]
+            )
+            if not self.is_dsv4_nextn:
+                metadata.kernel_metadata["c4a_metadata"].copy_(
+                    kernel_metadata["c4a_metadata"]
+                )
+                metadata.kernel_metadata["c128a_metadata"].copy_(
+                    kernel_metadata["c128a_metadata"]
+                )
+                metadata.kernel_metadata["li_quant_metadata"].copy_(
+                    kernel_metadata["li_quant_metadata"]
+                )
 
         self.forward_metadata = metadata
 
@@ -736,7 +1555,7 @@ class AscendAttnBackend(AttentionBackend):
     def forward_sparse(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
+        k: Union[torch.Tensor, List[torch.Tensor]],
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
@@ -745,6 +1564,7 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: torch.Tensor = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
 
         is_prefill = (
@@ -753,6 +1573,200 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_draft_extend()
             and not forward_batch.forward_mode.is_target_verify()
         )
+        if self.is_dsv4:
+            assert save_kv_cache == False
+            compress_ratio = self.compress_ratios[layer.layer_id]
+            if self.is_dsv4_nextn:
+                compress_page_table = None
+            elif compress_ratio == 4:
+                compress_page_table = (
+                    forward_batch.attn_backend.forward_metadata.c4_page_table
+                )
+            elif compress_ratio == 128:
+                compress_page_table = (
+                    forward_batch.attn_backend.forward_metadata.c128_page_table
+                )
+            else:
+                compress_page_table = None
+            swa_page_table = forward_batch.attn_backend.forward_metadata.swa_page_table
+
+            if is_prefill:
+                use_pa_prefill = get_bool_env_var("USE_PA_PREFILL")
+                if use_pa_prefill:
+                    kv_pad = k.unflatten(0, (-1, self.page_size))
+                    cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
+                        layer.layer_id, False
+                    )  #
+                    ori_kv = forward_batch.token_to_kv_pool.get_swa_buffer(
+                        layer.layer_id
+                    )  # [num_block, page_size, 1, dim]
+                    metadata = self.forward_metadata.kernel_metadata[
+                        f"c{compress_ratio}a_metadata"
+                    ]
+                    q = q.squeeze(0)
+                    attn_kwargs = {
+                        "cu_seqlens_q": self.forward_metadata.actual_seq_lengths_q_pa,  # just for TND
+                        "seqused_kv": self.forward_metadata.actual_seq_lengths_kv,  # num of key elements used, DT_INT32, Tentative: kv_len 非压缩
+                        "ori_mask_mode": 4,  # sliding window
+                        "ori_win_left": self.config.sliding_window_size - 1,
+                        "ori_win_right": 0,
+                        "layout_q": "TND",  # "BSND" , "TND"
+                        "layout_kv": "PA_ND",  # "PA_ND"
+                        "q": q,
+                        "ori_kv": kv_pad,  # get from past_key_values, prefill is full cache, transfer bsnd to bbnd TODO： full cacheTODO：这里需要从0开始（最小index）
+                        "ori_block_table": swa_page_table,  # TODO full cache in prefill stage
+                        "sinks": sinks,
+                        "metadata": metadata,  # get from operator ?----sparse_attn_sharedkv_metadata
+                        "softmax_scale": layer.scaling,
+                    }
+
+                    if compress_ratio == 4:
+                        topk_indices = topk_indices.view(-1, 1, topk_indices.shape[-1])
+                        c_kwargs = {
+                            "cmp_ratio": compress_ratio,  # no support 1, None
+                            "cmp_mask_mode": 3,  # causal
+                            "cmp_kv": cmp_kv,  # get from past_key_values, TODO when no cmp_kv , swa：None
+                            "cmp_sparse_indices": topk_indices,  # for LI, need to set TODO：c128传None， C4需要view一下 TODO：这里需要从0开始（最小index）
+                            "cmp_block_table": compress_page_table,
+                        }
+                        attn_kwargs = attn_kwargs | c_kwargs
+                    elif compress_ratio == 128:
+                        c_kwargs = {
+                            "cmp_ratio": compress_ratio,  # no support 1, None
+                            "cmp_mask_mode": 3,  # causal
+                            "cmp_kv": cmp_kv,  # get from past_key_values, TODO when no cmp_kv , swa：None
+                            "cmp_sparse_indices": None,  # for LI, need to set TODO：c128传None， C4需要view一下 TODO：这里需要从0开始（最小index）
+                            "cmp_block_table": compress_page_table,
+                        }
+                        attn_kwargs = attn_kwargs | c_kwargs
+
+                    o, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+                else:
+                    split_seq = forward_batch.seq_lens_cpu
+                    split_seq = split_seq.tolist()
+
+                    if isinstance(k, (list, tuple)):
+                        k_list = k
+                    else:
+                        k_list = k.split(split_seq, dim=0)
+                    o = q.new_empty(q.shape)
+                    q_list = q.split(split_seq, dim=0)
+                    topk_indices_list = topk_indices.split(split_seq, dim=0)
+
+                    offset = 0
+                    for q_i, k_i, topk_indices_i in zip(
+                        q_list, k_list, topk_indices_list
+                    ):
+                        q_i = q_i.unsqueeze(0)  # BSND
+                        k_i = k_i.view(1, k_i.shape[0], k_i.shape[-1])  # T1D --> BSD
+                        topk_indices_i = topk_indices_i.unsqueeze(0)  # BSK
+                        o[offset : offset + q_i.shape[1]] = dsv4_sparse_attn(
+                            q_i, k_i, sinks, topk_indices_i, layer.scaling
+                        ).flatten(0, 1)
+                        offset += q_i.shape[1]
+
+            else:
+                o = q.new_empty((q.shape[0], q.shape[1], layer.head_dim))
+
+                use_pa_decode = get_bool_env_var("USE_PA_DECODE")
+                if use_pa_decode:
+                    cmp_kv = forward_batch.token_to_kv_pool.get_compress_buffer(
+                        layer.layer_id, False
+                    )
+                    ori_kv = forward_batch.token_to_kv_pool.get_swa_buffer(
+                        layer.layer_id
+                    )  # [T, 1, D]
+                    metadata = self.forward_metadata.kernel_metadata[
+                        f"c{compress_ratio}a_metadata"
+                    ]
+
+                    attn_kwargs = {
+                        "cu_seqlens_q": self.forward_metadata.actual_seq_lengths_q_pa,  # just for TND
+                        "seqused_kv": self.forward_metadata.actual_seq_lengths_kv,  # num of key elements used, DT_INT32, Tentative: kv_len 非压缩
+                        "ori_mask_mode": 4,  # sliding window
+                        "ori_win_left": self.config.sliding_window_size - 1,
+                        "ori_win_right": 0,
+                        "layout_q": "TND",  # "BSND" , "TND"
+                        "layout_kv": "PA_ND",  # "PA_ND"
+                        "q": q,
+                        "ori_kv": ori_kv,  # get from past_key_values, prefill is full cache, transfer bsnd to bbnd TODO： full cacheTODO：这里需要从0开始（最小index）
+                        "ori_block_table": swa_page_table,  # TODO full cache in prefill stage
+                        "sinks": sinks,
+                        "metadata": metadata,  # get from operator ?----sparse_attn_sharedkv_metadata
+                        "softmax_scale": layer.scaling,
+                    }
+
+                    if compress_ratio == 4:
+                        topk_indices = topk_indices.view(-1, 1, topk_indices.shape[-1])
+                        c_kwargs = {
+                            "cmp_ratio": compress_ratio,  # no support 1, None
+                            "cmp_mask_mode": 3,  # causal
+                            "cmp_kv": cmp_kv,  # get from past_key_values, TODO when no cmp_kv , swa：None
+                            "cmp_sparse_indices": topk_indices,  # for LI, need to set TODO：c128传None， C4需要view一下 TODO：这里需要从0开始（最小index）
+                            "cmp_block_table": compress_page_table,
+                        }
+                        attn_kwargs = attn_kwargs | c_kwargs
+                    elif compress_ratio == 128:
+                        c_kwargs = {
+                            "cmp_ratio": compress_ratio,  # no support 1, None
+                            "cmp_mask_mode": 3,  # causal
+                            "cmp_kv": cmp_kv,  # get from past_key_values, TODO when no cmp_kv , swa：None
+                            "cmp_sparse_indices": None,  # for LI, need to set TODO：c128传None， C4需要view一下 TODO：这里需要从0开始（最小index）
+                            "cmp_block_table": compress_page_table,
+                        }
+                        attn_kwargs = attn_kwargs | c_kwargs
+                    o, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+                else:
+                    topk_indices = topk_indices.unflatten(
+                        0, (forward_batch.batch_size, -1)
+                    )
+                    q = q.unflatten(0, (forward_batch.batch_size, -1))  # BSND
+                    for idx, seq_len in enumerate(forward_batch.seq_lens_cpu):
+                        if seq_len <= 0:
+                            continue
+                        q_i = q[idx : idx + 1]
+                        topk_indices_i = topk_indices[idx : idx + 1]
+
+                        win_indices = get_kv_indices(
+                            forward_batch,
+                            layer.sliding_window_size,
+                            swa_page_table,
+                            idx,
+                            seq_len,
+                        )
+                        buffer_2 = None
+                        if compress_ratio > 1:
+                            compress_indices = get_kv_indices(
+                                forward_batch,
+                                seq_len // compress_ratio,
+                                compress_page_table,
+                                idx,
+                                seq_len // compress_ratio,
+                            )
+                            buffer_2 = (
+                                forward_batch.token_to_kv_pool.get_compress_buffer(
+                                    layer.layer_id, False, compress_indices
+                                )
+                            )  # [T//4, 1, D] or [T//128, 1, D]
+
+                        buffer_1 = forward_batch.token_to_kv_pool.get_swa_buffer(
+                            layer.layer_id, win_indices
+                        )
+
+                        if buffer_2 is not None and buffer_2.shape[0] > 0:
+                            k_i = (
+                                torch.cat([buffer_1, buffer_2], dim=0)
+                                .squeeze(1)
+                                .unsqueeze(0)
+                            )  # BSD
+                        else:
+                            k_i = buffer_1.squeeze(1).unsqueeze(0)  # BSD
+
+                        o[idx : idx + 1] = dsv4_sparse_attn(
+                            q_i, k_i, sinks, topk_indices_i, layer.scaling
+                        ).flatten(0, 1)
+
+            return o
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -874,7 +1888,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
             )
-        if topk_indices is not None:
+        if self.is_dsv4 or topk_indices is not None:
             return self.forward_sparse(
                 q,
                 k,
@@ -885,6 +1899,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope,
                 k_rope,
                 topk_indices,
+                sinks,
             )
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -1776,7 +2791,7 @@ class AscendAttnBackend(AttentionBackend):
         if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO does saving kv_cache
             save_kv_cache = False
-        if topk_indices is not None:
+        if self.is_dsv4 or topk_indices is not None:
             return self.forward_sparse(
                 q,
                 k,
@@ -1787,6 +2802,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope,
                 k_rope,
                 topk_indices,
+                sinks,
             )
 
         if self.graph_mode and (not self.enable_torch_compile):
@@ -2126,6 +3142,10 @@ class AscendAttnMultiStepDraftBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
+        out_cache_loc_dsv4 = forward_batch.out_cache_loc_dsv4.reshape_(
+            self.topk, self.speculative_num_steps
+        )
+
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
                 bs,
@@ -2136,6 +3156,7 @@ class AscendAttnMultiStepDraftBackend:
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
+                out_cache_loc_dsv4=out_cache_loc_dsv4.index_(i),  # todo
             )
 
         self.common_template(forward_batch, call_fn)

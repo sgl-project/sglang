@@ -4,6 +4,7 @@ Llama4Vision, DynamicNTK, DynamicNTKAlpha, DualChunkRotaryEmbedding."""
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -928,4 +929,243 @@ class Gemma4RotaryEmbedding(RotaryEmbedding):
         s += f", rope_angles={self.rope_angles}, nope_angles={self.nope_angles}"
         s += f", max_position_embeddings={self.max_position_embeddings}"
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
+        return s
+
+
+class ComplexExpRotaryEmbedding(nn.Module):
+    """deepseek v4 rotary positional embedding."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        scaling_factor: float,
+        dtype: torch.dtype,
+        **extra_kwargs,
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+        self.scaling_factor = scaling_factor
+        self.beta_fast = extra_kwargs["beta_fast"]
+        self.beta_slow = extra_kwargs["beta_slow"]
+        freqs = ComplexExpRotaryEmbedding.precompute_freqs_cis(
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            scaling_factor,
+            self.beta_fast,
+            self.beta_slow,
+        )
+        t = torch.arange(max_position_embeddings)
+        freqs = torch.outer(t, freqs)
+        complex_cache = torch.polar(torch.ones_like(freqs), freqs)
+        self.position_cos = (
+            complex_cache.real.repeat_interleave(2, dim=-1).to(dtype).contiguous()
+        )
+        self.position_sin = (
+            complex_cache.imag.repeat_interleave(2, dim=-1).to(dtype).contiguous()
+        )
+        self.cos_sin_cache: torch.Tensor = None  # used for reserve_rope_cache check
+        self.register_buffer("cos_cache", self.position_cos, persistent=False)
+        self.register_buffer("sin_cache", self.position_sin, persistent=False)
+
+        (
+            self.position_cos_layer_cache,
+            self.position_sin_layer_cache,
+            self.inverse_position_sin_layer_cache,
+        ) = (None, None, None)
+        (
+            self.c4_cmp_position_cos_layer_cache,
+            self.c4_cmp_position_sin_layer_cache,
+            self.c128_cmp_position_cos_layer_cache,
+            self.c128_cmp_position_sin_layer_cache,
+        ) = (None, None, None, None)
+
+    def get_cos_sin_with_position(self, position):
+        position_cos_layer_cache = self.cos_cache[position]
+        position_sin_layer_cache = self.sin_cache[position]
+        inverse_position_sin_layer_cache = -position_sin_layer_cache
+
+        self.position_cos_layer_cache = position_cos_layer_cache.view(
+            -1, 1, 1, position_cos_layer_cache.shape[-1]
+        ).contiguous()
+        self.position_sin_layer_cache = position_sin_layer_cache.view(
+            -1, 1, 1, position_sin_layer_cache.shape[-1]
+        ).contiguous()
+        self.inverse_position_sin_layer_cache = inverse_position_sin_layer_cache.view(
+            -1, 1, 1, inverse_position_sin_layer_cache.shape[-1]
+        ).contiguous()
+
+    def get_cos_sin_with_c4_cmpposition(self, position):
+        self.c4_cmp_position_cos_layer_cache = self.cos_cache.index_select(0, position)
+        self.c4_cmp_position_sin_layer_cache = self.sin_cache.index_select(0, position)
+
+    def get_cos_sin_with_c128_cmpposition(self, position):
+        self.c128_cmp_position_cos_layer_cache = self.cos_cache.index_select(
+            0, position
+        )
+        self.c128_cmp_position_sin_layer_cache = self.sin_cache.index_select(
+            0, position
+        )
+
+    @staticmethod
+    @lru_cache(2)
+    def precompute_freqs_cis(
+        dim, original_seq_len, base, factor, beta_fast, beta_slow
+    ) -> torch.Tensor:
+        """
+        Precomputes frequency-based complex exponential values for rotary positional embeddings.
+
+        Args:
+            args (ModelArgs): Model arguments containing positional embedding parameters.
+
+        Returns:
+            torch.Tensor: Precomputed complex exponential values for positional embeddings.
+        """
+
+        def find_correction_dim(num_rotations, dim, base, max_seq_len):
+            return (
+                dim
+                * math.log(max_seq_len / (num_rotations * 2 * math.pi))
+                / (2 * math.log(base))
+            )
+
+        def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+            low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
+            high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
+            return max(low, 0), min(high, dim - 1)
+
+        def linear_ramp_factor(min, max, dim):
+            if min == max:
+                max += 0.001
+            linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+            ramp_func = torch.clamp(linear_func, 0, 1)
+            return ramp_func
+
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        if (
+            original_seq_len > 0 and base == 160000
+        ):  # base=160000 means compress_ratio > 1
+            low, high = find_correction_range(
+                beta_fast, beta_slow, dim, base, original_seq_len
+            )
+            smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+            freqs = freqs / factor * (1 - smooth) + freqs * smooth
+
+        return freqs
+
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        """Ensure cos_sin_cache length > needed_max_pos."""
+        from sglang.srt.environ import envs
+
+        cur_len = int(self.cos_cache.shape[0])
+        if needed_max_pos < cur_len:
+            return
+
+        # Align to reduce realloc frequency
+        align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+        new_len = ((needed_max_pos + align) // align) * align
+        device = self.cos_cache.device
+        dtype = self.cos_cache.dtype
+
+        # Compute inv_freq on same device
+        inv_freq = ComplexExpRotaryEmbedding.precompute_freqs_cis(
+            self.rotary_dim,
+            self.max_position_embeddings,
+            self.base,
+            self.scaling_factor,
+            self.beta_fast,
+            self.beta_slow,
+        )
+
+        # Incremental computation for new positions only
+        start = cur_len
+        t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
+        if t_new.numel() == 0:
+            return
+
+        inv_freq = torch.outer(t_new, inv_freq)
+        complex_cache = torch.polar(torch.ones_like(inv_freq), inv_freq)
+        new_position_cos = (
+            complex_cache.real.repeat_interleave(2, dim=-1).to(dtype).contiguous()
+        )
+        new_position_sin = (
+            complex_cache.imag.repeat_interleave(2, dim=-1).to(dtype).contiguous()
+        )
+
+        # Update cache with new rows
+        self.cos_cache = torch.cat(
+            (self.cos_cache, new_position_cos.to(device=device, dtype=dtype)), dim=0
+        )
+        self.sin_cache = torch.cat(
+            (self.sin_cache, new_position_sin.to(device=device, dtype=dtype)), dim=0
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        sin: torch.Tensor,
+        cos: torch.Tensor,
+        inverse: bool = False,
+        positions: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Applies rotary positional embeddings to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor with positional embeddings to be applied.
+            freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
+
+        Returns:
+            torch.Tensor: Tensor with rotary embeddings applied.
+        """
+        # y = x
+        # x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+        # if inverse:
+        #     freqs_cis = freqs_cis.conj()
+        # if x.ndim == 3:
+        #     freqs_cis = freqs_cis.view(1, x.size(1), x.size(-1))
+        # else:
+        #     freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+        # x = torch.view_as_real(x * freqs_cis).flatten(-2)
+        # y.copy_(x)
+        ori_shape = x.shape
+        y = x
+        if x.dim() == 2:
+            x = x.unsqueeze(-2)
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        if positions is not None:
+            assert (
+                cos is None and sin is None
+            ), "cos and sin must be None when positions is not None"
+            cos = self.cos_cache[positions]
+            sin = self.sin_cache[positions]
+            if inverse:
+                sin = -sin
+            cos = cos.view(-1, 1, 1, cos.size(-1))
+            sin = sin.view(-1, 1, 1, sin.size(-1))
+
+        x = torch_npu.npu_rotary_mul(
+            x,
+            cos,
+            sin,
+            rotary_mode="interleave",
+        )
+        y.copy_(x.view(ori_shape))
+        return y
+
+    def extra_repr(self) -> str:
+        s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
+        s += f", max_position_embeddings={self.max_position_embeddings}"
+        s += f", base={self.base}, is_neox_style={self.is_neox_style}"
+        s += f", scaling_factor={self.scaling_factor}"
         return s

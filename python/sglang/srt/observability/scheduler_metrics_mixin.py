@@ -355,6 +355,46 @@ class SchedulerMetricsMixin:
                 f"full token usage: {full_tok:.2f}",
                 f"swa token usage: {swa_token_usage:.2f}",
             ]
+        elif self.is_hybrid_swa_c4_c128:
+            (
+                swa_available_size,
+                c4_available_size,
+                c4_state_available_size,
+                c128_available_size,
+                c128_state_available_size,
+                swa_num_uesd,
+                c4_num_used,
+                c128_num_used,
+                c4_state_num_used,
+                c128_state_num_used,
+                swa_token_usage,
+                c4_token_usage,
+                c128_token_usage,
+                c4_state_token_usage,
+                c128_state_token_usage,
+            ) = self._get_swa_c4_c128_token_info()
+            num_used = max(
+                swa_num_uesd,
+                c4_num_used,
+                c128_num_used,
+                c4_state_num_used,
+                c128_state_num_used,
+            )
+            token_usage = max(
+                swa_token_usage,
+                c4_token_usage,
+                c128_token_usage,
+                c4_state_token_usage,
+                c128_state_token_usage,
+            )
+            full_token_usage = swa_token_usage
+            msg_parts += [
+                f"swa token usage: {swa_token_usage:.2f}/{swa_num_uesd}",
+                f"c4 token usage: {c4_token_usage:.2f}/{c4_num_used}",
+                f"c128 token usage: {c128_token_usage:.2f}/{c128_num_used}",
+                f"c4 state token usage: {c4_state_token_usage:.2f}/{c4_state_num_used}",
+                f"c128 state token usage: {c128_state_token_usage:.2f}/{c128_state_num_used}; ",
+            ]
 
         if self.is_hybrid_ssm:
             num_used_m, _, full_tok_m, mamba_usage, *_ = self._get_mamba_token_info()
@@ -564,8 +604,47 @@ class SchedulerMetricsMixin:
                 f"#swa token: {swa_num_used}",
                 f"swa token usage: {swa_token_usage:.2f}",
             ]
-
-        if self.is_hybrid_ssm:
+        elif self.is_hybrid_swa_c4_c128:
+            (
+                swa_available_size,
+                c4_available_size,
+                c4_state_available_size,
+                c128_available_size,
+                c128_state_available_size,
+                swa_num_uesd,
+                c4_num_used,
+                c128_num_used,
+                c4_state_num_used,
+                c128_state_num_used,
+                swa_token_usage,
+                c4_token_usage,
+                c128_token_usage,
+                c4_state_token_usage,
+                c128_state_token_usage,
+            ) = self._get_swa_c4_c128_token_info()
+            num_used = max(
+                swa_num_uesd,
+                c4_num_used,
+                c128_num_used,
+                c4_state_num_used,
+                c128_state_num_used,
+            )
+            token_usage = max(
+                swa_token_usage,
+                c4_token_usage,
+                c128_token_usage,
+                c4_state_token_usage,
+                c128_state_token_usage,
+            )
+            full_token_usage = swa_token_usage
+            msg_parts += [
+                f"swa token usage: {swa_token_usage:.2f}/{swa_num_uesd}",
+                f"c4 token usage: {c4_token_usage:.2f}/{c4_num_used}",
+                f"c128 token usage: {c128_token_usage:.2f}/{c128_num_used}",
+                f"c4 state token usage: {c4_state_token_usage:.2f}/{c4_state_num_used}",
+                f"c128 state token usage: {c128_state_token_usage:.2f}/{c128_state_num_used}; ",
+            ]
+        elif self.is_hybrid_ssm:
             num_used_m, mamba_num, full_tok_m, mamba_usage, *_ = (
                 self._get_mamba_token_info()
             )

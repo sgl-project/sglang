@@ -21,7 +21,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8MoE,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import apply_module_patch
+from sglang.srt.utils import apply_module_patch, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig

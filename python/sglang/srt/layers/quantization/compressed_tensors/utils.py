@@ -118,11 +118,14 @@ def find_matched_target(
 
     if layer_name is None:
         layer_name = ""
-
-    matched_target = (
-        _find_first_match(layer_name, targets)
-        or _find_first_match(module.__class__.__name__, targets, True)
-        or _match_fused_layer(layer_name, targets, fused_mapping)
+    cls_names = [
+        cls.__name__ for cls in [module.__class__, *module.__class__.__bases__]
+    ]
+    matched_target = _find_first_match(layer_name, targets)
+    for cls_name in cls_names:
+        matched_target = matched_target or _find_first_match(cls_name, targets, True)
+    matched_target = matched_target or _match_fused_layer(
+        layer_name, targets, fused_mapping
     )
 
     if matched_target is None:

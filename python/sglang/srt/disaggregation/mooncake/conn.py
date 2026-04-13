@@ -5,6 +5,7 @@ import ctypes
 import dataclasses
 import logging
 import os
+import pickle
 import struct
 import threading
 import time
@@ -92,7 +93,13 @@ class TransferInfo:
             dst_aux_index = None
             dst_state_indices = []
         else:
-            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
+            kv_data = msg[4]  # 这是kv_indices 字段
+            # 尝试用 pickle 解析（新格式）
+            try:
+                dst_kv_indices = pickle.loads(kv_data)
+            except Exception:
+                dst_kv_indices = np.frombuffer(kv_data, dtype=np.int32)
+
             dst_aux_index = int(msg[5].decode("ascii"))
             if msg[6] == b"":
                 dst_state_indices = []
@@ -1195,19 +1202,27 @@ class MooncakeKVManager(CommonKVManager):
                                 )
                                 break
 
-                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
+                        if not isinstance(req.dst_kv_indices, dict):
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                kv_chunk.index_slice
                             ]
+
+                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                            if len(chunked_dst_kv_indice) < len(
+                                kv_chunk.prefill_kv_indices
+                            ):
+                                logger.warning(
+                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                )
+                                kv_chunk.prefill_kv_indices = (
+                                    kv_chunk.prefill_kv_indices[
+                                        : len(chunked_dst_kv_indice)
+                                    ]
+                                )
+                        else:
+                            # TODO: swa-c4-c128 attn support chunk-prefill
+                            chunked_dst_kv_indice = req.dst_kv_indices
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
@@ -1650,8 +1665,12 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
     ):
-        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
-        self.curr_idx += len(kv_indices)
+        if isinstance(kv_indices, dict):
+            kv_len = len(kv_indices.get("full"))
+        else:
+            kv_len = len(kv_indices)
+        index_slice = slice(self.curr_idx, self.curr_idx + kv_len)
+        self.curr_idx += kv_len
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
         # Special handling for cp
@@ -1839,6 +1858,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )
+        # 👇 序列化 kv_indices：如果是 dict，用 pickle；如果是 ndarray，保持 tobytes()
+        if isinstance(kv_indices, dict):
+            kv_indices_bytes = pickle.dumps(kv_indices)
+        else:
+            kv_indices_bytes = kv_indices.tobytes()
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1851,7 +1875,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         self.kv_mgr.local_ip.encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.session_id.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
+                        kv_indices_bytes if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
                         (
                             np.array(

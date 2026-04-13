@@ -24,8 +24,12 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ExtendNumTokens,
     ForwardBatch,
     ForwardMode,
+    KvLen,
+    LastLoc,
+    OutCacheLoc,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
@@ -115,54 +119,207 @@ class EagleDraftInputV2Mixin:
             )
 
         page_size = batch.token_to_kv_pool_allocator.page_size
-        cur_kv_lens_cpu = []
-        nxt_kv_lens_cpu = []
-        num_needed_tokens = 0
+
+        # DSV4
+        cur_full_kv_lens_cpu = []
+        nxt_full_kv_lens_cpu = []
+        cur_c4_kv_lens_cpu = []
+        nxt_c4_kv_lens_cpu = []
+        cur_c128_kv_lens_cpu = []
+        nxt_c128_kv_lens_cpu = []
+        num_needed_tokens = []
+        full_num_needed_token = 0
+        c4_num_needed_token = 0
+        c128_num_needed_token = 0
+
         alloc_len_per_decode = get_alloc_len_per_decode()
         for r in batch.reqs:
             # Over-allocation happens here
             x = r.kv_committed_len + 2 * alloc_len_per_decode - r.kv_allocated_len
-            cur_kv_lens_cpu.append(r.kv_allocated_len)
-            nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
-            num_needed_tokens += x
+            cur_full_kv_lens_cpu.append(r.kv_allocated_len)
+            nxt_full_kv_lens_cpu.append(r.kv_allocated_len + x)
+            full_num_needed_token += x
             r.kv_allocated_len += x
-            r.decode_batch_idx += 1
 
-        cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
+            x = r.kv_allocated_len // 4 - r.c4_kv_allocated_len
+            cur_c4_kv_lens_cpu.append(r.c4_kv_allocated_len)
+            nxt_c4_kv_lens_cpu.append(r.c4_kv_allocated_len + x)
+            c4_num_needed_token += x
+            r.c4_kv_allocated_len += x
+
+            x = r.kv_allocated_len // 128 - r.c128_kv_allocated_len
+            cur_c128_kv_lens_cpu.append(r.c128_kv_allocated_len)
+            nxt_c128_kv_lens_cpu.append(r.c128_kv_allocated_len + x)
+            c128_num_needed_token += x
+            r.c128_kv_allocated_len += x
+
+            r.decode_batch_idx += 1
+        num_needed_tokens = ExtendNumTokens(
+            full_num_needed_token,
+            full_num_needed_token,
+            c4_num_needed_token,
+            c128_num_needed_token,
+            full_num_needed_token,
+            full_num_needed_token,
+        )
+
+        cur_kv_lens_cpu_list = [
+            cur_full_kv_lens_cpu,
+            cur_full_kv_lens_cpu,
+            cur_c4_kv_lens_cpu,
+            cur_c128_kv_lens_cpu,
+            cur_full_kv_lens_cpu,
+            cur_full_kv_lens_cpu,
+        ]
+
+        nxt_kv_lens_cpu_list = [
+            nxt_full_kv_lens_cpu,
+            nxt_full_kv_lens_cpu,
+            nxt_c4_kv_lens_cpu,
+            nxt_c128_kv_lens_cpu,
+            nxt_full_kv_lens_cpu,
+            nxt_full_kv_lens_cpu,
+        ]
+
+        cur_kv_lens = None
+        nxt_kv_lens = None
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
         else:
-            cur_kv_lens = cur_kv_lens_cpu.to(device=batch.device)
-            nxt_kv_lens = nxt_kv_lens_cpu.to(device=batch.device)
-            last_loc = get_last_loc(
+            cur_kv_lens_cpu = KvLen.from_list(
+                cur_kv_lens_cpu_list,
+                dtype=torch.int64,
+            )
+            cur_kv_lens = cur_kv_lens_cpu.to(
+                device=batch.device,
+            )
+
+            nxt_kv_lens_cpu = KvLen.from_list(
+                nxt_kv_lens_cpu_list,
+                dtype=torch.int64,
+            )
+            nxt_kv_lens = nxt_kv_lens_cpu.to(
+                device=batch.device,
+            )
+
+            last_full_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
-                cur_kv_lens,
+                cur_kv_lens.full_kv_len,
             )
-            out_cache_loc = alloc_paged_token_slots_extend(
+            last_swa_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token_swa,
+                batch.req_pool_indices,
+                cur_kv_lens.swa_kv_len,
+            )
+            last_c4_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token_c4,
+                batch.req_pool_indices,
+                cur_kv_lens.c4_kv_len,
+            )
+            last_c128_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token_c128,
+                batch.req_pool_indices,
+                cur_kv_lens.c128_kv_len,
+            )
+            last_c4_state_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token_c4_state,
+                batch.req_pool_indices,
+                cur_kv_lens.c4_state_kv_len,
+            )
+            last_c128_state_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token_c128_state,
+                batch.req_pool_indices,
+                cur_kv_lens.c128_state_kv_len,
+            )
+            last_loc = LastLoc(
+                last_full_loc,
+                last_swa_loc,
+                last_c4_loc,
+                last_c128_loc,
+                last_c4_state_loc,
+                last_c128_state_loc,
+            )
+            out_alloc_meta_data = alloc_paged_token_slots_extend(
                 batch.tree_cache,
-                cur_kv_lens,
+                cur_kv_lens,  # pre
                 cur_kv_lens_cpu,
-                nxt_kv_lens,
+                nxt_kv_lens,  # cur
                 nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
+                last_loc,  # Las
+                num_needed_tokens,  # List
+            )
+
+        if cur_kv_lens is None:
+            cur_kv_lens = cur_kv_lens_cpu.pin_memory().to(
+                device=batch.device, non_blocking=True
+            )
+            nxt_kv_lens = nxt_kv_lens_cpu.pin_memory().to(
+                device=batch.device, non_blocking=True
             )
 
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_cpu.to(device=batch.device),
-            nxt_kv_lens_cpu.to(device=batch.device),
-            out_cache_loc,
+            cur_kv_lens.full_kv_len,
+            nxt_kv_lens.full_kv_len,
+            out_alloc_meta_data.out_full_loc,
+            bs,
+        )
+
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token_swa,
+            cur_kv_lens.swa_kv_len,
+            nxt_kv_lens.swa_kv_len,
+            out_alloc_meta_data.out_swa_loc,
+            bs,
+        )
+
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token_c4,
+            cur_kv_lens.c4_kv_len,
+            nxt_kv_lens.c4_kv_len,
+            out_alloc_meta_data.out_c4_loc,
+            bs,
+        )
+
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token_c128,
+            cur_kv_lens.c128_kv_len,
+            nxt_kv_lens.c128_kv_len,
+            out_alloc_meta_data.out_c128_loc,
+            bs,
+        )
+
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token_c4_state,
+            cur_kv_lens.c4_state_kv_len,
+            nxt_kv_lens.c4_state_kv_len,
+            out_alloc_meta_data.out_c4_state_loc,
+            bs,
+        )
+
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token_c128_state,
+            cur_kv_lens.c128_state_kv_len,
+            nxt_kv_lens.c128_state_kv_len,
+            out_alloc_meta_data.out_c128_state_loc,
             bs,
         )
 
         # FIXME(lsyin): make this sync optional
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+
+        batch.kv_seq_lens_cpu.full_kv_len = batch.kv_seq_lens.full_kv_len.cpu()
+        batch.kv_seq_lens_cpu.c4_kv_len = batch.kv_seq_lens.c4_kv_len.cpu()
+        batch.kv_seq_lens_cpu.c128_kv_len = batch.kv_seq_lens.c128_kv_len.cpu()
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,
@@ -177,17 +334,90 @@ class EagleDraftInputV2Mixin:
             bs = len(batch.seq_lens)
 
             # Assign cache locations
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
+            batch.out_cache_loc_dsv4 = OutCacheLoc.from_data(
+                bs * topk * num_steps,
                 dtype=torch.int64,
                 device=batch.input_ids.device,
             )
+            batch.out_cache_loc = batch.out_cache_loc_dsv4.out_full_loc
             # FIXME(lsyin): align with the default code path
             assign_draft_cache_locs_page_size_1[(bs,)](
                 batch.req_pool_indices,
                 req_to_token_pool.req_to_token,
                 batch.seq_lens,
                 batch.out_cache_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                topk,
+                num_steps,
+            )
+            assign_draft_cache_locs_page_size_1[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token_swa,
+                batch.seq_lens,
+                batch.out_cache_loc_dsv4.out_swa_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                topk,
+                num_steps,
+            )
+            extend_c4_token = (
+                ((batch.seq_lens_cpu + num_steps) // 4 - (batch.seq_lens_cpu) // 4)
+                .sum()
+                .item()
+            )
+
+            if extend_c4_token > 0:
+                batch.out_cache_loc_dsv4.out_c4_loc = assign_extend_cache_locs_func(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token_c4,
+                    start_offset=batch.seq_lens // 4,  # 1
+                    end_offset=(batch.seq_lens + num_steps) // 4,
+                    batch_size=bs,
+                    extend_token_nums=num_steps * bs * topk,
+                    device=batch.input_ids.device,
+                )
+            else:
+                batch.out_cache_loc_dsv4.out_c4_loc = torch.empty(
+                    num_steps * bs * topk,
+                    dtype=torch.int32,
+                    device=batch.input_ids.device,
+                )
+
+            extend_c128_token = (
+                ((batch.seq_lens_cpu + num_steps) // 128 - (batch.seq_lens_cpu) // 128)
+                .sum()
+                .item()
+            )
+            if extend_c128_token > 0:
+                batch.out_cache_loc_dsv4.out_c128_loc = assign_extend_cache_locs_func(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token_c128,
+                    start_offset=batch.seq_lens // 128,
+                    end_offset=(batch.seq_lens + num_steps) // 128,
+                    batch_size=bs,
+                    extend_token_nums=num_steps * bs * topk,
+                    device=batch.input_ids.device,
+                )
+            else:
+                batch.out_cache_loc_dsv4.out_c128_loc = torch.empty(
+                    num_steps * bs * topk,
+                    dtype=torch.int32,
+                    device=batch.input_ids.device,
+                )
+
+            assign_draft_cache_locs_page_size_1[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token_c4_state,
+                batch.seq_lens,
+                batch.out_cache_loc_dsv4.out_c4_state_loc,
+                req_to_token_pool.req_to_token.shape[1],
+                topk,
+                num_steps,
+            )
+            assign_draft_cache_locs_page_size_1[(bs,)](
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token_c128_state,
+                batch.seq_lens,
+                batch.out_cache_loc_dsv4.out_c128_state_loc,
                 req_to_token_pool.req_to_token.shape[1],
                 topk,
                 num_steps,
@@ -253,7 +483,82 @@ class EagleVerifyInputV2Mixin:
                 start_offset=batch.seq_lens,
                 end_offset=batch.seq_lens + self.draft_token_num,
                 batch_size=bs,
-                draft_token_num=self.draft_token_num,
+                extend_token_nums=self.draft_token_num * bs,
+                device=device,
+            )
+
+            batch.out_cache_loc_dsv4.out_full_loc = batch.out_cache_loc
+
+            batch.out_cache_loc_dsv4.out_swa_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,  # int 64
+                req_to_token=req_to_token_pool.req_to_token_swa,  # int 32
+                start_offset=batch.seq_lens,  # int 64
+                end_offset=batch.seq_lens + self.draft_token_num,  # int 64
+                batch_size=bs,
+                extend_token_nums=self.draft_token_num * bs,
+                device=device,
+            )
+            extend_c4_token = (
+                (
+                    (batch.seq_lens_cpu + self.draft_token_num) // 4
+                    - (batch.seq_lens_cpu) // 4
+                )
+                .sum()
+                .item()
+            )
+            if extend_c4_token > 0:
+                batch.out_cache_loc_dsv4.out_c4_loc = assign_extend_cache_locs_func(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token_c4,
+                    start_offset=batch.seq_lens // 4,  # 1
+                    end_offset=(batch.seq_lens + self.draft_token_num) // 4,
+                    batch_size=bs,
+                    extend_token_nums=extend_c4_token,
+                    device=device,
+                )
+            else:
+                batch.out_cache_loc_dsv4.out_c4_loc = torch.empty(
+                    0, dtype=torch.int32, device=device
+                )
+            extend_c128_token = (
+                (
+                    (batch.seq_lens_cpu + self.draft_token_num) // 128
+                    - (batch.seq_lens_cpu) // 128
+                )
+                .sum()
+                .item()
+            )
+            if extend_c128_token > 0:
+                batch.out_cache_loc_dsv4.out_c128_loc = assign_extend_cache_locs_func(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token_c128,
+                    start_offset=batch.seq_lens // 128,
+                    end_offset=(batch.seq_lens + self.draft_token_num) // 128,
+                    batch_size=bs,
+                    extend_token_nums=extend_c128_token,
+                    device=device,
+                )
+            else:
+                batch.out_cache_loc_dsv4.out_c128_loc = torch.empty(
+                    0, dtype=torch.int32, device=device
+                )
+
+            batch.out_cache_loc_dsv4.out_c4_state_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token_c4_state,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + self.draft_token_num,
+                batch_size=bs,
+                extend_token_nums=self.draft_token_num * bs,
+                device=device,
+            )
+            batch.out_cache_loc_dsv4.out_c128_state_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token_c128_state,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + self.draft_token_num,
+                batch_size=bs,
+                extend_token_nums=self.draft_token_num * bs,
                 device=device,
             )
 
@@ -523,12 +828,12 @@ def assign_extend_cache_locs_func(
     start_offset: torch.Tensor,
     end_offset: torch.Tensor,
     batch_size: int,
-    draft_token_num: int,
+    extend_token_nums: int,
     device,
 ) -> torch.Tensor:
     if _is_cuda or _is_hip:
         out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
+            (extend_token_nums,),
             dtype=torch.int64,
             device=device,
         )
@@ -546,7 +851,7 @@ def assign_extend_cache_locs_func(
 
     elif _is_npu:
         out_cache_loc = torch.empty(
-            (batch_size * draft_token_num,),
+            (extend_token_nums,),
             dtype=torch.int32,
             device=device,
         )

@@ -5,8 +5,16 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ExtendNumTokens,
+    ForwardMode,
+    KvLen,
+    OutCacheLoc,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
@@ -32,25 +40,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
         seq_lens = []
         pre_lens = []
         req_pool_indices = []
+        swa_seq_lens = []
+        c4_seq_lens = []
+        c128_seq_lens = []
+        c4_state_seq_lens = []
+        c128_state_seq_lens = []
 
         # Pre-calculate total size
-        total_size = sum(req.extend_input_len for req in reqs)
-        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
-
-        # Fill the tensor in one pass
-        offset = 0
-        for i, req in enumerate(reqs):
+        for req in reqs:
             req_pool_indices.append(req.req_pool_idx)
-
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
-            ]
-            assert (
-                offset + req.extend_input_len <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_input_len] = chunk
-            offset += req.extend_input_len
-
             pre_len = len(req.prefix_indices)
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
@@ -66,6 +64,70 @@ class ScheduleBatchDisaggregationDecodeMixin:
             pre_lens.append(pre_len)
             req.extend_logprob_start_len = 0
 
+            req.kv_committed_len = seq_len
+            req.c4_kv_committed_len = seq_len // 4
+            req.c128_kv_committed_len = seq_len // 128
+
+            tail = seq_len % 128
+            swa_alloc_len = seq_len if seq_len < 128 else 128 + tail
+            swa_seq_lens.append(swa_alloc_len)
+            req.swa_alloc_offset = seq_len - swa_alloc_len
+            c4_seq_lens.append(req.c4_kv_committed_len)
+            c128_seq_lens.append(req.c128_kv_committed_len)
+            c4_alloc_len = tail + 128 if (tail <= 3 and seq_len >= 128) else tail
+            c4_state_seq_lens.append(c4_alloc_len)
+            req.c4_alloc_offset = seq_len - c4_alloc_len
+            c128_alloc_len = seq_len % 128
+            c128_state_seq_lens.append(c128_alloc_len)
+            req.c128_alloc_offset = seq_len - c128_alloc_len
+
+        kv_seq_lens_list = [
+            seq_lens,
+            swa_seq_lens,
+            c4_seq_lens,
+            c128_seq_lens,
+            c4_state_seq_lens,
+            c128_state_seq_lens,
+        ]
+        self.kv_seq_lens_cpu = KvLen.from_list(
+            kv_seq_lens_list, dtype=torch.int64, device="cpu"
+        )
+        self.kv_seq_lens = self.kv_seq_lens_cpu.to(self.device)
+
+        self.extend_num_kv: ExtendNumTokens = ExtendNumTokens.from_list(
+            kv_seq_lens_list
+        )
+        out_cache_loc = OutCacheLoc.from_extend_token_nums(self.extend_num_kv)
+        field_specs = [
+            ("out_full_loc", 0, "full_extend_num_tokens"),
+            ("out_swa_loc", 1, "swa_extend_num_tokens"),
+            ("out_c4_loc", 2, "c4_extend_num_tokens"),
+            ("out_c128_loc", 3, "c128_extend_num_tokens"),
+            ("out_c4_state_loc", 4, "c4_state_extend_num_tokens"),
+            ("out_c128_state_loc", 5, "c128_state_extend_num_tokens"),
+        ]
+        offsets = {field: 0 for field, _, _ in field_specs}
+        for i, req in enumerate(reqs):
+            all_indices = self.req_to_token_pool.get_all_locs_by_req(req)
+            for (field_name, seq_idx, total_attr), indices in zip(
+                field_specs, all_indices
+            ):
+                length = kv_seq_lens_list[seq_idx][i]
+                if length == 0:
+                    continue
+
+                offset = offsets[field_name]
+                total_size = getattr(self.extend_num_kv, total_attr)
+                assert offset + length <= total_size, (
+                    f"Exceeds buffer size for {field_name}: "
+                    f"offset={offset}, length={length}, total_size={total_size}"
+                )
+                out_tensor = getattr(out_cache_loc, field_name)
+
+                # todo 优化耗时
+                out_tensor[offset : offset + length] = indices
+                offsets[field_name] = offset + length
+
         extend_input_logprob_token_ids = None
 
         # Set fields
@@ -80,7 +142,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.orig_seq_lens = torch.tensor(
             seq_lens, dtype=torch.int32, device=self.device
         )
-        self.out_cache_loc = out_cache_loc
+        self.out_cache_loc = out_cache_loc.out_full_loc
+        self.out_cache_loc_dsv4 = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
@@ -158,6 +221,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 ],
                 dim=0,
             )
+
+            enable_spec_overlap_reflow = envs.SGLANG_SPEC_ENABLE_OVERLAP_REFLOW.get()
+
+            if enable_spec_overlap_reflow and server_args.speculative_num_steps > 1:
+                topk_pad_size = (
+                    server_args.speculative_num_steps * num_states - topk_p.shape[-1]
+                )
+
+                topk_p = F.pad(topk_p, (0, topk_pad_size))
+                topk_index = F.pad(topk_index, (0, topk_pad_size))
 
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)

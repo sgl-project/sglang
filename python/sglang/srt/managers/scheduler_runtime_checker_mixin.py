@@ -103,6 +103,82 @@ class SchedulerRuntimeCheckerMixin:
             swa_evictable_size,
         )
 
+    def _get_swa_c4_c128_token_info(self: Scheduler):
+        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        c4_available_size = self.token_to_kv_pool_allocator.c4_available_size()
+        c4_state_available_size = (
+            self.token_to_kv_pool_allocator.c4_state_available_size()
+        )
+        c128_available_size = self.token_to_kv_pool_allocator.c128_available_size()
+        c128_state_available_size = (
+            self.token_to_kv_pool_allocator.c128_state_available_size()
+        )
+        swa_num_uesd = max(0, self.swa_tokens_per_layer - swa_available_size)
+        c4_num_used = max(0, self.c4_token_per_layer - c4_available_size)
+        c128_num_used = max(0, self.c128_token_per_layer - c128_available_size)
+        c4_state_num_used = max(
+            0, self.c4_state_token_per_layer - c4_state_available_size
+        )
+        c128_state_num_used = max(
+            0, self.c128_state_token_per_layer - c128_state_available_size
+        )
+        swa_token_usage = swa_num_uesd / self.swa_tokens_per_layer
+        c4_token_usage = c4_num_used / self.c4_token_per_layer
+        c128_token_usage = c128_num_used / self.c128_token_per_layer
+        c4_state_token_usage = c4_state_num_used / self.c4_state_token_per_layer
+        c128_state_token_usage = c128_state_num_used / self.c128_state_token_per_layer
+        return (
+            swa_available_size,
+            c4_available_size,
+            c4_state_available_size,
+            c128_available_size,
+            c128_state_available_size,
+            swa_num_uesd,
+            c4_num_used,
+            c128_num_used,
+            c4_state_num_used,
+            c128_state_num_used,
+            swa_token_usage,
+            c4_token_usage,
+            c128_token_usage,
+            c4_state_token_usage,
+            c128_state_token_usage,
+        )
+
+    def _check_hybrid_compress_memory(self: Scheduler):
+        (
+            swa_available_size,
+            c4_available_size,
+            c4_state_available_size,
+            c128_available_size,
+            c128_state_available_size,
+            swa_num_uesd,
+            c4_num_used,
+            c128_num_used,
+            c4_state_num_used,
+            c128_state_num_used,
+            swa_token_usage,
+            c4_token_usage,
+            c128_token_usage,
+            c4_state_token_usage,
+            c128_state_token_usage,
+        ) = self._get_swa_c4_c128_token_info()
+        memory_leak = (
+            swa_num_uesd != 0
+            or c4_num_used != 0
+            or c128_num_used != 0
+            or c4_state_num_used != 0
+            or c128_state_num_used != 0
+        )
+        token_msg = (
+            f"{self.swa_tokens_per_layer=}, {swa_available_size=}\n"
+            f"{self.c4_token_per_layer=}, {c4_available_size=}\n"
+            f"{self.c128_token_per_layer=}, {c128_available_size=}\n"
+            f"{self.c4_state_token_per_layer=}, {c4_state_available_size=}\n"
+            f"{self.c128_state_token_per_layer=}, {c128_state_available_size=}\n"
+        )
+        return memory_leak, token_msg
+
     def _check_hybrid_memory(self: Scheduler):
         (
             full_num_used,
@@ -271,7 +347,9 @@ class SchedulerRuntimeCheckerMixin:
             )
 
     def check_memory(self: Scheduler):
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa_c4_c128:
+            memory_leak, token_msg = self._check_hybrid_compress_memory()
+        elif self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             memory_leak, token_msg = self._check_mamba_memory()
@@ -318,6 +396,38 @@ class SchedulerRuntimeCheckerMixin:
                     _,
                     _,
                 ) = self._get_mamba_token_info()
+            elif self.is_hybrid_swa_c4_c128:
+                (
+                    swa_available_size,
+                    c4_available_size,
+                    c4_state_available_size,
+                    c128_available_size,
+                    c128_state_available_size,
+                    swa_num_uesd,
+                    c4_num_used,
+                    c128_num_used,
+                    c4_state_num_used,
+                    c128_state_num_used,
+                    swa_token_usage,
+                    c4_token_usage,
+                    c128_token_usage,
+                    c4_state_token_usage,
+                    c128_state_token_usage,
+                ) = self._get_swa_c4_c128_token_info()
+                num_used = max(
+                    swa_num_uesd,
+                    c4_num_used,
+                    c128_num_used,
+                    c4_state_num_used,
+                    c128_state_num_used,
+                )
+                token_usage = max(
+                    swa_token_usage,
+                    c4_token_usage,
+                    c128_token_usage,
+                    c4_state_token_usage,
+                    c128_state_token_usage,
+                )
             else:
                 num_used, token_usage, _, _ = self._get_token_info()
 

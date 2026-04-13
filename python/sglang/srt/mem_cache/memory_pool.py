@@ -54,8 +54,10 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
 )
+from sglang.srt.model_executor.forward_batch_info import OutCacheLoc
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -144,10 +146,131 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
+            if get_bool_env_var("IS_DEEPSEEK_V4", "False"):
+                self.req_to_token_swa = torch.zeros(
+                    (size, max_context_len), dtype=torch.int32, device=device
+                )
+                self.req_to_token_c4 = torch.zeros(
+                    (size, max_context_len // 4), dtype=torch.int32, device=device
+                )
+                self.req_to_token_c128 = torch.zeros(
+                    (size, max_context_len // 128), dtype=torch.int32, device=device
+                )
+                self.req_to_token_c4_state = torch.zeros(
+                    (size, max_context_len), dtype=torch.int32, device=device
+                )
+                self.req_to_token_c128_state = torch.zeros(
+                    (size, max_context_len), dtype=torch.int32, device=device
+                )
+
         self.free_slots = list(range(size))
+
+    def get_all_locs_by_req(self, req: Req):
+        kv_indices = self.req_to_token[req.req_pool_idx, : req.kv_committed_len]
+        if not get_bool_env_var("IS_DEEPSEEK_V4", "False"):
+            return kv_indices
+
+        swa_kv_indices = self.req_to_token_swa[
+            req.req_pool_idx, req.swa_alloc_offset : req.kv_committed_len
+        ]
+        c4_kv_indices = self.req_to_token_c4[
+            req.req_pool_idx, : req.c4_kv_committed_len
+        ]
+        c128_kv_indices = self.req_to_token_c128[
+            req.req_pool_idx, : req.c128_kv_committed_len
+        ]
+        c4_state_kv_indices = self.req_to_token_c4_state[
+            req.req_pool_idx, req.c4_alloc_offset : req.kv_committed_len
+        ]
+        c128_state_kv_indices = self.req_to_token_c128_state[
+            req.req_pool_idx, req.c128_alloc_offset : req.kv_committed_len
+        ]
+
+        return (
+            kv_indices,
+            swa_kv_indices,
+            c4_kv_indices,
+            c128_kv_indices,
+            c4_state_kv_indices,
+            c128_state_kv_indices,
+        )
+
+    def get_all_locs_by_kv_lens(
+        self, req: Req, kv_committed_len, c4_kv_committed_len, c128_kv_committed_len
+    ):
+        if not get_bool_env_var("IS_DEEPSEEK_V4", "False"):
+            raise NotImplementedError(
+                "Only DEEPSEEK_V4 does not support get_all_locs_by_kv_lens"
+            )
+        kv_indices = self.req_to_token[req.req_pool_idx, :kv_committed_len]
+        swa_kv_indices = self.req_to_token_swa[
+            req.req_pool_idx, req.swa_alloc_offset : kv_committed_len
+        ]
+        c4_kv_indices = self.req_to_token_c4[req.req_pool_idx, :c4_kv_committed_len]
+        c128_kv_indices = self.req_to_token_c128[
+            req.req_pool_idx, :c128_kv_committed_len
+        ]
+        c4_state_kv_indices = self.req_to_token_c4_state[
+            req.req_pool_idx, req.c4_alloc_offset : kv_committed_len
+        ]
+        c128_state_kv_indices = self.req_to_token_c128_state[
+            req.req_pool_idx, req.c128_alloc_offset : kv_committed_len
+        ]
+
+        return (
+            kv_indices,
+            swa_kv_indices,
+            c4_kv_indices,
+            c128_kv_indices,
+            c4_state_kv_indices,
+            c128_state_kv_indices,
+        )
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
+
+    def write_swa(self, indices, values):
+        if self.req_to_token_swa is not None:
+            self.req_to_token_swa[indices] = values
+
+    def write_c4(self, indices, values):
+        if self.req_to_token_c4 is not None:
+            self.req_to_token_c4[indices] = values
+
+    def write_c128(self, indices, values):
+        if self.req_to_token_c128 is not None:
+            self.req_to_token_c128[indices] = values
+
+    def write_c4_state(self, indices, values):
+        if self.req_to_token_c4_state is not None:
+            self.req_to_token_c4_state[indices] = values
+
+    def write_c128_state(self, indices, values):
+        if self.req_to_token_c128_state is not None:
+            self.req_to_token_c128_state[indices] = values
+
+    def write_all_locs_by_req(self, req: Req, kv_loc: OutCacheLoc):
+        self.write(
+            (req.req_pool_idx, slice(0, req.kv_committed_len)), kv_loc.out_full_loc
+        )
+        self.write_swa(
+            (req.req_pool_idx, slice(req.swa_alloc_offset, req.kv_committed_len)),
+            kv_loc.out_swa_loc,
+        )
+        self.write_c4(
+            (req.req_pool_idx, slice(0, req.c4_kv_committed_len)), kv_loc.out_c4_loc
+        )
+        self.write_c128(
+            (req.req_pool_idx, slice(0, req.c128_kv_committed_len)), kv_loc.out_c128_loc
+        )
+        self.write_c4_state(
+            (req.req_pool_idx, slice(req.c4_alloc_offset, req.kv_committed_len)),
+            kv_loc.out_c4_state_loc,
+        )
+        self.write_c128_state(
+            (req.req_pool_idx, slice(req.c128_alloc_offset, req.kv_committed_len)),
+            kv_loc.out_c128_state_loc,
+        )
 
     def available_size(self):
         return len(self.free_slots)

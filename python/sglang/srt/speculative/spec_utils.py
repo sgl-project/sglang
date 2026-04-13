@@ -54,7 +54,9 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
         server_args = get_global_server_args()
 
     # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
-    return not server_args.enable_multi_layer_eagle
+    # When enable speculative overlap reflow feature, we don't need to save hidden_states for next draft
+    enable_spec_overlap_reflow = envs.SGLANG_SPEC_ENABLE_OVERLAP_REFLOW.get()
+    return not server_args.enable_multi_layer_eagle and not enable_spec_overlap_reflow
 
 
 @triton.jit

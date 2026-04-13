@@ -29,7 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
@@ -76,6 +76,289 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+
+
+@dataclass
+class LastLoc:
+    # Basic batched sampling params
+    last_loc: torch.Tensor
+    last_swa_loc: torch.Tensor
+    last_c4_loc: torch.Tensor
+    last_c128_loc: torch.Tensor
+    last_c4_state_loc: torch.Tensor
+    last_c128_state_loc: torch.Tensor
+
+    @classmethod
+    def from_data(
+        cls,
+        bs: int,
+        fill_value: int = 0,
+        dtype: torch.dtype = torch.int64,
+        device: str = "npu",
+    ) -> "LastLoc":
+        cls_dict = {
+            field.name: torch.full((bs,), fill_value, dtype=dtype, device=device)
+            for field in fields(cls)
+        }
+        return LastLoc(**cls_dict)
+
+
+@dataclass
+class KvLen:
+    # Basic Seq len
+    full_kv_len: torch.Tensor
+    swa_kv_len: torch.Tensor
+    c4_kv_len: torch.Tensor
+    c128_kv_len: torch.Tensor
+    c4_state_kv_len: torch.Tensor
+    c128_state_kv_len: torch.Tensor
+
+    @classmethod
+    def from_data(
+        cls,
+        bs: int,
+        fill_value: int = 0,
+        dtype: torch.dtype = torch.int64,
+        device: str = "cpu",
+    ) -> "KvLen":
+        cls_attr = [field.name for field in fields(cls)]
+        cls_dict = {
+            name: torch.full((bs,), fill_value, dtype=dtype, device=device)
+            for name in cls_attr
+        }
+        return KvLen(**cls_dict)
+
+    @classmethod
+    def from_tensor_list(
+        cls,
+        kv_len_list: List[torch.Tensor],
+    ) -> "KvLen":
+        cls_attr = [field.name for field in fields(cls)]
+        cls_dict = {}
+        for i, name in enumerate(cls_attr):
+            cls_dict[name] = kv_len_list[i]
+        return KvLen(**cls_dict)
+
+    def index_(
+        self,
+        indices: torch.Tensor,
+    ) -> "KvLen":
+        cls_attr = fields(self.__class__)
+        cls_dict = {}
+        for attr in cls_attr:
+            name = attr.name
+            cls_dict[name] = getattr(self, name)[indices]
+        return KvLen(**cls_dict)
+
+    @classmethod
+    def from_list(
+        cls,
+        kv_len_list: List[List[int]],
+        dtype: torch.dtype = torch.int64,
+        device: str = "cpu",
+        pin_memory: bool = False,
+    ) -> "KvLen":
+        cls_attr = [field.name for field in fields(cls)]
+        try:
+            kv_len = torch.tensor(kv_len_list, dtype=dtype, device="cpu")
+            if "npu" in str(device) and pin_memory:
+                kv_len = kv_len.pin_memory().to(device=device, non_blocking=True)
+            else:
+                kv_len = kv_len.to(device=device)
+        except Exception as e:
+            raise ValueError(f"Failed to create tensor from kv_len_list: {e}")
+        cls_dict = {}
+        for i, name in enumerate(cls_attr):
+            cls_dict[name] = kv_len[i]
+        return KvLen(**cls_dict)
+
+    def update(self, bs: int):
+        cls_attr = vars(self)
+        cls_dict = {
+            name: value[:bs] if value is not None else None
+            for name, value in cls_attr.items()
+        }
+        return KvLen(**cls_dict)
+
+    def add_(self, num: int):
+        full_kv_len = self.full_kv_len + num
+        swa_kv_len = self.swa_kv_len + num
+        c4_kv_len = full_kv_len // 4
+        c128_kv_len = full_kv_len // 128
+        c4_state_kv_len = self.c4_state_kv_len + num
+        c128_state_kv_len = self.c128_state_kv_len + num
+        return KvLen(
+            full_kv_len,
+            swa_kv_len,
+            c4_kv_len,
+            c128_kv_len,
+            c4_state_kv_len,
+            c128_state_kv_len,
+        )
+
+    def copy_data(
+        self,
+        raw_num_token: int,
+        cls: "KvLen",
+    ):
+        cls_attr = fields(self.__class__)
+
+        for attr in cls_attr:
+            attr_name = attr.name
+            ori_tensor = getattr(self, attr_name)
+            cp_tensor = getattr(cls, attr_name)
+
+            ori_tensor[:raw_num_token] = cp_tensor[:raw_num_token]
+
+    def cat_data(
+        self,
+        cls: "KvLen",
+    ):
+        cls_attr = fields(self.__class__)
+        cls_dict = {}
+        for i, attr in enumerate(cls_attr):
+            attr_name = attr.name
+            ori_tensor = getattr(self, attr_name)
+            src_tensor = getattr(cls, attr_name)
+
+            t = torch.cat([ori_tensor, src_tensor])
+            cls_dict[attr_name] = t
+        return KvLen(**cls_dict)
+
+    def to(self, device: str, pin_memory: bool = False) -> "KvLen":
+        cls_attr = [field.name for field in fields(self)]
+        cls_dict = {}
+        for name in cls_attr:
+            if "npu" in str(device) and pin_memory:
+                cls_dict[name] = (
+                    self.__dict__[name]
+                    .pin_memory()
+                    .to(device=device, non_blocking=True)
+                )
+            else:
+                cls_dict[name] = self.__dict__[name].to(device)
+        return KvLen(**cls_dict)
+
+
+@dataclass
+class ExtendNumTokens:
+    # Basic Seq len cpu
+    full_extend_num_tokens: int
+    swa_extend_num_tokens: int
+    c4_extend_num_tokens: int
+    c128_extend_num_tokens: int
+    c4_state_extend_num_tokens: int
+    c128_state_extend_num_tokens: int
+
+    @classmethod
+    def from_list(
+        cls,
+        kv_len_list: List[List[int]],
+    ) -> "ExtendNumTokens":
+        cls_attr = [field.name for field in fields(cls)]
+
+        cls_dict = {}
+        for i, name in enumerate(cls_attr):
+            cls_dict[name] = sum(kv_len_list[i])
+        return cls(**cls_dict)
+
+
+@dataclass
+class OutCacheLoc:
+    # Basic batched sampling params
+    out_full_loc: Optional[torch.Tensor]
+    out_swa_loc: Optional[torch.Tensor]
+    out_c4_loc: Optional[torch.Tensor]
+    out_c128_loc: Optional[torch.Tensor]
+    out_c4_state_loc: Optional[torch.Tensor]
+    out_c128_state_loc: Optional[torch.Tensor]
+
+    @classmethod
+    def from_extend_token_nums(
+        cls,
+        extend_num_kv: "ExtendNumTokens",
+        dtype: torch.dtype = torch.int64,
+        device: torch.device = "npu",
+    ) -> "OutCacheLoc":
+        fields = [
+            ("out_full_loc", "full_extend_num_tokens"),
+            ("out_swa_loc", "swa_extend_num_tokens"),
+            ("out_c4_loc", "c4_extend_num_tokens"),
+            ("out_c128_loc", "c128_extend_num_tokens"),
+            ("out_c4_state_loc", "c4_state_extend_num_tokens"),
+            ("out_c128_state_loc", "c128_state_extend_num_tokens"),
+        ]
+        tensors = {
+            field_name: torch.empty(
+                getattr(extend_num_kv, attr_name), dtype=dtype, device=device
+            )
+            for field_name, attr_name in fields
+        }
+        return cls(**tensors)
+
+    @classmethod
+    def from_data(
+        cls, bs: int, dtype: torch.dtype = torch.int64, device: torch.device = "npu"
+    ) -> "OutCacheLoc":
+        cls_attr = [field.name for field in fields(cls)]
+        cls_dict = {
+            name: torch.zeros((bs,), dtype=dtype, device=device) for name in cls_attr
+        }
+        return OutCacheLoc(**cls_dict)
+
+    def update(self, bs: int):
+        cls_attr = vars(self)
+        cls_dict = {
+            name: value[:bs] if value is not None else None
+            for name, value in cls_attr.items()
+        }
+        return OutCacheLoc(**cls_dict)
+
+    def copy_data(
+        self,
+        raw_num_token: int,
+        cls: "OutCacheLoc",
+    ):
+        cls_attr = fields(self.__class__)
+
+        for attr in cls_attr:
+            attr_name = attr.name
+            ori_tensor = getattr(self, attr_name)
+            cp_tensor = getattr(cls, attr_name)
+
+            ori_tensor[:raw_num_token] = cp_tensor[:raw_num_token]
+
+    def clear(self):
+        self.out_full_loc = None
+        self.out_swa_loc = None
+        self.out_c4_loc = None
+        self.out_c128_loc = None
+        self.out_c4_state_loc = None
+        self.out_c128_state_loc = None
+
+    def reshape_(
+        self,
+        topk,
+        speculative_num_steps,
+    ) -> "OutCacheLoc":
+        cls_attr = vars(self)
+        cls_dict = {}
+        for name, value in cls_attr.items():
+            value = value.reshape(-1, topk, speculative_num_steps)
+            value = value.permute((2, 0, 1)).reshape(speculative_num_steps, -1)
+            cls_dict[name] = value
+        return OutCacheLoc(**cls_dict)
+
+    def index_(
+        self,
+        indices: torch.Tensor,
+    ) -> "OutCacheLoc":
+        cls_attr = fields(self.__class__)
+        cls_dict = {}
+        for attr in cls_attr:
+            name = attr.name
+            cls_dict[name] = getattr(self, name)[indices]
+        return OutCacheLoc(**cls_dict)
 
 
 class ForwardMode(IntEnum):
@@ -292,6 +575,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
+    out_cache_loc_dsv4: OutCacheLoc  # shape: [b], int64
+    kv_seq_lens: KvLen
+    kv_seq_lens_cpu: KvLen
 
     # The sum of all sequence lengths
     seq_lens_sum: int
@@ -449,6 +735,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
+            kv_seq_lens=batch.kv_seq_lens,
+            kv_seq_lens_cpu=batch.kv_seq_lens_cpu,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
@@ -489,12 +778,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+                batch.extend_input_logprob_token_ids.pin_memory().to(
+                    device, non_blocking=True
+                )
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded(model_runner.server_args):
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
+            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).pin_memory().to(
                 device, non_blocking=True
             )
         ret.num_token_non_padded_cpu = num_tokens
@@ -515,14 +806,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
-            ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
-            ).to(device, non_blocking=True)
+            ret.global_num_tokens_gpu = (
+                torch.tensor(global_num_tokens, dtype=torch.int64)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-            ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
-            ).to(device, non_blocking=True)
+            ret.global_num_tokens_for_logprob_gpu = (
+                torch.tensor(global_num_tokens_for_logprob, dtype=torch.int64)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -533,14 +828,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             block_size = batch.dllm_config.block_size
             # Use int64 for AMD rotary embedding kernel compatibility
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in batch.dllm_block_offsets
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+            ret.positions = (
+                torch.tensor(
+                    [
+                        i
+                        for block_offset in batch.dllm_block_offsets
+                        for i in range(block_offset, block_offset + block_size)
+                    ],
+                    dtype=positions_dtype,
+                )
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
@@ -554,12 +853,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
-            ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
-            ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            ret.extend_seq_lens = (
+                torch.tensor(batch.extend_seq_lens, dtype=torch.int32)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
+            ret.extend_prefix_lens = (
+                torch.tensor(batch.extend_prefix_lens, dtype=torch.int32)
+                .pin_memory()
+                .to(device, non_blocking=True)
+            )
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
@@ -865,6 +1168,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             max_num_tokens = max(global_num_tokens)
             global_num_tokens = [max_num_tokens] * sync_group_size
             buffer_len = max_num_tokens * sync_group_size
+            self.global_num_tokens_for_logprob_cpu = global_num_tokens
         else:
             buffer_len = sum(global_num_tokens)
 

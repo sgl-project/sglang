@@ -37,6 +37,8 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+    # for c4c128 kv layers
+    kv_type_map: dict[int, str]
 
 
 class KVPoll:

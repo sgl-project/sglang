@@ -1,5 +1,6 @@
 import functools
 import logging
+import math
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable
 
@@ -242,3 +243,14 @@ def process_routed_expert(hidden_states, topk_output, forward_func):
     with torch.get_device_module().stream(stream):
         shared_output = forward_func(hidden_states, topk_output)
     return shared_output
+
+@functools.lru_cache(2)
+def get_had_pow2(n, norm=True):
+    if not ((n & (n - 1) == 0) and (n > 0)):
+        raise ValueError(f"n must be a positive power of 2, got{n}")
+    had = torch.ones(1, 1, dtype=torch.bfloat16).npu()
+    while had.shape[0] != n:
+        had = torch.cat((torch.cat([had, had], 1), torch.cat([had, -had], 1)), 0)
+        if norm:
+            had /= math.sqrt(2)
+    return had

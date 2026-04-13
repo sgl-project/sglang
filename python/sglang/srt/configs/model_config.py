@@ -69,7 +69,9 @@ def is_deepseek_nsa(config) -> bool:
         in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
+            "DeepseekV4ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
@@ -307,6 +309,12 @@ class ModelConfig:
             "GlmMoeDsaForCausalLM",
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV4ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "Glm4MoeForCausalLM",
@@ -387,6 +395,22 @@ class ModelConfig:
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
         ]
+
+        self.is_hybrid_swa_c4_c128 = self.hf_config.architectures[0] in [
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForCausalLMNextN",
+        ]
+
+        if self.is_hybrid_swa_c4_c128:
+            (
+                self.swa_attention_layer_ids,
+                self.c4_attention_layer_ids,
+                self.c128_attention_layer_ids,
+            ) = get_hybrid_swa_c4_c128_layer_ids(
+                self.hf_config.architectures,
+                self.hf_text_config.num_hidden_layers,
+                getattr(self.hf_config, "compress_ratios", None),
+            )
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
@@ -487,6 +511,17 @@ class ModelConfig:
                     self.scaling = compute_mla_mscale_scaling(
                         rope_scaling, self.scaling
                     )
+
+        elif (
+            "DeepseekV4ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
+        ):
+            self.attention_arch = AttentionArch.MHA
+            self.index_head_dim = (
+                get_nsa_index_head_dim(self.hf_config)
+                if is_deepseek_nsa(self.hf_config)
+                else None
+            )
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -1527,3 +1562,23 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
+
+
+def get_hybrid_swa_c4_c128_layer_ids(
+    model_architectures: List[str],
+    num_hidden_layers: int,
+    compress_ratios: Optional[List[int]] = None,
+):
+    if (
+        "DeepseekV4ForCausalLM" in model_architectures
+        or "DeepseekV4ForCausalLMNextN" in model_architectures
+    ):
+        swa_attention_layer_ids = [i for i in range(num_hidden_layers)]
+        c4_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if compress_ratios[i] == 4
+        ]
+        c128_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if compress_ratios[i] == 128
+        ]
+
+    return swa_attention_layer_ids, c4_attention_layer_ids, c128_attention_layer_ids

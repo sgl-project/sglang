@@ -348,6 +348,9 @@ class SchedulerOutputProcessorMixin:
 
         for i, req in enumerate(batch.reqs):
             req.kv_committed_len += accept_lens[i]
+            req.c4_kv_committed_len = req.kv_committed_len // 4
+            req.c128_kv_committed_len = req.kv_committed_len // 128
+
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )

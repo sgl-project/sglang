@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 class SiluAndMul(MultiPlatformOp):
     def __init__(self, *args, **kwargs):
+        self.swiglu_limit = kwargs.pop("swiglu_limit", 0)
         super().__init__(*args, **kwargs)
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
@@ -85,6 +86,8 @@ class SiluAndMul(MultiPlatformOp):
             return self.forward_native(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        if self.swiglu_limit > 0:
+            x.clamp_(min=-self.swiglu_limit, max=self.swiglu_limit)
         out = torch_npu.npu_swiglu(x)
         return out
 

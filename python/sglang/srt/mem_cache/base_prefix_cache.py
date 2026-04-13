@@ -259,6 +259,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
+    def supports_swa_c4c128(self) -> bool:
+        return False
+
     def supports_mamba(self) -> bool:
         return False
 

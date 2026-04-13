@@ -572,6 +572,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        skip_layernorm=False,
     ):
         if cache is not None:
             self._context.cache = cache
@@ -582,6 +583,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
+            skip_layernorm=skip_layernorm,
         )
 
     def postprocess_layer(
@@ -819,10 +821,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        skip_layernorm=False,
     ):
-        # TODO move these `if shape != 0` into LayerNorm itself
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+        if not skip_layernorm:
+            # TODO move these `if shape != 0` into LayerNorm itself
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = layernorm(hidden_states, residual)
+                else:
+                    hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod
@@ -834,6 +841,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        skip_layernorm=False,
     ):
         if get_attn_tp_context().input_scattered:
             return CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
@@ -858,7 +866,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = layernorm(hidden_states, residual)
-            elif context.attn_tp_rank == 0:
+            elif context.attn_tp_rank == 0 and residual is not None:
                 hidden_states += residual
 
             hidden_states, local_hidden_states = (
@@ -868,7 +876,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
 
             if not use_layer_norm_before_gather:
-                dp_scatter(residual, hidden_states, forward_batch)
+                if residual is not None:
+                    dp_scatter(residual, hidden_states, forward_batch)
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
@@ -888,7 +897,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states, residual = layernorm(hidden_states, residual)
+                if residual is not None:
+                    hidden_states, residual = layernorm(hidden_states, residual)
+                else:
+                    hidden_states = layernorm(hidden_states, None)
         return hidden_states, residual
 
     @staticmethod
@@ -900,16 +912,21 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        skip_layernorm=False,
     ):
         input_hidden_states = hidden_states
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
             context.attn_tp_rank
         ]
         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
-        if residual_input_mode == ScatterMode.TP_ATTN_FULL:
+        if residual_input_mode == ScatterMode.TP_ATTN_FULL and residual is not None:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+        if not skip_layernorm:
+            if hidden_states.shape[0] != 0:
+                if residual is not None:
+                    hidden_states, residual = layernorm(hidden_states, residual)
+                else:
+                    hidden_states = layernorm(hidden_states, None)
         return hidden_states, residual
 
     @staticmethod
@@ -1022,7 +1039,8 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
         **kwargs,
     ):
-        hidden_states += residual
+        if residual is not None:
+            hidden_states += residual
         residual = None
         hidden_states, local_hidden_states = (
             get_local_dp_buffer(),

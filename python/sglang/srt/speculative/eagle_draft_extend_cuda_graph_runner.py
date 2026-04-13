@@ -23,6 +23,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    KvLen,
+    OutCacheLoc,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -102,6 +104,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
+        # dsv4
+        self.kv_seq_lens_cpu = KvLen.from_data(
+            self.max_bs, self.seq_len_fill_value, dtype=torch.int32
+        )
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
 
         if self.enable_torch_compile:
@@ -152,6 +158,12 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             accept_length = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
+            )
+
+            # dsv4
+            self.kv_seq_lens = self.kv_seq_lens_cpu.to(model_runner.device)
+            self.out_cache_loc_dsv4 = OutCacheLoc.from_data(
+                self.max_num_token, dtype=self._cache_loc_dtype()
             )
 
             if self.require_gathered_buffer:
@@ -287,6 +299,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         next_token_logits_buffer = buffers.next_token_logits_buffer[
             : bs if self.forward_mode == ForwardMode.DRAFT_EXTEND else num_tokens
         ]
+        # dsv4
+        kv_seq_lens_cpu = self.kv_seq_lens_cpu.update(bs)
+        kv_seq_lens = self.kv_seq_lens.update(bs)
+        out_cache_loc_dsv4 = self.out_cache_loc_dsv4.update(num_tokens)
 
         # V1 (DRAFT_EXTEND): pruned_states = bs (last token per seq)
         # V2 (DRAFT_EXTEND_V2): pruned_states = num_tokens (all tokens)
@@ -364,6 +380,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.LAST,
             attn_backend=self.eagle_worker.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
+            kv_seq_lens=kv_seq_lens,
+            kv_seq_lens_cpu=kv_seq_lens_cpu,
         )
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -412,13 +431,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 
-    def replay(self, forward_batch: ForwardBatch):
-        assert forward_batch.out_cache_loc is not None
-        self.deepep_adapter.replay()
-        buffers = self.buffers
-
+    def replay_prepare(self, forward_batch):
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
+        buffers = self.buffers
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
         if self.require_mlp_tp_gather:
@@ -503,20 +519,29 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_mode=self.forward_mode,
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu,
+            out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
         )
 
         # Replay
         self.raw_bs = raw_bs
         self.bs = bs
+        self.num_tokens = num_tokens
+
+    def replay(self, forward_batch: ForwardBatch, skip_attn_backend_init=False):
+        assert forward_batch.out_cache_loc is not None
+        self.deepep_adapter.replay()
+        buffers = self.buffers
+        if not skip_attn_backend_init:
+            self.replay_prepare(forward_batch)
         self._replay(forward_batch)
-        out = self.output_buffers[bs]
+        out = self.output_buffers[self.bs]
 
         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             # DRAFT_EXTEND_V2: all tokens calculations whether accepted or not.
-            unpadding_bs = num_tokens
-        elif bs != raw_bs:
-            forward_batch.spec_info.accept_length = buffers.accept_length[:raw_bs]
-            unpadding_bs = raw_bs
+            unpadding_bs = self.num_tokens
+        elif self.bs != self.raw_bs:
+            forward_batch.spec_info.accept_length = buffers.accept_length[: self.raw_bs]
+            unpadding_bs = self.raw_bs
         else:
             unpadding_bs = None
 

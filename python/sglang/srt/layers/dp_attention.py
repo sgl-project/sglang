@@ -133,6 +133,16 @@ class _DpGatheredBufferWrapper:
         return buffer
 
     @classmethod
+    def get_global_dp_id_buffer(cls, dtype=torch.int32) -> torch.Tensor:
+        with use_symmetric_memory(get_tp_group()):
+            buffer = torch.empty(
+                (cls._global_dp_buffer_len, 1),
+                dtype=dtype,
+                device=cls._device,
+            )
+        return buffer
+
+    @classmethod
     def get_local_dp_buffer(cls) -> torch.Tensor:
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
@@ -192,6 +202,10 @@ def set_dp_buffer_len(
 
 def get_global_dp_buffer() -> torch.Tensor:
     return _DpGatheredBufferWrapper.get_global_dp_buffer()
+
+
+def get_global_dp_id_buffer(dtype) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_id_buffer(dtype)
 
 
 def get_local_dp_buffer() -> torch.Tensor:

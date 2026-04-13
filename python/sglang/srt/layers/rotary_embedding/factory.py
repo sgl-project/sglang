@@ -24,6 +24,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     Gemma4RotaryEmbedding,
     Llama3RotaryEmbedding,
     Phi3LongRoPEScaledRotaryEmbedding,
+    ComplexExpRotaryEmbedding
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
 from sglang.srt.utils import get_bool_env_var, is_hip
@@ -105,6 +106,8 @@ def get_rope(
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
+    from sglang.srt.utils import get_bool_env_var
+    is_dsv4 = get_bool_env_var("IS_DEEPSEEK_V4")
 
     if dual_chunk_attention_config is not None:
         extra_kwargs = {
@@ -231,6 +234,26 @@ def get_rope(
                     scaling_factor,
                     dtype,
                 )
+        elif scaling_type == "complex_exp" or is_dsv4:
+            scaling_factor = rope_scaling["factor"]
+            original_max_position = rope_scaling["original_max_position_embeddings"]
+            extra_kwargs = {
+                k: v
+                for k, v in rope_scaling.items()
+                if k
+                in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
+            }
+            extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
+            rotary_emb = ComplexExpRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                original_max_position,
+                base,
+                is_neox_style,
+                scaling_factor,
+                dtype,
+                **extra_kwargs,
+            )
         elif scaling_type == "yarn":
             scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
             original_max_position = _get_rope_param(

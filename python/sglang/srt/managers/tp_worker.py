@@ -77,11 +77,24 @@ class BaseTpWorker(ABC):
     def is_hybrid_swa(self) -> bool:
         return self.model_runner.is_hybrid_swa
 
+    @property
+    def is_hybrid_swa_c4_c128(self) -> bool:
+        return self.model_runner.is_hybrid_swa_c4_c128
+
     def get_tokens_per_layer_info(self):
-        return (
-            self.model_runner.full_max_total_num_tokens,
-            self.model_runner.swa_max_total_num_tokens,
-        )
+        if self.is_hybrid_swa:
+            return (
+                self.model_runner.full_max_total_num_tokens,
+                self.model_runner.swa_max_total_num_tokens,
+            )
+        if self.is_hybrid_swa_c4_c128:
+            return (
+                self.model_runner.swa_max_total_num_tokens,
+                self.model_runner.c4_max_total_num_tokens,
+                self.model_runner.c128_max_total_num_tokens,
+                self.model_runner.c4_state_max_total_num_tokens,
+                self.model_runner.c128_state_max_total_num_tokens,
+            )
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)

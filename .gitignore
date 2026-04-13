@@ -274,3 +274,7 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+
+kernel_meta
+*.pt
+extra-info

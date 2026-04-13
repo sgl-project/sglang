@@ -157,6 +157,7 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    is_hash_layer: bool = False
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -257,6 +258,8 @@ class TopK(MultiPlatformOp):
         num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        is_hash_layer: bool = False,
+        tid2eid: torch.Tensor = None,
         correction_bias: Optional[torch.Tensor] = None,
         quant_config: Optional[QuantizationConfig] = None,
         routed_scaling_factor: Optional[float] = None,
@@ -286,7 +289,9 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            is_hash_layer=is_hash_layer,
         )
+        self.tid2eid = tid2eid
 
     def forward_native(
         self,
@@ -379,6 +384,7 @@ class TopK(MultiPlatformOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.Tensor] = None,
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
@@ -389,6 +395,8 @@ class TopK(MultiPlatformOp):
             hidden_states=hidden_states,
             router_logits=router_logits,
             topk_config=self.topk_config,
+            tid2eid=self.tid2eid,
+            input_ids=input_ids,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
             layer_id=self.layer_id,

@@ -505,9 +505,11 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     Takes temperature-scaled logits as input (softmax is applied internally).
     """
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
-    if hasattr(torch_npu, "npu_top_k_top_p") and torch.all(
-        (top_ks <= 1024) & (top_ks >= 1)
-    ):
+    if (
+        False
+        and hasattr(torch_npu, "npu_top_k_top_p")
+        and torch.all((top_ks <= 1024) & (top_ks >= 1))
+    ):  # TODO
         logits_top_k_top_p = torch_npu.npu_top_k_top_p(logits, top_ps, top_ks)
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 

@@ -342,12 +342,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
+        self.is_hybrid_swa_c4_c128 = model_config.is_hybrid_swa_c4_c128
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_spec_overlap_reflow = envs.SGLANG_SPEC_ENABLE_OVERLAP_REFLOW.get()
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -1282,9 +1284,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if hasattr(self.model, "get_attention_sliding_window_size"):
             self.sliding_window_size = self.model.get_attention_sliding_window_size()
         elif (
-            self.model_config.is_hybrid_swa
-            and self.model_config.sliding_window_size is not None
-        ):
+            self.model_config.is_hybrid_swa or self.model_config.is_hybrid_swa_c4_c128
+        ) and self.model_config.sliding_window_size is not None:
             # sliding window field in model config may have different meaning for different kinds of models (e.g., dllm), here we only consider the sliding window in SWA model
             self.sliding_window_size = self.model_config.sliding_window_size
         elif self.model_config.attention_chunk_size is not None:
@@ -2920,6 +2921,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
             and not is_nsa_enable_prefill_cp()
+            and not self.enable_spec_overlap_reflow
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,

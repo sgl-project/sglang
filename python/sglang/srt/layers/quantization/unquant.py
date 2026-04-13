@@ -134,6 +134,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
+        if "wo_a" in layer.prefix:
+            use_fused_transpose_batchmatmul = get_bool_env_var(
+                "USE_FUSED_TRANSPOSE_BATCHMATMUL"
+            )
+            if use_fused_transpose_batchmatmul:
+                layer.weight.data = (
+                    layer.weight.data.view(8 // layer.tp_size, 1024, -1)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+
     def apply(
         self,
         layer: torch.nn.Module,
