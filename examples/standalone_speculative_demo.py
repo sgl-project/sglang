@@ -68,6 +68,8 @@ CONFIGS = {
         base_engine=dict(mem_fraction_static=0.8, tp_size=1, trust_remote_code=True),
         spec_kwargs=dict(
             speculative_algorithm="STANDALONE",
+            speculative_num_steps=4,
+            speculative_eagle_topk=2,
             speculative_num_draft_tokens=5,
         ),
     ),
