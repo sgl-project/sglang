@@ -404,12 +404,13 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Encode prefill disaggregation
 
-| Argument                     | Defaults           | Options                                                        | Server supported |
-|------------------------------|--------------------|----------------------------------------------------------------|:----------------:|
-| `--encoder-only`             | `False`            | bool flag<br/> (set to enable)                                 |      A2, A3      |
-| `--language-only`            | `False`            | bool flag<br/> (set to enable)                                 |      A2, A3      |
-| `--encoder-transfer-backend` | `zmq_to_scheduler` | `zmq_to_scheduler`, <br/> `zmq_to_tokenizer`,<br/>  `mooncake` |      A2, A3      |
-| `--encoder-urls`             | `[]`               | List[str]                                                      |      A2, A3      |
+| Argument                                | Defaults           | Options                                                      | Server supported |
+| --------------------------------------- | ------------------ | ------------------------------------------------------------ | :--------------: |
+| `--enable-adaptive-dispatch-to-encoder` | `False`            | bool flag<br/> (set to enable)                               |      A2, A3      |
+| `--encoder-only`                        | `False`            | bool flag<br/> (set to enable)                               |      A2, A3      |
+| `--language-only`                       | `False`            | bool flag<br/> (set to enable)                               |      A2, A3      |
+| `--encoder-transfer-backend`            | `zmq_to_scheduler` | `zmq_to_scheduler`, <br/> `zmq_to_tokenizer`,<br/>  `mooncake` |      A2, A3      |
+| `--encoder-urls`                        | `[]`               | List[str]                                                    |      A2, A3      |
 
 ## Custom weight loader
 
