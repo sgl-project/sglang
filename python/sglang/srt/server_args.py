@@ -2822,10 +2822,11 @@ class ServerArgs:
 
         if self.moe_runner_backend == "flashinfer_trtllm_routed":
             assert self.quantization in [
+                "modelopt_fp4",
                 "fp8",
                 "mxfp8",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'modelopt_fp4', 'fp8', 'mxfp8', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -2911,14 +2912,18 @@ class ServerArgs:
             )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if os.environ.get("SGLANG_MOE_NVFP4_DISPATCH") is None:
+            if (
+                os.environ.get("SGLANG_MOE_NVFP4_DISPATCH") is None
+                and self.quantization == "modelopt_fp4"
+            ):
                 envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
                 logger.warning(
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
             assert self.moe_runner_backend in [
-                "flashinfer_cutlass"
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+                "flashinfer_cutlass",
+                "flashinfer_trtllm_routed",
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_trtllm_routed moe runner backend"
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size

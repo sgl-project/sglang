@@ -95,7 +95,7 @@ class FlashinferDispatcher(BaseDispatcher):
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
 
-        # TODO: Can other moe runners use payload_in_workspace too?
+        # TODO: Enable for flashinfer_trtllm_routed if possible.
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
@@ -147,27 +147,6 @@ class FlashinferDispatcher(BaseDispatcher):
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
-        # Preallocate dummy tensors (to overcome numLocalTokens > 0 restriction)
-        self.dummy_x = torch.empty(
-            (1, hidden_size),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        # -1 will be ignored by flashinfer cutlass moe
-        self.dummy_topk_ids = torch.full(
-            (1, self.router_topk), -1, dtype=torch.int32, device="cuda"
-        )
-        # Hack for dispatch with dummy token - will route the dummy token to this rank so it doesn't require any transfer.
-        self.dummy_topk_ids_current_rank = torch.full(
-            (1, self.router_topk),
-            self.ep_rank * self.num_local_experts,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self.dummy_topk_weights = torch.zeros(
-            (1, self.router_topk), dtype=torch.float32, device="cuda"
-        )
-
     @debug_kernel_api
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -177,16 +156,6 @@ class FlashinferDispatcher(BaseDispatcher):
         x_sf = None
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
-
-        # Handle case where there are no tokens on this DP worker
-        # moe_a2a.dispatch requires at least one token
-        self.has_dummy_token = False
-        if x.shape[0] == 0:
-            logger.warning("No tokens on this DP worker, using dummy token")
-            self.has_dummy_token = True
-            x = self.dummy_x
-            topk_ids = self.dummy_topk_ids
-            topk_weights = self.dummy_topk_weights
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
@@ -216,7 +185,7 @@ class FlashinferDispatcher(BaseDispatcher):
             else x.shape[0]
         )
         recv_tensors = self.moe_a2a.dispatch(
-            self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
+            topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
             expert_id_payload_index=expert_id_payload_index,
@@ -224,8 +193,9 @@ class FlashinferDispatcher(BaseDispatcher):
         if x_sf is not None:
             x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
-            # TODO: fuse interleave into cutlass moe
-            x_sf = nvfp4_block_scale_interleave(x_sf)
+            # TODO: Fuse interleave into cutlass moe when flashinfer is updated to have https://github.com/flashinfer-ai/flashinfer/pull/2330
+            if get_moe_runner_backend().is_flashinfer_cutlass():
+                x_sf = nvfp4_block_scale_interleave(x_sf)
         else:
             x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
         x = x_recv.view(-1, x_recv.shape[-1])
@@ -256,11 +226,4 @@ class FlashinferDispatcher(BaseDispatcher):
             self.runtime_max_tokens_per_rank,
             payload_in_workspace=self.payload_in_workspace,
         )
-
-        # Remove dummy token if it was added in dispatch
-        if self.has_dummy_token:
-            hidden_states = hidden_states[1:, :]
-
-        del self.runtime_max_tokens_per_rank
-        del self.has_dummy_token
         return hidden_states
