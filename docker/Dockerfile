@@ -428,8 +428,7 @@ COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
-# Copy flashinfer cache and jit-cache package (if installed)
-COPY --from=flashinfer_cache /root/.cache/flashinfer /root/.cache/flashinfer
+# Copy flashinfer jit-cache package (if installed)
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
 # Copy dev tools
