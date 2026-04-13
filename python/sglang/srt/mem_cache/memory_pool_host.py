@@ -933,6 +933,11 @@ class MLATokenToKVPoolHost(HostKVCache):
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
                     )
+                elif _is_npu:
+                    # NPU torch fallback: device pool has separate k/v buffers
+                    self._npu_load_mla_layer(
+                        device_pool, host_indices, device_indices, layer_id
+                    )
                 else:
                     transfer_kv_per_layer_mla(
                         src=self.kv_buffer[layer_id],
@@ -1002,6 +1007,60 @@ class MLATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def _npu_load_mla_layer(
+        self, device_pool, host_indices, device_indices, layer_id
+    ):
+        """NPU torch fallback: load KV from host to device (separate k/v buffers)."""
+        device = device_pool.k_buffer[layer_id].device
+        host_device = self.kv_buffer[layer_id].device
+        if host_indices.device != host_device:
+            host_indices = host_indices.to(host_device)
+        if device_indices.device != device:
+            device_indices = device_indices.to(device)
+
+        kv_lora_rank = device_pool.kv_lora_rank
+        host_kv = self.kv_buffer[layer_id][host_indices]  # [N, 1, kv_cache_dim]
+        host_k = host_kv[..., :kv_lora_rank].view(-1, 1, kv_lora_rank)
+        host_v = host_kv[..., kv_lora_rank:].view(
+            -1, 1, device_pool.qk_rope_head_dim
+        )
+        if host_k.device != device:
+            host_k = host_k.to(device, non_blocking=True)
+            host_v = host_v.to(device, non_blocking=True)
+
+        dst_k = device_pool.k_buffer[layer_id].view(-1, 1, kv_lora_rank)
+        dst_v = device_pool.v_buffer[layer_id].view(
+            -1, 1, device_pool.qk_rope_head_dim
+        )
+        dst_k[device_indices] = host_k
+        dst_v[device_indices] = host_v
+
+    def _npu_backup_mla_all_layer(
+        self, device_pool, host_indices, device_indices
+    ):
+        """NPU torch fallback: backup KV from device to host across all layers."""
+        host_device = self.kv_buffer[0].device
+        if host_indices.device != host_device:
+            host_indices = host_indices.to(host_device)
+
+        kv_lora_rank = device_pool.kv_lora_rank
+        for layer_id in range(self.layer_num):
+            device = device_pool.k_buffer[layer_id].device
+            layer_device_indices = device_indices
+            if layer_device_indices.device != device:
+                layer_device_indices = layer_device_indices.to(device)
+
+            src_k = device_pool.k_buffer[layer_id].view(-1, 1, kv_lora_rank)[
+                layer_device_indices
+            ]
+            src_v = device_pool.v_buffer[layer_id].view(
+                -1, 1, device_pool.qk_rope_head_dim
+            )[layer_device_indices]
+            host_kv = torch.cat([src_k, src_v], dim=-1)
+            if host_kv.device != host_device:
+                host_kv = host_kv.to(host_device, non_blocking=True)
+            self.kv_buffer[layer_id][host_indices] = host_kv
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
