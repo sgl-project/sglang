@@ -111,7 +111,7 @@ class TestAbortWithApiKey(CustomTestCase):
         )
 
 
-class TestAbortAll(AbortAllMixin, PauseResumeInPlaceMixin, CustomTestCase):
+class TestSchedulerControl(AbortAllMixin, PauseResumeInPlaceMixin, CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
