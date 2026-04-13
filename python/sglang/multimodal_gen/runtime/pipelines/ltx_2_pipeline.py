@@ -46,9 +46,9 @@ def _resolve_ltx2_two_stage_component_paths(
 
     if "spatial_upsampler" not in resolved:
         spatial_candidates = [
-            os.path.join(model_path, "latent_upsampler"),
-            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
             os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"),
+            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+            os.path.join(model_path, "latent_upsampler"),
             os.path.join(model_path, "ltx-2-spatial-upscaler-x2-1.0.safetensors"),
         ]
         for candidate in spatial_candidates:
@@ -59,6 +59,7 @@ def _resolve_ltx2_two_stage_component_paths(
 
     if "distilled_lora" not in resolved:
         distilled_lora_candidates = [
+            os.path.join(model_path, "ltx-2.3-20b-distilled-lora-384.safetensors"),
             os.path.join(model_path, "ltx-2.3-22b-distilled-lora-384.safetensors"),
             os.path.join(model_path, "ltx-2-19b-distilled-lora-384.safetensors"),
         ]
@@ -264,6 +265,12 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     pipeline_name = "LTX2TwoStagePipeline"
     STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
+    @staticmethod
+    def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:
+        return is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        )
+
     def initialize_pipeline(self, server_args: ServerArgs):
         super().initialize_pipeline(server_args)
         server_args.component_paths = _resolve_ltx2_two_stage_component_paths(
@@ -332,10 +339,12 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 lora_path=lora_paths,
                 target=lora_targets,
                 strength=lora_strengths,
-                # Keep the distilled adapter unmerged when it is the only active LoRA.
-                # Merging it into the base weights makes the subsequent switch back to
-                # stage 1 depend on unmerge bookkeeping instead of the original base.
-                merge_weights=self._stage1_lora_path is not None,
+                # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
+                # into the transformer weights. Legacy LTX-2 should keep the
+                # preexisting unmerged behavior to avoid regressing stage 2 quality.
+                merge_weights=self._should_merge_stage2_distilled_lora(
+                    self.server_args
+                ),
             )
         else:
             raise ValueError(f"Unknown LTX2 two-stage LoRA phase: {phase}")

@@ -271,6 +271,8 @@ def handle_rerun_stage(
         "stage-c-test-deepep-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
+        "multimodal-gen-component-accuracy-1-gpu",
+        "multimodal-gen-component-accuracy-2-gpu",
         "multimodal-gen-test-1-b200",
     ]
 
