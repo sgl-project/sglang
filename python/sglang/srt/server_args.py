@@ -1012,10 +1012,17 @@ class ServerArgs:
         # Auto-detect draft load_format: if the main model is GGUF but the draft
         # model path is a directory (safetensors checkpoint), default draft load
         # format to "auto" so the GGUF loader is not incorrectly applied to it.
+        # Note: _handle_speculative_decoding runs BEFORE _handle_load_format,
+        # so self.load_format may still be "auto" even for GGUF base models.
+        # Check both the explicit flag and the actual base model file.
+        _base_is_gguf = (
+            self.load_format == "gguf"
+            or check_gguf_file(self.model_path)
+        )
         if (
             self.speculative_draft_load_format is None
             and self.speculative_draft_model_path is not None
-            and self.load_format == "gguf"
+            and _base_is_gguf
             and not check_gguf_file(self.speculative_draft_model_path)
         ):
             import logging as _logging

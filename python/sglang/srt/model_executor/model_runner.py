@@ -1102,8 +1102,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             quantize_and_serve=self.server_args.quantize_and_serve,
         )
 
+        # Draft workers use speculative_draft_load_format (auto-detected or
+        # user-specified) so a safetensors draft isn't routed to the GGUF loader.
+        _load_fmt = (
+            self.server_args.speculative_draft_load_format
+            if self.is_draft_worker
+            and self.server_args.speculative_draft_load_format is not None
+            else self.server_args.load_format
+        )
         self.load_config = LoadConfig(
-            load_format=self.server_args.load_format,
+            load_format=_load_fmt,
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
             tp_rank=self.tp_rank,
