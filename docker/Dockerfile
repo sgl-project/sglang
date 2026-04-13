@@ -19,7 +19,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.7.post2
+ARG FLASHINFER_VERSION=0.6.7.post3
 ARG MOONCAKE_VERSION=0.3.9
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -152,48 +152,38 @@ ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8
 
 ########################################################
-########## Framework Development Image ################
+########## PARALLEL BUILDER STAGES ####################
 ########################################################
+#
+# These stages run IN PARALLEL via BuildKit:
+#
+#   base
+#     |
+#     +-- torch_deps ------> deepep_builder (needs torch)
+#     |                  \-> flashinfer_cache (needs flashinfer)
+#     |
+#     +-- devtools_builder (independent)
+#     +-- gateway_builder  (independent, only needs gateway source)
+#     |
+#     v
+#   framework (combines all artifacts)
+#
 
-# Copy local source if building from local
-FROM scratch AS local_src
-COPY . /src
+########################################################
+# PARALLEL STAGE 1: Torch/Deps Builder (starts from base)
+########################################################
+FROM base AS torch_deps
 
-FROM base AS framework
-
-ARG BRANCH_TYPE
-ARG BUILD_TYPE
 ARG CUDA_VERSION
-ARG BUILD_AND_DOWNLOAD_PARALLEL
+ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
-ARG SGL_VERSION
-ARG USE_LATEST_SGLANG
-ARG INSTALL_FLASHINFER_JIT_CACHE
-ARG FLASHINFER_VERSION
-ARG GRACE_BLACKWELL
-ARG GRACE_BLACKWELL_DEEPEP_BRANCH
-ARG DEEPEP_COMMIT
-ARG TRITON_LANG_COMMIT
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
 
-# Install SGLang
-COPY --from=local_src /src /tmp/local_src
-RUN if [ "$BRANCH_TYPE" = "local" ]; then \
-        cp -r /tmp/local_src /sgl-workspace/sglang; \
-    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
-        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
-    elif [ -z "$SGL_VERSION" ]; then \
-        echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
-    else \
-        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
-    fi \
-    && rm -rf /tmp/local_src
-
+# Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
-    && cd sglang \
     && case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
         12.8.1) CUINDEX=128 ;; \
@@ -213,21 +203,50 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
     ; \
-    fi \
-    && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-    && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
-    fi \
-    && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
-    && kernels download python
-    && kernels lock python
-    && mv python/kernels.lock /root/.cache/sglang
+    fi
 
-# DeepEP
-# We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
-# TODO: move from Tom's branch to DeepEP hybrid-ep branch
-# We use the nvshmem version that ships with torch 2.9.1
-# CU12 uses 3.3.20 and CU13 uses 3.3.24
+# Copy ONLY dependency specification file (for better caching)
+COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
+
+# Install sglang dependencies (torch, transformers, etc.)
+# This layer is cached unless pyproject.toml changes
+# Generate constraints.txt to prevent reinstalling these deps in later stages
+RUN --mount=type=cache,target=/root/.cache/pip \
+    case "$CUDA_VERSION" in \
+        12.6.1) CUINDEX=126 ;; \
+        12.8.1) CUINDEX=128 ;; \
+        12.9.1) CUINDEX=129 ;; \
+        13.0.1) CUINDEX=130 ;; \
+        *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+    esac \
+    && cd /tmp/sglang_deps/python \
+    && mkdir -p sglang \
+    && touch sglang/__init__.py \
+    && echo '__version__ = "0.0.0"' > sglang/version.py \
+    && touch README.md \
+    && touch LICENSE \
+    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && cd /sgl-workspace \
+    && rm -rf /tmp/sglang_deps \
+    && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
+
+########################################################
+# PARALLEL STAGE 2: DeepEP Builder (needs torch_deps)
+########################################################
+FROM torch_deps AS deepep_builder
+
+ARG CUDA_VERSION
+ARG BUILD_AND_DOWNLOAD_PARALLEL
+ARG GRACE_BLACKWELL
+ARG GRACE_BLACKWELL_DEEPEP_BRANCH
+ARG HOPPER_SBO
+ARG HOPPER_SBO_DEEPEP_COMMIT
+ARG DEEPEP_COMMIT
+ARG GITHUB_ARTIFACTORY
+
+WORKDIR /build
+
+# Clone DeepEP
 RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
@@ -252,19 +271,17 @@ RUN set -eux; \
         cd .. ; \
     fi
 
-# Install DeepEP
+# Build DeepEP wheel
 RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /sgl-workspace/DeepEP && \
+    cd /build/DeepEP && \
     case "$CUDA_VERSION" in \
         12.6.1) \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
             ;; \
         12.8.1) \
-            # FIXED: 12.8.1 does NOT support Blackwell 10.3 \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
             ;; \
         12.9.1|13.0.1) \
-            # 12.9.1+ properly supports Blackwell 10.3 \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
             ;; \
         *) \
@@ -274,76 +291,160 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
         sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi && \
-    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
+    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} \
+        python3 setup.py bdist_wheel -d /wheels
 
-# Install Mooncake
+########################################################
+# PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
+########################################################
+FROM torch_deps AS flashinfer_cache
+
+ARG CUDA_VERSION
+ARG INSTALL_FLASHINFER_JIT_CACHE
+ARG FLASHINFER_VERSION
+
+# Stage jit-cache artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
-    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
-    if [ "$CUDA_MAJOR" -ge 13 ]; then \
-        echo "CUDA >= 13, installing mooncake-transfer-engine from source code"; \
-        git clone --branch v${MOONCAKE_VERSION} --depth 1 https://github.com/kvcache-ai/Mooncake.git && \
-        cd Mooncake && \
-        bash dependencies.sh && \
-        mkdir -p build && \
-        cd build && \
-        cmake .. ${MOONCAKE_COMPILE_ARG} && \
-        make -j$(nproc) && \
-        make install; \
-    else \
-        echo "CUDA < 13, installing mooncake-transfer-engine from pip"; \
-        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+    case "$CUDA_VERSION" in \
+        12.6.1) CUINDEX=126 ;; \
+        12.8.1) CUINDEX=128 ;; \
+        12.9.1) CUINDEX=129 ;; \
+        13.0.1) CUINDEX=130 ;; \
+        *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+    esac \
+    && mkdir -p /flashinfer_jit_output \
+    && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
+        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
+        && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
+        && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
     fi
-# Install essential Python packages
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install \
-    datamodel_code_generator \
-    pre-commit \
-    pytest \
-    black \
-    isort \
-    icdiff \
-    uv \
-    wheel \
-    scikit-build-core \
-    nixl \
-    py-spy \
-    cubloaty \
-    google-cloud-storage
 
-# Build and install sgl-model-gateway (install Rust, build, then remove Rust toolchain)
-# Cleanup runs unconditionally via trap to ensure Rust artifacts don't bloat the layer
+########################################################
+# PARALLEL STAGE 4: Dev Tools Builder (starts from base)
+########################################################
+FROM base AS devtools_builder
+
+ARG GITHUB_ARTIFACTORY
+
+WORKDIR /tools
+
+# Minimal apt deps needed for oh-my-zsh install in this stage
+# Full dev apt packages (gdb, vim, tmux, nsight, etc.) are installed in the framework stage
+RUN --mount=type=cache,target=/var/cache/apt,id=devtools-apt \
+    apt-get update && apt-get install -y --no-install-recommends zsh git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download CLI tools (each in its own layer for parallel downloads)
+RUN curl --retry 3 --retry-delay 2 -LSso /tools/diff-so-fancy \
+        https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
+    && chmod +x /tools/diff-so-fancy
+
+RUN curl --retry 3 --retry-delay 2 -LSso /tools/clang-format \
+        https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
+    && chmod +x /tools/clang-format
+
+RUN curl --retry 3 --retry-delay 2 -fsSL -o /tmp/clangd.zip \
+        https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip \
+    && unzip -q /tmp/clangd.zip -d /tmp \
+    && cp /tmp/clangd_18.1.3/bin/* /tools/ \
+    && mkdir -p /tools/lib && cp -r /tmp/clangd_18.1.3/lib/* /tools/lib/ \
+    && rm -rf /tmp/clangd.zip /tmp/clangd_18.1.3
+
+RUN CMAKE_VERSION=3.31.1 \
+    && ARCH=$(uname -m) \
+    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
+    && curl --retry 3 --retry-delay 2 -fsSL -o "/tmp/${CMAKE_INSTALLER}.tar.gz" \
+        "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && tar -xzf "/tmp/${CMAKE_INSTALLER}.tar.gz" -C /tmp \
+    && cp -r "/tmp/${CMAKE_INSTALLER}/bin/"* /tools/ \
+    && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
+    && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
+
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
+    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
+    bash -s -- --tag 1.42.4 --to /tools
+
+# Install oh-my-zsh and plugins
+RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
+    && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
+    && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+
+########################################################
+# PARALLEL STAGE 5: Gateway Builder (starts from base)
+########################################################
+# Builds sgl-model-gateway in isolation so Python-only changes
+# don't trigger a full Rust recompilation.
+FROM base AS gateway_builder
+
+ARG GITHUB_ARTIFACTORY
+ARG BRANCH_TYPE
+ARG SGL_VERSION
+ARG USE_LATEST_SGLANG
+
+WORKDIR /build
+
+# Copy ONLY the gateway source (not the full repo)
+COPY sgl-model-gateway /build/sgl-model-gateway
+
+# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    cleanup() { rm -rf /root/.cargo /root/.rustup /sgl-workspace/sglang/sgl-model-gateway/target /sgl-workspace/sglang/sgl-model-gateway/bindings/python/target /sgl-workspace/sglang/sgl-model-gateway/bindings/python/dist; sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null; } \
-    && trap cleanup EXIT \
-    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
-    && rustc --version && cargo --version \
     && python3 -m pip install maturin \
-    && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
-    && python3 -m pip install --force-reinstall dist/*.whl \
-    && cd /sgl-workspace/sglang/sgl-model-gateway \
+    && cd /build/sgl-model-gateway/bindings/python \
+    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
+    && cd /build/sgl-model-gateway \
     && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
-    && cp target/release/sgl-model-gateway /usr/local/bin/sgl-model-gateway
+    && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
+    && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
 
+########################################################
+########## Final Framework Image ######################
+########################################################
+#
+# Combines all artifacts from parallel builder stages
+#
+FROM torch_deps AS framework
+
+ARG BRANCH_TYPE
+ARG BUILD_TYPE
+ARG CUDA_VERSION
+ARG BUILD_AND_DOWNLOAD_PARALLEL
+ARG SGL_VERSION
+ARG USE_LATEST_SGLANG
+ARG GITHUB_ARTIFACTORY
+ARG MOONCAKE_VERSION
+ARG MOONCAKE_COMPILE_ARG
+
+WORKDIR /sgl-workspace
+
+# =============================================================================
+# Copy artifacts from parallel builders
+# =============================================================================
+
+# Copy DeepEP wheel and install
+COPY --from=deepep_builder /wheels /tmp/wheels/deepep
+COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
-   python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
+    pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
-# Patching packages for CUDA 12/13 compatibility
-# TODO: Remove when torch version covers these packages
-RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install cuda-python==12.9 ; \
-elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nixl-cu13 --no-deps ; \
-    python3 -m pip install cuda-python==13.2.0 ; \
-fi
+# Copy flashinfer cache and jit-cache package (if installed)
+COPY --from=flashinfer_cache /root/.cache/flashinfer /root/.cache/flashinfer
+COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
-# Install development tools
+# Copy dev tools
+COPY --from=devtools_builder /tools/diff-so-fancy /usr/local/bin/
+COPY --from=devtools_builder /tools/clang-format /usr/local/bin/
+COPY --from=devtools_builder /tools/clangd /usr/local/bin/
+COPY --from=devtools_builder /tools/lib /usr/local/lib/
+COPY --from=devtools_builder /tools/cmake /usr/local/bin/
+COPY --from=devtools_builder /tools/ctest /usr/local/bin/
+COPY --from=devtools_builder /tools/cpack /usr/local/bin/
+COPY --from=devtools_builder /tools/share/cmake-3.31 /usr/local/share/cmake-3.31
+COPY --from=devtools_builder /tools/just /usr/local/bin/
+COPY --from=devtools_builder /root/.oh-my-zsh /root/.oh-my-zsh
+
+# Install dev apt packages (need to re-run since we're in a different stage)
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     apt-get update && apt-get install -y --no-install-recommends \
     gdb \
@@ -382,62 +483,68 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Install minimal Python dev packages
+# =============================================================================
+# Python packages and tools (before source copy for better caching)
+# =============================================================================
+
+# Install Mooncake
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --break-system-packages \
+    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
+    if [ "$CUDA_MAJOR" -ge 13 ]; then \
+        echo "CUDA >= 13, installing mooncake-transfer-engine from source code"; \
+        git clone --branch v${MOONCAKE_VERSION} --depth 1 https://github.com/kvcache-ai/Mooncake.git && \
+        cd Mooncake && \
+        bash dependencies.sh && \
+        mkdir -p build && \
+        cd build && \
+        cmake .. ${MOONCAKE_COMPILE_ARG} && \
+        make -j$(nproc) && \
+        make install; \
+    else \
+        echo "CUDA < 13, installing mooncake-transfer-engine from pip"; \
+        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+    fi
+
+# Install essential Python packages (use constraints to prevent conflicts)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    datamodel_code_generator \
+    pre-commit \
     pytest \
     black \
     isort \
     icdiff \
-    scikit-build-core \
     uv \
-    pre-commit \
+    wheel \
+    scikit-build-core \
+    nixl \
+    py-spy \
+    cubloaty \
+    google-cloud-storage \
     pandas \
     matplotlib \
     tabulate \
     termplotlib
 
-# diff-so-fancy
-RUN curl --retry 3 --retry-delay 2 -LSso /usr/local/bin/diff-so-fancy \
-        https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
-    && chmod +x /usr/local/bin/diff-so-fancy
+RUN --mount=type=cache,target=/root/.cache/pip \
+   python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
 
-# clang-format
-RUN curl --retry 3 --retry-delay 2 -LSso /usr/local/bin/clang-format \
-        https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
-    && chmod +x /usr/local/bin/clang-format
-
-# clangd
-RUN curl --retry 3 --retry-delay 2 -fsSL -o clangd.zip \
-        https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip \
-    && unzip -q clangd.zip \
-    && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
-    && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
-    && rm -rf clangd_18.1.3 clangd.zip
-
-# CMake
-RUN CMAKE_VERSION=3.31.1 \
-    && ARCH=$(uname -m) \
-    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
-    && curl --retry 3 --retry-delay 2 -fsSL -o "${CMAKE_INSTALLER}.tar.gz" \
-        "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
-    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
-    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
-    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
-    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
-
-# Install just
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
-    sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /usr/local/bin
+# Patching packages for CUDA 12/13 compatibility
+# TODO: Remove when torch version covers these packages
+RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+    python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
+    python3 -m pip install cuda-python==12.9 ; \
+elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+    python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nixl-cu13 --no-deps ; \
+    python3 -m pip install cuda-python==13.2.0 ; \
+fi
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
-
-# Install oh-my-zsh and plugins
-RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions \
-    && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
 # These configs are optional; users can override them by mounting their own files
 COPY docker/configs/opt/.vimrc /opt/sglang/.vimrc
@@ -453,7 +560,78 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
         ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
+# Fix Trivy-reported CVEs
+# pip:             urllib3 (CVE-2025-43859), pillow (CVE-2026-25990)
+# binutils family: CVE-2025-{1147,1148,3198,5244,5245,7545,7546,8225,11082,11083,11412,11413,11414,11494,11839,11840}
+# libgnutls30t64:  CVE-2025-{9820,14831}
+# libpam:          CVE-2024-10963
+# libsqlite3-0:    CVE-2025-{6965,7709}
+# libtasn1-6:      CVE-2025-13151
+# dpkg:            CVE-2025-6297
 RUN python3 -m pip install --upgrade "urllib3>=2.6.3" "pillow>=12.1.1"
+RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
+    apt-get update && apt-get install -y --only-upgrade \
+    binutils binutils-common binutils-x86-64-linux-gnu libbinutils \
+    libctf0 libctf-nobfd0 libgprofng0 libsframe1 \
+    libgnutls30t64 \
+    libpam-modules libpam-modules-bin libpam-runtime libpam0g \
+    libsqlite3-0 libtasn1-6 \
+    dpkg dpkg-dev libdpkg-perl \
+    && rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# Copy sglang source and do editable install (LAST for better caching)
+# =============================================================================
+
+# Copy local source if building from local
+FROM scratch AS local_src
+COPY . /src
+
+FROM framework AS framework_final
+
+ARG BRANCH_TYPE
+ARG BUILD_TYPE
+ARG CUDA_VERSION
+ARG SGL_VERSION
+ARG USE_LATEST_SGLANG
+
+WORKDIR /sgl-workspace
+
+COPY --from=local_src /src /tmp/local_src
+RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+        cp -r /tmp/local_src /sgl-workspace/sglang; \
+    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
+        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    elif [ -z "$SGL_VERSION" ]; then \
+        echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
+    else \
+        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    fi \
+    && rm -rf /tmp/local_src
+
+# Editable install (fast - dependencies already installed via constraints)
+# Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /sgl-workspace/sglang \
+    && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
+    && kernels lock python \
+    && ( success=0; for i in 1 2 3; do \
+        echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
+        kernels download python && \
+        success=1 && break; \
+        echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
+    done; [ "$success" = "1" ] ) \
+    && mv python/kernels.lock /root/.cache/sglang \
+    && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true \
+    && find /usr/local/lib/python3.12/dist-packages -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true \
+    && find /usr/local/lib/python3.12/dist-packages -name "*.pyc" -delete 2>/dev/null || true
+
+# Install pre-built gateway artifacts from parallel builder
+COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
+COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
+    && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
@@ -558,15 +736,32 @@ ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
 
-# Copy Python site-packages from framework (contains all built packages)
-COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
+# Fix Trivy-reported CVEs (see framework stage for full CVE list)
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
+    apt-get update && apt-get install -y --only-upgrade \
+    binutils binutils-common binutils-x86-64-linux-gnu libbinutils \
+    libctf0 libctf-nobfd0 libgprofng0 libsframe1 \
+    libgnutls30t64 \
+    libpam-modules libpam-modules-bin libpam-runtime libpam0g \
+    libsqlite3-0 libtasn1-6 \
+    dpkg dpkg-dev libdpkg-perl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
+COPY --from=framework_final /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
 
 # Copy SGLang workspace
-COPY --from=framework /sgl-workspace /sgl-workspace
+COPY --from=framework_final /sgl-workspace /sgl-workspace
+
+# Copy sgl-model-gateway binary
+COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
+
+# Copy py-spy binary
+COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
 
 # Copy cache for kernels from kernels community
-COPY --from=framework /root/.cache/huggingface /root/.cache/huggingface
-COPY --from=framework /root/.cache/sglang /root/.cache/sglang
+COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
+COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
@@ -575,9 +770,9 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
     fi
 
 # Copy GDRCopy runtime libraries (but not the build artifacts)
-COPY --from=framework /usr/lib/libgdrapi.so* /usr/lib/
-COPY --from=framework /usr/bin/gdrcopy_* /usr/bin/
-COPY --from=framework /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
+COPY --from=framework_final /usr/lib/libgdrapi.so* /usr/lib/
+COPY --from=framework_final /usr/bin/gdrcopy_* /usr/bin/
+COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so

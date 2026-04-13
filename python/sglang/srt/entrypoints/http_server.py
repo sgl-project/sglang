@@ -636,10 +636,7 @@ async def server_info():
         await _global_state.tokenizer_manager.get_internal_state()
     )
 
-    # This field is not serializable.
-    if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
-        del _global_state.tokenizer_manager.server_args.model_config
-
+    # server_args.model_config is not serializable but should be excluded by asdict.
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
@@ -814,7 +811,7 @@ async def list_external_corpora():
     return ORJSONResponse(
         {
             "success": result.success,
-            "corpus_ids": result.corpus_ids,
+            "corpus_token_counts": result.corpus_token_counts,
             "message": result.message,
         },
         status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
@@ -1642,7 +1639,7 @@ async def retrieve_model(model: str):
 
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
-    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
+    """Endpoint for the scoring API. Supports CausalLM (logprob-based) and SequenceClassification (class logit-based) models. See Engine.score() for documentation."""
     return await raw_request.app.state.openai_serving_score.handle_request(
         request, raw_request
     )
