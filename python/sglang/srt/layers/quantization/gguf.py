@@ -236,9 +236,13 @@ def fused_mul_mat_gguf(
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
 
-    # MMVQ safe batch thresholds — Q1 must use batch=1 only (RDNA2 MMVQ crash on batch>1)
-    if qweight_type in PRISM_Q1_TYPES or qweight_type in IMATRIX_QUANT_TYPES:
-        mmvq_safe = 1
+    # MMVQ safe batch thresholds
+    # Q1_0/Q1_0_G128: MMVQ kernel handles batch>1 correctly, previous crash was from
+    # non-contiguous tensors in PHANTOM TARGET_VERIFY (now guarded by .contiguous() below)
+    if qweight_type in PRISM_Q1_TYPES:
+        mmvq_safe = 8  # match llama.cpp MMVQ_MAX_BATCH_SIZE
+    elif qweight_type in IMATRIX_QUANT_TYPES:
+        mmvq_safe = 8
     else:
         mmvq_safe = 2 if qweight.shape[0] > 5120 else 6
 
@@ -246,7 +250,8 @@ def fused_mul_mat_gguf(
     if has_fast_gguf and x.shape[0] <= mmvq_safe and (
         qweight_type in MMVQ_QUANT_TYPES or qweight_type in PRISM_Q1_TYPES
     ):
-        return ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
+        # Ensure contiguous layout — quantize_row_q8_1_cuda reads raw pointer with stride assumptions
+        return ggml_mul_mat_vec_a8(qweight, x.contiguous(), qweight_type, qweight.shape[0])
 
     # Tier 2: MMQ kernel — standard + k-quants only
     if has_fast_gguf and qweight_type in MMQ_QUANT_TYPES:
