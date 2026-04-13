@@ -24,24 +24,17 @@ from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.device_communicators.pymscclpp import PyMscclppCommunicator
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
     get_tensor_model_parallel_group,
     graph_capture,
     initialize_model_parallel,
     set_mscclpp_all_reduce,
 )
-from sglang.srt.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
 
 def torch_allreduce(torch_input: torch.Tensor, group: ProcessGroup) -> torch.Tensor:
     dist.all_reduce(torch_input, group=group)
     return torch_input
-
-
-def custom_allreduce(
-    custom_input: torch.Tensor, custom_comm: CustomAllreduce
-) -> torch.Tensor:
-    custom_comm.all_reduce(custom_input)
-    return custom_input
 
 
 def msccl_allreduce(
@@ -59,12 +52,12 @@ def pynccl_allreduce(
 
 def _bench_graph_time(func, inp_randn, warmup_loop=2, graph_loop=10, test_loop=10):
     graph_input = inp_randn.clone()
-    graph_input_src = inp_randn.clone()  # static source to reset input each iteration
+    graph_input_snapshot = inp_randn.clone()
     with graph_capture() as graph_capture_context:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
             for _ in range(graph_loop):
-                graph_input.copy_(graph_input_src)
+                graph_input.copy_(graph_input_snapshot)
                 graph_out = func(graph_input)
 
     graph.replay()
@@ -210,12 +203,6 @@ if __name__ == "__main__":
             msccl_graph_output, msccl_graph_time = _bench_graph_time(
                 lambda inp: msccl_allreduce(inp, pymscclpp_comm), inp_randn
             )
-            custom_eager_output, custom_eager_time = _bench_eager_time(
-                lambda inp: custom_allreduce(inp, custom_comm), inp_randn
-            )
-            custom_graph_output, custom_graph_time = _bench_graph_time(
-                lambda inp: custom_allreduce(inp, custom_comm), inp_randn
-            )
             # since pynccl is inplace op, this return result is not correct if graph loop > 1
             _, pynccl_graph_time = _bench_graph_time(
                 lambda inp: pynccl_allreduce(inp, pynccl_comm), inp_randn
@@ -229,8 +216,6 @@ if __name__ == "__main__":
                     "msccl eager time": msccl_eager_time,
                     "msccl graph time": msccl_graph_time,
                     "pynccl graph time": pynccl_graph_time,
-                    "custom eager time": custom_eager_time,
-                    "custom graph time": custom_graph_time,
                 }
             )
             if rank == 0:
@@ -243,3 +228,5 @@ if __name__ == "__main__":
         ctx.export_chrome_trace(f"{prof_dir}/trace_rank{dist.get_rank()}.json.gz")
 
     pymscclpp_comm.destroy()
+    dist.barrier()
+    cleanup_dist_env_and_memory()

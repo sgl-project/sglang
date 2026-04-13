@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 _in_piecewise_cuda_graph = False
 _in_pcg_torch_compile = False
 _pcg_capture_stream = None
+_piecewise_compiled = False
 
 
 def is_in_piecewise_cuda_graph():
@@ -30,12 +31,17 @@ def get_pcg_capture_stream():
     return _pcg_capture_stream
 
 
+def is_piecewise_compiled():
+    return _piecewise_compiled
+
+
 @contextmanager
 def enable_piecewise_cuda_graph_compile():
-    global _in_pcg_torch_compile
+    global _in_pcg_torch_compile, _piecewise_compiled
     _in_pcg_torch_compile = True
     yield
     _in_pcg_torch_compile = False
+    _piecewise_compiled = True
 
 
 @contextmanager
