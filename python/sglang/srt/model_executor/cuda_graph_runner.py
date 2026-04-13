@@ -78,8 +78,12 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
-from sglang.srt.utils.torch_compile import _torch_compile, warmup_compiled_fn
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+try:
+    torch._dynamo.config.capture_scalar_outputs = True
+except:
+    pass
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -1155,6 +1159,7 @@ class CudaGraphRunner:
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         )
 
+    @torch.compile(fullgraph=True, options={"combo_kernels": True, "cpp_wrapper": True if envs.SGLANG_TORCH_COMPILE_CPP_WRAPPER.get() else False})
     def _populate_from_forward_batch_and_init_attn_backend_compiled(
         self,
         forward_batch: ForwardBatch,
@@ -1166,7 +1171,7 @@ class CudaGraphRunner:
         use_foreach_copy: bool = False,
     ):
         """Lazily compile and call _populate_from_forward_batch_and_init_attn_backend."""
-        args = (
+        self._populate_from_forward_batch_and_init_attn_backend(
             forward_batch,
             pp_proxy_tensors,
             buffers,
@@ -1175,25 +1180,7 @@ class CudaGraphRunner:
             bs,
             use_foreach_copy,
         )
-        if self.compiled_replay_prepare is not None:
-            self.compiled_replay_prepare(*args)
-            return
 
-        logger.info("Compiling cuda graph replay preparation")
-        inductor_kwargs = {"combo_kernels": True}
-        if envs.SGLANG_TORCH_COMPILE_CPP_WRAPPER.get() and hasattr(
-            torch._inductor.config, "cpp_wrapper"
-        ):
-            inductor_kwargs["cpp_wrapper"] = True
-        self.compiled_replay_prepare = _torch_compile(
-            self._populate_from_forward_batch_and_init_attn_backend,
-            compile_kwargs={
-                "fullgraph": True,
-            },
-            dynamo_kwargs={"capture_scalar_outputs": True},
-            inductor_kwargs=inductor_kwargs,
-        )
-        warmup_compiled_fn(self.compiled_replay_prepare, *args)
 
     def replay_prepare(
         self,
