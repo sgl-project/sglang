@@ -301,7 +301,14 @@ class LTX2DenoisingStage(DenoisingStage):
     def _resize_center_crop(
         img: PIL.Image.Image, *, width: int, height: int
     ) -> PIL.Image.Image:
-        return img.resize((width, height), resample=PIL.Image.Resampling.BILINEAR)
+        src_w, src_h = img.size
+        scale = max(height / src_h, width / src_w)
+        new_h = math.ceil(src_h * scale)
+        new_w = math.ceil(src_w * scale)
+        img = img.resize((new_w, new_h), resample=PIL.Image.Resampling.BILINEAR)
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        return img.crop((left, top, left + width, top + height))
 
     @staticmethod
     def _apply_video_codec_compression(
