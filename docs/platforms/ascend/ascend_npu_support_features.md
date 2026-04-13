@@ -279,17 +279,17 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Hierarchical cache
 
-| Argument                                        | Defaults        | Options                                                                        | Server supported |
-|-------------------------------------------------|-----------------|--------------------------------------------------------------------------------|:----------------:|
-| `--enable-hierarchical-`<br/>`cache`            | `False`         | bool flag<br/> (set to enable).<br/> Currently, mamba cache are not supported. |      A2, A3      |
-| `--hicache-ratio`                               | `2.0`           | Type: float                                                                    |      A2, A3      |
-| `--hicache-size`                                | `0`             | Type: int                                                                      |      A2, A3      |
-| `--hicache-write-policy`                        | `write_through` | Currently only `write_back` supported                                          |      A2, A3      |
-| `--hicache-io-backend`                          | `kernel`        | `kernel_ascend`,<br/>                     `direct`                             |      A2, A3      |
-| `--hicache-mem-layout`                          | `layer_first`   | `page_first_direct`,<br/>                  `page_first_kv_split`               |      A2, A3      |
-| `--hicache-storage-`<br/>`backend`              | `None`          | `file`                                                                         |      A2, A3      |
-| `--hicache-storage-`<br/>`prefetch-policy`      | `best_effort`   | `best_effort`,<br/> `wait_complete`,<br/>  `timeout`                           | Special for GPU  |
-| `--hicache-storage-`<br/>`backend-extra-config` | `None`          | Type: str                                                                      | Special for GPU  |
+| Argument                                        | Defaults        | Options                                                                       | Server supported |
+|-------------------------------------------------|-----------------|-------------------------------------------------------------------------------|:----------------:|
+| `--enable-hierarchical-`<br/>`cache`            | `False`         | bool flag<br/> (set to enable).<br/> Currently, mamba cache is not supported. |      A2, A3      |
+| `--hicache-ratio`                               | `2.0`           | Type: float                                                                   |      A2, A3      |
+| `--hicache-size`                                | `0`             | Type: int                                                                     |      A2, A3      |
+| `--hicache-write-policy`                        | `write_through` | Currently only `write_back` supported                                         |      A2, A3      |
+| `--hicache-io-backend`                          | `kernel`        | `kernel_ascend`,<br/>                     `direct`                            |      A2, A3      |
+| `--hicache-mem-layout`                          | `layer_first`   | `page_first_direct`,<br/>                  `page_first_kv_split`              |      A2, A3      |
+| `--hicache-storage-`<br/>`backend`              | `None`          | `file`                                                                        |      A2, A3      |
+| `--hicache-storage-`<br/>`prefetch-policy`      | `best_effort`   | `best_effort`,<br/> `wait_complete`,<br/>  `timeout`                          | Special for GPU  |
+| `--hicache-storage-`<br/>`backend-extra-config` | `None`          | Type: str                                                                     | Special for GPU  |
 
 ## LMCache
 
