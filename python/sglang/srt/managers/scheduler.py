@@ -379,10 +379,6 @@ class Scheduler(
             )
         )
 
-        self.enable_kv_cache_events = bool(
-            server_args.kv_events_config and self.attn_tp_rank == 0
-        )
-
         # Init model configs
         self.init_model_config()
 
@@ -3688,12 +3684,11 @@ def run_scheduler_process(
     dp_rank = configure_scheduler(
         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
-
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
     # Set cpu affinity to this gpu process
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
