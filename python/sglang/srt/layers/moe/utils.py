@@ -359,7 +359,7 @@ class RoutingMethodType(IntEnum):
 AITER_PADDING_SIZE = 128
 TRITON_PADDING_SIZE = 128
 
-
+# Unit of padding - context dependent
 def get_moe_padding_size(is_aiter_moe):
     if is_aiter_moe:
         return AITER_PADDING_SIZE
@@ -381,6 +381,7 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
         is_packed: If True, uses 4-bit quantization (two FP4 elements per byte).
         is_aiter_moe: If True, applies Aiter-specific kernel padding alignment.
     """
+    # w2_down_dim is the packing rank, but w13_up_dim not (of matrix to matmul)
     w13_up_dim = 2 * inter_dim if is_concat else inter_dim
     w2_down_dim = inter_dim // 2 if is_packed else inter_dim
 
@@ -389,12 +390,14 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
         align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
         is_padded = (w2_down_dim % padding_size) > 0
         if is_padded:
+            # w2_down_dim, padding & aligned, unit: parameter dtype
             w2_down_dim = align_aiter(w2_down_dim)
         # up proj + gate fusion : 2x
         if is_concat:
             w13_up_dim = w2_down_dim * 2
         # packed
         if hasattr(torch, "float4_e2m1fn_x2") and is_packed:
+            # w13_up_dim (row rank of matmul matrix) is not packing dim, *2 to recover
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
