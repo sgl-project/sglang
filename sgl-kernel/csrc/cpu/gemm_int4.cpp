@@ -590,53 +590,81 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_c
   return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros));
 }
 
-std::tuple<at::Tensor, at::Tensor> unpack_4bit_to_32bit_signed(const at::Tensor& qweight, const at::Tensor& qzeros) {
-  TORCH_CHECK(qweight.scalar_type() == at::kByte, "qweight must be uint8");
-  TORCH_CHECK(qzeros.scalar_type() == at::kByte, "qzeros must be uint8");
-  TORCH_CHECK(qweight.is_cpu() && qzeros.is_cpu(), "CPU version only");
-
-  const auto W0 = qweight.size(0);
-  const auto W1 = qweight.size(1);
-  const auto Z0 = qzeros.size(0);
-  const auto Z1 = qzeros.size(1);
-
-  // unpacked_weights: (W0 * 8, W1), int8
-  auto unpacked_weights = at::zeros({W0 * 8, W1}, at::TensorOptions().dtype(at::kChar).device(qweight.device()));
-
-  // unpacked_zeros: (Z0, Z1 * 8), int8
-  auto unpacked_zeros = at::zeros({Z0, Z1 * 8}, at::TensorOptions().dtype(at::kChar).device(qzeros.device()));
-
-  const uint8_t* qw_ptr = qweight.data_ptr<uint8_t>();
-  const uint8_t* qz_ptr = qzeros.data_ptr<uint8_t>();
-  int8_t* uw_ptr = unpacked_weights.data_ptr<int8_t>();
-  int8_t* uz_ptr = unpacked_zeros.data_ptr<int8_t>();
-
-  // unpack weights
-  for (int64_t row = 0; row < W0 * 8; ++row) {
-    int i = row & 7;         // row % 8
-    int src_row = row >> 3;  // row / 8
-    int shift = 4 * i;
-
-    for (int64_t col = 0; col < W1; ++col) {
-      uint8_t v = qw_ptr[src_row * W1 + col];
-      uw_ptr[row * W1 + col] = static_cast<int8_t>((v >> shift) & 0xF);
-    }
+std::tuple<torch::Tensor, torch::Tensor> unpack_4bit_to_32bit_signed(
+  const torch::Tensor& qweight, 
+  const torch::Tensor& qzeros) {
+  
+  // ===== 基础校验 =====
+  TORCH_CHECK(qweight.dtype() == torch::kInt32, "qweight must be torch.int32");
+  TORCH_CHECK(qzeros.dtype() == torch::kInt32, "qzeros must be torch.int32");
+  TORCH_CHECK(qweight.is_contiguous(), "qweight must be contiguous (call .contiguous())");
+  TORCH_CHECK(qzeros.is_contiguous(), "qzeros must be contiguous (call .contiguous())");
+  TORCH_CHECK(qweight.device() == qzeros.device(), "qweight and qzeros must be on the same device");
+  
+  bool is_3d = (qweight.dim() == 3);
+  TORCH_CHECK(is_3d == (qzeros.dim() == 3), "qweight and qzeros must have same dim (2D or 3D)");
+  if (is_3d) {
+      TORCH_CHECK(qweight.size(0) == qzeros.size(0), "Expert dimension (dim 0) must match");
   }
 
-  // unpack zeros
-  for (int64_t col = 0; col < Z1 * 8; ++col) {
-    int i = col & 7;
-    int src_col = col >> 3;
-    int shift = 4 * i;
+  // ===== 解析维度 =====
+  int64_t E  = is_3d ? qweight.size(0) : 1;
+  int64_t Hw = qweight.size(-2);  // packed K dim
+  int64_t Ww = qweight.size(-1);  // N dim (unpacked)
+  int64_t Hz = qzeros.size(-2);   // K//group_size (unpacked)
+  int64_t Wz = qzeros.size(-1);   // packed N dim
 
-    for (int64_t row = 0; row < Z0; ++row) {
-      uint8_t v = qz_ptr[row * Z1 + src_col];
-      uz_ptr[row * (Z1 * 8) + col] = static_cast<int8_t>((v >> shift) & 0xF);
-    }
-  }
+  // ===== 创建输出 Tensor =====
+  std::vector<int64_t> w_shape = is_3d ? std::vector<int64_t>{E, Hw * 8, Ww} : std::vector<int64_t>{Hw * 8, Ww};
+  std::vector<int64_t> z_shape = is_3d ? std::vector<int64_t>{E, Hz, Wz * 8} : std::vector<int64_t>{Hz, Wz * 8};
 
-  return std::make_tuple(unpacked_weights, unpacked_zeros + 1);
+  auto w_out = torch::empty(w_shape, qweight.options().dtype(torch::kInt8));
+  auto z_out = torch::empty(z_shape, qzeros.options().dtype(torch::kInt8));
+
+  const int32_t* w_in = qweight.data_ptr<int32_t>();
+  const int32_t* z_in = qzeros.data_ptr<int32_t>();
+  int8_t* w_out_ptr = w_out.data_ptr<int8_t>();
+  int8_t* z_out_ptr = z_out.data_ptr<int8_t>();
+
+  // ===== 1. 解包 Weights: 按行展开 [E, Hw*8, Ww] =====
+  int64_t total_w_rows = E * Hw * 8;
+  at::parallel_for(0, total_w_rows, 1, [&](int64_t start, int64_t end) {
+      for (int64_t idx = start; idx < end; ++idx) {
+          int64_t e = idx / (Hw * 8);
+          int64_t r_out = idx % (Hw * 8);
+          int64_t bit = r_out & 7;       // r_out % 8
+          int64_t r_in  = r_out >> 3;    // r_out // 8
+
+          int64_t src_base = (is_3d ? e * Hw * Ww : 0) + r_in * Ww;
+          int64_t dst_base = (is_3d ? e * Hw * 8 * Ww : 0) + r_out * Ww;
+
+          for (int64_t c = 0; c < Ww; ++c) {
+              w_out_ptr[dst_base + c] = static_cast<int8_t>((w_in[src_base + c] >> (bit << 2)) & 0xF);
+          }
+      }
+  });
+
+  // ===== 2. 解包 Zeros: 按列展开 +1 [E, Hz, Wz*8] =====
+  // 改为逐元素并行，保证内存连续写入，大幅提升缓存命中率
+  int64_t total_z_elems = E * Hz * Wz * 8;
+  at::parallel_for(0, total_z_elems, 1, [&](int64_t start, int64_t end) {
+      for (int64_t idx = start; idx < end; ++idx) {
+          int64_t e = idx / (Hz * Wz * 8);
+          int64_t local = idx % (Hz * Wz * 8);
+          int64_t h = local / (Wz * 8);
+          int64_t c_out = local % (Wz * 8);
+          
+          int64_t bit = c_out & 7;
+          int64_t c_in  = c_out >> 3;
+
+          int64_t src_idx = (is_3d ? e * Hz * Wz : 0) + h * Wz + c_in;
+          z_out_ptr[idx] = static_cast<int8_t>(((z_in[src_idx] >> (bit << 2)) & 0xF) + 1);
+      }
+  });
+
+  return std::make_tuple(w_out, z_out);
 }
+
 
 std::tuple<at::Tensor, at::Tensor> int4pack(
     at::Tensor qweight,  // (*, K, N / 8), int32
@@ -666,6 +694,8 @@ std::tuple<at::Tensor, at::Tensor> int4pack(
 
     // qzeros = unpacked_qzeros.to(uint8)
     at::Tensor packed_qzeros = unpacked_qzeros.contiguous().to(at::kByte);
+    std::cout<<packed_qweight.sizes()<<std::endl;
+    std::cout<<packed_qzeros.sizes()<<std::endl;
 
     return std::make_tuple(packed_qweight, packed_qzeros);
   }
@@ -676,9 +706,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     at::Tensor qzeros,   // (*, K / group_size, N / 8), int32
     at::Tensor scales,   // (*, K / group_size, N), bfloat16
     int64_t quant_method_4bit) {
-  auto res = int4pack(qweight, qzeros, quant_method_4bit);
-  auto _qweight = std::get<0>(res);
-  auto _qzeros = std::get<1>(res);
+      at::Tensor _qweight;
+      at::Tensor _qzeros;
+  if(quant_method_4bit == 0){
+    auto res = int4pack(qweight, qzeros, quant_method_4bit);
+    _qweight = std::get<0>(res);
+    _qzeros = std::get<1>(res);
+   } else{
+    _qweight = qweight;
+    _qzeros = qzeros;
+   }
+
   auto _scales = scales;
   _qzeros = _qzeros.transpose(-2, -1).contiguous();  // .T
   _scales = _scales.transpose(-2, -1).contiguous();

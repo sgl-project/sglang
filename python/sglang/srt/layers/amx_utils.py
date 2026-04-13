@@ -72,6 +72,38 @@ def _init_amx_conv_state(conv_state):
         conv_state_cpu.append(conv_shape_new)
     return conv_state_cpu
 
+def unpack_4bit_to_32bit_signed(qweight, qzeros):
+    # Unpack 4-bit values and interpret them as signed integers
+    unpacked_weights = torch.zeros(
+        (qweight.shape[0] * 8, qweight.shape[1]),
+        dtype=torch.int8,
+        device=qweight.device,
+        requires_grad=False,
+    )
+
+    unpacked_zeros = torch.zeros(
+        (qzeros.shape[0], qzeros.shape[1] * 8),
+        dtype=torch.int8,
+        device=qzeros.device,
+        requires_grad=False,
+    )
+
+    for row in range(unpacked_weights.shape[0]):
+        i = row % 8
+        unpacked_weights[row, :] = (qweight[row // 8, :] >> (4 * i)) & 0xF
+
+    for col in range(unpacked_zeros.shape[1]):
+        i = col % 8
+        unpacked_zeros[:, col] = (qzeros[:, col // 8] >> (4 * i)) & 0xF
+
+    return unpacked_weights, unpacked_zeros + 1
+
+
+
+# Copied from https://github.com/IST-DASLab/marlin/pull/1
+def _autogptq_to_int4pack(qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor, is_w4a8: bool
+):
+    unpacked_qweight, unpacked_qzeros = unpack_4bit_to_32bit_signed(qweight, qzeros)
 
 def _amx_process_weight_after_loading(
     module, weight_names, transpose_dims=None, qweight_packed_method=None
@@ -125,12 +157,41 @@ def _amx_process_weight_after_loading(
         qweight_tensor = getattr(module, weight_names[0])
         qzeros_tensor = getattr(module, weight_names[1])
         scales_tensor = getattr(module, weight_names[2])
-        qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-            qweight_tensor,
-            qzeros_tensor,
-            scales_tensor,
-            0 if qweight_packed_method is "awq" else 1,
-        )
+        if qweight_packed_method is "gptq":
+            if qweight_tensor.dim() == 3:
+                qweight_list = []
+                qzeros_list = []
+                for i in range(qweight_tensor.data.size(0)):
+                    unpacked_qweight, unpacked_qzeros = unpack_4bit_to_32bit_signed(qweight_tensor[i], qzeros_tensor[i])
+                    unpacked_qweight = unpacked_qweight.T.to(torch.uint8)
+                    unpacked_qzeros = unpacked_qzeros.to(torch.uint8)
+                    qweight_list.append(unpacked_qweight)
+                    qzeros_list.append(unpacked_qzeros)
+                qweight_ = torch.stack(qweight_list).detach()
+                qzeros_ = torch.stack(qzeros_list).detach()
+                qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                    qweight_,
+                    qzeros_,
+                    scales_tensor,
+                    0 if qweight_packed_method is "awq" else 1,
+                )
+            else:
+                unpacked_qweight, unpacked_qzeros = unpack_4bit_to_32bit_signed(qweight_tensor, qzeros_tensor)
+                unpacked_qweight = unpacked_qweight.T.to(torch.uint8)
+                unpacked_qzeros = unpacked_qzeros.to(torch.uint8)
+                qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                    unpacked_qweight,
+                    unpacked_qzeros,
+                    scales_tensor,
+                    0 if qweight_packed_method is "awq" else 1,
+                )
+        else:
+            qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                qweight_tensor,
+                qzeros_tensor,
+                scales_tensor,
+                0 if qweight_packed_method is "awq" else 1,
+            )
         packed_qweight = torch.nn.Parameter(
             qweight.detach(),
             requires_grad=False,
