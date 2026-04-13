@@ -435,8 +435,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 | Argument                                      | Defaults | Options                        | Server supported |
 |-----------------------------------------------|----------|--------------------------------|:----------------:|
-| `--mm-max-concurrent-calls`                   | `32`     | Type: int                      |      A2, A3      |
-| `--mm-per-request-timeout`                    | `10.0`   | Type: float                    |      A2, A3      |
 | `--enable-broadcast-mm-`<br/>`inputs-process` | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--mm-process-config`                         | `None`   | Type: JSON / Dict              |      A2, A3      |
 | `--mm-enable-dp-encoder`                      | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
