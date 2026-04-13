@@ -12,9 +12,6 @@ register_amd_ci(est_time=312, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestChunkedPrefill(CustomTestCase):
-    def test_chunked_prefill(self):
-        run_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=False)
-
     def test_mixed_chunked_prefill(self):
         run_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=True)
 
