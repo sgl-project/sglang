@@ -375,6 +375,21 @@ class ServerArgs:
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
+            if (
+                current_platform.is_cuda()
+                and self.pipeline_class_name is None
+                and self.num_gpus == 1
+                and self.tp_size == 1
+                and self.sp_degree == 1
+                and self.ulysses_degree == 1
+                and self.ring_degree == 1
+                and self._is_ltx23_model_path(self.model_path)
+            ):
+                self.attention_backend = "fa"
+                logger.info(
+                    "Automatically set attention_backend=fa for LTX-2.3 one-stage on 1 GPU to preserve precision"
+                )
+                return
             self._set_default_attention_backend()
 
     def _adjust_warmup(self):
@@ -409,11 +424,16 @@ class ServerArgs:
             self.master_port = self.settle_port(self.master_port, 37)
 
     def _adjust_parallelism(self):
-        if self.tp_size is None:
-            self.tp_size = 1
+        tp_unspecified = self.tp_size is None
+        sp_unspecified = self.sp_degree is None
+        ulysses_unspecified = self.ulysses_degree is None
+        ring_unspecified = self.ring_degree is None
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
+
+        if self.tp_size is None:
+            self.tp_size = 1
 
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
@@ -445,6 +465,20 @@ class ServerArgs:
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    @staticmethod
+    def _is_ltx23_model_path(model_path: str | None) -> bool:
+        if not model_path:
+            return False
+        normalized = model_path.lower()
+        return any(
+            token in normalized
+            for token in (
+                "lightricks/ltx-2.3",
+                "models--lightricks--ltx-2.3",
+                "lightricks__ltx-2.3",
+            )
+        )
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
