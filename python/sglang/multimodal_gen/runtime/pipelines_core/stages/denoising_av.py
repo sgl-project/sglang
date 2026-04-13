@@ -156,11 +156,14 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the distilled refinement schedule on top of the shared AV denoiser."""
         batch.extra["ltx2_phase"] = "stage2"
+        is_ltx23_variant = is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        )
         original_clean_latent_background = getattr(
             batch, "ltx2_ti2v_clean_latent_background", None
         )
         if (
-            is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config)
+            is_ltx23_variant
             and batch.image_path is not None
             and isinstance(batch.latents, torch.Tensor)
         ):
@@ -172,23 +175,58 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         if self._should_reset_stage2_generators(server_args):
             self._reset_stage2_generators(batch)
         noise_scale = self.distilled_sigmas[0].to(batch.latents.device)
-        video_noise = self._randn_like_with_batch_generators(batch.latents, batch)
-        batch.latents = video_noise * noise_scale + batch.latents * (1 - noise_scale)
-
-        if isinstance(batch.audio_latents, torch.Tensor):
+        if (
+            is_ltx23_variant
+            and isinstance(batch.latents, torch.Tensor)
+            and batch.latents.ndim == 3
+            and isinstance(batch.audio_latents, torch.Tensor)
+            and batch.audio_latents.ndim == 3
+        ):
+            unpacked_video_latents, unpacked_audio_latents = (
+                server_args.pipeline_config._unpad_and_unpack_latents(
+                    batch.latents, batch.audio_latents, batch, self.vae, self.audio_vae
+                )
+            )
+            video_noise = self._randn_like_with_batch_generators(
+                unpacked_video_latents, batch
+            )
+            batch.latents = (
+                video_noise * noise_scale + unpacked_video_latents * (1 - noise_scale)
+            )
             audio_noise = self._randn_like_with_batch_generators(
-                batch.audio_latents, batch
+                unpacked_audio_latents, batch
             )
             audio_noise_scale = noise_scale.to(
-                batch.audio_latents.device, batch.audio_latents.dtype
+                unpacked_audio_latents.device, unpacked_audio_latents.dtype
             )
             batch.audio_latents = (
                 audio_noise * audio_noise_scale
-                + batch.audio_latents * (1 - audio_noise_scale)
+                + unpacked_audio_latents * (1 - audio_noise_scale)
             )
-        if not is_ltx23_native_variant(
-            server_args.pipeline_config.vae_config.arch_config
-        ):
+            batch.latents = server_args.pipeline_config.maybe_pack_latents(
+                batch.latents, batch.latents.shape[0], batch
+            )
+            batch.audio_latents = server_args.pipeline_config.maybe_pack_audio_latents(
+                batch.audio_latents, batch.audio_latents.shape[0], batch
+            )
+        else:
+            video_noise = self._randn_like_with_batch_generators(batch.latents, batch)
+            batch.latents = (
+                video_noise * noise_scale + batch.latents * (1 - noise_scale)
+            )
+
+            if isinstance(batch.audio_latents, torch.Tensor):
+                audio_noise = self._randn_like_with_batch_generators(
+                    batch.audio_latents, batch
+                )
+                audio_noise_scale = noise_scale.to(
+                    batch.audio_latents.device, batch.audio_latents.dtype
+                )
+                batch.audio_latents = (
+                    audio_noise * audio_noise_scale
+                    + batch.audio_latents * (1 - audio_noise_scale)
+                )
+        if not is_ltx23_variant:
             batch.latents = batch.latents.to(
                 device=batch.latents.device, dtype=torch.float32
             )
