@@ -1158,10 +1158,11 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            self.process_decode_queue()
+
             if self._engine_paused:
                 continue
-            # polling and allocating kv cache
-            self.process_decode_queue()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -1187,10 +1188,10 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            self.process_decode_queue()
             if self._engine_paused:
                 continue
-            # polling and allocating kv cache
-            self.process_decode_queue()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
