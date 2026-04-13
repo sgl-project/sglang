@@ -108,8 +108,10 @@ jobs:
           container_id=$(docker run -dt \
             --group-add 992 \
             --group-add $(getent group video | cut -d: -f3) \
+            --group-add $(getent group render | cut -d: -f3) \
             -v ${HF_HOME}:/home/sdp/.cache/huggingface \
-            --device /dev/dri \
+            -v /dev/dri:/dev/dri \
+            -v /dev/dri/by-path:/dev/dri/by-path \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
             xpu_sglang_main:bmg)
           echo "Started container: $container_id"

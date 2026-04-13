@@ -6,9 +6,10 @@ import os
 import unittest
 from pathlib import Path
 
+from transformers import AutoTokenizer
+
 # Import base test class
 from test_deepseek_ocr import TestDeepSeekOCR
-from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
@@ -17,10 +18,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Register for per-commit XPU tests
-register_xpu_ci(est_time=360, suite="per-commit-xpu")
+# Register for per-commit XPU tests (higher est_time to run before test_deepseek_ocr.py)
+register_xpu_ci(est_time=400, suite="per-commit-xpu")
 # Register for nightly XPU tests
-register_xpu_ci(est_time=360, suite="nightly-xpu", nightly=True)
+register_xpu_ci(est_time=400, suite="nightly-xpu", nightly=True)
 
 
 class TestDeepSeekOCRTriton(TestDeepSeekOCR):
@@ -42,6 +43,8 @@ class TestDeepSeekOCRTriton(TestDeepSeekOCR):
             "xpu",
             "--attention-backend",
             "intel_xpu",
+            "--mem-fraction-static",
+            "0.7",
         ]
         os.environ["SGLANG_USE_SGL_XPU"] = "0"
         cls.process = popen_launch_server(

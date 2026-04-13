@@ -2,8 +2,8 @@ name: Nightly Test (Intel)
 
 on:
   schedule:
-    # Nightly test at 19:15 Beijing Time (UTC+8) = 11:15 UTC
-    - cron: '15 11 * * *'
+    # Nightly test at 23:00 Beijing Time (UTC+8) = 15:00 UTC
+    - cron: '0 15 * * *'
   push:
     branches:
       - main
@@ -25,7 +25,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  nightly-test:
+  # ==================== XPU Nightly Test ==================== #
+  nightly-test-xpu:
     runs-on: sglang-bmg
     env:
       HF_HOME: /home/sdp/.cache/huggingface
@@ -55,8 +56,10 @@ jobs:
           container_id=$(docker run -dt \
             --group-add 992 \
             --group-add $(getent group video | cut -d: -f3) \
+            --group-add $(getent group render | cut -d: -f3) \
             -v ${HF_HOME}:/home/sdp/.cache/huggingface \
-            --device /dev/dri \
+            -v /dev/dri:/dev/dri \
+            -v /dev/dri/by-path:/dev/dri/by-path \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
             xpu_sglang_nightly:bmg)
           echo "Started container: $container_id"
@@ -113,17 +116,81 @@ jobs:
           cid="${{ steps.start_container.outputs.container_id }}"
           docker rm -f "$cid" || true
 
+  # ==================== CPU (Xeon) Nightly Test ==================== #
+  nightly-test-cpu:
+    runs-on: xeon-gnr
+    env:
+      HF_HOME: /home/sdp/.cache/huggingface
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          REPO="https://github.com/${{ github.repository }}.git"
+          BRANCH="${{ inputs.ref || github.ref_name }}"
+          echo "Building with REPO=$REPO, BRANCH=$BRANCH"
+          docker build \
+            --build-arg SGLANG_REPO=$REPO \
+            --build-arg VER_SGLANG=$BRANCH \
+            --no-cache --progress=plain -f docker/xeon.Dockerfile -t sglang_xeon_nightly .
+
+      - name: Run container
+        id: start_container
+        run: |
+          container_id=$(docker run -dt \
+            -v ${HF_HOME}:/root/.cache/huggingface \
+            --ipc=host \
+            sglang_xeon_nightly)
+          echo "Started container: $container_id"
+          echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
+
+      - name: Install Dependency
+        timeout-minutes: 10
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /opt/.venv/bin/activate && pip install pytest expecttest tabulate"
+
+      - name: Run Nightly CPU tests
+        timeout-minutes: 60
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /opt/.venv/bin/activate && cd /sgl-workspace/sglang/test/srt && python3 run_suite.py --suite per-commit-cpu --timeout-per-file 1500"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker rm -f "$cid" || true
+
   finish:
     if: always()
-    needs: [nightly-test]
+    needs: [nightly-test-xpu, nightly-test-cpu]
     runs-on: ubuntu-latest
     steps:
       - name: Check job status
         run: |
-          result="${{ needs.nightly-test.result }}"
-          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
-            echo "Job failed with result: $result"
+          xpu_result="${{ needs.nightly-test-xpu.result }}"
+          cpu_result="${{ needs.nightly-test-cpu.result }}"
+          
+          failed=false
+          if [ "$xpu_result" != "success" ] && [ "$xpu_result" != "skipped" ]; then
+            echo "XPU job failed with result: $xpu_result"
+            failed=true
+          fi
+          if [ "$cpu_result" != "success" ] && [ "$cpu_result" != "skipped" ]; then
+            echo "CPU job failed with result: $cpu_result"
+            failed=true
+          fi
+          
+          if [ "$failed" = true ]; then
             exit 1
           fi
-          echo "All jobs completed successfully (result: $result)"
+          echo "All jobs completed successfully (XPU: $xpu_result, CPU: $cpu_result)"
           exit 0
