@@ -40,7 +40,7 @@ class NpuCommunicator:
         # All-gather.
         dist.all_gather_into_tensor(output_tensor, x_q, group=self.group)
         dist.all_gather_into_tensor(output_scale, scale, group=self.group)
-        #output_tensor = npu_anti_quant(output_tensor.T, output_scale, dst_dtype=x.dtype).T # slow
+
         output_tensor = output_tensor.to(x.dtype) * output_scale.unsqueeze(-1).to(x.dtype)
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
