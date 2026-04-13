@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
 from sglang.multimodal_gen.runtime.models.adapter.ltx_2_connector import (
     LTX2TextConnectors,
 )
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
+    LTX2AudioVideoRotaryPosEmbed,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
     LTX2AVDecodingStage,
@@ -237,6 +240,35 @@ def test_ltx23_velocity_to_x0_supports_tokenwise_sigma():
 
     expected = torch.tensor([[[1.0, 2.0], [2.5, 3.5]]], dtype=torch.float32)
     assert torch.allclose(denoised, expected)
+
+
+def test_ltx23_rope_respects_requested_output_dtype():
+    rope = LTX2AudioVideoRotaryPosEmbed(
+        dim=128,
+        modality="video",
+        base_num_frames=20,
+        base_height=2048,
+        base_width=2048,
+        num_attention_heads=8,
+    )
+    coords = rope.prepare_video_coords(
+        batch_size=1,
+        num_frames=1,
+        height=2,
+        width=2,
+        device=torch.device("cpu"),
+        fps=24.0,
+    )
+
+    cos_fp32, sin_fp32 = rope(coords, out_dtype=torch.float32)
+    cos_bf16, sin_bf16 = rope(coords, out_dtype=torch.bfloat16)
+
+    assert cos_fp32.dtype == torch.float32
+    assert sin_fp32.dtype == torch.float32
+    assert cos_bf16.dtype == torch.bfloat16
+    assert sin_bf16.dtype == torch.bfloat16
+    assert torch.allclose(cos_bf16.float(), cos_fp32, atol=2e-3, rtol=0.0)
+    assert torch.allclose(sin_bf16.float(), sin_fp32, atol=2e-3, rtol=0.0)
 
 
 def test_ltx23_connector_repack_renames_qk_norm_keys():

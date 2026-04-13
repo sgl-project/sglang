@@ -289,9 +289,13 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         return self.prepare_audio_coords(*args, **kwargs)
 
     def forward(
-        self, coords: torch.Tensor, device: Optional[Union[str, torch.device]] = None
+        self,
+        coords: torch.Tensor,
+        device: Optional[Union[str, torch.device]] = None,
+        out_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = device or coords.device
+        out_dtype = out_dtype or coords.dtype
         num_pos_dims = coords.shape[1]
 
         if coords.ndim == 4:
@@ -358,7 +362,7 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
             cos_freqs = torch.swapaxes(cos_freq, 1, 2)
             sin_freqs = torch.swapaxes(sin_freq, 1, 2)
 
-        return cos_freqs, sin_freqs
+        return cos_freqs.to(dtype=out_dtype), sin_freqs.to(dtype=out_dtype)
 
 
 def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -1632,15 +1636,25 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             video_coords, hidden_states.device, hidden_states.dtype
         )
         audio_coords = audio_coords.to(device=audio_hidden_states.device)
-        video_rotary_emb = self.rope(video_coords, device=hidden_states.device)
+        video_rotary_emb = self.rope(
+            video_coords,
+            device=hidden_states.device,
+            out_dtype=hidden_states.dtype,
+        )
         audio_rotary_emb = self.audio_rope(
-            audio_coords, device=audio_hidden_states.device
+            audio_coords,
+            device=audio_hidden_states.device,
+            out_dtype=audio_hidden_states.dtype,
         )
         ca_video_rotary_emb = self.cross_attn_rope(
-            video_coords[:, 0:1, :], device=hidden_states.device
+            video_coords[:, 0:1, :],
+            device=hidden_states.device,
+            out_dtype=hidden_states.dtype,
         )
         ca_audio_rotary_emb = self.cross_attn_audio_rope(
-            audio_coords[:, 0:1, :], device=audio_hidden_states.device
+            audio_coords[:, 0:1, :],
+            device=audio_hidden_states.device,
+            out_dtype=audio_hidden_states.dtype,
         )
 
         # 2. Patchify input projections
