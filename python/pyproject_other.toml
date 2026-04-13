@@ -25,6 +25,7 @@ runtime_common = [
   "build",
   "compressed-tensors",
   "datasets",
+  "deprecated",
   "einops",
   "fastapi",
   "gguf",
