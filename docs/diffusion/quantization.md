@@ -122,6 +122,9 @@ sglang generate \
   falls back to loading from the directory.
 - On Blackwell, `comfy-kitchen` can provide the best-performance path when
   available; otherwise SGLang falls back to the generic ModelOpt FP4 path.
+- To force the generic diffusion ModelOpt FP4 path onto a specific FlashInfer
+  backend, set `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND`. Supported values
+  include `flashinfer_cudnn`, `flashinfer_cutlass`, and `flashinfer_trtllm`.
 
 ## Nunchaku (SVDQuant)
 
