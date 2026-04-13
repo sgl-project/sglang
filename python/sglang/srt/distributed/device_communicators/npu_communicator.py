@@ -13,7 +13,7 @@ if _is_npu:
 class NpuCommunicator:
 
     def __init__(self, group: ProcessGroup):
-        if not is_npu():
+        if not _is_npu:
             self.disabled = True
             return
         self.disabled = False
