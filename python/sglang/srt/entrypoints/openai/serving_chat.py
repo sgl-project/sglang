@@ -275,6 +275,8 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        self._apply_server_max_new_tokens_cap(sampling_params)
+
         # Handle single vs multiple requests
         if is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}

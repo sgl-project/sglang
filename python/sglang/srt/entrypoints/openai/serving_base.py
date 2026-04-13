@@ -161,6 +161,33 @@ class OpenAIServingBase(ABC):
                 parts.append(value)
         return "".join(parts) if parts else None
 
+    def _get_sampling_max_new_tokens(self, sampling_params: Any) -> Optional[int]:
+        if isinstance(sampling_params, dict):
+            return sampling_params.get("max_new_tokens")
+        return getattr(sampling_params, "max_new_tokens", None)
+
+    def _set_sampling_max_new_tokens(
+        self, sampling_params: Any, max_new_tokens: int
+    ) -> None:
+        if isinstance(sampling_params, dict):
+            sampling_params["max_new_tokens"] = max_new_tokens
+        else:
+            sampling_params.max_new_tokens = max_new_tokens
+
+    def _apply_server_max_new_tokens_cap(self, sampling_params: Any) -> None:
+        """Apply the server-level max_new_tokens default and cap in-place."""
+        server_max = self.tokenizer_manager.server_args.max_new_tokens
+        if server_max is None:
+            return
+
+        user_max = self._get_sampling_max_new_tokens(sampling_params)
+        if user_max is None:
+            self._set_sampling_max_new_tokens(sampling_params, server_max)
+        else:
+            self._set_sampling_max_new_tokens(
+                sampling_params, min(user_max, server_max)
+            )
+
     @abstractmethod
     def _convert_to_internal_request(
         self,

@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    ResponsesRequest,
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -290,6 +291,20 @@ class TestChatCompletionRequest(unittest.TestCase):
         strict = json_format.strict
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
+
+
+class TestResponsesRequest(unittest.TestCase):
+    """Test ResponsesRequest protocol model"""
+
+    def test_sampling_params_respect_small_user_max_output_tokens(self):
+        req = ResponsesRequest(model="x", input="Hello", max_output_tokens=1)
+        params = req.to_sampling_params(default_max_tokens=128)
+        self.assertEqual(params["max_new_tokens"], 1)
+
+    def test_sampling_params_still_reserve_context_when_unset(self):
+        req = ResponsesRequest(model="x", input="Hello")
+        params = req.to_sampling_params(default_max_tokens=128)
+        self.assertEqual(params["max_new_tokens"], 126)
 
 
 class TestModelSerialization(unittest.TestCase):

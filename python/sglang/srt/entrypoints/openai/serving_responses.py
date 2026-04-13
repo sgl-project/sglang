@@ -266,6 +266,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         default_max_tokens, self.default_sampling_params
                     )
 
+                    self._apply_server_max_new_tokens_cap(sampling_params)
+
                     context: ConversationContext
                     if self.use_harmony:
                         if request.stream:
@@ -1268,6 +1270,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
         orig_priority = priority or 0
+        max_new_tokens_budget = self._get_sampling_max_new_tokens(sampling_params)
 
         while True:
             # Generate using SGLang's tokenizer manager
@@ -1307,22 +1310,23 @@ class OpenAIServingResponses(OpenAIServingChat):
                 background=adapted_request.background,
             )
 
-            # Update sampling params with reduced max_tokens
-            if hasattr(sampling_params, "max_new_tokens") or isinstance(
-                sampling_params, dict
-            ):
+            # Preserve the original output budget across tool-call turns while
+            # still respecting the remaining context window.
+            if max_new_tokens_budget is not None:
                 context_len = getattr(
                     self.tokenizer_manager.model_config, "context_len", 4096
                 )
                 num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
-                remaining_tokens = (
-                    context_len - len(prompt_token_ids) - num_reserved_tokens
+                remaining_context_tokens = max(
+                    context_len - len(prompt_token_ids) - num_reserved_tokens, 0
                 )
-
-                if isinstance(sampling_params, dict):
-                    sampling_params["max_new_tokens"] = max(remaining_tokens, 1)
-                else:
-                    sampling_params.max_new_tokens = max(remaining_tokens, 1)
+                remaining_budget_tokens = max(
+                    (max_new_tokens_budget or 0) - context.num_output_tokens, 0
+                )
+                self._set_sampling_max_new_tokens(
+                    sampling_params,
+                    min(remaining_context_tokens, remaining_budget_tokens),
+                )
 
             # Slightly reduce priority for subsequent tool calls
             priority = orig_priority - 1

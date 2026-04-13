@@ -174,6 +174,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 request.response_format.model_dump(by_alias=True)
             )
 
+        self._apply_server_max_new_tokens_cap(sampling_params)
+
         return sampling_params
 
     async def _handle_streaming_request(

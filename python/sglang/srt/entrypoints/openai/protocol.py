@@ -1233,14 +1233,14 @@ class ResponsesRequest(BaseModel):
         if default_params is None:
             default_params = {}
 
+        # Avoid exceed the context length by minus 2 token
+        available_max_tokens = max(default_max_tokens - 2, 0)
+
         # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
         if self.max_output_tokens is not None:
-            max_tokens = min(self.max_output_tokens, default_max_tokens)
+            max_tokens = min(self.max_output_tokens, available_max_tokens)
         else:
-            max_tokens = default_max_tokens
-
-        # Avoid exceed the context length by minus 2 token
-        max_tokens -= 2
+            max_tokens = available_max_tokens
 
         # Get parameters with defaults
         temperature = self.temperature

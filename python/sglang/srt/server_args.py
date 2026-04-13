@@ -347,6 +347,7 @@ class ServerArgs:
     mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
+    max_new_tokens: Optional[int] = None
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
@@ -4231,6 +4232,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_queued_requests,
             help="The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
+        )
+        parser.add_argument(
+            "--max-new-tokens",
+            type=int,
+            default=ServerArgs.max_new_tokens,
+            help="Server-level max output tokens per request. "
+            "Applied as default when the user does not specify max_tokens, "
+            "and as an upper-bound cap when they do.",
         )
         parser.add_argument(
             "--max-total-tokens",
