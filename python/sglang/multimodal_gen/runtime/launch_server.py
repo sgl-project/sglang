@@ -10,7 +10,7 @@ import threading
 import psutil
 import uvicorn
 
-from sglang.multimodal_gen.runtime.disaggregation.diffusion_server import (
+from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType

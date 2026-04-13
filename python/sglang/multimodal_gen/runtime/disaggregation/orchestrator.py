@@ -135,14 +135,25 @@ class DiffusionServer:
         self._transfer_state: dict[str, _TransferRequestState] = {}
 
         # Per-instance registration: instance_idx -> {session_id, pool_ptr, pool_size}
+        # Keyed by the same index used to build the PUSH work-socket list
+        # (i.e. the index into --encoder/denoiser/decoder-urls). The index is
+        # resolved from the registering instance's work_endpoint so the control
+        # plane (work PUSH) and the data plane (RDMA session_id / pool_ptr /
+        # preallocated slots) stay consistent regardless of startup order.
         self._encoder_peers: dict[int, dict] = {}
         self._denoiser_peers: dict[int, dict] = {}
         self._decoder_peers: dict[int, dict] = {}
 
-        # Monotonic counters for peer registration (safe across register/deregister)
-        self._next_encoder_peer_idx = 0
-        self._next_denoiser_peer_idx = 0
-        self._next_decoder_peer_idx = 0
+        # work_endpoint -> index lookup tables, built from the --*-urls args
+        self._encoder_endpoint_to_idx = {
+            ep: i for i, ep in enumerate(encoder_work_endpoints)
+        }
+        self._denoiser_endpoint_to_idx = {
+            ep: i for i, ep in enumerate(denoiser_work_endpoints)
+        }
+        self._decoder_endpoint_to_idx = {
+            ep: i for i, ep in enumerate(decoder_work_endpoints)
+        }
 
     @property
     def tracker(self) -> RequestTracker:
@@ -575,32 +586,52 @@ class DiffusionServer:
                 msg.get("role"),
             )
             return
+
+        work_endpoint = msg.get("work_endpoint", "")
+        if role == RoleType.ENCODER:
+            endpoint_to_idx = self._encoder_endpoint_to_idx
+            peers = self._encoder_peers
+        elif role == RoleType.DENOISER:
+            endpoint_to_idx = self._denoiser_endpoint_to_idx
+            peers = self._denoiser_peers
+        elif role == RoleType.DECODER:
+            endpoint_to_idx = self._decoder_endpoint_to_idx
+            peers = self._decoder_peers
+        else:
+            logger.warning(
+                "DiffusionServer transfer: unsupported role in register: %s", role
+            )
+            return
+
+        idx = endpoint_to_idx.get(work_endpoint)
+        if idx is None:
+            # Fail loudly: without a URL match, the control plane (work PUSH)
+            # and data plane (RDMA dest) would drift silently.
+            logger.error(
+                "DiffusionServer transfer: register for role=%s with unknown "
+                "work_endpoint=%r (known=%s); dropping registration",
+                role.value,
+                work_endpoint,
+                list(endpoint_to_idx.keys()),
+            )
+            return
+
         info = {
             "session_id": msg.get("session_id", ""),
             "pool_ptr": msg.get("pool_ptr", 0),
             "pool_size": msg.get("pool_size", 0),
+            "work_endpoint": work_endpoint,
         }
         prealloc = msg.get("preallocated_slots", [])
-        info["free_preallocated_slots"] = list(prealloc) if prealloc else []
+        info["free_preallocated_slots"] = list(prealloc)
+        peers[idx] = info
 
-        if role == RoleType.ENCODER:
-            idx = self._next_encoder_peer_idx
-            self._next_encoder_peer_idx += 1
-            self._encoder_peers[idx] = info
-        elif role == RoleType.DENOISER:
-            idx = self._next_denoiser_peer_idx
-            self._next_denoiser_peer_idx += 1
-            self._denoiser_peers[idx] = info
-        elif role == RoleType.DECODER:
-            idx = self._next_decoder_peer_idx
-            self._next_decoder_peer_idx += 1
-            self._decoder_peers[idx] = info
-        else:
-            idx = 0
         logger.info(
-            "DiffusionServer transfer: registered %s[%d] session=%s pool_ptr=%#x prealloc=%d",
+            "DiffusionServer transfer: registered %s[%d] work_endpoint=%s "
+            "session=%s pool_ptr=%#x prealloc=%d",
             role,
             idx,
+            work_endpoint,
             info["session_id"],
             info["pool_ptr"],
             len(prealloc),
@@ -637,6 +668,72 @@ class DiffusionServer:
             _RoleTTAEntry(request_id=request_id, transfer_state=p2p)
         )
 
+    def _try_fast_path_push(
+        self,
+        request_id: str,
+        p2p: _TransferRequestState,
+        receiver_peer_info: dict,
+        sender_pushes: list,
+        receiver_role_label: str,
+        receiver_idx: int,
+    ) -> bool:
+        """Try to dispatch via a pre-allocated receive slot (fast path).
+
+        If the receiver already registered a free prealloc slot large enough
+        for this transfer, claim it and send a ``TransferPushMsg`` directly
+        to the sender so RDMA can start immediately. Returns True when the
+        fast path is used; False when the caller must fall back to the
+        round-trip alloc path.
+        """
+        free_slots = receiver_peer_info.get("free_preallocated_slots", [])
+        if not (free_slots and free_slots[0].get("size", 0) >= p2p.data_size):
+            return False
+
+        slot_info = free_slots.pop(0)
+        p2p.receiver_session_id = receiver_peer_info.get("session_id", "")
+        p2p.receiver_pool_ptr = receiver_peer_info.get("pool_ptr", 0)
+        p2p.receiver_slot_offset = slot_info["offset"]
+        p2p.prealloc_slot_id = slot_info.get("slot_id")
+
+        push_msg = TransferPushMsg(
+            request_id=request_id,
+            dest_session_id=p2p.receiver_session_id,
+            dest_addr=slot_info["addr"],
+            transfer_size=p2p.data_size,
+        )
+        sender_pushes[p2p.sender_instance].send_multipart(encode_transfer_msg(push_msg))
+        logger.debug(
+            "DiffusionServer transfer: fast-path push to %s[%d] for %s "
+            "(prealloc slot %s, %d bytes)",
+            receiver_role_label,
+            receiver_idx,
+            request_id,
+            slot_info.get("slot_id"),
+            p2p.data_size,
+        )
+        return True
+
+    def _send_slow_path_alloc(
+        self,
+        request_id: str,
+        p2p: _TransferRequestState,
+        receiver_pushes: list,
+        receiver_idx: int,
+        source_role: str,
+    ) -> None:
+        """Ask the receiver to allocate a slot (slow path).
+
+        Used when the receiver has no free prealloc slot large enough. The
+        receiver will respond with ``transfer_allocated``; see
+        :meth:`_handle_transfer_allocated`.
+        """
+        alloc_msg = TransferAllocMsg(
+            request_id=request_id,
+            data_size=p2p.data_size,
+            source_role=source_role,
+        )
+        receiver_pushes[receiver_idx].send_multipart(encode_transfer_msg(alloc_msg))
+
     def _transfer_dispatch_to_denoiser(
         self, request_id: str, p2p: _TransferRequestState, denoiser_idx: int
     ) -> None:
@@ -652,43 +749,21 @@ class DiffusionServer:
         except ValueError:
             pass
 
-        # Fast path: use pre-allocated slot if available and large enough
         peer_info = self._denoiser_peers.get(denoiser_idx, {})
-        free_slots = peer_info.get("free_preallocated_slots", [])
-        if free_slots and free_slots[0].get("size", 0) >= p2p.data_size:
-            slot_info = free_slots.pop(0)
-            p2p.receiver_session_id = peer_info.get("session_id", "")
-            p2p.receiver_pool_ptr = peer_info.get("pool_ptr", 0)
-            p2p.receiver_slot_offset = slot_info["offset"]
-            p2p.prealloc_slot_id = slot_info.get("slot_id")
-
-            dest_addr = slot_info["addr"]
-            push_msg = TransferPushMsg(
+        if not self._try_fast_path_push(
+            request_id=request_id,
+            p2p=p2p,
+            receiver_peer_info=peer_info,
+            sender_pushes=self._encoder_pushes,
+            receiver_role_label="denoiser",
+            receiver_idx=denoiser_idx,
+        ):
+            self._send_slow_path_alloc(
                 request_id=request_id,
-                dest_session_id=p2p.receiver_session_id,
-                dest_addr=dest_addr,
-                transfer_size=p2p.data_size,
-            )
-            sender_idx = p2p.sender_instance
-            self._encoder_pushes[sender_idx].send_multipart(
-                encode_transfer_msg(push_msg)
-            )
-            logger.debug(
-                "DiffusionServer transfer: fast-path push to denoiser[%d] for %s "
-                "(prealloc slot %s, %d bytes)",
-                denoiser_idx,
-                request_id,
-                slot_info.get("slot_id"),
-                p2p.data_size,
-            )
-        else:
-            alloc_msg = TransferAllocMsg(
-                request_id=request_id,
-                data_size=p2p.data_size,
+                p2p=p2p,
+                receiver_pushes=self._denoiser_pushes,
+                receiver_idx=denoiser_idx,
                 source_role="encoder",
-            )
-            self._denoiser_pushes[denoiser_idx].send_multipart(
-                encode_transfer_msg(alloc_msg)
             )
 
     def _handle_transfer_allocated(self, msg: dict) -> None:
@@ -891,42 +966,21 @@ class DiffusionServer:
         except ValueError:
             pass
 
-        # Fast path: use pre-allocated slot if available and large enough
         peer_info = self._decoder_peers.get(decoder_idx, {})
-        free_slots = peer_info.get("free_preallocated_slots", [])
-        if free_slots and free_slots[0].get("size", 0) >= p2p.data_size:
-            slot_info = free_slots.pop(0)
-            p2p.receiver_session_id = peer_info.get("session_id", "")
-            p2p.receiver_pool_ptr = peer_info.get("pool_ptr", 0)
-            p2p.receiver_slot_offset = slot_info["offset"]
-            p2p.prealloc_slot_id = slot_info.get("slot_id")
-
-            dest_addr = slot_info["addr"]
-            push_msg = TransferPushMsg(
+        if not self._try_fast_path_push(
+            request_id=request_id,
+            p2p=p2p,
+            receiver_peer_info=peer_info,
+            sender_pushes=self._denoiser_pushes,
+            receiver_role_label="decoder",
+            receiver_idx=decoder_idx,
+        ):
+            self._send_slow_path_alloc(
                 request_id=request_id,
-                dest_session_id=p2p.receiver_session_id,
-                dest_addr=dest_addr,
-                transfer_size=p2p.data_size,
-            )
-            sender_idx = p2p.sender_instance
-            self._denoiser_pushes[sender_idx].send_multipart(
-                encode_transfer_msg(push_msg)
-            )
-            logger.debug(
-                "DiffusionServer transfer: fast-path push to decoder[%d] for %s "
-                "(prealloc slot %s)",
-                decoder_idx,
-                request_id,
-                slot_info.get("slot_id"),
-            )
-        else:
-            alloc_msg = TransferAllocMsg(
-                request_id=request_id,
-                data_size=p2p.data_size,
+                p2p=p2p,
+                receiver_pushes=self._decoder_pushes,
+                receiver_idx=decoder_idx,
                 source_role="denoiser",
-            )
-            self._decoder_pushes[decoder_idx].send_multipart(
-                encode_transfer_msg(alloc_msg)
             )
 
     def _transfer_return_to_client_from_msg(self, request_id: str, msg: dict) -> None:

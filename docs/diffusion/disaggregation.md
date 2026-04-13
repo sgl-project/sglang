@@ -9,10 +9,12 @@ Disaggregation is controlled by a single flag: `--disagg-role`. Each component i
 | `--disagg-role` | What it runs |
 |----------------|--------------|
 | `monolithic` | (Default) Standard single-server mode |
-| `encoder` | Encoder role instance (text/image encoding) |
-| `denoiser` | Denoiser role instance (DiT forward) |
-| `decoder` | Decoder role instance (VAE decode) |
+| `encoder` | All stages with the default `RoleType.ENCODER` affinity: `InputValidationStage`, `TextEncodingStage` (plus `ImageEncodingStage` / `ImageVAEEncodingStage` for image-conditioned pipelines), `LatentPreparationStage`, `TimestepPreparationStage`, and any model-specific "before denoising" stage (e.g. `QwenImageLayeredBeforeDenoisingStage`, `GlmImageBeforeDenoisingStage`). |
+| `denoiser` | `DenoisingStage` (and its subclasses: `CausalDMDDenoisingStage`, `DmdDenoisingStage`, `LTX2AVDenoisingStage`, `LTX2RefinementStage`, `Hunyuan3DShapeDenoisingStage`, ...) — the DiT forward loop plus the scheduler stepping it drives. |
+| `decoder` | `DecodingStage` (VAE decode) and its subclasses (`LTX2AVDecodingStage`, `HeliosDecodingStage`, ...). |
 | `server` | DiffusionServer head node + HTTP server (no GPU) |
+
+> Each stage declares its role via the `role_affinity` property on `PipelineStage` (default `ENCODER`). When `--disagg-role` is not `monolithic`, the pipeline only instantiates stages whose affinity matches, so the above table is the source of truth for what actually runs in each process.
 
 ### Single-Machine Example (Verified)
 

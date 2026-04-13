@@ -109,6 +109,12 @@ class TransferRegisterMsg:
     session_id: str = ""
     pool_ptr: int = 0
     pool_size: int = 0
+    # The instance's own work endpoint (e.g. tcp://host:port). Used by the
+    # DiffusionServer to key peer info by URL index (i.e. the same index used
+    # to build the PUSH work-socket list), so the control plane and the RDMA
+    # data plane cannot drift when instances register in a different order
+    # than --*-urls.
+    work_endpoint: str = ""
     # Pre-allocated receive slots: [{"offset": int, "size": int, "slot_id": int, "addr": int}]
     preallocated_slots: list = field(default_factory=list)
 

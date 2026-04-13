@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +186,7 @@ class BuddyAllocator:
         return order
 
     @staticmethod
+    @lru_cache(maxsize=256)
     def _next_power_of_2(n: int) -> int:
         if n <= 0:
             return 1

@@ -88,17 +88,22 @@ _EXCLUDE_FIELDS = frozenset(
     }
 )
 
-_SAMPLING_PARAMS_FIELDS = [
-    "request_id",
-    "guidance_scale",
-    "guidance_scale_2",
-    "height",
-    "width",
-    "num_frames",
-    "fps",
-    "num_inference_steps",
-    "seed",
-]
+# Sampling-params fields that should never be transferred across roles:
+#   - data_type / supported_resolutions: enums / non-JSON classvars reconstructed on the receiver
+#   - teacache_params: model-specific object, not JSON-safe
+#   - output_* / save_output / return_*: output-side concerns owned by the decoder role
+#
+# Everything else on SamplingParams is forwarded automatically via a field-walk
+# below; this keeps new request-level features (e.g. Qwen-Image's
+# true_cfg_scale, guidance_rescale, cfg_normalization, ...) from silently
+# getting dropped just because nobody remembered to add them to a whitelist.
+_SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
+    {
+        "data_type",
+        "supported_resolutions",
+        "teacache_params",
+    }
+)
 
 
 def _is_tensor_like(value) -> bool:
@@ -174,12 +179,29 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
 
     sp = getattr(req, "sampling_params", None)
     if sp is not None:
-        for name in _SAMPLING_PARAMS_FIELDS:
+        # Forward every non-default, JSON-safe SamplingParams field, not a
+        # narrow whitelist. Previously only a handful of fields were carried
+        # across roles, which silently dropped per-request config like
+        # Qwen-Image's true_cfg_scale (and any future feature added to
+        # SamplingParams). Using a field-walk keeps the disagg boundary
+        # feature-complete without needing to edit this list.
+        for f in dataclasses.fields(sp):
+            name = f.name
+            if name in _SAMPLING_PARAMS_EXCLUDE_FIELDS:
+                continue
             if name in scalar_fields:
+                # Req-level field already took precedence (or upstream Req
+                # explicitly set it).
                 continue
             value = getattr(sp, name, None)
-            if value is not None:
+            if value is None:
+                continue
+            if _is_default(value, f):
+                continue
+            try:
                 scalar_fields[name] = _to_json_serializable(value)
+            except (TypeError, ValueError):
+                pass
 
     if _debug_transfer:
         import torch as _torch
@@ -208,6 +230,53 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
                         )
 
     return tensor_fields, scalar_fields
+
+
+# ---------------------------------------------------------------------------
+# Helpers for broadcasting Req contents across SP/CFG/TP ranks
+# ---------------------------------------------------------------------------
+
+# Sentinel marker key used to distinguish "list of tensors" from a regular
+# nested dict when round-tripping through GroupCoordinator.broadcast_tensor_dict
+# (which only natively understands tensor / nested-dict values).
+_LIST_MARKER_KEY = "__is_list__"
+
+
+def _pack_tensor_fields_for_broadcast(tensor_fields: dict) -> dict:
+    """Pack ``tensor_fields`` into a structure ``broadcast_tensor_dict`` accepts.
+
+    ``broadcast_tensor_dict`` understands dict-of-tensor values (recursively),
+    but not list-of-tensor values. Several Req fields (``prompt_embeds``,
+    ``image_embeds``, ...) are lists of tensors, so we encode each list as a
+    nested dict whose tensors are keyed by their stringified index, with a
+    sentinel ``__is_list__`` flag to disambiguate from real nested dicts.
+    """
+    packed: dict = {}
+    for key, value in tensor_fields.items():
+        if isinstance(value, torch.Tensor):
+            packed[key] = value
+        elif isinstance(value, list):
+            sub: dict = {_LIST_MARKER_KEY: True}
+            for i, item in enumerate(value):
+                if isinstance(item, torch.Tensor):
+                    sub[str(i)] = item
+            packed[key] = sub
+        # Anything else (e.g. None, scalars) is intentionally dropped — the
+        # scalar_fields broadcast covers non-tensor metadata.
+    return packed
+
+
+def _unpack_tensor_fields_from_broadcast(packed: dict) -> dict:
+    """Inverse of :func:`_pack_tensor_fields_for_broadcast`."""
+    out: dict = {}
+    for key, value in packed.items():
+        if isinstance(value, dict) and value.get(_LIST_MARKER_KEY) is True:
+            indexed = [(int(k), v) for k, v in value.items() if k != _LIST_MARKER_KEY]
+            indexed.sort(key=lambda kv: kv[0])
+            out[key] = [v for _, v in indexed]
+        else:
+            out[key] = value
+    return out
 
 
 class SchedulerDisaggMixin:
@@ -293,17 +362,22 @@ class SchedulerDisaggMixin:
         # Pool size: configurable, default 256 MiB
         pool_size = getattr(sa, "disagg_transfer_pool_size", 256 * 1024 * 1024)
 
-        # Create transfer engine
+        # Create transfer engine.
+        # NOTE: self.gpu_id is the role-internal rank (0..num_role_gpus-1),
+        # not the physical GPU index. In disagg mode with --base-gpu-id > 0,
+        # the physical device is self.worker.local_rank. Mooncake needs the
+        # physical index to pin the right NIC and register GPUDirect buffers.
         hostname = getattr(sa, "disagg_p2p_hostname", "127.0.0.1")
         ib_device = getattr(sa, "disagg_ib_device", None)
+        physical_gpu_id = self.worker.local_rank
         engine = create_transfer_engine(
             hostname=hostname,
-            gpu_id=self.gpu_id,
+            gpu_id=physical_gpu_id,
             ib_device=ib_device,
         )
 
         # Use GPU buffer when engine supports GPUDirect RDMA, CPU pinned otherwise
-        device = f"cuda:{self.gpu_id}" if engine.supports_gpu_direct else "cpu"
+        device = f"cuda:{physical_gpu_id}" if engine.supports_gpu_direct else "cpu"
         buffer = TransferTensorBuffer(
             pool_size=pool_size, device=device, role_name=self._disagg_role.value
         )
@@ -336,12 +410,16 @@ class SchedulerDisaggMixin:
                     len(preallocated_slot_info),
                 )
 
-        # Register with DiffusionServer
+        # Register with DiffusionServer.
+        # Include our own work_endpoint so DS can key the peer by URL index,
+        # not by registration order (startup order is not guaranteed to match
+        # --encoder/denoiser/decoder-urls ordering).
         register_msg = TransferRegisterMsg(
             role=self._disagg_role.value,
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,
             pool_size=self._transfer_manager.pool_size,
+            work_endpoint=sa.pool_work_endpoint,
             preallocated_slots=preallocated_slot_info,
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
@@ -556,6 +634,87 @@ class SchedulerDisaggMixin:
 
         return data
 
+    def _is_multi_rank(self: Scheduler) -> bool:
+        sa = self.server_args
+        return sa.sp_degree != 1 or sa.tp_size > 1 or sa.enable_cfg_parallel
+
+    def _broadcast_tensor_dict_to_all_ranks(
+        self: Scheduler, tensor_dict: dict | None
+    ) -> dict | None:
+        """Broadcast a tensor dict from rank 0 to non-rank-0 via NCCL.
+
+        Uses ``GroupCoordinator.broadcast_tensor_dict`` which ships tensor
+        metadata over the CPU group and the tensor payload over the device
+        (NCCL) group, so large GPU buffers never bounce through CPU.
+        """
+        sa = self.server_args
+
+        if sa.sp_degree != 1:
+            tensor_dict = self.worker.sp_group.broadcast_tensor_dict(tensor_dict, src=0)
+        if sa.enable_cfg_parallel:
+            tensor_dict = self.worker.cfg_group.broadcast_tensor_dict(
+                tensor_dict, src=0
+            )
+        if sa.tp_size > 1:
+            tensor_dict = self.worker.tp_group.broadcast_tensor_dict(tensor_dict, src=0)
+        return tensor_dict
+
+    def _broadcast_req_to_all_ranks(self: Scheduler, req: Req | None) -> Req | None:
+        """Broadcast a fully-loaded Req (scalars + GPU tensors) from rank 0.
+
+        Required for multi-rank denoiser/decoder in disagg mode: only rank 0
+        owns the TransferManager and RDMA-loads tensors into GPU memory. All
+        other ranks must see the same Req before entering ``execute_forward``,
+        otherwise REPLICATED stages (e.g. denoising) blow up on empty tensor
+        fields because ``ParallelExecutor`` never broadcasts the batch for
+        that paradigm.
+
+        Tensor fields travel over NCCL (stays on GPU); scalar fields travel
+        as a small pickled object over the CPU group.
+        """
+        if not self._is_multi_rank():
+            return req
+
+        is_rank0 = self.gpu_id == 0
+
+        if is_rank0:
+            assert req is not None, "rank 0 must pass a loaded Req"
+            tensor_fields, scalar_fields = extract_transfer_fields(req)
+            packed_tensors = _pack_tensor_fields_for_broadcast(tensor_fields)
+        else:
+            scalar_fields = None
+            packed_tensors = None
+
+        # 1. Scalars via CPU pyobj broadcast.
+        scalar_fields = self._broadcast_to_all_ranks(scalar_fields)
+
+        # 2. Tensors via NCCL broadcast — keeps GPU buffers on device.
+        packed_tensors = self._broadcast_tensor_dict_to_all_ranks(packed_tensors)
+
+        if is_rank0:
+            return req
+
+        tensor_fields = _unpack_tensor_fields_from_broadcast(packed_tensors or {})
+        # Move tensors onto this rank's physical device. The broadcast
+        # allocates receive tensors on the receiver's default CUDA device
+        # (set via torch.cuda.set_device(local_rank) during init), which is
+        # already the right physical GPU — the .to() is effectively a no-op
+        # but makes the invariant explicit for future readers.
+        local_device = torch.device(f"cuda:{self.worker.local_rank}")
+        for key, value in list(tensor_fields.items()):
+            if isinstance(value, torch.Tensor):
+                tensor_fields[key] = value.to(local_device, non_blocking=True)
+            elif isinstance(value, list):
+                tensor_fields[key] = [
+                    (
+                        t.to(local_device, non_blocking=True)
+                        if isinstance(t, torch.Tensor)
+                        else t
+                    )
+                    for t in value
+                ]
+        return self._build_disagg_req(scalar_fields or {}, tensor_fields)
+
     # ------------------------------------------------------------------
     # Event loops
     # ------------------------------------------------------------------
@@ -619,9 +778,15 @@ class SchedulerDisaggMixin:
                             )
                     else:
                         self._transfer_manager.free_receive_slot(request_id)
-                    # Broadcast scalar fields to non-rank-0
+                    # Broadcast the full Req (scalar + tensor fields) to
+                    # non-rank-0 ranks. Tensors ride NCCL on the SP/CFG/TP
+                    # groups so downstream REPLICATED stages (e.g. denoising)
+                    # see identical inputs on every rank — without this, the
+                    # non-rank-0 ranks would enter execute_forward with empty
+                    # prompt_embeds and fail verify_input.
                     if is_multi_rank:
-                        self._broadcast_to_all_ranks(("compute", scalar_fields))
+                        self._broadcast_to_all_ranks(("compute",))
+                        self._broadcast_req_to_all_ranks(req)
                     # Init scheduler timesteps on main thread (safe — no
                     # concurrent denoising loop can be running here).
                     if self._disagg_role == RoleType.DENOISER:
@@ -695,9 +860,13 @@ class SchedulerDisaggMixin:
                     # Shutdown signal
                     break
 
-                if isinstance(msg, tuple) and len(msg) >= 2 and msg[0] == "compute":
-                    scalar_fields = msg[1]
-                    self._disagg_compute_non_rank0(scalar_fields)
+                if isinstance(msg, tuple) and len(msg) >= 1 and msg[0] == "compute":
+                    # Participate in the companion tensor broadcast so this
+                    # rank sees the full Req (scalars + GPU tensors). Without
+                    # the tensor half, REPLICATED stages would see empty
+                    # prompt_embeds on non-rank-0 and fail verify_input.
+                    req = self._broadcast_req_to_all_ranks(None)
+                    self._disagg_compute_non_rank0(req)
                 # else: ("skip",) — continue
 
             except Exception as e:
@@ -872,13 +1041,11 @@ class SchedulerDisaggMixin:
         msg_type = msg.get("msg_type", "")
 
         if msg_type == TransferMsgType.READY:
-            # Participate in compute — but non-rank-0 has no TransferManager.
-            # Rank 0 loads tensors and broadcasts; non-rank-0 gets them
-            # via the execute_forward's internal NCCL sync.
-            # For now, non-rank-0 reconstructs the Req from scalar fields
-            # (no tensor data — pipeline broadcasts internally).
-            scalar_fields = msg.get("scalar_fields", {})
-            self._disagg_compute_non_rank0(scalar_fields)
+            # Non-rank-0 has no TransferManager, so rank 0 loads tensors from
+            # the RDMA buffer and broadcasts the full Req (scalars + tensors)
+            # over NCCL. Participate in the matching broadcast here.
+            req = self._broadcast_req_to_all_ranks(None)
+            self._disagg_compute_non_rank0(req)
         # else: transfer_alloc, transfer_push — skip (rank-0-only operations)
 
     def _handle_transfer_alloc(self: Scheduler, msg: dict) -> None:
@@ -1022,7 +1189,13 @@ class SchedulerDisaggMixin:
         else:
             self._transfer_manager.free_receive_slot(request_id)
 
-        # 5. Run compute
+        # 6. In multi-rank mode, broadcast the fully-loaded Req to the other
+        # ranks so REPLICATED stages see identical inputs everywhere. See
+        # the prefetch-loop variant for the matching receiver broadcast.
+        if self._is_multi_rank():
+            self._broadcast_req_to_all_ranks(req)
+
+        # 7. Run compute
         if self._disagg_role == RoleType.DENOISER:
             self._disagg_denoiser_compute(req, request_id, role_name)
         elif self._disagg_role == RoleType.DECODER:
@@ -1032,28 +1205,29 @@ class SchedulerDisaggMixin:
     # Compute
     # ------------------------------------------------------------------
 
-    def _disagg_compute_non_rank0(self: Scheduler, scalar_fields: dict) -> None:
-        """Non-rank-0 compute: build minimal Req and enter execute_forward.
+    def _disagg_compute_non_rank0(self: Scheduler, req: Req) -> None:
+        """Non-rank-0 compute: enter execute_forward with a Req received via
+        NCCL broadcast from rank 0.
 
-        Rank 0 loads tensors from the transfer buffer and runs compute.
-        The pipeline's forward() internally uses NCCL to broadcast/scatter
-        tensors to all SP/TP ranks. Non-rank-0 needs to enter execute_forward
-        with a minimal Req so the NCCL collectives match.
+        The Req already contains tensor fields materialized on this rank's
+        GPU (see ``_broadcast_req_to_all_ranks``), so REPLICATED stages such
+        as denoising have non-empty prompt_embeds and verify_input passes.
 
-        Used by both the old non-prefetch path (_handle_transfer_non_rank0)
-        and the new prefetch non-rank-0 loop (_disagg_non_rank0_event_loop).
+        Used by both the non-prefetch path (:meth:`_handle_transfer_non_rank0`)
+        and the prefetch non-rank-0 loop
+        (:meth:`_disagg_non_rank0_event_loop`).
         """
-        # Build a minimal Req with scalar fields only.
-        # Tensor fields will be received via NCCL inside execute_forward.
-        req = self._build_disagg_req(scalar_fields, {})
-
         if self._disagg_role == RoleType.DENOISER:
             # Initialize scheduler timesteps (same as rank 0)
             scheduler_mod = self.worker.pipeline.get_module("scheduler")
             num_steps = getattr(req, "num_inference_steps", None)
             if scheduler_mod is not None and num_steps is not None:
                 device = torch.device(f"cuda:{self.worker.local_rank}")
-                scheduler_mod.set_timesteps(num_steps, device=device)
+                extra_kwargs = {}
+                mu = req.extra.get("mu") if hasattr(req, "extra") else None
+                if mu is not None:
+                    extra_kwargs["mu"] = mu
+                scheduler_mod.set_timesteps(num_steps, device=device, **extra_kwargs)
 
             self.worker.execute_forward([req], return_req=True)
 
