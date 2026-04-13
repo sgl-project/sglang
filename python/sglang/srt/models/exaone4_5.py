@@ -425,6 +425,12 @@ class Exaone4_5_ForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(text_config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        return self.language_model.set_embed_and_head(embed, head)
+
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
