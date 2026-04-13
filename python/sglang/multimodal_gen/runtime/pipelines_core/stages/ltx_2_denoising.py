@@ -220,6 +220,37 @@ class LTX2DenoisingStage(DenoisingStage):
         return tensor.repeat(repeat_factor, *([1] * (tensor.ndim - 1)))
 
     @staticmethod
+    def _ltx2_resolve_probe_root(module):
+        candidates = [module, getattr(module, "model", None)]
+        for candidate in candidates:
+            if candidate is not None and getattr(candidate, "adaln_single", None) is not None:
+                return candidate
+        return module
+
+    @staticmethod
+    def _ltx2_wrap_first_call(module, name: str):
+        if module is None:
+            return None
+        original_forward = module.forward
+        state = {"done": False}
+
+        def wrapped(*args, **kwargs):
+            out = original_forward(*args, **kwargs)
+            if not state["done"]:
+                if isinstance(out, tuple):
+                    if len(out) >= 1 and isinstance(out[0], torch.Tensor):
+                        maybe_save_ltx23_ti2v_tensor(f"{name}_out", out[0])
+                    if len(out) >= 2 and isinstance(out[1], torch.Tensor):
+                        maybe_save_ltx23_ti2v_tensor(f"{name}_aux", out[1])
+                elif isinstance(out, torch.Tensor):
+                    maybe_save_ltx23_ti2v_tensor(f"{name}_out", out)
+                state["done"] = True
+            return out
+
+        module.forward = wrapped
+        return original_forward
+
+    @staticmethod
     def _build_ltx2_sp_padding_mask(
         batch: Req,
         *,
@@ -907,6 +938,36 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         use_official_cfg_path = stage1_guider_params is None
         if use_official_cfg_path:
+            original_module_forwards = []
+            if should_dump_stage2_step0:
+                probe_root = self._ltx2_resolve_probe_root(step.current_model)
+                for attr_name, dump_name in [
+                    ("caption_projection", "caption_projection_video"),
+                    ("audio_caption_projection", "caption_projection_audio"),
+                    ("adaln_single", "adaln_video"),
+                    ("audio_adaln_single", "adaln_audio"),
+                    ("prompt_adaln_single", "prompt_adaln_video"),
+                    ("audio_prompt_adaln_single", "prompt_adaln_audio"),
+                    (
+                        "av_ca_video_scale_shift_adaln_single",
+                        "av_ca_scale_shift_video",
+                    ),
+                    (
+                        "av_ca_audio_scale_shift_adaln_single",
+                        "av_ca_scale_shift_audio",
+                    ),
+                    ("av_ca_a2v_gate_adaln_single", "av_ca_gate_video"),
+                    ("av_ca_v2a_gate_adaln_single", "av_ca_gate_audio"),
+                ]:
+                    original_module_forwards.append(
+                        (
+                            probe_root,
+                            attr_name,
+                            self._ltx2_wrap_first_call(
+                                getattr(probe_root, attr_name, None), dump_name
+                            ),
+                        )
+                    )
             encoder_hidden_states = batch.prompt_embeds[0]
             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
             encoder_attention_mask = prompt_attention_mask
@@ -968,16 +1029,22 @@ class LTX2DenoisingStage(DenoisingStage):
                         v2a_cross_attention_mask, cfg_batch_size
                     )
 
-            with set_forward_context(
-                current_timestep=step.step_index, attn_metadata=step.attn_metadata
-            ):
-                model_video, model_audio = step.current_model(
-                    **build_model_kwargs(
-                        encoder_hidden_states=encoder_hidden_states,
-                        audio_encoder_hidden_states=audio_encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
+            try:
+                with set_forward_context(
+                    current_timestep=step.step_index, attn_metadata=step.attn_metadata
+                ):
+                    model_video, model_audio = step.current_model(
+                        **build_model_kwargs(
+                            encoder_hidden_states=encoder_hidden_states,
+                            audio_encoder_hidden_states=audio_encoder_hidden_states,
+                            encoder_attention_mask=encoder_attention_mask,
+                        )
                     )
-                )
+            finally:
+                for root, attr_name, original_forward in original_module_forwards:
+                    if original_forward is None:
+                        continue
+                    getattr(root, attr_name).forward = original_forward
             if should_dump_stage2_step0:
                 maybe_save_ltx23_ti2v_tensor(
                     "stage2_step0_model_video_raw", model_video
