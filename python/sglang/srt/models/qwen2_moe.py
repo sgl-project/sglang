@@ -89,6 +89,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_cuda_alike,
     make_layers,
     use_intel_amx_backend,
 )
@@ -97,8 +98,18 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_cuda_alike = is_cuda_alike()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
+
+fused_linear_sigmoid_mul_triton = None
+if _is_cuda_alike:
+    try:
+        from sglang.srt.layers.fused_linear_sigmoid_mul_triton import (
+            fused_linear_sigmoid_mul as fused_linear_sigmoid_mul_triton,
+        )
+    except ImportError:
+        pass
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -256,6 +267,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         self.shared_expert_gate.bias,
                         True,
                         shared_output,
+                    )
+                elif (
+                    fused_linear_sigmoid_mul_triton is not None
+                    and hidden_states.is_cuda
+                    and self.shared_expert_gate.bias is None
+                    and self.shared_expert_gate.weight.dim() == 2
+                    and self.shared_expert_gate.weight.shape[0] == 1
+                    and self.shared_expert_gate.weight.shape[1]
+                    == hidden_states.shape[1]
+                    and hidden_states.is_contiguous()
+                    and shared_output.is_contiguous()
+                    and self.shared_expert_gate.weight.is_contiguous()
+                ):
+                    fused_linear_sigmoid_mul_triton(
+                        hidden_states,
+                        self.shared_expert_gate.weight,
+                        shared_output,
+                        out=shared_output,
                     )
                 else:
                     shared_output = (
