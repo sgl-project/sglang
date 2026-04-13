@@ -278,6 +278,12 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.gpu_cache_usage_perc = Gauge(
+            name="sglang:gpu_cache_usage_perc",
+            documentation="GPU KV cache usage percentage (0.0-1.0). Compatible with vLLM's gpu_cache_usage_perc.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         # Speculative decoding
         self.spec_accept_length = Gauge(
@@ -1014,6 +1020,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+        self._log_gauge(self.gpu_cache_usage_perc, stats.token_usage)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
