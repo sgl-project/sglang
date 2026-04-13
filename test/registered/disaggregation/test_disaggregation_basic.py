@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 
 import aiohttp
@@ -20,7 +22,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=400, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=394, suite="stage-b-test-2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
@@ -96,6 +98,101 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         output = response.json()["text"]
         # ensure the output is a valid JSON
         json.loads(output)
+
+    def test_pause_resume_in_place(self):
+        """Send requests, pause mid-generation, verify no progress during pause, resume."""
+        NUM_REQUESTS = 32
+        MAX_NEW_TOKENS = 512
+        REQUEST_TIMEOUT = 180
+        PAUSE_DURATION = 5
+
+        def _generate(prompt_id):
+            return requests.post(
+                self.lb_url + "/generate",
+                json={
+                    "text": f"Question {prompt_id}: Write a short essay about the number {prompt_id}.",
+                    "sampling_params": {
+                        "temperature": 0.8,
+                        "max_new_tokens": MAX_NEW_TOKENS,
+                    },
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+
+        with ThreadPoolExecutor(max_workers=NUM_REQUESTS) as executor:
+            futures = {executor.submit(_generate, i): i for i in range(NUM_REQUESTS)}
+
+            time.sleep(1)
+
+            requests.post(
+                self.prefill_url + "/pause_generation",
+                json={"mode": "in_place"},
+                timeout=30,
+            ).raise_for_status()
+            requests.post(
+                self.decode_url + "/pause_generation",
+                json={"mode": "in_place"},
+                timeout=30,
+            ).raise_for_status()
+
+            time.sleep(0.5)
+            done_before = sum(1 for f in futures if f.done())
+
+            time.sleep(PAUSE_DURATION)
+            done_after = sum(1 for f in futures if f.done())
+
+            self.assertLess(
+                done_before,
+                NUM_REQUESTS,
+                "All requests completed before pause took effect — "
+                "increase MAX_NEW_TOKENS to make the test meaningful.",
+            )
+
+            self.assertEqual(
+                done_after - done_before,
+                0,
+                f"{done_after - done_before} requests completed during pause "
+                f"({done_before} before, {done_after} after) — "
+                f"pause_generation was not respected by the disagg scheduler.",
+            )
+
+            requests.post(
+                self.decode_url + "/continue_generation",
+                json={},
+                timeout=30,
+            ).raise_for_status()
+            requests.post(
+                self.prefill_url + "/continue_generation",
+                json={},
+                timeout=30,
+            ).raise_for_status()
+
+            completed = 0
+            errors = []
+            for future in as_completed(futures, timeout=REQUEST_TIMEOUT):
+                prompt_id = futures[future]
+                try:
+                    resp = future.result()
+                    if resp.status_code == 200:
+                        body = resp.json()
+                        self.assertIn("text", body)
+                        self.assertGreater(len(body["text"]), 0)
+                        completed += 1
+                    else:
+                        errors.append(f"Request {prompt_id}: status={resp.status_code}")
+                except Exception as e:
+                    errors.append(f"Request {prompt_id}: exception={e}")
+
+        self.assertEqual(
+            completed + len(errors),
+            NUM_REQUESTS,
+            "Some requests did not resolve within the timeout — likely hung during pause.",
+        )
+        self.assertEqual(
+            completed,
+            NUM_REQUESTS,
+            f"Some requests failed: {completed}/{NUM_REQUESTS} succeeded. Errors: {errors}",
+        )
 
     def test_first_token_finish(self):
         client = openai.Client(api_key="empty", base_url=f"{self.lb_url}/v1")

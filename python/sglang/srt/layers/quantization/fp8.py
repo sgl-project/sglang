@@ -531,9 +531,11 @@ class Fp8LinearMethod(LinearMethodBase):
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
+            # block_scale_interleave may pad and/or reshape scales,
+            # so store swizzled scales separately to keep weight update working
             copy_or_rebind_param(
                 layer,
-                "weight_scale_inv",
+                "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
         else:
@@ -688,18 +690,22 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
+            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+                weight_scale = layer.weight_scale_inv_swizzled
+            else:
+                weight_scale = layer.weight_scale_inv
             if isinstance(x, tuple):
                 return self.w8a8_mxfp8_linear(
                     input=x[0],
                     weight=layer.weight,
-                    weight_scale=layer.weight_scale_inv,
+                    weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
                 )
             return self.w8a8_mxfp8_linear(
                 input=x,
                 weight=layer.weight,
-                weight_scale=layer.weight_scale_inv,
+                weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
             )

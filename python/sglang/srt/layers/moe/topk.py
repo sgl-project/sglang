@@ -929,7 +929,6 @@ def biased_grouped_topk_cpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    assert not apply_routed_scaling_factor_on_output, "Not implemented"
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
         gating_output,
@@ -939,7 +938,7 @@ def biased_grouped_topk_cpu(
         num_expert_group,
         topk_group,
         num_fused_shared_experts,
-        routed_scaling_factor,
+        routed_scaling_factor if apply_routed_scaling_factor_on_output else None,
         # num_token_non_padded must be None since it is not supported in kernel
         num_token_non_padded=None,
     )
