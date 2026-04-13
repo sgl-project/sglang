@@ -825,6 +825,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> List[int]:
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
+    # ---- Async support ----
+
+    @property
+    def supports_async(self) -> bool:
+        return hasattr(self.store, "create_async_context")
+
+    def create_async_context(self, max_concurrency: int):
+        if not self.supports_async:
+            return None
+        return self.store.create_async_context(max_concurrency)
+
+    def async_submit(self, ctx, keys, host_indices, extra_info=None):
+        if self.extra_backend_tag is not None:
+            keys = [f"{self.extra_backend_tag}_{key}" for key in keys]
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            keys, host_indices
+        )
+        return ctx.submit(key_strs, buffer_ptrs, buffer_sizes)
+
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 

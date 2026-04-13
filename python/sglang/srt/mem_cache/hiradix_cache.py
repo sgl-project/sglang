@@ -131,6 +131,7 @@ class HiRadixCache(RadixCache):
             attn_cp_rank=self.attn_cp_rank,
             attn_cp_size=self.attn_cp_size,
             enable_storage_metrics=self.enable_storage_metrics,
+            async_prefetch_concurrency=server_args.hicache_storage_async_concurrency,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,

@@ -264,7 +264,9 @@ class HiCacheController:
         attn_cp_rank: int = 0,
         attn_cp_size: int = 1,
         enable_storage_metrics: bool = False,
+        async_prefetch_concurrency: int = 1,
     ):
+        self.async_prefetch_concurrency = async_prefetch_concurrency
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -886,7 +888,20 @@ class HiCacheController:
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
+        Dispatches to async or sync path based on backend capability and config.
         """
+        use_async = (
+            self.storage_backend is not None
+            and self.storage_backend.supports_async
+            and self.async_prefetch_concurrency > 1
+        )
+        if use_async:
+            self._prefetch_io_async_loop()
+        else:
+            self._prefetch_io_sync_loop()
+
+    def _prefetch_io_sync_loop(self):
+        """Original serial IO logic."""
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
@@ -899,6 +914,81 @@ class HiCacheController:
                 )
             except Empty:
                 continue
+
+    def _prefetch_io_async_loop(self):
+        """Concurrent IO with async backend using AsyncGetContext."""
+        ctx = self.storage_backend.create_async_context(
+            self.async_prefetch_concurrency
+        )
+        if ctx is None:
+            logger.warning("Failed to create async context, falling back to sync")
+            self._prefetch_io_sync_loop()
+            return
+
+        INVALID_TOKEN = 2**64 - 1
+        token_to_op = {}
+
+        while not self.storage_stop_event.is_set():
+            # Phase 1: Submit new operations up to concurrency limit
+            while True:
+                block = (ctx.in_flight == 0)
+                try:
+                    operation = self.prefetch_buffer.get(
+                        block=block, timeout=1
+                    )
+                except Empty:
+                    break
+                if operation is None:
+                    continue
+
+                token = self.storage_backend.async_submit(
+                    ctx, operation.hash_value, operation.host_indices,
+                    HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys),
+                )
+                if token == INVALID_TOKEN:
+                    # Concurrency full, put back and go to wait
+                    logger.info(f"async prefetch: concurrency full, in_flight={ctx.in_flight}")
+                    self.prefetch_buffer.put(operation)
+                    break
+                logger.info(f"async prefetch: submitted token={token} keys={len(operation.hash_value)} in_flight={ctx.in_flight}")
+                token_to_op[token] = operation
+
+            # Phase 2: Wait for any completion
+            if ctx.in_flight > 0:
+                token, results = ctx.wait_any()
+                if token == INVALID_TOKEN:
+                    continue  # shutting down
+                operation = token_to_op.pop(token, None)
+                if operation is not None:
+                    self._process_async_results(operation, results)
+                    logger.info(f"async prefetch: completed token={token} completed_tokens={operation.completed_tokens}/{len(operation.hash_value)*self.page_size}")
+
+    def _process_async_results(self, operation, results):
+        """Process results from async batch get, update completed_tokens.
+        C++ async path returns 0 for success, -1 for failure (not byte counts).
+        Need to convert to per-page results matching the storage layout."""
+        # Convert 0/-1 to positive/negative so _batch_postprocess works
+        # _batch_postprocess checks > 0 for success, so map 0 -> 1, -1 -> -1
+        adjusted = [1 if r >= 0 else -1 for r in results]
+        page_results = self.storage_backend._batch_postprocess(
+            adjusted, is_set_operate=False
+        )
+        success_pages = 0
+        for ok in page_results:
+            if not ok:
+                break
+            success_pages += 1
+
+        inc = success_pages * self.page_size
+        operation.increment(inc)
+
+        if success_pages < len(operation.hash_value):
+            logger.info(f"async prefetch: partial success {success_pages}/{len(operation.hash_value)} pages, marking terminate")
+            operation.mark_terminate()
+
+        self.append_host_mem_release(
+            operation.host_indices[operation.completed_tokens :]
+        )
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -972,6 +1062,9 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
+                    logger.info(
+                        f"Revoking prefetch for {operation.request_id}: hits={storage_hit_count} < threshold={self.prefetch_threshold}"
+                    )
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )

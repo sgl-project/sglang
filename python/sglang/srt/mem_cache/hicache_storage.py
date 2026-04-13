@@ -263,6 +263,20 @@ class HiCacheStorage(ABC):
                 return i
         return len(keys)
 
+    @property
+    def supports_async(self) -> bool:
+        """Whether this backend supports async batch get."""
+        return False
+
+    def create_async_context(self, max_concurrency: int):
+        """Create an async context for concurrent batch get operations.
+        Returns None if async is not supported by this backend."""
+        return None
+
+    def async_submit(self, ctx, keys, host_indices, extra_info=None) -> int:
+        """Submit async batch get via context. Returns token or INVALID_TOKEN."""
+        return -1
+
     def clear(self) -> None:
         pass
 
