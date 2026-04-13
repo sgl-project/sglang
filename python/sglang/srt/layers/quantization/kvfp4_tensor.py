@@ -224,9 +224,10 @@ class NVFP4KVQuantizeUtil:
         global_scale: torch.Tensor,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        """Dequantize NVFP4 tensor to BF16/FP16 via FlashInfer ``nvfp4_kv_dequantize``.
+        """Dequantize NVFP4 tensor to BF16/FP16.
 
-        Requires SM100+.
+        Uses ``nvfp4_kv_dequantize`` on SM100+, falls back to pure PyTorch
+        E2M1 LUT on SM90.
 
         Args:
             quant_tensor: Packed FP4 data of shape [B, M, N/2] (uint8)
@@ -237,11 +238,7 @@ class NVFP4KVQuantizeUtil:
         Returns:
             Dequantized tensor of shape [B, M, N]
         """
-        from flashinfer import nvfp4_kv_dequantize
-
         from sglang.srt.utils import is_sm100_supported
-
-        assert is_sm100_supported(), "NVFP4 KV cache dequantize requires SM100+ GPU"
 
         b, m, n_half = quant_tensor.shape
 
@@ -252,11 +249,25 @@ class NVFP4KVQuantizeUtil:
         elif global_scale.dim() == 0:
             global_scale = global_scale.unsqueeze(0)
 
-        quant_2d = quant_tensor.view(torch.uint8).reshape(b * m, n_half)
-        scales_2d = block_scales.view(torch.uint8).reshape(b * m, -1)
+        if is_sm100_supported():
+            from flashinfer import nvfp4_kv_dequantize
 
-        output_2d = nvfp4_kv_dequantize(
-            quant_2d, scales_2d, global_scale, output_dtype=dtype
-        )
-
-        return output_2d.reshape(b, m, -1)
+            quant_2d = quant_tensor.view(torch.uint8).reshape(b * m, n_half)
+            scales_2d = block_scales.view(torch.uint8).reshape(b * m, -1)
+            output_2d = nvfp4_kv_dequantize(
+                quant_2d, scales_2d, global_scale, output_dtype=dtype
+            )
+            return output_2d.reshape(b, m, -1)
+        else:
+            # Pure PyTorch fallback for SM90
+            n = n_half * 2
+            fp4_vals = torch.empty(
+                b, m, n, dtype=torch.uint8, device=quant_tensor.device
+            )
+            fp4_vals[..., 0::2] = quant_tensor & 0x0F
+            fp4_vals[..., 1::2] = (quant_tensor >> 4) & 0x0F
+            float_vals = E2M1_VALUES[fp4_vals.long()]
+            reshaped = float_vals.view(b, m * n // 16, 16)
+            block_scales_float = block_scales.float().unsqueeze(-1)
+            scaled = reshaped * block_scales_float
+            return (scaled.view(b, m, n) * global_scale).to(dtype)
