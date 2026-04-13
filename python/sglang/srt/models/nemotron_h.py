@@ -967,9 +967,9 @@ def breakable_nemotron_mamba2_with_output(
     global _breakable_mamba_fn
     if _breakable_mamba_fn is None:
         from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
-            non_graph,
+            eager_on_graph,
         )
 
-        _breakable_mamba_fn = non_graph(True)(_nemotron_mamba2_with_output_impl)
+        _breakable_mamba_fn = eager_on_graph(True)(_nemotron_mamba2_with_output_impl)
     return _breakable_mamba_fn(hidden_states, output, layer_id)
     return

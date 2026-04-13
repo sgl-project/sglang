@@ -620,6 +620,7 @@ class ServerArgs:
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
@@ -5656,6 +5657,11 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--enable-breakable-cuda-graph",
+            action="store_true",
+            help="Use breakable CUDA graph for piecewise capture instead of torch.compile-based splitting.",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",
