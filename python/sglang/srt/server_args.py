@@ -475,6 +475,7 @@ class ServerArgs:
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
     experts_shared_outer_loras: Optional[bool] = None
+    lora_use_virtual_experts: bool = False
     lora_strict_loading: bool = False
 
     # Kernel backend
@@ -4964,6 +4965,12 @@ class ServerArgs:
             "By default this is auto-detected from adapter weights.",
         )
         parser.add_argument(
+            "--lora-use-virtual-experts",
+            default=ServerArgs.lora_use_virtual_experts,
+            action="store_true",
+            help="Enable virtual expert computation for MoE models. When set, the model will use virtual expert computation.",
+        )
+        parser.add_argument(
             "--lora-strict-loading",
             default=ServerArgs.lora_strict_loading,
             action=argparse.BooleanOptionalAction,
@@ -6714,6 +6721,13 @@ class ServerArgs:
                     16 <= self.max_lora_chunk_size <= 128
                     and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
+
+            if self.lora_use_virtual_experts:
+                assert self.lora_backend == "triton", (
+                    "--lora-use-virtual-experts requires --lora-backend triton. "
+                    f"Got: {self.lora_backend}"
+                )
+                logger.info("Virtual expert computation enabled.")
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:
