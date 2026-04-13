@@ -166,8 +166,7 @@ class SchedulerMetricsMixin:
                     reporter=self.metrics_collector.increment_gpu_overlap_wait_seconds,
                 )
 
-        if self.enable_kv_cache_events:
-            self.init_kv_events(self.server_args.kv_events_config)
+        self.init_kv_events(self.server_args.kv_events_config)
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
