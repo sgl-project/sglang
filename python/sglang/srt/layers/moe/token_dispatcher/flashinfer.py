@@ -100,7 +100,7 @@ class FlashinferDispatcher(BaseDispatcher):
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         self.max_num_tokens = (
-            get_int_env_var("SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024)
+            get_int_env_var("SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 8192)
             * self.ep_size
         )
 
@@ -147,26 +147,9 @@ class FlashinferDispatcher(BaseDispatcher):
             mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(group)),
         )
 
-        # Preallocate dummy tensors (to overcome numLocalTokens > 0 restriction)
-        self.dummy_x = torch.empty(
-            (1, hidden_size),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        # -1 will be ignored by flashinfer cutlass moe
-        self.dummy_topk_ids = torch.full(
-            (1, self.router_topk), -1, dtype=torch.int32, device="cuda"
-        )
-        # Hack for dispatch with dummy token - will route the dummy token to this rank so it doesn't require any transfer.
-        self.dummy_topk_ids_current_rank = torch.full(
-            (1, self.router_topk),
-            self.ep_rank * self.num_local_experts,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self.dummy_topk_weights = torch.zeros(
-            (1, self.router_topk), dtype=torch.float32, device="cuda"
-        )
+        # Note: dummy tensors for the old dummy-token approach have been removed.
+        # We now pass 0-size tensors directly to the alltoall kernel, which
+        # handles local_num_tokens=0 natively (same as TRT-LLM).
 
     @debug_kernel_api
     def dispatch(
@@ -178,15 +161,11 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
-        # Handle case where there are no tokens on this DP worker
-        # moe_a2a.dispatch requires at least one token
-        self.has_dummy_token = False
-        if x.shape[0] == 0:
-            logger.warning("No tokens on this DP worker, using dummy token")
-            self.has_dummy_token = True
-            x = self.dummy_x
-            topk_ids = self.dummy_topk_ids
-            topk_weights = self.dummy_topk_weights
+        # Track if this DP worker has no tokens (idle rank).
+        # Unlike the old dummy-token approach, we pass 0-size tensors directly
+        # to the alltoall kernel, which handles local_num_tokens=0 natively
+        # (same as TRT-LLM). The kernel keeps 1 thread alive for sync.
+        self.is_idle_rank = x.shape[0] == 0
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
@@ -216,9 +195,10 @@ class FlashinferDispatcher(BaseDispatcher):
             else x.shape[0]
         )
         recv_tensors = self.moe_a2a.dispatch(
-            self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
+            topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
+            invalid_token_expert_id=self.num_experts,
             expert_id_payload_index=expert_id_payload_index,
         )
         if x_sf is not None:
@@ -257,10 +237,6 @@ class FlashinferDispatcher(BaseDispatcher):
             payload_in_workspace=self.payload_in_workspace,
         )
 
-        # Remove dummy token if it was added in dispatch
-        if self.has_dummy_token:
-            hidden_states = hidden_states[1:, :]
-
         del self.runtime_max_tokens_per_rank
-        del self.has_dummy_token
+        del self.is_idle_rank
         return hidden_states
