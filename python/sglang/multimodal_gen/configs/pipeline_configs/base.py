@@ -151,7 +151,6 @@ def maybe_unpad_latents(latents, batch):
     return latents
 
 
-# config for a single pipeline
 @dataclass
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
@@ -360,10 +359,28 @@ class PipelineConfig:
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
+    @staticmethod
+    def _gather_sp_tensor(tensor: torch.Tensor, *, dim: int) -> torch.Tensor:
+        """All-gather an SP-sharded tensor along the specified logical dimension."""
+        return sequence_model_parallel_all_gather(tensor.contiguous(), dim=dim)
+
+    @staticmethod
+    def _trim_sp_gather_padding(
+        tensor: torch.Tensor, *, orig_len: int | None, dim: int
+    ) -> torch.Tensor:
+        """Trim padding introduced before SP sharding back to the original length."""
+        if orig_len is None:
+            return tensor
+        orig_len = int(orig_len)
+        if orig_len <= 0 or tensor.shape[dim] <= orig_len:
+            return tensor
+        slices = [slice(None)] * tensor.ndim
+        slices[dim] = slice(orig_len)
+        return tensor[tuple(slices)]
+
     def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
-        latents = sequence_model_parallel_all_gather(latents, dim=2)
-        return latents
+        return self._gather_sp_tensor(latents, dim=2)
 
     def can_shard_audio_latents_for_sp(self, audio_latents) -> bool:
         """Return whether this pipeline uses packed audio latents that can be SP-sharded."""
@@ -405,9 +422,9 @@ class PipelineConfig:
         noise_pred = self.gather_latents_for_sp(noise_pred)
         raw_latent_shape = getattr(batch, "raw_latent_shape", None)
         if raw_latent_shape is not None and noise_pred.dim() == 3:
-            orig_s = raw_latent_shape[1]
-            if noise_pred.shape[1] > orig_s:
-                noise_pred = noise_pred[:, :orig_s, :]
+            noise_pred = self._trim_sp_gather_padding(
+                noise_pred, orig_len=raw_latent_shape[1], dim=1
+            )
         return noise_pred
 
     def preprocess_vae_image(self, batch, vae_image_processor):
@@ -850,8 +867,7 @@ class ImagePipelineConfig(PipelineConfig):
 
     def gather_latents_for_sp(self, latents, batch=None):
         # For image latents [B, S_local, D], gather along sequence dim=1
-        latents = sequence_model_parallel_all_gather(latents, dim=1)
-        return latents
+        return self._gather_sp_tensor(latents, dim=1)
 
     def _unpad_and_unpack_latents(self, latents, batch):
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
@@ -908,7 +924,7 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
         if latents.dim() != 4:
             return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
-        return sequence_model_parallel_all_gather(latents, dim=2)
+        return self._gather_sp_tensor(latents, dim=2)
 
 
 @dataclass
