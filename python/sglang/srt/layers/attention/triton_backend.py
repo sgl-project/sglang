@@ -281,7 +281,10 @@ class TritonAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None:
+            if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
+                # Standard path — build kv metadata from batch fields.
+                # Also used by P-EAGLE which keeps spec_info for hidden_states
+                # but has no pre-built kv_indptr/kv_indices.
                 kv_indptr = _fill_prefix_sum_buffer(
                     kv_indptr, forward_batch.seq_lens, bs
                 )

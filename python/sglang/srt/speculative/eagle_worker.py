@@ -681,7 +681,7 @@ class EAGLEWorker(TpModelWorker):
                 not forward_batch.forward_mode.is_idle()
                 and self.speculative_num_steps > 1
             ):
-                # Skip attention backend init for idle mode or 1-step draft
+                # Multi-step EAGLE3 needs explicit attn backend init
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
 
             if self.is_p_eagle and not forward_batch.forward_mode.is_idle():
@@ -854,6 +854,11 @@ class EAGLEWorker(TpModelWorker):
         bs = verified_id.shape[0]
         device = verified_id.device
 
+        # After prefill, hidden_states may contain all prefill tokens (num_tokens > bs).
+        # P_EAGLE only needs the last token's fused hidden state per request.
+        if hidden_states.dim() == 2 and hidden_states.shape[0] > bs:
+            hidden_states = hidden_states[-bs:]
+
         # Reshape hidden_states to [bs, 1, feat_dim] for prepare_p_eagle_inputs
         if hidden_states.dim() == 2:
             hidden_states = hidden_states.unsqueeze(1)
@@ -899,13 +904,22 @@ class EAGLEWorker(TpModelWorker):
         )
         forward_batch.out_cache_loc = out_cache_loc[:, :, 0].reshape(-1)
 
-        # Set the attention backend for single-step decode
-        if self.speculative_num_steps > 1 and self.draft_attn_backend.attn_backends:
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[0]
+        # P-EAGLE: K candidates per request share the same KV cache.
+        # Replicate batch metadata so the model_runner's standard attention
+        # init builds correct kv_indptr/kv_indices for bs*K decode tokens.
+        # spec_info is kept (model reads hidden_states from it) but its
+        # kv_indptr/kv_indices stay None — triton_backend falls through to
+        # the standard build-from-batch-metadata path.
+        bs_k = forward_batch.batch_size * self.topk
+        forward_batch.batch_size = bs_k
+        forward_batch.seq_lens = forward_batch.seq_lens.repeat_interleave(self.topk)
+        forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu.repeat(self.topk) if forward_batch.seq_lens_cpu is not None else None
+        forward_batch.seq_lens_sum = forward_batch.seq_lens.sum().item()
+        forward_batch.req_pool_indices = forward_batch.req_pool_indices.repeat_interleave(self.topk)
 
         # Run ONE forward pass through the draft model
         logits_output = self.draft_model_runner.forward(
-            forward_batch, skip_attn_backend_init=True
+            forward_batch, skip_attn_backend_init=False
         ).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "p_eagle_draft: NaN in logits")
 
@@ -1298,7 +1312,9 @@ class EAGLEWorker(TpModelWorker):
                 logits_output.topk_p,
                 logits_output.topk_index,
             )
-            forward_batch.spec_info.hidden_states = logits_output.hidden_states
+            # P_EAGLE preserves target model's fused aux hidden states (hidden*3)
+            if not self.is_p_eagle:
+                forward_batch.spec_info.hidden_states = logits_output.hidden_states
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
@@ -1345,7 +1361,11 @@ class EAGLEWorker(TpModelWorker):
         draft_input.topk_p, draft_input.topk_index = fast_topk(
             probs, self.topk, dim=-1
         )
-        draft_input.hidden_states = logits_output.hidden_states
+        # P_EAGLE needs the target model's fused aux hidden states (hidden*3)
+        # for prepare_p_eagle_inputs each round. The draft model outputs only
+        # hidden_size, so overwriting would lose the fused representation.
+        if not self.is_p_eagle:
+            draft_input.hidden_states = logits_output.hidden_states
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

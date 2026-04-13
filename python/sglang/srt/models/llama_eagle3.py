@@ -370,5 +370,22 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
     def get_hot_token_id(self):
         return self.hot_token_id
 
+    def prepare_p_eagle_inputs(
+        self,
+        last_token_ids: torch.Tensor,
+        fused_hidden_states: torch.Tensor,
+        k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Delegate to inner LlamaModel which holds the fc/mask/embed layers."""
+        return self.model.prepare_p_eagle_inputs(last_token_ids, fused_hidden_states, k)
+
+    @property
+    def mask_token_id(self) -> int:
+        return self.model.mask_token_id
+
+    @property
+    def embed_tokens(self):
+        return self.model.embed_tokens
+
 
 EntryClass = [LlamaForCausalLMEagle3]
