@@ -359,6 +359,7 @@ class RoutingMethodType(IntEnum):
 AITER_PADDING_SIZE = 128
 TRITON_PADDING_SIZE = 128
 
+
 # Unit of padding - context dependent
 def get_moe_padding_size(is_aiter_moe):
     if is_aiter_moe:
