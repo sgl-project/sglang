@@ -30,13 +30,11 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -94,17 +92,6 @@ class Exaone45VisionMLP(nn.Module):
         return x
 
 
-def _gqa_rope_applier(q, k, position_embeddings, x_shape):
-    """Apply rotary position embeddings for GQA where Q and K have different head counts."""
-    cos, sin = position_embeddings
-    if cos.size(-1) * 2 == q.shape[-1]:
-        cos = torch.cat([cos, cos], dim=-1)
-        sin = torch.cat([sin, sin], dim=-1)
-    q = apply_rotary_pos_emb(q, q, cos, sin)[0]
-    k = apply_rotary_pos_emb(k, k, cos, sin)[0]
-    return q, k
-
-
 class Exaone45VisionBlock(nn.Module):
     """Transformer block for EXAONE-4.5 vision encoder."""
 
@@ -122,62 +109,22 @@ class Exaone45VisionBlock(nn.Module):
         self.norm1 = RMSNorm(dim, eps=norm_eps)
         self.norm2 = RMSNorm(dim, eps=norm_eps)
 
-        # Use customized_position_embedding_applier for GQA compatibility
-        # VisionAttention's default RoPE path assumes Q and K have same head count
-        use_gqa = num_kv_heads != num_heads
-        rope_applier = _gqa_rope_applier if use_gqa else None
-
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
             projection_size=dim,
             use_qkv_parallel=True,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
-            customized_position_embedding_applier=rope_applier,
         )
-        if use_gqa:
-            self._setup_gqa(dim, num_heads, num_kv_heads, quant_config, prefix)
 
         self.mlp = Exaone45VisionMLP(
             dim,
             intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-        )
-
-    def _setup_gqa(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        quant_config: Optional[QuantizationConfig],
-        prefix: str,
-    ):
-        """Replace the QKV projection with one that supports GQA."""
-        head_size = dim // num_heads
-        tp_size = self.attn.tp_size
-        tp_rank = self.attn.tp_rank
-
-        self.attn.num_attention_kv_heads_per_partition = max(1, num_kv_heads // tp_size)
-        self.attn.kv_size = self.attn.num_attention_kv_heads_per_partition * head_size
-
-        self.attn.qkv_proj = QKVParallelLinear(
-            hidden_size=dim,
-            head_size=head_size,
-            total_num_heads=num_heads,
-            total_num_kv_heads=num_kv_heads,
-            bias=True,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            prefix=add_prefix("attn.qkv_proj", prefix),
-        )
-
-        # Update the backend's kv head count
-        self.attn.qkv_backend.num_kv_heads = (
-            self.attn.num_attention_kv_heads_per_partition
         )
 
     def forward(
