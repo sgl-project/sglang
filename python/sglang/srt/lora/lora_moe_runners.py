@@ -17,14 +17,7 @@
 LoRA deltas are injected at two points in the MoE pipeline:
 1. After gate_up projection, BEFORE activation
 2. After down projection, BEFORE final reduction
-"""LoRA hooks for MoE runners.
 
-LoRA deltas are injected at two points in the MoE pipeline:
-1. After gate_up projection, BEFORE activation
-2. After down projection, BEFORE final reduction
-
-This module provides hook closures that any MoE backend can call at those points,
-without needing a per-backend LoRA runner subclass.
 This module provides hook closures that any MoE backend can call at those points,
 without needing a per-backend LoRA runner subclass.
 """
@@ -33,13 +26,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable
-from typing import Callable
 
 import torch
 
-
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
 from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
 
 _is_cuda = is_cuda()
@@ -356,39 +346,7 @@ def _compute_lora_alignment(
         (max_num_tokens_padded + block_size_m - 1) // block_size_m
     ) * block_size_m
     max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
-    max_num_tokens_padded = topk_ids.numel() + lora_info.num_experts * (
-        block_size_m - 1
-    )
-    max_num_tokens_padded = (
-        (max_num_tokens_padded + block_size_m - 1) // block_size_m
-    ) * block_size_m
-    max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
 
-    device = topk_ids.device
-
-    use_naive = (
-        cg is None
-        and M * topk_ids.shape[1] * _SPARSITY_FACTOR
-        <= lora_info.num_experts * max_loras
-    )
-
-    if use_naive:
-        sorted_token_ids_lora, expert_ids_lora, num_tokens_post_padded_lora = (
-            _naive_moe_lora_align_block_size(
-                topk_ids,
-                lora_info.seg_indptr,
-                lora_info.req_to_lora,
-                int(lora_info.num_experts),
-                int(block_size_m),
-                int(max_loras),
-                int(max_num_tokens_padded),
-                int(max_num_m_blocks),
-                lora_info.adapter_enabled,
-                device,
-            )
-        )
-        lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
-    else:
     device = topk_ids.device
 
     use_naive = (
