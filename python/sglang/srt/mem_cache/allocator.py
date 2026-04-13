@@ -136,12 +136,31 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._pending_free = []
+        self._pending_free_count = 0
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
-        return len(self.free_pages) + len(self.release_pages)
+        return len(self.free_pages) + len(self.release_pages) + self._pending_free_count
+
+    def _flush_pending_free(self):
+        if not self._pending_free:
+            return
+        batch = (
+            self._pending_free[0]
+            if len(self._pending_free) == 1
+            else torch.cat(self._pending_free)
+        )
+        self._pending_free = []
+        self._pending_free_count = 0
+        if self.need_sort:
+            self.release_pages = torch.cat((self.release_pages, batch))
+        else:
+            self.free_pages = torch.cat((self.free_pages, batch))
 
     def alloc(self, need_size: int):
+        self._flush_pending_free()
+
         if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
 
@@ -157,10 +176,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            if self.need_sort:
-                self.release_pages = torch.cat((self.release_pages, free_index))
-            else:
-                self.free_pages = torch.cat((self.free_pages, free_index))
+            self._pending_free.append(free_index)
+            self._pending_free_count += free_index.numel()
         else:
             self.free_group.append(free_index)
 
