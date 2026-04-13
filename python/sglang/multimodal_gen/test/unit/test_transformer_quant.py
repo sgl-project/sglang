@@ -121,18 +121,30 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         return_value=None,
     )
     @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model"
+    )
+    @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_quant_config_from_safetensors_metadata",
         return_value=None,
     )
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_metadata_from_safetensors_file"
     )
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
+        side_effect=lambda path, **kw: path,
+    )
     def test_resolve_transformer_quant_load_spec_keeps_nunchaku_hook(
         self,
+        _mock_download,
         mock_metadata,
         _mock_quant_metadata,
+        mock_maybe_download,
         _mock_nvfp4,
     ):
+        mock_maybe_download.side_effect = AssertionError(
+            "local safetensors path should not trigger maybe_download_model"
+        )
         mock_metadata.return_value = {
             "config": json.dumps({"_class_name": _FakeFluxTransformer.__name__})
         }
@@ -158,6 +170,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertIsNone(spec.param_dtype)
         self.assertEqual(len(spec.post_load_hooks), 1)
         self.assertIs(nunchaku_config.model_cls, _FakeFluxTransformer)
+        mock_maybe_download.assert_not_called()
 
     def test_flux2_mixed_nvfp4_fallback_disables_conflicting_offloads(self):
         server_args = self._make_server_args(

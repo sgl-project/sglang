@@ -794,6 +794,8 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
         )
@@ -833,6 +835,21 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                from sglang.srt.mem_cache.unified_cache_components import (
+                    ComponentType,
+                )
+                from sglang.srt.mem_cache.unified_radix_cache import (
+                    UnifiedRadixCache,
+                )
+
+                tree_components = [ComponentType.FULL]
+                if self.is_hybrid_swa or self.is_hybrid_ssm:
+                    tree_components.append(
+                        ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
+                    )
+                params.tree_components = tuple(tree_components)
+                self.tree_cache = UnifiedRadixCache(params)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -1368,7 +1385,7 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
-                self.self_check_during_idle()
+                self.on_idle()
 
             # Update last_batch
             self.last_batch = batch
@@ -1418,7 +1435,7 @@ class Scheduler(
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                self.on_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1846,8 +1863,11 @@ class Scheduler(
                     self.stream_output([req], req.return_logprob)
                     return
 
-        elif session_id in self.session_controller:
-            # Session exists: create request from session
+        elif (
+            session_id in self.session_controller
+            and not self.session_controller.get(session_id).close_on_finish
+        ):
+            # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
             req = session.create_req(
                 recv_req,
@@ -1864,7 +1884,13 @@ class Scheduler(
                 return
 
         else:
-            # Session ID provided but session not found
+            # Session not found, or session is closing
+            if session_id in self.session_controller:
+                error_msg = (
+                    f"Invalid request: close was requested for session {session_id}"
+                )
+            else:
+                error_msg = f"Invalid request: session id {session_id} does not exist"
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1873,9 +1899,7 @@ class Scheduler(
                 vocab_size=self.model_config.vocab_size,
             )
             req.tokenizer = self.tokenizer
-            req.set_finish_with_abort(
-                f"Invalid request: session id {session_id} does not exist"
-            )
+            req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
@@ -2352,26 +2376,10 @@ class Scheduler(
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
-            # Get token usage from several pools
-            token_usage = None
-            if self.is_hybrid_swa:
-                _, _, full_token_usage, swa_token_usage, *_ = self._get_swa_token_info()
-                token_usage = max(full_token_usage, swa_token_usage)
-            if self.is_hybrid_ssm:
-                _, _, full_token_usage, mamba_token_usage, *_ = (
-                    self._get_mamba_token_info()
-                )
-                token_usage = (
-                    max(token_usage, mamba_token_usage)
-                    if token_usage is not None
-                    else max(full_token_usage, mamba_token_usage)
-                )
-            if token_usage is None:
-                _, token_usage, _, _ = self._get_token_info()
-
-            assert token_usage is not None
+            # Get max usage across all pools for prefill delay decision
+            max_pool_usage = self.get_pool_stats().get_max_pool_usage()
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
-                self.prefill_delayer, token_usage=token_usage
+                self.prefill_delayer, token_usage=max_pool_usage
             )
 
         ret = self._get_new_batch_prefill_raw(
@@ -2579,9 +2587,18 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        # Record prefill stats for logging after forward
+        # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
-            adder, self.running_batch.reqs, self.enable_priority_scheduling
+            adder,
+            self.running_batch.reqs,
+            self.enable_priority_scheduling,
+            num_pending_tokens=self._get_num_pending_tokens(
+                chunk_deduct=(
+                    self.chunked_req.extend_input_len
+                    if self.chunked_req is not None
+                    else 0
+                )
+            ),
         )
 
         # Mixed-style chunked prefill
@@ -3018,6 +3035,12 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                if self.decode_offload_manager is not None:
+                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+
+            # HiSparse: staging requests transitioning prefill -> decode
+            if self.enable_hisparse:
+                idle &= not self.hisparse_coordinator.has_ongoing_staging()
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -3156,7 +3179,7 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = vars(get_global_server_args())
+        ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -3460,7 +3483,10 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        return self.session_controller.open(recv_req)
+        output = self.session_controller.open(recv_req)
+        if self.pp_rank == 0 and self.tp_rank == 0 and self.attn_cp_rank == 0:
+            return output
+        return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
         self.session_controller.close(recv_req)
