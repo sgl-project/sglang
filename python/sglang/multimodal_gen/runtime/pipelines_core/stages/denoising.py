@@ -154,6 +154,12 @@ class DenoisingStage(PipelineStage):
     the initial noise into the final output.
     """
 
+    @property
+    def role_affinity(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        return RoleType.DENOISER
+
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
     ) -> None:
