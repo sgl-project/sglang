@@ -141,6 +141,19 @@ class CudaPlatformBase(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        prefer_flashinfer = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND is not None
+
+        if prefer_flashinfer:
+            try:
+                from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+                return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+            except ImportError:
+                logger.warning(
+                    "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND is set, "
+                    "but flashinfer.mm_fp4 is unavailable. Falling back to cutlass."
+                )
+
         try:
             from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
 

@@ -67,6 +67,7 @@ that have been brought up and verified in SGLang.
 | --- | --- | --- | --- |
 | `black-forest-labs/FLUX.1-dev` | mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace | `unpublished` | use `build_modelopt_nvfp4_transformer.py`; validated builder keeps selected FLUX.1 modules in BF16 and sets `swap_weight_nibbles=false` |
 | `black-forest-labs/FLUX.2-dev` | packed-QKV load path | `black-forest-labs/FLUX.2-dev-NVFP4` | validated packed export detection and runtime layout handling |
+| `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | primary `transformer` quantized with official ModelOpt FP4 export, `transformer_2` kept BF16 | `unpublished` | global `--transformer-weights-path` targets only the primary `transformer`; keep `transformer_2` on the base checkpoint unless you pass a per-component override; validated on B200 with `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn` |
 
 ## ModelOpt FP8
 
@@ -130,10 +131,29 @@ sglang generate \
   --save-output
 ```
 
+For a dual-transformer Wan2.2 export where only the primary `transformer`
+was quantized:
+
+```bash
+SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn \
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --transformer-weights-path /path/to/wan22-nvfp4-export/transformer \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
 ### Notes
 
 - `--transformer-weights-path` is still the canonical CLI for NVFP4
   transformer checkpoints.
+- For dual-transformer pipelines such as `Wan2.2-T2V-A14B-Diffusers`, the
+  global `--transformer-weights-path` applies only to the primary
+  `transformer`. Use a per-component override such as `--transformer-2-path`
+  only when you intentionally want a non-default `transformer_2`.
+- On Blackwell, the validated Wan2.2 ModelOpt NVFP4 path currently prefers
+  FlashInfer FP4 GEMM via
+  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn`.
 - Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
   repos or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence

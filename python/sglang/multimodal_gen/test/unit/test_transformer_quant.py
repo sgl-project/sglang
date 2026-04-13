@@ -51,6 +51,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     _prepare_nvfp4_weight_bytes,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    _server_args_for_transformer_component,
+)
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
@@ -238,6 +241,44 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertFalse(config.swap_weight_nibbles)
+
+    def test_secondary_transformer_masks_global_quantized_override(self):
+        nunchaku_config = object()
+        server_args = self._make_server_args(
+            transformer_weights_path="/tmp/wan22-transformer-nvfp4",
+            nunchaku_config=nunchaku_config,
+        )
+
+        component_server_args = _server_args_for_transformer_component(
+            server_args, "transformer_2"
+        )
+
+        self.assertIsNot(component_server_args, server_args)
+        self.assertIsNone(component_server_args.transformer_weights_path)
+        self.assertIsNone(component_server_args.nunchaku_config)
+        self.assertEqual(
+            server_args.transformer_weights_path,
+            "/tmp/wan22-transformer-nvfp4",
+        )
+        self.assertIs(server_args.nunchaku_config, nunchaku_config)
+
+    def test_primary_transformer_keeps_global_quantized_override(self):
+        nunchaku_config = object()
+        server_args = self._make_server_args(
+            transformer_weights_path="/tmp/wan22-transformer-nvfp4",
+            nunchaku_config=nunchaku_config,
+        )
+
+        component_server_args = _server_args_for_transformer_component(
+            server_args, "transformer"
+        )
+
+        self.assertIs(component_server_args, server_args)
+        self.assertEqual(
+            component_server_args.transformer_weights_path,
+            "/tmp/wan22-transformer-nvfp4",
+        )
+        self.assertIs(component_server_args.nunchaku_config, nunchaku_config)
 
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(
