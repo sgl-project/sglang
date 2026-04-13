@@ -687,6 +687,7 @@ class ServerArgs:
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
+    enable_tf32_matmul: bool = False
 
     # Context parallelism
     enable_prefill_context_parallel: bool = False
@@ -6073,6 +6074,11 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
+        )
+        parser.add_argument(
+            "--enable-tf32-matmul",
+            action="store_true",
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance.",
         )
 
         # Dynamic batch tokenizer

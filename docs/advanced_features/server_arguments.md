@@ -470,6 +470,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--nsa-prefill-cp-mode` | Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: `round-robin-split`(default),`in-seq-split`. `round-robin-split` distributes tokens across ranks based on `token_idx % cp_size`. It supports multi-batch prefill, fused MoE, and FP8 KV cache. | `in-seq-split` | `in-seq-split`, `round-robin-split` |
 | `--enable-fused-qk-norm-rope` | Enable fused qk normalization and rope rotary embedding. | `False` | bool flag (set to enable) |
 | `--enable-precise-embedding-interpolation` | Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values. | `False` | bool flag (set to enable) |
+| `--enable-tf32-matmul` | Enables float32 matmuls to use TensorFloat32 precision for better performance. | `False` | bool flag (set to enable) |
 
 ## Dynamic batch tokenizer
 | Argument | Description | Defaults | Options |
