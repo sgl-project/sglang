@@ -1129,12 +1129,26 @@ def run_bench_serving(
         other_args=other_server_args,
     )
 
+    # Resolve tokenizer to local snapshot path when available, so the benchmark
+    # client's AutoTokenizer.from_pretrained uses the local path directly instead
+    # of calling the HF Hub API (which can stall for minutes in CI).
+    bench_tokenizer = tokenizer
+    if bench_tokenizer is None:
+        try:
+            from sglang.srt.utils import find_local_repo_dir
+
+            local_dir = find_local_repo_dir(model, revision=None)
+            if local_dir and os.path.isdir(local_dir):
+                bench_tokenizer = local_dir
+        except Exception:
+            pass
+
     # Run benchmark
     args = get_benchmark_args(
         base_url=base_url,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
-        tokenizer=tokenizer,
+        tokenizer=bench_tokenizer,
         num_prompts=num_prompts,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
