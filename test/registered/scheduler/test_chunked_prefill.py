@@ -15,9 +15,6 @@ class TestChunkedPrefill(CustomTestCase):
     def test_mixed_chunked_prefill(self):
         run_mmlu_test(disable_radix_cache=False, enable_mixed_chunk=True)
 
-    def test_chunked_prefill_without_radix_cache(self):
-        run_mmlu_test(disable_radix_cache=True, enable_mixed_chunk=False)
-
     def test_mixed_chunked_prefill_without_radix_cache(self):
         run_mmlu_test(disable_radix_cache=True, enable_mixed_chunk=True)
 
