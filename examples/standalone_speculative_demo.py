@@ -1,7 +1,7 @@
 """
 Standalone Speculative Decoding Benchmark
 ==========================================
-支持两种配置，通过 --config 参数切换：
+支持三种配置，通过 --config 参数切换：
 
   qwen-32b   : 7B draft for Qwen2.5-32B（2x H100，无需授权）
                target = Qwen/Qwen2.5-32B-Instruct
@@ -11,9 +11,14 @@ Standalone Speculative Decoding Benchmark
                target = meta-llama/Llama-3.1-70B-Instruct
                draft  = meta-llama/Llama-3.1-8B-Instruct
 
+  sdar-8b    : 1.7B draft for SDAR-8B（单卡）
+               target = JetLM/SDAR-8B-Chat
+               draft  = JetLM/SDAR-1.7B-Chat
+
 运行方式：
   python standalone_speculative_demo.py --config qwen-32b
   python standalone_speculative_demo.py --config llama-70b
+  python standalone_speculative_demo.py --config sdar-8b
 """
 
 import argparse
@@ -55,6 +60,15 @@ CONFIGS = {
             speculative_num_steps=4,
             speculative_eagle_topk=2,
             speculative_num_draft_tokens=7,
+        ),
+    ),
+    "sdar-8b": dict(
+        target="JetLM/SDAR-8B-Chat",
+        draft="JetLM/SDAR-1.7B-Chat",
+        base_engine=dict(mem_fraction_static=0.8, tp_size=1),
+        spec_kwargs=dict(
+            speculative_algorithm="STANDALONE",
+            speculative_num_draft_tokens=5,
         ),
     ),
 }
