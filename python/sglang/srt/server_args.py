@@ -1746,10 +1746,11 @@ class ServerArgs:
                 if (
                     self.attention_backend is None
                     and self.decode_attention_backend is None
+                    and importlib.util.find_spec("aiter")
                 ):
                     self.decode_attention_backend = "aiter"
                     logger.info(
-                        "Use aiter as decode attention backend on ROCm for DeepseekV3ForCausalLM (MLA)"
+                        f"Use aiter as decode attention backend on ROCm for {model_arch} (MLA)"
                     )
 
                 if (
