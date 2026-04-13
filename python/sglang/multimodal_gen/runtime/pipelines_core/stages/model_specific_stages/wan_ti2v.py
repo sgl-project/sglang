@@ -76,7 +76,9 @@ def prepare_wan_ti2v_latents(
     temporal_scale = (
         server_args.pipeline_config.vae_config.arch_config.scale_factor_temporal
     )
-    spatial_scale = server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
+    spatial_scale = (
+        server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
+    )
     patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
     seq_len = (
         ((num_frames - 1) // temporal_scale + 1)
@@ -167,6 +169,6 @@ def blend_wan_ti2v_latents(
 
     if z is None or reserved_frames_mask is None:
         return latents
-    return (1.0 - reserved_frames_mask.unsqueeze(0)) * z + reserved_frames_mask.unsqueeze(
-        0
-    ) * latents
+    return (
+        1.0 - reserved_frames_mask.unsqueeze(0)
+    ) * z + reserved_frames_mask.unsqueeze(0) * latents
