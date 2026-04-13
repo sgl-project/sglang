@@ -3,7 +3,6 @@
 import logging
 from typing import List, NamedTuple
 
-from sglang.python.sglang.srt.utils.common import is_npu
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
@@ -12,7 +11,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_npu
 
 device_module = get_device_module()
 
