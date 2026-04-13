@@ -1,6 +1,8 @@
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+import torch
+
 from sglang.srt.entrypoints.openai.protocol import (
     CachedTokensDetails,
     ChatCompletionRequest,
@@ -132,3 +134,41 @@ def process_cached_tokens_details_from_ret(
             device=details.get("device", 0),
             host=details.get("host", 0),
         )
+
+
+def convert_embeds_to_tensors(
+    embeds: Optional[Union[List[Optional[List[List[float]]]], List[List[float]]]],
+) -> Optional[List[Optional[List[torch.Tensor]]]]:
+    """Convert nested float lists from the HTTP API to lists of tensors.
+
+    Accepts either:
+      - None -> returns None
+      - List[List[float]] (single input) -> [[tensor, ...]]
+      - List[Optional[List[List[float]]]] (batch) -> [Optional[List[tensor]], ...]
+    Each innermost List[float] becomes a 1-D torch.Tensor.
+    Per-input None entries are preserved (no overrides for that input).
+    """
+    if embeds is None:
+        return None
+    if len(embeds) == 0:
+        return []
+    # Find first non-None entry to detect nesting depth
+    first_non_none = next((e for e in embeds if e is not None), None)
+    if first_non_none is None:
+        # All entries are None
+        return [None] * len(embeds)
+    # Detect nesting depth by checking the first non-None entry:
+    # - Single input [num_replacements][hidden_size]: first element is List[float]
+    # - Batch [num_inputs][num_replacements][hidden_size]: first element is List[List[float]]
+    if not first_non_none or not isinstance(first_non_none[0], list):
+        # Single input: each entry is a float vector
+        return [[torch.tensor(vec, dtype=torch.float32) for vec in embeds]]
+    # Otherwise it's batch: [num_inputs][num_replacements][hidden_size]
+    return [
+        (
+            [torch.tensor(vec, dtype=torch.float32) for vec in per_input]
+            if per_input is not None
+            else None
+        )
+        for per_input in embeds
+    ]

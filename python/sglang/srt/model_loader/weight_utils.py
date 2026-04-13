@@ -551,9 +551,9 @@ def download_safetensors_index_file_from_hf(
         # If file not found on remote or locally, we should not fail since
         # only some models will have index_file.
         except huggingface_hub.utils.EntryNotFoundError:
-            logger.info("No %s found in remote.", index_file)
+            logger.debug("No %s found in remote.", index_file)
         except huggingface_hub.utils.LocalEntryNotFoundError:
-            logger.info("No %s found in local cache.", index_file)
+            logger.debug("No %s found in local cache.", index_file)
 
 
 # For models like Mistral-7B-v0.3, there are both sharded
