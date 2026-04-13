@@ -257,6 +257,7 @@ def test_ltx23_transformer_config_adds_required_arch_markers():
         config = _build_transformer_config(donor_dir)
 
     assert config["_class_name"] == "LTX2VideoTransformer3DModel"
+    assert config["ltx_variant"] == "ltx_2_3"
     assert config["cross_attention_adaln"] is True
     assert config["force_sdpa_v2a_cross_attention"] is True
 
