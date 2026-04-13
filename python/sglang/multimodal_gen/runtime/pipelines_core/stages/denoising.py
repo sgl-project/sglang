@@ -19,8 +19,13 @@ import torch.nn as nn
 from einops import rearrange
 from tqdm.auto import tqdm
 
+from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    FluxPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
@@ -73,6 +78,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
+)
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
+)
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -130,6 +141,43 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
+    def _maybe_prepare_rollout(self, batch: Req):
+        """Prepare denoising loop for rollout."""
+        if not isinstance(self.scheduler, SchedulerRLMixin):
+            if batch.rollout:
+                raise ValueError(
+                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                )
+            return
+
+        self.scheduler.release_rollout_resources(batch)
+        if batch.rollout:
+            self.scheduler.prepare_rollout(
+                batch=batch,
+                pipeline_config=self.server_args.pipeline_config,
+            )
+
+    def _maybe_collect_rollout_log_probs(self, batch: Req):
+        """Get rollout log probs and store into batch for reward calculation."""
+        if not isinstance(self.scheduler, SchedulerRLMixin):
+            if batch.rollout:
+                raise ValueError(
+                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                )
+            return
+
+        if batch.rollout:
+            if batch.rollout_trajectory_data is None:
+                batch.rollout_trajectory_data = RolloutTrajectoryData()
+            batch.rollout_trajectory_data.rollout_log_probs = (
+                self.scheduler.collect_rollout_log_probs(batch)
+            )
+            if getattr(batch, "rollout_debug_mode", False):
+                batch.rollout_trajectory_data.rollout_debug_tensors = (
+                    self.scheduler.collect_rollout_debug_tensors(batch)
+                )
+            self.scheduler.release_rollout_resources(batch)
+
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
@@ -159,8 +207,25 @@ class DenoisingStage(PipelineStage):
             compile_kwargs["mode"] = mode
             logger.info(f"Compiling transformer with mode: {mode}")
 
+        if self._needs_nvfp4_jit_prewarm(module):
+            logger.info(
+                "Prewarming NVFP4 JIT modules before torch.compile to avoid "
+                "Dynamo tracing JIT initialization."
+            )
+            prewarm_nvfp4_jit_modules()
+
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(**compile_kwargs)
+
+    @staticmethod
+    def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
+        for submodule in module.modules():
+            quant_method = getattr(submodule, "quant_method", None)
+            if quant_method is None:
+                continue
+            if type(quant_method).__name__ == "ModelOptFp4LinearMethod":
+                return True
+        return False
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -353,14 +418,15 @@ class DenoisingStage(PipelineStage):
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
         """Builds a guidance tensor. This method is cached."""
-        return (
-            torch.full(
-                (batch_size,),
-                guidance_val,
-                dtype=target_dtype,
-                device=device,
-            )
-            * 1000.0
+        if isinstance(
+            self.server_args.pipeline_config, FluxPipelineConfig
+        ) and not isinstance(self.server_args.pipeline_config, Flux2PipelineConfig):
+            guidance_val = guidance_val * 1000.0
+        return torch.full(
+            (batch_size,),
+            guidance_val,
+            dtype=target_dtype,
+            device=device,
         )
 
     def get_or_build_guidance(self, bsz: int, dtype, device):
@@ -558,10 +624,13 @@ class DenoisingStage(PipelineStage):
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 
+        if batch.rollout:
+            self._maybe_prepare_rollout(batch)
+
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta},
+            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
         )
 
         # Setup precision and autocast settings
@@ -710,6 +779,8 @@ class DenoisingStage(PipelineStage):
         trajectory_timesteps: list,
         server_args: ServerArgs,
         is_warmup: bool = False,
+        *args,
+        **kwargs,
     ):
         # Gather results if using sequence parallelism
         if trajectory_latents:
@@ -718,6 +789,10 @@ class DenoisingStage(PipelineStage):
         else:
             trajectory_tensor = None
             trajectory_timesteps_tensor = None
+
+        # Gather log probs for rollout
+        if batch.rollout:
+            self._maybe_collect_rollout_log_probs(batch)
 
         # Gather results if using sequence parallelism
         latents, trajectory_tensor = self._postprocess_sp_latents(
@@ -798,9 +873,21 @@ class DenoisingStage(PipelineStage):
         # image_latent must be sharded consistently with latents when it is
         # concatenated along the sequence dimension in the denoising loop.
         if batch.image_latent is not None:
+            sp_video_metadata = {
+                name: getattr(batch, name)
+                for name in (
+                    "sp_video_latent_num_frames",
+                    "sp_video_start_frame",
+                    "sp_video_tokens_per_frame",
+                    "sp_video_valid_token_count",
+                )
+                if hasattr(batch, name)
+            }
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
                 batch, batch.image_latent
             )
+            for name, value in sp_video_metadata.items():
+                setattr(batch, name, value)
 
     def _postprocess_sp_latents(
         self,
@@ -1025,6 +1112,7 @@ class DenoisingStage(PipelineStage):
                         logger=logger,
                         metrics=batch.metrics,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
+                        record_as_step=True,
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
@@ -1085,7 +1173,6 @@ class DenoisingStage(PipelineStage):
                             guidance=guidance,
                             latents=latents,
                         )
-
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
                         if server_args.comfyui_mode:
                             batch.noise_pred = noise_pred

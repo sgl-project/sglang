@@ -31,7 +31,8 @@ from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 _is_cuda = current_platform.is_cuda()
 _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
-if _is_cuda:
+_is_xpu = current_platform.is_xpu()
+if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 if _is_npu:
@@ -209,6 +210,27 @@ class RMSNorm(CustomOp):
         else:
             weight = self._get_weight(x.dtype)
             out = F.rms_norm(x, (self.hidden_size,), weight, self.variance_epsilon)
+        out = out.view(shape)
+        return out
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        if residual is not None:
+            residual_shape = residual.shape
+            residual = residual.view(-1, shape[-1])
+
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+        elif residual is not None:
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x.view(shape), residual.view(residual_shape)
+        else:
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 
@@ -410,6 +432,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs):
+        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -514,6 +541,11 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs):
+        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
@@ -527,6 +559,80 @@ class LayerNormScaleShift(_NormScaleShift):
 
 
 class RMSNormScaleShift(_NormScaleShift):
+    norm_type = "rms"
+
+
+################################################################################
+# NormTanhMulAdd
+# y = norm(x) * tanh(scale) + shift (where norm is layernorm or rmsnorm)
+# See details in norm_tanh_mul_add_norm_scale.py
+################################################################################
+class _NormTanhMulAdd(CustomOp):
+    norm_type: str
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.eps = eps
+        if self.norm_type == "rms":
+            self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
+        elif self.norm_type == "layer":
+            self.norm = FP32LayerNorm(
+                hidden_size, elementwise_affine=affine, eps=eps, dtype=dtype
+            )
+        else:
+            raise NotImplementedError(f"Norm type {self.norm_type} not implemented")
+
+    def forward_cuda(
+        self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+    ) -> torch.Tensor:
+        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+            import warnings
+
+            warnings.warn(
+                "FusedNormScaleShift cuda not available, using native fallback",
+                stacklevel=2,
+            )
+            return self.forward_native(x, scale, shift)
+
+        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+            fused_norm_tanh_mul_add,
+        )
+
+        x, scale, shift = x.contiguous(), scale.contiguous(), shift.contiguous()
+        weight = _ensure_contiguous(getattr(self.norm, "weight", None))
+        bias = _ensure_contiguous(getattr(self.norm, "bias", None))
+        return fused_norm_tanh_mul_add(
+            x,
+            weight,
+            bias,
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
+        )
+
+    def forward_hip(self, *args, **kwargs):
+        # Fallback to native because ROCm does not support CuTeDSL.
+        return self.forward_native(*args, **kwargs)
+
+    def forward_native(
+        self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+    ) -> torch.Tensor:
+        y = self.norm(x) * torch.tanh(scale) + shift
+        return y.to(x.dtype)
+
+
+class LayerNormTanhMulAdd(_NormTanhMulAdd):
+    norm_type = "layer"
+
+
+class RMSNormTanhMulAdd(_NormTanhMulAdd):
     norm_type = "rms"
 
 
@@ -707,6 +813,34 @@ def apply_qk_norm_rope(
         is_neox=is_neox,
         positions=positions,
     )
+
+
+def apply_rmsnorm_tanh_mul_add(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    norm: "RMSNorm",
+) -> torch.Tensor:
+    """Compute residual + tanh(gate) * rmsnorm(x), with a fused CUDA fast path."""
+    if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
+        return residual + torch.tanh(gate) * norm(x)
+
+    if _is_cuda and x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
+        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+            fused_norm_tanh_mul_add,
+        )
+
+        return fused_norm_tanh_mul_add(
+            x.contiguous(),
+            norm.weight.data.contiguous(),
+            None,
+            gate.contiguous(),
+            residual.contiguous(),
+            "rms",
+            norm.variance_epsilon,
+        )
+
+    return residual + torch.tanh(gate) * norm(x)
 
 
 def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
