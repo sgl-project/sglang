@@ -45,7 +45,6 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -609,7 +608,7 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_piecewise_cuda_graph():
+        elif is_in_piecewise_cuda_graph() and self.pynccl_comm is not None:
             # For piecewise cuda graph, we use pynccl outplace allreduce
             outplace_all_reduce_method = "pynccl"
         if outplace_all_reduce_method is not None:
@@ -629,7 +628,7 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator."""
+        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -647,24 +646,17 @@ class GroupCoordinator:
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
 
-        # 1-stage policy for fused AR+RMSNorm:
-        # 1) Explicit env override wins.
-        # 2) Deterministic inference forces 1-stage for reproducibility.
-        # 3) Otherwise follow AITER's heuristic (small payloads only).
+        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
+        # The 1-stage kernel launches one block per token and is capped at
+        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
+        # prefill batches fall through to the 2-stage kernel instead of
+        # hitting a runtime error.  AITER's C++ dispatch already gates
+        # which hidden_dims have valid 1-stage support.
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
-        elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
-            use_1stage_ar = True
         else:
             total_bytes = input_.numel() * input_.element_size()
-            hidden_dim = input_.shape[-1]
-            use_1stage_ar = total_bytes <= 128 * 1024 and hidden_dim in {
-                512,
-                1024,
-                2048,
-                2880,
-                4096,
-            }
+            use_1stage_ar = total_bytes <= 128 * 1024
 
         fused_outputs = ca_comm.custom_fused_ar_rms(
             input_,
@@ -1724,6 +1716,7 @@ def initialize_model_parallel(
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    enable_symm_mem: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1800,9 +1793,7 @@ def initialize_model_parallel(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_message_queue_broadcaster=get_bool_env_var(
-            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-        ),
+        use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
     )
 
@@ -1815,9 +1806,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_message_queue_broadcaster=get_bool_env_var(
-                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-            ),
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="pdmux_prefill_tp",
         )
         if _TP.pynccl_comm:
@@ -1855,6 +1844,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
         )
 
@@ -1884,10 +1874,11 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
         )
 
@@ -1922,7 +1913,6 @@ def initialize_model_parallel(
     if moe_ep_size == tensor_model_parallel_size:
         _MOE_EP = _TP
     else:
-        # TODO(ch-wan): use split_group to save memory
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for moe_dp_idx in range(moe_dp_size):
@@ -1939,6 +1929,8 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
             group_name="moe_ep",
         )
 
@@ -1947,7 +1939,6 @@ def initialize_model_parallel(
     if moe_tp_size == tensor_model_parallel_size:
         _MOE_TP = _TP
     else:
-        # TODO(ch-wan): use split_group to save memory
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for ep_dp_combined_idx in range(moe_ep_size * moe_dp_size):
@@ -1965,6 +1956,8 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
             group_name="moe_tp",
         )
 

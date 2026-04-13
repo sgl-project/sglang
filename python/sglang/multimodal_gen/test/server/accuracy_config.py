@@ -353,6 +353,11 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "2-GPU FLUX.2 transformer diverges strongly from Diffusers baseline (CosSim ~0.54) despite full weight transfer"
         )
     },
+    "ltx_2_two_stage_t2v": {
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Transformer output shape mismatch after 100% matched weight transfer: SGL [1, 128, 4, 16, 16] vs Diffusers [1, 1024, 128]"
+        )
+    },
     "hunyuan3d_shape_gen": {
         ComponentType.VAE: ComponentSkip(
             "HF config cannot be parsed as valid JSON for component reference loading"
