@@ -34,7 +34,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--warmups`            | `None`      | Type: str                 |      A2, A3      |
 | `--nccl-port`          | `None`      | Type: int                 |      A2, A3      |
 | `--fastapi-root-path`  | `None`      | Type: str                 |      A2, A3      |
-| `--grpc-mode`          | `False`     | bool flag (set to enable) |      A2, A3      |
+| `--grpc-mode`          | `False`     | `False`                   |     Planned      |
 
 ## Quantization and data type
 
@@ -143,19 +143,19 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## API related
 
-| Argument                | Defaults  | Options                        | Server supported |
-|-------------------------|-----------|--------------------------------|:----------------:|
-| `--api-key`             | `None`    | Type: str                      |      A2, A3      |
-| `--admin-api-key`       | `None`    | Type: str                      |      A2, A3      |
-| `--served-model-name`   | `None`    | Type: str                      |      A2, A3      |
-| `--weight-version`      | `default` | Type: str                      |      A2, A3      |
-| `--chat-template`       | `None`    | Type: str                      |      A2, A3      |
-| `--hf-chat-template-name` | `None`  | Type: str                      |      A2, A3      |
-| `--completion-template` | `None`    | Type: str                      |      A2, A3      |
-| `--enable-cache-report` | `False`   | bool flag<br/> (set to enable) |      A2, A3      |
-| `--reasoning-parser`    | `None`    | `deepseek-r1`<br/>`deepseek-v3`<br/>`glm45`<br/>`gpt-oss`<br/>`kimi`<br/>`qwen3`<br/>`qwen3-thinking`<br/>`step3`                  |      A2, A3      |
-| `--tool-call-parser`    | `None`    | `deepseekv3`<br/>`deepseekv31`<br/>`glm`<br/>`glm45`<br/>`glm47`<br/>`gpt-oss`<br/>`kimi_k2`<br/>`llama3`<br/>`mistral`<br/>`pythonic`<br/>`qwen`<br/>`qwen25`<br/>`qwen3_coder`<br/>`step3`<br/>`gigachat3`            |      A2, A3      |
-| `--sampling-defaults`   | `model`   | `openai`, `model`              |      A2, A3      |
+| Argument                  | Defaults  | Options                                                                                                           | Server supported |
+|---------------------------|-----------|-------------------------------------------------------------------------------------------------------------------|:----------------:|
+| `--api-key`               | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--admin-api-key`         | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--served-model-name`     | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--weight-version`        | `default` | Type: str                                                                                                         |      A2, A3      |
+| `--chat-template`         | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--hf-chat-template-name` | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--completion-template`   | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--enable-cache-report`   | `False`   | bool flag<br/> (set to enable)                                                                                    |      A2, A3      |
+| `--reasoning-parser`      | `None`    | `deepseek-r1`<br/>`deepseek-v3`<br/>`glm45`<br/>`gpt-oss`<br/>`kimi`<br/>`qwen3`<br/>`qwen3-thinking`<br/>`step3` |      A2, A3      |
+| `--tool-call-parser`      | `None`    | `llama3`<br/>``pythonic`<br/>`qwen`<br/> `qwen3_coder`                                                            |      A2, A3      |
+| `--sampling-defaults`     | `model`   | `openai`, `model`                                                                                                 |      A2, A3      |
 
 ## Data parallelism
 
@@ -211,23 +211,23 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Speculative decoding
 
-| Argument                                                         | Defaults  | Options                  | Server supported |
-|------------------------------------------------------------------|-----------|--------------------------|:----------------:|
-| `--speculative-algorithm`                                        | `None`    | `EAGLE3`,<br/> `NEXTN`   |      A2, A3      |
-| `--speculative-draft-model-path`<br/>`--speculative-draft-model` | `None`    | Type: str                |      A2, A3      |
-| `--speculative-draft-model-`<br/>`revision`                      | `None`    | Type: str                |      A2, A3      |
-| `--speculative-draft-load-format`                                | `None`    | `auto`                   |      A2, A3      |
-| `--speculative-num-steps`                                        | `None`    | Type: int                |      A2, A3      |
-| `--speculative-eagle-topk`                                       | `None`    | Type: int                |      A2, A3      |
-| `--speculative-num-draft-tokens`                                 | `None`    | Type: int                |      A2, A3      |
-| `--speculative-accept-`<br/>`threshold-single`                   | `1.0`     | Type: float              | Special for GPU  |
-| `--speculative-accept-`<br/>`threshold-acc`                      | `1.0`     | Type: float              | Special for GPU  |
-| `--speculative-token-map`                                        | `None`    | Type: str                |      A2, A3      |
-| `--speculative-attention-`<br/>`mode`                            | `prefill` | `prefill`,<br/> `decode` |      A2, A3      |
-| `--speculative-moe-runner-`<br/>`backend`                        | `None`    | `auto`                   |      A2, A3      |
-| `--speculative-moe-a2a-`<br/>`backend`                           | `None`    | `ascend_fuseep`          |      A2, A3      |
-| `--speculative-draft-attention-backend`                          | `None`    | `ascend`                 |      A2, A3      |
-| `--speculative-draft-model-quantization`                         | `None`    | `unquant`                |      A2, A3      |
+| Argument                                                         | Defaults  | Options                                                          | Server supported |
+|------------------------------------------------------------------|-----------|------------------------------------------------------------------|:----------------:|
+| `--speculative-algorithm`                                        | `None`    | `EAGLE3`,<br/> `NEXTN`                                           |      A2, A3      |
+| `--speculative-draft-model-path`<br/>`--speculative-draft-model` | `None`    | Type: str                                                        |      A2, A3      |
+| `--speculative-draft-model-`<br/>`revision`                      | `None`    | Type: str,<br/> `branch name`,<br/> `tag name`,<br/> `commit id` |      A2, A3      |
+| `--speculative-draft-load-format`                                | `auto`    | `auto`,<br/> `dummy`                                             |      A2, A3      |
+| `--speculative-num-steps`                                        | `None`    | Type: int                                                        |      A2, A3      |
+| `--speculative-eagle-topk`                                       | `None`    | Type: int                                                        |      A2, A3      |
+| `--speculative-num-draft-tokens`                                 | `None`    | Type: int                                                        |      A2, A3      |
+| `--speculative-accept-`<br/>`threshold-single`                   | `1.0`     | Type: float                                                      | Special for GPU  |
+| `--speculative-accept-`<br/>`threshold-acc`                      | `1.0`     | Type: float                                                      | Special for GPU  |
+| `--speculative-token-map`                                        | `None`    | Type: str                                                        |      A2, A3      |
+| `--speculative-attention-`<br/>`mode`                            | `prefill` | `prefill`,<br/> `decode`                                         |      A2, A3      |
+| `--speculative-moe-runner-`<br/>`backend`                        | `None`    | `auto`                                                           |      A2, A3      |
+| `--speculative-moe-a2a-`<br/>`backend`                           | `None`    | `ascend_fuseep`                                                  |      A2, A3      |
+| `--speculative-draft-attention-backend`                          | `None`    | `ascend`                                                         |      A2, A3      |
+| `--speculative-draft-model-quantization`                         | `None`    | `unquant`                                                        |      A2, A3      |
 
 ## Ngram speculative decoding
 
@@ -398,7 +398,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--disaggregation-transfer-backend`                     | `mooncake` | `ascend`                              |      A2, A3      |
 | `--disaggregation-bootstrap-port`                       | `8998`     | Type: int                             |      A2, A3      |
 | `--disaggregation-ib-device`                            | `None`     | Type: str                             | Special for GPU  |
-| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
+| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | `False`                               |     Planned      |
 | `--num-reserved-decode-tokens`                          | `512`      | Type: int                             |      A2, A3      |
 | `--disaggregation-decode-`<br/>`polling-interval`       | `1`        | Type: int                             |      A2, A3      |
 
