@@ -305,6 +305,7 @@ class ServerArgs:
     fastapi_root_path: str = ""
     grpc_mode: bool = False
     skip_server_warmup: bool = False
+    dummy_forward: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
@@ -3181,6 +3182,16 @@ class ServerArgs:
             self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
+        if self.dummy_forward:
+            logger.info(
+                "Dummy forward mode enabled: cuda graph, server warmup disabled; "
+                "load format forced to 'dummy'."
+            )
+            self.disable_cuda_graph = True
+            self.skip_server_warmup = True
+            if self.load_format != "dummy":
+                self.load_format = "dummy"
+
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(
@@ -3355,6 +3366,14 @@ class ServerArgs:
             "--skip-server-warmup",
             action="store_true",
             help="If set, skip warmup.",
+        )
+        parser.add_argument(
+            "--dummy-forward",
+            action="store_true",
+            help="Replace model forward with dummy KV fill and fake logits. "
+            "Useful for stress-testing HiCache / tiered-cache storage without "
+            "real computation. Automatically enables --load-format dummy, "
+            "--disable-cuda-graph, and --skip-server-warmup.",
         )
         parser.add_argument(
             "--warmups",

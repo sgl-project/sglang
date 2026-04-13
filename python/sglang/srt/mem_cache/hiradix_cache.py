@@ -941,10 +941,40 @@ class HiRadixCache(RadixCache):
         num_evicted_backuped = 0
         num_evicted_regular = 0
         write_back_nodes = []
-        while num_evicted < num_tokens and len(eviction_heap):
+        locked_nodes = []
+        _drain_attempts = 0
+        _max_drain_attempts = 3
+        while num_evicted < num_tokens and (
+            len(eviction_heap)
+            or (_drain_attempts < _max_drain_attempts and locked_nodes)
+        ):
+            if not eviction_heap:
+                # Heap exhausted but locked nodes remain — force-complete
+                # a limited number of pending D2H writes to release lock_ref
+                # without blocking on the entire queue.
+                _drain_attempts += 1
+                needed = num_tokens - num_evicted
+                synced = 0
+                for entry in self.cache_controller.ack_write_queue:
+                    entry[1].synchronize()
+                    synced += 1
+                    if synced >= _drain_attempts * 4:
+                        break
+                self.writing_check()
+                for p, n in locked_nodes:
+                    if n.lock_ref == 0:
+                        heapq.heappush(eviction_heap, (p, n))
+                locked_nodes = [(p, n) for p, n in locked_nodes if n.lock_ref > 0]
+                if not eviction_heap:
+                    if not self.cache_controller.ack_write_queue:
+                        break
+                    continue
+                continue
+
             _priority, x = heapq.heappop(eviction_heap)
 
             if x.lock_ref > 0:
+                locked_nodes.append((_priority, x))
                 continue
 
             if self._is_pinned(x):

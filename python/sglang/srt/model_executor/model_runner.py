@@ -2449,6 +2449,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return output
 
+    def _dummy_forward(self, forward_batch: ForwardBatch) -> ModelRunnerOutput:
+        """Skip real computation: fill KV slots with dummy data, return fake logits.
+
+        Preserves the full scheduler → KV allocation → RadixCache insert →
+        HiCache write-through pipeline so that tiered-cache storage behaviour
+        can be stress-tested without paying for GEMM / attention compute.
+        """
+        kv_pool = forward_batch.token_to_kv_pool
+        if (
+            kv_pool is not None
+            and forward_batch.out_cache_loc is not None
+            and forward_batch.out_cache_loc.numel() > 0
+        ):
+            loc = forward_batch.out_cache_loc
+            for i in range(kv_pool.layer_num):
+                buf = kv_pool.kv_buffer[i]
+                buf[loc] = 1e-3
+
+        logits = torch.zeros(
+            forward_batch.batch_size,
+            self.model_config.vocab_size,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        return ModelRunnerOutput(
+            logits_output=LogitsProcessorOutput(next_token_logits=logits),
+            can_run_graph=False,
+        )
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -2457,6 +2486,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        if self.server_args.dummy_forward:
+            return self._dummy_forward(forward_batch)
+
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"

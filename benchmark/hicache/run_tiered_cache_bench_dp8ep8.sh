@@ -58,6 +58,7 @@ BENCHMARK_TIMEOUT="${BENCHMARK_TIMEOUT:-10800}"        # per-case timeout
 WRITE_POLICY="write_through"
 MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-mori}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
+DUMMY_FORWARD="${DUMMY_FORWARD:-}"
 
 # ---- Derived paths ------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -351,6 +352,9 @@ DP_EP_ARGS=(
 if [[ -n "$KV_CACHE_DTYPE" ]]; then
     DP_EP_ARGS+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
 fi
+if bool_is_true "$DUMMY_FORWARD"; then
+    DP_EP_ARGS+=(--dummy-forward)
+fi
 
 launch_server_case1() {
     python -m sglang.launch_server \
@@ -437,6 +441,9 @@ log "  Output len:  $OUTPUT_LENGTH"
 log "  Request rate: $REQUEST_RATE"
 log "  Write policy: $WRITE_POLICY"
 log "  KV dtype:    ${KV_CACHE_DTYPE:-auto}"
+if bool_is_true "$DUMMY_FORWARD"; then
+log "  Dummy fwd:   ENABLED (dummy weights, no compute)"
+fi
 log "  L2 size:     ${HICACHE_SIZE} GB/rank"
 log "  L3 DRAM:     $((UMBP_DRAM_BYTES / 1073741824)) GB/rank"
 log "  L3 SSD:      $((UMBP_SSD_BYTES / 1073741824)) GB/rank"
