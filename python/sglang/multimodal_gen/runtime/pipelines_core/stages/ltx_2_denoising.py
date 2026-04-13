@@ -899,36 +899,44 @@ class LTX2DenoisingStage(DenoisingStage):
                 kwargs["disable_v2a_cross_attn"] = True
             return kwargs
 
-        should_dump_stage2_step0 = (
-            ctx.is_ltx23_variant and ctx.stage == "stage2" and step.step_index == 0
-        )
-        if should_dump_stage2_step0:
+        dump_step0_prefix = None
+        if ctx.is_ltx23_variant and step.step_index == 0:
+            if ctx.stage == "stage1":
+                dump_step0_prefix = "stage1_step0"
+            elif ctx.stage == "stage2":
+                dump_step0_prefix = "stage2_step0"
+        if dump_step0_prefix is not None:
             maybe_save_ltx23_ti2v_tensor(
-                "stage2_step0_video_latents_noised", latent_model_input
+                f"{dump_step0_prefix}_video_latents_noised", latent_model_input
             )
             maybe_save_ltx23_ti2v_tensor(
-                "stage2_step0_audio_latents_noised", audio_latent_model_input
-            )
-            maybe_save_ltx23_ti2v_tensor("stage2_step0_timestep_video", timestep_video)
-            maybe_save_ltx23_ti2v_tensor("stage2_step0_timestep_audio", timestep_audio)
-            maybe_save_ltx23_ti2v_tensor(
-                "stage2_step0_prompt_timestep_video", prompt_timestep_video
+                f"{dump_step0_prefix}_audio_latents_noised", audio_latent_model_input
             )
             maybe_save_ltx23_ti2v_tensor(
-                "stage2_step0_prompt_timestep_audio", prompt_timestep_audio
+                f"{dump_step0_prefix}_timestep_video", timestep_video
             )
             maybe_save_ltx23_ti2v_tensor(
-                "stage2_step0_encoder_hidden_states_video", batch.prompt_embeds[0]
+                f"{dump_step0_prefix}_timestep_audio", timestep_audio
             )
             maybe_save_ltx23_ti2v_tensor(
-                "stage2_step0_encoder_hidden_states_audio",
+                f"{dump_step0_prefix}_prompt_timestep_video", prompt_timestep_video
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_prompt_timestep_audio", prompt_timestep_audio
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_encoder_hidden_states_video",
+                batch.prompt_embeds[0],
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_encoder_hidden_states_audio",
                 batch.audio_prompt_embeds[0],
             )
             maybe_save_ltx23_ti2v_tensor(
-                "stage2_step0_denoise_mask_video", ctx.denoise_mask
+                f"{dump_step0_prefix}_denoise_mask_video", ctx.denoise_mask
             )
             maybe_save_ltx23_ti2v_tensor(
-                "stage2_step0_clean_latent_video", ctx.clean_latent
+                f"{dump_step0_prefix}_clean_latent_video", ctx.clean_latent
             )
 
         # 5. Run the branch-specific LTX forward path and apply CFG/guider logic.
@@ -941,7 +949,7 @@ class LTX2DenoisingStage(DenoisingStage):
         use_official_cfg_path = stage1_guider_params is None
         if use_official_cfg_path:
             original_module_forwards = []
-            if should_dump_stage2_step0:
+            if dump_step0_prefix is not None:
                 probe_root = self._ltx2_resolve_probe_root(step.current_model)
                 for attr_name, dump_name in [
                     ("caption_projection", "caption_projection_video"),
@@ -966,7 +974,8 @@ class LTX2DenoisingStage(DenoisingStage):
                             probe_root,
                             attr_name,
                             self._ltx2_wrap_first_call(
-                                getattr(probe_root, attr_name, None), dump_name
+                                getattr(probe_root, attr_name, None),
+                                f"{dump_step0_prefix}_{dump_name}",
                             ),
                         )
                     )
@@ -1047,12 +1056,12 @@ class LTX2DenoisingStage(DenoisingStage):
                     if original_forward is None:
                         continue
                     getattr(root, attr_name).forward = original_forward
-            if should_dump_stage2_step0:
+            if dump_step0_prefix is not None:
                 maybe_save_ltx23_ti2v_tensor(
-                    "stage2_step0_model_video_raw", model_video
+                    f"{dump_step0_prefix}_model_video_raw", model_video
                 )
                 maybe_save_ltx23_ti2v_tensor(
-                    "stage2_step0_model_audio_raw", model_audio
+                    f"{dump_step0_prefix}_model_audio_raw", model_audio
                 )
 
             model_video = model_video.float()
@@ -1115,9 +1124,13 @@ class LTX2DenoisingStage(DenoisingStage):
 
         v_pos = v_pos.float()
         a_v_pos = a_v_pos.float()
-        if should_dump_stage2_step0:
-            maybe_save_ltx23_ti2v_tensor("stage2_step0_model_video_raw", v_pos)
-            maybe_save_ltx23_ti2v_tensor("stage2_step0_model_audio_raw", a_v_pos)
+        if dump_step0_prefix is not None:
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_model_video_raw", v_pos
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_model_audio_raw", a_v_pos
+            )
         if v_neg is not None:
             v_neg = v_neg.float()
         if a_v_neg is not None:
@@ -1136,9 +1149,13 @@ class LTX2DenoisingStage(DenoisingStage):
         denoised_audio = self._ltx2_velocity_to_x0(
             ctx.audio_latents, a_v_pos, sigma_val
         )
-        if should_dump_stage2_step0:
-            maybe_save_ltx23_ti2v_tensor("stage2_step0_video_x0", denoised_video)
-            maybe_save_ltx23_ti2v_tensor("stage2_step0_audio_x0", denoised_audio)
+        if dump_step0_prefix is not None:
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_video_x0", denoised_video
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_audio_x0", denoised_audio
+            )
         denoised_video_neg = None
         denoised_audio_neg = None
         denoised_video_perturbed = None
