@@ -43,7 +43,7 @@ backend.
 | quant_family     | checkpoint form                                                                            | canonical CLI                                        | supported models                                             | extra dependency                      | platform / notes                                                                                                      |
 |------------------|--------------------------------------------------------------------------------------------|------------------------------------------------------|--------------------------------------------------------------|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------|
 | `fp8`            | Quantized transformer component folder, or safetensors with `quantization_config` metadata | `--transformer-path` or `--transformer-weights-path` | ALL                                                          | None                                  | Component-folder and single-file flows are both supported                                                             |
-| `modelopt-fp8`   | Converted ModelOpt FP8 transformer directory or repo with `config.json`                    | `--transformer-weights-path`                         | FLUX.2, Wan2.2                                               | None                                  | Override config is read from the quantized transformer repo; `dit_cpu_offload` and `dit_layerwise_offload` are auto-disabled |
+| `modelopt-fp8`   | Converted ModelOpt FP8 transformer directory or repo with `config.json`                    | `--transformer-weights-path`                         | FLUX.2, Wan2.2                                               | None                                  | Override config is read from the quantized transformer repo; `dit_layerwise_offload` is supported and `dit_cpu_offload` stays disabled |
 | `nvfp4-modelopt` | NVFP4 safetensors file, sharded directory, or repo providing transformer weights           | `--transformer-weights-path`                         | FLUX.2                                                       | `comfy-kitchen` optional on Blackwell | Blackwell can use a best-performance kit when available; otherwise SGLang falls back to the generic ModelOpt FP4 path |
 | `nunchaku-svdq`  | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`   | `--transformer-weights-path`                         | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                            |
 | `msmodelslim`    | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                       | Wan2.2 family                                                | None                                  | Currently only compatible with the Ascend NPU family and supports both `w8a8` and `w4a4`                              |
@@ -78,9 +78,10 @@ sglang generate \
 - If the override repo or local directory contains its own `config.json`,
   SGLang reads the quantization config from that override instead of relying on
   the base model config.
-- `dit_cpu_offload` and `dit_layerwise_offload` are automatically disabled for
-  ModelOpt FP8 checkpoints because the runtime expects the transformed FP8
-  weights to remain GPU-resident in their column-major layout.
+- `dit_layerwise_offload` is supported for ModelOpt FP8 checkpoints.
+- `dit_cpu_offload` still stays disabled for ModelOpt FP8 checkpoints.
+- The layerwise offload path now preserves the non-contiguous FP8 weight stride
+  expected by the runtime FP8 GEMM path.
 - To build the converted checkpoint yourself from a ModelOpt diffusers export,
   use `python -m sglang.multimodal_gen.tools.convert_modelopt_fp8_checkpoint`.
 

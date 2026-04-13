@@ -302,9 +302,7 @@ FROM torch_deps AS flashinfer_cache
 ARG CUDA_VERSION
 ARG INSTALL_FLASHINFER_JIT_CACHE
 ARG FLASHINFER_VERSION
-ARG BUILD_AND_DOWNLOAD_PARALLEL
 
-# Download flashinfer cubins
 # Stage jit-cache artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
@@ -319,8 +317,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
-    fi \
-    && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+    fi
 
 ########################################################
 # PARALLEL STAGE 4: Dev Tools Builder (starts from base)
@@ -431,8 +428,7 @@ COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
-# Copy flashinfer cache and jit-cache package (if installed)
-COPY --from=flashinfer_cache /root/.cache/flashinfer /root/.cache/flashinfer
+# Copy flashinfer jit-cache package (if installed)
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
 # Copy dev tools
