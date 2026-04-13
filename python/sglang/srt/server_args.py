@@ -981,8 +981,7 @@ class ServerArgs:
         if self.device is None:
             self.device = get_device()
         # strip device index from user if any (e.g. "cuda:0" -> "cuda")
-        if self.device and ":" in self.device:
-            self.device = self.device.split(":")[0]
+        self.device = self.device.split(":")[0]
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
