@@ -459,6 +459,33 @@ class PipelineConfig:
         sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
         return sharded_tensor, True
 
+    def get_text_encoder_attention_mask(
+        self, text_inputs: dict, encoder_index: int
+    ) -> "torch.Tensor | None":
+        """Return the attention mask for the given text encoder.
+
+        Override to suppress (return None) or modify the mask per model.
+        """
+        return text_inputs.get("attention_mask")
+
+    def get_text_encoder_pooler_output(
+        self, outputs: "BaseEncoderOutput", encoder_index: int
+    ) -> "torch.Tensor | None":
+        """Return the pooler output for the given text encoder, or None to skip.
+
+        Override for models that need pooled embeddings (e.g. FLUX v1, SD3).
+        """
+        return None
+
+    def select_vae_weight_files(
+        self,
+        safetensors_list: list[str],
+        component_model_path: str,
+        component_name: str,
+        vae_precision: str,
+    ) -> list[str]:
+        return safetensors_list
+
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds
 

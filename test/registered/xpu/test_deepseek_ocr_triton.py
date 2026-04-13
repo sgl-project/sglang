@@ -6,10 +6,9 @@ import os
 import unittest
 from pathlib import Path
 
-from transformers import AutoTokenizer
-
 # Import base test class
 from test_deepseek_ocr import TestDeepSeekOCR
+from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
