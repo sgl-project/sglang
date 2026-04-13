@@ -177,7 +177,7 @@ class NVFP4KVQuantizeUtil:
                 block_scales: shape [B, M, N/16], dtype float8_e4m3fn
                 global_scale: passthrough
         """
-        from sglang.srt.utils import is_sm90_supported
+        from sglang.srt.utils import is_sm90_supported, is_sm100_supported
 
         assert is_sm90_supported(), "NVFP4 KV cache quantize requires SM90+ GPU"
 
@@ -191,13 +191,13 @@ class NVFP4KVQuantizeUtil:
         elif global_scale.dim() == 0:
             global_scale = global_scale.unsqueeze(0)
 
-        try:
+        if is_sm100_supported():
             from flashinfer import nvfp4_kv_quantize
 
             # nvfp4_kv_quantize takes global_scale directly (not inverted)
             fp4_2d, scales_2d = nvfp4_kv_quantize(tensor_2d, global_scale)
-        except (ImportError, AttributeError, RuntimeError):
-            # Fallback: fp4_quantize available on SM90+
+        else:
+            # SM90: fp4_quantize takes inverted global_scale
             from flashinfer import fp4_quantize
 
             global_scale_inv = 1.0 / global_scale
