@@ -45,6 +45,13 @@ class Exaone4_5_MTP(Exaone4ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         config = copy.deepcopy(config)
+        # EXAONE-4.5 exposes a multimodal wrapper config
+        # (Exaone4_5_Config with text_config / vision_config). For the MTP
+        # draft, only the text tower is needed, so unwrap to the inner
+        # text config when present — same pattern as qwen3_5_mtp.py.
+        self.is_multimodal = hasattr(config, "text_config")
+        if self.is_multimodal:
+            config = config.text_config
         self.config = config
         config.num_hidden_layers = 1
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -77,6 +84,24 @@ class Exaone4_5_MTP(Exaone4ForCausalLM):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        # For VLM + MTP speculative decoding: pre-computed multimodal
+        # embeddings are forwarded from the target model via
+        # `forward_batch.mm_input_embeds`. Calling `embed_tokens(input_ids)`
+        # directly on multimodal pad tokens would produce incorrect
+        # embeddings (or IndexError when image/video pad ids are OOV),
+        # matching the pattern used by `qwen3_5_mtp.py`.
+        assert input_embeds is None
+        input_embeds = forward_batch.mm_input_embeds
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.contains_mm_inputs()
+            and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            assert input_embeds is not None
+            input_embeds = torch.cat(
+                [input_embeds[:-1], self.model.embed_tokens(input_ids[-1].unsqueeze(0))]
+            )
+
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
 
