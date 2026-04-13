@@ -48,6 +48,47 @@ def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
     )
 
 
+def _ltx2_is_perturbed(
+    perturbation_config: dict[str, object],
+    key: str,
+    block_idx: int,
+) -> bool:
+    value = perturbation_config.get(key)
+    if value is None:
+        return False
+    if key.endswith("_blocks"):
+        return block_idx in value
+    return bool(value)
+
+
+def _ltx2_batched_perturbation_mask(
+    perturbation_configs: tuple[dict[str, object], ...] | None,
+    key: str,
+    block_idx: int,
+    values: torch.Tensor,
+) -> tuple[torch.Tensor | None, bool]:
+    if not perturbation_configs:
+        return None, False
+
+    mask = torch.ones(
+        (len(perturbation_configs),), device=values.device, dtype=values.dtype
+    )
+    any_perturbed = False
+    all_perturbed = True
+    for batch_idx, config in enumerate(perturbation_configs):
+        perturbed = _ltx2_is_perturbed(config, key, block_idx)
+        any_perturbed = any_perturbed or perturbed
+        all_perturbed = all_perturbed and perturbed
+        if perturbed:
+            mask[batch_idx] = 0
+
+    if not any_perturbed:
+        return None, False
+    if all_perturbed:
+        return None, True
+    return mask.view(mask.numel(), *([1] * (values.ndim - 1))), False
+
+
 def apply_interleaved_rotary_emb(
     x: torch.Tensor, freqs: Tuple[torch.Tensor, torch.Tensor]
 ) -> torch.Tensor:
@@ -653,6 +694,8 @@ class LTX2Attention(nn.Module):
                 )
 
             if perturbation_mask is not None:
+                if perturbation_mask.ndim == out.ndim - 1:
+                    perturbation_mask = perturbation_mask.unsqueeze(-1)
                 out = out * perturbation_mask + v * (1 - perturbation_mask)
 
         if not use_attention:
@@ -918,6 +961,10 @@ class LTX2TransformerBlock(nn.Module):
         skip_audio_self_attn: bool = False,
         skip_a2v_cross_attn: bool = False,
         skip_v2a_cross_attn: bool = False,
+        video_self_attn_perturbation_mask: Optional[torch.Tensor] = None,
+        audio_self_attn_perturbation_mask: Optional[torch.Tensor] = None,
+        a2v_cross_attn_perturbation_mask: Optional[torch.Tensor] = None,
+        v2a_cross_attn_perturbation_mask: Optional[torch.Tensor] = None,
         audio_replicated_for_sp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
@@ -934,6 +981,7 @@ class LTX2TransformerBlock(nn.Module):
             norm_hidden_states,
             mask=video_self_attention_mask,
             pe=video_rotary_emb,
+            perturbation_mask=video_self_attn_perturbation_mask,
             all_perturbed=skip_video_self_attn,
             gather_context_kv_for_sp=audio_replicated_for_sp,
         )
@@ -949,6 +997,7 @@ class LTX2TransformerBlock(nn.Module):
             norm_audio_hidden_states,
             mask=audio_self_attention_mask,
             pe=audio_rotary_emb,
+            perturbation_mask=audio_self_attn_perturbation_mask,
             all_perturbed=skip_audio_self_attn,
             skip_sequence_parallel_override=audio_replicated_for_sp,
         )
@@ -1097,6 +1146,10 @@ class LTX2TransformerBlock(nn.Module):
                 mask=a2v_cross_attention_mask,
                 skip_sequence_parallel_override=audio_replicated_for_sp,
             )
+            if a2v_cross_attn_perturbation_mask is not None:
+                a2v_attn_hidden_states = (
+                    a2v_attn_hidden_states * a2v_cross_attn_perturbation_mask
+                )
             hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
 
         # V2A
@@ -1116,6 +1169,10 @@ class LTX2TransformerBlock(nn.Module):
                 mask=v2a_cross_attention_mask,
                 gather_context_kv_for_sp=audio_replicated_for_sp,
             )
+            if v2a_cross_attn_perturbation_mask is not None:
+                v2a_attn_hidden_states = (
+                    v2a_attn_hidden_states * v2a_cross_attn_perturbation_mask
+                )
             audio_hidden_states = (
                 audio_hidden_states + v2a_gate * v2a_attn_hidden_states
             )
@@ -1532,6 +1589,15 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             raise ValueError(
                 "audio_num_frames must be provided for RoPE coordinate generation."
             )
+        perturbation_configs = kwargs.get("perturbation_configs")
+        if (
+            perturbation_configs is not None
+            and len(perturbation_configs) != batch_size
+        ):
+            raise ValueError(
+                "perturbation_configs length must match batch size, got "
+                f"{len(perturbation_configs)=} {batch_size=}."
+            )
 
         if video_coords is None:
             # Wan-style SP-RoPE: when SP is enabled, each rank runs on its local
@@ -1673,6 +1739,55 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         skip_video_self_attn_blocks = set(skip_video_self_attn_blocks or ())
         skip_audio_self_attn_blocks = set(skip_audio_self_attn_blocks or ())
         for block in self.transformer_blocks:
+            video_self_attn_perturbation_mask = None
+            audio_self_attn_perturbation_mask = None
+            a2v_cross_attn_perturbation_mask = None
+            v2a_cross_attn_perturbation_mask = None
+            skip_video_self_attn = block.idx in skip_video_self_attn_blocks
+            skip_audio_self_attn = block.idx in skip_audio_self_attn_blocks
+            skip_a2v_cross_attn = disable_a2v_cross_attn
+            skip_v2a_cross_attn = disable_v2a_cross_attn
+            if perturbation_configs is not None:
+                if not skip_video_self_attn:
+                    (
+                        video_self_attn_perturbation_mask,
+                        skip_video_self_attn,
+                    ) = _ltx2_batched_perturbation_mask(
+                        perturbation_configs,
+                        "skip_video_self_attn_blocks",
+                        block.idx,
+                        hidden_states,
+                    )
+                if not skip_audio_self_attn:
+                    (
+                        audio_self_attn_perturbation_mask,
+                        skip_audio_self_attn,
+                    ) = _ltx2_batched_perturbation_mask(
+                        perturbation_configs,
+                        "skip_audio_self_attn_blocks",
+                        block.idx,
+                        audio_hidden_states,
+                    )
+                if not skip_a2v_cross_attn:
+                    (
+                        a2v_cross_attn_perturbation_mask,
+                        skip_a2v_cross_attn,
+                    ) = _ltx2_batched_perturbation_mask(
+                        perturbation_configs,
+                        "skip_a2v_cross_attn",
+                        block.idx,
+                        hidden_states,
+                    )
+                if not skip_v2a_cross_attn:
+                    (
+                        v2a_cross_attn_perturbation_mask,
+                        skip_v2a_cross_attn,
+                    ) = _ltx2_batched_perturbation_mask(
+                        perturbation_configs,
+                        "skip_v2a_cross_attn",
+                        block.idx,
+                        audio_hidden_states,
+                    )
             hidden_states, audio_hidden_states = block(
                 hidden_states,
                 audio_hidden_states,
@@ -1699,10 +1814,14 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 audio_self_attention_mask=audio_self_attention_mask,
                 a2v_cross_attention_mask=a2v_cross_attention_mask,
                 v2a_cross_attention_mask=v2a_cross_attention_mask,
-                skip_video_self_attn=block.idx in skip_video_self_attn_blocks,
-                skip_audio_self_attn=block.idx in skip_audio_self_attn_blocks,
-                skip_a2v_cross_attn=disable_a2v_cross_attn,
-                skip_v2a_cross_attn=disable_v2a_cross_attn,
+                skip_video_self_attn=skip_video_self_attn,
+                skip_audio_self_attn=skip_audio_self_attn,
+                skip_a2v_cross_attn=skip_a2v_cross_attn,
+                skip_v2a_cross_attn=skip_v2a_cross_attn,
+                video_self_attn_perturbation_mask=video_self_attn_perturbation_mask,
+                audio_self_attn_perturbation_mask=audio_self_attn_perturbation_mask,
+                a2v_cross_attn_perturbation_mask=a2v_cross_attn_perturbation_mask,
+                v2a_cross_attn_perturbation_mask=v2a_cross_attn_perturbation_mask,
                 audio_replicated_for_sp=audio_replicated_for_sp,
             )
 
