@@ -215,6 +215,8 @@ def _get_quantization_config(
                         "q_a_proj",
                         "kv_a_proj_with_mqa",
                     ],
+                    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+                    "in_proj_ba": ["in_proj_b", "in_proj_a"],
                 },
             }
         )
