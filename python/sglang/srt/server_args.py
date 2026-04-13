@@ -3058,14 +3058,27 @@ class ServerArgs:
             assert self.moe_a2a_backend in [
                 "none",
                 "deepep",
+                "flashinfer",
             ], (
-                f"flashinfer_cutedsl supports moe_a2a_backend='none' (standard path) "
-                f"or 'deepep' (DeepEP low-latency path), got '{self.moe_a2a_backend}'."
+                f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
+                f"got '{self.moe_a2a_backend}'."
             )
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
+            if self.moe_a2a_backend == "flashinfer":
+                import os
+
+                if os.environ.get("SGLANG_MOE_NVFP4_DISPATCH", "").lower() in (
+                    "1",
+                    "true",
+                ):
+                    logger.warning(
+                        "SGLANG_MOE_NVFP4_DISPATCH is not yet supported with "
+                        "flashinfer_cutedsl + flashinfer a2a. Forcing it to False."
+                    )
+                    os.environ["SGLANG_MOE_NVFP4_DISPATCH"] = "0"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert self.quantization in [
@@ -3180,8 +3193,9 @@ class ServerArgs:
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
             assert self.moe_runner_backend in [
-                "flashinfer_cutlass"
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+                "flashinfer_cutlass",
+                "flashinfer_cutedsl",
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
