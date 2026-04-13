@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -20,6 +21,8 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
+logger = logging.getLogger(__name__)
 
 
 class _VirtualNode:
@@ -187,12 +190,23 @@ class SessionAwareCache(BasePrefixCache):
         if slot is None or slot.req_pool_idx is None:
             return self.inner.match_prefix(params)
 
+        if slot.kv_committed_len > len(params.key):
+            logger.warning(
+                "Streaming session prefix recovery mismatch: "
+                f"{slot.kv_committed_len=} exceeds {len(params.key)=} "
+                f"for session_id={session_id}. This indicates upstream "
+                "truncation or request/session state divergence. "
+                "Dropping the held session KV and falling back to regular prefix matching."
+            )
+            self.release_session(session_id)
+            return self.inner.match_prefix(params)
+
         slot.restore_to_req(req)
 
-        # logprob_start_len is already forced to -1 for streaming sessions
-        # (in Req.init_next_round_input), so the prefix key is not truncated
-        # and we can directly reuse the committed KV length.
-        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
+        # Streaming sessions are append-only. Req.init_next_round_input() also
+        # forces logprob_start_len = -1, so params.key still covers at least the
+        # full previously committed span.
+        prefix_len = req.kv_committed_len
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
@@ -201,6 +215,7 @@ class SessionAwareCache(BasePrefixCache):
             device_indices=device_indices,
             last_device_node=slot.virtual_node,
             last_host_node=slot.virtual_node,
+            mamba_branching_seqlen=req.mamba_branching_seqlen,
             cache_protected_len=slot.cache_protected_len,
         )
 

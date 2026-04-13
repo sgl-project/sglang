@@ -228,6 +228,13 @@ class TestStreamingSession(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def _single_token_append_ids(self) -> list[int]:
+        token_ids = self.tokenizer.encode(" Paris is nice.")
+        if token_ids and token_ids[0] == self.tokenizer.bos_token_id:
+            token_ids = token_ids[1:]
+        self.assertGreater(len(token_ids), 0, "Failed to derive a single append token")
+        return [token_ids[0]]
+
     def test_kv_cache_inheritance(self, gen_len=12):
         """Verify KV inheritance, radix cache insertion, and flush reclamation."""
         chunks = [
@@ -338,6 +345,116 @@ class TestStreamingSession(CustomTestCase):
             0,
             "After session close + flush, cache should be fully reclaimed",
         )
+
+    def test_single_token_append_recovers_full_prefix(self):
+        """A prefill-only turn followed by a one-token append must recover all KV."""
+        first_turn_ids = self.tokenizer.encode("The capital of France is")
+        if first_turn_ids and first_turn_ids[0] == self.tokenizer.bos_token_id:
+            first_turn_ids = first_turn_ids[1:]
+        second_turn_ids = self._single_token_append_ids()
+
+        requests.post(self.base_url + "/flush_cache")
+        session_id = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 1000, "streaming": True},
+        ).json()
+
+        first = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": first_turn_ids,
+                "session_params": {"id": session_id, "rid": None},
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 0,
+                    "no_stop_trim": True,
+                    "skip_special_tokens": False,
+                },
+            },
+        ).json()
+
+        self.assertEqual(
+            first["meta_info"]["completion_tokens"],
+            0,
+            "Turn 1 must remain prefill-only in this scenario",
+        )
+        expected_cached = first["meta_info"]["prompt_tokens"]
+        second = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": second_turn_ids,
+                "session_params": {
+                    "id": session_id,
+                    "rid": first["meta_info"]["id"],
+                },
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 4,
+                    "no_stop_trim": True,
+                    "skip_special_tokens": False,
+                },
+            },
+        ).json()
+
+        self.assertEqual(
+            second["meta_info"]["cached_tokens"],
+            expected_cached,
+            "A one-token append should still recover the full committed KV span",
+        )
+        requests.post(self.base_url + "/close_session", json={"session_id": session_id})
+
+    def test_single_token_append_with_logprob_recovers_full_prefix(self):
+        """Logprob streaming requests must recover the full prefix."""
+        first_turn_ids = self.tokenizer.encode("The capital of France is")
+        if first_turn_ids and first_turn_ids[0] == self.tokenizer.bos_token_id:
+            first_turn_ids = first_turn_ids[1:]
+        second_turn_ids = self._single_token_append_ids()
+
+        requests.post(self.base_url + "/flush_cache")
+        session_id = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 1000, "streaming": True},
+        ).json()
+
+        first = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": first_turn_ids,
+                "session_params": {"id": session_id, "rid": None},
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 0,
+                    "no_stop_trim": True,
+                    "skip_special_tokens": False,
+                },
+            },
+        ).json()
+
+        self.assertEqual(
+            first["meta_info"]["completion_tokens"],
+            0,
+            "Turn 1 must remain prefill-only in this scenario",
+        )
+        expected_cached = first["meta_info"]["prompt_tokens"]
+        second = _logprob_generate(
+            self.base_url,
+            second_turn_ids,
+            session_params={
+                "id": session_id,
+                "rid": first["meta_info"]["id"],
+            },
+            max_new_tokens=4,
+            return_logprob=True,
+            logprob_start_len=0,
+        )
+
+        self.assertEqual(
+            second["meta_info"]["cached_tokens"],
+            expected_cached,
+            "logprob_start_len must not reduce the recovered cached prefix",
+        )
+        self.assertIn("output_token_logprobs", second["meta_info"])
+        requests.post(self.base_url + "/close_session", json={"session_id": session_id})
 
     def test_leak_logprob_none(self) -> None:
         """Streaming sessions without logprobs must not leak tokens."""
