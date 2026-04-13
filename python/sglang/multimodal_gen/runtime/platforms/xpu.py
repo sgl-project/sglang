@@ -176,6 +176,7 @@ class XpuPlatform(Platform):
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.AITER,
+            AttentionBackendEnum.AITER_FP8,
         ):
             logger.warning(
                 f"{selected_backend.name} is not supported on Intel XPU. "

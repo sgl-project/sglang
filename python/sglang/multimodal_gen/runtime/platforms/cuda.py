@@ -326,6 +326,9 @@ class CudaPlatformBase(Platform):
         elif selected_backend == AttentionBackendEnum.AITER:
             logger.info("Using AITer backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
+        elif selected_backend == AttentionBackendEnum.AITER_FP8:
+            logger.info("Using AITER FP8 backend (requires ROCm AITER with FP8 FMHA)")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_fp8.AITerFP8Backend"
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"

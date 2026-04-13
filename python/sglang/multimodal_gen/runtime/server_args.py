@@ -579,7 +579,8 @@ class ServerArgs:
             default=None,
             help=(
                 "The attention backend to use. For SGLang-native pipelines, use "
-                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
+                "values like fa, torch_sdpa, sage_attn, aiter, aiter_fp8, aiter_sage, "
+                "etc. For diffusers pipelines, "
                 "use diffusers attention backend names such as flash, _flash_3_hub, "
                 "sage, or xformers."
             ),

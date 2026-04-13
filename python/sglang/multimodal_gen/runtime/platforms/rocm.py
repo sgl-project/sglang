@@ -115,6 +115,16 @@ class RocmPlatform(Platform):
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
+        elif selected_backend == AttentionBackendEnum.AITER_FP8:
+            if dtype not in (torch.float16, torch.bfloat16):
+                logger.warning(
+                    "AITER FP8 backend expects fp16/bf16 activations (quantized inside "
+                    "the kernel) but got dtype=%s.",
+                    dtype,
+                )
+            logger.info("Using AITER FP8 (per-tensor) FMHA backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_fp8.AITerFP8Backend"
+
         elif selected_backend == AttentionBackendEnum.AITER_SAGE:
             if dtype in (torch.float16, torch.bfloat16):
                 logger.info("Using AITER Sage backend on ROCm.")
