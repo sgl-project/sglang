@@ -59,12 +59,14 @@ class TritonLoRABackend(BaseLoRABackend):
         x: torch.Tensor,
         weights: torch.Tensor,
         pruned_batch_info: LoRABatchInfo = None,
+        stack_num: int = 1,
         *args,
         **kwargs,
     ) -> torch.Tensor:
         return sgemm_lora_a_fwd(
             x, weights, self._sgemm_info(pruned_batch_info), stack_num=1
         )
+        return sgemm_lora_a_fwd(x, weights, batch_info, stack_num=stack_num)
 
     def run_lora_b_sgemm(
         self,

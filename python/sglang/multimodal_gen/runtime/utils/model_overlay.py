@@ -26,6 +26,7 @@ logger = init_logger(__name__)
 # Built-in diffusion model overlay registry.
 BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     "Lightricks/LTX-2.3": {
+        # TODO: consider move to lmsys hf repo
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
         "overlay_revision": "main",
         "bundled_overlay_subdir": "ltx_2_3",
