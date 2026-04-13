@@ -59,6 +59,7 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.common import (
@@ -571,6 +572,7 @@ class Req(ReqDllmMixin):
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
+        positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
         session: Optional[Session] = None,
         custom_logit_processor: Optional[str] = None,
@@ -610,6 +612,7 @@ class Req(ReqDllmMixin):
         self.fill_ids = []
         self.session = session
         self.input_embeds = input_embeds
+        self.positional_embed_overrides = positional_embed_overrides
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -973,6 +976,12 @@ class Req(ReqDllmMixin):
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
+        # Disable prefix caching when embed overrides are present: same token IDs
+        # with different override vectors must not share cached KV values.
+        if self.positional_embed_overrides is not None:
+            max_prefix_len = 0
+            token_ids = []
+
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
@@ -1332,6 +1341,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+    # Token replacement embeddings and absolute positions (optional).
+    replace_embeds: Optional[torch.Tensor] = None
+    replace_positions: Optional[torch.Tensor] = None
     ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
@@ -1618,6 +1630,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Set fields
         input_embeds = []
+        all_replace_embeds: List[torch.Tensor] = []
+        all_replace_positions: List[int] = []
+        has_replace_embeds = False
+        input_id_pointer = 0
+        input_id_lens = [len(input_id) for input_id in input_ids]
         extend_input_logprob_token_ids = []
         multimodal_inputs = []
         mamba_track_mask_cpu = []
@@ -1641,6 +1658,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]
                 )
+
+            if req.positional_embed_overrides is not None:
+                # Override positions are absolute in the full sequence.
+                # Convert to extend-tensor coordinates by subtracting pre_len,
+                # then skip any that fall within the cached prefix.
+                embeds_to_add = []
+                for embed_idx, pos in enumerate(
+                    req.positional_embed_overrides.positions
+                ):
+                    extend_pos = pos - pre_len
+                    if extend_pos < 0 or extend_pos >= req.extend_input_len:
+                        continue  # Outside current extend chunk, skip
+                    embeds_to_add.append((embed_idx, input_id_pointer + extend_pos))
+                if embeds_to_add:
+                    has_replace_embeds = True
+                    indices, positions = zip(*embeds_to_add)
+                    all_replace_embeds.append(
+                        req.positional_embed_overrides.embeds[list(indices)]
+                    )
+                    all_replace_positions.extend(positions)
+            input_id_pointer += input_id_lens[i]
 
             multimodal_inputs.append(req.multimodal_inputs)
 
@@ -1737,6 +1775,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             extend_input_logprob_token_ids = None
 
+        if has_replace_embeds:
+            replace_embeds_tensor = torch.cat(all_replace_embeds, dim=0).to(
+                self.device, non_blocking=True
+            )
+            replace_positions_tensor = torch.tensor(
+                all_replace_positions, dtype=torch.long, device=self.device
+            )
+        else:
+            replace_embeds_tensor = None
+            replace_positions_tensor = None
+
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
@@ -1748,6 +1797,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
+        self.replace_embeds = replace_embeds_tensor
+        self.replace_positions = replace_positions_tensor
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -2020,6 +2071,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.retract_req(req)
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
@@ -2364,6 +2418,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
+            replace_embeds=self.replace_embeds,
+            replace_positions=self.replace_positions,
             ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
@@ -2459,8 +2515,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), "cache_protected_len must be page aligned"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
+        # Subtract an extra page_size so the eviction frontier never reaches the
+        # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
+        # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
+        # preserving cache reuse in multi-turn scenarios.
+        # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
         new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen, pre_len - sliding_window_size
+            req.swa_evicted_seqlen,
+            pre_len - sliding_window_size - self.tree_cache.page_size,
         )
 
         if self.tree_cache.page_size > 1:
@@ -2539,6 +2601,8 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.Tensor] = None
+    replace_embeds: Optional[torch.Tensor] = None
+    replace_positions: Optional[torch.Tensor] = None
 
     # token table for ngram embedding
     ne_token_table: Optional[torch.Tensor] = None

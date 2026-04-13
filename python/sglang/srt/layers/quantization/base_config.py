@@ -10,6 +10,7 @@ from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.models.utils import WeightsMapper
 
@@ -106,18 +107,17 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> CombineInput:
         raise NotImplementedError
 
-    def get_triton_quant_info(self, layer: torch.nn.Module):
-        """Return a ``TritonMoeQuantInfo`` for the Triton MoE runner.
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> "TritonMoeQuantInfo":
+        """Return a ``TritonMoeQuantInfo`` describing the quantisation state
+        stored on *layer*.
 
-        Handles base case for UnquantizedFusedMoEMethod.
+        The LoRA MoE runner calls this so that ``invoke_fused_moe_kernel``
+        receives the correct flags / scales / block-shape for the base
+        weights.  Each quantisation method must override this with the
+        same construction it already uses inside ``apply()``.
         """
-        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-
-        return TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            b13=getattr(layer, "w13_weight_bias", None),
-            b2=getattr(layer, "w2_weight_bias", None),
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_triton_quant_info()"
         )
 
 

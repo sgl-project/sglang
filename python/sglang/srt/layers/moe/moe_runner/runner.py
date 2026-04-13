@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.lora.lora_moe_runners import LoRAHooks
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +55,8 @@ class MoeRunner:
             or runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
+        elif runner_backend.is_flashinfer_cutedsl():
+            self.runner_core = None  # FlashInfer CuteDSL only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
@@ -141,6 +142,11 @@ class MoeRunner:
             dispatch_output, quant_info, self.config, running_state
         )
 
+        hooks = _maybe_build_lora_hooks(runner_input)
+
+        runner_output = self.runner_core.run(
+            runner_input, quant_info, running_state, hooks=hooks
+        )
         hooks = _maybe_build_lora_hooks(runner_input)
 
         runner_output = self.runner_core.run(

@@ -364,19 +364,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> CombineInput:
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         weight_bits = self.quant_config.weight_bits
         has_zp = self.quant_config.has_zp
-
-        quant_info = TritonMoeQuantInfo(
+        return TritonMoeQuantInfo(
             w13_weight=layer.w13_qweight,
             w2_weight=layer.w2_qweight,
             use_int4_w4a16=weight_bits == 4,
@@ -387,6 +378,17 @@ class MoeWNA16Method(FusedMoEMethodBase):
             w2_zp=layer.w2_qzeros if has_zp else None,
             block_shape=[0, layer.group_size],
         )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 
     @staticmethod
