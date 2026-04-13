@@ -1292,10 +1292,25 @@ class LTX2DenoisingStage(DenoisingStage):
                 denoised_audio - denoised_audio_neg
             )
 
+        if dump_step0_prefix is not None:
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_video_x0_guided_pre_mask", denoised_video
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_audio_x0_guided_pre_mask", denoised_audio
+            )
+
         if ctx.denoise_mask is not None and ctx.clean_latent is not None:
             denoised_video = (
                 denoised_video * ctx.denoise_mask
                 + ctx.clean_latent.float() * (1.0 - ctx.denoise_mask)
+            )
+        if dump_step0_prefix is not None:
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_video_x0_guided", denoised_video
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_audio_x0_guided", denoised_audio
             )
 
         # 6. Convert x0 predictions back to velocity and update both latent streams.
@@ -1319,6 +1334,13 @@ class LTX2DenoisingStage(DenoisingStage):
         ctx.latents = self.post_forward_for_ti2v_task(
             batch, server_args, ctx.reserved_frames_mask, ctx.latents, ctx.z
         )
+        if dump_step0_prefix is not None:
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_video_latents_after", ctx.latents
+            )
+            maybe_save_ltx23_ti2v_tensor(
+                f"{dump_step0_prefix}_audio_latents_after", ctx.audio_latents
+            )
 
     def _record_trajectory(
         self,
