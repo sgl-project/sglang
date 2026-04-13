@@ -1492,7 +1492,7 @@ class LTX2DenoisingStage(DenoisingStage):
             denoised_video = (
                 denoised_video * ctx.denoise_mask
                 + ctx.clean_latent.float() * (1.0 - ctx.denoise_mask)
-            )
+            ).to(denoised_video.dtype)
         if dump_guidance_prefix is not None:
             maybe_save_ltx23_ti2v_tensor(
                 f"{dump_guidance_prefix}_video_x0_guided", denoised_video
