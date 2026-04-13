@@ -356,6 +356,7 @@ class Envs:
     # TODO(mmangkad): Remove this once the FlashInfer unified allreduce-fusion
     # transport issue on GB200/GB300 platforms is fixed and verified resolved.
     SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
+    SGLANG_ENABLE_FLASHINFER_ROPE_FUSION = EnvBool(False)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)

@@ -5,6 +5,7 @@ Support attention backend for TRTLLM MHA kernels from flashinfer.
 The kernel supports sm100 only, with sliding window and attention sink features.
 """
 
+import bisect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -19,7 +20,10 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
-from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.layers.attention.utils import (
+    canonicalize_stride,
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
@@ -60,6 +64,18 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
+
+    # The following fields are used for Flashinfer KV update
+    # kv_indices: page indices for all requests (full-attention)
+    kv_indices: torch.Tensor = None
+    # kv_indices for SWA layers
+    swa_kv_indices: torch.Tensor = None
+    # kv_indptr: cumulative page count per request
+    kv_indptr: torch.Tensor = None
+    # batch_indices: which request each token belongs to
+    batch_indices: torch.Tensor = None
+    # positions: position of each token within its sequence
+    positions: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -149,6 +165,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
+        self.enable_rope_fusion = envs.SGLANG_ENABLE_FLASHINFER_ROPE_FUSION.get()
+        if self.enable_rope_fusion:
+            logger.info("Flashinfer RoPE+Quant+cache update fusion is enabled")
+            assert (
+                self.data_type == torch.float8_e4m3fn
+            ), "RoPE+Quant+cache update fusion is only supported for FP8 KV cache dtype"
+
+        self.piecewise_cuda_graph_tokens = (
+            model_runner.server_args.piecewise_cuda_graph_tokens
+            if not model_runner.server_args.disable_piecewise_cuda_graph
+            else None
+        )
+
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -211,6 +240,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 return swa_pt
         return self.forward_metadata.page_table
 
+    def _get_layer_kv_indices(self, layer: RadixAttention) -> torch.Tensor:
+        """Return the correct kv_indices for the RoPE fusion kernel (SWA or full)."""
+        swa_kv_indices = self.forward_metadata.swa_kv_indices
+        if swa_kv_indices is not None:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                return swa_kv_indices
+        return self.forward_metadata.kv_indices
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -233,6 +271,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
         }
 
+        if self.enable_rope_fusion:
+            self.decode_cuda_graph_metadata["kv_indices"] = torch.zeros(
+                max_bs * max_num_pages, dtype=torch.int32, device=self.device
+            )
+            if self.use_sliding_window_kv_pool:
+                self.decode_cuda_graph_metadata["swa_kv_indices"] = torch.zeros(
+                    max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                )
         if (
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
@@ -302,6 +348,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
             }
+
+            if self.enable_rope_fusion:
+                self.target_verify_metadata["kv_indices"] = torch.zeros(
+                    max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                )
+                self.draft_extend_metadata["kv_indices"] = torch.zeros(
+                    max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                )
+                if self.use_sliding_window_kv_pool:
+                    self.target_verify_metadata["swa_kv_indices"] = torch.zeros(
+                        max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                    )
+                    self.draft_extend_metadata["swa_kv_indices"] = torch.zeros(
+                        max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                    )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -438,6 +499,25 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
             self.draft_extend_metadata[bs] = metadata
+
+        if self.enable_rope_fusion:
+            if forward_mode.is_decode_or_idle():
+                metadata.kv_indices = self.decode_cuda_graph_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.decode_cuda_graph_metadata.get(
+                    "swa_kv_indices"
+                )
+            elif forward_mode.is_target_verify():
+                metadata.kv_indices = self.target_verify_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.target_verify_metadata.get(
+                    "swa_kv_indices"
+                )
+            else:
+                metadata.kv_indices = self.draft_extend_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.draft_extend_metadata.get(
+                    "swa_kv_indices"
+                )
+            self._init_forward_metadata_for_rope_fusion(metadata, bs, num_tokens)
+
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
@@ -543,41 +623,38 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+
+        if self.enable_rope_fusion:
+            # Compute total number of tokens
+            if forward_mode.is_decode_or_idle():
+                if spec_info is not None:
+                    total_num_tokens = bs * self.topk
+                else:
+                    total_num_tokens = bs
+                metadata.kv_indices = self.decode_cuda_graph_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.decode_cuda_graph_metadata.get(
+                    "swa_kv_indices"
+                )
+            elif forward_mode.is_target_verify():
+                total_num_tokens = bs * self.speculative_num_draft_tokens
+                metadata.kv_indices = self.target_verify_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.target_verify_metadata.get(
+                    "swa_kv_indices"
+                )
+            else:  # draft_extend
+                total_num_tokens = metadata.cu_seqlens_q[-1].item()
+                metadata.kv_indices = self.draft_extend_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.draft_extend_metadata.get(
+                    "swa_kv_indices"
+                )
+
+            self._init_forward_metadata_for_rope_fusion(metadata, bs, total_num_tokens)
+
         self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
-
-    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
-        """Check if we should use the fused FP8 KV cache write path."""
-        return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
-
-    def _fused_fp8_set_kv_buffer(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        **kwargs,
-    ):
-        """Fused FP8 quantization and KV cache write."""
-        cache_loc = self._get_layer_cache_loc(layer, forward_batch.out_cache_loc)
-
-        # Get K/V cache buffers from token_to_kv_pool
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-        fused_fp8_set_kv_buffer(
-            k=k,
-            v=v,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            cache_loc=cache_loc,
-            k_scale=layer.k_scale,  # May be None
-            v_scale=layer.v_scale,  # May be None
-            page_size=self.page_size,
-        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
@@ -646,7 +723,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
-
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
@@ -690,7 +766,113 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     metadata.swa_page_table[:, self.strided_indices] // self.page_size
                 )
 
+        if self.enable_rope_fusion:
+            # Compute total number of tokens
+            if forward_batch.forward_mode.is_decode_or_idle():
+                if forward_batch.spec_info is not None:
+                    total_num_tokens = batch_size * self.topk
+                else:
+                    total_num_tokens = batch_size
+            elif forward_batch.forward_mode.is_target_verify():
+                total_num_tokens = batch_size * self.speculative_num_draft_tokens
+            else:
+                total_num_tokens = forward_batch.extend_num_tokens
+                # For piecewise CUDA graph, we need to find padded token count
+                # to initialize the rope fusion metadata
+                if self.piecewise_cuda_graph_tokens is not None:
+                    idx = bisect.bisect_left(
+                        self.piecewise_cuda_graph_tokens, total_num_tokens
+                    )
+                    if idx < len(self.piecewise_cuda_graph_tokens):
+                        total_num_tokens = self.piecewise_cuda_graph_tokens[idx]
+
+            self._init_forward_metadata_for_rope_fusion(
+                metadata, batch_size, total_num_tokens
+            )
+
         self.forward_metadata = metadata
+
+    def _init_forward_metadata_for_rope_fusion(
+        self,
+        metadata: TRTLLMMHAMetadata,
+        batch_size: int,
+        total_num_tokens: int,
+    ):
+        """
+        Initialize the following metadata for RoPE + FP8 quantization + KV cache update kernel.
+        - kv_indptr: cumulative page count per request
+        - batch_indices: which request each token belongs to
+        - positions: position of each token within its sequence
+        - kv_indices: page indices for all requests (full pool)
+        - swa_kv_indices: page indices for SWA layers
+        """
+
+        # Compute number of pages per request
+        num_pages_per_req = (
+            metadata.cache_seqlens_int32 + self.page_size - 1
+        ) // self.page_size
+
+        # kv_indptr
+        if metadata.kv_indptr is None:
+            metadata.kv_indptr = torch.nn.functional.pad(
+                torch.cumsum(num_pages_per_req, dim=0, dtype=torch.int32), (1, 0)
+            )
+        else:
+            metadata.kv_indptr[1:].copy_(
+                torch.cumsum(num_pages_per_req, dim=0, dtype=torch.int32)
+            )
+
+        # batch_indices and positions
+        metadata.batch_indices, metadata.positions = (
+            flashinfer.page.get_batch_indices_positions(
+                metadata.cu_seqlens_q,
+                metadata.cache_seqlens_int32,
+                total_num_tokens,
+                metadata.batch_indices,
+                metadata.positions,
+            )
+        )
+
+        # kv_indices (full-attention)
+        device = metadata.kv_indptr.device
+        batch_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
+        if metadata.kv_indices is None:
+            # The max number of pages is kv_indptr[-1]
+            # Use upper bound to avoid D2H transfer from accessing kv_indptr[-1]
+            max_pages_per_req = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
+            metadata.kv_indices = torch.zeros(
+                batch_size * max_pages_per_req, dtype=torch.int32, device=device
+            )
+        create_flashinfer_kv_indices_triton[(batch_size,)](
+            metadata.page_table,
+            batch_idx,
+            num_pages_per_req,
+            metadata.kv_indptr,
+            None,
+            metadata.kv_indices,
+            metadata.page_table.stride(0),
+        )
+
+        # swa_kv_indices (SWA)
+        if metadata.swa_page_table is not None:
+            if metadata.swa_kv_indices is None:
+                max_pages_per_req = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+                metadata.swa_kv_indices = torch.zeros(
+                    batch_size * max_pages_per_req, dtype=torch.int32, device=device
+                )
+            create_flashinfer_kv_indices_triton[(batch_size,)](
+                metadata.swa_page_table,
+                batch_idx,
+                num_pages_per_req,
+                metadata.kv_indptr,
+                None,
+                metadata.swa_kv_indices,
+                metadata.swa_page_table.stride(0),
+            )
 
     def forward_decode(
         self,
@@ -703,58 +885,107 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
-        cache_loc = forward_batch.out_cache_loc
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+        q_scale_float = 1.0
+        k_scale_float = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        v_scale_float = (
+            layer.v_scale_float
+            if getattr(layer, "v_scale_float", None) is not None
+            else 1.0
+        )
 
-        if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
-            )
-            k = None
-            v = None
-        else:
-            # Use original set_kv_buffer path
-            if save_kv_cache and k is not None:
+        if save_kv_cache and k is not None:
+            if (
+                self.enable_rope_fusion
+                and kwargs.get("cos_sin_cache") is not None
+                and kwargs.get("is_neox_style") is not None
+                and (not self.is_xqa_impl)
+            ):
+                # Use fused RoPE + FP8 quantization + KV cache update path
+                cos_sin_cache = kwargs.get("cos_sin_cache")
+                is_neox_style = kwargs.get("is_neox_style")
+
+                q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
+                k_cache = k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                )
+                v_cache = v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+
+                q = flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
+                    q_rope=q,
+                    k_rope=k,
+                    q_nope=None,
+                    k_nope=None,
+                    v=v,
+                    cos_sin_cache=cos_sin_cache,
+                    pos_ids=forward_batch.positions,
+                    paged_kv_cache=(k_cache, v_cache),
+                    kv_indices=self._get_layer_kv_indices(layer),
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    batch_indices=self.forward_metadata.batch_indices,
+                    positions=self.forward_metadata.positions,
+                    is_neox=is_neox_style,
+                    quantize_dtype=torch.float8_e4m3fn,
+                    quant_scale_q=q_scale_float,
+                    quant_scale_kv=k_scale_float,
+                    page_size=self.page_size,
+                    kv_layout="NHD",
+                )[0]
+            elif self.data_type == torch.float8_e4m3fn:
+                # Use fused KV FP8 quantization + KV cache update path
+                cache_loc = self._get_layer_cache_loc(
+                    layer, forward_batch.out_cache_loc
+                )
+                fused_fp8_set_kv_buffer(
+                    k=k,
+                    v=v,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    cache_loc=cache_loc,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                    page_size=self.page_size,
+                )
+            else:
+                # Use original set_kv_buffer path
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
                 )
 
         # For XQA, q_dtype should be bf16
         if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
             q = q.to(torch.float8_e4m3fn)
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # shape conversion:
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)
         if layer.tp_v_head_num == 1:
             v_cache = canonicalize_stride(v_cache)
-
         kv_cache = (k_cache, v_cache)
 
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm1_scale = q_scale_float * k_scale_float * layer.scaling
+        bmm2_scale = v_scale_float
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
@@ -775,9 +1006,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             sinks=attention_sink,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             out_dtype=self.q_data_type,  # model_runner.dtype
+            kv_layout="NHD",
         )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend(
         self,
@@ -786,61 +1018,111 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        save_kv_cache=True,
+        save_kv_cache: bool = True,
         **kwargs,
-    ):
-        cache_loc = forward_batch.out_cache_loc
-
-        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
-
-        if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
-            )
-            k = None
-            v = None
-        else:
-            # Use original set_kv_buffer path
-            if save_kv_cache and k is not None:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
-
-        if self.data_type == torch.float8_e4m3fn:
-            q = q.to(torch.float8_e4m3fn)
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
+    ) -> torch.Tensor:
+        """Run forward for extend using TRTLLM MHA kernel."""
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
 
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
-
-        kv_cache = (k_cache, v_cache)
-
-        # sink: additional value per head in the denominator of the softmax.
-        attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
+        q_scale_float = 1.0
+        k_scale_float = (
             layer.k_scale_float
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        v_scale_float = (
+            layer.v_scale_float
+            if getattr(layer, "v_scale_float", None) is not None
+            else 1.0
+        )
+
+        if save_kv_cache and k is not None:
+            if (
+                self.enable_rope_fusion
+                and kwargs.get("cos_sin_cache") is not None
+                and kwargs.get("is_neox_style") is not None
+            ):
+                # Use fused RoPE + FP8 quantization + KV cache update path
+                cos_sin_cache = kwargs.get("cos_sin_cache")
+                is_neox_style = kwargs.get("is_neox_style")
+
+                q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
+                k_cache = k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                )
+                v_cache = v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+
+                q = flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
+                    q_rope=q,
+                    k_rope=k,
+                    q_nope=None,
+                    k_nope=None,
+                    v=v,
+                    cos_sin_cache=cos_sin_cache,
+                    pos_ids=forward_batch.positions,
+                    paged_kv_cache=(k_cache, v_cache),
+                    kv_indices=self._get_layer_kv_indices(layer),
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    batch_indices=self.forward_metadata.batch_indices,
+                    positions=self.forward_metadata.positions,
+                    is_neox=is_neox_style,
+                    quantize_dtype=torch.float8_e4m3fn,
+                    quant_scale_q=q_scale_float,
+                    quant_scale_kv=k_scale_float,
+                    page_size=self.page_size,
+                    kv_layout="NHD",
+                )[0]
+            elif self.data_type == torch.float8_e4m3fn:
+                # Use fused KV FP8 quantization + KV cache update path
+                cache_loc = self._get_layer_cache_loc(
+                    layer, forward_batch.out_cache_loc
+                )
+                fused_fp8_set_kv_buffer(
+                    k=k,
+                    v=v,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    cache_loc=cache_loc,
+                    k_scale=layer.k_scale,
+                    v_scale=layer.v_scale,
+                    page_size=self.page_size,
+                )
+            else:
+                # Use original set_kv_buffer path
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                )
+
+        if self.data_type == torch.float8_e4m3fn:
+            q = q.to(torch.float8_e4m3fn)
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+        if layer.tp_k_head_num == 1:
+            k_cache = canonicalize_stride(k_cache)
+        if layer.tp_v_head_num == 1:
+            v_cache = canonicalize_stride(v_cache)
+        kv_cache = (k_cache, v_cache)
+
+        bmm1_scale = q_scale_float * k_scale_float * layer.scaling
+        bmm2_scale = v_scale_float
+        # sink: additional value per head in the denominator of the softmax.
+        attention_sink = kwargs.get("sinks", None)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
@@ -859,6 +1141,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=self.q_data_type,  # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
+                kv_layout="NHD",
             )
         else:
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
@@ -878,9 +1161,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=self.q_data_type,  # model_runner.dtype
+                kv_layout="NHD",
             )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):

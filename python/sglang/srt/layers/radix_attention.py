@@ -148,6 +148,8 @@ def unified_attention_with_output(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox_style: Optional[bool] = None,
 ) -> None:
     context = get_forward_context()
     forward_batch = context.forward_batch
@@ -161,6 +163,10 @@ def unified_attention_with_output(
         kwargs["k_rope"] = k_rope
     if sinks is not None:
         kwargs["sinks"] = sinks
+    if cos_sin_cache is not None:
+        kwargs["cos_sin_cache"] = cos_sin_cache
+    if is_neox_style is not None:
+        kwargs["is_neox_style"] = is_neox_style
 
     ret = forward_batch.attn_backend.forward(
         query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs

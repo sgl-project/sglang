@@ -40,6 +40,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -396,7 +397,9 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-        q, k = self.rotary_emb(positions, q, k, **extra_args)
+        # Defer RoPE to attn backend if RoPE fusion is enabled
+        if not envs.SGLANG_ENABLE_FLASHINFER_ROPE_FUSION.get():
+            q, k = self.rotary_emb(positions, q, k, **extra_args)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -404,10 +407,20 @@ class GptOssAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+
+        # Pass required RoPE args into attn backend if RoPE fusion is enabled
+        extra_args = {}
+        if envs.SGLANG_ENABLE_FLASHINFER_ROPE_FUSION.get():
+            extra_args = {
+                "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+                "is_neox_style": self.rotary_emb.is_neox_style,
+            }
+
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            **extra_args,
         )
         output, _ = self.o_proj(attn_output)
         return output
