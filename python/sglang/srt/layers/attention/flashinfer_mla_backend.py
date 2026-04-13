@@ -527,12 +527,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if forward_batch.attn_attend_prefix_cache is not None and any(
-            forward_batch.extend_prefix_lens_cpu
+        if (
+            forward_batch.attn_attend_prefix_cache is not None
+            and any(forward_batch.extend_prefix_lens_cpu)
+            and k_rope is None  # Only MHA layers use the chunk path; MLA layers
+            # (which pass k_rope) use the normal paged absorbed path below.
         ):  # MHA Chunk
             assert self.enable_chunk_kv
             assert q_rope is None
-            assert k_rope is None
             return self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
 
         cache_loc = forward_batch.out_cache_loc

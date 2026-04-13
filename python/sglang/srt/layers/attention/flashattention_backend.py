@@ -826,6 +826,8 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and k_rope is None  # Only MHA layers use the chunk path; MLA
+                # layers (which pass k_rope) use the absorbed FA3 path below.
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:

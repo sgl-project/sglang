@@ -117,6 +117,14 @@ class RadixAttention(nn.Module):
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if get_global_server_args().enable_breakable_cuda_graph:
+                # When mha_return_lse is True (chunked prefix MHA), the backend
+                # returns a tuple (output, lse). The bridge/breakable path can't
+                # propagate tuples, so call the backend directly.
+                if getattr(forward_batch, "mha_return_lse", False):
+                    return forward_batch.attn_backend.forward(
+                        q, k, v, self, forward_batch, save_kv_cache, **kwargs
+                    )
+
                 from sglang.srt.model_executor.breakable_piecewise_cuda_graph_runner import (
                     get_bridge_buffers,
                 )
@@ -226,15 +234,91 @@ def _unified_attention_with_output_impl(
     if sinks is not None:
         kwargs["sinks"] = sinks
 
-    ret = forward_batch.attn_backend.forward(
-        query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
-    )
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
+    # For BCG replay: MHA layers need special handling (see _bcg_mha_attention).
+    _bcg_n = getattr(forward_batch, "_bcg_mha_slice_n", None)
+    if (
+        _bcg_n is not None
+        and not save_kv_cache
+        and k_rope is None
+        and (query.shape[0] > _bcg_n or forward_batch._bcg_mha_has_prefix)
+    ):
+        ret = _bcg_mha_attention(
+            query, key, value, attention_layer, forward_batch,
+            save_kv_cache, _bcg_n, kwargs,
+        )
+        output[:_bcg_n].view(ret.shape).copy_(ret)
+    else:
+        ret = forward_batch.attn_backend.forward(
+            query, key, value, attention_layer, forward_batch, save_kv_cache,
+            **kwargs,
+        )
+        assert (
+            output.numel() == ret.numel()
+        ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
+        output.view(ret.shape).copy_(ret)
     return
+
+
+def _bcg_mha_attention(
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    attention_layer: "RadixAttention",
+    forward_batch: "ForwardBatch",
+    save_kv_cache: bool,
+    n: int,
+    kwargs: dict,
+) -> torch.Tensor:
+    """MHA attention for BCG replay.
+
+    During BCG replay, MHA layers receive static-sized tensors from graph
+    capture but the attention backend expects real-sized tensors. This function
+    slices q/k/v to extend_num_tokens, runs extend-only attention, then runs
+    the chunked prefix attention loop (which doesn't replay in CUDA graphs
+    since it's Python code between break points).
+
+    The BCG runner pre-computes _bcg_mha_slice_n and _bcg_mha_has_prefix on
+    forward_batch once per forward to avoid redundant per-layer evaluation.
+    """
+    query = query[:n]
+    if key is not None:
+        key = key[:n]
+    if value is not None:
+        value = value[:n]
+
+    has_prefix = forward_batch._bcg_mha_has_prefix
+
+    # Set flags for extend-only attention, request LSE if prefix exists.
+    # mha_one_shot must be False: with True, FA3 uses cu_seqlens_k that
+    # includes prefix length, but k only has extend tokens.
+    forward_batch.mha_return_lse = has_prefix
+    forward_batch.mha_one_shot = False
+    forward_batch.set_attn_attend_prefix_cache(False)
+
+    ret = forward_batch.attn_backend.forward(
+        query, key, value, attention_layer, forward_batch, save_kv_cache,
+        **kwargs,
+    )
+
+    # Run chunked prefix attention and merge
+    if has_prefix and hasattr(attention_layer, "_bcg_chunked_prefix_fn"):
+        attn_output, lse = ret
+        forward_batch.set_attn_attend_prefix_cache(True)
+        ret = attention_layer._bcg_chunked_prefix_fn(
+            q=query.view(
+                -1, attention_layer.tp_q_head_num, attention_layer.qk_head_dim
+            ),
+            accum_output=attn_output,
+            accum_lse=lse,
+            forward_batch=forward_batch,
+        )
+
+    # Restore flags
+    forward_batch.set_attn_attend_prefix_cache(False)
+    forward_batch.mha_return_lse = False
+    forward_batch.mha_one_shot = True
+
+    return ret
 
 
 # Lazy-init: wrapped with non_graph(True) on first use to avoid import-time
@@ -248,10 +332,10 @@ def breakable_unified_attention_with_output(
     global _breakable_attention_fn
     if _breakable_attention_fn is None:
         from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
-            non_graph,
+            eager_on_graph,
         )
 
-        _breakable_attention_fn = non_graph(True)(_unified_attention_with_output_impl)
+        _breakable_attention_fn = eager_on_graph(True)(_unified_attention_with_output_impl)
     return _breakable_attention_fn(
         query, key, value, output, save_kv_cache, layer_id, **kwargs
     )

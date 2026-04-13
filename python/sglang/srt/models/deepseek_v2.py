@@ -1439,6 +1439,10 @@ class DeepseekV2AttentionMLA(
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
+        # For BCG replay: store prefix attention callback so the break function
+        # can run the chunked prefix loop (which doesn't replay in CUDA graphs).
+        if not hasattr(self.attn_mha, "_bcg_chunked_prefix_fn"):
+            self.attn_mha._bcg_chunked_prefix_fn = self._chunked_prefix_attn_mha
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):

@@ -45,7 +45,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
     BreakableCUDAGraph,
-    BreakableCUDAGraphContext,
+    BreakableCUDAGraphCapture,
 )
 from sglang.srt.model_executor.cuda_graph_runner import (
     get_global_graph_memory_pool,
@@ -377,10 +377,11 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
                 self.graphs[num_tokens] = graph
                 self.output_buffers[num_tokens] = output
                 mem_after = torch.cuda.memory_allocated(self.device) / 1024**3
+                num_breaks = len(graph._exec) if hasattr(graph, '_exec') else 0
                 logger.info(
                     f"[Breakable PCG] num_tokens={num_tokens}: "
-                    f"segments={len(graph._segments)}, "
-                    f"breaks={len(graph._break_fns)}, "
+                    f"segments={num_breaks + 1}, "
+                    f"breaks={num_breaks}, "
                     f"mem_delta={mem_after - mem_before:.3f} GB, "
                     f"mem_total={mem_after:.3f} GB"
                 )
@@ -409,7 +410,7 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
             run_once()
 
         graph = BreakableCUDAGraph()
-        with BreakableCUDAGraphContext(cuda_graph=graph, pool=pool, stream=stream):
+        with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
             output = run_once()
 
         return graph, output
@@ -440,13 +441,46 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
 
             # Restore Python-level model state that was set during capture
             # but doesn't replay with CUDA graphs (e.g. DeepSeek MHA dispatch).
+            # Note: setting attn_attend_prefix_cache=False here affects ALL
+            # attention layers. The attention backends are modified to skip the
+            # MHA chunk path for MLA layers (identified by k_rope kwarg) so
+            # that MLA uses the absorbed paged path regardless of this flag.
+            #
+            # For MHA layers: pre-compute BCG replay state once (instead of
+            # per-layer in the break function). The break function reads
+            # _bcg_mha_slice_n and _bcg_mha_has_prefix from forward_batch.
             if hasattr(static_forward_batch, "set_attn_attend_prefix_cache"):
+                has_prefix = (
+                    static_forward_batch.extend_prefix_lens_cpu is not None
+                    and any(static_forward_batch.extend_prefix_lens_cpu)
+                )
                 static_forward_batch.set_attn_attend_prefix_cache(False)
                 static_forward_batch.mha_return_lse = False
                 static_forward_batch.mha_one_shot = True
+                static_forward_batch._bcg_mha_slice_n = (
+                    static_forward_batch.extend_num_tokens
+                )
+                static_forward_batch._bcg_mha_has_prefix = has_prefix
+
+                if has_prefix:
+                    static_forward_batch.prepare_chunked_prefix_cache_info(
+                        self.device
+                    )
+            else:
+                static_forward_batch._bcg_mha_slice_n = None
+                static_forward_batch._bcg_mha_has_prefix = False
 
             # Set forward context and replay
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # Initialize MHA chunk metadata after main metadata (needs ragged
+            # wrappers from init_forward_metadata to exist first).
+            if (
+                static_forward_batch._bcg_mha_has_prefix
+                and hasattr(self.model_runner.attn_backend, "init_mha_chunk_metadata")
+            ):
+                self.model_runner.attn_backend.init_mha_chunk_metadata(
+                    static_forward_batch
+                )
             with set_forward_context(
                 static_forward_batch,
                 self.attention_layers,
