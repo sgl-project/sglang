@@ -69,7 +69,9 @@ CONFIGS = {
     "sdar-8b": dict(
         target="JetLM/SDAR-8B-Chat",
         draft="JetLM/SDAR-1.7B-Chat",
-        base_engine=dict(mem_fraction_static=0.7, tp_size=4, trust_remote_code=True),
+        # mem_fraction_static 只控制目标模型的 KV cache，STANDALONE 还需给草稿模型
+        # 分配单独的 KV cache，因此需要留出足够余量
+        base_engine=dict(mem_fraction_static=0.4, tp_size=4, trust_remote_code=True),
         spec_kwargs=dict(
             speculative_algorithm="STANDALONE",
             speculative_num_steps=4,
