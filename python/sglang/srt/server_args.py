@@ -591,6 +591,23 @@ class ServerArgs:
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
 
+    # Expert weight offloading (mutually exclusive with KTransformers)
+    # Expert weights stored in CUDA Unified Memory (cudaMallocManaged).
+    # Offloaded experts live in CPU DRAM, accessed by GPU via PCIe read-through.
+    # All computation stays on GPU.
+    expert_offload_num_resident: int = (
+        -1
+    )  # -1 = disabled; N = experts permanently on GPU
+    expert_offload_resident_selection: str = (
+        "first_n"  # "first_n" | "frequency" | "manual"
+    )
+    expert_offload_resident_ids: Optional[str] = (
+        None  # comma-separated IDs (manual mode)
+    )
+    expert_offload_prefetch_num: int = (
+        0  # 0 = disabled; N = prefetch top-N hot offloaded experts
+    )
+
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
@@ -837,6 +854,7 @@ class ServerArgs:
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
+        self._handle_expert_offload()
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
@@ -2979,6 +2997,30 @@ class ServerArgs:
                 self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
+
+    def _handle_expert_offload(self):
+        """Validate expert weight offloading configuration."""
+        if self.expert_offload_num_resident < 0:
+            return  # Disabled — nothing to do.
+
+        # Mutual exclusion with KTransformers.
+        if self.kt_weight_path is not None:
+            raise ValueError(
+                "--expert-offload-num-resident is mutually exclusive with --kt-weight-path. "
+                "Use one strategy at a time."
+            )
+
+        if self.expert_offload_prefetch_num < 0:
+            raise ValueError("--expert-offload-prefetch-num must be >= 0")
+
+        logger.info(
+            f"[ExpertOffload] Enabled (UVM): num_resident={self.expert_offload_num_resident}, "
+            f"resident_selection={self.expert_offload_resident_selection!r}. "
+            "Expert weights stored in CUDA Unified Memory. "
+            "Resident experts stay on GPU (VRAM speed). "
+            "Offloaded experts accessible via PCIe read-through (no quality loss). "
+            "CUDA graph compatible."
+        )
 
     def _handle_pipeline_parallelism(self):
         if self.pp_size > 1:
@@ -5588,6 +5630,43 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kt_max_deferred_experts_per_token,
             help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        )
+
+        # Expert weight offloading args (mutually exclusive with KTransformers)
+        parser.add_argument(
+            "--expert-offload-num-resident",
+            type=int,
+            default=-1,
+            help="Number of expert weights permanently resident on GPU per MoE layer. "
+            "-1 = disabled. Expert weights are stored in CUDA Unified Memory; "
+            "offloaded experts live in CPU DRAM and are accessed by the GPU "
+            "transparently via PCIe read-through. Mutually exclusive with --kt-weight-path.",
+        )
+        parser.add_argument(
+            "--expert-offload-resident-selection",
+            type=str,
+            default="first_n",
+            choices=["first_n", "frequency", "manual"],
+            help="Strategy for selecting which experts stay resident on GPU. "
+            "'first_n' = experts 0..N-1; 'manual' = explicit list via "
+            "--expert-offload-resident-ids.",
+        )
+        parser.add_argument(
+            "--expert-offload-resident-ids",
+            type=str,
+            default=None,
+            help="Comma-separated expert IDs to keep resident (for manual selection).",
+        )
+        parser.add_argument(
+            "--expert-offload-prefetch-num",
+            type=int,
+            default=0,
+            help="Number of hot offloaded experts to prefetch for the next layer. "
+            "0 = disabled. When enabled, after each MoE layer's kernel is submitted, "
+            "cudaMemPrefetchAsync is issued for the next layer's most-frequently-hit "
+            "offloaded experts on a background CUDA stream. "
+            "Too high a value can cause GPU memory pressure and page thrashing, "
+            "reducing decode speed.",
         )
 
         # Diffusion LLM
