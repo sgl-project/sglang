@@ -3,8 +3,8 @@ import unittest
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
-from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
+from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE,
@@ -14,11 +14,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=96, suite="stage-b-test-1-gpu-large")
 
 
 class TestEagleConstrainedDecoding(
-    CustomTestCase, TestRegexConstrainedMixin, TestJSONConstrainedMixin
+    CustomTestCase, RegexConstrainedMixin, JSONConstrainedMixin
 ):
     max_running_requests = 64
     attention_backend = "triton"
@@ -59,7 +59,13 @@ class TestEagleConstrainedDecoding(
             cls.grammar_backend,
         ]
         launch_args.extend(cls.other_launch_args)
-        with envs.SGLANG_ENABLE_SPEC_V2.override(cls.spec_v2):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(
+            cls.spec_v2
+        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
+            True
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
+            True
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

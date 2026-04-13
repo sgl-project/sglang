@@ -5,27 +5,27 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.executor import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.executor import (
     execute_token_aligner,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.planner import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.planner import (
     compute_token_aligner_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.seq_info_builder import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.seq_info_builder import (
     build_seqs_info,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.types import (
+from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     SGLangSeqId,
     TokenAlignerGlobalAux,
     TokenAlignerPlan,
     TokenAlignerStepAux,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.dims import TokenLayout
+from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="default", nightly=True)
+register_cpu_ci(est_time=15, suite="stage-a-test-cpu", nightly=True)
 
 
 def _named(tensor: torch.Tensor, names: list[str]) -> torch.Tensor:

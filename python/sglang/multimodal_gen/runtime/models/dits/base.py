@@ -73,6 +73,10 @@ class BaseDiT(nn.Module, ABC):
                     f"Subclasses of BaseDiT must define '{attr}' instance variable"
                 )
 
+    def post_load_weights(self) -> None:
+        """Run model-specific post-load weight fixups after all parameters are materialized."""
+        return None
+
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends

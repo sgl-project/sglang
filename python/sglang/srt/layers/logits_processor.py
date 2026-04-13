@@ -475,6 +475,11 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices_pt = 0
             input_logprob_indices = []
             pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
+            aux_pruned_states_lists = (
+                [[] for _ in aux_hidden_states]
+                if aux_hidden_states is not None
+                else None
+            )
 
             for idx, (extend_logprob_start_len, extend_len) in enumerate(
                 zip(
@@ -499,6 +504,11 @@ class LogitsProcessor(nn.Module):
                     pruned_states_before_norm_list.append(
                         hidden_states_before_norm[pt + start_len : pt + extend_len]
                     )
+                if aux_pruned_states_lists is not None:
+                    for j, hidden in enumerate(aux_hidden_states):
+                        aux_pruned_states_lists[j].append(
+                            hidden[pt + start_len : pt + extend_len]
+                        )
                 # Map each token to its sequence index, for chunked computation
                 # of input logprobs
                 token_to_seq_idx.extend([idx] * (extend_len - start_len))
@@ -518,12 +528,14 @@ class LogitsProcessor(nn.Module):
             pruned_states = torch.cat(pruned_states_list)
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = torch.cat(pruned_states_before_norm_list)
+            if aux_pruned_states_lists is not None:
+                aux_pruned_states = [torch.cat(lst) for lst in aux_pruned_states_lists]
             sample_indices = torch.tensor(
-                sample_indices, dtype=torch.int64, pin_memory=True
-            ).to(pruned_states.device, non_blocking=True)
+                sample_indices, device=pruned_states.device, dtype=torch.int64
+            )
             input_logprob_indices = torch.tensor(
-                input_logprob_indices, dtype=torch.int64, pin_memory=True
-            ).to(pruned_states.device, non_blocking=True)
+                input_logprob_indices, device=pruned_states.device, dtype=torch.int64
+            )
 
         return (
             pruned_states,
@@ -590,24 +602,19 @@ class LogitsProcessor(nn.Module):
     def _expand_metadata_for_logprobs(
         self, logits_metadata: LogitsMetadata, device: torch.device
     ):
-        # Avoid implicit device sync inside repeat_interleave by providing output_size,
-        # which we can compute from CPU metadata.
-        total_pruned_len = sum(logits_metadata.extend_logprob_pruned_lens_cpu)
         pruned_lens = torch.tensor(
             logits_metadata.extend_logprob_pruned_lens_cpu,
-            pin_memory=True,
-        ).to(device, non_blocking=True)
+            device=device,
+        )
         if logits_metadata.temp_scaled_logprobs:
             logits_metadata.temperature = torch.repeat_interleave(
                 logits_metadata.temperature.view(-1),
                 pruned_lens,
-                output_size=total_pruned_len,
             ).view(-1, 1)
         if logits_metadata.top_p_normalized_logprobs:
             logits_metadata.top_p = torch.repeat_interleave(
                 logits_metadata.top_p,
                 pruned_lens,
-                output_size=total_pruned_len,
             )
 
     def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
@@ -692,6 +699,12 @@ class LogitsProcessor(nn.Module):
         for i in range(num_chunks):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, total_size)
+
+            # Notify lm_head LoRA about the current chunk so it can swap
+            # to the precomputed per-chunk batch_info.  This is a no-op
+            # for non-LoRA lm_head modules.
+            if hasattr(lm_head, "set_lm_head_pass"):
+                lm_head.set_lm_head_pass(i)
 
             # Get indices for this chunk
             chunk_mask = (input_logprob_indices >= start_idx) & (
@@ -796,6 +809,13 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.extend_input_logprob_token_ids_gpu[mask_indices],
             ]
             input_token_logprobs.append(chunk_input_token_logprobs)
+
+        # Restore the full-pruned lm_head batch_info after chunk iteration.
+        if hasattr(lm_head, "reset_lm_head_pass"):
+            assert hasattr(
+                lm_head, "set_lm_head_pass"
+            ), "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
+            lm_head.reset_lm_head_pass()
 
         # Concatenate the results
         input_token_logprobs = torch.cat(input_token_logprobs, dim=0)
@@ -1060,7 +1080,7 @@ class LogitsProcessor(nn.Module):
                 input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_prefill(
-                sliced_logprobs, logits_metadata, delay_cpu_copy=True
+                sliced_logprobs, logits_metadata, no_copy_to_cpu=True
             )
 
         # Get the logprob of top-k tokens

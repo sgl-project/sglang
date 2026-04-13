@@ -6,7 +6,6 @@ import logging
 import time
 import uuid
 from collections import deque
-from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -23,6 +22,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    AddExternalCorpusReqInput,
+    AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
@@ -53,6 +54,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    ListExternalCorporaReqInput,
+    ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -64,6 +67,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    RemoveExternalCorpusReqInput,
+    RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -205,6 +210,15 @@ class TokenizerCommunicatorMixin:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.add_external_corpus_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.remove_external_corpus_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.list_external_corpora_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -309,6 +323,18 @@ class TokenizerCommunicatorMixin:
                     self.flush_cache_communicator.handle_recv,
                 ),
                 (
+                    AddExternalCorpusReqOutput,
+                    self.add_external_corpus_communicator.handle_recv,
+                ),
+                (
+                    RemoveExternalCorpusReqOutput,
+                    self.remove_external_corpus_communicator.handle_recv,
+                ),
+                (
+                    ListExternalCorporaReqOutput,
+                    self.list_external_corpora_communicator.handle_recv,
+                ),
+                (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
@@ -343,11 +369,129 @@ class TokenizerCommunicatorMixin:
             ]
         )
 
-    async def flush_cache(self: TokenizerManager) -> FlushCacheReqOutput:
-        return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+    async def add_external_corpus(
+        self: TokenizerManager, obj: AddExternalCorpusReqInput
+    ) -> AddExternalCorpusReqOutput:
+        self.auto_create_handle_loop()
+        if self.server_args.speculative_algorithm != "NGRAM":
+            return AddExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        truncated = False
+        try:
+            if not obj.corpus_id:
+                import uuid
+
+                obj.corpus_id = uuid.uuid4().hex
+            if obj.file_path is not None:
+                from sglang.srt.speculative.cpp_ngram.external_corpus import (
+                    iter_external_corpus_chunks,
+                )
+
+                max_tokens = (
+                    self.server_args.speculative_ngram_external_corpus_max_tokens
+                )
+                obj.token_chunks = list(
+                    iter_external_corpus_chunks(
+                        obj.file_path, self.tokenizer, max_tokens
+                    )
+                )
+            elif obj.documents is not None:
+                from sglang.srt.speculative.cpp_ngram.external_corpus import (
+                    SEPARATOR_TOKEN,
+                )
+
+                max_tokens = (
+                    self.server_args.speculative_ngram_external_corpus_max_tokens
+                )
+                token_chunks = []
+                total_tokens = 0
+                has_prev = False
+                for doc in obj.documents:
+                    if not doc:
+                        continue
+                    token_ids = list(
+                        self.tokenizer.encode(doc, add_special_tokens=False)
+                    )
+                    if not token_ids:
+                        continue
+                    if has_prev:
+                        token_ids = [SEPARATOR_TOKEN] + token_ids
+                    if total_tokens + len(token_ids) > max_tokens:
+                        truncated = True
+                        break
+                    token_chunks.append(token_ids)
+                    total_tokens += len(token_ids)
+                    has_prev = True
+                obj.token_chunks = token_chunks
+            else:
+                return AddExternalCorpusReqOutput(
+                    success=False,
+                    message="Either file_path or documents must be provided.",
+                )
+            obj.file_path = None
+            obj.documents = None
+            results = await self.add_external_corpus_communicator(obj)
+            all_success, all_message = _Communicator.merge_results(results)
+            if truncated and all_success:
+                all_message += f" (truncated: exceeded {max_tokens} token limit)"
+            return AddExternalCorpusReqOutput(
+                success=all_success,
+                corpus_id=results[0].corpus_id if all_success else "",
+                message=all_message,
+                loaded_token_count=results[0].loaded_token_count if all_success else 0,
+            )
+        except Exception as e:
+            return AddExternalCorpusReqOutput(success=False, message=str(e))
+
+    async def remove_external_corpus(
+        self: TokenizerManager, corpus_id: str
+    ) -> RemoveExternalCorpusReqOutput:
+        self.auto_create_handle_loop()
+        if self.server_args.speculative_algorithm != "NGRAM":
+            return RemoveExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        results = await self.remove_external_corpus_communicator(
+            RemoveExternalCorpusReqInput(corpus_id=corpus_id)
+        )
+        all_success, all_message = _Communicator.merge_results(results)
+        return RemoveExternalCorpusReqOutput(success=all_success, message=all_message)
+
+    async def list_external_corpora(
+        self: TokenizerManager,
+    ) -> ListExternalCorporaReqOutput:
+        self.auto_create_handle_loop()
+        if self.server_args.speculative_algorithm != "NGRAM":
+            return ListExternalCorporaReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        results = await self.list_external_corpora_communicator(
+            ListExternalCorporaReqInput()
+        )
+        all_success, all_message = _Communicator.merge_results(results)
+        # Merge corpus token counts from all DP ranks (each rank loads the same set).
+        corpus_token_counts = results[0].corpus_token_counts if all_success else {}
+        return ListExternalCorporaReqOutput(
+            success=all_success,
+            corpus_token_counts=corpus_token_counts,
+            message=all_message,
+        )
+
+    async def flush_cache(
+        self: TokenizerManager, timeout_s: Optional[float] = None
+    ) -> FlushCacheReqOutput:
+        self.auto_create_handle_loop()
+        return (
+            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+        )[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
+        self.auto_create_handle_loop()
         # Delegate to the scheduler to handle HiCacheStorage clearing
         return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
             0
@@ -361,6 +505,7 @@ class TokenizerCommunicatorMixin:
         hicache_write_policy: Optional[str] = None,
     ) -> AttachHiCacheStorageReqOutput:
         """Attach (enable) HiCache storage backend at runtime."""
+        self.auto_create_handle_loop()
         results = await self.attach_hicache_storage_communicator(
             AttachHiCacheStorageReqInput(
                 hicache_storage_backend=hicache_storage_backend,
@@ -392,6 +537,7 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager,
     ) -> DetachHiCacheStorageReqOutput:
         """Detach (disable) HiCache storage backend at runtime."""
+        self.auto_create_handle_loop()
         results = await self.detach_hicache_storage_communicator(
             DetachHiCacheStorageReqInput()
         )
@@ -480,7 +626,7 @@ class TokenizerCommunicatorMixin:
         return _Communicator.merge_results(results)
 
     async def destroy_weights_update_group(
-        self,
+        self: TokenizerManager,
         obj: DestroyWeightsUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -505,15 +651,15 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Immediately update the weights if the engine is in paused state
+        # Hold is_pause_cond while updating to prevent unpause from racing.
         async with self.is_pause_cond:
             is_paused = self.is_pause
+            if is_paused:
+                results = await self.update_weights_from_distributed_communicator(obj)
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            results = await self.update_weights_from_distributed_communicator(obj)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
@@ -523,7 +669,7 @@ class TokenizerCommunicatorMixin:
         return success, message
 
     async def init_weights_send_group_for_remote_instance(
-        self,
+        self: TokenizerManager,
         obj: InitWeightsSendGroupForRemoteInstanceReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -538,7 +684,7 @@ class TokenizerCommunicatorMixin:
         return result.success, result.message
 
     async def send_weights_to_remote_instance(
-        self,
+        self: TokenizerManager,
         obj: SendWeightsToRemoteInstanceReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -563,15 +709,14 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             is_paused = self.is_pause
+            if is_paused:
+                results = await self.update_weights_from_tensor_communicator(obj)
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            results = await self.update_weights_from_tensor_communicator(obj)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
@@ -581,7 +726,7 @@ class TokenizerCommunicatorMixin:
         return success, message
 
     async def update_weights_from_ipc(
-        self,
+        self: TokenizerManager,
         obj: UpdateWeightsFromIPCReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -593,10 +738,17 @@ class TokenizerCommunicatorMixin:
                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
             logger.info("Starting IPC weight update")
-            # This means that weight sync cannot run while requests are in progress.
-            async with self.model_update_lock.writer_lock:
-                result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                success, message = result.success, result.message
+
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+                if is_paused:
+                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
+                    success, message = result.success, result.message
+
+            if not is_paused:
+                async with self.model_update_lock.writer_lock:
+                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
+                    success, message = result.success, result.message
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
             logger.error(error_msg)
@@ -855,6 +1007,7 @@ class TokenizerCommunicatorMixin:
         await self.slow_down_communicator(obj)
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
         req = GetInternalStateReq()
         responses: List[GetInternalStateReqOutput] = (
             await self.get_internal_state_communicator(req)
@@ -865,6 +1018,7 @@ class TokenizerCommunicatorMixin:
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
     ) -> List[bool]:
+        self.auto_create_handle_loop()
         responses: List[SetInternalStateReqOutput] = (
             await self.set_internal_state_communicator(obj)
         )
@@ -873,9 +1027,11 @@ class TokenizerCommunicatorMixin:
     async def dumper_control(
         self: TokenizerManager, obj: DumperControlReqInput
     ) -> List[DumperControlReqOutput]:
+        self.auto_create_handle_loop()
         return await self.dumper_control_communicator(obj)
 
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
+        self.auto_create_handle_loop()
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
 
@@ -894,6 +1050,7 @@ class TokenizerCommunicatorMixin:
         Returns:
             List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
         """
+        self.auto_create_handle_loop()
         req = GetLoadsReqInput(
             include=include if include else ["all"],
             dp_rank=dp_rank,
@@ -907,28 +1064,51 @@ class TokenizerCommunicatorMixin:
         return results
 
     async def open_session(
-        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
+        self: TokenizerManager,
+        obj: OpenSessionReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+        if obj.streaming:
+            if not self.server_args.enable_streaming_session:
+                raise ValueError(
+                    "Streaming sessions are disabled. "
+                    "Please relaunch with --enable-streaming-session."
+                )
+            if (
+                self.server_args.speculative_algorithm is not None
+                and not self.server_args.disable_overlap_schedule
+            ):
+                raise ValueError(
+                    "Streaming sessions are incompatible with speculative decoding v2 "
+                    "(overlap + speculative). Use --disable-overlap-schedule or "
+                    "disable speculative decoding."
+                )
 
         if obj.session_id is None:
             obj.session_id = uuid.uuid4().hex
         elif obj.session_id in self.session_futures:
             return None
 
+        future = asyncio.Future()
+        self.session_futures[obj.session_id] = future
         self.send_to_scheduler.send_pyobj(obj)
 
-        self.session_futures[obj.session_id] = asyncio.Future()
-        session_id = await self.session_futures[obj.session_id]
-        del self.session_futures[obj.session_id]
-        return session_id
+        try:
+            return await future
+        finally:
+            self.session_futures.pop(obj.session_id, None)
 
     async def close_session(
-        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
+        self: TokenizerManager,
+        obj: CloseSessionReqInput,
+        request: Optional[fastapi.Request] = None,
     ):
         await self.send_to_scheduler.send_pyobj(obj)
 
-    def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
+    def _update_weight_version_if_provided(
+        self: TokenizerManager, weight_version: Optional[str]
+    ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
             self.server_args.weight_version = weight_version

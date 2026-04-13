@@ -388,21 +388,30 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
+            self.enable_storage_metrics = False
             if storage_config is not None:
                 self.is_mla_backend = storage_config.is_mla_model
                 self.local_rank = storage_config.tp_rank
                 self.pp_rank = storage_config.pp_rank
                 self.pp_size = storage_config.pp_size
+                self.attn_cp_rank = storage_config.attn_cp_rank
+                self.attn_cp_size = storage_config.attn_cp_size
+                self.enable_storage_metrics = storage_config.enable_storage_metrics
             else:
                 self.is_mla_backend = False
                 self.local_rank = 0
                 self.pp_rank = 0
                 self.pp_size = 1
+                self.attn_cp_rank = 0
+                self.attn_cp_size = 1
 
             self.enable_pp = self.pp_size > 1
-            if self.enable_pp:
-                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
-                self.mla_suffix = f"{self.pp_rank}"
+            self.enable_cp = self.attn_cp_size > 1
+            if self.enable_pp or self.enable_cp:
+                self.mha_suffix = (
+                    f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
+                )
+                self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
@@ -415,9 +424,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
-                if self.enable_pp:
+                if self.enable_pp or self.enable_cp:
                     self.mha_suffix = [
-                        f"{rank}_{self.pp_rank}" for rank in target_ranks
+                        f"{rank}_{self.pp_rank}_{self.attn_cp_rank}"
+                        for rank in target_ranks
                     ]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
@@ -581,9 +591,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             keys = [f"{prefix}_{key}" for key in keys]
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+
+        start_time = time.perf_counter()
         get_results = self._get_batch_zero_copy_impl(
             key_strs, buffer_ptrs, buffer_sizes
         )
+        end_time = time.perf_counter()
+
+        if self.enable_storage_metrics:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (end_time - start_time) * self.gb_per_page
+            )
+
         return self._batch_postprocess(get_results, is_set_operate=False)
 
     def batch_set_v1(
@@ -616,9 +636,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Only set non-existing keys to storage
         if len(set_keys) > 0:
+            start_time = time.perf_counter()
             put_results = self._put_batch_zero_copy_impl(
                 set_keys, set_buffer_ptrs, set_buffer_sizes
             )
+            end_time = time.perf_counter()
+
+            if self.enable_storage_metrics:
+                self.backup_pgs.append(len(set_keys))
+                self.backup_bandwidth.append(
+                    len(set_keys) / (end_time - start_time) * self.gb_per_page
+                )
+
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
 
@@ -681,10 +710,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         end_time = time.perf_counter()
 
-        self.backup_pgs.append(len(keys))
-        self.backup_bandwidth.append(
-            len(keys) / (end_time - start_time) * self.gb_per_page
-        )
+        if self.enable_storage_metrics:
+            self.backup_pgs.append(len(set_keys))
+            self.backup_bandwidth.append(
+                len(set_keys) / (end_time - start_time) * self.gb_per_page
+            )
 
         for i in range(len(set_indices)):
             if put_result[i] == 0:
@@ -731,10 +761,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         else:
             key_multiplier = 2
 
-        self.prefetch_pgs.append(len(keys))
-        self.prefetch_bandwidth.append(
-            len(keys) / (end_time - start_time) * self.gb_per_page
-        )
+        if self.enable_storage_metrics:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (end_time - start_time) * self.gb_per_page
+            )
 
         for i in range(len(keys)):
             if get_result[i] < 0:

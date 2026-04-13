@@ -1,5 +1,6 @@
 import os
 import random
+import sys
 from typing import Optional, Type
 
 import pytest
@@ -90,4 +91,4 @@ def test_accuracy(M, N, K, out_dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

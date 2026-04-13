@@ -30,7 +30,7 @@ conda create -n sgl-xpu python=3.12 -y
 conda activate sgl-xpu
 
 # Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
-pip3 install torch==2.9.0+xpu torchao torchvision torchaudio pytorch-triton-xpu==3.5.0 --index-url https://download.pytorch.org/whl/xpu
+pip3 install torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 pip3 install xgrammar --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
 
 # Clone the SGLang code
@@ -43,7 +43,7 @@ cd python
 cp pyproject_xpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
-pip install -v .
+pip install -v . --extra-index-url https://download.pytorch.org/whl/xpu
 ```
 
 ### Install Using Docker

@@ -84,12 +84,12 @@ def is_layer_skipped(
             if prefix_gate in ignored_layers and prefix_up in ignored_layers:
                 is_skipped = True
         elif "experts" in prefix:
-            is_skipped = any(
-                [
-                    prefix in layer_name
-                    for layer_name in ignored_layers
-                    if "experts" in layer_name
-                ]
+            # Expert names can include full module paths; keep coarse prefix matches
+            # (e.g., "model.layers.{i}.") while also checking expert-specific entries.
+            is_skipped = is_skipped or any(
+                prefix in layer_name
+                for layer_name in ignored_layers
+                if "experts" in layer_name
             )
 
     assert is_skipped is not None

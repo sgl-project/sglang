@@ -5,7 +5,7 @@ import pytest
 from sglang.srt.utils import sample_video_frames
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=4, suite="stage-a-test-cpu")
 
 
 class DummyVideo:
@@ -16,7 +16,8 @@ class DummyVideo:
     def __len__(self):
         return self._frames
 
-    def get_avg_fps(self):
+    @property
+    def avg_fps(self):
         return self._fps
 
 
