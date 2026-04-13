@@ -427,7 +427,9 @@ class Mistral3ForConditionalGeneration(nn.Module):
         execution_tensor = input_ids if input_ids is not None else inputs_embeds
         sdpa_context = (
             sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
-            if execution_tensor is not None and execution_tensor.device.type == "cuda" and current_platform.is_cuda()
+            if execution_tensor is not None
+            and execution_tensor.device.type == "cuda"
+            and current_platform.is_cuda()
             else nullcontext()
         )
         with sdpa_context:
