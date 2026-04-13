@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+from dataclasses import dataclass, field
+from typing import Any
+
+import torch
+
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+
+@dataclass
+class HybridAttentionSchedule:
+    """Configuration for hybrid attention scheduling.
+
+    During denoising, the first ``high_precision_first_steps`` and last
+    ``high_precision_last_steps`` steps use the high-precision backend,
+    while the middle steps use the low-precision backend.
+
+    Parsed once on ``ServerArgs`` and shared across all attention modules.
+    Before each denoising step, ``update_current_backend()`` swaps
+    ``module.attn_impl`` on every registered module to the correct impl.
+    """
+
+    high_precision_backend: AttentionBackendEnum
+    low_precision_backend: AttentionBackendEnum
+    high_precision_first_steps: int
+    high_precision_last_steps: int
+    registered_modules: list[tuple[Any, Any, Any]] = field(
+        default_factory=list, repr=False
+    )
+
+    def register_module(
+        self,
+        module: torch.nn.Module,
+        high_impl: Any,
+        low_impl: Any,
+    ) -> None:
+        """Register an attention module for backend swapping."""
+        self.registered_modules.append((module, high_impl, low_impl))
+
+    def update_current_backend(self, step_index: int, total_steps: int) -> None:
+        """Swap attn_impl on all registered modules for the current step."""
+        use_high = (
+            self.get_backend_for_step(step_index, total_steps)
+            == self.high_precision_backend
+        )
+        for module, high_impl, low_impl in self.registered_modules:
+            module.attn_impl = high_impl if use_high else low_impl
+
+    def get_backend_for_step(
+        self, step_index: int, total_steps: int
+    ) -> AttentionBackendEnum:
+        """Return which backend should be active for a given denoising step."""
+        if step_index < self.high_precision_first_steps:
+            return self.high_precision_backend
+        if step_index >= total_steps - self.high_precision_last_steps:
+            return self.high_precision_backend
+        return self.low_precision_backend
+
+    @classmethod
+    def from_string(cls, schedule_str: str) -> "HybridAttentionSchedule":
+        """Parse from CLI string ``'high_backend:low_backend:first:last'``.
+
+        Example: ``'fa:sdpa:3:3'``
+        """
+        parts = schedule_str.split(":")
+        if len(parts) != 4:
+            raise ValueError(
+                f"hybrid-attention-schedule must have 4 colon-separated parts "
+                f"'high_backend:low_backend:first_steps:last_steps', got: {schedule_str!r}"
+            )
+
+        high_name, low_name, first_str, last_str = parts
+
+        try:
+        try:
+            high_name_norm = high_name.lower().replace("fa3", "fa").replace("fa4", "fa")
+            high_backend = AttentionBackendEnum[high_name_norm.upper()]
+        except KeyError:
+            raise ValueError(
+                f"Unknown high-precision attention backend '{high_name}'. "
+                f"Available: {[e.name.lower() for e in AttentionBackendEnum]}"
+            )
+
+        try:
+            low_name_norm = low_name.lower().replace("fa3", "fa").replace("fa4", "fa")
+            low_backend = AttentionBackendEnum[low_name_norm.upper()]
+        except KeyError:
+            raise ValueError(
+                f"Unknown low-precision attention backend '{low_name}'. "
+                f"Available: {[e.name.lower() for e in AttentionBackendEnum]}"
+            )
+
+        try:
+            first_steps = int(first_str)
+            last_steps = int(last_str)
+        except ValueError:
+            raise ValueError(
+                f"first_steps and last_steps must be integers, got: "
+                f"{first_str!r} and {last_str!r}"
+            )
+
+        if first_steps < 0 or last_steps < 0:
+            raise ValueError(
+                f"first_steps and last_steps must be non-negative, got: "
+                f"{first_steps} and {last_steps}"
+            )
+
+        return cls(
+            high_precision_backend=high_backend,
+            low_precision_backend=low_backend,
+            high_precision_first_steps=first_steps,
+            high_precision_last_steps=last_steps,
+        )

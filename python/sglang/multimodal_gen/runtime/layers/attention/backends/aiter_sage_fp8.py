@@ -12,29 +12,28 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
-class AITERSageBackend(AttentionBackend):
+class AITERSageFp8Backend(AttentionBackend):
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
-        return AttentionBackendEnum.AITER_SAGE
+        return AttentionBackendEnum.AITER_SAGE_FP8
 
     @staticmethod
-    def get_impl_cls() -> type["AITERSageImpl"]:
-        return AITERSageImpl
+    def get_impl_cls() -> type["AITERSageFp8Impl"]:
+        return AITERSageFp8Impl
 
     @staticmethod
     def get_metadata_cls() -> type["AttentionMetadata"]:
-        # AITER Sage backend does not require special metadata.
         return AttentionMetadata
 
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError(
-            "AITER Sage backend does not have a metadata builder."
+            "AITER Sage FP8 backend does not have a metadata builder."
         )
 
 
-class AITERSageImpl(AttentionImpl):
+class AITERSageFp8Impl(AttentionImpl):
 
     def __init__(
         self,
@@ -51,10 +50,10 @@ class AITERSageImpl(AttentionImpl):
         try:
             from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
 
-            self.aiter_sage_attn_fn = fav3_sage_wrapper_func
+            self.attn_fn = fav3_sage_wrapper_func
         except ImportError:
             raise ImportError(
-                "AITER Sage attention is not available, please update AITER version."
+                "AITER Sage FP8 attention is not available, please update AITER version."
             )
 
     def forward(
@@ -65,7 +64,7 @@ class AITERSageImpl(AttentionImpl):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         """
-        Performs attention using aiter sage backend.
+        Performs attention using AITER Sage FP8 backend.
 
         Args:
             query: Query tensor of shape [batch_size, seq_len, head_num, head_dim]
@@ -77,5 +76,5 @@ class AITERSageImpl(AttentionImpl):
             Output tensor of shape [batch_size, seq_len, head_num, head_dim]
         """
 
-        output = self.aiter_sage_attn_fn(query, key, value)
+        output = self.attn_fn(query, key, value)
         return output

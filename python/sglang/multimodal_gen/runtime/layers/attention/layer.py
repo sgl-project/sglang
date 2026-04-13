@@ -22,7 +22,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     wrap_attention_impl_forward,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    global_force_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_output_all_to_all,
@@ -33,7 +36,74 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.utils import get_compute_dtype
+
+
+def _init_hybrid_schedule(
+    module: nn.Module,
+    head_size: int,
+    dtype: torch.dtype,
+    num_heads: int,
+    num_kv_heads: int,
+    softmax_scale: float,
+    causal: bool,
+    prefix: str,
+    extra_impl_args: dict,
+) -> None:
+    """Register an attention module for hybrid backend swapping.
+
+    Creates both a high-precision and low-precision impl, registers the
+    module on the shared ``HybridAttentionSchedule``.
+    """
+
+    server_args = get_global_server_args()
+    if server_args is None or server_args.parsed_hybrid_schedule is None:
+        return
+
+    schedule = server_args.parsed_hybrid_schedule
+
+    # Force each backend explicitly via the global override so the
+    # CLI/default --attention-backend doesn't interfere.
+    with global_force_attn_backend_context_manager(schedule.high_precision_backend):
+        high_backend = get_attn_backend(
+            head_size,
+            dtype,
+            supported_attention_backends={schedule.high_precision_backend},
+        )
+    high_impl_cls = high_backend.get_impl_cls()
+    high_impl = high_impl_cls(
+        num_heads=num_heads,
+        head_size=head_size,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        num_kv_heads=num_kv_heads,
+        prefix=f"{prefix}.high_impl",
+        **extra_impl_args,
+    )
+    wrap_attention_impl_forward(high_impl)
+
+    with global_force_attn_backend_context_manager(schedule.low_precision_backend):
+        low_backend = get_attn_backend(
+            head_size,
+            dtype,
+            supported_attention_backends={schedule.low_precision_backend},
+        )
+    low_impl_cls = low_backend.get_impl_cls()
+    low_impl = low_impl_cls(
+        num_heads=num_heads,
+        head_size=head_size,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        num_kv_heads=num_kv_heads,
+        prefix=f"{prefix}.low_impl",
+        **extra_impl_args,
+    )
+    wrap_attention_impl_forward(low_impl)
+
+    schedule.register_module(module, high_impl, low_impl)
+    # Default to high-precision impl until the first update_current_backend call
+    module.attn_impl = high_impl
 
 
 class UlyssesAttention(nn.Module):
@@ -80,6 +150,18 @@ class UlyssesAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
+
+        _init_hybrid_schedule(
+            self,
+            head_size=head_size,
+            dtype=dtype,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            softmax_scale=self.softmax_scale,
+            causal=causal,
+            prefix=prefix,
+            extra_impl_args=extra_impl_args,
+        )
 
     def forward(
         self,
@@ -261,6 +343,18 @@ class LocalAttention(nn.Module):
         self.backend = attn_backend.get_enum()
         self.dtype = dtype
 
+        _init_hybrid_schedule(
+            self,
+            head_size=head_size,
+            dtype=dtype,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            softmax_scale=self.softmax_scale,
+            causal=causal,
+            prefix="",
+            extra_impl_args=extra_impl_args,
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -392,6 +486,18 @@ class USPAttention(nn.Module):
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
+
+        _init_hybrid_schedule(
+            self,
+            head_size=head_size,
+            dtype=dtype,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            softmax_scale=self.softmax_scale,
+            causal=causal,
+            prefix=prefix,
+            extra_impl_args=extra_impl_args,
+        )
 
     def forward(
         self,

@@ -107,6 +107,8 @@ class ServerArgs:
     # Attention
     attention_backend: str = None
     attention_backend_config: addict.Dict | None = None
+    hybrid_attention_schedule: str | None = None
+    parsed_hybrid_schedule: Any = None
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -392,6 +394,15 @@ class ServerArgs:
                 return
             self._set_default_attention_backend()
 
+        if self.hybrid_attention_schedule:
+            from sglang.multimodal_gen.runtime.layers.attention.hybrid_schedule import (
+                HybridAttentionSchedule,
+            )
+
+            self.parsed_hybrid_schedule = HybridAttentionSchedule.from_string(
+                self.hybrid_attention_schedule
+            )
+
     def _adjust_warmup(self):
         if self.warmup_resolutions is not None:
             self.warmup = True
@@ -623,6 +634,17 @@ class ServerArgs:
             type=str,
             default=None,
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
+        )
+        parser.add_argument(
+            "--hybrid-attention-schedule",
+            type=str,
+            default=None,
+            help=(
+                "Hybrid attention schedule: 'high_backend:low_backend:first_steps:last_steps'. "
+                "Uses high-precision backend for the first and last N steps, "
+                "low-precision backend for middle steps. "
+                "Example: 'fa:sdpa:3:3'."
+            ),
         )
         parser.add_argument(
             "--cache-dit-config",

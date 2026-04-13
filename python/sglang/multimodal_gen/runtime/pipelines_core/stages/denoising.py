@@ -1125,6 +1125,11 @@ class DenoisingStage(PipelineStage):
                             )
                         )
 
+                        if server_args.parsed_hybrid_schedule is not None:
+                            server_args.parsed_hybrid_schedule.update_current_backend(
+                                i, num_timesteps
+                            )
+
                         # Expand latents for I2V
                         latent_model_input = latents.to(target_dtype)
                         if batch.image_latent is not None:
