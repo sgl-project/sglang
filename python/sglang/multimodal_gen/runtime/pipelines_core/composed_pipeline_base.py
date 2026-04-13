@@ -8,7 +8,6 @@ This module defines the base class for pipelines that are composed of multiple s
 """
 
 import os
-import re
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Literal, cast
 
@@ -305,6 +304,7 @@ class ComposedPipelineBase(ABC):
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
+                component_architecture=architecture,
             )
 
             self.memory_usages[load_module_name] = memory_usage
@@ -333,12 +333,7 @@ class ComposedPipelineBase(ABC):
 
     @staticmethod
     def _infer_stage_name(stage: PipelineStage) -> str:
-        class_name = stage.__class__.__name__
-        # snake_case
-        name = re.sub(r"(?<!^)(?=[A-Z])", "_", class_name).lower()
-        if not name.endswith("_stage"):
-            name += "_stage"
-        return name
+        return stage.__class__.__name__
 
     def add_stage(
         self, stage: PipelineStage, stage_name: str | None = None

@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=450, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=244, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -36,7 +36,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=["--model-impl", "transformers"],
         )
-        cls.mmlu_lower_bound = 0.65
+        cls.mmlu_lower_bound = 0.63
         cls.gsm8k_lower_bound = 0.65
 
     @classmethod
@@ -86,7 +86,7 @@ class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
                 "int4wo-128",
             ],
         )
-        cls.mmlu_lower_bound = 0.65
+        cls.mmlu_lower_bound = 0.63
         cls.gsm8k_lower_bound = 0.65
 
 

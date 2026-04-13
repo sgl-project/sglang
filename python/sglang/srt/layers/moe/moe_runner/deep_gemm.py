@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
@@ -44,7 +44,7 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if not (_is_npu or _is_hip) and _is_cuda:
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sgl_kernel import silu_and_mul
 
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
@@ -120,6 +120,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         runner_input: DeepGemmRunnerInput,
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> DeepGemmRunnerOutput:
         if not runner_input.use_masked_gemm:
             hidden_states = self._run_contiguous_gemm(

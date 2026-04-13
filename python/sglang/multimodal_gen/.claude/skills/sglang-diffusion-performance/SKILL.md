@@ -26,8 +26,8 @@ These options are intended to preserve output quality. In practice, some paths (
 | **torch.compile** | `--enable-torch-compile` | Applies `torch.compile` to the DiT forward pass, fusing ops and reducing kernel launch overhead. | ~1.2–1.5x on denoising | First request is slow (compilation). May cause minor precision drifts due to [PyTorch issue #145213](https://github.com/pytorch/pytorch/issues/145213). Pair with `--warmup` for best results. |
 | **Warmup** | `--warmup` | Runs dummy forward passes to warm up CUDA caches, JIT, and `torch.compile`. Eliminates cold-start penalty. | Removes first-request latency spike | Adds startup time. Without `--warmup-resolutions`, warmup happens on first request. |
 | **Warmup Resolutions** | `--warmup-resolutions 256x256 720x720` | Pre-compiles and warms up specific resolutions at server startup (instead of lazily on first request). | Faster first request per resolution | Each resolution adds to startup time. Serving mode only; useful when you know your target resolutions in advance. |
-| **Multi-GPU (SP)** | `--num-gpus N --ulysses-degree N` | Sequence parallelism across GPUs. Shards sequence tokens (not frames) to minimize padding. | Near-linear scaling with N GPUs | Requires NCCL; inter-GPU bandwidth matters. `ulysses_degree * ring_degree = sp_degree`. |
-| **CFG Parallel** | `--enable-cfg-parallel` | Runs conditional and unconditional CFG branches in parallel across GPUs. For CFG models on multi-GPU, benchmark this against pure Ulysses on your topology instead of assuming one always wins. | Often faster than pure SP for CFG models | Requires `num_gpus >= 2`. Halves the Ulysses group size (e.g. 8 GPU → two 4-GPU groups). Only for models that use CFG. |
+| **Multi-GPU (SP)** | `--num-gpus N --ulysses-degree N` | Sequence parallelism across GPUs. Shards sequence tokens (not frames) to minimize padding. | Near-linear scaling with N GPUs | Requires NCCL; inter-GPU bandwidth matters. `ulysses_degree * ring_degree = sp_degree`. For Wan2.2 video, start by benchmarking pure Ulysses before assuming a mixed Ulysses/Ring layout is fastest. |
+| **CFG Parallel** | `--enable-cfg-parallel` | Runs conditional and unconditional CFG branches in parallel across GPUs. For CFG models on multi-GPU, benchmark this against pure Ulysses on your topology instead of assuming one always wins. | Often faster than pure SP for CFG models | Requires `num_gpus >= 2`. Halves the Ulysses group size (e.g. 8 GPU → two 4-GPU groups). Only for models that use CFG. Nightly coverage configs may intentionally use smaller Ulysses groups to keep ring behavior exercised; that does not automatically make them the lowest-latency choice. |
 | **Layerwise Offload** | `--dit-layerwise-offload` | Async layer-by-layer H2D prefetch with compute overlap. Only ~2 DiT layers reside on GPU at a time, dramatically reducing VRAM. For some video models the copy stream can be almost fully hidden behind compute ([PR #15511](https://github.com/sgl-project/sglang/pull/15511)). | Saves VRAM (40 GB → ~11 GB for Wan A14B); can be near-zero speed cost on the right workload | Enabled by default for Wan/MOVA video models. Incompatible with Cache-DiT. For **image models** or highly parallelized setups (many GPUs, small per-GPU compute), the copy stream may not be fully hidden and can cause slowdown. |
 | **Offload Prefetch Size** | `--dit-offload-prefetch-size F` | Fine-grained control over layerwise offload: how many layers to prefetch ahead. `0.0` = 1 layer (min VRAM), `0.1` = 10% of layers, `≥1` = absolute layer count. | Tune for cases where default offload has copy stream interference (e.g. image models). 0.05–0.1 is a good starting point. | Values ≥ 0.5 approach no-offload VRAM with worse performance. See [PR #17693](https://github.com/sgl-project/sglang/pull/17693) for benchmarks on image models. |
 | **FSDP Inference** | `--use-fsdp-inference` | Uses PyTorch FSDP to shard model weights across GPUs with prefetch. Low latency, low VRAM. | Reduces per-GPU VRAM | Mutually exclusive with `--dit-layerwise-offload`. More overhead than SP on high-bandwidth interconnects. |
@@ -66,6 +66,58 @@ sglang generate --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
 ```
 
 Note: `--dit-layerwise-offload` is enabled by default for Wan/MOVA video models and is often a good default, but still benchmark it on your exact workload if latency matters.
+
+For Wan2.2 specifically:
+- the nightly-aligned 4-GPU benchmark may use `--enable-cfg-parallel --ulysses-degree=2` to keep CFG and ring behavior covered
+- that is a **coverage** choice, not a guaranteed best-performance choice
+- for pure latency tuning, benchmark pure Ulysses too, for example `--ulysses-degree=4 --ring-degree=1` on 4 GPUs
+- on 8 GPUs, compare pure `--ulysses-degree=8` against `--enable-cfg-parallel --ulysses-degree=4`
+
+### Nightly-aligned model, single GPU: LTX-2 two-stage
+
+```bash
+sglang generate --model-path Lightricks/LTX-2 \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --prompt "A beautiful sunset over the ocean" \
+  --negative-prompt "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width 1536 --height 1024 \
+  --num-frames 121 --fps 24 \
+  --seed 1234 --num-gpus 1 \
+  --enable-torch-compile --warmup --save-output
+```
+
+Note: this generate recipe is aligned with the nightly comparison case `ltx2_twostage_t2v`. After [PR #20707](https://github.com/sgl-project/sglang/pull/20707), `LTX2TwoStagePipeline` is a native path and auto-resolves the spatial upsampler plus distilled LoRA from the same model snapshot unless you override them.
+
+### Native baseline, 2 GPUs: LTX-2.3 one-stage
+
+```bash
+sglang generate --model-path Lightricks/LTX-2.3 \
+  --prompt "A beautiful sunset over the ocean" \
+  --negative-prompt "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width 768 --height 512 \
+  --num-frames 121 --fps 24 \
+  --num-inference-steps 30 --guidance-scale 3.0 \
+  --seed 1234 --num-gpus 2 \
+  --enable-torch-compile --warmup --save-output
+```
+
+Note: use this as the native `LTX2Pipeline` baseline for `LTX-2.3`. It keeps the validated one-stage resolution and explicit `LTX-2.3` sampling defaults, and matches the `ltx23-one-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
+
+### Benchmark target, 2 GPUs: LTX-2.3 two-stage
+
+```bash
+sglang generate --model-path Lightricks/LTX-2.3 \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --prompt "A beautiful sunset over the ocean" \
+  --negative-prompt "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width 1536 --height 1024 \
+  --num-frames 121 --fps 24 \
+  --num-inference-steps 30 --guidance-scale 3.0 \
+  --seed 1234 --num-gpus 2 \
+  --enable-torch-compile --warmup --save-output
+```
+
+Note: this is the recommended benchmark command for the new `LTX-2.3` two-stage path. It uses the native `LTX2TwoStagePipeline` and matches the `ltx23-two-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
 
 ### Maximum speed, image model, single GPU, lossless
 
@@ -107,3 +159,7 @@ SGLANG_CACHE_DIT_ENABLED=true sglang generate --model-path <MODEL> \
 - **Perf dump**: use `--perf-dump-path result.json` to save structured metrics, then compare with `python python/sglang/multimodal_gen/benchmarks/compare_perf.py baseline.json result.json`.
 - **Offload tuning**: after the first request, the runtime logs peak GPU memory and which components could stay resident. Use this to decide which `--*-cpu-offload` flags to disable.
 - **Backend selection**: `--backend sglang` (default, auto-detected) enables all native optimizations (fused kernels, SP, etc.). `--backend diffusers` falls back to vanilla Diffusers pipelines but supports `--cache-dit-config` and diffusers attention backends.
+- **Wan2.2-I2V sizing**: after [PR #21390](https://github.com/sgl-project/sglang/pull/21390), explicit `--width/--height` on `Wan2.2-I2V-A14B` control the target area while preserving the condition-image aspect ratio.
+- **Merged diffusion fast paths**: before proposing a new kernel or overlap scheme, check `sglang-diffusion-benchmark-profile/existing-fast-paths.md`. It now covers merged Z-Image residual-form modulation, fused diffusion `QK norm + RoPE`, and existing multi-GPU overlap families such as Ulysses / USP and turbo-layer async all-to-all.
+- **NVFP4 trace interpretation**: on FLUX.2 NVFP4 and Nunchaku-style checkpoints, packed QKV is expected. SGLang intentionally uses fused projection modules such as `to_qkv` / `to_added_qkv` instead of separate `to_q` / `to_k` / `to_v`, so a split-QKV trace usually means the quantized path did not engage rather than a brand new fusion opportunity.
+- **Hotspot workflow split**: use `sglang-diffusion-benchmark-profile` to prove and classify a slowdown with perf dumps plus `torch.profiler`; hand concrete kernel work to `sglang-diffusion-ako4all-kernel` or another specialized optimization skill instead of expanding the benchmark skill.
