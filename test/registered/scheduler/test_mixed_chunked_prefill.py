@@ -1,7 +1,3 @@
-"""
-python3 -m unittest test_mixed_chunked_prefill.TestMixedChunkedPrefill.test_mixed_chunked_prefill_without_radix_cache
-"""
-
 import unittest
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
