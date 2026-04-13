@@ -96,6 +96,7 @@ class SchedulerUpdateWeightsMixin:
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def update_weights_from_tensor(
@@ -137,6 +138,8 @@ class SchedulerUpdateWeightsMixin:
         """Optional post-processing for updated weights (e.g., Marlin conversion)."""
         self._quiesce_for_weight_update()
         success, message = self.tp_worker.post_process_weights(recv_req)
+        if self.tp_cpu_group is not None:
+            torch.distributed.barrier(group=self.tp_cpu_group)
         return PostProcessWeightsReqOutput(success, message)
 
     def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
