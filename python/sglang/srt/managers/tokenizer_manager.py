@@ -1950,7 +1950,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and len(recv_obj.spec_accepted_tokens) > i
         ):
             # The draft tokens per speculative step (excluding the target-sampled token).
-            num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
+            num_draft = self.server_args.speculative_num_draft_tokens
+            if num_draft is None:
+                return
+            num_guess_tokens = num_draft - 1
             total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
             accepted_tokens = recv_obj.spec_accepted_tokens[i]
 
