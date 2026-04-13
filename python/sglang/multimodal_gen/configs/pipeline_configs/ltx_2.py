@@ -124,13 +124,14 @@ def sync_ltx23_runtime_vae_markers(
 ) -> None:
     if loaded_vae_config is None:
         return
+    source = getattr(loaded_vae_config, "arch_config", loaded_vae_config)
     for key in (
         "ltx_variant",
         "condition_encoder_subdir",
         "video_decoder_variant",
         "video_decoder_config",
     ):
-        value = getattr(loaded_vae_config, key, None)
+        value = getattr(source, key, None)
         if value is not None:
             setattr(arch_config, key, value)
 
