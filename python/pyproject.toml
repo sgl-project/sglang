@@ -22,7 +22,7 @@ dependencies = [
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
-  "cuda-python==12.9",
+  "cuda-python>=13.0",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "datasets",
   "einops",
@@ -86,14 +86,14 @@ url = "https://pypi.org/simple"
 default = true
 
 [[tool.uv.index]]
-name = "torch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
+name = "torch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
 torch = [
   { index = "pypi", marker = "platform_machine == 'x86_64'"},
-  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+  { index = "torch-cu130", marker = "platform_machine == 'aarch64'"},
 ]
 
 [project.optional-dependencies]
