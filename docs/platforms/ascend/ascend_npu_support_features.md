@@ -243,29 +243,29 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Expert parallelism
 
-| Argument                                              | Defaults  | Options                                     | Server supported |
-|-------------------------------------------------------|-----------|---------------------------------------------|:----------------:|
-| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                   |      A2, A3      |
-| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep` |      A2, A3      |
-| `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                            |      A2, A3      |
-| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                      | Special for GPU  |
-| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)              | Special for GPU  |
-| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`   |      A2, A3      |
-| `--deepep-config`                                     | `None`    | Type: str                                   | Special for GPU  |
-| `--ep-num-redundant-experts`                          | `0`       | Type: int                                   |      A2, A3      |
-| `--ep-dispatch-algorithm`                             | `None`    | `static`,<br/> `dynamic`,<br/> `fake`       |      A2, A3      |
+| Argument                                              | Defaults  | Options                                                                   | Server supported |
+|-------------------------------------------------------|-----------|---------------------------------------------------------------------------|:----------------:|
+| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                                                 |      A2, A3      |
+| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep`(It is incompatible with eplb) |      A2, A3      |
+| `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                                                          |      A2, A3      |
+| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                                                    | Special for GPU  |
+| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)                                            | Special for GPU  |
+| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`                                 |      A2, A3      |
+| `--deepep-config`                                     | `None`    | Type: str                                                                 | Special for GPU  |
+| `--ep-num-redundant-experts`                          | `0`       | Type: int                                                                 |      A2, A3      |
+| `--ep-dispatch-algorithm`                             | `None`    | `static`,<br/> `dynamic`,<br/> `fake`                                     |      A2, A3      |
 | `--init-expert-location`                              | `trivial` | `trivial`,<br/> `<path.pt>`,<br/> `<path.json>`,<br/> `<json_string>` |      A2, A3      |
 | `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              |      A2, A3      |
 | `--eplb-algorithm`                                    | `deepseek`| `auto`,<br/> `<deepseek>` |      A2, A3      |
-| `--eplb-rebalance-num-iterations`                     | `1000`    | Type: int                                   |      A2, A3      |
-| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   |      A2, A3      |
-| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 |      A2, A3      |
-| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | `stat`,<br/> `stat_approx`,<br/> `per_pass`,<br/> `per_token` |      A2, A3      |
-| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                   |      A2, A3      |
-| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag (set to enable)                   |      A2, A3      |
-| `--moe-dense-tp-size`                                 | `None`    | `1`                                         |      A2, A3      |
-| `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                          | Special for GPU  |
-| `--mooncake-ib-device`                                | `None`    | Type: str                                   | Special for GPU  |
+| `--eplb-rebalance-num-iterations`                     | `1000`    | Type: int                                                                 |      A2, A3      |
+| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                                                 |      A2, A3      |
+| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                                               |      A2, A3      |
+| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | `stat`,<br/> `stat_approx`,<br/> `per_pass`,<br/> `per_token`             |      A2, A3      |
+| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                                                 |      A2, A3      |
+| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag (set to enable)                                                 |      A2, A3      |
+| `--moe-dense-tp-size`                                 | `None`    | `1`                                                                       |      A2, A3      |
+| `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                                                        | Special for GPU  |
+| `--mooncake-ib-device`                                | `None`    | Type: str                                                                 | Special for GPU  |
 
 ## Mamba Cache
 
@@ -404,12 +404,13 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Encode prefill disaggregation
 
-| Argument                     | Defaults           | Options                                                        | Server supported |
-|------------------------------|--------------------|----------------------------------------------------------------|:----------------:|
-| `--encoder-only`             | `False`            | bool flag<br/> (set to enable)                                 |      A2, A3      |
-| `--language-only`            | `False`            | bool flag<br/> (set to enable)                                 |      A2, A3      |
-| `--encoder-transfer-backend` | `zmq_to_scheduler` | `zmq_to_scheduler`, <br/> `zmq_to_tokenizer`,<br/>  `mooncake` |      A2, A3      |
-| `--encoder-urls`             | `[]`               | List[str]                                                      |      A2, A3      |
+| Argument                                | Defaults           | Options                                                          | Server supported |
+| --------------------------------------- | ------------------ | ---------------------------------------------------------------- |:----------------:|
+| `--enable-adaptive-dispatch-to-encoder` | `False`            | bool flag<br/> (set to enable adaptively dispatch)               |      A2, A3      |
+| `--encoder-only`                        | `False`            | bool flag<br/> (set to launch an encoder-only server)            |      A2, A3      |
+| `--language-only`                       | `False`            | bool flag<br/> (set to load weights for the language model only) |      A2, A3      |
+| `--encoder-transfer-backend`            | `zmq_to_scheduler` | `zmq_to_scheduler`, <br/> `zmq_to_tokenizer`,<br/>  `mooncake`   |      A2, A3      |
+| `--encoder-urls`                        | `[]`               | List[str]<br/> (List of encoder server urls)                     |      A2, A3      |
 
 ## Custom weight loader
 
@@ -435,8 +436,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 | Argument                                      | Defaults | Options                        | Server supported |
 |-----------------------------------------------|----------|--------------------------------|:----------------:|
-| `--mm-max-concurrent-calls`                   | `32`     | Type: int                      |      A2, A3      |
-| `--mm-per-request-timeout`                    | `10.0`   | Type: float                    |      A2, A3      |
 | `--enable-broadcast-mm-`<br/>`inputs-process` | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--mm-process-config`                         | `None`   | Type: JSON / Dict              |      A2, A3      |
 | `--mm-enable-dp-encoder`                      | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
