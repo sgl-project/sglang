@@ -15,6 +15,9 @@ Usage:
 
     # Run only specific framework(s)
     python3 scripts/ci/utils/diffusion/run_comparison.py --frameworks sglang
+
+    # Cleanup installed comparison framework venvs after run
+    python3 scripts/ci/utils/diffusion/run_comparison.py --cleanup-framework-venvs
 """
 
 import argparse
@@ -45,6 +48,7 @@ HEALTH_TIMEOUT = (
 )
 REQUEST_TIMEOUT = 1200  # seconds
 GPU_CLEAR_WAIT = 15  # seconds between framework runs
+FRAMEWORK_INSTALL_TIMEOUT = 1800  # seconds (source installs can be slow)
 
 # Frameworks that need separate installation (conflict with sglang's deps)
 INSTALLABLE_FRAMEWORKS = {"vllm-omni", "lightx2v"}
@@ -54,12 +58,29 @@ _cached_ref_image: bytes | None = None
 _cached_ref_image_path: str | None = None
 
 
+def _framework_executable(executable: str, framework_bin_dir: str | None) -> str:
+    """Return framework-scoped executable path when available."""
+    if framework_bin_dir:
+        return os.path.join(framework_bin_dir, executable)
+    return executable
+
+
+def _expected_framework_bin_dir(fw_name: str) -> str | None:
+    """Return expected framework venv bin directory for installable frameworks."""
+    if fw_name not in INSTALLABLE_FRAMEWORKS:
+        return None
+    venv_root = os.environ.get("COMPARISON_VENV_ROOT", "/tmp/sglang-comparison-venvs")
+    return os.path.join(venv_root, fw_name, "bin")
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle — command builders
 # ---------------------------------------------------------------------------
 
 
-def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
+def _build_sglang_cmd(
+    case: dict, fw_cfg: dict, port: int, framework_bin_dir: str | None = None
+) -> list[str]:
     cmd = [
         "sglang",
         "serve",
@@ -77,9 +98,11 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
     return cmd
 
 
-def _build_vllm_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
+def _build_vllm_cmd(
+    case: dict, fw_cfg: dict, port: int, framework_bin_dir: str | None = None
+) -> list[str]:
     cmd = [
-        "vllm",
+        _framework_executable("vllm", framework_bin_dir),
         "serve",
         case["model"],
         "--omni",
@@ -107,19 +130,54 @@ def _resolve_hf_model_path(model_id: str) -> str:
         return model_id
 
 
-def _write_lightx2v_config(case: dict) -> str:
+def _write_lightx2v_config(case: dict, fw_cfg: dict, model_path: str) -> str:
     """Write a minimal LightX2V config JSON and return its path."""
+    guidance_scale = case.get("guidance_scale", 4.0)
     cfg = {
         "infer_steps": case.get("num_inference_steps", 50),
-        "guidance_scale": case.get("guidance_scale", 4.0),
+        "guidance_scale": guidance_scale,
         "seed": case.get("seed", 42),
     }
+    model_cls = fw_cfg.get("model_cls")
+    if model_cls == "ltx2":
+        # LTX2 scheduler requires these keys.
+        cfg["sample_shift"] = fw_cfg.get("sample_shift", [2.05, 0.95])
+        cfg["sample_guide_scale"] = fw_cfg.get("sample_guide_scale", guidance_scale)
+        # LTX2 runner accesses config["fps"] directly when deriving duration.
+        # Use case fps when provided; otherwise use the runner's common default.
+        cfg["fps"] = case.get("fps", fw_cfg.get("fps", 24))
+        # LTX2 runner also directly indexes audio config keys. Set stable
+        # defaults to avoid runtime KeyError when framework internals omit them.
+        cfg["audio_mel_bins"] = fw_cfg.get("audio_mel_bins", 16)
+        cfg["audio_sampling_rate"] = fw_cfg.get("audio_sampling_rate", 16000)
+        cfg["audio_hop_length"] = fw_cfg.get("audio_hop_length", 160)
+        cfg["audio_scale_factor"] = fw_cfg.get("audio_scale_factor", 4)
+        # LTX2 transformer weights require attn_type; use torch_sdpa as the
+        # most portable default when optional flash/sage kernels are absent.
+        cfg["attn_type"] = fw_cfg.get("attn_type", "torch_sdpa")
+        # Prefer a concrete checkpoint file to avoid loading metadata from a
+        # directory path (can fail on some environments/filesystems).
+        ltx_ckpt_candidates = [
+            fw_cfg.get("dit_original_ckpt"),
+            os.path.join(model_path, "ltx-2-19b-dev.safetensors"),
+            os.path.join(model_path, "ltx-2-19b-distilled.safetensors"),
+            os.path.join(model_path, "ltx-2-19b-dev-fp8.safetensors"),
+            os.path.join(model_path, "ltx-2-19b-dev-fp4.safetensors"),
+        ]
+        for ckpt in ltx_ckpt_candidates:
+            if ckpt and os.path.isfile(ckpt):
+                cfg["dit_original_ckpt"] = ckpt
+                break
+
     if "num_frames" in case:
         cfg["target_video_length"] = case["num_frames"]
     if "height" in case:
         cfg["height"] = case["height"]
+        # LTX2 runner reads target_height/target_width in request-time config.
+        cfg["target_height"] = case["height"]
     if "width" in case:
         cfg["width"] = case["width"]
+        cfg["target_width"] = case["width"]
 
     config_path = os.path.join(
         tempfile.gettempdir(), f"lightx2v_config_{case['id']}.json"
@@ -129,7 +187,13 @@ def _write_lightx2v_config(case: dict) -> str:
     return config_path
 
 
-def _build_lightx2v_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
+def _build_lightx2v_cmd(
+    case: dict,
+    fw_cfg: dict,
+    port: int,
+    framework_bin_dir: str | None = None,
+    resolve_model_path: bool = True,
+) -> list[str]:
     """Build LightX2V server launch command.
 
     Single GPU:  python -m lightx2v.server --model_path ... --model_cls ... --task ... --port ...
@@ -140,8 +204,10 @@ def _build_lightx2v_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
     model_cls = fw_cfg["model_cls"]
     task = fw_cfg["lightx2v_task"]
     num_gpus = case["num_gpus"]
-    model_path = _resolve_hf_model_path(case["model"])
-    config_path = _write_lightx2v_config(case)
+    model_path = (
+        _resolve_hf_model_path(case["model"]) if resolve_model_path else case["model"]
+    )
+    config_path = _write_lightx2v_config(case, fw_cfg, model_path)
 
     server_args = [
         "--model_path",
@@ -162,18 +228,29 @@ def _build_lightx2v_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
 
     if num_gpus > 1:
         cmd = [
-            "torchrun",
+            _framework_executable("torchrun", framework_bin_dir),
             f"--nproc_per_node={num_gpus}",
             "-m",
             "lightx2v.server",
         ] + server_args
     else:
-        cmd = ["python3", "-m", "lightx2v.server"] + server_args
+        cmd = [
+            _framework_executable("python", framework_bin_dir),
+            "-m",
+            "lightx2v.server",
+        ] + server_args
 
     return cmd
 
 
-def build_server_cmd(framework: str, case: dict, fw_cfg: dict, port: int) -> list[str]:
+def build_server_cmd(
+    framework: str,
+    case: dict,
+    fw_cfg: dict,
+    port: int,
+    framework_bin_dir: str | None = None,
+    resolve_model_path: bool = True,
+) -> list[str]:
     builders = {
         "sglang": _build_sglang_cmd,
         "vllm-omni": _build_vllm_cmd,
@@ -182,7 +259,9 @@ def build_server_cmd(framework: str, case: dict, fw_cfg: dict, port: int) -> lis
     builder = builders.get(framework)
     if builder is None:
         raise ValueError(f"Unknown framework: {framework}")
-    return builder(case, fw_cfg, port)
+    if framework == "lightx2v":
+        return builder(case, fw_cfg, port, framework_bin_dir, resolve_model_path)
+    return builder(case, fw_cfg, port, framework_bin_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -583,9 +662,9 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
     """Send request via LightX2V's async task API."""
     task = case["task"]
     if task in ("text-to-image", "image-edit"):
-        endpoint = "/v1/tasks/image"
+        endpoint = "/v1/tasks/image/"
     else:
-        endpoint = "/v1/tasks/video"
+        endpoint = "/v1/tasks/video/"
 
     payload = {
         "prompt": case["prompt"],
@@ -597,8 +676,10 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
         payload["target_video_length"] = case["num_frames"]
     if "height" in case:
         payload["height"] = case["height"]
+        payload["target_height"] = case["height"]
     if "width" in case:
         payload["width"] = case["width"]
+        payload["target_width"] = case["width"]
     if "guidance_scale" in case:
         payload["guidance_scale"] = case["guidance_scale"]
     if "fps" in case:
@@ -630,7 +711,9 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
         poll_resp = requests.get(poll_url, timeout=30)
         poll_resp.raise_for_status()
         poll_data = poll_resp.json()
-        status = poll_data.get("task_status", "").upper()
+        status = (
+            poll_data.get("status") or poll_data.get("task_status") or ""
+        ).upper()
         if status == "COMPLETED":
             break
         elif status in ("FAILED", "CANCELLED"):
@@ -686,6 +769,7 @@ def run_single(
     port: int,
     log_dir: Path,
     config: dict | None = None,
+    framework_bin_dir: str | None = None,
 ) -> dict:
     """Run a single (case, framework) combination. Returns result dict."""
     result = {
@@ -697,10 +781,18 @@ def run_single(
         "error": None,
     }
 
-    cmd = build_server_cmd(framework, case, fw_cfg, port)
+    cmd = build_server_cmd(framework, case, fw_cfg, port, framework_bin_dir)
     print(f"\n  Command: {' '.join(cmd)}")
 
     env = os.environ.copy()
+    if framework_bin_dir:
+        # Isolate the venv: override PATH so the venv's bin comes first,
+        # and remove LD_LIBRARY_PATH / PYTHONPATH inherited from the host
+        # to prevent ABI mismatches (e.g. host PyTorch vs venv PyTorch).
+        env["PATH"] = framework_bin_dir + ":" + env.get("PATH", "")
+        env["VIRTUAL_ENV"] = os.path.dirname(framework_bin_dir)
+        env.pop("LD_LIBRARY_PATH", None)
+        env.pop("PYTHONPATH", None)
     env.update(fw_cfg.get("extra_env", {}))
 
     # perf_dump_path for SGLang server-side timing (passed in request, zero overhead when None)
@@ -724,13 +816,19 @@ def run_single(
             bufsize=1,
         )
 
-        # Tee server output to both log file and stdout (like test_server_utils)
+        # Tee server output to both log file and stdout (like test_server_utils).
+        # Once shutting_down is set, only write to the log file so that
+        # expected SIGTERM tracebacks (e.g. torchrun SignalException) don't
+        # clutter the console.
+        shutting_down = threading.Event()
+
         def _log_pipe(pipe, fh):
             try:
                 for line in iter(pipe.readline, ""):
-                    sys.stdout.write(f"  [server] {line}")
-                    sys.stdout.flush()
                     fh.write(line)
+                    if not shutting_down.is_set():
+                        sys.stdout.write(f"  [server] {line}")
+                        sys.stdout.flush()
             except ValueError:
                 pass  # pipe closed
 
@@ -768,6 +866,8 @@ def run_single(
         print(f"  ERROR: {e}")
     finally:
         if proc:
+            shutting_down.set()
+            print("  Stopping server (shutdown logs suppressed, see log file)...")
             kill_server(proc)
         if log_thread:
             log_thread.join(timeout=5)
@@ -776,26 +876,83 @@ def run_single(
     return result
 
 
-def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
-    """Install a comparison framework via the install script. Returns True on success."""
+def _install_framework(fw_name: str, dry_run: bool = False) -> tuple[bool, str | None]:
+    """Install a framework and return (success, framework_bin_dir)."""
+    if fw_name not in INSTALLABLE_FRAMEWORKS:
+        return True, None
+    if not INSTALL_SCRIPT.exists():
+        print(f"  WARNING: Install script not found at {INSTALL_SCRIPT}")
+        return False, None
+    expected_bin_dir = _expected_framework_bin_dir(fw_name)
+    if dry_run:
+        print(f"  [DRY-RUN] Would install: bash {INSTALL_SCRIPT} {fw_name} install")
+        if expected_bin_dir:
+            print(f"  [DRY-RUN] Expected framework bin dir: {expected_bin_dir}")
+        return True, expected_bin_dir
+    print(f"\n{'='*60}")
+    print(f"Installing framework: {fw_name}")
+    print(f"{'='*60}")
+    ret = subprocess.run(
+        ["bash", str(INSTALL_SCRIPT), fw_name, "install"],
+        capture_output=True,
+        text=True,
+        timeout=FRAMEWORK_INSTALL_TIMEOUT,
+    )
+    if ret.returncode != 0:
+        print(f"  WARNING: {fw_name} installation failed (exit {ret.returncode})")
+        if ret.stdout:
+            print(ret.stdout.strip())
+        if ret.stderr:
+            print(ret.stderr.strip())
+        return False, None
+
+    framework_bin_dir = None
+    for line in f"{ret.stdout}\n{ret.stderr}".splitlines():
+        if line.startswith("FRAMEWORK_BIN_DIR="):
+            framework_bin_dir = line.split("=", 1)[1].strip()
+            break
+
+    if not framework_bin_dir:
+        if expected_bin_dir:
+            print(
+                f"  WARNING: {fw_name} install did not report bin dir; "
+                f"falling back to expected path {expected_bin_dir}"
+            )
+            framework_bin_dir = expected_bin_dir
+        else:
+            print(f"  WARNING: {fw_name} install succeeded but no bin dir reported")
+            return False, None
+
+    print(f"  Using framework bin dir: {framework_bin_dir}")
+    return True, framework_bin_dir
+
+
+def _cleanup_framework_venv(fw_name: str, dry_run: bool = False) -> bool:
+    """Remove framework venv via install script. Returns True on success."""
     if fw_name not in INSTALLABLE_FRAMEWORKS:
         return True
     if not INSTALL_SCRIPT.exists():
         print(f"  WARNING: Install script not found at {INSTALL_SCRIPT}")
         return False
     if dry_run:
-        print(f"  [DRY-RUN] Would install: bash {INSTALL_SCRIPT} {fw_name}")
+        print(f"  [DRY-RUN] Would cleanup: bash {INSTALL_SCRIPT} {fw_name} remove")
         return True
-    print(f"\n{'='*60}")
-    print(f"Installing framework: {fw_name}")
-    print(f"{'='*60}")
+
     ret = subprocess.run(
-        ["bash", str(INSTALL_SCRIPT), fw_name],
-        timeout=600,
+        ["bash", str(INSTALL_SCRIPT), fw_name, "remove"],
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     if ret.returncode != 0:
-        print(f"  WARNING: {fw_name} installation failed (exit {ret.returncode})")
+        print(f"  WARNING: failed to cleanup {fw_name} venv (exit {ret.returncode})")
+        if ret.stdout:
+            print(ret.stdout.strip())
+        if ret.stderr:
+            print(ret.stderr.strip())
         return False
+
+    print(f"  Cleaned up venv for framework: {fw_name}")
     return True
 
 
@@ -806,6 +963,7 @@ def run_comparison(
     port: int = DEFAULT_PORT,
     output: str = "comparison-results.json",
     dry_run: bool = False,
+    cleanup_framework_venvs: bool = False,
 ) -> dict:
     """Run all comparison cases, grouped by framework to minimize installs.
 
@@ -835,6 +993,7 @@ def run_comparison(
 
     results = []
     installed_fws: set[str] = set()
+    framework_bin_dirs: dict[str, str | None] = {"sglang": None}
 
     for fw_name in fw_order:
         pairs = fw_cases.get(fw_name, [])
@@ -843,7 +1002,8 @@ def run_comparison(
 
         # Install framework if needed (once per framework)
         if fw_name not in installed_fws and fw_name in INSTALLABLE_FRAMEWORKS:
-            if not _install_framework(fw_name, dry_run):
+            install_success, bin_dir = _install_framework(fw_name, dry_run)
+            if not install_success:
                 # Skip all cases for this framework
                 for case, _ in pairs:
                     results.append(
@@ -857,6 +1017,7 @@ def run_comparison(
                         }
                     )
                 continue
+            framework_bin_dirs[fw_name] = bin_dir
             installed_fws.add(fw_name)
 
         for case, fw_cfg in pairs:
@@ -865,7 +1026,14 @@ def run_comparison(
             print(f"{'='*60}")
 
             if dry_run:
-                cmd = build_server_cmd(fw_name, case, fw_cfg, port)
+                cmd = build_server_cmd(
+                    fw_name,
+                    case,
+                    fw_cfg,
+                    port,
+                    framework_bin_dirs.get(fw_name),
+                    resolve_model_path=False,
+                )
                 print(f"  [DRY-RUN] Would run: {' '.join(cmd)}")
                 results.append(
                     {
@@ -879,7 +1047,15 @@ def run_comparison(
                 )
                 continue
 
-            result = run_single(case, fw_name, fw_cfg, port, log_dir, config)
+            result = run_single(
+                case,
+                fw_name,
+                fw_cfg,
+                port,
+                log_dir,
+                config,
+                framework_bin_dirs.get(fw_name),
+            )
             results.append(result)
 
             # Wait for GPU memory to clear
@@ -905,6 +1081,15 @@ def run_comparison(
     for r in results:
         lat = f"{r['latency_s']:.2f}s" if r["latency_s"] else r.get("error", "N/A")
         print(f"  {r['case_id']:30s} | {r['framework']:12s} | {lat}")
+
+    if cleanup_framework_venvs:
+        cleanup_targets = [fw for fw in fw_order if fw in installed_fws]
+        if cleanup_targets:
+            print(f"\n{'='*60}")
+            print("CLEANUP FRAMEWORK VENVS")
+            print(f"{'='*60}")
+        for fw_name in cleanup_targets:
+            _cleanup_framework_venv(fw_name, dry_run=dry_run)
 
     return output_data
 
@@ -951,6 +1136,11 @@ def main():
         action="store_true",
         help="Parse config and print commands without launching servers",
     )
+    parser.add_argument(
+        "--cleanup-framework-venvs",
+        action="store_true",
+        help="Remove installed non-sglang comparison venvs after the run",
+    )
 
     args = parser.parse_args()
 
@@ -966,6 +1156,7 @@ def main():
         port=args.port,
         output=args.output,
         dry_run=args.dry_run,
+        cleanup_framework_venvs=args.cleanup_framework_venvs,
     )
 
 

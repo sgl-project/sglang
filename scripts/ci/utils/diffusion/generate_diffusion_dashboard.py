@@ -235,6 +235,18 @@ def _sanitize_filename(name: str) -> str:
     return name.replace("/", "_").replace(" ", "_").replace(":", "_")
 
 
+def _framework_color(index: int) -> str:
+    palette = [
+        "#2563eb",
+        "#dc2626",
+        "#16a34a",
+        "#ea580c",
+        "#7c3aed",
+        "#0891b2",
+    ]
+    return palette[index % len(palette)]
+
+
 def generate_dashboard(
     current: dict,
     history: list[dict],
@@ -260,29 +272,6 @@ def generate_dashboard(
     current_cases = _extract_case_results(current)
     case_ids = list(current_cases.keys())
 
-    # ---- Regression detection ----
-    REGRESSION_THRESHOLD = 0.05  # 5%
-    regressions: list[str] = []
-    if history:
-        prev_cases = _extract_case_results(history[0])
-        for cid in case_ids:
-            for fw in ("sglang", "vllm-omni"):
-                cur = current_cases.get(cid, {}).get(fw)
-                prev = prev_cases.get(cid, {}).get(fw)
-                if cur and prev and prev > 0:
-                    pct = (cur - prev) / prev
-                    if pct > REGRESSION_THRESHOLD:
-                        regressions.append(
-                            f"**{cid}** ({fw}): {prev:.2f}s -> {cur:.2f}s "
-                            f"(+{pct*100:.1f}%)"
-                        )
-
-    if regressions:
-        lines.append("> [!WARNING]\n> **Performance Regression Detected**\n>")
-        for reg in regressions:
-            lines.append(f"> - {reg}")
-        lines.append("\n")
-
     # Discover all frameworks present in results
     all_frameworks = []
     seen_fw = set()
@@ -296,6 +285,29 @@ def generate_dashboard(
         all_frameworks.remove("sglang")
         all_frameworks.insert(0, "sglang")
     other_frameworks = [fw for fw in all_frameworks if fw != "sglang"]
+
+    # ---- Regression detection ----
+    REGRESSION_THRESHOLD = 0.05  # 5%
+    regressions: list[str] = []
+    if history:
+        prev_cases = _extract_case_results(history[0])
+        for cid in case_ids:
+            for fw in all_frameworks:
+                cur = current_cases.get(cid, {}).get(fw)
+                prev = prev_cases.get(cid, {}).get(fw)
+                if cur and prev and prev > 0:
+                    pct = (cur - prev) / prev
+                    if pct > REGRESSION_THRESHOLD:
+                        regressions.append(
+                            f"**{cid}** ({fw}): {prev:.2f}s -> {cur:.2f}s "
+                            f"(+{pct * 100:.1f}%)"
+                        )
+
+    if regressions:
+        lines.append("> [!WARNING]\n> **Performance Regression Detected**\n>")
+        for reg in regressions:
+            lines.append(f"> - {reg}")
+        lines.append("\n")
 
     # ---- Section 1: Cross-Framework Comparison (current run) ----
     lines.append("## Cross-Framework Performance Comparison\n")
@@ -347,26 +359,28 @@ def generate_dashboard(
 
     # ---- Section 2: Cross-Framework Speedup Trend (only if multiple frameworks) ----
     if history and other_frameworks:
-        lines.append("\n## SGLang vs vLLM-Omni Speedup Over Time\n")
-
-        header = "| Date |"
-        sep = "|------|"
-        for cid in case_ids:
-            header += f" {cid} |"
-            sep += "---------|"
-        lines.append(header)
-        lines.append(sep)
-
+        lines.append("\n## SGLang Speedup Over Time\n")
         all_runs = [current] + history
-        for run in all_runs:
-            run_cases = _extract_case_results(run)
-            date = _short_date(run.get("timestamp", ""))
-            row = f"| {date} |"
+
+        for competitor in other_frameworks:
+            lines.append(f"\n### SGLang vs {competitor}\n")
+            header = "| Date |"
+            sep = "|------|"
             for cid in case_ids:
-                sg = run_cases.get(cid, {}).get("sglang")
-                vl = run_cases.get(cid, {}).get("vllm-omni")
-                row += f" {_fmt_speedup(sg, vl)} |"
-            lines.append(row)
+                header += f" {cid} |"
+                sep += "---------|"
+            lines.append(header)
+            lines.append(sep)
+
+            for run in all_runs:
+                run_cases = _extract_case_results(run)
+                date = _short_date(run.get("timestamp", ""))
+                row = f"| {date} |"
+                for cid in case_ids:
+                    sg = run_cases.get(cid, {}).get("sglang")
+                    comp = run_cases.get(cid, {}).get(competitor)
+                    row += f" {_fmt_speedup(sg, comp)} |"
+                lines.append(row)
 
     # ---- Section 4: Matplotlib Trend Charts (saved as PNG files) ----
     if history and charts_dir:
@@ -388,68 +402,50 @@ def generate_dashboard(
             # Per-case latency trend charts
             for cid in case_ids:
                 labels = []
-                sg_vals = []
-                vl_vals = []
+                fw_vals: dict[str, list[float | None]] = {
+                    fw: [] for fw in all_frameworks
+                }
                 for run in all_runs:
                     run_cases = _extract_case_results(run)
                     sg = run_cases.get(cid, {}).get("sglang")
-                    vl = run_cases.get(cid, {}).get("vllm-omni")
                     if sg is None:
                         continue
                     labels.append(_chart_label(run))
-                    sg_vals.append(sg)
-                    vl_vals.append(vl)
+                    for fw in all_frameworks:
+                        fw_vals[fw].append(run_cases.get(cid, {}).get(fw))
 
-                if not sg_vals:
+                if not fw_vals.get("sglang"):
                     continue
 
-                has_vl = any(v is not None for v in vl_vals)
                 fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.2), 4))
 
-                # SGLang line
-                ax.plot(
-                    range(len(sg_vals)),
-                    sg_vals,
-                    "o-",
-                    color="#2563eb",
-                    linewidth=2,
-                    markersize=6,
-                    label="SGLang",
-                )
-                for i, v in enumerate(sg_vals):
-                    ax.annotate(
-                        f"{v:.2f}s",
-                        (i, v),
-                        textcoords="offset points",
-                        xytext=(0, 10),
-                        ha="center",
-                        fontsize=8,
-                        fontweight="bold",
-                        color="#2563eb",
-                    )
-
-                # vLLM-Omni line (if data exists)
-                if has_vl:
-                    vl_clean = [v if v is not None else float("nan") for v in vl_vals]
+                all_vals: list[float] = []
+                for fw_idx, fw in enumerate(all_frameworks):
+                    vals = fw_vals[fw]
+                    if not any(v is not None for v in vals):
+                        continue
+                    clean = [v if v is not None else float("nan") for v in vals]
+                    color = _framework_color(fw_idx)
                     ax.plot(
-                        range(len(vl_clean)),
-                        vl_clean,
-                        "s--",
-                        color="#dc2626",
+                        range(len(clean)),
+                        clean,
+                        "o-",
+                        color=color,
                         linewidth=2,
                         markersize=5,
-                        label="vLLM-Omni",
+                        label=fw,
                     )
-                    for i, v in enumerate(vl_vals):
+                    for i, v in enumerate(vals):
                         if v is not None:
+                            all_vals.append(v)
                             ax.annotate(
                                 f"{v:.2f}s",
                                 (i, v),
                                 textcoords="offset points",
-                                xytext=(0, -14),
+                                xytext=(0, 8 if fw == "sglang" else -12),
                                 ha="center",
-                                fontsize=8,
-                                color="#dc2626",
+                                fontsize=7,
+                                color=color,
                             )
 
                 ax.set_xticks(range(len(labels)))
@@ -458,7 +454,6 @@ def generate_dashboard(
                 ax.set_title(f"Latency Trend -- {cid}", fontsize=11, fontweight="bold")
                 ax.legend(loc="lower right", fontsize=8, framealpha=0.8)
                 ax.grid(True, alpha=0.3)
-                all_vals = sg_vals + [v for v in vl_vals if v is not None]
                 y_min = min(all_vals)
                 y_max = max(all_vals)
                 y_range = y_max - y_min if y_max > y_min else max(y_max * 0.1, 0.1)
@@ -477,28 +472,26 @@ def generate_dashboard(
                 lines.append(f"\n### Latency Trend: {cid}\n")
                 lines.append(f"![Latency Trend {cid}]({chart_url})\n")
 
-            # Speedup trend chart (only if multiple frameworks)
-            if other_frameworks:
+            # Speedup trend chart per competitor (only if multiple frameworks)
+            for competitor in other_frameworks:
                 fig, ax = plt.subplots(figsize=(max(6, len(all_runs) * 1.2), 4))
-                colors = ["#2563eb", "#dc2626", "#16a34a", "#ea580c"]
+                run_labels = [_chart_label(run) for run in all_runs]
                 for ci_idx, cid in enumerate(case_ids):
                     speedups = []
-                    run_labels = []
                     for run in all_runs:
                         run_cases = _extract_case_results(run)
                         sg = run_cases.get(cid, {}).get("sglang")
-                        vl = run_cases.get(cid, {}).get("vllm-omni")
-                        if sg and vl and sg > 0:
-                            speedups.append(vl / sg)
+                        comp = run_cases.get(cid, {}).get(competitor)
+                        if sg and comp and sg > 0:
+                            speedups.append(comp / sg)
                         else:
                             speedups.append(None)
-                        run_labels.append(_chart_label(run))
                     clean = [v if v is not None else float("nan") for v in speedups]
                     ax.plot(
                         range(len(clean)),
                         clean,
                         "o-",
-                        color=colors[ci_idx % len(colors)],
+                        color=_framework_color(ci_idx),
                         linewidth=2,
                         markersize=5,
                         label=cid,
@@ -508,21 +501,23 @@ def generate_dashboard(
                 ax.set_xticklabels(run_labels, fontsize=7)
                 ax.set_ylabel("Speedup (x)")
                 ax.set_title(
-                    "SGLang Speedup Over vLLM-Omni", fontsize=11, fontweight="bold"
+                    f"SGLang Speedup Over {competitor}",
+                    fontsize=11,
+                    fontweight="bold",
                 )
                 ax.axhline(y=1.0, color="gray", linestyle=":", alpha=0.5)
                 ax.legend(loc="upper left", fontsize=7)
                 ax.grid(True, alpha=0.3)
 
-                filename = "speedup_trend.png"
+                filename = f"speedup_trend_{_sanitize_filename(competitor)}.png"
                 chart_path = os.path.join(charts_dir, filename)
                 fig.savefig(chart_path, format="png", dpi=120, bbox_inches="tight")
                 plt.close(fig)
                 print(f"  Saved chart: {chart_path}")
 
                 chart_url = f"{CHARTS_RAW_BASE_URL}/{filename}"
-                lines.append("\n### Speedup Trend (SGLang vs vLLM-Omni)\n")
-                lines.append(f"![Speedup Trend]({chart_url})\n")
+                lines.append(f"\n### Speedup Trend (SGLang vs {competitor})\n")
+                lines.append(f"![Speedup Trend {competitor}]({chart_url})\n")
 
         except ImportError:
             lines.append("\n*Charts unavailable (matplotlib not installed)*\n")
