@@ -183,6 +183,46 @@ namespace {
     }                                                                     \
   }()
 
+// Helper MICRO for CPU_DISPATCH_FLOATING_TYPES_EXT:
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: defined as PARAM_T input
+#define CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, PARAM_T, ...)   \
+  switch (TYPE1) {                                           \
+    case at::ScalarType::BFloat16: {                         \
+      using scalar_t = at::BFloat16;                         \
+      using param_t = PARAM_T;                               \
+      return __VA_ARGS__();                                  \
+    }                                                        \
+    case at::ScalarType::Half: {                             \
+      using scalar_t = at::Half;                             \
+      using param_t = PARAM_T;                               \
+      return __VA_ARGS__();                                  \
+    }                                                        \
+    case at::ScalarType::Float: {                            \
+      using scalar_t = float;                                \
+      using param_t = PARAM_T;                               \
+      return __VA_ARGS__();                                  \
+    }                                                        \
+    default:                                                 \
+      TORCH_CHECK(false, "Unsupported floating data type."); \
+  }
+
+// dispatch with mixed dtypes (TYPE1, TYPE2):
+//   TYPE1: the primary dtype (input, output, weight);
+//   TYPE2: the secondary dtype (bias, etc.).
+#define CPU_DISPATCH_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...)            \
+  [&] {                                                               \
+    if (TYPE2 == at::kFloat) {                                        \
+      CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, float, __VA_ARGS__)        \
+    } else if (TYPE2 == at::ScalarType::BFloat16) {                   \
+      CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, at::BFloat16, __VA_ARGS__) \
+    } else if (TYPE2 == at::ScalarType::Half) {                       \
+      CPU_DISPATCH_TYPE1_WITH_PARAM(TYPE1, at::Half, __VA_ARGS__)     \
+    } else {                                                          \
+      TORCH_CHECK(false, "Unsupported floating data type.");          \
+    }                                                                 \
+  }()
+
 #define UNUSED(x) (void)(x)
 
 #define CHECK_CPU(x) TORCH_CHECK(x.device().type() == at::kCPU, #x " must be a CPU tensor")
