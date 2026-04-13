@@ -167,11 +167,12 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
 def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
+    # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
     return (
         _use_aiter
         and total_bytes > 0
         and n <= 16384
-        and total_bytes < 8 * 1024 * 8192
+        and total_bytes <= 8 * 1024 * 8192
         and get_tensor_model_parallel_world_size() != 6
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_aiter_allreduce_fusion
