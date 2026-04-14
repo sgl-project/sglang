@@ -130,8 +130,8 @@ class ServerArgs:
     dp_size: int = 1
     # number of gpu in a dp group
     dp_degree: int = 1
-    # cfg parallel
-    enable_cfg_parallel: bool = False
+    # cfg parallel (None = auto-decide based on num_gpus)
+    enable_cfg_parallel: Optional[bool] = None
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -375,6 +375,21 @@ class ServerArgs:
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
+            if (
+                current_platform.is_cuda()
+                and self.pipeline_class_name is None
+                and self.num_gpus == 1
+                and self.tp_size == 1
+                and self.sp_degree == 1
+                and self.ulysses_degree == 1
+                and self.ring_degree == 1
+                and self._is_ltx23_model_path(self.model_path)
+            ):
+                self.attention_backend = "fa"
+                logger.info(
+                    "Automatically set attention_backend=fa for LTX-2.3 one-stage on 1 GPU to preserve precision"
+                )
+                return
             self._set_default_attention_backend()
 
     def _adjust_warmup(self):
@@ -409,11 +424,41 @@ class ServerArgs:
             self.master_port = self.settle_port(self.master_port, 37)
 
     def _adjust_parallelism(self):
-        if self.tp_size is None:
-            self.tp_size = 1
+        tp_unspecified = self.tp_size is None
+        sp_unspecified = self.sp_degree is None
+        ulysses_unspecified = self.ulysses_degree is None
+        ring_unspecified = self.ring_degree is None
+        cfg_unspecified = self.enable_cfg_parallel is None
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
+
+        if self.tp_size is None:
+            self.tp_size = 1
+
+        # Auto-enable CFG parallel when user hasn't set any parallelism flags
+        # and there are enough GPUs.  Only auto-enable for models whose default
+        # SamplingParams use classifier-free guidance (negative_prompt is not None),
+        # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
+        if cfg_unspecified:
+            cfg_group_size = self.dp_size * self.tp_size * 2
+            if (
+                self.num_gpus >= 2
+                and self.num_gpus % cfg_group_size == 0
+                and sp_unspecified
+                and ulysses_unspecified
+                and ring_unspecified
+                and self._model_default_uses_cfg()
+            ):
+                self.enable_cfg_parallel = True
+                logger.info(
+                    "Automatically enabled CFG parallel for %d GPUs. "
+                    "Use --sp-degree / --ulysses-degree to use sequence "
+                    "parallelism instead.",
+                    self.num_gpus,
+                )
+            else:
+                self.enable_cfg_parallel = False
 
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
@@ -445,6 +490,42 @@ class ServerArgs:
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def _model_default_uses_cfg(self) -> bool:
+        """
+        Check whether the model uses classifier-free guidance by default.
+
+        CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        """
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(self.model_path, self.backend, self.model_id)
+        if model_info is None:
+            return False
+        default_params = model_info.sampling_param_cls()
+
+        # for ltx2.3, cfg-parallel performs worse than ulysses-sp
+        is_ltx = "ltx" in type(default_params).__name__.lower()
+        if is_ltx:
+            return False
+        return (
+            getattr(default_params, "negative_prompt", None) is not None
+            and getattr(default_params, "guidance_scale", 0) > 1.0
+        )
+
+    @staticmethod
+    def _is_ltx23_model_path(model_path: str | None) -> bool:
+        if not model_path:
+            return False
+        normalized = model_path.lower()
+        return any(
+            token in normalized
+            for token in (
+                "lightricks/ltx-2.3",
+                "models--lightricks--ltx-2.3",
+                "lightricks__ltx-2.3",
+            )
+        )
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
@@ -645,8 +726,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cfg-parallel",
             action="store_true",
-            default=ServerArgs.enable_cfg_parallel,
-            help="Enable cfg parallel.",
+            default=None,
+            help="Enable cfg parallel. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
         )
         parser.add_argument(
             "--data-parallel-size",

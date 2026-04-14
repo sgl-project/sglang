@@ -8,6 +8,11 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
@@ -254,12 +259,20 @@ class EagleVerifyInputV2Mixin:
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
-                batch.mamba_track_indices = torch.stack(
-                    [
-                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
-                        for req in batch.reqs
-                    ]
-                ).to(torch.int64)
+                mapping = (
+                    req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+                )
+                req_pool_idx_tensor = batch.req_pool_indices.to(
+                    device=mapping.device, dtype=torch.int64
+                )
+                track_col_idx = torch.tensor(
+                    [req.mamba_next_track_idx for req in batch.reqs],
+                    dtype=torch.int64,
+                    pin_memory=True,
+                ).to(mapping.device, non_blocking=True)
+                batch.mamba_track_indices = mapping[
+                    req_pool_idx_tensor, track_col_idx
+                ].to(dtype=torch.int64)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
@@ -411,6 +424,20 @@ class EagleVerifyInputV2Mixin:
                 threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
             )
+
+            # Sync sampling results across TP ranks: different GPUs may
+            # produce slightly different target_probs due to floating-point
+            # non-determinism in softmax/top_k/top_p, causing different
+            # sampled tokens. Broadcast from rank 0 to ensure consistency.
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(accept_length, src=0)
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation

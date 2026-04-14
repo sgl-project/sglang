@@ -2482,12 +2482,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
 
+            # Eviction_interval: trade-off between SWA token waste and eviction overhead
+            page_size = self.tree_cache.page_size
+            eviction_interval = max(
+                page_size,
+                int(
+                    sliding_window_size
+                    * envs.SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER.get()
+                ),
+            )
+            eviction_interval = (eviction_interval // page_size) * page_size
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every window_size tokens to reduce the overhead.
-                    if req.decode_batch_idx % sliding_window_size == 1:
+                    # 2. Evict swa every eviction_interval tokens to reduce the overhead.
+                    if req.decode_batch_idx % eviction_interval == 1:
                         self._evict_swa(req, req.seqlen - 1)
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
                     pre_len = self.prefix_lens[idx]
@@ -2515,8 +2525,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), "cache_protected_len must be page aligned"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
+        # Subtract an extra page_size so the eviction frontier never reaches the
+        # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
+        # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
+        # preserving cache reuse in multi-turn scenarios.
+        # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
         new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen, pre_len - sliding_window_size
+            req.swa_evicted_seqlen,
+            pre_len - sliding_window_size - self.tree_cache.page_size,
         )
 
         if self.tree_cache.page_size > 1:
