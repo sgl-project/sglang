@@ -23,6 +23,7 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -437,8 +438,9 @@ class ServerArgs:
             self.tp_size = 1
 
         # Auto-enable CFG parallel when user hasn't set any parallelism flags
-        # and there are enough GPUs.  CFG parallel is the best default for most
-        # models (all that use classifier-free guidance, i.e. guidance_scale > 1).
+        # and there are enough GPUs.  Only auto-enable for models whose default
+        # SamplingParams use classifier-free guidance (negative_prompt is not None),
+        # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
         if cfg_unspecified:
             cfg_group_size = self.dp_size * self.tp_size * 2
             if (
@@ -447,6 +449,7 @@ class ServerArgs:
                 and sp_unspecified
                 and ulysses_unspecified
                 and ring_unspecified
+                and self._model_default_uses_cfg()
             ):
                 self.enable_cfg_parallel = True
                 logger.info(
@@ -488,6 +491,23 @@ class ServerArgs:
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def _model_default_uses_cfg(self) -> bool:
+        """Check whether the model uses classifier-free guidance by default.
+
+        Mirrors the runtime CFG decision in ``Req.validate()``: CFG is active
+        when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        ``get_model_info`` is already cached from ``PipelineConfig.from_kwargs``,
+        so this adds no I/O.
+        """
+        model_info = get_model_info(self.model_path, self.backend, self.model_id)
+        if model_info is None:
+            return False
+        default_params = model_info.sampling_param_cls()
+        return (
+            getattr(default_params, "negative_prompt", None) is not None
+            and getattr(default_params, "guidance_scale", 0) > 1.0
+        )
 
     @staticmethod
     def _is_ltx23_model_path(model_path: str | None) -> bool:
