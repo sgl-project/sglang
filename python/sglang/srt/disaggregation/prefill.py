@@ -267,6 +267,162 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    def _is_hicache_ready(self, req: Req) -> bool:
+        """Check whether the HiCache prefetch for *req* has completed.
+
+        In PP mode the prefetch may be issued by PP0 and must finish on all
+        ranks before the request can enter the waiting queue.  Returns True
+        immediately when HiCache storage is not enabled.
+        """
+        if not self.scheduler.enable_hicache_storage:
+            return True
+
+        if not self.scheduler.tree_cache.check_prefetch_progress(req.rid):
+            return False
+
+        if req.storage_hit_length == 0:
+            req.storage_hit_length = (
+                self.scheduler.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+            )
+        return True
+
+    def _handle_bootstrap_failed_req(self, req: Req) -> None:
+        """Handle a single bootstrap-failed request (abort + stream error)."""
+        error_message = (
+            f"Prefill bootstrap failed for request rank={self.tp_rank} "
+            f"{req.rid=} {req.bootstrap_room=}"
+        )
+        try:
+            req.disagg_kv_sender.failure_exception()
+        except Exception as e:
+            error_message += f" with exception {e}"
+        logger.error(error_message)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        prepare_abort(
+            req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+        self.scheduler.stream_output([req], req.return_logprob)
+        if self.scheduler.enable_metrics:
+            self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+        if self.scheduler.enable_hicache_storage:
+            self.scheduler.tree_cache.release_aborted_request(req.rid)
+
+    def _init_bootstrapped_req(self, req: Req) -> None:
+        """Allocate metadata buffer and initialise the KV sender for *req*."""
+        req.time_stats.set_bootstrap_done_time()
+        num_kv_indices = len(req.origin_input_ids)
+        if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+            raise RuntimeError(
+                "Prefill bootstrap ran out of metadata buffers for "
+                f"rid={req.rid}"
+            )
+
+        req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
+        assert req.metadata_buffer_index is not None
+
+        num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+        req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        req.time_stats.set_wait_queue_entry_time()
+
+    def get_bootstrapped_rids(
+        self, reqs: Optional[List[Req]] = None
+    ) -> tuple[List[str], List[str]]:
+        """Poll bootstrap state and return ``(good_rids, bad_rids)`` *without*
+        mutating the queue.
+
+        This is used by PP0 to propose a consensus list based on transport
+        readiness only.  HiCache readiness is intentionally **not** checked
+        here because it is a per-rank local condition; each rank checks it
+        independently in ``apply_bootstrap_consensus`` / ``pop_bootstrapped``.
+
+        The result is capped at the available metadata buffer count so that
+        ``apply_bootstrap_consensus`` will not fail mid-way due to exhaustion.
+        """
+        reqs_to_poll = self.queue if reqs is None else reqs
+        if not reqs_to_poll:
+            return [], []
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in reqs_to_poll],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )
+
+        remaining_slots = self.req_to_metadata_buffer_idx_allocator.available_size()
+        good_rids: List[str] = []
+        bad_rids: List[str] = []
+        for req, poll in zip(reqs_to_poll, polls):
+            if poll == KVPoll.Failed:
+                bad_rids.append(req.rid)
+                continue
+            if poll != KVPoll.WaitingForInput:
+                break
+            if remaining_slots <= 0:
+                break
+            good_rids.append(req.rid)
+            remaining_slots -= 1
+
+        return good_rids, bad_rids
+
+    def apply_bootstrap_consensus(
+        self,
+        good_rids: List[str],
+        bad_rids: List[str],
+        return_failed_reqs: bool = False,
+    ) -> List[Req]:
+        """Apply an authoritative bootstrap consensus decided by PP0.
+
+        Unlike ``pop_bootstrapped`` this method does **not** re-poll the
+        senders; it trusts the rid lists produced by ``get_bootstrapped_rids``
+        on the leader rank and applies them identically on every PP rank, so
+        the bootstrap queue drains in the same order everywhere.
+        """
+        if not good_rids and not bad_rids:
+            return ([], []) if return_failed_reqs else []
+
+        # Validate no overlap or duplicates.
+        overlap = set(good_rids) & set(bad_rids)
+        if overlap:
+            raise RuntimeError(
+                f"PP bootstrap consensus has overlapping good/bad rids: {overlap}"
+            )
+
+        consensus_rid_set = set(good_rids) | set(bad_rids)
+        rid_to_req = {}
+        indices_to_remove = set()
+
+        for i, req in enumerate(self.queue):
+            if req.rid in consensus_rid_set:
+                rid_to_req[req.rid] = req
+                indices_to_remove.add(i)
+
+        # All consensus rids must be present locally; a mismatch means
+        # the queues have already diverged — fail fast.
+        missing = [rid for rid in consensus_rid_set if rid not in rid_to_req]
+        if missing:
+            raise RuntimeError(
+                f"PP bootstrap desync on pp_rank={self.pp_rank}: "
+                f"consensus rids missing from local queue: {missing}"
+            )
+
+        failed_reqs = []
+        for rid in bad_rids:
+            self._handle_bootstrap_failed_req(rid_to_req[rid])
+            failed_reqs.append(rid_to_req[rid])
+
+        bootstrapped_reqs = []
+        for rid in good_rids:
+            self._init_bootstrapped_req(rid_to_req[rid])
+            bootstrapped_reqs.append(rid_to_req[rid])
+
+        self.queue = [
+            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
+        ]
+
+        if return_failed_reqs:
+            return bootstrapped_reqs, failed_reqs
+        return bootstrapped_reqs
+
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
@@ -289,6 +445,8 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
+        # Always poll the full queue so that poll_and_all_reduce_attn_cp_tp_group
+        # sees the same tensor shape on every TP/CP participant.
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender for req in self.queue],
             self.scheduler.attn_cp_cpu_group,
@@ -296,51 +454,26 @@ class PrefillBootstrapQueue:
         )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if rids_to_check is not None:
-                # if req not in reqs_info_to_check, skip
-                if req.rid not in rids_to_check:
-                    continue
+            if rids_to_check is not None and req.rid not in rids_to_check:
+                continue
 
             if poll == KVPoll.Bootstrapping:
                 continue
             elif poll == KVPoll.Failed:
-                error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
-                try:
-                    req.disagg_kv_sender.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.error(error_message)
-                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                self.scheduler.stream_output([req], req.return_logprob)
+                self._handle_bootstrap_failed_req(req)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
-                if self.scheduler.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                if self.scheduler.enable_hicache_storage:
-                    # to release prefetch events associated with the request
-                    self.scheduler.tree_cache.release_aborted_request(req.rid)
                 continue
 
             # KV.WaitingForInput - init here
-            req.time_stats.set_bootstrap_done_time()
-            num_kv_indices = len(req.origin_input_ids)
+            if not self._is_hicache_ready(req):
+                break
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break
 
-            req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
-            assert req.metadata_buffer_index is not None
-
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
-
+            self._init_bootstrapped_req(req)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
-            req.time_stats.set_wait_queue_entry_time()
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
