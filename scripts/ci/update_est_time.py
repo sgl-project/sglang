@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # Regex to extract per-file elapsed time from CI logs.
 # Matches lines like:
 #   filename='/actions-runner/_work/sglang/sglang/test/registered/core/test_x.py', elapsed=120, ...
-#   filename='/actions-runner/_work/sglang/sglang/python/sglang/jit_kernel/tests/test_x.py', elapsed=120, ...
+#   filename='/actions-runner/_work/sglang/sglang/python/sglang/jit_kernel/tests/test_x.py', ...
 LOG_PATTERN = re.compile(
     r"filename='[^']*?/sglang/((?:test|python)/[^']+\.py)', elapsed=(\d+),"
 )
@@ -73,6 +73,15 @@ def get_successful_jobs(repo, run_id):
     return [j for j in data["jobs"] if j["conclusion"] == "success"]
 
 
+def job_name_to_suite(job_name):
+    """Extract the suite name from a job name.
+
+    Job names look like "stage-c-test-4-gpu-h100 (2)" or "stage-a-test-cpu".
+    Strip the partition suffix " (N)" to get the suite name.
+    """
+    return re.sub(r"\s*\(\d+\)$", "", job_name)
+
+
 def determine_backend(job_name):
     """Determine backend from job name."""
     name = job_name.lower()
@@ -104,8 +113,8 @@ def parse_job_logs(repo, job_id):
 def collect_timings(repo):
     """Collect per-file elapsed times from recent scheduled CI runs.
 
-    Returns dict mapping (relative_path, backend) -> list of elapsed times
-    (newest first).
+    Returns dict mapping (relative_path, suite, backend) -> list of elapsed
+    times (newest first).
     """
     workflow_id = get_workflow_id(repo)
     print(f"Found workflow '{WORKFLOW_NAME}' (id={workflow_id})")
@@ -113,7 +122,7 @@ def collect_timings(repo):
     runs = get_scheduled_runs(repo, workflow_id)
     print(f"Found {len(runs)} completed scheduled runs on main")
 
-    # timings[(rel_path, backend)] = [elapsed1, elapsed2, ...]
+    # timings[(rel_path, suite, backend)] = [elapsed1, elapsed2, ...]
     timings = defaultdict(list)
     runs_processed = 0
 
@@ -135,10 +144,11 @@ def collect_timings(repo):
         )
 
         for job in test_jobs:
+            suite = job_name_to_suite(job["name"])
             backend = determine_backend(job["name"])
             entries = parse_job_logs(repo, job["id"])
             for rel_path, elapsed in entries:
-                key = (rel_path, backend)
+                key = (rel_path, suite, backend)
                 timings[key].append(elapsed)
 
         if runs_processed >= MAX_RUNS:
@@ -147,15 +157,15 @@ def collect_timings(repo):
 
     print(
         f"\nProcessed {runs_processed} runs, "
-        f"collected timings for {len(timings)} (file, backend) pairs"
+        f"collected timings for {len(timings)} (file, suite, backend) pairs"
     )
     return timings
 
 
 def compute_medians(timings):
-    """Compute median of last TARGET_DATA_POINTS timings for each (file, backend).
+    """Compute median of last TARGET_DATA_POINTS timings for each entry.
 
-    Returns dict mapping (rel_path, backend) -> median (int).
+    Returns dict mapping (rel_path, suite, backend) -> median (int).
     Only includes entries with >= MIN_DATA_POINTS data points.
     """
     medians = {}
@@ -170,17 +180,21 @@ def compute_medians(timings):
 def update_est_times(medians, dry_run=False):
     """Update est_time values in source files.
 
+    Each registration call is matched by both the function name and suite,
+    so files with multiple registrations for different suites get the correct
+    per-suite median.
+
     Returns (updated_count, skipped_count).
     """
     updated = 0
     skipped = 0
 
-    # Group medians by file
-    by_file = defaultdict(dict)
-    for (rel_path, backend), median in medians.items():
-        by_file[rel_path][backend] = median
+    # Group medians by file: {rel_path: [(suite, backend, median), ...]}
+    by_file = defaultdict(list)
+    for (rel_path, suite, backend), median in medians.items():
+        by_file[rel_path].append((suite, backend, median))
 
-    for rel_path, backend_medians in sorted(by_file.items()):
+    for rel_path, entries in sorted(by_file.items()):
         filepath = REPO_ROOT / rel_path
         if not filepath.exists():
             print(f"  SKIP {rel_path}: file not found")
@@ -190,8 +204,13 @@ def update_est_times(medians, dry_run=False):
         content = filepath.read_text()
         new_content = content
 
-        for backend, median in backend_medians.items():
-            pattern = re.compile(rf"(register_{backend}_ci\(est_time=)(\d+)")
+        for suite, backend, median in entries:
+            # Match registration calls with this specific backend and suite.
+            # Handles: register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-h100")
+            pattern = re.compile(
+                rf"(register_{backend}_ci\(est_time=)(\d+)"
+                rf'(,\s*suite="{re.escape(suite)}")'
+            )
             match = pattern.search(new_content)
             if not match:
                 continue
@@ -200,10 +219,10 @@ def update_est_times(medians, dry_run=False):
             if old_val == median:
                 continue
 
-            new_content = pattern.sub(rf"\g<1>{median}", new_content)
+            new_content = pattern.sub(rf"\g<1>{median}\3", new_content)
             print(
                 f"  {rel_path}: register_{backend}_ci "
-                f"est_time={old_val} -> {median}"
+                f'suite="{suite}" est_time={old_val} -> {median}'
             )
 
         if new_content != content:
@@ -237,7 +256,7 @@ def main():
 
     print("\nComputing medians...")
     medians = compute_medians(timings)
-    print(f"Computed medians for {len(medians)} (file, backend) pairs")
+    print(f"Computed medians for {len(medians)} (file, suite, backend) entries")
 
     print("\nUpdating est_time values...")
     updated, skipped = update_est_times(medians, dry_run=args.dry_run)
