@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -121,6 +122,11 @@ class PrefillBootstrapQueue:
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
         self.transfer_backend = transfer_backend
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
+            raise RuntimeError(
+                "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
+                "(e.g. GQA, MHA). MLA models should not set this flag."
+            )
         self.kv_manager = self._init_kv_manager()
 
         if self.scheduler.tp_worker.is_hybrid_swa:
@@ -201,6 +207,21 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
+        if (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            and hasattr(kv_manager, "set_kv_buffer_tensors")
+            and not self.is_mla_backend
+        ):
+            kv_pool = self.token_to_kv_pool
+            if hasattr(kv_pool, "full_kv_pool"):
+                kv_pool = kv_pool.full_kv_pool
+            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+                kv_manager.set_kv_buffer_tensors(
+                    kv_pool.k_buffer,
+                    kv_pool.v_buffer,
+                    kv_pool.page_size,
+                )
         return kv_manager
 
     def add(self, req: Req, num_kv_heads: int) -> None:
@@ -336,6 +357,17 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
+        if prefetch is None:
+            return
+        for req in batch.reqs:
+            room = getattr(req, "bootstrap_room", None)
+            if room is not None and room in kv_mgr.transfer_infos:
+                prefetch(room)
+
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
@@ -356,6 +388,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             # Receive requests
@@ -364,6 +397,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if self._engine_paused:
+                self.process_disagg_prefill_inflight_queue()
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -371,10 +407,12 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                self.self_check_during_idle()
+                self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -384,6 +422,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             # Receive requests
@@ -392,6 +431,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if self._engine_paused:
+                self.process_disagg_prefill_inflight_queue()
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -399,6 +441,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                if self.enable_staging:
+                    self.maybe_prefetch_staging_for_batch(batch)
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -410,7 +454,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -569,7 +613,20 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
-                assert poll == KVPoll.Success or poll == KVPoll.Failed
+                # In PP mode, the previous rank may have reached a terminal
+                # state (Success/Failed) while this rank's local poll is still
+                # in a transient state due to clock skew or propagation delay.
+                # Treat non-terminal states as undone instead of crashing.
+                if poll not in (
+                    KVPoll.Success,
+                    KVPoll.Failed,
+                ):
+                    logger.warning(
+                        f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                        f"from consensus; treating as undone"
+                    )
+                    undone_reqs.append(req)
+                    continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
@@ -597,7 +654,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
-                assert False, f"Unexpected polling state {poll=}"
+                logger.warning(
+                    f"Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
+                    f"treating as undone"
+                )
+                undone_reqs.append(req)
 
         for req in done_reqs:
             req.time_stats.set_completion_time()

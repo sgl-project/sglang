@@ -7,6 +7,8 @@ Image encoding stages for I2V diffusion pipelines.
 This module contains implementations of image encoding stages for diffusion pipelines.
 """
 
+import inspect
+
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -119,12 +121,21 @@ class ImageEncodingStage(PipelineStage):
         all_prompt_embeds = []
         all_neg_prompt_embeds = []
 
+        image_processor_call_params = inspect.signature(
+            self.image_processor.__call__
+        ).parameters
+        image_processor_kwargs = {
+            k: v
+            for k, v in image_processor_kwargs.items()
+            if k in image_processor_call_params
+        }
+
         for idx, prompt_images in enumerate(per_prompt_images):
             if not prompt_images:
                 continue
 
             cur_kwargs = image_processor_kwargs.copy()
-            if texts and idx < len(texts):
+            if texts and idx < len(texts) and "text" in image_processor_call_params:
                 cur_kwargs["text"] = [texts[idx]]
 
             image_inputs = self.image_processor(
@@ -322,24 +333,31 @@ class ImageVAEEncodingStage(PipelineStage):
             latent_condition = server_args.pipeline_config.postprocess_vae_encode(
                 latent_condition, self.vae
             )
-
-            scaling_factor, shift_factor = (
-                server_args.pipeline_config.get_decode_scale_and_shift(
-                    device=latent_condition.device,
-                    dtype=latent_condition.dtype,
-                    vae=self.vae,
+            normalized_latent_condition = (
+                server_args.pipeline_config.normalize_vae_encode(
+                    latent_condition, self.vae
                 )
             )
+            if normalized_latent_condition is None:
+                scaling_factor, shift_factor = (
+                    server_args.pipeline_config.get_decode_scale_and_shift(
+                        device=latent_condition.device,
+                        dtype=latent_condition.dtype,
+                        vae=self.vae,
+                    )
+                )
 
-            # apply shift & scale if needed
-            if isinstance(shift_factor, torch.Tensor):
-                shift_factor = shift_factor.to(latent_condition.device)
+                # apply shift & scale if needed
+                if isinstance(shift_factor, torch.Tensor):
+                    shift_factor = shift_factor.to(latent_condition.device)
 
-            if isinstance(scaling_factor, torch.Tensor):
-                scaling_factor = scaling_factor.to(latent_condition.device)
+                if isinstance(scaling_factor, torch.Tensor):
+                    scaling_factor = scaling_factor.to(latent_condition.device)
 
-            latent_condition -= shift_factor
-            latent_condition = latent_condition * scaling_factor
+                latent_condition -= shift_factor
+                latent_condition = latent_condition * scaling_factor
+            else:
+                latent_condition = normalized_latent_condition
 
             if condition_latents is not None:
                 condition_latents.append(latent_condition)

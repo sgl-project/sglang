@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -135,13 +135,14 @@ class SchedulerPPMixin:
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
+                                msg_type="proxy",
                             )
 
                 self.pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.self_check_during_idle()
+                self.on_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -306,6 +307,7 @@ class SchedulerPPMixin:
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
+                            msg_type="proxy",
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -316,7 +318,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.self_check_during_idle()
+                self.on_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -486,6 +488,7 @@ class SchedulerPPMixin:
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
+                            msg_type="proxy",
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -505,7 +508,7 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
-                self.self_check_during_idle()
+                self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
@@ -529,6 +532,9 @@ class SchedulerPPMixin:
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
+        self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
+            defaultdict(deque)
+        )
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -660,6 +666,15 @@ class SchedulerPPMixin:
                     src=self.attn_tp_group.ranks[0],
                 )
                 seq_lens, latencies = data_to_sync_tp
+
+            if self.attn_cp_size > 1:
+                data_to_sync_tp = [seq_lens, latencies]
+                data_to_sync_tp = broadcast_pyobj(
+                    data_to_sync_tp,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
 
         # Broadcast data to all ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -859,7 +874,7 @@ class SchedulerPPMixin:
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
-        if self.attn_tp_rank == 0:
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
@@ -872,7 +887,7 @@ class SchedulerPPMixin:
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
-        if self.attn_tp_rank == 0:
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
             data = point_to_point_pyobj(
                 [],
@@ -890,6 +905,14 @@ class SchedulerPPMixin:
                 self.attn_tp_group.rank,
                 self.attn_tp_cpu_group,
                 src=self.attn_tp_group.ranks[0],
+            )
+
+        if self.attn_cp_size > 1:
+            data = broadcast_pyobj(
+                data,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
             )
 
         return data
@@ -913,7 +936,15 @@ class SchedulerPPMixin:
         self: Scheduler,
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
+        msg_type: str = "default",
     ):
+        # Warn once if using default untyped messages
+        if msg_type == "default":
+            logger.warning_once(
+                "PP send: using default untyped message. "
+                "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+            )
+        tensor_dict["__msg_type__"] = msg_type
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -926,14 +957,48 @@ class SchedulerPPMixin:
         )
         return p2p_work
 
+    def _pp_recv_typed_dict(
+        self: Scheduler,
+        expected_kind: str = "default",
+        all_gather_group: Optional = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Receive a typed tensor dict, demultiplexing by msg_type.
+
+        If a message of the wrong kind is received, it's stashed in the queue
+        and we continue receiving until we get the expected kind.
+        """
+        if expected_kind in self._pp_tensor_dict_inbox:
+            inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
+            if inbox_queue:
+                return inbox_queue.popleft()
+
+        while True:
+            tensor_dict = self.pp_group.recv_tensor_dict(
+                all_gather_group=all_gather_group
+            )
+            received_kind = tensor_dict.get("__msg_type__", "default")
+            if received_kind == expected_kind:
+                if received_kind == "default":
+                    logger.warning_once(
+                        f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
+                        "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+                    )
+                return tensor_dict
+            else:
+                logger.debug(
+                    f"PP recv: expected {expected_kind}, got {received_kind}, stashing"
+                )
+                self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
+
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(
+                self._pp_recv_typed_dict(
+                    expected_kind="proxy",
                     all_gather_group=(
                         self.attn_tp_group if self.require_attn_tp_allgather else None
-                    )
+                    ),
                 )
             )
         return pp_proxy_tensors
@@ -941,12 +1006,12 @@ class SchedulerPPMixin:
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
-        res = self.pp_group.recv_tensor_dict(
+        return self._pp_recv_typed_dict(
+            expected_kind="output",
             all_gather_group=(
                 self.attn_tp_group if self.require_attn_tp_allgather else None
             ),
         )
-        return res
 
     def _pp_prep_batch_result(
         self: Scheduler,
@@ -1000,6 +1065,7 @@ class SchedulerPPMixin:
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
                             async_send=True,
+                            msg_type="output",
                         )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
@@ -1008,6 +1074,7 @@ class SchedulerPPMixin:
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs.tensors,
                         async_send=True,
+                        msg_type="output",
                     )
         return send_output_work
 

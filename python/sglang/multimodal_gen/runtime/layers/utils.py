@@ -10,6 +10,7 @@ from typing import Any, Callable, List, Optional
 import torch
 from torch.library import Library
 
+from sglang.kernel_api_logging import debug_torch_op
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
@@ -155,7 +156,7 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = getattr(torch.ops.sglang, self.op_name)
+            self._impl = debug_torch_op(self.op_func, self.op_name)
             assert self._impl is not None
         return self._impl
 

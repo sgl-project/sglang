@@ -209,7 +209,7 @@ class NightlyBenchmarkRunner:
             )
 
             # Note: JSON files are preserved for metrics collection by CI scripts
-            # They will be collected by scripts/ci/save_metrics.py
+            # They will be collected by scripts/ci/utils/save_metrics.py
 
             return benchmark_results, True
 
@@ -324,7 +324,7 @@ class NightlyBenchmarkRunner:
             The average speculative decoding accept length, or None if not available.
         """
         try:
-            response = requests.get(f"{self.base_url}/get_server_info", timeout=10)
+            response = requests.get(f"{self.base_url}/server_info", timeout=10)
             if response.status_code == 200:
                 server_info = response.json()
                 internal_states = server_info.get("internal_states", [])
