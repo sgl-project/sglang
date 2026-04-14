@@ -118,7 +118,9 @@ def _set_diffusion_fp4_backend(
     monkeypatch: pytest.MonkeyPatch, backend: str | None
 ) -> None:
     if backend is None:
-        monkeypatch.delenv("SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND", raising=False)
+        monkeypatch.delenv(
+            "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND", raising=False
+        )
     else:
         monkeypatch.setenv("SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND", backend)
 
@@ -170,7 +172,9 @@ def _build_layer(
 
     _, flashinfer_backend = current_platform.get_modelopt_fp4_gemm_op()
     if flashinfer_backend == "trtllm":
-        expected_weight, _ = pad_nvfp4_weight(weight_fp4, n_alignment=128, k_alignment=0)
+        expected_weight, _ = pad_nvfp4_weight(
+            weight_fp4, n_alignment=128, k_alignment=0
+        )
         expected_scale = weight_scale_linear
         if expected_scale.shape[0] != expected_weight.shape[0]:
             pad_n = expected_weight.shape[0] - expected_scale.shape[0]
@@ -180,12 +184,18 @@ def _build_layer(
         if expected_scale.shape[1] % 4 != 0:
             padded_scale_k = ((expected_scale.shape[1] + 4 - 1) // 4) * 4
             pad_scale_k = padded_scale_k - expected_scale.shape[1]
-            expected_scale = torch.nn.functional.pad(expected_scale, (0, pad_scale_k, 0, 0))
+            expected_scale = torch.nn.functional.pad(
+                expected_scale, (0, pad_scale_k, 0, 0)
+            )
             pad_weight_k = pad_scale_k * 8
-            expected_weight = torch.nn.functional.pad(expected_weight, (0, pad_weight_k, 0, 0))
+            expected_weight = torch.nn.functional.pad(
+                expected_weight, (0, pad_weight_k, 0, 0)
+            )
             expected_padding_cols = pad_weight_k
 
-        expected_weight = flashinfer.shuffle_matrix_a(expected_weight.view(torch.uint8), 128)
+        expected_weight = flashinfer.shuffle_matrix_a(
+            expected_weight.view(torch.uint8), 128
+        )
         expected_scale = (
             flashinfer.shuffle_matrix_sf_a(expected_scale.view(torch.uint8), 128)
             .reshape(expected_scale.shape)
@@ -234,7 +244,9 @@ def _resolve_mode(mode: str):
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
 )
-@pytest.mark.parametrize("backend", [None, "flashinfer_trtllm"], ids=["default", "flashinfer_trtllm"])
+@pytest.mark.parametrize(
+    "backend", [None, "flashinfer_trtllm"], ids=["default", "flashinfer_trtllm"]
+)
 @pytest.mark.parametrize("m,n,k", TEST_CASES)
 def test_checkpoint_processing(
     monkeypatch: pytest.MonkeyPatch, backend: str | None, m: int, n: int, k: int
@@ -345,7 +357,9 @@ def test_flux2_shape_correctness_flashinfer_trtllm(
 
     expected = torch.matmul(
         _dequantize_nvfp4(x_fp4, x_scale_swizzled, input_global_scale),
-        _dequantize_nvfp4(weight_fp4_ref, weight_scale_swizzled, weight_global_scale).t(),
+        _dequantize_nvfp4(
+            weight_fp4_ref, weight_scale_swizzled, weight_global_scale
+        ).t(),
     )
 
     diff = _calc_diff(actual, expected.to(dtype=DTYPE))

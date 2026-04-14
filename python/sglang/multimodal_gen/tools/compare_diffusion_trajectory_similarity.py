@@ -373,7 +373,9 @@ def run_variant(
         raise ValueError("measure_runs must be >= 1.")
 
     with override_diffusion_fp4_backend(fp4_gemm_backend):
-        with DiffGenerator.from_pretrained(local_mode=True, **server_kwargs) as generator:
+        with DiffGenerator.from_pretrained(
+            local_mode=True, **server_kwargs
+        ) as generator:
             for _ in range(warmup_runs):
                 _normalize_single_result(
                     generator.generate(sampling_params_kwargs=sampling_kwargs)
@@ -411,7 +413,9 @@ def run_variant(
         "per_run_peak_memory_mb": peak_memories,
         "total_duration_ms": total_duration_ms[-1] if total_duration_ms else None,
         "avg_total_duration_ms": (
-            sum(total_duration_ms) / len(total_duration_ms) if total_duration_ms else None
+            sum(total_duration_ms) / len(total_duration_ms)
+            if total_duration_ms
+            else None
         ),
         "per_run_total_duration_ms": total_duration_ms,
     }
