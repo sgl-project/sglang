@@ -33,10 +33,6 @@ double effectiveTrieSourcePrior(double source_prior) {
   return source_prior > 0.0 ? source_prior : 1.0;
 }
 
-Result buildEmptyResult(int32_t last_token, int result_token_num) {
-  return buildResultFromLeafPaths_(last_token, result_token_num, {});
-}
-
 }  // namespace
 Ngram::Ngram(size_t capacity, const Param& param) : trie_capacity_(capacity), param_(param) {
   if (!(param_.max_trie_depth > 1)) {
@@ -289,7 +285,7 @@ Result Ngram::batchMatch(
     if (ordered_sams.empty()) {
       auto res = trie != nullptr
                      ? (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)
-                     : buildEmptyResult(suffix.back(), result_token_num);
+                     : buildResultFromLeafPaths_(suffix.back(), result_token_num, {});
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
       continue;
@@ -325,7 +321,7 @@ Result Ngram::batchMatch(
     if (source_results.empty()) {
       combined = trie != nullptr
                      ? (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)
-                     : buildEmptyResult(suffix.back(), result_token_num);
+                     : buildResultFromLeafPaths_(suffix.back(), result_token_num, {});
     } else {
       // Merge stronger sources first so the final cap keeps their branches when the tree saturates.
       std::stable_sort(source_results.begin(), source_results.end(), [](const auto& lhs, const auto& rhs) {
