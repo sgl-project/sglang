@@ -8,6 +8,7 @@ through sglang's infrastructure using vanilla diffusers pipelines.
 
 import argparse
 import inspect
+import os
 import re
 import warnings
 from io import BytesIO
@@ -637,17 +638,26 @@ class DiffusersPipeline(ComposedPipelineBase):
                     # TODO(DefTruth): Add support for 'compile_repeated_blocks' for 'transformer'
                     # modules which can significantly reduce compilation time for large models
                     # with repeated blocks.
+                    env_mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE")
+                    mode = (
+                        env_mode
+                        if env_mode is not None
+                        else server_args.pipeline_config.torch_compile_mode
+                    )
+                    source = "env" if env_mode is not None else "pipeline_config"
                     if isinstance(component, torch.nn.Module) and hasattr(
                         component, "compile"
                     ):
                         # Prefer in-place compilation if supported. According to PyTorch documentation:
                         # https://docs.pytorch.org/docs/stable/generated/torch.compile.html
-                        component.compile()
+                        component.compile(mode=mode, fullgraph=False, dynamic=None)
                     else:
-                        compiled_component = torch.compile(component)
+                        compiled_component = torch.compile(
+                            component, mode=mode, fullgraph=False, dynamic=None
+                        )
                         setattr(pipe, comp, compiled_component)
                     logger.info(
-                        f"Applied torch.compile to {comp} component of the pipeline"
+                        f"Applied torch.compile to {comp} with mode: {mode} (source: {source})"
                     )
                 except Exception as e:
                     logger.warning(f"Failed to apply torch.compile to {comp}: {e}")

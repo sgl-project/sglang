@@ -41,6 +41,7 @@ class TransformersModelConfig(EncoderConfig):
 
 @dataclass
 class ZImagePipelineConfig(ImagePipelineConfig):
+    torch_compile_mode: str = "default"
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)

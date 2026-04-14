@@ -586,10 +586,18 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             ddim_timesteps=30,
         ).to(self.device)
         if server_args.enable_torch_compile:
-            compile_mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            env_mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE")
+            compile_mode = (
+                env_mode
+                if env_mode is not None
+                else server_args.pipeline_config.torch_compile_mode
             )
-            logger.info("Compiling paint transformer with mode: %s", compile_mode)
+            source = "env" if env_mode is not None else "pipeline_config"
+            logger.info(
+                "Compiling paint transformer with mode: %s (source: %s)",
+                compile_mode,
+                source,
+            )
             self.transformer.compile(mode=compile_mode, fullgraph=False, dynamic=None)
 
     def _convert_pil_list_to_tensor(

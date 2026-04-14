@@ -252,11 +252,15 @@ class DenoisingStage(PipelineStage):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            env_mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE")
+            mode = (
+                env_mode
+                if env_mode is not None
+                else self.server_args.pipeline_config.torch_compile_mode
             )
             compile_kwargs["mode"] = mode
-            logger.info(f"Compiling transformer with mode: {mode}")
+            source = "env" if env_mode is not None else "pipeline_config"
+            logger.info(f"Compiling transformer with mode: {mode} (source: {source})")
 
         if self._needs_nvfp4_jit_prewarm(module):
             logger.info(

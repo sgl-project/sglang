@@ -367,6 +367,7 @@ def flux2_pack_latents(latents):
 
 @dataclass
 class Flux2PipelineConfig(FluxPipelineConfig):
+    torch_compile_mode: str = "default"
     embedded_cfg_scale: float = 4.0
 
     task_type: ModelTaskType = ModelTaskType.TI2I

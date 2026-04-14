@@ -130,6 +130,7 @@ def _pack_latents(latents, batch_size, num_channels_latents, height, width):
 class QwenImagePipelineConfig(ImagePipelineConfig):
     """Configuration for the QwenImage pipeline."""
 
+    torch_compile_mode: str = "default"
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
 

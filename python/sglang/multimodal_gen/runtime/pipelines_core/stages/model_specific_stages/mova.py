@@ -227,11 +227,20 @@ class MOVADenoisingStage(PipelineStage):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            env_mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE")
+            mode = (
+                env_mode
+                if env_mode is not None
+                else server_args.pipeline_config.torch_compile_mode
             )
             compile_kwargs["mode"] = mode
-            logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
+            source = "env" if env_mode is not None else "pipeline_config"
+            logger.info(
+                "Compiling %s with mode: %s (source: %s)",
+                module.__class__.__name__,
+                mode,
+                source,
+            )
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(**compile_kwargs)
