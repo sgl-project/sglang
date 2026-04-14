@@ -129,21 +129,12 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
         for manager in offload_managers:
             offloaded_names.update(manager.update_cpu_weights(weight_dict))
         remaining = ((n, w) for n, w in weight_dict.items() if n not in offloaded_names)
-        load_weights_into_model(
-            remaining,
-            dict(module.named_parameters()),
-        )
+        load_weights_into_model(remaining, dict(module.named_parameters()))
     else:
-        load_weights_into_model(
-            weights_iter,
-            dict(module.named_parameters()),
-        )
+        load_weights_into_model(weights_iter, dict(module.named_parameters()))
 
 
-def load_weights_into_model(
-    weights_iter,
-    model_params: dict,
-) -> None:
+def load_weights_into_model(weights_iter, model_params: dict) -> None:
     """Copy weights from weights_iter into model_params in-place."""
     for name, loaded_weight in weights_iter:
         if name not in model_params:
