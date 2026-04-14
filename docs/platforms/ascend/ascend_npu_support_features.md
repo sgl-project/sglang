@@ -69,8 +69,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--priority-scheduling-`<br/>`preemption-threshold` | `10`     | Type: int                      |      A2, A3      |
 | `--schedule-conservativeness`                       | `1.0`    | Type: float                    |      A2, A3      |
 | `--page-size`                                       | `128`    | Type: int                      |      A2, A3      |
-| `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |      A2, A3      |
-| `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |     Planned      |
+| `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |     Planned      |
 | `--radix-eviction-policy`                           | `lru`    | `lru`,<br/>`lfu`               |      A2, A3      |
 | `--enable-prefill-delayer`                          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--prefill-delayer-max-delay-passes`                | `30`     | Type: int                      |      A2, A3      |
@@ -78,32 +78,32 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--prefill-delayer-forward-passes-buckets`          | `None`   | List[float]                    |      A2, A3      |
 | `--prefill-delayer-wait-seconds-buckets`            | `None`   | List[float]                    |      A2, A3      |
 | `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |   Experimental   |
 
 ## Runtime options
 
-| Argument                                           | Defaults | Options                   | Server supported |
-|----------------------------------------------------|----------|---------------------------|:----------------:|
-| `--device`                                         | `None`   | Type: str                 |      A2, A3      |
-| `--tensor-parallel-size`<br/>`--tp-size`           | `1`      | Type: int                 |      A2, A3      |
-| `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Type: int; Currently `2` not supported |      A2, A3      |
-| `--attention-context-parallel-size`<br/>`--attn-cp-size`  | `1` | Type: int; must be equal to --tp-size |      A2, A3      |
-| `--moe-data-parallel-size`<br/>`--moe-dp-size`     | `1`      | Type: int                 |      A2, A3      |
-| `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
-| `--pp-async-batch-depth`                           | `None`   | Type: int                 |      A2, A3      |
-| `--stream-interval`                                | `1`      | Type: int                 |      A2, A3      |
-| `--incremental-streaming-output`                   | `False`  | bool flag (set to enable) |      A2, A3      |
-| `--random-seed`                                    | `None`   | Type: int                 |      A2, A3      |
-| `--constrained-json-`<br/>`whitespace-pattern`     | `None`   | Type: str                 |      A2, A3      |
-| `--constrained-json-`<br/>`disable-any-whitespace` | `False`  | bool flag (set to enable) |      A2, A3      |
-| `--watchdog-timeout`                               | `300`    | Type: float               |      A2, A3      |
-| `--soft-watchdog-timeout`                          | `300`    | Type: float               |      A2, A3      |
-| `--dist-timeout`                                   | `None`   | Type: int                 |      A2, A3      |
-| `--download-dir`                                   | `None`   | Type: str                 |      A2, A3      |
-| `--model-checksum`                                 | `None`   | Type: str                 |      A2, A3      |
-| `--base-gpu-id`                                    | `0`      | Type: int                 |      A2, A3      |
-| `--gpu-id-step`                                    | `1`      | Type: int                 |      A2, A3      |
-| `--sleep-on-idle`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
+| Argument                                                 | Defaults | Options                                | Server supported |
+|----------------------------------------------------------|----------|----------------------------------------|:----------------:|
+| `--device`                                               | `None`   | Type: str                              |      A2, A3      |
+| `--tensor-parallel-size`<br/>`--tp-size`                 | `1`      | Type: int                              |      A2, A3      |
+| `--pipeline-parallel-size`<br/>`--pp-size`               | `1`      | Type: int; Currently `2` not supported |   Experimental   |
+| `--attention-context-parallel-size`<br/>`--attn-cp-size` | `1`      | Type: int; must be equal to --tp-size  |      A2, A3      |
+| `--moe-data-parallel-size`<br/>`--moe-dp-size`           | `1`      | Type: int                              |     Planned      |
+| `--pp-max-micro-batch-size`                              | `None`   | Type: int                              |   Experimental   |
+| `--pp-async-batch-depth`                                 | `None`   | Type: int                              |   Experimental   |
+| `--stream-interval`                                      | `1`      | Type: int                              |      A2, A3      |
+| `--incremental-streaming-output`                         | `False`  | bool flag (set to enable)              |      A2, A3      |
+| `--random-seed`                                          | `None`   | Type: int                              |      A2, A3      |
+| `--constrained-json-`<br/>`whitespace-pattern`           | `None`   | Type: str                              |      A2, A3      |
+| `--constrained-json-`<br/>`disable-any-whitespace`       | `False`  | bool flag (set to enable)              |      A2, A3      |
+| `--watchdog-timeout`                                     | `300`    | Type: float                            |      A2, A3      |
+| `--soft-watchdog-timeout`                                | `300`    | Type: float                            |      A2, A3      |
+| `--dist-timeout`                                         | `None`   | Type: int                              |      A2, A3      |
+| `--download-dir`                                         | `None`   | Type: str                              |      A2, A3      |
+| `--model-checksum`                                       | `None`   | Type: str                              |     Planned      |
+| `--base-gpu-id`                                          | `0`      | Type: int                              |      A2, A3      |
+| `--gpu-id-step`                                          | `1`      | Type: int                              |      A2, A3      |
+| `--sleep-on-idle`                                        | `False`  | bool flag (set to enable)              |      A2, A3      |
 
 ## Logging
 
@@ -341,7 +341,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--tbo-token-`<br/>`distribution-threshold`             | `0.48`   | Type: float                                                                                                          |     Planned      |
 | `--enable-torch-`<br/>`compile`                         | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
 | `--enable-torch-`<br/>`compile-debug-mode`              | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
-| `--enable-piecewise-`<br/>`cuda-graph`                  | `False`  | bool flag<br/> (set to enable); <br/> Currently, Llama-3.1-8B-Instruct and Qwen2.5-7B-Instruct models are supported. |      A2, A3      |
+| `--enforce-piecewise-`<br/>`cuda-graph`                 | `False`  | bool flag<br/> (set to enable); <br/> Currently, Llama-3.1-8B-Instruct and Qwen2.5-7B-Instruct models are supported. |      A2, A3      |
 | `--piecewise-cuda-`<br/>`graph-tokens`                  | `None`   | Type: JSON<br/> list                                                                                                 |      A2, A3      |
 | `--piecewise-cuda-`<br/>`graph-compiler`                | `eager`  | `eager`                                                                                                              |      A2, A3      |
 | `--torch-compile-max-bs`                                | `32`     | Type: int                                                                                                            |      A2, A3      |
