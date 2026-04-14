@@ -40,8 +40,6 @@ def build_named_tensor_sha256(
 ) -> dict[str, str]:
     sha256_by_name: dict[str, str] = {}
     for name, tensor in named_tensors:
-        if name in sha256_by_name:
-            raise ValueError(f"Duplicate tensor name in SHA256 manifest: {name}")
         sha256_by_name[name] = compute_tensor_sha256(tensor)
     return sha256_by_name
 
@@ -114,13 +112,6 @@ class UpdateWeightFromTensorChecker:
         target_module: str,
         expected_named_tensors_sha256: dict[str, str],
     ) -> tuple[bool, str]:
-        if not target_module:
-            return False, "target_module is required"
-        if not expected_named_tensors_sha256:
-            return False, "expected_named_tensors_sha256 is required"
-        if not isinstance(expected_named_tensors_sha256, dict):
-            return False, "expected_named_tensors_sha256 must be a dict[str, str]"
-
         module = self.pipeline.get_module(target_module)
         if module is None:
             return False, f"Module '{target_module}' is not initialized"
