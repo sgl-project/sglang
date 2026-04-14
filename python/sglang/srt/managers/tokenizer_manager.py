@@ -504,14 +504,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
-                (
-                    (
-                        BatchStrOutput,
-                        BatchEmbeddingOutput,
-                        BatchTokenIDOutput,
-                    ),
-                    self._handle_batch_output,
-                ),
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (

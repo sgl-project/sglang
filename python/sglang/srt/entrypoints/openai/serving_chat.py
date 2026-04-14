@@ -38,15 +38,31 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
+from sglang.srt.entrypoints.openai.utils import (
+    process_cached_tokens_details_from_ret,
+    process_hidden_states_from_ret,
+    process_routed_experts_from_ret,
+    should_include_usage,
+    to_openai_style_logprobs,
+)
+from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 _SSE_DATA = "data: "
 _SSE_NL = "\n\n"
 
 
-class _StreamDelta(msgspec.Struct, omit_defaults=True):
+class _StreamDelta(msgspec.Struct):
     role: Optional[str] = None
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
+    tool_calls: Optional[Any] = None
 
 
 class _StreamChoice(msgspec.Struct):
@@ -57,7 +73,7 @@ class _StreamChoice(msgspec.Struct):
     matched_stop: Union[None, int, str] = None
 
 
-class _StreamChunk(msgspec.Struct, omit_defaults=True):
+class _StreamChunk(msgspec.Struct):
     id: str
     object: str
     created: int
@@ -100,22 +116,6 @@ def _fast_sse_content(
     )
     return _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
 
-
-from sglang.srt.entrypoints.openai.utils import (
-    process_cached_tokens_details_from_ret,
-    process_hidden_states_from_ret,
-    process_routed_experts_from_ret,
-    should_include_usage,
-    to_openai_style_logprobs,
-)
-from sglang.srt.function_call.core_types import ToolCallItem
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import get_json_schema_constraint
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
