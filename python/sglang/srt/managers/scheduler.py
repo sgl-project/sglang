@@ -1457,7 +1457,20 @@ class Scheduler(
                         break
                     recv_reqs.append(recv_rpc)
 
-                if self._engine_paused and len(recv_reqs) == 0:
+                should_block_for_paused_rpc = True
+                if self.server_args.enable_dp_attention:
+                    # In DP-attention mode, control requests are broadcast via
+                    # tp_group below. Only the tp_group source should wait on
+                    # the RPC socket while paused; the other ranks must enter
+                    # the broadcast as receivers. If they block on ZMQ here,
+                    # pause/flush can deadlock the control broadcast.
+                    should_block_for_paused_rpc = self.tp_group.is_first_rank
+
+                if (
+                    self._engine_paused
+                    and len(recv_reqs) == 0
+                    and should_block_for_paused_rpc
+                ):
                     poller = zmq.Poller()
                     poller.register(self.recv_from_tokenizer, zmq.POLLIN)
                     poller.register(self.recv_from_rpc, zmq.POLLIN)
