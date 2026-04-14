@@ -88,7 +88,7 @@ if is_cuda() or (_is_mxfp_supported and is_hip()):
     )
 
 # subset of above quant methods, supported on CPU
-CPU_QUANTIZATIPON_METHODS = {
+CPU_QUANTIZATION_METHODS = {
     "fp8": Fp8Config,
     "w8a8_int8": W8A8Int8Config,
     "compressed-tensors": CompressedTensorsConfig,
@@ -108,13 +108,13 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     from sglang.srt.utils import is_cpu
 
     if is_cpu():
-        if quantization not in CPU_QUANTIZATIPON_METHODS:
+        if quantization not in CPU_QUANTIZATION_METHODS:
             raise ValueError(
                 f"Invalid quantization method on CPU: {quantization}. "
                 f"Available methods on CPU: {list(QUANTIZATION_METHODS.keys())}"
             )
         else:
-            return CPU_QUANTIZATIPON_METHODS[quantization]
+            return CPU_QUANTIZATION_METHODS[quantization]
 
     return QUANTIZATION_METHODS[quantization]
 
