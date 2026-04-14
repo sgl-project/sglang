@@ -329,9 +329,7 @@ class SessionController:
             node.req.multimodal_inputs = None
 
         if isinstance(self.tree_cache, SessionAwareCache):
-            self.tree_cache.release_session(
-                session_id, req if session.streaming else None
-            )
+            self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
         log_info_on_rank0(
             logger, f"Session closed: {session_id} (active={len(self.sessions)})"

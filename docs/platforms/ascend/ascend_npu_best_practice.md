@@ -2397,7 +2397,6 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=400
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -2410,7 +2409,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
     --tp-size 4 --mem-fraction-static 0.843 --cuda-graph-bs 1 4 8 16 --dtype bfloat16
@@ -2470,7 +2469,6 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=400
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -2483,7 +2481,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
     --tp-size 4 --mem-fraction-static 0.843 --cuda-graph-bs 1 4 10 15 16 --dtype bfloat16
@@ -2543,7 +2541,6 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=400
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -2556,7 +2553,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
     --tp-size 2 --mem-fraction-static 0.894 --cuda-graph-bs 1 2 4 6 9 10 15 16 --dtype bfloat16
@@ -2616,7 +2613,6 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=400
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -2629,7 +2625,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
     --tp-size 2 --mem-fraction-static 0.894 --cuda-graph-bs 1 5 15 16 --dtype bfloat16
