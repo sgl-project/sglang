@@ -312,7 +312,7 @@ class SessionController:
             )
             return
 
-        # No active request -- safe to release immediately.
+        # No owning request -- safe to release immediately.
         if session.streaming and session.req_nodes:
             req = next(iter(session.req_nodes.values())).req
             req.session = None
