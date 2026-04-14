@@ -2,6 +2,7 @@
 
 import logging
 from enum import Enum
+from functools import cached_property
 from typing import List, Optional, Tuple
 
 import torch
@@ -48,7 +49,7 @@ from sglang.srt.layers.moe.topk import (
     TopKOutput,
     TopKOutputChecker,
 )
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import RoutingMethodType, is_deepep_class_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -197,10 +198,20 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
-        assert (num_experts - num_fused_shared_experts) % self.moe_ep_size == 0
-        self.num_local_experts = (
-            num_experts - num_fused_shared_experts
-        ) // self.moe_ep_size + num_fused_shared_experts
+
+        # DeepEP: each rank has its own shared expert slot, so total shared
+        # weight slots = num_fused_shared_experts * ep_size.
+        # AMD/Standard: shared experts are global, slots = num_fused_shared_experts.
+        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+            num_shared_slots = num_fused_shared_experts * self.moe_ep_size
+        else:
+            num_shared_slots = num_fused_shared_experts
+
+        assert (num_experts - num_shared_slots) % self.moe_ep_size == 0
+        self._num_global_routed = num_experts - num_shared_slots
+        self._num_local_routed = self._num_global_routed // self.moe_ep_size
+        self.num_local_experts = self._num_local_routed + num_fused_shared_experts
+        self._has_fused_shared = num_fused_shared_experts > 0
 
         self.expert_mask_gpu = None
 
@@ -315,6 +326,21 @@ class FusedMoE(torch.nn.Module):
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
 
+    @cached_property
+    def use_padded_loading(self) -> bool:
+        # This handles the case where the loaded weights are smaller than the padded expert_data
+        # Use narrow_padded_param_and_loaded_weight for:
+        # 1. CPU (always)
+        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
+        # 3. GPU with Aiter padding
+        aiter_padded = (
+            _use_aiter
+            and hasattr(self, "w2_weight")
+            and getattr(self.w2_weight, "weight_padded", False)
+        )
+
+        return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -426,12 +452,7 @@ class FusedMoE(torch.nn.Module):
         else:
             start = 0
 
-        # Use narrow_padded_param_and_loaded_weight for:
-        # 1. CPU (always)
-        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
-        # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
-        if use_padded_loading:
+        if self.use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -500,12 +521,7 @@ class FusedMoE(torch.nn.Module):
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
 
-        # Use narrow_padded_param_and_loaded_weight for:
-        # 1. CPU (always)
-        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
-        # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
-        if use_padded_loading:
+        if self.use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -555,18 +571,12 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
-        num_local_routed_experts = (
-            self.num_local_experts - self.num_fused_shared_experts
-        )
-        start_idx = self.moe_ep_rank * num_local_routed_experts
-        end_idx = (self.moe_ep_rank + 1) * num_local_routed_experts
+        start_idx = self.moe_ep_rank * self._num_local_routed
+        end_idx = start_idx + self._num_local_routed
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
-        elif (
-            self.num_fused_shared_experts > 0 and expert_id >= num_global_routed_experts
-        ):
-            return expert_id - num_global_routed_experts + num_local_routed_experts
+        elif self._has_fused_shared and expert_id >= self._num_global_routed:
+            return expert_id - self._num_global_routed + self._num_local_routed
         else:
             return -1
 
@@ -611,7 +621,7 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        if expert_id >= self.num_experts - self.num_fused_shared_experts:
+        if self._has_fused_shared and expert_id >= self._num_global_routed:
             # This is a shared expert.
             physical_expert_ids = [expert_id]
         else:

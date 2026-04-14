@@ -9,7 +9,6 @@ from sglang.test.test_utils import CustomTestCase
 
 flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
 
-
 torch.manual_seed(1234)
 
 

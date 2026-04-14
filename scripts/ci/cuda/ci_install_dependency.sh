@@ -181,7 +181,7 @@ mark_step_done "Pip / uv toolchain & stale package cleanup"
 # Uninstall Flashinfer
 # ------------------------------------------------------------------------------
 # Keep flashinfer packages installed if version matches to avoid re-downloading:
-# - flashinfer-cubin: 150+ MB, plus extra cubins from ci_download_flashinfer_cubin.sh
+# - flashinfer-cubin: 150+ MB
 # - flashinfer-jit-cache: 1.2+ GB, by far the largest download in CI
 FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_python==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
 FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_cubin==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
@@ -290,8 +290,6 @@ UNINSTALL_JIT_CACHE="$UNINSTALL_JIT_CACHE" \
     PIP_CMD="$PIP_CMD" \
     PIP_INSTALL_SUFFIX="$PIP_INSTALL_SUFFIX" \
     bash "${SCRIPT_DIR}/ci_download_flashinfer_jit_cache.sh"
-# Download flashinfer cubins
-bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
 
 mark_step_done "Download flashinfer artifacts"
 
@@ -358,6 +356,10 @@ mark_step_done "Fix other dependencies"
 # can delete the .pth file without reliably recreating it (pip race condition).
 $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --no-deps --force-reinstall $PIP_INSTALL_SUFFIX || true
 
+# Download kernels from kernels community
+kernels download python || true
+kernels lock python || true
+mv python/kernels.lock ${HOME}/.cache/sglang || true
 
 # Install human-eval
 pip install "setuptools==70.0.0"

@@ -26,6 +26,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -52,6 +53,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_mps,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -120,9 +122,10 @@ QUANTIZATION_CHOICES = [
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "quark_int4fp8_moe",
+    "unquant",
 ]
 
-SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
+SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -325,6 +328,7 @@ class ServerArgs:
     ssl_ca_certs: Optional[str] = None
     ssl_keyfile_password: Optional[str] = None
     enable_ssl_refresh: bool = False
+    enable_http2: bool = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -403,6 +407,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
+    metrics_http_port: Optional[int] = None
     enable_mfu_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
@@ -470,6 +475,8 @@ class ServerArgs:
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
     experts_shared_outer_loras: Optional[bool] = None
+    lora_use_virtual_experts: bool = False
+    lora_strict_loading: bool = False
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -497,6 +504,8 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -616,6 +625,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
+    debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
@@ -659,6 +669,7 @@ class ServerArgs:
     enable_custom_logit_processor: bool = False
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
+    enforce_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
@@ -754,6 +765,8 @@ class ServerArgs:
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
 
+        # Validate mm_process_config before dummy-model early return.
+        self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
 
@@ -766,6 +779,16 @@ class ServerArgs:
 
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
+
+        # Resolve --quantization unquant: explicitly opt out of quantization.
+        # Convert to None now (before model config validation), but record
+        # the intent so auto-detection in _handle_model_specific_adjustments
+        # does not override it.
+        if self.quantization == "unquant":
+            self.quantization = None
+            self._quantization_explicitly_unset = True
+        else:
+            self._quantization_explicitly_unset = False
 
         # Set missing default values.
         self._handle_missing_default_values()
@@ -921,6 +944,45 @@ class ServerArgs:
                 "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
                 "to be specified."
             )
+
+        if self.enable_http2:
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
+
+            if self.enable_ssl_refresh:
+                raise ValueError(
+                    "--enable-ssl-refresh is not supported with --enable-http2. "
+                    "Granian does not support SSL certificate hot-reloading. "
+                    "Use Uvicorn (the default) or handle certificate rotation externally."
+                )
+
+            if self.tokenizer_worker_num > 1:
+                raise ValueError(
+                    "--enable-http2 does not yet support --tokenizer-worker-num > 1. "
+                    "Multi-worker HTTP/2 support will be added in a future release."
+                )
+
+    def _handle_multimodal(self):
+        """Validate mm_process_config structure before model loading."""
+        if self.mm_process_config is not None:
+            if not isinstance(self.mm_process_config, dict):
+                raise TypeError(
+                    f"mm_process_config must be a dict, "
+                    f"but got {type(self.mm_process_config)}"
+                )
+            for key in ("image", "video", "audio"):
+                if key in self.mm_process_config and not isinstance(
+                    self.mm_process_config[key], dict
+                ):
+                    raise TypeError(
+                        f"mm_process_config['{key}'] must be a dict, "
+                        f"but got {type(self.mm_process_config[key])}"
+                    )
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -1139,6 +1201,9 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 17. Context parallel
         if self.attn_cp_size > 1:
+            self.disable_piecewise_cuda_graph = True
+        # 18. CUDA Graph debug mode
+        if self.debug_cuda_graph:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
@@ -1466,12 +1531,14 @@ class ServerArgs:
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
-                self.nsa_prefill_backend = "trtllm"
-                self.nsa_decode_backend = "trtllm"
-            else:
-                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_auto"
+                    self.nsa_prefill_backend = "trtllm"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "trtllm"
+            else:
+                # Hopper FP8 defaults to flashmla_kv for both prefill and decode.
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_kv"
                 if not user_set_decode:
                     self.nsa_decode_backend = "flashmla_kv"
         else:
@@ -1500,6 +1567,14 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
+        if _hybrid_spec is not None:
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=_hybrid_spec.support_mamba_cache,
+                support_mamba_cache_extra_buffer=_hybrid_spec.support_mamba_cache_extra_buffer,
+            )
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
@@ -1630,7 +1705,10 @@ class ServerArgs:
                     and weights_cfg.get("strategy") == "group"
                     and weights_cfg.get("type") == "int"
                 )
-                if self.quantization is None:
+                if (
+                    self.quantization is None
+                    and not self._quantization_explicitly_unset
+                ):
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                     # Because we need this condition for an assertion in
                     # flashinfer_trtllm MoE runner backend.
@@ -1965,7 +2043,11 @@ class ServerArgs:
         ]:
             if is_sm100_supported():
                 quant_method = get_quantization_config(hf_config)
-                if self.quantization is None and quant_method is not None:
+                if (
+                    self.quantization is None
+                    and not self._quantization_explicitly_unset
+                    and quant_method is not None
+                ):
                     self.quantization = quant_method
                 if (
                     (
@@ -2019,7 +2101,11 @@ class ServerArgs:
                     if quantization_config is not None
                     else None
                 )
-                if self.quantization is None and quant_method is not None:
+                if (
+                    self.quantization is None
+                    and not self._quantization_explicitly_unset
+                    and quant_method is not None
+                ):
                     self.quantization = quant_method
                 if (
                     self.quantization == "modelopt_fp4"
@@ -2098,7 +2184,9 @@ class ServerArgs:
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
                 "GptOssForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
@@ -2156,19 +2244,6 @@ class ServerArgs:
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
 
-        # FlashInfer GDN decode is incompatible with no_buffer scheduling.
-        # See https://github.com/sgl-project/sglang/issues/20791
-        if (
-            self.linear_attn_decode_backend == "flashinfer"
-            and self.mamba_scheduler_strategy == "no_buffer"
-        ):
-            raise ValueError(
-                "FlashInfer GDN decode (--linear-attn-decode-backend flashinfer) is not "
-                "compatible with --mamba-scheduler-strategy no_buffer. "
-                "Please use --mamba-scheduler-strategy extra_buffer instead. "
-                "See https://github.com/sgl-project/sglang/issues/20791"
-            )
-
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
                 raise ValueError(
@@ -2195,6 +2270,13 @@ class ServerArgs:
                     == 0
                 ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
         elif not self.disable_radix_cache:  # no_buffer
+            if self.page_size is not None and self.page_size != 1:
+                logger.warning(
+                    f"{model_arch} with radix cache requires page_size=1 in the current "
+                    f"Mamba scheduling mode (no_buffer), but got {self.page_size}. "
+                    "Automatically setting page_size=1."
+                )
+                self.page_size = 1
             if self.speculative_algorithm is None:
                 logger.warning(
                     "Disabling overlap schedule since mamba no_buffer is not compatible with "
@@ -2552,7 +2634,10 @@ class ServerArgs:
 
     def _handle_page_size(self):
         if self.page_size is None:
-            self.page_size = 1
+            if not is_musa():
+                self.page_size = 1
+            else:
+                self.page_size = 64
 
     def _handle_amd_specifics(self):
         if is_hip():
@@ -2588,9 +2673,27 @@ class ServerArgs:
                 )
 
     def _handle_linear_attn_backend(self):
-        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         import torch
 
+        # SM100+: default to FlashInfer GDN decode when the user hasn't
+        # explicitly chosen a decode backend and mamba-ssm-dtype is bf16
+        # (required by FlashInfer GDN on SM100+).
+        # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
+        # Excluded when MTP speculative decoding is enabled because
+        # FlashInfer GDN MTP verify is not yet supported on SM100+.
+        if (
+            self.linear_attn_decode_backend is None
+            and is_sm100_supported()
+            and self.mamba_ssm_dtype == "bfloat16"
+            and self.speculative_algorithm is None
+        ):
+            self.linear_attn_decode_backend = "flashinfer"
+            logger.info(
+                "SM100+ detected with mamba-ssm-dtype=bfloat16, "
+                "defaulting --linear-attn-decode-backend to flashinfer."
+            )
+
+        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
             decode == "flashinfer"
@@ -2683,6 +2786,26 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
+        if self.moe_runner_backend == "flashinfer_cutedsl":
+            assert self.quantization in [
+                "modelopt_fp4"
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4'."
+            assert self.ep_size in [
+                1,
+                self.tp_size,
+            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            assert self.moe_a2a_backend in [
+                "none",
+                "deepep",
+            ], (
+                f"flashinfer_cutedsl supports moe_a2a_backend='none' (standard path) "
+                f"or 'deepep' (DeepEP low-latency path), got '{self.moe_a2a_backend}'."
+            )
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert self.quantization in [
                 "modelopt_fp4",
@@ -2702,8 +2825,9 @@ class ServerArgs:
             assert self.quantization in [
                 "fp8",
                 "mxfp8",
+                "modelopt_fp4",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -2989,6 +3113,134 @@ class ServerArgs:
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
+
+        if self.speculative_algorithm == "DFLASH":
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "Currently DFLASH speculative decoding does not support dp attention."
+                )
+
+            if self.pp_size != 1:
+                raise ValueError(
+                    "Currently DFLASH speculative decoding only supports pp_size == 1."
+                )
+
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DFLASH speculative decoding requires setting --speculative-draft-model-path."
+                )
+
+            # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
+            # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
+            # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
+            #
+            # For DFlash, the natural unit is `block_size` (verify window length).
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 1
+            elif int(self.speculative_num_steps) != 1:
+                logger.warning(
+                    "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+                    self.speculative_num_steps,
+                )
+                self.speculative_num_steps = 1
+
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            elif int(self.speculative_eagle_topk) != 1:
+                logger.warning(
+                    "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+                    self.speculative_eagle_topk,
+                )
+                self.speculative_eagle_topk = 1
+
+            if self.speculative_dflash_block_size is not None:
+                if int(self.speculative_dflash_block_size) <= 0:
+                    raise ValueError(
+                        "DFLASH requires --speculative-dflash-block-size to be positive, "
+                        f"got {self.speculative_dflash_block_size}."
+                    )
+                if self.speculative_num_draft_tokens is not None and int(
+                    self.speculative_num_draft_tokens
+                ) != int(self.speculative_dflash_block_size):
+                    raise ValueError(
+                        "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
+                        "but they differ. For DFLASH they must match. "
+                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
+                        f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
+                    )
+                self.speculative_num_draft_tokens = int(
+                    self.speculative_dflash_block_size
+                )
+
+            window_size = None
+            if self.speculative_dflash_draft_window_size is not None:
+                window_size = int(self.speculative_dflash_draft_window_size)
+                if window_size <= 0:
+                    raise ValueError(
+                        "DFLASH requires --speculative-dflash-draft-window-size "
+                        f"to be positive, got {window_size}."
+                    )
+                self.speculative_dflash_draft_window_size = window_size
+
+            if self.speculative_num_draft_tokens is None:
+                from sglang.srt.speculative.dflash_utils import (
+                    parse_dflash_draft_config,
+                )
+
+                model_override_args = json.loads(self.json_model_override_args)
+                inferred_block_size = None
+                try:
+                    from sglang.srt.utils.hf_transformers_utils import get_config
+
+                    draft_hf_config = get_config(
+                        self.speculative_draft_model_path,
+                        trust_remote_code=self.trust_remote_code,
+                        revision=self.speculative_draft_model_revision,
+                        model_override_args=model_override_args,
+                    )
+                    inferred_block_size = parse_dflash_draft_config(
+                        draft_hf_config=draft_hf_config
+                    ).resolve_block_size(default=None)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to infer DFLASH block_size from draft model config; "
+                        "defaulting speculative_num_draft_tokens to 16. Error: %s",
+                        e,
+                    )
+
+                if inferred_block_size is None:
+                    inferred_block_size = 16
+                    logger.warning(
+                        "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
+                        inferred_block_size,
+                    )
+                self.speculative_num_draft_tokens = inferred_block_size
+
+            if window_size is not None:
+                draft_tokens = int(self.speculative_num_draft_tokens)
+                if window_size < draft_tokens:
+                    raise ValueError(
+                        "DFLASH --speculative-dflash-draft-window-size must be >= "
+                        "--speculative-num-draft-tokens (block_size). "
+                        f"window_size={window_size}, block_size={draft_tokens}."
+                    )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+                )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
@@ -3330,6 +3582,8 @@ class ServerArgs:
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
+            "KimiVLForConditionalGeneration",
+            "KimiK25ForConditionalGeneration",
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
@@ -3425,6 +3679,19 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
+        if self.debug_cuda_graph:
+            if not is_cuda():
+                logger.warning(
+                    "--debug-cuda-graph is not supported on non CUDA devices. "
+                    "Disabling breakable CUDA graph."
+                )
+                self.debug_cuda_graph = False
+            else:
+                envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
+                logger.warning(
+                    "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
+                    "All operations will run eagerly through the graph capture/replay path."
+                )
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
@@ -3848,6 +4115,14 @@ class ServerArgs:
             default=ServerArgs.enable_ssl_refresh,
             help="Enable automatic SSL certificate hot-reloading when cert/key "
             "files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
+        )
+        parser.add_argument(
+            "--enable-http2",
+            action="store_true",
+            default=ServerArgs.enable_http2,
+            help="Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and "
+            "HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. "
+            "Requires 'pip install sglang[http2]'.",
         )
 
         # Quantization and data type
@@ -4329,6 +4604,14 @@ class ServerArgs:
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
+            "--metrics-http-port",
+            type=int,
+            default=ServerArgs.metrics_http_port,
+            help="Port for the Prometheus metrics HTTP server. "
+            "Only used in gRPC mode (--grpc-mode); in HTTP mode, metrics are served on the main --port. "
+            "Defaults to --port + 1 when --enable-metrics is set.",
+        )
+        parser.add_argument(
             "--enable-mfu-metrics",
             action="store_true",
             help="Enable estimated MFU-related prometheus metrics.",
@@ -4681,6 +4964,19 @@ class ServerArgs:
             "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
             "By default this is auto-detected from adapter weights.",
         )
+        parser.add_argument(
+            "--lora-use-virtual-experts",
+            default=ServerArgs.lora_use_virtual_experts,
+            action="store_true",
+            help="Enable virtual expert computation for MoE models. When set, the model will use virtual expert computation.",
+        )
+        parser.add_argument(
+            "--lora-strict-loading",
+            default=ServerArgs.lora_strict_loading,
+            action=argparse.BooleanOptionalAction,
+            help="Enable strict loading for LoRA adapters. "
+            "When set, mismatched or missing keys in the adapter weights will raise an error.",
+        )
 
         # Kernel backend
         parser.add_argument(
@@ -4787,7 +5083,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4830,6 +5126,21 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dflash-block-size",
+            type=int,
+            help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+            default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-draft-window-size",
+            type=int,
+            help="DFLASH only. Sliding window size for the draft-model KV cache. "
+            "When set, the draft worker keeps a recent target-token window in its "
+            "local cache (paged backends may retain up to one extra page on the left "
+            "for alignment). Default is full context.",
+            default=ServerArgs.speculative_dflash_draft_window_size,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
@@ -4992,7 +5303,7 @@ class ServerArgs:
             type=str,
             choices=["normal", "low_latency", "auto"],
             default="auto",
-            help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+            help="Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
@@ -5208,7 +5519,16 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic", "eic"],
+            choices=[
+                "file",
+                "mooncake",
+                "hf3fs",
+                "nixl",
+                "aibrix",
+                "dynamic",
+                "eic",
+                "simm",
+            ],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
             "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
@@ -5414,6 +5734,14 @@ class ServerArgs:
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
+        )
+        parser.add_argument(
+            "--debug-cuda-graph",
+            action="store_true",
+            help="Enable debug/eager mode for CUDA graph using breakable CUDA graph. "
+            "When enabled, graph breaks are inserted so every operation runs eagerly "
+            "while still going through the CUDA graph capture / replay path. "
+            "Useful for debugging CUDA graph capture / replay issues.",
         )
         parser.add_argument(
             "--enable-layerwise-nvtx-marker",
@@ -5637,6 +5965,12 @@ class ServerArgs:
             "--disable-shared-experts-fusion",
             action="store_true",
             help="Disable shared experts fusion optimization for deepseek v3/r1.",
+        )
+        parser.add_argument(
+            "--enforce-shared-experts-fusion",
+            action="store_true",
+            help="Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). "
+            "Mutually exclusive with --disable-shared-experts-fusion.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
@@ -6247,6 +6581,12 @@ class ServerArgs:
                         f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
                     )
 
+            if self.kv_cache_dtype != "bfloat16":
+                raise ValueError(
+                    f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
+                    f"Please use --kv-cache-dtype=bfloat16."
+                )
+
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
@@ -6360,14 +6700,14 @@ class ServerArgs:
                     "Expected a list or a dictionary."
                 )
 
-            # Expand target modules
+            # Normalize target modules to a set; keep {"all"} as a sentinel
+            # that gets resolved model-awarely in lora_manager.init_lora_shapes().
             if self.lora_target_modules:
                 self.lora_target_modules = set(self.lora_target_modules)
                 if "all" in self.lora_target_modules:
                     assert (
                         len(self.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
-                    self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
@@ -6390,6 +6730,13 @@ class ServerArgs:
                     16 <= self.max_lora_chunk_size <= 128
                     and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
+
+            if self.lora_use_virtual_experts:
+                assert self.lora_backend == "triton", (
+                    "--lora-use-virtual-experts requires --lora-backend triton. "
+                    f"Got: {self.lora_backend}"
+                )
+                logger.info("Virtual expert computation enabled.")
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:
