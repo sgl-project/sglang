@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank
+from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import WeightsUpdater
+from sglang.multimodal_gen.runtime.loader.weights_updater import get_updatable_modules
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+    iter_materialized_weights,
+)
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -68,3 +73,23 @@ class GPUWorkerPostTrainingMixin:
             load_format=req.load_format,
             target_modules=req.target_modules,
         )
+
+    def get_weights_checksum(
+        self: GPUWorker, module_names: list[str] | None = None
+    ) -> dict[str, str]:
+        if not self.pipeline:
+            return {"error": "Pipeline is not initialized"}
+
+        all_modules = get_updatable_modules(self.pipeline)
+        names = module_names if module_names is not None else list(all_modules.keys())
+
+        checksums: dict[str, str] = {}
+        for name in names:
+            module = all_modules.get(name)
+            if module is None:
+                checksums[name] = "not_found"
+                continue
+            checksums[name] = compute_weights_checksum(
+                iter_materialized_weights(module)
+            )
+        return checksums

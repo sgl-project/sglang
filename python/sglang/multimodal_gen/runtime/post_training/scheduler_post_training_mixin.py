@@ -36,3 +36,10 @@ class SchedulerPostTrainingMixin:
             output={"success": success, "message": message},
             error=None if success else message,
         )
+
+    def _handle_get_weights_checksum(
+        self: Scheduler, reqs: List[Any]
+    ) -> OutputBatch:
+        req = reqs[0]
+        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
+        return OutputBatch(output=checksums)
