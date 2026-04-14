@@ -23,7 +23,7 @@ set -euxo pipefail
 # Configuration & timing
 # ------------------------------------------------------------------------------
 # Set up environment variables
-CU_VERSION="cu130"
+CU_VERSION="cu129"
 
 # Nvidia package versions we override (torch pins older versions).
 # Used both as pip constraints during install and for post-install verification.
@@ -244,15 +244,7 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
     else
         WHEEL_ARCH="x86_64"
     fi
-    # Wheel may have +cuXYZ suffix (e.g. sglang_kernel-0.4.0+cu130-...) depending on CUDA version
-    KERNEL_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}*-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1)
-    if [ -z "$KERNEL_WHL" ]; then
-        echo "ERROR: No matching sgl-kernel wheel found in sgl-kernel/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH}"
-        ls -alh sgl-kernel/dist/
-        exit 1
-    fi
-    echo "Installing sgl-kernel wheel: $KERNEL_WHL"
-    $PIP_CMD install "$KERNEL_WHL" --force-reinstall $PIP_INSTALL_SUFFIX
+    $PIP_CMD install sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 elif [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; then
     # CUSTOM_BUILD_SGL_KERNEL was set but artifacts not available (e.g., stage rerun without wheel build)
     # Fail instead of falling back to PyPI - we need to test the built kernel, not PyPI version
@@ -326,10 +318,10 @@ mark_step_done "Install extra dependency"
 # Fix other dependencies
 # ------------------------------------------------------------------------------
 # Fix CUDA version mismatch between torch and torchaudio.
-# PyPI's torch bundles a specific CUDA version but torchaudio from pytorch.org/cu130 may use a different one.
+# PyPI's torch 2.9.1 bundles cu128 but torchaudio from pytorch.org/cu129 uses cu129.
 # This mismatch causes torchaudio's C extension to fail loading, producing:
 #   "partially initialized module 'torchaudio' has no attribute 'lib'"
-# We cannot replace torch with a different CUDA version (breaks sgl_kernel ABI), so instead we reinstall
+# We cannot replace torch with cu129 (breaks sgl_kernel ABI), so instead we reinstall
 # torchaudio/torchvision from an index matching torch's CUDA version.
 TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
 echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
