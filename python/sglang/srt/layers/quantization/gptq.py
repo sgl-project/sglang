@@ -598,6 +598,18 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        if _is_cpu:
+            if self.quant_config.desc_act and not (
+                self.quant_config.true_sequential and self.quant_config.static_groups
+            ):
+                raise ValueError(
+                    "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
+                )
+            if self.use_v2_format:
+                raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
+            _amx_process_weight_after_loading(
+                layer, ["qweight", "qzeros", "scales"], None, "gptq"
+            )
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
         if self.use_shuffle:
@@ -615,7 +627,14 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
+        if _is_cpu:
+            return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                x,
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                bias,
+            )
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
@@ -1579,65 +1598,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
 
-class GPTQLinearIntelAMXMethod(GPTQLinearMethod):
-    """Linear method for GPTQ on Ascend NPU."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        super().create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
-
-        if self.quant_config.desc_act and not (
-            self.quant_config.true_sequential and self.quant_config.static_groups
-        ):
-            raise ValueError(
-                "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
-            )
-        if self.use_v2_format:
-            raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-
-        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
-        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
-        layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-
-        _amx_process_weight_after_loading(
-            layer, ["qweight", "qzeros", "scales"], None, "gptq"
-        )
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-
-        return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-            x,
-            layer.qweight,
-            layer.qzeros,
-            layer.scales,
-            bias,
-        )
-
-
 class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GPTQConfig):
@@ -1714,7 +1674,7 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
                 num_experts,
                 scales_size13,
                 2 * intermediate_size_per_partition,
-                dtype=torch.half,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -1722,7 +1682,7 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_scales, extra_weight_attrs)
         # down_proj scales
         w2_scales = torch.nn.Parameter(
-            torch.empty(num_experts, scales_size2, hidden_size, dtype=torch.half),
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_scales", w2_scales)
