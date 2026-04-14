@@ -60,14 +60,7 @@ class UpdateWeightFromTensorChecker:
         tp_cpu_group,
     ) -> tuple[bool, str]:
         if tp_world_size == 1:
-            try:
-                return self.verify(expected_transformer_sha256)
-            except Exception as e:
-                return (
-                    False,
-                    "Exception while verifying transformer update from tensor: "
-                    f"{type(e).__name__}: {e}",
-                )
+            return self.verify(expected_transformer_sha256)
 
         return self._verify_on_tp_root(
             expected_transformer_sha256=expected_transformer_sha256,
@@ -80,16 +73,11 @@ class UpdateWeightFromTensorChecker:
         self,
         expected_transformer_sha256: dict[str, str],
     ) -> tuple[bool, str]:
-        if not expected_transformer_sha256:
-            return False, "expected_transformer_sha256 is required"
-        if not isinstance(expected_transformer_sha256, dict):
-            return False, "expected_transformer_sha256 must be a dict[str, str]"
-
-        transformer = self.pipeline.get_module(_TRANSFORMER_MODULE_NAME)
-        if transformer is None:
-            return False, "Transformer module is not initialized"
-        if not isinstance(transformer, torch.nn.Module):
-            return False, "Transformer module is not a torch.nn.Module"
+        transformer, error_message = self._get_transformer_for_verification(
+            expected_transformer_sha256
+        )
+        if error_message is not None:
+            return False, error_message
 
         actual_transformer_sha256 = self._build_local_transformer_sha256(
             transformer=transformer,
@@ -191,8 +179,6 @@ class UpdateWeightFromTensorChecker:
         transformer = self.pipeline.get_module(_TRANSFORMER_MODULE_NAME)
         if transformer is None:
             return None, "Transformer module is not initialized"
-        if not isinstance(transformer, torch.nn.Module):
-            return None, "Transformer module is not a torch.nn.Module"
         return transformer, None
 
     def _build_local_transformer_sha256(
