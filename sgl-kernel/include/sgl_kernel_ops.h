@@ -103,8 +103,6 @@ void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, 
 /*
  * From csrc/attention
  */
-void merge_state(
-    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
@@ -142,17 +140,6 @@ void rotary_embedding(
     int64_t head_size,
     torch::Tensor& cos_sin_cache,
     bool is_neox);
-
-void downcast_fp8(
-    at::Tensor& k,
-    at::Tensor& v,
-    at::Tensor& k_out,
-    at::Tensor& v_out,
-    at::Tensor& k_scale,
-    at::Tensor& v_scale,
-    at::Tensor& loc,
-    int64_t mult,
-    int64_t offset);
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
@@ -603,9 +590,6 @@ void top_k_renorm_probs(
 
 void top_p_renorm_probs(
     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
-
-void top_k_mask_logits(
-    at::Tensor logits, at::Tensor mask_logits, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
 namespace flash {
 /*

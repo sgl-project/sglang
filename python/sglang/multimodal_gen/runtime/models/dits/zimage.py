@@ -19,7 +19,11 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     UlyssesAttention,
     USPAttention,
 )
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm_with_optional_rope,
+    apply_rmsnorm_tanh_mul_add,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -256,16 +260,6 @@ class ZImageAttention(nn.Module):
         k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
         v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
 
-        if self.qk_norm:
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                allow_inplace=True,
-            )
-
         if freqs_cis is not None:
             cos, sin = freqs_cis
             if _is_cuda and q.shape == k.shape:
@@ -276,12 +270,42 @@ class ZImageAttention(nn.Module):
                     ],
                     dim=-1,
                 )
-                q, k = apply_flashinfer_rope_qk_inplace(
-                    q, k, cos_sin_cache, is_neox=False
-                )
+                if self.qk_norm:
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        cos_sin_cache=cos_sin_cache,
+                        is_neox=False,
+                        allow_inplace=True,
+                    )
+                else:
+                    q, k = apply_flashinfer_rope_qk_inplace(
+                        q, k, cos_sin_cache, is_neox=False
+                    )
             else:
+                if self.qk_norm:
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        allow_inplace=True,
+                    )
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+        elif self.qk_norm:
+            q, k = apply_qk_norm_with_optional_rope(
+                q=q,
+                k=k,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                allow_inplace=True,
+            )
 
         if (
             num_replicated_suffix > 0
@@ -412,8 +436,7 @@ class ZImageTransformerBlock(nn.Module):
             scale_msa, gate_msa, scale_mlp, gate_mlp = scale_msa_gate.unsqueeze(
                 1
             ).chunk(4, dim=2)
-            gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
-            scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+            scale_msa = 1.0 + scale_msa
 
             # Attention block
             attn_out = self.attention(
@@ -422,14 +445,39 @@ class ZImageTransformerBlock(nn.Module):
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
             )
-            x = x + gate_msa * self.attention_norm2(attn_out)
+            if (
+                _is_cuda
+                and attn_out.is_cuda
+                and attn_out.shape[-1] % 256 == 0
+                and attn_out.shape[-1] <= 8192
+                and self.attention_norm2.variance_epsilon
+                == self.ffn_norm1.variance_epsilon
+            ):
+                from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+                    fused_norm_tanh_mul_add_norm_scale,
+                )
+
+                x, ffn_in = fused_norm_tanh_mul_add_norm_scale(
+                    attn_out.contiguous(),
+                    self.attention_norm2.weight.data.contiguous(),
+                    None,
+                    gate_msa.contiguous(),
+                    x.contiguous(),
+                    self.ffn_norm1.weight.data.contiguous(),
+                    None,
+                    scale_mlp.contiguous(),
+                    "rms",
+                    self.attention_norm2.variance_epsilon,
+                )
+            else:
+                x = apply_rmsnorm_tanh_mul_add(
+                    attn_out, gate_msa, x, self.attention_norm2
+                )
+                ffn_in = self.ffn_norm1(x) * (1.0 + scale_mlp)
 
             # FFN block
-            x = x + gate_mlp * self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
-                )
-            )
+            ffn_out = self.feed_forward(ffn_in)
+            x = apply_rmsnorm_tanh_mul_add(ffn_out, gate_mlp, x, self.ffn_norm2)
         else:
             # Attention block
             attn_input = self.attention_norm1(x)
@@ -895,7 +943,8 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         x = list(unified.unbind(dim=0))
         x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 
-        return -x[0]
+        # Keep batch dim so output shape matches input (e.g. rollout/scheduler expect same ndim).
+        return -torch.stack(x)
 
 
 EntryClass = ZImageTransformer2DModel

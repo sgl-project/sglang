@@ -13,13 +13,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
+from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -65,7 +65,7 @@ def can_use_nsa_fused_store(
         return False
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def fused_store_index_k_cache(
     key: torch.Tensor,
     index_k_with_scale: torch.Tensor,

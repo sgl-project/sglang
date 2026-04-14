@@ -427,3 +427,68 @@ def add_output_logprobs_for_spec_v1(
                     req.output_token_ids_logprobs_val.append(token_ids_logprobs_val[pt])
                     req.output_token_ids_logprobs_idx.append(token_ids_logprobs_idx[pt])
             pt += 1
+
+
+def compute_spec_v2_logprobs(
+    batch,
+    logits_output,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    speculative_num_steps: int,
+):
+    """Compute logprobs for accepted tokens after spec v2 verify sampling.
+
+    Gathers logits at accepted positions, applies log_softmax (temperature-scaled
+    if not greedy), and populates logits_output.next_token_logprobs (plus optional
+    top-k / token-ids logprobs) so they flow through copy_to_cpu().
+    """
+    bs = len(batch.seq_lens)
+    max_accept = speculative_num_steps + 1
+    device = predict.device
+
+    flat_accept_idx = accept_index.long().reshape(-1)
+    gathered_logits = logits_output.next_token_logits[flat_accept_idx]
+
+    if batch.sampling_info.is_all_greedy or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+        gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
+    else:
+        temperatures = torch.repeat_interleave(
+            batch.sampling_info.temperatures,
+            max_accept,
+            dim=0,
+        )
+        gathered_logprobs = torch.nn.functional.log_softmax(
+            gathered_logits / temperatures, dim=-1
+        )
+    gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
+
+    accepted_token_ids = predict[flat_accept_idx]
+    token_logprobs = gathered_logprobs[
+        torch.arange(bs * max_accept, device=device),
+        accepted_token_ids.long(),
+    ]
+    logits_output.next_token_logprobs = token_logprobs.reshape(bs, max_accept)
+
+    if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
+        top_logprobs_nums_expanded = [
+            num for num in batch.top_logprobs_nums for _ in range(max_accept)
+        ]
+        (
+            logits_output.next_token_top_logprobs_val,
+            logits_output.next_token_top_logprobs_idx,
+        ) = get_top_logprobs(
+            gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
+        )
+
+    if batch.token_ids_logprobs and any(
+        x is not None for x in batch.token_ids_logprobs
+    ):
+        token_ids_logprobs_expanded = [
+            ids for ids in batch.token_ids_logprobs for _ in range(max_accept)
+        ]
+        (
+            logits_output.next_token_token_ids_logprobs_val,
+            logits_output.next_token_token_ids_logprobs_idx,
+        ) = get_token_ids_logprobs(
+            gathered_logprobs, token_ids_logprobs_expanded, no_copy_to_cpu=True
+        )

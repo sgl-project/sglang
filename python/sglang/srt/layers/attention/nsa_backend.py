@@ -61,7 +61,10 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    from sglang.jit_kernel.flash_attention import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+    )
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -260,6 +263,11 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 row_starts=ks,
             )
         elif self.topk_transform_method == TopkTransformMethod.RAGGED:
+            if cu_topk_indices_offset is None:
+                raise RuntimeError(
+                    "RAGGED topk_transform requires topk_indices_offset; "
+                    "expected extend-without-speculative metadata."
+                )
             return fast_topk_transform_ragged_fused(
                 score=logits,
                 lengths=seq_lens_topk,
@@ -318,6 +326,13 @@ class NativeSparseAttnBackend(
             model_runner.server_args.nsa_prefill_backend
         )
         self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
+        if self.num_q_heads <= 64:
+            self.flashmla_kv_num_q_heads = 64
+        elif self.num_q_heads <= 128:
+            self.flashmla_kv_num_q_heads = 128
+        else:
+            # Keep original head count if it exceeds current padded variants.
+            self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
@@ -333,6 +348,12 @@ class NativeSparseAttnBackend(
                 max_bs * self.nsa_index_topk,
                 dtype=torch.int32,
                 device=self.device,
+            )
+            # Aiter mla_decode_fwd supports num_heads multiples of 16 in range [16, 128].
+            # For models with fewer heads per GPU (e.g. GLM-5 64 heads / TP8 = 8), need to pad the heads to 16.
+            self.need_pad_heads = self.num_q_heads < 16
+            self.head_repeat_factor = (
+                16 // self.num_q_heads if self.num_q_heads < 16 else 1
             )
 
         # Speculative decoding
@@ -402,7 +423,19 @@ class NativeSparseAttnBackend(
 
         # Centralized dispatch: decide all strategies for this batch
         self.set_nsa_prefill_impl(forward_batch)
-        topk_transform_method = self.get_topk_transform_method()
+        nsa_impl_for_batch = (
+            self.nsa_decode_impl
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            )
+            else self.nsa_prefill_impl
+        )
+        use_flashmla_kv = (not self.use_mha) and nsa_impl_for_batch == "flashmla_kv"
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
         # Batch indices selected when cp enabled: After splitting multiple sequences,
         # a certain cp rank may not have some of these sequences.
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
@@ -635,7 +668,7 @@ class NativeSparseAttnBackend(
                     cache_seqlens=nsa_cache_seqlens_int32,
                     seq_len_q=1,
                 )
-                if self.nsa_decode_impl == "flashmla_kv"
+                if use_flashmla_kv
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
@@ -1290,6 +1323,7 @@ class NativeSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                is_prefill=True,
             )
 
         if k is not None:
@@ -1343,7 +1377,9 @@ class NativeSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         # NOTE(dark): here, we use page size = 1
-        topk_transform_method = self.get_topk_transform_method()
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
@@ -1700,9 +1736,21 @@ class NativeSparseAttnBackend(
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
+        assert metadata.flashmla_metadata is not None
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        num_q_heads = q_all.shape[2]
+        target_q_heads = self.flashmla_kv_num_q_heads
+        if target_q_heads != num_q_heads:
+            # Pad q heads to match FlashMLA decode supported head-count variants.
+            q_input = q_all.new_zeros(
+                q_all.shape[0], q_all.shape[1], target_q_heads, q_all.shape[3]
+            )
+            q_input[:, :, :num_q_heads, :] = q_all
+        else:
+            q_input = q_all
+
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
@@ -1716,7 +1764,7 @@ class NativeSparseAttnBackend(
         )  # requirement of FlashMLA decode kernel
 
         o, _ = flash_mla_with_kvcache(
-            q=q_all,
+            q=q_input,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
             head_dim_v=v_head_dim,
@@ -1730,6 +1778,10 @@ class NativeSparseAttnBackend(
             ),
             is_fp8_kvcache=True,
         )
+
+        if target_q_heads != num_q_heads:
+            o = o[:, :, :num_q_heads, :]
+
         return o
 
     def _forward_standard_mha(
@@ -1781,6 +1833,7 @@ class NativeSparseAttnBackend(
                 enable_pdl=False,
                 is_causal=causal,
                 return_lse=False,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
 
         # Use FA3 for SM90 (Hopper/H200)
@@ -1830,6 +1883,21 @@ class NativeSparseAttnBackend(
         else:
             o = torch.empty_like(q)
 
+        if self.need_pad_heads:
+            q_kernel = q.view(
+                -1, layer.tp_q_head_num, layer.head_dim
+            ).repeat_interleave(self.head_repeat_factor, dim=1)
+            o_kernel = q.new_empty(
+                (
+                    q.shape[0],
+                    layer.tp_q_head_num * self.head_repeat_factor,
+                    layer.v_head_dim,
+                )
+            )
+        else:
+            q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
         kv_indptr = self.kv_indptr
 
         non_minus1_mask = page_table_1 != -1
@@ -1840,9 +1908,9 @@ class NativeSparseAttnBackend(
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
         mla_decode_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            o_kernel,
             metadata.cu_seqlens_q,
             kv_indptr,
             kv_indices,
@@ -1851,7 +1919,10 @@ class NativeSparseAttnBackend(
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
         )
-        # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
+
+        if self.need_pad_heads:
+            o = o_kernel[:, :: self.head_repeat_factor, :]
+
         return o
 
     def _forward_aiter_extend(
@@ -1868,6 +1939,21 @@ class NativeSparseAttnBackend(
             o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
+
+        if self.need_pad_heads:
+            q_kernel = q.view(
+                -1, layer.tp_q_head_num, layer.head_dim
+            ).repeat_interleave(self.head_repeat_factor, dim=1)
+            o_kernel = q.new_empty(
+                (
+                    num_tokens,
+                    layer.tp_q_head_num * self.head_repeat_factor,
+                    layer.v_head_dim,
+                )
+            )
+        else:
+            q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
@@ -1890,9 +1976,9 @@ class NativeSparseAttnBackend(
         )
         # TODO support more forward_mode
         mla_decode_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            o_kernel,
             cu_seqlens_q,
             kv_indptr,
             kv_indices,
@@ -1901,6 +1987,10 @@ class NativeSparseAttnBackend(
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
         )
+
+        if self.need_pad_heads:
+            o = o_kernel[:, :: self.head_repeat_factor, :]
+
         return o
 
     def _forward_trtllm(
@@ -1919,6 +2009,7 @@ class NativeSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
@@ -1980,6 +2071,13 @@ class NativeSparseAttnBackend(
 
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
+        elif is_prefill:
+            page_table_1 = transform_index_page_table_prefill(
+                page_table=metadata.page_table_1,
+                topk_indices=topk_indices,
+                extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
+                page_size=1,
+            )
         else:
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
@@ -2016,6 +2114,7 @@ class NativeSparseAttnBackend(
             sparse_mla_top_k=self.nsa_index_topk,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
         )
         # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
         return out.squeeze(1)
@@ -2095,7 +2194,9 @@ class NativeSparseAttnBackend(
                 # bf16 kv cache
                 self.nsa_prefill_impl = "flashmla_sparse"
 
-    def get_topk_transform_method(self) -> TopkTransformMethod:
+    def get_topk_transform_method(
+        self, forward_mode: Optional[ForwardMode] = None
+    ) -> TopkTransformMethod:
         """
         SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
@@ -2104,6 +2205,7 @@ class NativeSparseAttnBackend(
             # disable for MTP
             self.nsa_kv_cache_store_fp8
             and self.nsa_prefill_impl == "flashmla_sparse"
+            and forward_mode == ForwardMode.EXTEND
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
@@ -2119,7 +2221,9 @@ class NativeSparseAttnBackend(
         )
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
-            topk_transform_method=self.get_topk_transform_method(),
+            topk_transform_method=self.get_topk_transform_method(
+                forward_batch.forward_mode
+            ),
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             force_unfused_topk=force_unfused,
         )
@@ -2127,13 +2231,15 @@ class NativeSparseAttnBackend(
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
         from sgl_kernel.flash_mla import get_mla_metadata
 
+        num_heads_q = self.flashmla_kv_num_q_heads
+
         flashmla_metadata, num_splits = get_mla_metadata(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
             #      but the name looks like need seq_len_q?
-            num_q_tokens_per_head_k=seq_len_q * self.num_q_heads // 1,
+            num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
             num_heads_k=1,
-            num_heads_q=self.num_q_heads,
+            num_heads_q=num_heads_q,
             is_fp8_kvcache=True,
             topk=self.nsa_index_topk,
         )
