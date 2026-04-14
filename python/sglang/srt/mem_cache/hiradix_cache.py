@@ -239,14 +239,15 @@ class HiRadixCache(RadixCache):
         self.enable_storage_metrics = enable_storage_metrics
 
         if self.enable_storage_metrics:
-            cc = self.cache_controller
-            attn_cp_rank, attn_cp_size = cc.get_attn_cp_rank_and_size()
+            attn_cp_rank, attn_cp_size = (
+                self.cache_controller.get_attn_cp_rank_and_size()
+            )
             labels = {
                 "storage_backend": storage_backend,
-                "tp_rank": cc.tp_rank,
-                "dp_rank": cc.dp_rank,
-                "pp_rank": cc.pp_rank,
-                "pp_size": cc.pp_size,
+                "tp_rank": self.cache_controller.tp_rank,
+                "dp_rank": self.cache_controller.dp_rank,
+                "pp_rank": self.cache_controller.pp_rank,
+                "pp_size": self.cache_controller.pp_size,
                 "attn_cp_rank": attn_cp_rank,
                 "attn_cp_size": attn_cp_size,
             }
