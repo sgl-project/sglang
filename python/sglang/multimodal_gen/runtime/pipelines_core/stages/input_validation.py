@@ -79,6 +79,11 @@ class InputValidationStage(PipelineStage):
         # Create generators based on generator_device parameter
         # Note: This will overwrite any existing batch.generator
         generator_device = batch.generator_device
+        if generator_device is None:
+            generator_device = (
+                getattr(server_args.pipeline_config, "generator_device", None)
+                or current_platform.device_type
+            )
 
         if generator_device == "cpu":
             device_str = "cpu"
@@ -129,8 +134,13 @@ class InputValidationStage(PipelineStage):
             # adjust output image size
             if calculated_size is not None:
                 calculated_width, calculated_height = calculated_size
-                width = batch.width or calculated_width
-                height = batch.height or calculated_height
+                explicit_fields = set(batch.extra.get("explicit_fields", []))
+                width_is_explicit = "width" in explicit_fields
+                height_is_explicit = "height" in explicit_fields
+
+                width = batch.width if width_is_explicit else calculated_width
+                height = batch.height if height_is_explicit else calculated_height
+
                 multiple_of = (
                     server_args.pipeline_config.vae_config.get_vae_scale_factor() * 2
                 )

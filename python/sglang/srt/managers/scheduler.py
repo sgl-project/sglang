@@ -38,7 +38,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -83,6 +83,8 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    AddExternalCorpusReqInput,
+    AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BaseBatchReq,
@@ -114,16 +116,18 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    ListExternalCorporaReqInput,
+    ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
-    PinPrefixReqInput,
-    PinPrefixReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    RemoveExternalCorpusReqInput,
+    RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -142,7 +146,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    has_shm_features,
+    init_mm_embedding_cache,
+    unwrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
@@ -183,6 +191,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
     real_time,
@@ -265,6 +274,24 @@ class EmbeddingBatchResult:
             ]
 
         self.copy_done.record()
+
+
+def validate_dflash_request(req: Req) -> Optional[str]:
+    if req.return_logprob:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+
+    if (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    ):
+        return (
+            "DFLASH speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
+
+    return None
 
 
 class Scheduler(
@@ -350,10 +377,6 @@ class Scheduler(
                 self.dp_size,
                 self.attn_cp_size,
             )
-        )
-
-        self.enable_kv_cache_events = bool(
-            server_args.kv_events_config and self.attn_tp_rank == 0
         )
 
         # Init model configs
@@ -546,7 +569,7 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            self.tokenizer.think_end_id = self.tokenizer.encode(
+            self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
@@ -596,6 +619,7 @@ class Scheduler(
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
             self.draft_worker = None
+            self.external_corpus_manager = None
             return
 
         # Launch a draft worker for speculative decoding
@@ -621,6 +645,18 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+        if self.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.external_corpus_manager import (
+                ExternalCorpusManager,
+            )
+
+            self.external_corpus_manager = ExternalCorpusManager(
+                self.draft_worker,
+                self.send_to_tokenizer.send_output,
+            )
+        else:
+            self.external_corpus_manager = None
 
     def init_model_worker(self):
         self.init_tp_model_worker()
@@ -697,12 +733,20 @@ class Scheduler(
 
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
+        uses_transformers_backend = (
+            get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
+        )
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
+        _spec = self.tp_worker.model_runner.linear_attn_model_spec
+        _registry_needs_mamba = (
+            _spec.uses_mamba_radix_cache if _spec is not None else False
+        )
         self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
+            or _registry_needs_mamba
         )
 
         self.sliding_window_size = None
@@ -716,9 +760,21 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
-        # Create cache
+        self.disable_radix_cache = server_args.disable_radix_cache or (
+            self.model_config.is_multimodal and uses_transformers_backend
+        )
+        if self.disable_radix_cache and not server_args.disable_radix_cache:
+            logger.warning(
+                "Radix cache is disabled for multimodal models with the "
+                "Transformers backend to avoid multimodal prefix-cache mismatches."
+            )
+
+        effective_chunked_prefill_size = server_args.chunked_prefill_size
+        if self.model_config.is_multimodal and uses_transformers_backend:
+            effective_chunked_prefill_size = None
+
         params = CacheInitParams(
-            disable=server_args.disable_radix_cache,
+            disable=self.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             page_size=self.page_size,
@@ -734,14 +790,13 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
-            chunked_prefill_size=server_args.chunked_prefill_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
+            chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
         )
 
-        if (
-            server_args.chunked_prefill_size is not None
-            and server_args.disable_radix_cache
-        ):
+        if effective_chunked_prefill_size is not None and self.disable_radix_cache:
             if not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
@@ -776,6 +831,21 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                from sglang.srt.mem_cache.unified_cache_components import (
+                    ComponentType,
+                )
+                from sglang.srt.mem_cache.unified_radix_cache import (
+                    UnifiedRadixCache,
+                )
+
+                tree_components = [ComponentType.FULL]
+                if self.is_hybrid_swa or self.is_hybrid_ssm:
+                    tree_components.append(
+                        ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
+                    )
+                params.tree_components = tuple(tree_components)
+                self.tree_cache = UnifiedRadixCache(params)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -842,9 +912,22 @@ class Scheduler(
         self._engine_paused = False
 
     def init_chunked_prefill(self):
-        # Init chunked prefill
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
-        if self.chunked_prefill_size <= 0:  # -1 means disable
+        uses_transformers_backend = (
+            get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
+        )
+        if (
+            self.chunked_prefill_size is not None
+            and self.chunked_prefill_size > 0
+            and self.model_config.is_multimodal
+            and uses_transformers_backend
+        ):
+            logger.warning(
+                "Chunked prefill is disabled for multimodal models with the "
+                "Transformers backend to avoid partial multimodal chunk mismatches."
+            )
+            self.chunked_prefill_size = None
+        elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
         self.is_mixed_chunk = (
@@ -1181,7 +1264,6 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
-                (PinPrefixReqInput, self.pin_prefix_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -1224,6 +1306,15 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (AddExternalCorpusReqInput, self.add_external_corpus),
+                (
+                    RemoveExternalCorpusReqInput,
+                    self.remove_external_corpus,
+                ),
+                (
+                    ListExternalCorporaReqInput,
+                    self.list_external_corpora,
+                ),
             ]
         )
 
@@ -1290,7 +1381,7 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
-                self.self_check_during_idle()
+                self.on_idle()
 
             # Update last_batch
             self.last_batch = batch
@@ -1340,7 +1431,7 @@ class Scheduler(
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                self.on_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1501,6 +1592,27 @@ class Scheduler(
         # so that ShmPointerMMData metadata (not full tensor data) is what
         # gets serialized during broadcast_pyobj.
         if recv_reqs:
+            # Barrier for the non-DP-attention path only: there is a single
+            # broadcast_pyobj on tp_cpu_group where the source rank returns
+            # the original objects immediately while other ranks are still in
+            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
+            # the source can call materialize() / shm_unlink before others
+            # open the segment.  recv_reqs is consistent across all ranks
+            # here (same broadcast), so the guard is deadlock-free.
+            #
+            # Under DP-attention no barrier is needed: the control_reqs
+            # broadcast on tp_cpu_group (step 3) is a collective that forces
+            # every rank to complete the earlier attn_tp / attn_cp work_reqs
+            # deserializations (steps 1-2, which call shm_open) before any
+            # rank returns from step 3.  POSIX guarantees shm_unlink only
+            # removes the name; already-open handles stay valid.
+            if (
+                not self.server_args.enable_dp_attention
+                and self.tp_size > 1
+                and self.model_config.is_multimodal
+                and has_shm_features(recv_reqs)
+            ):
+                barrier(group=self.tp_cpu_group)
             for req in recv_reqs:
                 unwrap_shm_features(req)
 
@@ -1557,6 +1669,8 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
 
         self._check_pending_flush()
+        if self.external_corpus_manager is not None:
+            self.external_corpus_manager.check_pending_load()
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -1570,17 +1684,17 @@ class Scheduler(
 
     def _process_and_broadcast_mm_inputs(
         self,
-        raw_mm_inputs: Optional[dict],
+        raw_mm_inputs,
     ):
         """Materialize MultimodalInputs once on the entry rank and broadcast to others.
 
         Entry rank:
-        - constructs MultimodalInputs.from_dict(raw_mm_inputs) once
+        - constructs MultimodalInputs.from_processor_output() once
         - broadcasts to other ranks in self.cpu_group (if world_size > 1)
 
         Non-entry ranks:
         - receive the object via broadcast (if world_size > 1)
-        - otherwise (single-rank / no group) fall back to local from_dict
+        - otherwise (single-rank / no group) fall back to local from_processor_output
 
         Returns:
             MultimodalInputs | None
@@ -1611,7 +1725,7 @@ class Scheduler(
         # increase the CUDA kernel launch time.
         if self.dp_tp_group.rank_in_group == 0:
             # Only the entry rank materializes once from dict.
-            image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+            image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
             # Broadcast to other TP ranks (use src=0 within the group).
             if group_world_size > 1:
                 obj_list = [image_inputs]
@@ -1632,15 +1746,15 @@ class Scheduler(
                 )
                 image_inputs = obj_list[0]
             else:
-                image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+                image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
 
         return image_inputs
 
-    def _get_multimodal_inputs(self, mm_inputs_dict: dict):
+    def _get_multimodal_inputs(self, mm_inputs_dict):
         if self.server_args.enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
-            return MultimodalInputs.from_dict(mm_inputs_dict)
+            return MultimodalInputs.from_processor_output(mm_inputs_dict)
 
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
@@ -1702,6 +1816,8 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
+                positional_embed_overrides=recv_req.positional_embed_overrides,
+                token_type_ids=recv_req.token_type_ids,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
@@ -1743,8 +1859,11 @@ class Scheduler(
                     self.stream_output([req], req.return_logprob)
                     return
 
-        elif session_id in self.session_controller:
-            # Session exists: create request from session
+        elif (
+            session_id in self.session_controller
+            and not self.session_controller.get(session_id).close_on_finish
+        ):
+            # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
             req = session.create_req(
                 recv_req,
@@ -1761,7 +1880,13 @@ class Scheduler(
                 return
 
         else:
-            # Session ID provided but session not found
+            # Session not found, or session is closing
+            if session_id in self.session_controller:
+                error_msg = (
+                    f"Invalid request: close was requested for session {session_id}"
+                )
+            else:
+                error_msg = f"Invalid request: session id {session_id} does not exist"
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1770,12 +1895,18 @@ class Scheduler(
                 vocab_size=self.model_config.vocab_size,
             )
             req.tokenizer = self.tokenizer
-            req.set_finish_with_abort(
-                f"Invalid request: session id {session_id} does not exist"
-            )
+            req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        if self.spec_algorithm.is_dflash():
+            error_msg = validate_dflash_request(req)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -1784,10 +1915,12 @@ class Scheduler(
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 
             # The following steps are already fast, execute locally on each rank.
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
-            )
+            # Expand a single image token into multiple dummy tokens for receiving image embeddings.
+            # The pad function is model-specific and can be None for some backends.
+            if self.pad_input_ids_func:
+                req.origin_input_ids = self.pad_input_ids_func(
+                    req.origin_input_ids, image_inputs
+                )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
 
@@ -2016,6 +2149,7 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            positional_embed_overrides=recv_req.positional_embed_overrides,
             token_type_ids=recv_req.token_type_ids,
             routed_dp_rank=recv_req.routed_dp_rank,
             priority=recv_req.priority,
@@ -2140,6 +2274,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
+        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -2149,31 +2284,37 @@ class Scheduler(
                 else:
                     self.running_batch.merge_batch(new_batch)
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
-        else:
-            if self.last_batch and self.last_batch.forward_mode.is_extend():
-                if self.last_batch.chunked_req is not None:
-                    # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                    # We need to discard it.
-                    chunked_req_to_exclude.add(self.last_batch.chunked_req)
+            # Reset batch_is_full so the scheduler can schedule more prefills.
+            self.running_batch.batch_is_full = False
 
-                if self.dllm_config is not None and self.last_batch.reqs:
-                    chunked_req_to_exclude.update(self.last_batch.reqs)
+        if (
+            not self.enable_hisparse
+            and self.last_batch
+            and self.last_batch.forward_mode.is_extend()
+        ):
+            if self.last_batch.chunked_req is not None:
+                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+                # We need to discard it.
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
-                # Filter batch
-                last_bs = self.last_batch.batch_size()
-                self.last_batch.filter_batch(
-                    chunked_req_to_exclude=list(chunked_req_to_exclude)
-                )
-                if self.last_batch.batch_size() < last_bs:
-                    self.running_batch.batch_is_full = False
+            if self.dllm_config is not None and self.last_batch.reqs:
+                chunked_req_to_exclude.update(self.last_batch.reqs)
 
-                # Merge the new batch into the running batch.
-                if not self.last_batch.is_empty():
-                    if self.running_batch.is_empty():
-                        self.running_batch = self.last_batch
-                    else:
-                        # Merge running_batch with prefill batch
-                        self.running_batch.merge_batch(self.last_batch)
+            # Filter batch
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
+                self.running_batch.batch_is_full = False
+
+            # Merge the new batch into the running batch.
+            if not self.last_batch.is_empty():
+                if self.running_batch.is_empty():
+                    self.running_batch = self.last_batch
+                else:
+                    # Merge running_batch with prefill batch
+                    self.running_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -2231,26 +2372,10 @@ class Scheduler(
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
-            # Get token usage from several pools
-            token_usage = None
-            if self.is_hybrid_swa:
-                _, _, full_token_usage, swa_token_usage, *_ = self._get_swa_token_info()
-                token_usage = max(full_token_usage, swa_token_usage)
-            if self.is_hybrid_ssm:
-                _, _, full_token_usage, mamba_token_usage, *_ = (
-                    self._get_mamba_token_info()
-                )
-                token_usage = (
-                    max(token_usage, mamba_token_usage)
-                    if token_usage is not None
-                    else max(full_token_usage, mamba_token_usage)
-                )
-            if token_usage is None:
-                _, token_usage, _, _ = self._get_token_info()
-
-            assert token_usage is not None
+            # Get max usage across all pools for prefill delay decision
+            max_pool_usage = self.get_pool_stats().get_max_pool_usage()
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
-                self.prefill_delayer, token_usage=token_usage
+                self.prefill_delayer, token_usage=max_pool_usage
             )
 
         ret = self._get_new_batch_prefill_raw(
@@ -2458,9 +2583,18 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        # Record prefill stats for logging after forward
+        # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
-            adder, self.running_batch.reqs, self.enable_priority_scheduling
+            adder,
+            self.running_batch.reqs,
+            self.enable_priority_scheduling,
+            num_pending_tokens=self._get_num_pending_tokens(
+                chunk_deduct=(
+                    self.chunked_req.extend_input_len
+                    if self.chunked_req is not None
+                    else 0
+                )
+            ),
         )
 
         # Mixed-style chunked prefill
@@ -2547,8 +2681,6 @@ class Scheduler(
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.retract_req(req)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -2809,6 +2941,36 @@ class Scheduler(
                 pending_req,
             )
 
+    def add_external_corpus(
+        self, recv_req: AddExternalCorpusReqInput
+    ) -> Optional[AddExternalCorpusReqOutput]:
+        if self.external_corpus_manager is None:
+            return AddExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        return self.external_corpus_manager.add(recv_req)
+
+    def remove_external_corpus(
+        self, recv_req: RemoveExternalCorpusReqInput
+    ) -> RemoveExternalCorpusReqOutput:
+        if self.external_corpus_manager is None:
+            return RemoveExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        return self.external_corpus_manager.remove(recv_req)
+
+    def list_external_corpora(
+        self, recv_req: ListExternalCorporaReqInput
+    ) -> ListExternalCorporaReqOutput:
+        if self.external_corpus_manager is None:
+            return ListExternalCorporaReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        return self.external_corpus_manager.list(recv_req)
+
     def flush_cache_wrapped(
         self, recv_req: FlushCacheReqInput
     ) -> Optional[FlushCacheReqOutput]:
@@ -2869,6 +3031,12 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                if self.decode_offload_manager is not None:
+                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+
+            # HiSparse: staging requests transitioning prefill -> decode
+            if self.enable_hisparse:
+                idle &= not self.hisparse_coordinator.has_ongoing_staging()
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -2979,37 +3147,6 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def pin_prefix_wrapped(self, recv_req: PinPrefixReqInput):
-        if not hasattr(self.tree_cache, "pin_prefix"):
-            return PinPrefixReqOutput(
-                success=False,
-                nodes_pinned=0,
-                message="PIN requires --enable-hierarchical-cache",
-            )
-        if getattr(self.tree_cache, "_max_pinned_tokens", 0) <= 0:
-            return PinPrefixReqOutput(
-                success=False,
-                nodes_pinned=0,
-                message="Pinning is disabled (SGLANG_HICACHE_MAX_PINNED_RATIO is 0)",
-            )
-        nodes_pinned, reject_reason = self.tree_cache.pin_prefix(
-            recv_req.token_ids, recv_req.ttl_seconds
-        )
-        if nodes_pinned == 0:
-            return PinPrefixReqOutput(
-                success=False,
-                nodes_pinned=0,
-                message=reject_reason or "No matching prefix found in cache to pin",
-            )
-        msg = f"Pinned {nodes_pinned} nodes (ttl={recv_req.ttl_seconds}s)"
-        if reject_reason:
-            msg += f"; {reject_reason}"
-        return PinPrefixReqOutput(
-            success=True,
-            nodes_pinned=nodes_pinned,
-            message=msg,
-        )
-
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if self.is_fully_idle():
@@ -3038,7 +3175,7 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = vars(get_global_server_args())
+        ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -3233,6 +3370,16 @@ class Scheduler(
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
+        if recv_req.mode == "in_place":
+            # In-place pause: just set the flag and return immediately.
+            # All scheduler state (running_batch, last_batch, chunked_req,
+            # result_queue) is left untouched. On resume, the normal event
+            # loop (get_next_batch_to_run) handles last_batch merge,
+            # chunked_req cleanup, and overlap result processing through
+            # the standard code paths. This avoids duplicating batch
+            # manipulation logic and the accounting bugs that come with it.
+            return
+
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3240,13 +3387,17 @@ class Scheduler(
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
-            if recv_req.mode == "in_place":
-                if self.chunked_req is not None:
-                    chunked_req_to_exclude.add(self.chunked_req)
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
-            if not self.last_batch.is_empty():
+            # Skip merge for disagg prefill: completed prefill requests are
+            # already in disagg_prefill_inflight_queue. Merging them into
+            # running_batch leaks them, since the prefill event loop never
+            # calls update_running_batch to clean them up.
+            if (
+                not self.last_batch.is_empty()
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
@@ -3255,7 +3406,7 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch = None
 
-        if recv_req.mode == "retract":
+        if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
@@ -3328,7 +3479,10 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        return self.session_controller.open(recv_req)
+        output = self.session_controller.open(recv_req)
+        if self.pp_rank == 0 and self.tp_rank == 0 and self.attn_cp_rank == 0:
+            return output
+        return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
         self.session_controller.close(recv_req)
@@ -3530,18 +3684,18 @@ def run_scheduler_process(
     dp_rank = configure_scheduler(
         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
-
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
     # Set cpu affinity to this gpu process
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
-    numa_node = get_numa_node_if_available(server_args, gpu_id)
-    if numa_node is not None and not envs.SGLANG_NUMA_BIND_V2.get():
-        numa_bind_to_node(numa_node)
+    if not envs.SGLANG_NUMA_BIND_V2.get():
+        numa_node = get_numa_node_if_available(server_args, gpu_id)
+        if numa_node is not None:
+            numa_bind_to_node(numa_node)
 
     # Set up tracing
     if server_args.enable_trace:
