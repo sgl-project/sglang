@@ -298,9 +298,7 @@ class PrefillBootstrapQueue:
             error_message += f" with exception {e}"
         logger.error(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        prepare_abort(
-            req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-        )
+        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.scheduler.stream_output([req], req.return_logprob)
         if self.scheduler.enable_metrics:
             self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
@@ -313,8 +311,7 @@ class PrefillBootstrapQueue:
         num_kv_indices = len(req.origin_input_ids)
         if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
             raise RuntimeError(
-                "Prefill bootstrap ran out of metadata buffers for "
-                f"rid={req.rid}"
+                "Prefill bootstrap ran out of metadata buffers for " f"rid={req.rid}"
             )
 
         req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
