@@ -111,61 +111,13 @@ class HeterFusedMoE(nn.Module):
             num_bits = gcfg.get("num_bits", 16)
             if num_bits == 16:
                 if not hasattr(self, "w13_weight"):
-                    self.register_parameter(
-                        "w13_weight",
-                        nn.Parameter(
-                            torch.empty(
-                                E, 2 * I, H, dtype=self.dtype, device=self.device
-                            ),
-                            requires_grad=False,
-                        ),
-                    )
-                    self.register_parameter(
-                        "w2_weight",
-                        nn.Parameter(
-                            torch.empty(E, H, I, dtype=self.dtype, device=self.device),
-                            requires_grad=False,
-                        ),
-                    )
+                    self._init_bf16_params(E, H, I)
             elif num_bits == 4:
                 if not hasattr(self, "int4_w13_qweight"):
                     self._init_int4_params(E, H, I, gcfg)
             elif num_bits == 8:
                 if not hasattr(self, "w13_weight"):
-                    self.register_parameter(
-                        "w13_weight",
-                        nn.Parameter(
-                            torch.empty(
-                                E, 2 * I, H, dtype=torch.int8, device=self.device
-                            ),
-                            requires_grad=False,
-                        ),
-                    )
-                    self.register_parameter(
-                        "w2_weight",
-                        nn.Parameter(
-                            torch.empty(E, H, I, dtype=torch.int8, device=self.device),
-                            requires_grad=False,
-                        ),
-                    )
-                    self.register_parameter(
-                        "w13_weight_scale",
-                        nn.Parameter(
-                            torch.ones(
-                                E, 2 * I, 1, dtype=torch.float32, device=self.device
-                            ),
-                            requires_grad=False,
-                        ),
-                    )
-                    self.register_parameter(
-                        "w2_weight_scale",
-                        nn.Parameter(
-                            torch.ones(
-                                E, H, 1, dtype=torch.float32, device=self.device
-                            ),
-                            requires_grad=False,
-                        ),
-                    )
+                    self._init_int8_params(E, H, I)
 
     def init_fake_weights(self, seed: int = 0) -> None:
         gen = torch.Generator(device=self.device)
@@ -220,6 +172,54 @@ class HeterFusedMoE(nn.Module):
         instance.w2_weight = nn.Parameter(fused_moe.w2_weight.data, requires_grad=False)
 
         return instance
+
+    def _init_bf16_params(self, E: int, H: int, I: int) -> None:
+        """Create BF16 weight containers."""
+        self.register_parameter(
+            "w13_weight",
+            nn.Parameter(
+                torch.empty(E, 2 * I, H, dtype=self.dtype, device=self.device),
+                requires_grad=False,
+            ),
+        )
+        self.register_parameter(
+            "w2_weight",
+            nn.Parameter(
+                torch.empty(E, H, I, dtype=self.dtype, device=self.device),
+                requires_grad=False,
+            ),
+        )
+
+    def _init_int8_params(self, E: int, H: int, I: int) -> None:
+        """Create INT8 weight and scale containers."""
+        self.register_parameter(
+            "w13_weight",
+            nn.Parameter(
+                torch.empty(E, 2 * I, H, dtype=torch.int8, device=self.device),
+                requires_grad=False,
+            ),
+        )
+        self.register_parameter(
+            "w2_weight",
+            nn.Parameter(
+                torch.empty(E, H, I, dtype=torch.int8, device=self.device),
+                requires_grad=False,
+            ),
+        )
+        self.register_parameter(
+            "w13_weight_scale",
+            nn.Parameter(
+                torch.ones(E, 2 * I, 1, dtype=torch.float32, device=self.device),
+                requires_grad=False,
+            ),
+        )
+        self.register_parameter(
+            "w2_weight_scale",
+            nn.Parameter(
+                torch.ones(E, H, 1, dtype=torch.float32, device=self.device),
+                requires_grad=False,
+            ),
+        )
 
     def _init_int4_params(self, E: int, H: int, I: int, gcfg: Dict) -> None:
         """Create GPTQ-format INT4 parameter containers.
@@ -476,7 +476,9 @@ class HeterFusedMoE(nn.Module):
         topk_ids = topk_output.topk_ids
         router_logits = topk_output.router_logits
 
-        group_dispatches = self.policy.dispatch(topk_ids, topk_weights)
+        # Sentinel = -1: Triton (BF16/INT8) fully skips expert ID -1.
+        group_dispatches = self.policy.dispatch(topk_ids, topk_weights, sentinel=-1)
+        # print(group_dispatches)
 
         output = None
 
@@ -484,15 +486,6 @@ class HeterFusedMoE(nn.Module):
             group_ids, group_weights = group_dispatches[group_idx]
 
             num_bits = gcfg.get("num_bits", 16)
-
-            # Triton kernels (BF16/INT8) require sentinel=-1, not num_experts.
-            # Marlin INT4 handles num_experts sentinel natively.
-            if num_bits != 4:
-                group_ids = torch.where(
-                    group_ids == self.num_experts,
-                    torch.full_like(group_ids, -1),
-                    group_ids,
-                )
 
             if num_bits == 16:
                 group_out = outplace_fused_experts(
