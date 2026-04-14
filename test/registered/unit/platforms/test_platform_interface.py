@@ -98,7 +98,18 @@ class TestPlatformEnum(CustomTestCase):
     """Tests for PlatformEnum enumeration."""
 
     def test_all_expected_values_exist(self):
-        expected = {"CUDA", "ROCM", "CPU", "XPU", "MUSA", "NPU", "TPU", "MPS", "OOT", "UNSPECIFIED"}
+        expected = {
+            "CUDA",
+            "ROCM",
+            "CPU",
+            "XPU",
+            "MUSA",
+            "NPU",
+            "TPU",
+            "MPS",
+            "OOT",
+            "UNSPECIFIED",
+        }
         actual = {member.name for member in PlatformEnum}
         self.assertEqual(actual, expected)
 
@@ -350,7 +361,10 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         bad_fn = MagicMock(side_effect=RuntimeError("broken"))
         good_fn = MagicMock(return_value="pkg.Mod:GoodPlatform")
-        mock_load.return_value = {"bad": (bad_fn, "bad-dist"), "good": (good_fn, "good-dist")}
+        mock_load.return_value = {
+            "bad": (bad_fn, "bad-dist"),
+            "good": (good_fn, "good-dist"),
+        }
         with patch("sglang.srt.platforms._load_platform_class") as mock_resolve:
             mock_instance = MagicMock()
             mock_resolve.return_value = MagicMock(return_value=mock_instance)
@@ -365,7 +379,10 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         none_fn = MagicMock(return_value=None)
         good_fn = MagicMock(return_value="pkg.Mod:GoodPlatform")
-        mock_load.return_value = {"unavailable": (none_fn, "unavail-dist"), "good": (good_fn, "good-dist")}
+        mock_load.return_value = {
+            "unavailable": (none_fn, "unavail-dist"),
+            "good": (good_fn, "good-dist"),
+        }
         with patch("sglang.srt.platforms._load_platform_class") as mock_resolve:
             mock_instance = MagicMock()
             mock_resolve.return_value = MagicMock(return_value=mock_instance)

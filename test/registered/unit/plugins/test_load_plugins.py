@@ -10,7 +10,12 @@ Run:  python -m pytest test/registered/unit/plugins/test_load_plugins.py -v
 
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.plugins import _current_plugin_source, _get_excluded_dists, load_plugins, load_plugins_by_group
+from sglang.srt.plugins import (
+    _current_plugin_source,
+    _get_excluded_dists,
+    load_plugins,
+    load_plugins_by_group,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -136,7 +141,9 @@ class TestLoadPlugins(CustomTestCase):
     @patch("sglang.srt.plugins.HookRegistry")
     @patch("sglang.srt.plugins.envs")
     @patch("sglang.srt.plugins.entry_points")
-    def test_current_plugin_source_set_during_and_reset_after(self, mock_eps, mock_envs, mock_registry):
+    def test_current_plugin_source_set_during_and_reset_after(
+        self, mock_eps, mock_envs, mock_registry
+    ):
         """_current_plugin_source is set during plugin execution, reset after."""
         sources_seen = []
 
@@ -158,7 +165,9 @@ class TestLoadPlugins(CustomTestCase):
     @patch("sglang.srt.plugins.HookRegistry")
     @patch("sglang.srt.plugins.envs")
     @patch("sglang.srt.plugins.entry_points")
-    def test_current_plugin_source_reset_after_exception(self, mock_eps, mock_envs, mock_registry):
+    def test_current_plugin_source_reset_after_exception(
+        self, mock_eps, mock_envs, mock_registry
+    ):
         """_current_plugin_source is reset to None even when a plugin raises."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_envs.SGLANG_PLUGINS.get.return_value = ""

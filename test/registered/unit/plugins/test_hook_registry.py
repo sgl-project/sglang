@@ -83,6 +83,7 @@ class TestBasicHooks(_HookTestCase):
 
     def test_before_modifies_args(self):
         """BEFORE hook returns (args, kwargs) to modify arguments."""
+
         def orig(x, y=0):
             return x + y
 
@@ -97,6 +98,7 @@ class TestBasicHooks(_HookTestCase):
 
     def test_before_returning_none(self):
         """BEFORE hook returning None leaves arguments unchanged."""
+
         def orig(x):
             return x * 2
 
