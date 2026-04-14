@@ -52,6 +52,16 @@ class SchedulerUpdateWeightsMixin:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    def _quiesce_for_weight_update(self: Scheduler):
+        """Drain in-flight forward work before any NCCL weight mutation.
+        Synchronize forward_stream and schedule_stream to ensure all ranks are quiescent.
+        """
+        if self.enable_overlap:
+            self.forward_stream.synchronize()
+        self.schedule_stream.synchronize()
+        if self.tp_cpu_group is not None:
+            torch.distributed.barrier(group=self.tp_cpu_group)
+
     def update_weights_from_disk(
         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
     ):
@@ -85,17 +95,20 @@ class SchedulerUpdateWeightsMixin:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        self._quiesce_for_weight_update()
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
             self.flush_cache_after_weight_update(recv_req)
         else:
             logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
     def update_weights_from_tensor(
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
+        self._quiesce_for_weight_update()
         if recv_req.disable_draft_model:
             worker = self.tp_worker
         else:
@@ -112,6 +125,7 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
     ):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        self._quiesce_for_weight_update()
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
         tp_success = success
         if success and self.draft_worker is not None:
@@ -125,7 +139,10 @@ class SchedulerUpdateWeightsMixin:
 
     def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
         """Optional post-processing for updated weights (e.g., Marlin conversion)."""
+        self._quiesce_for_weight_update()
         success, message = self.tp_worker.post_process_weights(recv_req)
+        if self.tp_cpu_group is not None:
+            torch.distributed.barrier(group=self.tp_cpu_group)
         return PostProcessWeightsReqOutput(success, message)
 
     def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):

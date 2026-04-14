@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import uuid
+from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -541,9 +542,16 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         """Trigger post-processing hooks for weights after loading."""
         self.auto_create_handle_loop()
-        async with self.model_update_lock.writer_lock:
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
+        async with lock_context:
             results = await self.post_process_weights_communicator(obj)
-        return FanOutCommunicator.merge_results(results)
+            return FanOutCommunicator.merge_results(results)
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,

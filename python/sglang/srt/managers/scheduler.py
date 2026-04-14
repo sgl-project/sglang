@@ -565,7 +565,8 @@ class Scheduler(
                     [
                         self.recv_from_tokenizer,
                         self.recv_from_rpc,
-                    ]
+                    ],
+                    can_empty_cache=lambda: not self._engine_paused,
                 )
         else:
             self.recv_from_tokenizer = None
@@ -1688,6 +1689,39 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                should_block_for_paused_rpc = True
+                if self.server_args.enable_dp_attention:
+                    # In DP-attention mode, control requests are broadcast via
+                    # tp_group below. Only the tp_group source should wait on
+                    # the RPC socket while paused; the other ranks must enter
+                    # the broadcast as receivers. If they block on ZMQ here,
+                    # pause/flush can deadlock the control broadcast.
+                    should_block_for_paused_rpc = self.tp_group.is_first_rank
+
+                if (
+                    self._engine_paused
+                    and len(recv_reqs) == 0
+                    and should_block_for_paused_rpc
+                ):
+                    poller = zmq.Poller()
+                    poller.register(self.recv_from_tokenizer, zmq.POLLIN)
+                    poller.register(self.recv_from_rpc, zmq.POLLIN)
+
+                    while len(recv_reqs) == 0:
+                        events = dict(poller.poll())
+                        for socket in (self.recv_from_tokenizer, self.recv_from_rpc):
+                            if socket not in events:
+                                continue
+                            while True:
+                                try:
+                                    if self.recv_limit_reached(len(recv_reqs)):
+                                        break
+                                    recv_reqs.append(socket.recv_pyobj(zmq.NOBLOCK))
+                                except zmq.ZMQError:
+                                    break
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
             else:
                 recv_reqs = None
         else:
@@ -3215,7 +3249,9 @@ class Scheduler(
 
         pending_req, deadline = self._pending_flush
 
-        if self.is_fully_idle():
+        if self.is_fully_idle() or (
+            self._engine_paused and self.running_batch.is_empty()
+        ):
             success = self.flush_cache()
             self._pending_flush = None
             self.send_to_tokenizer.send_output(
@@ -3276,10 +3312,18 @@ class Scheduler(
 
         timeout_s = float(recv_req.timeout_s or 0.0)
         if timeout_s <= 0.0:
-            return FlushCacheReqOutput(success=self.flush_cache())
+            success = self.flush_cache()
+            if self.tp_cpu_group is not None:
+                barrier(group=self.tp_cpu_group)
+            return FlushCacheReqOutput(success=success)
 
-        if self.is_fully_idle():
-            return FlushCacheReqOutput(success=self.flush_cache())
+        if self.is_fully_idle() or (
+            self._engine_paused and self.running_batch.is_empty()
+        ):
+            success = self.flush_cache()
+            if self.tp_cpu_group is not None:
+                barrier(group=self.tp_cpu_group)
+            return FlushCacheReqOutput(success=success)
 
         self._pending_flush = (recv_req, time.monotonic() + timeout_s)
         return None
@@ -3443,7 +3487,10 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle():
+        can_flush = self.is_fully_idle() or (
+            self._engine_paused and self.running_batch.is_empty()
+        )
+        if can_flush:
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -3455,7 +3502,7 @@ class Scheduler(
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
 
-            if empty_cache:
+            if empty_cache and not self._engine_paused:
                 empty_device_cache(self.device_module)
             logger.info("Cache flushed successfully!")
             success = True
@@ -3839,9 +3886,10 @@ class IdleSleeper:
     data that needs handling immediately.
     """
 
-    def __init__(self, sockets):
+    def __init__(self, sockets, can_empty_cache=None):
         self.poller = zmq.Poller()
         self.last_empty_time = real_time()
+        self.can_empty_cache = can_empty_cache
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
@@ -3854,7 +3902,8 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            empty_device_cache()
+            if self.can_empty_cache is None or self.can_empty_cache():
+                empty_device_cache()
 
 
 def is_health_check_generate_req(recv_req):
