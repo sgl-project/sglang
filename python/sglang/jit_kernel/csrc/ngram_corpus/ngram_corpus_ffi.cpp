@@ -45,22 +45,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
   }
 
-  void async_insert(const tvm::ffi::TensorView tokens_flat, const tvm::ffi::TensorView offsets) {
-    auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
-    auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
-    int64_t batch_size = offsets.size(0) - 1;
-
-    std::vector<ngram::InsertWorkItem> items;
-    items.reserve(batch_size);
-    for (int64_t i = 0; i < batch_size; ++i) {
-      ngram::InsertWorkItem item;
-      item.tokens.assign(data + offs[i], data + offs[i + 1]);
-      items.push_back(std::move(item));
-    }
-    ngram_->asyncInsert(std::move(items));
-  }
-
-  void async_insert_stateful(
+  void async_insert(
       const tvm::ffi::TensorView state_ids_tv,
       const tvm::ffi::TensorView tokens_flat,
       const tvm::ffi::TensorView offsets) {
@@ -196,7 +181,6 @@ void register_ngram_corpus() {
           refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, double, double, double>(),
           "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
-      .def("async_insert_stateful", &NgramCorpusObj::async_insert_stateful)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
       .def("erase_request_state", &NgramCorpusObj::erase_request_state)

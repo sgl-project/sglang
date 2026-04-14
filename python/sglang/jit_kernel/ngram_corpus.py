@@ -92,10 +92,12 @@ def get_ngram_corpus_cls():
                     raise ValueError(
                         "request trie mode requires state_ids for insert"
                     )
-                self.async_insert(tokens_flat, offsets)  # type: ignore
-                return
-            state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
-            self.async_insert_stateful(state_ids_t, tokens_flat, offsets)  # type: ignore
+                state_ids_t = torch.full(
+                    (len(batch_tokens),), -1, dtype=torch.int64
+                )
+            else:
+                state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
+            self.async_insert(state_ids_t, tokens_flat, offsets)  # type: ignore
 
         def match_stateful(
             self,
