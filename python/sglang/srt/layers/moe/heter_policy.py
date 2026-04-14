@@ -139,24 +139,31 @@ class HeterDispatchPolicy(abc.ABC):
         self,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
+        sentinel: int = -1,
     ) -> List[GroupDispatchTuple]:
         """Transform N-expert routing into per-group dispatches.
 
         Returns list of ``(experts, scales)`` with shape ``[N, K]`` per group.
-        Non-group slots: expert=``num_experts``, scale=0.
+        Non-group slots: expert=``sentinel``, scale=0.
+
+        Args:
+            sentinel: expert ID for non-group slots. Default -1 (Triton
+                kernels skip -1). Marlin INT4 needs ``num_experts``.
         """
         expert_to_group = self._assign(
             token_selected_experts,
             token_final_scales,
         )
         return self._dispatch_from_expert_to_group(
-            expert_to_group, token_selected_experts, token_final_scales)
+            expert_to_group, token_selected_experts, token_final_scales,
+            sentinel=sentinel)
 
     def _dispatch_from_expert_to_group(
         self,
         expert_to_group: torch.Tensor,
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
+        sentinel: int = -1,
     ) -> List[GroupDispatchTuple]:
         """Build per-group dispatch tuples using torch.where (fixed shapes)."""
         num_groups = self.num_groups
@@ -166,7 +173,7 @@ class HeterDispatchPolicy(abc.ABC):
         for gidx in range(num_groups):
             in_group = (slot_groups == gidx)
             experts_g = torch.where(
-                in_group, token_selected_experts, self._num_experts)
+                in_group, token_selected_experts, sentinel)
             scales_g = torch.where(
                 in_group, token_final_scales, 0.0)
             results.append((experts_g, scales_g))
@@ -245,6 +252,43 @@ class ConfidenceThresholdHeterDispatch(HeterDispatchPolicy):
             self._expert_to_group_buf, self._group_labels)
 
 
+class TotalWeightHeterDispatch(HeterDispatchPolicy):
+    """Assign by per-expert total routing weight (sum, not mean).
+
+    High-total-weight experts -> last group (high-precision).
+    Falls back to random when signals are unavailable.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        group_size_ratios: List[float],
+        fallback_seed: int = 42,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__(num_experts, group_size_ratios, device=device)
+        self._fallback = RandomHeterDispatch(
+            num_experts, group_size_ratios, seed=fallback_seed, device=device)
+        self._weight_sum_buf = torch.empty(
+            num_experts, device=self._device, dtype=torch.float32)
+
+    def _assign(self, token_selected_experts, token_final_scales):
+        if token_selected_experts is None or token_final_scales is None:
+            return self._fallback._assign(
+                token_selected_experts, token_final_scales)
+
+        buf = self._weight_sum_buf
+        flat_experts = token_selected_experts.reshape(-1).long()
+        flat_scales = token_final_scales.reshape(-1)
+
+        buf.zero_()
+        buf.scatter_add_(0, flat_experts, flat_scales)
+
+        return _assign_by_score_gpu(
+            buf, self._num_experts, self._group_size_ratios,
+            self._expert_to_group_buf, self._group_labels)
+
+
 class ExpertLoadHeterDispatch(HeterDispatchPolicy):
     """Assign by expert activation frequency.
 
@@ -285,6 +329,7 @@ class ExpertLoadHeterDispatch(HeterDispatchPolicy):
 _POLICY_REGISTRY = {
     "expert_load": ExpertLoadHeterDispatch,
     "confidence": ConfidenceThresholdHeterDispatch,
+    "total_weight": TotalWeightHeterDispatch,
     "random": RandomHeterDispatch,
 }
 
