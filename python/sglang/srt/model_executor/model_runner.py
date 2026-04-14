@@ -475,6 +475,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        # For generic sparse attention
+        self.sparse_coordinator = None
 
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
@@ -689,7 +691,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.maybe_init_ngram_embedding()
 
         # Init hisparse coordinator (must happen before CUDA graph capture)
-        if self.enable_hisparse:
+        # Only NSA (DeepSeek) models use HiSparseCoordinator; non-NSA algorithms
+        # (SnapKV, Quest, …) use the generic SparseCoordinator below instead.
+        from sglang.srt.configs.model_config import is_deepseek_nsa
+
+        if self.enable_hisparse and is_deepseek_nsa(self.model_config.hf_config):
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -707,6 +713,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             )
+
+        # Init generic sparse coordinator when a non-NSA algorithm is requested.
+        if self.enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import (
+                create_sparse_coordinator,
+                parse_hisparse_config,
+            )
+
+            _sc_cfg = parse_hisparse_config(self.server_args)
+            _algo = (_sc_cfg.algorithm or "").lower()
+            if _algo and _algo != "deepseek_nsa":
+                self.sparse_coordinator = create_sparse_coordinator(
+                    device=torch.device(self.device),
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    server_args=self.server_args,
+                )
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
@@ -2972,6 +2997,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+        forward_batch.sparse_coordinator = self.sparse_coordinator
+        if self.sparse_coordinator is not None:
+            # Re-register every extend pass: req_pool slots are reused across requests,
+            # and on_request_end is not always called, so we cannot rely on the
+            # repr_constructed flag being False for a fresh request.
+            if forward_batch.forward_mode.is_extend():
+                for i, req_idx in enumerate(forward_batch.req_pool_indices.tolist()):
+                    self.sparse_coordinator.states.register(
+                        req_idx, int(forward_batch.seq_lens[i].item())
+                    )
+            self.sparse_coordinator.forward_begin(forward_batch)
+
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -3000,6 +3037,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.pp_group.is_last_rank
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
+
+        if self.sparse_coordinator is not None:
+            self.sparse_coordinator.forward_end(forward_batch)
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseCoordinator
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -429,6 +430,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For hisparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    # For generic sparse attention algorithms
+    sparse_coordinator: Optional[SparseCoordinator] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None

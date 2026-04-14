@@ -116,6 +116,13 @@ def create_sparse_coordinator(
     **kwargs,
 ) -> SparseCoordinator:
     config = _parse_sparse_config(server_args)
+
+    # Apply defaults that require runtime context (not available at parse time).
+    if config.page_size is None:
+        config.page_size = getattr(token_to_kv_pool, "page_size", 1)
+    if config.min_sparse_prompt_len is None:
+        config.min_sparse_prompt_len = 0
+
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     backend_adaptor = _create_backend_adaptor(
         config.backend, device, algorithm, req_to_token_pool

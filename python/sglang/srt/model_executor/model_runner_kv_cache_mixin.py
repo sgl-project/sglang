@@ -567,7 +567,9 @@ class ModelRunnerKVCacheMixin:
                         need_sort=need_sort,
                     )
                 else:
-                    if self.enable_hisparse:
+                    if self.enable_hisparse and is_deepseek_nsa(
+                        self.model_config.hf_config
+                    ):
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )

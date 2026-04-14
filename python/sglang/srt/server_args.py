@@ -6560,28 +6560,41 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
+            import json
+
             from sglang.srt.configs.model_config import is_deepseek_nsa
 
             hf_config = self.get_model_config().hf_config
-            assert is_deepseek_nsa(hf_config), (
-                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
-                "(e.g., DeepSeek V3.2, GLM-5). "
+            _hisparse_extra = (
+                json.loads(self.hisparse_config) if self.hisparse_config else {}
             )
+            _hisparse_algo = _hisparse_extra.get("algorithm", "").lower()
+            _is_nsa_algo = not _hisparse_algo or _hisparse_algo == "deepseek_nsa"
+
+            if _is_nsa_algo:
+                assert is_deepseek_nsa(hf_config), (
+                    "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
+                    "(e.g., DeepSeek V3.2, GLM-5). "
+                    "To use hisparse with standard models, specify a non-NSA algorithm via "
+                    '--hisparse-config \'{"algorithm": "quest", ...}\'.'
+                )
 
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-            for attr, label in [
-                ("nsa_prefill_backend", "prefill"),
-                ("nsa_decode_backend", "decode"),
-            ]:
-                backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
-                    raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                        f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
-                    )
+
+            if _is_nsa_algo:
+                for attr, label in [
+                    ("nsa_prefill_backend", "prefill"),
+                    ("nsa_decode_backend", "decode"),
+                ]:
+                    backend = getattr(self, attr)
+                    if backend is not None and backend != "flashmla_sparse":
+                        raise ValueError(
+                            f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                            f"but got --nsa-{label}-backend={backend}. "
+                            f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                        )
 
             if self.kv_cache_dtype != "bfloat16":
                 raise ValueError(
