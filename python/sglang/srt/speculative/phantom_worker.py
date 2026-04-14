@@ -39,6 +39,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_prefilter import AdaptiveThresholdController
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.sok import KernelCache, KernelFingerprint, SOKConfig
+from sglang.srt.speculative.sok.fingerprint import detect_fingerprint
 
 try:
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
@@ -1138,6 +1140,35 @@ class PhantomWorker:
         # Detect HSA capability
         self._is_hsa = self._detect_hsa()
 
+        # SOK — Self-Optimizing Kernel subsystem (Phase F1: cache + prewarm)
+        self._sok_config = SOKConfig()
+        try:
+            self._sok_fingerprint = detect_fingerprint()
+            self._sok_cache = KernelCache(self._sok_config, self._sok_fingerprint)
+            self._sok_cache.load_manifest()
+            self._sok_cache.load_hot_shapes()
+            # Bootstrap from existing Triton cache on first ever run
+            if self._sok_cache.get_stats()["entries"] == 0:
+                scanned = self._sok_cache.scan_triton_cache()
+                if scanned > 0:
+                    self._sok_cache.save_manifest()
+                    logger.info("PHANTOM-SOK: bootstrapped %d entries from Triton cache", scanned)
+            # Background prewarm (non-blocking)
+            self._sok_prewarm_thread = threading.Thread(
+                target=self._sok_cache.prewarm, daemon=True, name="sok-prewarm"
+            )
+            self._sok_prewarm_thread.start()
+            sok_stats = self._sok_cache.get_stats()
+            logger.info(
+                "PHANTOM-SOK: loaded manifest (%d entries, %d hot shapes, fp=%s)",
+                sok_stats["entries"], sok_stats["hot_shapes"],
+                self._sok_fingerprint.hex_digest[:12],
+            )
+        except Exception as e:
+            logger.warning("PHANTOM-SOK: init failed, running without cache: %s", e)
+            self._sok_cache = None
+            self._sok_fingerprint = None
+
         logger.info(
             "PHANTOM worker: draft_tokens=%d (max=%d), max_bs=%d, HSA=%s, "
             "ghost_pool=%d workers, pinned_buf=%.1f KB per worker",
@@ -1168,6 +1199,10 @@ class PhantomWorker:
         return self.target_worker.get_memory_pool()
 
     def clear_cache_pool(self):
+        # Persist SOK manifest before clearing
+        if getattr(self, "_sok_cache", None) is not None:
+            self._sok_cache.save_manifest()
+            self._sok_cache.save_hot_shapes()
         self._ghost_pool.stop()
         self.corpus._corpus.reset()
         self._corpus_frozen = False
@@ -1718,9 +1753,23 @@ class PhantomWorker:
                     qt["confusion_pairs"], qt["channel_samples"],
                     qt["pos_rate"],
                 )
+            # SOK manifest save (every 500 rounds) + stats
+            if self._sok_cache is not None and self.total_rounds % 500 == 0:
+                self._sok_cache.save_manifest()
+                self._sok_cache.save_hot_shapes()
+                ss = self._sok_cache.get_stats()
+                logger.info(
+                    "PHANTOM-SOK: saved manifest (%d entries, hits=%d, misses=%d, hot=%d)",
+                    ss["entries"], ss["hits"],
+                    ss["misses"], ss["hot_shapes"],
+                )
 
     def __del__(self):
         try:
+            # Persist SOK manifest on shutdown
+            if getattr(self, "_sok_cache", None) is not None:
+                self._sok_cache.save_manifest()
+                self._sok_cache.save_hot_shapes()
             self._stop_ghost_pool()
         except Exception:
             pass
