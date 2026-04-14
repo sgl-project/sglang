@@ -22,12 +22,11 @@ if TYPE_CHECKING:
         UpdateWeightFromTensorCheckerReqInput,
         UpdateWeightFromTensorReqInput,
     )
-    from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 
 
 class GPUWorkerPostTrainingMixin:
     def update_weights_from_disk(
-        self: GPUWorker,
+        self,
         model_path: str,
         flush_cache: bool = True,
         target_modules: list[str] | None = None,
@@ -47,7 +46,7 @@ class GPUWorkerPostTrainingMixin:
         return success, message
 
     def update_weights_from_tensor(
-        self: GPUWorker,
+        self,
         req: UpdateWeightFromTensorReqInput,
     ) -> tuple[bool, str]:
         if not self.pipeline:
@@ -74,7 +73,7 @@ class GPUWorkerPostTrainingMixin:
         )
 
     def update_weights_from_tensor_checker(
-        self: GPUWorker,
+        self,
         req: UpdateWeightFromTensorCheckerReqInput,
     ) -> tuple[bool, str]:
         if not self.pipeline:
@@ -96,7 +95,7 @@ class GPUWorkerPostTrainingMixin:
         )
 
     def get_weights_checksum(
-        self: GPUWorker, module_names: list[str] | None = None
+        self, module_names: list[str] | None = None
     ) -> dict[str, str]:
         if not self.pipeline:
             return {"error": "Pipeline is not initialized"}
@@ -116,7 +115,7 @@ class GPUWorkerPostTrainingMixin:
         return checksums
 
     def _select_rank_scoped_payload(
-        self: GPUWorker,
+        self,
         payloads: list,
         field_name: str,
     ) -> tuple[object | None, str | None]:

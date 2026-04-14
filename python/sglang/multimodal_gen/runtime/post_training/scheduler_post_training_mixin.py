@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, List
+from typing import Any, List
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
-if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
-
-
 class SchedulerPostTrainingMixin:
     def _handle_update_weights_from_disk(
-        self: Scheduler, reqs: List[Any]
+        self, reqs: List[Any]
     ) -> OutputBatch:
         req = reqs[0]
         success, message = self.worker.update_weights_from_disk(
@@ -24,7 +20,7 @@ class SchedulerPostTrainingMixin:
         )
 
     def _handle_update_weights_from_tensor(
-        self: Scheduler, reqs: List[Any]
+        self, reqs: List[Any]
     ) -> OutputBatch:
         req = reqs[0]
         success, message = self.worker.update_weights_from_tensor(req)
@@ -38,7 +34,7 @@ class SchedulerPostTrainingMixin:
         )
 
     def _handle_update_weights_from_tensor_checker(
-        self: Scheduler, reqs: List[Any]
+        self, reqs: List[Any]
     ) -> OutputBatch:
         req = reqs[0]
         success, message = self.worker.update_weights_from_tensor_checker(req)
@@ -48,7 +44,7 @@ class SchedulerPostTrainingMixin:
         )
 
     def _handle_get_weights_checksum(
-        self: Scheduler, reqs: List[Any]
+        self, reqs: List[Any]
     ) -> OutputBatch:
         req = reqs[0]
         checksums = self.worker.get_weights_checksum(module_names=req.module_names)
