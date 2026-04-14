@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
+    SchedulerPostTrainingMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -43,7 +46,7 @@ logger = init_logger(__name__)
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
-class Scheduler:
+class Scheduler(SchedulerPostTrainingMixin):
     """
     Runs the main event loop for the rank 0 worker.
     It listens for external requests via ZMQ and coordinates with other workers.
@@ -136,19 +139,6 @@ class Scheduler:
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
-
-    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
-        """Handle update_weights_from_disk request for RL workflows."""
-        req = reqs[0]
-        success, message = self.worker.update_weights_from_disk(
-            model_path=req.model_path,
-            flush_cache=req.flush_cache,
-            target_modules=req.target_modules,
-        )
-        return OutputBatch(
-            output={"success": success, "message": message},
-            error=None if success else message,
-        )
 
     def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
         """Handle get_weights_checksum request."""

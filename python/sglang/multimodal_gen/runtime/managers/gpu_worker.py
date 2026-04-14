@@ -32,7 +32,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
-    WeightsUpdater,
     get_updatable_modules,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
@@ -42,6 +41,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
+    GPUWorkerPostTrainingMixin,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
@@ -63,7 +65,7 @@ from sglang.srt.utils.network import NetworkAddress
 logger = init_logger(__name__)
 
 
-class GPUWorker:
+class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
     """
@@ -419,27 +421,6 @@ class GPUWorker:
             return OutputBatch(error="Lora is not enabled")
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
-
-    def update_weights_from_disk(
-        self,
-        model_path: str,
-        flush_cache: bool = True,
-        target_modules: list[str] | None = None,
-    ) -> tuple[bool, str]:
-        """Update model weights from disk inplace without restarting the server."""
-        if not self.pipeline:
-            return False, "Pipeline is not initialized"
-
-        updater = WeightsUpdater(self.pipeline)
-        success, message = updater.update_weights_from_disk(
-            model_path,
-            flush_cache=flush_cache,
-            target_modules=target_modules,
-        )
-        if success:
-            self.server_args.model_path = model_path
-            self.pipeline.model_path = model_path
-        return success, message
 
     def get_weights_checksum(
         self, module_names: list[str] | None = None
