@@ -35,6 +35,7 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
+    EMBEDDING_NAMES,
     LoRAType,
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
@@ -66,7 +67,10 @@ class LoRAManager:
         lora_paths: Optional[List[LoRARef]] = None,
     ):
         self.base_model: torch.nn.Module = base_model
-        self.base_hf_config: AutoConfig = base_hf_config
+        if hasattr(base_hf_config, "get_text_config"):
+            self.base_hf_config: AutoConfig = base_hf_config.get_text_config()
+        else:
+            self.base_hf_config: AutoConfig = base_hf_config
         self.max_loras_per_batch: int = max_loras_per_batch
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
@@ -81,6 +85,10 @@ class LoRAManager:
         self.eviction_policy = server_args.lora_eviction_policy
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
+        )
+        self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
+        self.lora_strict_loading: bool = getattr(
+            server_args, "lora_strict_loading", False
         )
 
         # LoRA backend for running sgemm kernels
@@ -504,9 +512,19 @@ class LoRAManager:
     ):
         """Infer LoRA target modules and max_lora_rank from loaded adapters if not provided."""
 
-        self.target_modules = (
-            get_normalized_target_modules(target_modules) if target_modules else set()
-        )
+        if target_modules and target_modules == {"all"}:
+            self.target_modules = auto_detect_lora_target_modules(self.base_model)
+            self.target_modules.update(EMBEDDING_NAMES)
+            logger.info(
+                "CLI --lora-target-modules='all' resolved to %s "
+                "by inspecting the base model.",
+                sorted(self.target_modules),
+            )
+            target_modules = self.target_modules
+        elif target_modules:
+            self.target_modules = get_normalized_target_modules(target_modules)
+        else:
+            self.target_modules = set()
 
         for lora_id, config in self.configs.items():
             # Handle PEFT shorthand strings like "all-linear" or "all".
@@ -679,6 +697,7 @@ class LoRAManager:
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
+            strict_loading=self.lora_strict_loading,
         )
 
         # Initializing memory pool with base model
@@ -734,17 +753,9 @@ class LoRAManager:
                 self.base_model.lm_head = untied_lm_head
 
         for module_name, module in self.base_model.named_modules():
-            # TODO (lifuhuang): in the future, we should consider generalizing the
-            # should_apply_lora function to support mapping by full module name instead
-            # of just the last part (e.g., "qkv_proj") to support scenarios with multiple
-            # attention stacks (e.g., multimodal models).
-            # See: https://github.com/sgl-project/sglang/issues/6608
-            if getattr(
-                self.base_model, "should_apply_lora", None
-            ) and not self.base_model.should_apply_lora(module_name):
-                continue
-
-            # Check if module should be wrapped with LoRA
+            # Handle embed_tokens and lm_head before the should_apply_lora gate,
+            # since VL models' should_apply_lora patterns only match language
+            # model layers and would incorrectly skip these.
             # Handle embed_tokens
             if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
                 if isinstance(module, VocabParallelEmbedding) and not isinstance(
@@ -753,7 +764,6 @@ class LoRAManager:
                     lora_module = self.set_lora_module(module_name, module)
                     self.embed_tokens_module = lora_module
                     continue
-
             # Handle lm_head
             if "lm_head" in module_name and "lm_head" in self.target_modules:
                 if isinstance(module, ParallelLMHead) and not isinstance(
@@ -798,4 +808,5 @@ class LoRAManager:
                 layer_id = get_layer_id(module_name)
                 lora_module = self.set_lora_module(module_name, module)
                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
+                lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module

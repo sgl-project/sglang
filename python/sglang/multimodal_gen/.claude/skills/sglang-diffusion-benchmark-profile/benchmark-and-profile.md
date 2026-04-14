@@ -100,6 +100,26 @@ PYTHONPATH=python python3 \
   --output-dir "${BENCH_DIR}"
 ```
 
+Run the `LTX-2.3` one-stage skill preset:
+
+```bash
+PYTHONPATH=python python3 \
+  python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py \
+  --model ltx23-one-stage \
+  --label baseline \
+  --output-dir "${BENCH_DIR}"
+```
+
+Run the `LTX-2.3` two-stage skill preset:
+
+```bash
+PYTHONPATH=python python3 \
+  python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py \
+  --model ltx23-two-stage \
+  --label baseline \
+  --output-dir "${BENCH_DIR}"
+```
+
 Run the full preset sweep:
 
 ```bash
@@ -123,6 +143,8 @@ Nightly-aligned presets come first; skill-only presets stay available after them
 | `wan-ti2v` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Yes: `wan22_ti2v_5b_720p` | Uses the nightly cat image and motion prompt |
 | `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | Uses `LTX2TwoStagePipeline`; nightly-aligned prompt, negative prompt, 1536x1024, 121 frames, fps 24, seed 1234 |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Aligned to nightly CFG-parallel 4-GPU launch |
+| `ltx23-one-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` one-stage baseline; 2 GPUs, 768x512, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
+| `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only extra preset |
 | `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
 | `helios` | `BestWishYsh/Helios-Base` | No | Skill-only extra preset |
@@ -150,6 +172,41 @@ sglang generate \
 After [PR #20707](https://github.com/sgl-project/sglang/pull/20707),
 `LTX2TwoStagePipeline` is a native path. The spatial upsampler and distilled
 LoRA are auto-resolved from the same model snapshot unless you override them.
+
+### Manual command example: LTX-2.3 One-Stage
+
+```bash
+sglang generate \
+  --model-path=Lightricks/LTX-2.3 \
+  --prompt="A beautiful sunset over the ocean" \
+  --negative-prompt="shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width=768 --height=512 \
+  --num-frames=121 --fps=24 \
+  --num-inference-steps=30 --guidance-scale=3.0 \
+  --seed=1234 --num-gpus=2 \
+  --save-output --enable-torch-compile --warmup
+```
+
+Use this when you want the native `LTX2Pipeline` baseline for `LTX-2.3` at the
+validated one-stage resolution.
+
+### Manual command example: LTX-2.3 Two-Stage
+
+```bash
+sglang generate \
+  --model-path=Lightricks/LTX-2.3 \
+  --pipeline-class-name=LTX2TwoStagePipeline \
+  --prompt="A beautiful sunset over the ocean" \
+  --negative-prompt="shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width=1536 --height=1024 \
+  --num-frames=121 --fps=24 \
+  --num-inference-steps=30 --guidance-scale=3.0 \
+  --seed=1234 --num-gpus=2 \
+  --save-output --enable-torch-compile --warmup
+```
+
+This matches the new `ltx23-two-stage` skill preset and is a good benchmark target for
+the recently merged `LTX-2.3` two-stage path.
 
 ### Manual command example: Wan2.2-I2V-A14B 720P
 
