@@ -23,7 +23,6 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
-from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -498,6 +497,8 @@ class ServerArgs:
 
         CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
         """
+        from sglang.multimodal_gen.registry import get_model_info
+
         model_info = get_model_info(self.model_path, self.backend, self.model_id)
         if model_info is None:
             return False
