@@ -14,6 +14,7 @@ import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -24,7 +25,6 @@ from sglang.srt.utils import (
     use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.server_args import get_global_server_args
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (

@@ -3627,6 +3627,7 @@ def dispatch_event_loop(scheduler: Scheduler):
 
 def configure_scheduler_process(
     server_args: ServerArgs,
+    gpu_id: int,
     tp_rank: int,
     attn_cp_rank: int,
     moe_dp_rank: int,
@@ -3694,7 +3695,7 @@ def run_scheduler_process(
     pipe_writer,
 ):
     dp_rank = configure_scheduler_process(
-        server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+        server_args, gpu_id, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
     parent_process = psutil.Process().parent()
 
