@@ -15,8 +15,6 @@ from sglang.srt.utils import get_device_module, is_npu
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
-
 if not is_npu():
     from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
 else:
