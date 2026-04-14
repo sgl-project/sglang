@@ -883,10 +883,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                fp_communications = \
-                    forward_batch.forward_mode.is_decode() or \
-                    not get_global_server_args().quantize_tp_communications
-                hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states, fp_comm=fp_communications)
+                quantize_communications = \
+                    not forward_batch.forward_mode.is_decode_or_idle() and \
+                    get_global_server_args().quantize_tp_communications
+                hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states, quantize_communications=quantize_communications)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
