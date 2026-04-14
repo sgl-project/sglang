@@ -187,8 +187,6 @@ sglang generate \
   over the compatibility `--model-path` flow.
 - For local directories, SGLang first looks for `*-mixed.safetensors`, then
   falls back to loading from the directory.
-- On Blackwell, `comfy-kitchen` can provide the best-performance path when
-  available; otherwise SGLang falls back to the generic ModelOpt FP4 path.
 - On disk, the quantization config stays `quant_method=modelopt` with
   `quant_algo=NVFP4`; the `modelopt-nvfp4` label here is again a documentation
   family name rather than a serialized config key.
