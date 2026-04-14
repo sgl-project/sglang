@@ -1,23 +1,4 @@
-# Copyright 2025 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Tests for the JIT moe_fused_gate kernel.
-
-Compares the JIT kernel against a pure-PyTorch reference implementation of
-DeepSeek-style biased grouped top-k routing.
-"""
 import sys
-from typing import Optional
 
 import pytest
 import torch
@@ -54,7 +35,9 @@ def biased_grouped_topk_ref(
 
     # Group scores: sum top-2 within each group
     group_scores = (
-        scores_for_choice.view(num_token, num_expert_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+        scores_for_choice.view(num_token, num_expert_group, -1)
+        .topk(2, dim=-1)[0]
+        .sum(dim=-1)
     )  # [num_token, num_expert_group]
 
     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
@@ -157,9 +140,7 @@ def test_moe_fused_gate(
     routed_scaling_factor = 2.5
 
     torch.manual_seed(seq_length ^ (num_experts << 8))
-    gating_output = torch.randn(
-        (seq_length, num_experts), dtype=dtype, device="cuda"
-    )
+    gating_output = torch.randn((seq_length, num_experts), dtype=dtype, device="cuda")
     bias = torch.rand(num_experts, dtype=dtype, device="cuda")
 
     # JIT kernel
@@ -194,13 +175,15 @@ def test_moe_fused_gate(
         shared_jit = jit_ids[:, topk_excl:]
         shared_ref = ref_ids[:, topk_excl:]
         assert torch.all(
-            (shared_jit >= num_experts) & (shared_jit < num_experts + num_fused_shared_experts)
+            (shared_jit >= num_experts)
+            & (shared_jit < num_experts + num_fused_shared_experts)
         ), (
             f"JIT shared expert indices out of range [{num_experts}, "
             f"{num_experts + num_fused_shared_experts}): {shared_jit}"
         )
         assert torch.all(
-            (shared_ref >= num_experts) & (shared_ref < num_experts + num_fused_shared_experts)
+            (shared_ref >= num_experts)
+            & (shared_ref < num_experts + num_fused_shared_experts)
         ), (
             f"Ref shared expert indices out of range [{num_experts}, "
             f"{num_experts + num_fused_shared_experts}): {shared_ref}"

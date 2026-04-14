@@ -1,26 +1,3 @@
-# Copyright 2025 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Benchmark: JIT moe_fused_gate vs. PyTorch reference (biased grouped top-k).
-
-Usage::
-
-    python -m sglang.jit_kernel.benchmark.bench_moe_fused_gate
-
-The benchmark sweeps over a range of token sequence lengths and compares:
-  * ``original`` – pure-PyTorch ``biased_grouped_topk`` reference.
-  * ``jit``      – JIT-compiled ``moe_fused_gate`` CUDA kernel.
-"""
 import itertools
 
 import torch
