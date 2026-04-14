@@ -454,17 +454,11 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
     audio_url: ChatCompletionMessageContentAudioURL
 
 
-class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
-    type: Literal["tool_reference"]
-    name: str
-
-
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
-    ChatCompletionMessageContentToolReferenceBlock,
 ]
 
 # Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
