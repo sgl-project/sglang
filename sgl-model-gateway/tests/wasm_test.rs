@@ -43,10 +43,10 @@ use uuid::Uuid;
 async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let config = RouterConfig::default();
 
-    // Initialize WASM manager first
-    let wasm_manager = Arc::new(
-        WasmModuleManager::with_default_config().expect("Failed to create WASM module manager"),
-    );
+    // Initialize WASM manager first. `with_default_config` is infallible in
+    // the current smg-wasm release — the `.expect(...)` dance no longer
+    // compiles, so we drop it here.
+    let wasm_manager = Arc::new(WasmModuleManager::with_default_config());
 
     // Create AppContext with wasm_manager from the start
     let client = reqwest::Client::new();
