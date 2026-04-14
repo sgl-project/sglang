@@ -40,11 +40,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-    prepare_fp4_layer_for_marlin,
-    prepare_moe_fp4_layer_for_marlin,
-    should_use_fp4_marlin_fallback,
-)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -56,7 +51,6 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
-    get_bool_env_var,
     is_cuda,
     is_sm120_supported,
     next_power_of_2,
@@ -171,10 +165,6 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
     ):
         return
 
-
-CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
-    "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
-)
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
 FP4_GEMM_ALIGNMENT = 32
@@ -998,9 +988,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     ) -> CombineInput:
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
-        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
@@ -1094,8 +1085,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 activation_type=activation,
             )[0]
 
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
             return StandardCombineInput(hidden_states=output)
 
         quant_info = TritonMoeQuantInfo(
@@ -1147,7 +1136,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75  # SM75+ (Turing) supports Marlin FP4 fallback; SM100 for native FP4
+        return 100
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
@@ -1321,7 +1310,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
         layer.logical_widths = output_partition_sizes
-        layer.params_dtype = params_dtype
 
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
@@ -1376,20 +1364,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if should_use_fp4_marlin_fallback():
-            # Marlin FP4 fallback: consolidate global scale then repack weights
-            weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
-            layer.weight_scale_2_marlin = Parameter(weight_scale_2, requires_grad=False)
-            prepare_fp4_layer_for_marlin(
-                layer,
-                weight_attr="weight",
-                weight_scale_attr="weight_scale",
-                weight_global_scale_attr="weight_scale_2_marlin",
-            )
-            layer.use_marlin_fallback = True
-            return
-
-        layer.use_marlin_fallback = False
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
@@ -1490,18 +1464,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if layer.use_marlin_fallback:
-            return torch.ops.sglang.apply_fp4_marlin_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                weight_global_scale=layer.weight_scale_2_marlin,
-                workspace=layer.marlin_workspace,
-                size_n=layer.output_size_per_partition,
-                size_k=layer.input_size_per_partition,
-                bias=bias,
-            )
-
         output_dtype = x.dtype
         x_m, _ = x.shape
 
@@ -1558,24 +1520,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-
-        if should_use_fp4_marlin_fallback():
-            logger.warning_once(
-                "GPU is not Blackwell (SM100+). Using Marlin FP4 fallback kernel "
-                "for MoE layers. Weights remain compressed in FP4 format."
-            )
-            self.use_marlin_fallback = True
-            self.enable_flashinfer_trtllm_moe = False
-        elif not is_blackwell_supported():
+        if not is_blackwell_supported():
             raise ValueError(
                 "Current platform does not support NVFP4"
-                " quantization. Please use SM75+ (Turing or newer)."
+                " quantization. Please use Blackwell and"
+                " above."
             )
-        else:
-            self.use_marlin_fallback = False
-            self.enable_flashinfer_trtllm_moe = (
-                get_moe_runner_backend().is_flashinfer_trtllm()
-            )
+        self.enable_flashinfer_trtllm_moe = (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
         self._cache_permute_indices = {}
 
     @property
@@ -1587,9 +1541,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
+        """Access the global enable_flashinfer_cutedsl_moe setting."""
         from sglang.srt.layers.moe import get_moe_runner_backend
 
-        """Access the global enable_flashinfer_cutedsl_moe setting."""
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
     def create_weights(
@@ -1729,9 +1683,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-        if self.use_marlin_fallback:
-            prepare_moe_fp4_layer_for_marlin(layer)
-            return
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
@@ -1757,19 +1708,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         elif self.enable_flashinfer_cutedsl_moe:
-            # All-expert-one-input-scale is mathematically different from default per-expert-input-scale
-            # Thus we allow users to switch the flag to do thorough testing
-            if CUTEDSL_MOE_SCALAR_INPUT_SCALE:
-                w13_input_scale = (
-                    layer.w13_input_scale.max()
-                    .to(torch.float32)
-                    .repeat(layer.w13_input_scale.shape[0])
-                )
-            else:
-                w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(
-                    torch.float32
-                )
-
+            # CuteDSL standard path uses a single scalar input scale (all experts).
+            w13_input_scale = (
+                layer.w13_input_scale.max()
+                .to(torch.float32)
+                .repeat(layer.w13_input_scale.shape[0])
+            )
             w2_input_scale = layer.w2_input_scale
 
             def _slice_scale(w):
@@ -1868,6 +1812,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         else:
             # CUTLASS processing - handle w13 and w2 separately
 
+            if self.enable_flashinfer_cutedsl_moe and layer.moe_runner_config.is_gated:
+                # For the CuteDSL FP4 path, interleave the two logical W13 halves
+                # in 64-row chunks before swizzling the block-scales.
+                from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                    interleave_w13_halves,
+                )
+
+                layer.w13_weight = Parameter(
+                    interleave_w13_halves(
+                        layer.w13_weight.view(torch.uint8), group_size=64, dim=1
+                    ).contiguous(),
+                    requires_grad=False,
+                )
+                layer.w13_weight_scale = Parameter(
+                    interleave_w13_halves(
+                        layer.w13_weight_scale, group_size=64, dim=1
+                    ).contiguous(),
+                    requires_grad=False,
+                )
+
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
             copy_or_rebind_param(
@@ -1912,6 +1876,45 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer, "w2_blockscale_swizzled", w2_blockscale_swizzled
             )
 
+            if self.enable_flashinfer_cutedsl_moe:
+                # CuteDSL expects MMA layout for weight scales. Convert from swizzled bytes.
+                from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+                from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                    _FP4_SF_VEC_SIZE,
+                )
+
+                sf_vec_size = _FP4_SF_VEC_SIZE
+                num_local_experts = layer.w13_weight.shape[0]
+                w13_m = layer.w13_weight.shape[1]
+                w13_k = layer.w13_weight.shape[2] * 2
+                w2_m = layer.w2_weight.shape[1]
+                w2_k = layer.w2_weight.shape[2] * 2
+                layer.w13_blockscale_mma = Parameter(
+                    convert_sf_to_mma_layout(
+                        layer.w13_blockscale_swizzled.contiguous()
+                        .view(torch.uint8)
+                        .reshape(-1),
+                        m=w13_m,
+                        k=w13_k,
+                        num_groups=num_local_experts,
+                        sf_vec_size=sf_vec_size,
+                    ),
+                    requires_grad=False,
+                )
+                layer.w2_blockscale_mma = Parameter(
+                    convert_sf_to_mma_layout(
+                        layer.w2_blockscale_swizzled.contiguous()
+                        .view(torch.uint8)
+                        .reshape(-1),
+                        m=w2_m,
+                        k=w2_k,
+                        num_groups=num_local_experts,
+                        sf_vec_size=sf_vec_size,
+                    ),
+                    requires_grad=False,
+                )
+
             # Both flashinfer cutlass and regular cutlass use same processing for w2
 
             # Set up CUTLASS MoE parameters (reuse to keep CUDA graph stable)
@@ -1937,26 +1940,34 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
-        return self.enable_flashinfer_cutlass_moe and self.moe_runner_config.is_gated
+        # Load W13 as [Up, Gate] for FlashInfer CUTLASS/CuteDSL kernels.
+        return self.moe_runner_config.is_gated and (
+            self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_cutedsl_moe
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_marlin_fallback:
-            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
-            return
-        if get_moe_runner_backend().is_flashinfer_trtllm():
-            self.runner = MoeRunner(
-                MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
-            )
+        moe_runner_backend = get_moe_runner_backend()
+
+        if moe_runner_backend.is_auto():
+            # TRTLLM is currently the most performant and tested FP4 MoE
+            # backend, so use it as the default.
+            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+
+        if moe_runner_backend.is_flashinfer_cutedsl():
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
+
+        if not moe_runner_backend.is_flashinfer_cutlass():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply(
         self,
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         x_sf = dispatch_output.hidden_states_scale
@@ -1969,37 +1980,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
 
-        # Marlin FP4 fallback path for non-Blackwell GPUs (SM75-SM89)
-        if self.use_marlin_fallback:
-            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-
-            expert_map = None
-            global_num_experts = -1
-            if hasattr(layer, "dispatcher") and hasattr(
-                layer.dispatcher, "local_expert_mapping"
-            ):
-                expert_map = layer.dispatcher.local_expert_mapping
-                if expert_map is not None:
-                    global_num_experts = moe_runner_config.num_experts
-
-            quant_info = MarlinMoeQuantInfo(
-                w13_qweight=layer.w13_weight,
-                w2_qweight=layer.w2_weight,
-                w13_scales=layer.w13_weight_scale,
-                w2_scales=layer.w2_weight_scale,
-                w13_g_idx_sort_indices=None,
-                w2_g_idx_sort_indices=None,
-                weight_bits=4,
-                w13_global_scale=layer.w13_weight_scale_2,
-                w2_global_scale=layer.w2_weight_scale_2,
-                expert_map=expert_map,
-                global_num_experts=global_num_experts,
-            )
-            return self.runner.run(dispatch_output, quant_info)
-
-        # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
-        # backend is flashinfer_trtllm
-        if hasattr(layer, "gemm1_weights_fp4_shuffled"):
+        # FlashInfer TRTLLM FP4 path
+        if self.enable_flashinfer_trtllm_moe and hasattr(layer, "g1_scale_c"):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
             )
@@ -2011,10 +1993,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             quant_info = FlashInferTrtllmFp4MoeQuantInfo(
-                gemm1_weights_fp4_shuffled=layer.gemm1_weights_fp4_shuffled.data,
-                gemm2_weights_fp4_shuffled=layer.gemm2_weights_fp4_shuffled.data,
-                gemm1_scales_fp4_shuffled=layer.gemm1_scales_fp4_shuffled.data,
-                gemm2_scales_fp4_shuffled=layer.gemm2_scales_fp4_shuffled.data,
+                w13_weight=layer.w13_weight.data,
+                w2_weight=layer.w2_weight.data,
+                w13_weight_scale=layer.w13_weight_scale.data,
+                w2_weight_scale=layer.w2_weight_scale.data,
                 g1_scale_c=layer.g1_scale_c.data,
                 g1_alphas=layer.g1_alphas.data,
                 g2_alphas=layer.g2_alphas.data,
@@ -2026,6 +2008,33 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 routing_method_type=routing_method_type,
             )
 
+            return self.runner.run(dispatch_output, quant_info)
+
+        if self.enable_flashinfer_cutedsl_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                CuteDslFp4MoeQuantInfo,
+                ensure_cutedsl_wrapper,
+            )
+
+            ensure_cutedsl_wrapper(layer)
+            w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
+            w1_weight_sf = getattr(
+                layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
+            )
+            w2_weight_sf = getattr(
+                layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
+            )
+            quant_info = CuteDslFp4MoeQuantInfo(
+                wrapper=layer._cutedsl_wrapper,
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_sf=w1_weight_sf,
+                w2_weight_sf=w2_weight_sf,
+                w1_alpha=w1_alpha,
+                w2_alpha=w2_alpha,
+                fc2_input_scale=fc2_input_scale,
+                input_scale=layer._cutedsl_input_scale,
+            )
             return self.runner.run(dispatch_output, quant_info)
 
         if self.enable_flashinfer_cutlass_moe:
@@ -2067,7 +2076,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 fc2_expert_weights=layer.w2_weight.view(torch.long),
                 output_dtype=output_dtype,
                 input_sf=x_sf,
-                # swizzled_input_sf=not get_moe_a2a_backend().is_flashinfer(),
+                # swizzled_input_sf intentionally omitted; not used for this path.
                 quant_scales=[
                     layer.w13_input_scale_quant,
                     layer.w13_blockscale_swizzled.view(torch.int32),
@@ -2084,8 +2093,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 activation_type=ACT_STR_TO_TYPE_MAP[activation],
                 enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
             )[0]
-
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
             return StandardCombineInput(hidden_states=output)
 
@@ -2108,8 +2115,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
         return StandardCombineInput(hidden_states=output)
 
     def apply_without_routing_weights(

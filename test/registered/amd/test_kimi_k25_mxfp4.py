@@ -1,14 +1,8 @@
-"""Kimi-K2.5-MXFP4 aiter MLA backend test (4-GPU, FP8 KV cache)
+"""Kimi-K2.5-MXFP4 aiter MLA backend test (8-GPU, FP8 KV cache)
 
 PR-level test for Kimi-K2.5-MXFP4 with aiter unified attention backend
 and fp8_e4m3 KV cache on MI35x.
 
-NOTE: TP must be <= 4 for Kimi-K2.5 with the aiter MLA kernel.
-Kimi-K2.5 has num_attention_heads=64; with tp_size=8 that gives
-64/8 = 8 heads per GPU, but the aiter ASM MLA kernel requires
-heads_per_gpu % 16 == 0. With tp_size=4: 64/4 = 16 heads, which
-satisfies the constraint. (DeepSeek-R1/V3 has 128 heads so TP=8
-yields 128/8 = 16 heads and works fine.)
 """
 
 import os
@@ -33,6 +27,7 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 KIMI_K25_MXFP4_MODEL_PATH = "amd/Kimi-K2.5-MXFP4"
+KIMI_K25_MXFP4_REVISION = "b071bc6f8eb042e093e14f3b8bdbad71c18e09d3"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 
@@ -41,10 +36,11 @@ class TestKimiK25MXFP4(CustomTestCase):
     def setUpClass(cls):
         cls.model = KIMI_K25_MXFP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        # TP=4 required: 64 attn heads / 4 = 16 heads per GPU (aiter MLA needs % 16 == 0)
         other_args = [
+            "--revision",
+            KIMI_K25_MXFP4_REVISION,
             "--tp",
-            "4",
+            "8",
             "--attention-backend",
             "aiter",
             "--kv-cache-dtype",

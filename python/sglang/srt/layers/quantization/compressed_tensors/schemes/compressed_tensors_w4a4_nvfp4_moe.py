@@ -17,13 +17,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-    prepare_moe_fp4_layer_for_marlin,
-    should_use_fp4_marlin_fallback,
-)
 from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
+    replace_parameter,
     swizzle_blockscale,
 )
 from sglang.srt.utils import next_power_of_2, set_weight_attrs
@@ -42,27 +39,19 @@ if TYPE_CHECKING:
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
 
     def __init__(self):
-        self.group_size = 16
-
-        if should_use_fp4_marlin_fallback():
-            logger.warning_once(
-                "GPU is not Blackwell (SM100+). Using Marlin FP4 fallback kernel "
-                "for MoE layers. Weights remain compressed in FP4 format."
-            )
-            self.use_marlin_fallback = True
-            self.use_flashinfer_trtllm = False
-        elif not is_blackwell_supported():
+        if not is_blackwell_supported():
             raise ValueError(
                 "Current platform does not support NVFP4"
-                " quantization. Please use SM75+ (Turing or newer)."
+                " quantization. Please use Blackwell and"
+                " above."
             )
-        else:
-            self.use_marlin_fallback = False
-            self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        self.group_size = 16
+        self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75  # SM75+ (Turing) supports Marlin FP4 fallback; SM100 for native FP4
+        # Requires sm100(blackwell) architecture
+        return 100
 
     def create_weights(
         self,
@@ -76,7 +65,6 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         layer.params_dtype = params_dtype
-        layer.intermediate_size_per_partition = intermediate_size_per_partition
 
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -188,21 +176,6 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         )
         delattr(layer, "w2_weight_packed")
 
-        if self.use_marlin_fallback:
-            # CompressedTensors checkpoint: global_scale is stored as the inverse.
-            # Actual dequant scale = 1 / stored_value. We create w*_weight_scale_2
-            # with the actual scale before calling prepare_moe_fp4_layer_for_marlin().
-            layer.w13_weight_scale_2 = torch.nn.Parameter(
-                (1.0 / layer.w13_weight_global_scale).to(layer.params_dtype),
-                requires_grad=False,
-            )  # [E, 2]
-            layer.w2_weight_scale_2 = torch.nn.Parameter(
-                (1.0 / layer.w2_weight_global_scale).to(layer.params_dtype),
-                requires_grad=False,
-            )  # [E]
-            prepare_moe_fp4_layer_for_marlin(layer)
-            return
-
         if self.use_flashinfer_trtllm:
             w, s = reorder_w1w3_to_w3w1(
                 layer.w13_weight.data, layer.w13_weight_scale.data, dim=-2
@@ -285,30 +258,16 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             )
             logger.debug("Finished shuffling weights for TRT-LLM MOE")
 
-            layer.gemm1_weights_fp4_shuffled = torch.nn.Parameter(
-                gemm1_weights_fp4_shuffled, requires_grad=False
-            )
-            layer.gemm2_weights_fp4_shuffled = torch.nn.Parameter(
-                gemm2_weights_fp4_shuffled, requires_grad=False
-            )
-            layer.gemm1_scales_fp4_shuffled = torch.nn.Parameter(
-                gemm1_scales_fp4_shuffled, requires_grad=False
-            )
-            layer.gemm2_scales_fp4_shuffled = torch.nn.Parameter(
-                gemm2_scales_fp4_shuffled, requires_grad=False
-            )
+            replace_parameter(layer, "w13_weight", gemm1_weights_fp4_shuffled)
+            replace_parameter(layer, "w2_weight", gemm2_weights_fp4_shuffled)
+            replace_parameter(layer, "w13_weight_scale", gemm1_scales_fp4_shuffled)
+            replace_parameter(layer, "w2_weight_scale", gemm2_scales_fp4_shuffled)
 
             # Additional parameter needed for TRT-LLM
             layer.g1_scale_c = torch.nn.Parameter(
                 (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
                 requires_grad=False,
             )
-
-            # Clean up weights that won't be used by TRT-LLM
-            del layer.w2_weight
-            del layer.w2_weight_scale
-            del layer.w13_weight
-            del layer.w13_weight_scale
         else:
             # swizzle weight scales
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -331,10 +290,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_marlin_fallback:
-            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
-        else:
-            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply_weights(
         self,
@@ -343,33 +299,6 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        if self.use_marlin_fallback:
-            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-
-            expert_map = None
-            global_num_experts = -1
-            if hasattr(layer, "dispatcher") and hasattr(
-                layer.dispatcher, "local_expert_mapping"
-            ):
-                expert_map = layer.dispatcher.local_expert_mapping
-                if expert_map is not None:
-                    global_num_experts = self.moe_runner_config.num_experts
-
-            quant_info = MarlinMoeQuantInfo(
-                w13_qweight=layer.w13_weight,
-                w2_qweight=layer.w2_weight,
-                w13_scales=layer.w13_weight_scale,
-                w2_scales=layer.w2_weight_scale,
-                w13_g_idx_sort_indices=None,
-                w2_g_idx_sort_indices=None,
-                weight_bits=4,
-                w13_global_scale=layer.w13_weight_scale_2,
-                w2_global_scale=layer.w2_weight_scale_2,
-                expert_map=expert_map,
-                global_num_experts=global_num_experts,
-            )
-            return self.runner.run(dispatch_output, quant_info)
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -428,18 +357,14 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 routing_bias=correction_bias,
                 hidden_states=hs_fp4,
                 hidden_states_scale=hs_scale,
-                gemm1_weights=layer.gemm1_weights_fp4_shuffled,
-                gemm1_weights_scale=layer.gemm1_scales_fp4_shuffled.view(
-                    torch.float8_e4m3fn
-                ),
+                gemm1_weights=layer.w13_weight,
+                gemm1_weights_scale=layer.w13_weight_scale.view(torch.float8_e4m3fn),
                 gemm1_bias=None,
                 gemm1_alpha=None,
                 gemm1_beta=None,
                 gemm1_clamp_limit=None,
-                gemm2_weights=layer.gemm2_weights_fp4_shuffled,
-                gemm2_weights_scale=layer.gemm2_scales_fp4_shuffled.view(
-                    torch.float8_e4m3fn
-                ),
+                gemm2_weights=layer.w2_weight,
+                gemm2_weights_scale=layer.w2_weight_scale.view(torch.float8_e4m3fn),
                 gemm2_bias=None,
                 output1_scale_scalar=layer.g1_scale_c,
                 output1_scale_gate_scalar=layer.g1_alphas,
