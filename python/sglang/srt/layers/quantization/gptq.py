@@ -52,7 +52,13 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs, cpu_has_amx_support
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_npu,
+    set_weight_attrs,
+)
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -207,7 +213,9 @@ class GPTQConfig(QuantizationConfig):
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return (
-            [torch.half] if not (_is_npu or _is_cpu_amx_available) else [torch.half, torch.bfloat16]
+            [torch.half]
+            if not (_is_npu or _is_cpu_amx_available)
+            else [torch.half, torch.bfloat16]
         )
 
     @classmethod
