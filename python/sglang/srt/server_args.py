@@ -520,7 +520,8 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_trie_mode: Literal["global", "request"] = "global"
     speculative_ngram_max_trie_depth: int = 18
-    speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_ngram_trie_capacity: int = 10 * 1000 * 1000
+    speculative_ngram_trie_capacity_per_request: int = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: Optional[str] = None
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     speculative_ngram_trie_source_prior: float = 0.0
@@ -3375,6 +3376,18 @@ class ServerArgs:
                 raise ValueError(
                     "--speculative-ngram-trie-source-prior must be greater than or equal to 0."
                 )
+            if self.speculative_ngram_trie_capacity <= 0:
+                raise ValueError(
+                    "--speculative-ngram-trie-capacity must be greater than 0."
+                )
+            if (
+                self.speculative_ngram_trie_mode == "request"
+                and self.speculative_ngram_trie_capacity_per_request <= 0
+            ):
+                raise ValueError(
+                    "--speculative-ngram-trie-capacity-per-request must be greater "
+                    "than 0 when --speculative-ngram-trie-mode=request."
+                )
             if self.speculative_ngram_match_specificity_weight < 0:
                 raise ValueError(
                     "--speculative-ngram-match-specificity-weight must be greater than or equal to 0."
@@ -5232,10 +5245,17 @@ class ServerArgs:
             help="The max trie depth for ngram speculative decoding.",
         )
         parser.add_argument(
+            "--speculative-ngram-trie-capacity",
             "--speculative-ngram-capacity",
             type=int,
-            default=ServerArgs.speculative_ngram_capacity,
-            help="The cache capacity for ngram speculative decoding.",
+            default=ServerArgs.speculative_ngram_trie_capacity,
+            help="The cache capacity for the global online trie in ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-trie-capacity-per-request",
+            type=int,
+            default=ServerArgs.speculative_ngram_trie_capacity_per_request,
+            help="The cache capacity for each request-local online trie in request trie mode.",
         )
         parser.add_argument(
             "--speculative-ngram-external-corpus-path",

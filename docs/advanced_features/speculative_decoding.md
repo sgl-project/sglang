@@ -392,7 +392,8 @@ Enable it with:
 | `--speculative-ngram-max-bfs-breadth` | Maximum BFS breadth. | `10` |
 | `--speculative-ngram-match-type` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion. | `"BFS"` |
 | `--speculative-ngram-max-trie-depth` | Maximum suffix length stored and matched by the ngram trie. | `18` |
-| `--speculative-ngram-capacity` | Cache capacity (number of entries). | `10,000,000` |
+| `--speculative-ngram-trie-capacity` | Cache capacity (number of nodes) for the global online trie. | `10,000,000` |
+| `--speculative-ngram-trie-capacity-per-request` | Cache capacity (number of nodes) for each request-local online trie when `--speculative-ngram-trie-mode request` is enabled. | `10,000,000` |
 
 Notes:
 - Ngram speculative decoding **only supports CUDA**.
@@ -465,7 +466,8 @@ Below is a comprehensive list of all speculative decoding parameters available i
 | `--speculative-ngram-max-bfs-breadth` | `int` | `10` | Maximum BFS breadth |
 | `--speculative-ngram-match-type` | `str` | `"BFS"` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion |
 | `--speculative-ngram-max-trie-depth` | `int` | `18` | Maximum suffix length stored and matched by the ngram trie |
-| `--speculative-ngram-capacity` | `int` | `10,000,000` | Cache capacity |
+| `--speculative-ngram-trie-capacity` | `int` | `10,000,000` | Cache capacity for the global online trie |
+| `--speculative-ngram-trie-capacity-per-request` | `int` | `10,000,000` | Cache capacity for each request-local online trie in request trie mode |
 
 ### Environment variables
 

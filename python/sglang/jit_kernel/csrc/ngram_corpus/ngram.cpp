@@ -33,8 +33,12 @@ double effectiveTrieSourcePrior(double source_prior) {
   return source_prior > 0.0 ? source_prior : 1.0;
 }
 
+Result buildEmptyResult(int32_t last_token, int result_token_num) {
+  return buildResultFromLeafPaths_(last_token, result_token_num, {});
+}
+
 }  // namespace
-Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
+Ngram::Ngram(size_t capacity, const Param& param) : trie_capacity_(capacity), param_(param) {
   if (!(param_.max_trie_depth > 1)) {
     throw std::runtime_error(
         "param_.max_trie_depth must be greater than 1, current value: " + std::to_string(param_.max_trie_depth));
@@ -71,6 +75,9 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (param_.match_specificity_weight + param_.match_confidence_weight <= 0.0) {
     throw std::runtime_error("match quality weights must sum to a positive value");
   }
+  if (!(trie_capacity_ > 0)) {
+    throw std::runtime_error("trie capacity must be greater than 0, current value: " + std::to_string(trie_capacity_));
+  }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config <= param_.draft_token_num)) {
@@ -81,9 +88,8 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
     }
   }
 
-  trie_arena_ = std::make_unique<TrieArena>(capacity);
   if (!param_.request_trie_mode) {
-    global_trie_ = std::make_unique<Trie>(trie_arena_.get(), param_);
+    global_trie_ = std::make_unique<Trie>(trie_capacity_, param_);
   }
 
   insert_worker_ = std::thread(&Ngram::insertWorker, this);
@@ -180,10 +186,10 @@ void Ngram::insertWorker() {
     if (!insert_queue_.dequeue(item)) {
       break;
     }
-    // Still a per-Ngram lock because of contention with batchMatch()
-    // and getOrCreateTrie_(), which modifies TrieArena
+    // Still a per-Ngram lock because of contention with batchMatch() and
+    // request-trie lifecycle changes.
     std::unique_lock<std::mutex> lock(mutex_);
-    auto* trie = getOrCreateTrie_(item.state_id);
+    auto* trie = getOrCreateTrieForInsert_(item.state_id);
     trie->insert(item.tokens.data(), item.tokens.size());
     --pending_count_;
     lock.unlock();
@@ -192,10 +198,23 @@ void Ngram::insertWorker() {
 }
 
 // See C++ Core Guidelines F.7 and R.3 for why the return type is a raw pointer.
-Trie* Ngram::getOrCreateTrie_(int64_t state_id) {
+Trie* Ngram::getTrieForMatch_(int64_t state_id) {
+  if (!param_.request_trie_mode) {
+    return global_trie_.get();
+  }
+
+  if (state_id < 0) {
+    throw std::runtime_error("request_trie_mode requires non-negative state ids");
+  }
+  auto iter = request_tries_.find(state_id);
+  return iter == request_tries_.end() ? nullptr : iter->second.get();
+}
+
+// See C++ Core Guidelines F.7 and R.3 for why the return type is a raw pointer.
+Trie* Ngram::getOrCreateTrieForInsert_(int64_t state_id) {
   if (!param_.request_trie_mode) {
     if (!global_trie_) {
-      global_trie_ = std::make_unique<Trie>(trie_arena_.get(), param_);
+      global_trie_ = std::make_unique<Trie>(trie_capacity_, param_);
     }
     return global_trie_.get();
   }
@@ -205,7 +224,7 @@ Trie* Ngram::getOrCreateTrie_(int64_t state_id) {
   }
   auto& trie = request_tries_[state_id];
   if (!trie) {
-    trie = std::make_unique<Trie>(trie_arena_.get(), param_);
+    trie = std::make_unique<Trie>(trie_capacity_, param_);
   }
   return trie.get();
 }
@@ -253,13 +272,19 @@ Result Ngram::batchMatch(
       throw std::runtime_error("batchMatch received an empty token tail");
     }
 
-    auto& state = match_state_[state_ids[i]];
-    auto* trie = getOrCreateTrie_(state_ids[i]);
-    auto trie_anchors = trie->match(suffix.data(), suffix.size(), state, total_lens[i]);
-    auto trie_quality = trie->summarizeMatchQuality(trie_anchors, param_);
+    std::vector<std::pair<const TrieNode*, int32_t>> trie_anchors;
+    MatchQuality trie_quality;
+    auto* trie = getTrieForMatch_(state_ids[i]);
+    if (trie != nullptr) {
+      auto& state = match_state_[state_ids[i]];
+      trie_anchors = trie->match(suffix.data(), suffix.size(), state, total_lens[i]);
+      trie_quality = trie->summarizeMatchQuality(trie_anchors, param_);
+    }
 
     if (ordered_sams.empty()) {
-      auto res = (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
+      auto res = trie != nullptr
+                     ? (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)
+                     : buildEmptyResult(suffix.back(), result_token_num);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
       continue;
@@ -293,7 +318,9 @@ Result Ngram::batchMatch(
 
     Result combined;
     if (source_results.empty()) {
-      combined = (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
+      combined = trie != nullptr
+                     ? (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)
+                     : buildEmptyResult(suffix.back(), result_token_num);
     } else {
       // Merge stronger sources first so the final cap keeps their branches when the tree saturates.
       std::stable_sort(source_results.begin(), source_results.end(), [](const auto& lhs, const auto& rhs) {

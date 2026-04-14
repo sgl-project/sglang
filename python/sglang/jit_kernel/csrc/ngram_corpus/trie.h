@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <list>
+#include <memory>
 #include <new>
 #include <set>
 #include <tuple>
@@ -53,23 +54,9 @@ struct MatchState {
   std::vector<NodeRef> anchors;
 };
 
-class TrieArena {
- public:
-  explicit TrieArena(size_t capacity);
-
- private:
-  friend class Trie;
-
-  std::vector<TrieNode> nodes_;
-  std::vector<TrieNode*> node_pool_;
-  size_t free_node_count_ = 0;
-  std::list<TrieNode*> global_lru_;
-};
-
 class Trie {
  public:
-  Trie(TrieArena* arena, const Param& param);
-  ~Trie();
+  Trie(size_t capacity, const Param& param);
 
   void insert(const int32_t* tokens, size_t len);
 
@@ -100,8 +87,9 @@ class Trie {
   void reset();
 
  private:
-  void clear_(bool release_root);
-  void releaseNode_(TrieNode* node);
+  void ensureFreeNodes_(size_t count);
+  void allocateChunk_(size_t min_nodes);
+  TrieNode* getNode();
 
   // Recompute all cached anchors from the current tail. After this, for every
   // d in [1, min(len, max_trie_depth)], anchors[d - 1] represents the suffix of
@@ -135,17 +123,15 @@ class Trie {
     }
   }
 
-  TrieNode* getNode() {
-    auto node = arena_->node_pool_[--arena_->free_node_count_];
-    auto version = node->version;
-    node->~TrieNode();
-    new (node) TrieNode();
-    node->version = version;
-    return node;
-  }
-
-  TrieArena* arena_;
-  TrieNode* root_;
+  size_t capacity_;
+  size_t allocated_node_count_ = 0;
+  size_t next_chunk_size_ = 0;
+  std::vector<std::unique_ptr<TrieNode[]>> node_chunks_;
+  std::vector<size_t> chunk_sizes_;
+  std::vector<TrieNode*> node_pool_;
+  size_t free_node_count_ = 0;
+  std::list<TrieNode*> global_lru_;
+  TrieNode* root_ = nullptr;
   std::vector<TrieNode*> path_;
   Param param_;
   uint64_t trie_epoch_ = 1;

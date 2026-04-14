@@ -436,6 +436,10 @@ class TestNgramExternalSamArgs(CustomTestCase):
                 "NGRAM",
                 "--speculative-ngram-trie-mode",
                 "request",
+                "--speculative-ngram-trie-capacity",
+                "256",
+                "--speculative-ngram-trie-capacity-per-request",
+                "32",
                 "--speculative-ngram-external-corpus-path",
                 "/tmp/ngram-corpus.jsonl",
                 "--speculative-ngram-external-corpus-max-tokens",
@@ -453,6 +457,8 @@ class TestNgramExternalSamArgs(CustomTestCase):
             "/tmp/ngram-corpus.jsonl",
         )
         self.assertEqual(server_args.speculative_ngram_trie_mode, "request")
+        self.assertEqual(server_args.speculative_ngram_trie_capacity, 256)
+        self.assertEqual(server_args.speculative_ngram_trie_capacity_per_request, 32)
         self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
         self.assertEqual(server_args.speculative_ngram_trie_source_prior, 1.5)
         self.assertEqual(server_args.speculative_ngram_match_specificity_weight, 0.6)
@@ -496,6 +502,21 @@ class TestNgramExternalSamArgs(CustomTestCase):
                 speculative_ngram_trie_source_prior=-0.1,
             )._handle_speculative_decoding()
         self.assertIn("trie-source-prior", str(context.exception))
+
+    def test_trie_capacity_must_be_positive(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_trie_capacity=0,
+            )._handle_speculative_decoding()
+        self.assertIn("trie-capacity", str(context.exception))
+
+    def test_request_trie_capacity_must_be_positive_in_request_mode(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_trie_mode="request",
+                speculative_ngram_trie_capacity_per_request=0,
+            )._handle_speculative_decoding()
+        self.assertIn("trie-capacity-per-request", str(context.exception))
 
 
 if __name__ == "__main__":

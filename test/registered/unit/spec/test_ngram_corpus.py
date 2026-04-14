@@ -277,6 +277,52 @@ class TestNgramCorpusRequestTrieMode(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires req_ids"):
             corpus.batch_put([[1, 2, 3, 4]])
 
+    def test_request_mode_batch_get_without_insert_does_not_allocate_trie(self):
+        corpus = _make_corpus(
+            "BFS",
+            trie_mode="request",
+            draft_token_num=4,
+            max_trie_depth=4,
+            capacity=12,
+        )
+
+        for i in range(32):
+            ids, _ = _batch_get_with_state(corpus, f"query-only-{i}", [999], 1)
+            self.assertEqual(ids.tolist(), [999, 0, 0, 0])
+
+        corpus.batch_put([[1, 2, 3, 4]], req_ids=["req-live"])
+        corpus.synchronize()
+
+        ids, _ = _batch_get_with_state(corpus, "req-live", [1, 2, 3], 3)
+        self.assertIn(4, ids.tolist())
+
+    def test_request_mode_small_capacity_does_not_cross_evict(self):
+        corpus = _make_corpus(
+            "BFS",
+            trie_mode="request",
+            draft_token_num=4,
+            max_trie_depth=6,
+            capacity=40,
+        )
+        corpus.batch_put([[1, 2, 3, 4, 5, 6]], req_ids=["req-a"])
+        corpus.synchronize()
+
+        ids_before, masks_before = _batch_get_with_state(corpus, "req-a", [1, 2, 3], 3)
+
+        corpus.batch_put(
+            [
+                [100, 101, 102, 103, 104, 105],
+                [200, 201, 202, 203, 204, 205],
+                [300, 301, 302, 303, 304, 305],
+            ],
+            req_ids=["req-b", "req-c", "req-d"],
+        )
+        corpus.synchronize()
+
+        ids_after, masks_after = _batch_get_with_state(corpus, "req-a", [1, 2, 3], 3)
+        np.testing.assert_array_equal(ids_before, ids_after)
+        np.testing.assert_array_equal(masks_before, masks_after)
+
 
 class TestNgramCorpusNoMatch(CustomTestCase):
     """Verify behavior when query has no match in the corpus."""

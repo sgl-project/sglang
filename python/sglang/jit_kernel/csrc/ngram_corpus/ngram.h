@@ -23,7 +23,7 @@ struct InsertWorkItem {
 };
 
 class Ngram {
-  std::unique_ptr<TrieArena> trie_arena_;
+  size_t trie_capacity_;
   std::unique_ptr<Trie> global_trie_;
   std::unordered_map<int64_t, std::unique_ptr<Trie>> request_tries_;
   std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
@@ -32,7 +32,7 @@ class Ngram {
   std::unique_ptr<SuffixAutomaton> staging_sam_;
   Param param_;
 
-  // NOTE: protects trie_arena_, global_trie_, request_tries_, sams_, and
+  // NOTE: protects global_trie_, request_tries_, sams_, and
   // pending_count_. staging_sam_ is NOT
   // protected by mutex_ — it is only accessed from the corpus loading thread.
   // finishExternalCorpusLoad briefly acquires mutex_ to move the completed
@@ -89,7 +89,8 @@ class Ngram {
 
  private:
   void insertWorker();
-  Trie* getOrCreateTrie_(int64_t state_id);
+  Trie* getTrieForMatch_(int64_t state_id);
+  Trie* getOrCreateTrieForInsert_(int64_t state_id);
 };
 
 }  // namespace ngram

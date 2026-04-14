@@ -42,6 +42,11 @@ class NGRAMWorker:
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.trie_mode: str = server_args.speculative_ngram_trie_mode
+        self.trie_capacity: int = (
+            server_args.speculative_ngram_trie_capacity
+            if self.trie_mode == "global"
+            else server_args.speculative_ngram_trie_capacity_per_request
+        )
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
@@ -53,7 +58,7 @@ class NGRAMWorker:
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
             match_type=server_args.speculative_ngram_match_type,
             trie_mode=server_args.speculative_ngram_trie_mode,
-            capacity=server_args.speculative_ngram_capacity,
+            capacity=self.trie_capacity,
             max_trie_depth=server_args.speculative_ngram_max_trie_depth,
             draft_token_num=server_args.speculative_num_draft_tokens,
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
