@@ -499,8 +499,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         # Image-only Qwen2/3-VL fast path: smart_resize -> grid_thw -> pad
-        # input_ids -> reuse compute_mrope_positions for delta. Falls back for
-        # video / audio / unsupported types.
+        # input_ids -> compute M-RoPE directly from the full image_grid_thw.
+        # Falls back for video / audio / unsupported types.
         if request_obj.video_data or request_obj.audio_data or audio_data:
             return None
         if not image_data:
@@ -541,18 +541,21 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             image_grids.append((1, resized_h // patch_size, resized_w // patch_size))
 
         image_grid_thw = torch.tensor(image_grids, dtype=torch.long)
-        input_ids, offsets, _ = self.build_input_ids(
+        input_ids, _, _ = self.build_input_ids(
             base_output.input_text, img_grid_thw=image_grid_thw
         )
 
-        mm_items: List[MultimodalDataItem] = []
-        for i, offset in enumerate(offsets):
-            item = MultimodalDataItem(modality=Modality.IMAGE, offsets=[offset])
-            item.model_specific_data["image_grid_thw"] = image_grid_thw[i : i + 1]
-            mm_items.append(item)
-
-        mrope_positions, mrope_position_delta = self.compute_mrope_positions(
-            input_ids, mm_items
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+            image_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.model_type,
+            tokens_per_second=getattr(
+                self.hf_config.vision_config, "tokens_per_second", None
+            ),
+            input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
+            image_grid_thw=image_grid_thw,
         )
 
         return MultimodalProcessorOutput(
