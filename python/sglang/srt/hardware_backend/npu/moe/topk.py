@@ -30,7 +30,6 @@ def fused_topk_npu(
     if (
         use_grouped_topk
         or correction_bias is not None
-        or topk_config.scoring_func == "sigmoid"
     ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
