@@ -807,9 +807,7 @@ if not current_platform.is_hip():
 MODELOPT_FLUX1_FP8_TRANSFORMER = "BBuf/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "BBuf/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_TRANSFORMER = "BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
-MODELOPT_FLUX1_NVFP4_TRANSFORMER = (
-    "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
-)
+MODELOPT_FLUX1_NVFP4_TRANSFORMER = "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_WAN22_NVFP4_TRANSFORMER = (
     "BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
