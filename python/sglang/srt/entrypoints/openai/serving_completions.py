@@ -377,11 +377,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
-            if (
-                (request.return_routed_experts and routed_experts)
-                or (
-                    request.return_cached_tokens_details and cached_tokens_details
-                )
+            if (request.return_routed_experts and routed_experts) or (
+                request.return_cached_tokens_details and cached_tokens_details
             ):
                 first_routed_experts = next(
                     (v for v in routed_experts.values() if v is not None),

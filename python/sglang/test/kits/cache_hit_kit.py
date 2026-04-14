@@ -95,7 +95,9 @@ async def async_request_sglang_generate(
                     output.prompt_len = prompt_tokens
                     output.cached_tokens_details = cached_tokens_details
                     if cached_tokens_details and cached_tokens == 0:
-                        cached_tokens = _sum_cached_tokens_details(cached_tokens_details)
+                        cached_tokens = _sum_cached_tokens_details(
+                            cached_tokens_details
+                        )
                     output.cached_tokens = cached_tokens
                     output.generated_len = len(output.itl) + 1
                 else:

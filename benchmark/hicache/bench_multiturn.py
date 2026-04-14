@@ -238,9 +238,7 @@ def print_cache_report(cache_report, title="Cache Hit Details"):
         print("{:<40} {:<10}".format("  Host:", host_cached_tokens))
         if storage_cached_tokens is not None:
             storage_label = (
-                f"  Storage ({storage_backend}):"
-                if storage_backend
-                else "  Storage:"
+                f"  Storage ({storage_backend}):" if storage_backend else "  Storage:"
             )
             print("{:<40} {:<10}".format(storage_label, storage_cached_tokens))
     print("{:<40} {:.1f}%".format("Cache hit rate:", cache_hit_rate_pct))
@@ -257,9 +255,7 @@ def print_cache_report(cache_report, title="Cache Hit Details"):
         )
         if storage_cached_tokens is not None:
             storage_label = (
-                f"  Storage ({storage_backend}):"
-                if storage_backend
-                else "  Storage:"
+                f"  Storage ({storage_backend}):" if storage_backend else "  Storage:"
             )
             print(
                 "{:<40} {:.1f}%".format(
