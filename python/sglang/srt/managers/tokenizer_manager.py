@@ -1028,6 +1028,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                mm_data_mooncake=obj.mm_data_mooncake,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1057,8 +1058,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
-        if getattr(obj, "mm_data_mooncake", None) is not None:
-            tokenized_obj.mm_data_mooncake = obj.mm_data_mooncake
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 

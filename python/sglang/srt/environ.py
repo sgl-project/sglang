@@ -626,6 +626,7 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
 
     # Elastic EP Backup Port

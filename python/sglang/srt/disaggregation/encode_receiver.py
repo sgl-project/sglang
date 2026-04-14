@@ -446,7 +446,9 @@ class WaitingImageRequest:
 
         async def send_embedding_port(req_id, receive_count, host_name, embedding_port):
             async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=1800)
+                timeout=aiohttp.ClientTimeout(
+                    total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                )
             ) as session:
                 tasks = []
                 logger.info(f"{self.num_items_assigned = } ")
@@ -489,7 +491,20 @@ class WaitingImageRequest:
                     logger.info("No tasks to send.")
                     return
                 logger.info(f"Concurrently sending {len(tasks)} requests...")
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                except asyncio.TimeoutError:
+                    timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                    logger.error(
+                        f"Encoder /scheduler_receive_url timeout ({timeout_val}s) for req_id={req_id}"
+                    )
+                    return
+                except Exception as e:
+                    logger.error(
+                        f"Encoder /scheduler_receive_url failed for req_id={req_id}: {e}",
+                        exc_info=True,
+                    )
+                    return
 
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
@@ -561,6 +576,9 @@ class WaitingImageRequest:
         self.recv_req.input_ids = mm_inputs.input_ids
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
+
+    def _cleanup_gpu_buffer(self):
+        pass
 
 
 class WaitingImageRequestGrpc(WaitingImageRequest):
@@ -656,7 +674,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
         # Use the URL list captured at tokenizer time.  TokenizedGenerateReqInput
         # has no image_data field, so reading recv_req.image_data here would
         # always return None and produce empty mm_items.
-        mm_data_all = getattr(self.recv_req, "mm_data_mooncake", [])
+        mm_data_all = self.recv_req.mm_data_mooncake or []
 
         total_num_parts = sum(modality_num_parts.values())
         part_idx_offset = 0
@@ -693,7 +711,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             part_idx_offset += num_parts
 
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=1800)
+            timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
         ) as session:
             # Phase 1: POST /encode → get metadata immediately
             tasks = [
@@ -703,7 +721,26 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                 )
                 for r in encode_requests
             ]
-            responses = await asyncio.gather(*tasks)
+            try:
+                responses = await asyncio.gather(*tasks)
+            except asyncio.TimeoutError:
+                timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                logger.error(
+                    f"Encoder /encode timeout ({timeout_val}s) for rid={self.rid}"
+                )
+                self.status = WaitingImageRequestStatus.FAIL
+                self.error_msg = f"Encoder /encode timeout ({timeout_val}s)"
+                self.recv_socket.close()
+                return
+            except Exception as e:
+                logger.error(
+                    f"Encoder /encode failed for rid={self.rid}: {e}",
+                    exc_info=True,
+                )
+                self.status = WaitingImageRequestStatus.FAIL
+                self.error_msg = str(e)
+                self.recv_socket.close()
+                return
             for resp in responses:
                 if resp.status != 200:
                     try:
@@ -807,7 +844,6 @@ class WaitingImageRDMARequest(WaitingImageRequest):
             # Embedding was written directly into pre-registered GPU buffer by encode server
             # (Mooncake GPU-direct transfer); no ZMQ payload in this message.
             # recv_obj.embedding stays None until we extract from GPU buffer below
-
             if self.recv_embedding_data is None:
                 self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
                     recv_obj
@@ -1199,8 +1235,7 @@ class MMReceiverBase(ABC):
             waiting_req._try_recv_mm_data()
             if current_time - waiting_req.start_time > self.wait_timeout:
                 waiting_req.status = WaitingImageRequestStatus.TIMEOUT
-                if hasattr(waiting_req, "_cleanup_gpu_buffer"):
-                    waiting_req._cleanup_gpu_buffer()
+                waiting_req._cleanup_gpu_buffer()
                 waiting_req.recv_socket.close()
             local_status.append(waiting_req.status)
 
@@ -1498,9 +1533,7 @@ class MMReceiverHTTP(MMReceiverBase):
             part_idx_offset += num_parts
 
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=1800
-            )  # Add timeout for request reliability
+            timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
         ) as session:
             # Send encode requests
 
@@ -1512,7 +1545,21 @@ class MMReceiverHTTP(MMReceiverBase):
                 for encode_request in encode_requests
             ]
 
-            responses = await asyncio.gather(*tasks)
+            try:
+                responses = await asyncio.gather(*tasks)
+            except asyncio.TimeoutError:
+                timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
+                logger.error(
+                    f"Encoder HTTP request timeout ({timeout_val}s) for req_id={req_id}, "
+                    f"encoders={[self.encode_urls[req['encoder_idx']] for req in encode_requests]}"
+                )
+                return
+            except Exception as e:
+                logger.error(
+                    f"Encoder HTTP request failed for req_id={req_id}: {e}",
+                    exc_info=True,
+                )
+                return
             for response in responses:
                 if response.status != 200:
                     try:
@@ -1597,7 +1644,7 @@ class MMReceiverGrpc(MMReceiverBase):
         self.send_encode_request(encode_req)
         return encode_req
 
-    # For zmq_to_scheduler
+    # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
         return self._process_waiting_requests(recv_reqs, WaitingImageRequestGrpc)
 
