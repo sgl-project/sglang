@@ -1097,6 +1097,11 @@ class LTX2DenoisingStage(DenoisingStage):
             ctx.audio_latents = ctx.audio_scheduler.step(
                 model_audio, step.t_device, ctx.audio_latents, return_dict=False
             )[0]
+            if ctx.denoise_mask is not None and ctx.clean_latent is not None:
+                ctx.latents = (
+                    ctx.latents.float() * ctx.denoise_mask
+                    + ctx.clean_latent.float() * (1.0 - ctx.denoise_mask)
+                ).to(dtype=ctx.latents.dtype)
             ctx.latents = self.post_forward_for_ti2v_task(
                 batch, server_args, ctx.reserved_frames_mask, ctx.latents, ctx.z
             )
