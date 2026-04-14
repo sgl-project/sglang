@@ -42,6 +42,8 @@ class TestJsonArrayParser(CustomTestCase):
         res = self.parser.parse_streaming_increment(text, self.tools)
         # Should return a StreamingParseResult where is_tool_call is typically evaluated
         self.assertIsNotNone(res)
+        self.assertEqual(len(res.calls), 1)
+        self.assertEqual(res.calls[0].name, "test_tool")
 
 register_cpu_ci(TestJsonArrayParser)
 
