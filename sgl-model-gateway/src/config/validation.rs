@@ -102,6 +102,7 @@ impl ConfigValidator {
                 prefill_urls,
                 decode_urls,
                 prefill_policy,
+                prefill_queue_threshold: _,
                 decode_policy,
             } => {
                 // Allow empty URLs even without service discovery to support dynamic worker addition
@@ -557,6 +558,7 @@ impl ConfigValidator {
                 prefill_urls,
                 decode_urls,
                 prefill_policy,
+                prefill_queue_threshold: _,
                 decode_policy,
             } = &config.mode
             {
@@ -745,6 +747,7 @@ mod tests {
                 prefill_urls: vec![("http://prefill:8000".to_string(), Some(8081))],
                 decode_urls: vec!["http://decode:8000".to_string()],
                 prefill_policy: None,
+                prefill_queue_threshold: 0,
                 decode_policy: None,
             },
             PolicyConfig::Random,
@@ -761,6 +764,7 @@ mod tests {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
                 prefill_policy: None,
+                prefill_queue_threshold: 0,
                 decode_policy: None,
             },
             PolicyConfig::RoundRobin,
@@ -778,6 +782,7 @@ mod tests {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
                 prefill_policy: None,
+                prefill_queue_threshold: 0,
                 decode_policy: None,
             },
             PolicyConfig::CacheAware {
@@ -831,6 +836,7 @@ mod tests {
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
                 }),
+                prefill_queue_threshold: 0,
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
                 }),
@@ -854,6 +860,7 @@ mod tests {
                 prefill_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
                 }), // Requires 2+ workers
+                prefill_queue_threshold: 0,
                 decode_policy: None,
             },
             PolicyConfig::Random,
@@ -883,6 +890,7 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     bucket_adjust_interval_secs: 5,
                 }),
+                prefill_queue_threshold: 0,
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
                 }),
@@ -911,6 +919,7 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     bucket_adjust_interval_secs: 5,
                 }),
+                prefill_queue_threshold: 0,
                 decode_policy: Some(PolicyConfig::Bucket {
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
@@ -935,6 +944,7 @@ mod tests {
                 prefill_urls: vec![],
                 decode_urls: vec![],
                 prefill_policy: None,
+                prefill_queue_threshold: 0,
                 decode_policy: None,
             },
             PolicyConfig::Random,

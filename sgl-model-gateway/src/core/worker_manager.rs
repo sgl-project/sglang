@@ -81,6 +81,23 @@ impl IntoResponse for EngineMetricsResult {
     }
 }
 
+/// 带队列深度信息的worker负载数据
+pub struct WorkerLoadWithQueue {
+    pub worker: String,
+    pub worker_type: Option<String>,
+    pub load: isize,
+    /// 等待队列中的请求数，-1表示获取失败
+    pub waiting_reqs: isize,
+}
+
+/// 带队列深度信息的worker负载查询结果
+pub struct WorkerLoadsWithQueueResult {
+    pub loads: Vec<WorkerLoadWithQueue>,
+    pub total_workers: usize,
+    pub successful: usize,
+    pub failed: usize,
+}
+
 pub struct WorkerManager;
 
 impl WorkerManager {
@@ -229,6 +246,88 @@ impl WorkerManager {
         }
     }
 
+    /// 从 /get_load 端点同时解析token负载和等待队列请求数
+    async fn parse_load_response_with_queue(
+        client: &reqwest::Client,
+        url: &str,
+        api_key: Option<&str>,
+    ) -> (isize, isize) {
+        let load_url = format!("{}/get_load", url);
+        let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
+        if let Some(key) = api_key {
+            req = req.bearer_auth(key);
+        }
+
+        match req.send().await {
+            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+                Ok(json) if json.is_array() => {
+                    let arr = json.as_array().unwrap();
+                    let load = arr
+                        .iter()
+                        .filter_map(|e| e.get("num_tokens").and_then(|v| v.as_i64()))
+                        .sum::<i64>() as isize;
+                    let waiting = arr
+                        .iter()
+                        .filter_map(|e| e.get("num_waiting_reqs").and_then(|v| v.as_i64()))
+                        .sum::<i64>() as isize;
+                    (load, waiting)
+                }
+                _ => (-1, -1),
+            },
+            _ => (-1, -1),
+        }
+    }
+
+    /// 获取所有worker负载，包含队列深度信息
+    pub async fn get_all_worker_loads_with_queue(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+    ) -> WorkerLoadsWithQueueResult {
+        let workers = worker_registry.get_all();
+        let total_workers = workers.len();
+
+        let futures: Vec<_> = workers
+            .iter()
+            .map(|worker| {
+                let url = worker.url().to_string();
+                let api_key = worker.api_key().clone();
+                let worker_type = match worker.worker_type() {
+                    WorkerType::Regular => None,
+                    WorkerType::Prefill { .. } => Some("prefill".to_string()),
+                    WorkerType::Decode => Some("decode".to_string()),
+                };
+                let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
+                let client = client.clone();
+
+                async move {
+                    let (load, waiting_reqs) = if is_http {
+                        Self::parse_load_response_with_queue(&client, &url, api_key.as_deref())
+                            .await
+                    } else {
+                        (-1, -1)
+                    };
+                    WorkerLoadWithQueue {
+                        worker: url,
+                        worker_type,
+                        load,
+                        waiting_reqs,
+                    }
+                }
+            })
+            .collect();
+
+        let loads = future::join_all(futures).await;
+        let successful = loads.iter().filter(|l| l.load >= 0).count();
+        let failed = loads.iter().filter(|l| l.load < 0).count();
+
+        WorkerLoadsWithQueueResult {
+            loads,
+            total_workers,
+            successful,
+            failed,
+        }
+    }
+
     pub async fn get_engine_metrics(
         worker_registry: &WorkerRegistry,
         client: &reqwest::Client,
@@ -274,6 +373,9 @@ pub struct LoadMonitor {
     interval: Duration,
     tx: watch::Sender<HashMap<String, isize>>,
     rx: watch::Receiver<HashMap<String, isize>>,
+    /// 每个worker的等待队列请求数（用于队列感知路由）
+    queue_depth_tx: watch::Sender<HashMap<String, usize>>,
+    queue_depth_rx: watch::Receiver<HashMap<String, usize>>,
     monitor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -285,6 +387,7 @@ impl LoadMonitor {
         interval_secs: u64,
     ) -> Self {
         let (tx, rx) = watch::channel(HashMap::new());
+        let (queue_depth_tx, queue_depth_rx) = watch::channel(HashMap::new());
 
         Self {
             worker_registry,
@@ -293,8 +396,15 @@ impl LoadMonitor {
             interval: Duration::from_secs(interval_secs),
             tx,
             rx,
+            queue_depth_tx,
+            queue_depth_rx,
             monitor_handle: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 订阅worker等待队列深度数据
+    pub fn subscribe_queue_depth(&self) -> watch::Receiver<HashMap<String, usize>> {
+        self.queue_depth_rx.clone()
     }
 
     pub async fn start(&self) {
@@ -314,9 +424,18 @@ impl LoadMonitor {
         let client = self.client.clone();
         let interval = self.interval;
         let tx = self.tx.clone();
+        let queue_depth_tx = self.queue_depth_tx.clone();
 
         let handle = tokio::spawn(async move {
-            Self::monitor_loop(worker_registry, policy_registry, client, interval, tx).await;
+            Self::monitor_loop(
+                worker_registry,
+                policy_registry,
+                client,
+                interval,
+                tx,
+                queue_depth_tx,
+            )
+            .await;
         });
 
         *handle_guard = Some(handle);
@@ -341,6 +460,7 @@ impl LoadMonitor {
         client: reqwest::Client,
         interval: Duration,
         tx: watch::Sender<HashMap<String, isize>>,
+        queue_depth_tx: watch::Sender<HashMap<String, usize>>,
     ) {
         let mut interval_timer = tokio::time::interval(interval);
 
@@ -349,30 +469,43 @@ impl LoadMonitor {
 
             let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
 
-            if power_of_two_policies.is_empty() {
-                debug!("No PowerOfTwo policies found, skipping load fetch");
-                continue;
-            }
-
-            let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
+            // 即使没有PowerOfTwo策略，也需要获取队列深度用于队列感知路由
+            let result =
+                WorkerManager::get_all_worker_loads_with_queue(&worker_registry, &client).await;
 
             let mut loads = HashMap::new();
-            for load_info in result.loads {
-                loads.insert(load_info.worker, load_info.load);
+            let mut queue_depths = HashMap::new();
+            for load_info in &result.loads {
+                loads.insert(load_info.worker.clone(), load_info.load);
+                if load_info.waiting_reqs >= 0 {
+                    queue_depths
+                        .insert(load_info.worker.clone(), load_info.waiting_reqs as usize);
+                }
             }
 
             if !loads.is_empty() {
-                debug!(
-                    "Fetched loads from {} workers, updating {} PowerOfTwo policies",
-                    loads.len(),
-                    power_of_two_policies.len()
-                );
-                for policy in &power_of_two_policies {
-                    policy.update_loads(&loads);
+                if !power_of_two_policies.is_empty() {
+                    debug!(
+                        "Fetched loads from {} workers, updating {} PowerOfTwo policies",
+                        loads.len(),
+                        power_of_two_policies.len()
+                    );
+                    for policy in &power_of_two_policies {
+                        policy.update_loads(&loads);
+                    }
                 }
                 let _ = tx.send(loads);
             } else {
                 warn!("No loads fetched from workers");
+            }
+
+            if !queue_depths.is_empty() {
+                debug!(
+                    "Fetched queue depths from {} workers: {:?}",
+                    queue_depths.len(),
+                    queue_depths
+                );
+                let _ = queue_depth_tx.send(queue_depths);
             }
         }
     }

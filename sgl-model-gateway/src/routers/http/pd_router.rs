@@ -52,6 +52,12 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    /// prefill节点的队列堆积阈值，超过此值则跳过该节点
+    pub prefill_queue_threshold: usize,
+    /// 轮询获取的worker队列深度数据（作为降级方案）
+    pub queue_depth_rx: Option<tokio::sync::watch::Receiver<std::collections::HashMap<String, usize>>>,
+    /// 从prefill响应头实时提取的队列深度（主要数据源，比轮询更实时）
+    pub header_queue_depths: Arc<std::sync::RwLock<std::collections::HashMap<String, usize>>>,
 }
 
 #[derive(Clone)]
@@ -158,6 +164,12 @@ impl PDRouter {
     }
 
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+        let prefill_queue_threshold = ctx.router_config.mode.get_prefill_queue_threshold();
+        let queue_depth_rx = ctx
+            .load_monitor
+            .as_ref()
+            .map(|lm| lm.subscribe_queue_depth());
+
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -165,6 +177,9 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            prefill_queue_threshold,
+            queue_depth_rx,
+            header_queue_depths: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         })
     }
 
@@ -699,6 +714,72 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
+    /// 获取worker的队列深度，优先使用响应头实时数据，降级到轮询数据
+    fn get_worker_queue_depth(&self, worker_url: &str) -> usize {
+        // 优先级1: 响应头实时数据（延迟 < 1个请求周期）
+        if let Ok(map) = self.header_queue_depths.read() {
+            if let Some(&depth) = map.get(worker_url) {
+                return depth;
+            }
+        }
+
+        // 优先级2: LoadMonitor轮询数据（延迟 = 轮询周期）
+        if let Some(rx) = &self.queue_depth_rx {
+            let polled = rx.borrow();
+            if let Some(&depth) = polled.get(worker_url) {
+                return depth;
+            }
+        }
+
+        0
+    }
+
+    /// 根据队列深度过滤掉超过阈值的prefill节点
+    fn filter_prefill_by_queue_depth(
+        &self,
+        workers: Vec<Arc<dyn Worker>>,
+    ) -> Vec<Arc<dyn Worker>> {
+        if self.prefill_queue_threshold == 0 {
+            return workers;
+        }
+
+        let filtered: Vec<Arc<dyn Worker>> = workers
+            .iter()
+            .filter(|w| {
+                let depth = self.get_worker_queue_depth(w.url());
+                let pass = depth < self.prefill_queue_threshold;
+                if !pass {
+                    warn!(
+                        "Prefill worker {} skipped: queue depth {} >= threshold {}",
+                        w.url(),
+                        depth,
+                        self.prefill_queue_threshold
+                    );
+                }
+                pass
+            })
+            .cloned()
+            .collect();
+
+        if filtered.is_empty() {
+            warn!(
+                "All prefill workers exceed queue threshold {}, falling back to all {} workers",
+                self.prefill_queue_threshold,
+                workers.len()
+            );
+            return workers;
+        }
+
+        debug!(
+            "Queue-aware filtering: {}/{} prefill workers within threshold {}",
+            filtered.len(),
+            workers.len(),
+            self.prefill_queue_threshold
+        );
+
+        filtered
+    }
+
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
@@ -722,6 +803,9 @@ impl PDRouter {
         } else {
             self.worker_registry.get_prefill_workers()
         };
+
+        // 根据队列深度过滤prefill节点
+        let prefill_workers = self.filter_prefill_by_queue_depth(prefill_workers);
 
         let decode_workers = if let Some(model) = effective_model_id {
             self.worker_registry
@@ -950,7 +1034,6 @@ impl PDRouter {
         prefill_url: &str,
         return_logprob: bool,
     ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
-        // Check prefill result first - it's critical for disaggregated mode
         let prefill_response = match prefill_result {
             Ok(response) => response,
             Err(e) => {
@@ -960,7 +1043,6 @@ impl PDRouter {
                     e
                 );
 
-                // Return error immediately - don't wait for decode to timeout
                 return Err(error::bad_gateway(
                     "prefill_server_error",
                     format!(
@@ -970,6 +1052,21 @@ impl PDRouter {
                 ));
             }
         };
+
+        // 从响应头提取队列深度，实时更新（比轮询延迟低得多）
+        if let Some(depth_val) = prefill_response.headers().get("x-sglang-queue-depth") {
+            if let Ok(depth_str) = depth_val.to_str() {
+                if let Ok(depth) = depth_str.parse::<usize>() {
+                    if let Ok(mut map) = self.header_queue_depths.write() {
+                        map.insert(prefill_url.to_string(), depth);
+                    }
+                    debug!(
+                        "Updated queue depth from response header: {} = {}",
+                        prefill_url, depth
+                    );
+                }
+            }
+        }
 
         let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1427,6 +1524,9 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            prefill_queue_threshold: 0,
+            queue_depth_rx: None,
+            header_queue_depths: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 

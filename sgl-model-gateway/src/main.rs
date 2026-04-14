@@ -210,6 +210,12 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
+    /// Queue depth threshold for prefill nodes. When a prefill node's waiting
+    /// queue exceeds this value, it will be skipped in favor of other nodes.
+    /// Set to 0 to disable queue-aware routing (default: 0).
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
+    prefill_queue_threshold: usize,
+
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     worker_startup_timeout_secs: u64,
@@ -878,6 +884,7 @@ impl CliArgs {
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls: self.decode.clone(),
+                prefill_queue_threshold: self.prefill_queue_threshold,
                 prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }

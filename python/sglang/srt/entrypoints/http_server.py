@@ -413,6 +413,77 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class _QueueDepthCache:
+    """Caches queue depth to avoid IPC on every request.
+
+    Refreshes at most once per `ttl_seconds` via the tokenizer_manager's
+    get_load() IPC call. Between refreshes, the middleware reads the stale
+    value (typically < 500ms old), which is good enough for routing decisions.
+    """
+
+    def __init__(self, ttl_seconds: float = 0.5):
+        self.ttl = ttl_seconds
+        self._value: int = 0
+        self._last_update: float = 0.0
+        self._lock = asyncio.Lock()
+
+    async def get(self) -> int:
+        now = time.monotonic()
+        if now - self._last_update < self.ttl:
+            return self._value
+
+        if self._lock.locked():
+            return self._value
+
+        async with self._lock:
+            if time.monotonic() - self._last_update < self.ttl:
+                return self._value
+            try:
+                state = get_global_state()
+                if state and state.tokenizer_manager:
+                    results = await state.tokenizer_manager.get_load()
+                    self._value = sum(r.num_waiting_reqs for r in results)
+            except Exception:
+                pass
+            self._last_update = time.monotonic()
+            return self._value
+
+
+_queue_depth_cache = _QueueDepthCache(ttl_seconds=0.5)
+
+
+class QueueDepthHeaderMiddleware:
+    """ASGI middleware: injects X-SGLang-Queue-Depth header into every response.
+
+    Enables sgl-model-gateway to read real-time queue depth from prefill
+    workers without extra polling, by piggybacking on normal inference
+    response headers. Uses a short-TTL cache to keep overhead near zero.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_queue_depth(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                depth = await _queue_depth_cache.get()
+                headers.append(
+                    (b"x-sglang-queue-depth", str(depth).encode())
+                )
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_queue_depth)
+
+
+app.add_middleware(QueueDepthHeaderMiddleware)
+
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 

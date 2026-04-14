@@ -159,6 +159,10 @@ pub enum RoutingMode {
         decode_urls: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
+        /// 当prefill节点的等待队列请求数超过此阈值时，跳过该节点选择其他节点。
+        /// 设为0表示禁用队列感知路由。
+        #[serde(default)]
+        prefill_queue_threshold: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
@@ -191,6 +195,17 @@ impl RoutingMode {
                 prefill_policy.as_ref().unwrap_or(main_policy)
             }
             _ => main_policy,
+        }
+    }
+
+    /// 获取prefill节点的队列堆积阈值，超过此值则跳过该节点
+    pub fn get_prefill_queue_threshold(&self) -> usize {
+        match self {
+            RoutingMode::PrefillDecode {
+                prefill_queue_threshold,
+                ..
+            } => *prefill_queue_threshold,
+            _ => 0,
         }
     }
 
@@ -672,6 +687,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
+            prefill_queue_threshold: 0,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -699,6 +715,7 @@ mod tests {
                 "http://decode2".to_string(),
                 "http://decode3".to_string(),
             ],
+            prefill_queue_threshold: 0,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -722,6 +739,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), Some(8001))],
             decode_urls: vec!["http://decode1".to_string()],
+            prefill_queue_threshold: 0,
             prefill_policy: None,
             decode_policy: None,
         };
@@ -1181,6 +1199,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
+            prefill_queue_threshold: 0,
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
@@ -1211,6 +1230,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
+            prefill_queue_threshold: 0,
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
@@ -1239,6 +1259,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
+            prefill_queue_threshold: 0,
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1263,6 +1284,7 @@ mod tests {
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
+            prefill_queue_threshold: 0,
             prefill_policy: None,
             decode_policy: None,
         };
