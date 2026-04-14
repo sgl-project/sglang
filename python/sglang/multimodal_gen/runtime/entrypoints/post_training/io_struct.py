@@ -22,6 +22,13 @@ class UpdateWeightFromTensorReqInput:
 
 
 @dataclass
+class UpdateWeightFromTensorCheckerReqInput:
+    """Request to verify live transformer weights against expected SHA-256 values."""
+
+    expected_transformer_sha256: list[dict[str, str]]
+
+
+@dataclass
 class GetWeightsChecksumReqInput:
     """Compute SHA-256 checksum of loaded module weights for verification."""
 

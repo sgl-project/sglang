@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorReqInput,
 )
@@ -101,6 +102,9 @@ class Scheduler(SchedulerPostTrainingMixin):
             ShutdownReq: self._handle_shutdown,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
+            UpdateWeightFromTensorCheckerReqInput: (
+                self._handle_update_weights_from_tensor_checker
+            ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 

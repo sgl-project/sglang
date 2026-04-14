@@ -37,6 +37,16 @@ class SchedulerPostTrainingMixin:
             error=None if success else message,
         )
 
+    def _handle_update_weights_from_tensor_checker(
+        self: Scheduler, reqs: List[Any]
+    ) -> OutputBatch:
+        req = reqs[0]
+        success, message = self.worker.update_weights_from_tensor_checker(req)
+        return OutputBatch(
+            output={"success": success, "message": message},
+            error=None if success else message,
+        )
+
     def _handle_get_weights_checksum(
         self: Scheduler, reqs: List[Any]
     ) -> OutputBatch:

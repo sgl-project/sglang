@@ -4,6 +4,7 @@ from fastapi import APIRouter, Request
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorReqInput,
 )
@@ -62,6 +63,41 @@ async def update_weights_from_tensor(request: Request):
         serialized_named_tensors=serialized_named_tensors,
         load_format=body.get("load_format"),
         target_modules=body.get("target_modules"),
+    )
+
+    try:
+        response = await async_scheduler_client.forward(req)
+    except Exception as e:
+        return orjson_response(
+            {"success": False, "message": str(e)},
+            status_code=500,
+        )
+
+    result = response.output
+    success = result.get("success", False)
+    message = result.get("message", "Unknown status")
+    return orjson_response(
+        {"success": success, "message": message},
+        status_code=200 if success else 400,
+    )
+
+
+@router.post("/update_weights_from_tensor_checker")
+async def update_weights_from_tensor_checker(request: Request):
+    """Verify live transformer weights against expected SHA-256 values."""
+    body = await request.json()
+    expected_transformer_sha256 = body.get("expected_transformer_sha256")
+    if (
+        not isinstance(expected_transformer_sha256, list)
+        or not expected_transformer_sha256
+    ):
+        return orjson_response(
+            {"success": False, "message": "expected_transformer_sha256 is required"},
+            status_code=400,
+        )
+
+    req = UpdateWeightFromTensorCheckerReqInput(
+        expected_transformer_sha256=expected_transformer_sha256,
     )
 
     try:
