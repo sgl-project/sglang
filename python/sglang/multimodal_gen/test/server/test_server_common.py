@@ -78,6 +78,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
+    extra_args = f"--model-type diffusion {extra_args}".strip()
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
@@ -122,6 +123,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     env_vars = {}
     if server_args.enable_cache_dit:
         env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
+    env_vars.update(server_args.env_vars)
 
     # start server
     wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))

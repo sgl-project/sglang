@@ -206,6 +206,7 @@ class DiffusionServerArgs:
     enable_warmup: bool = True
 
     extras: list[str] = field(default_factory=lambda: [])
+    env_vars: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.modality == "image":
@@ -357,6 +358,12 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
+MODELOPT_T2I_SMOKE_sampling_params = DiffusionSamplingParams(
+    prompt="Doraemon is eating dorayaki",
+    output_size="768x768",
+    extras={"num_inference_steps": 12},
+)
+
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
@@ -391,6 +398,13 @@ T2V_PROMPT = "A curious raccoon"
 
 T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
+)
+
+MODELOPT_T2V_SMOKE_sampling_params = DiffusionSamplingParams(
+    prompt=T2V_PROMPT,
+    output_size="640x384",
+    num_frames=17,
+    extras={"num_inference_steps": 12},
 )
 
 TI2V_sampling_params = DiffusionSamplingParams(
@@ -790,16 +804,86 @@ if not current_platform.is_hip():
         )
     )
 
-# TODO: enable on 4090/5090
-ONE_GPU_CASES_C = [
-    DiffusionTestCase(
-        "flux_2_nvfp4_t2i",
+MODELOPT_FLUX1_FP8_TRANSFORMER = "BBuf/flux1-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_FLUX2_FP8_TRANSFORMER = "BBuf/flux2-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_WAN22_FP8_TRANSFORMER = "BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
+MODELOPT_FLUX1_NVFP4_TRANSFORMER = (
+    "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
+)
+MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_WAN22_NVFP4_TRANSFORMER = (
+    "BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
+)
+
+
+def _make_modelopt_smoke_case(
+    case_id: str,
+    *,
+    model_path: str,
+    modality: str,
+    sampling_params: DiffusionSamplingParams,
+    extras: list[str],
+    env_vars: dict[str, str] | None = None,
+) -> DiffusionTestCase:
+    return DiffusionTestCase(
+        case_id,
         DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev-NVFP4",
-            modality="image",
+            model_path=model_path,
+            modality=modality,
+            enable_warmup=False,
+            extras=extras,
+            env_vars=env_vars or {},
         ),
-        T2I_sampling_params,
+        sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
     )
+
+
+ONE_GPU_CASES_C = [
+    _make_modelopt_smoke_case(
+        "flux1_modelopt_fp8_t2i",
+        model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
+        modality="image",
+        sampling_params=MODELOPT_T2I_SMOKE_sampling_params,
+        extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
+    ),
+    _make_modelopt_smoke_case(
+        "flux2_modelopt_fp8_t2i",
+        model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+        modality="image",
+        sampling_params=MODELOPT_T2I_SMOKE_sampling_params,
+        extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+    ),
+    _make_modelopt_smoke_case(
+        "wan22_modelopt_fp8_t2v",
+        model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+        modality="video",
+        sampling_params=MODELOPT_T2V_SMOKE_sampling_params,
+        extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+    ),
+    _make_modelopt_smoke_case(
+        "flux1_modelopt_nvfp4_t2i",
+        model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
+        modality="image",
+        sampling_params=MODELOPT_T2I_SMOKE_sampling_params,
+        extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
+    ),
+    _make_modelopt_smoke_case(
+        "flux2_modelopt_nvfp4_t2i",
+        model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+        modality="image",
+        sampling_params=MODELOPT_T2I_SMOKE_sampling_params,
+        extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
+    ),
+    _make_modelopt_smoke_case(
+        "wan22_modelopt_nvfp4_t2v",
+        model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+        modality="video",
+        sampling_params=MODELOPT_T2V_SMOKE_sampling_params,
+        extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
+        env_vars={"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"},
+    ),
 ]
 
 TWO_GPU_CASES_A = [
