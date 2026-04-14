@@ -118,6 +118,7 @@ QUANTIZATION_CHOICES = [
     "mxfp4",
     "auto-round",
     "compressed-tensors",  # for Ktransformers
+    "kivi",
     "modelslim",  # for NPU
     "quark_int4fp8_moe",
 ]
