@@ -80,20 +80,31 @@ async def update_weights_from_tensor(request: Request):
 
 @router.post("/update_weights_from_tensor_checker")
 async def update_weights_from_tensor_checker(request: Request):
-    """Verify live transformer weights against expected SHA-256 values."""
+    """Verify live module weights against expected SHA-256 values."""
     body = await request.json()
-    expected_transformer_sha256 = body.get("expected_transformer_sha256")
+    target_module = body.get("target_module")
+    if not target_module:
+        return orjson_response(
+            {"success": False, "message": "target_module is required"},
+            status_code=400,
+        )
+
+    expected_named_tensors_sha256 = body.get("expected_named_tensors_sha256")
     if (
-        not isinstance(expected_transformer_sha256, list)
-        or not expected_transformer_sha256
+        not isinstance(expected_named_tensors_sha256, list)
+        or not expected_named_tensors_sha256
     ):
         return orjson_response(
-            {"success": False, "message": "expected_transformer_sha256 is required"},
+            {
+                "success": False,
+                "message": "expected_named_tensors_sha256 is required",
+            },
             status_code=400,
         )
 
     req = UpdateWeightFromTensorCheckerReqInput(
-        expected_transformer_sha256=expected_transformer_sha256,
+        target_module=target_module,
+        expected_named_tensors_sha256=expected_named_tensors_sha256,
     )
 
     try:

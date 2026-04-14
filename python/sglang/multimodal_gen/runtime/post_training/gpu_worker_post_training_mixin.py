@@ -79,16 +79,17 @@ class GPUWorkerPostTrainingMixin:
         if not self.pipeline:
             return False, "Pipeline is not initialized"
 
-        expected_transformer_sha256, error = self._select_rank_scoped_payload(
-            payloads=req.expected_transformer_sha256,
-            field_name="expected_transformer_sha256",
+        expected_named_tensors_sha256, error = self._select_rank_scoped_payload(
+            payloads=req.expected_named_tensors_sha256,
+            field_name="expected_named_tensors_sha256",
         )
         if error is not None:
             return False, error
 
         checker = UpdateWeightFromTensorChecker(self.pipeline)
         return checker.verify_across_tp(
-            expected_transformer_sha256=expected_transformer_sha256,
+            target_module=req.target_module,
+            expected_named_tensors_sha256=expected_named_tensors_sha256,
             tp_rank=get_tp_rank(),
             tp_world_size=get_tp_world_size(),
             tp_cpu_group=self.tp_cpu_group,
