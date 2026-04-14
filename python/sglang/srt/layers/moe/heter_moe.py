@@ -496,6 +496,14 @@ class HeterFusedMoE(nn.Module):
                     group_ids,
                 )
             elif num_bits == 4:
+                # expert_map enables is_ep=True inside fused_marlin_moe,
+                # which makes the Marlin GEMM kernel skip expert_id=-1
+                # blocks (marlin_template.h:380) and zeros cache3 for
+                # unwritten slots.  The tensor itself is never forwarded
+                # to the CUDA kernel — only its existence matters.
+                _dummy_expert_map = torch.empty(
+                    0, dtype=torch.int32, device=hidden_states.device
+                )
                 group_out = fused_marlin_moe(
                     hidden_states=hidden_states,
                     w1=self.int4_w13_qweight,
@@ -505,6 +513,7 @@ class HeterFusedMoE(nn.Module):
                     gating_output=router_logits,
                     topk_weights=group_weights,
                     topk_ids=group_ids,
+                    expert_map=_dummy_expert_map,
                     num_bits=4,
                     is_k_full=self._int4_is_k_full,
                     inplace=False,
