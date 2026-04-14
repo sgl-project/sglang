@@ -13,6 +13,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    MiMoAudioMMId,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -171,7 +172,6 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             logprob_pt = 0
-
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
@@ -181,6 +181,12 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
+                    # 适配 mimoaudio next_token_id 多 group 多 channel 模式
+                    def split_list(lst, n):
+                        return [lst[i : i + n] for i in range(0, len(lst), n)]
+
+                    if len(next_token_id) > 1:
+                        next_token_id = MiMoAudioMMId(split_list(next_token_id, 9))
                     req.output_ids.append(next_token_id)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
@@ -446,6 +452,13 @@ class SchedulerOutputProcessorMixin:
             # Non-spec and V2: full post-processing
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
+
+            # 适配 mimoaudio next_token_id 多 group 多 channel 模式
+            def split_list(lst, n):
+                return [lst[i : i + n] for i in range(0, len(lst), n)]
+
+            if len(next_token_id) > 1:
+                next_token_id = MiMoAudioMMId(split_list(next_token_id, 9))
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             else:

@@ -49,6 +49,8 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
+    output_ids: Optional[torch.Tensor] = None
+
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,

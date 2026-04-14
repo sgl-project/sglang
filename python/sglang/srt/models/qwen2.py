@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -101,9 +102,48 @@ class Qwen2MLP(nn.Module):
         return x
 
 
+def _compute_default_rope_parameters(
+    config: Optional[PretrainedConfig] = None,
+    device: Optional["torch.device"] = None,
+    seq_len: Optional[int] = None,
+    **rope_kwargs,
+) -> Tuple["torch.Tensor", float]:
+    if config is not None and len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
+            f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
+        )
+    if len(rope_kwargs) > 0:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    elif config is not None:
+        base = config.rope_theta
+        partial_rotary_factor = (
+            config.partial_rotary_factor
+            if hasattr(config, "partial_rotary_factor")
+            else 1.0
+        )
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
+    )
+    return inv_freq, attention_factor
+
+
+ROPE_INIT_FUNCTIONS = {"default": _compute_default_rope_parameters}
+
+
 class Qwen2Attention(nn.Module):
     def __init__(
         self,
+        config,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -117,6 +157,7 @@ class Qwen2Attention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -158,7 +199,6 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -185,8 +225,11 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
         q, k = self.rotary_emb(positions, q, k)
+
         attn_output = self.attn(q, k, v, forward_batch)
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -201,6 +244,7 @@ class Qwen2DecoderLayer(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
@@ -209,6 +253,7 @@ class Qwen2DecoderLayer(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.self_attn = Qwen2Attention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -246,12 +291,12 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
