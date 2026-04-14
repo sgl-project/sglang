@@ -1619,8 +1619,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
-    _BATCH_NOTIFY_SIZE = 16
-
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
@@ -1628,7 +1626,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             if isinstance(
                 recv_obj,
-                (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput, BatchMultimodalOutput),
+                (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
             ):
                 await self._handle_batch_output(recv_obj)
             else:
@@ -1837,9 +1835,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
-                pending_notify[id(state)] = state
+                pending_notify[rid] = state
 
-                if len(pending_notify) >= self._BATCH_NOTIFY_SIZE:
+                if len(pending_notify) >= self.server_args.batch_notify_size:
                     for s in pending_notify.values():
                         s.event.set()
                     pending_notify = {}

@@ -9,6 +9,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
+import msgspec
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -42,10 +43,36 @@ _SSE_DATA = "data: "
 _SSE_NL = "\n\n"
 
 
-def _pydantic_default(obj):
+class _StreamDelta(msgspec.Struct, omit_defaults=True):
+    role: Optional[str] = None
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+
+
+class _StreamChoice(msgspec.Struct):
+    index: int
+    delta: _StreamDelta
+    logprobs: Optional[Any] = None
+    finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
+
+
+class _StreamChunk(msgspec.Struct, omit_defaults=True):
+    id: str
+    object: str
+    created: int
+    model: str
+    choices: List[_StreamChoice]
+    usage: Optional[Any] = None
+
+
+def _enc_hook(obj: Any) -> Any:
     if hasattr(obj, "model_dump"):
         return obj.model_dump()
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+    raise TypeError(f"Unsupported type: {type(obj)}")
+
+
+_stream_encoder = msgspec.json.Encoder(enc_hook=_enc_hook)
 
 
 def _fast_sse_content(
@@ -59,27 +86,19 @@ def _fast_sse_content(
     logprobs=None,
     usage=None,
 ) -> str:
-    delta = {}
-    if content is not None:
-        delta["content"] = content
-    if reasoning_content is not None:
-        delta["reasoning_content"] = reasoning_content
-    choice = {
-        "index": index,
-        "delta": delta,
-        "logprobs": logprobs,
-        "finish_reason": finish_reason,
-    }
-    resp = {
-        "id": chunk_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [choice],
-    }
-    if usage is not None:
-        resp["usage"] = usage
-    return _SSE_DATA + orjson.dumps(resp, default=_pydantic_default).decode() + _SSE_NL
+    delta = _StreamDelta(content=content, reasoning_content=reasoning_content)
+    choice = _StreamChoice(
+        index=index, delta=delta, logprobs=logprobs, finish_reason=finish_reason
+    )
+    chunk = _StreamChunk(
+        id=chunk_id,
+        object="chat.completion.chunk",
+        created=created,
+        model=model,
+        choices=[choice],
+        usage=usage,
+    )
+    return _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
 from sglang.srt.entrypoints.openai.utils import (
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
@@ -764,15 +783,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    delta = {"role": "assistant", "content": ""}
-                    resp = {
-                        "id": content["meta_info"]["id"],
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": request.model,
-                        "choices": [{"index": index, "delta": delta, "finish_reason": None, "logprobs": None}],
-                    }
-                    yield _SSE_DATA + orjson.dumps(resp).decode() + _SSE_NL
+                    chunk = _StreamChunk(
+                        id=content["meta_info"]["id"],
+                        object="chat.completion.chunk",
+                        created=int(time.time()),
+                        model=request.model,
+                        choices=[_StreamChoice(
+                            index=index,
+                            delta=_StreamDelta(role="assistant", content=""),
+                        )],
+                    )
+                    yield _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
                     stream_started = True
 
                 stream_buffer = stream_buffers.get(index, "")
@@ -864,22 +885,19 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
-                fr_choice = {
-                    "index": idx,
-                    "delta": {},
-                    "finish_reason": final_finish_reason,
-                    "logprobs": None,
-                }
-                if matched_stop is not None:
-                    fr_choice["matched_stop"] = matched_stop
-                fr_resp = {
-                    "id": content["meta_info"]["id"],
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": request.model,
-                    "choices": [fr_choice],
-                }
-                yield _SSE_DATA + orjson.dumps(fr_resp).decode() + _SSE_NL
+                chunk = _StreamChunk(
+                    id=content["meta_info"]["id"],
+                    object="chat.completion.chunk",
+                    created=int(time.time()),
+                    model=request.model,
+                    choices=[_StreamChoice(
+                        index=idx,
+                        delta=_StreamDelta(),
+                        finish_reason=final_finish_reason,
+                        matched_stop=matched_stop,
+                    )],
+                )
+                yield _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
 
             # Send hidden states if requested
             if request.return_hidden_states and hidden_states:
