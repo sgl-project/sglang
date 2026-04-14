@@ -186,26 +186,13 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         if quant_name != "modelopt_fp8":
             return
 
-        disabled_args: list[str] = []
-
         if server_args.dit_cpu_offload:
             server_args.dit_cpu_offload = False
-            disabled_args.append("dit_cpu_offload")
-
-        if server_args.dit_layerwise_offload:
-            server_args.dit_layerwise_offload = False
-            disabled_args.append("dit_layerwise_offload")
-
-        if not disabled_args:
-            return
-
-        logger.warning(
-            "ModelOpt FP8 diffusion checkpoints currently require the transformer "
-            "FP8 weights to stay GPU-resident in their column-major layout; "
-            "disabling %s for this run. Text encoder / VAE offload settings are "
-            "left unchanged.",
-            ", ".join(disabled_args),
-        )
+            logger.warning(
+                "ModelOpt FP8 diffusion checkpoints currently keep dit_cpu_offload "
+                "disabled. Layerwise DiT offload stays enabled because the runtime "
+                "now preserves the restored FP8 tensor strides.",
+            )
 
     def prepare(self) -> None:
         _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(
@@ -366,6 +353,20 @@ def _resolve_quant_config_from_transformer_override(
     transformer_weights_path: str,
 ) -> Optional[QuantizationConfig]:
     """Resolve quant config from an override transformer repo or directory."""
+    expanded_path = os.path.expanduser(transformer_weights_path)
+    if os.path.isfile(expanded_path):
+        return None
+
+    # A single local safetensors file does not carry a directory-level config.json.
+    # Let downstream metadata probing handle it instead of misrouting it through HF.
+    if expanded_path.endswith(".safetensors") and (
+        os.path.isabs(expanded_path)
+        or expanded_path.startswith(".")
+        or os.sep in expanded_path
+        or (os.path.altsep and os.path.altsep in expanded_path)
+    ):
+        return None
+
     override_quantized_path = maybe_download_model(transformer_weights_path)
     if not os.path.isdir(override_quantized_path):
         return None
