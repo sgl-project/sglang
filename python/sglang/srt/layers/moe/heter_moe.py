@@ -71,14 +71,28 @@ class HeterFusedMoE(nn.Module):
         heter_config: Dict[str, Any],
         dtype: torch.dtype = torch.bfloat16,
         device: Optional[torch.device] = None,
+        # EP support: num_experts is the LOCAL count when ep_size > 1.
+        ep_size: int = 1,
+        ep_rank: int = 0,
+        num_global_experts: Optional[int] = None,
+        reduce_results: bool = False,
+        moe_tp_size: int = 1,
     ):
         super().__init__()
-        self.num_experts = num_experts
+        self.num_experts = num_experts  # local expert count
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.top_k = top_k
         self.dtype = dtype
         self.device = device or torch.device("cuda")
+
+        # EP state
+        self.ep_size = ep_size
+        self.ep_rank = ep_rank
+        self.num_global_experts = num_global_experts or num_experts
+        self.reduce_results = reduce_results
+        self.moe_tp_size = moe_tp_size
+        self._local_expert_mapping: Optional[torch.Tensor] = None
 
         self.group_cfgs = heter_config["groups"]
         self.num_groups = len(self.group_cfgs)
@@ -148,13 +162,20 @@ class HeterFusedMoE(nn.Module):
 
         Transfers BF16 expert weights from the FusedMoE. INT4 weights
         are loaded separately via load_int4_weights().
+        Captures EP state so the layer can remap global expert IDs.
         """
-        E = fused_moe.w13_weight.shape[0]
+        E = fused_moe.w13_weight.shape[0]  # num_local_experts with EP
         # w13_weight: [E, 2*I_part, H], w2_weight: [E, H, I_part]
         I_part = fused_moe.w2_weight.shape[2]
         H = fused_moe.w13_weight.shape[2]
         device = fused_moe.w13_weight.device
         dtype = fused_moe.w13_weight.dtype
+
+        ep_size = getattr(fused_moe, "moe_ep_size", 1)
+        ep_rank = getattr(fused_moe, "moe_ep_rank", 0)
+        num_global_experts = getattr(fused_moe, "num_experts", E)
+        reduce_results = getattr(fused_moe, "reduce_results", False)
+        moe_tp_size = getattr(fused_moe, "moe_tp_size", 1)
 
         instance = cls(
             num_experts=E,
@@ -164,6 +185,11 @@ class HeterFusedMoE(nn.Module):
             heter_config=heter_config,
             dtype=dtype,
             device=device,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            num_global_experts=num_global_experts,
+            reduce_results=reduce_results,
+            moe_tp_size=moe_tp_size,
         )
 
         instance.w13_weight = nn.Parameter(
@@ -305,7 +331,8 @@ class HeterFusedMoE(nn.Module):
         """Load INT4 expert weights from a GPTQ checkpoint into our params.
 
         Reads per-expert GPTQ tensors (qweight, scales, qzeros, g_idx)
-        and stacks them into [E, ...] format.
+        and stacks them into [E, ...] format. With EP, only loads experts
+        assigned to this rank (global ID → local ID mapping).
         """
         from safetensors import safe_open
 
@@ -339,19 +366,24 @@ class HeterFusedMoE(nn.Module):
                     if not match:
                         continue
 
-                    expert_id = int(match.group(1))
+                    global_expert_id = int(match.group(1))
                     proj = match.group(2)
                     attr = match.group(3)
 
-                    if expert_id >= E:
+                    # EP: map global expert ID to local; skip non-local experts.
+                    local_expert_id = self._map_global_to_local_expert_id(
+                        global_expert_id
+                    )
+                    if local_expert_id < 0 or local_expert_id >= E:
                         continue
 
                     tensor = f.get_tensor(key)
 
-                    self._fill_int4_param(expert_id, proj, attr, tensor)
+                    self._fill_int4_param(local_expert_id, proj, attr, tensor)
 
         logger.info(
             f"Loaded INT4 expert weights for layer {layer_id} from {checkpoint_path}"
+            f" (ep_rank={self.ep_rank}/{self.ep_size}, local_experts={E})"
         )
 
     def _fill_int4_param(
@@ -467,6 +499,36 @@ class HeterFusedMoE(nn.Module):
             f"w2={list(self.int4_w2_qweight.shape)}"
         )
 
+    def _get_local_expert_mapping(self) -> Optional[torch.Tensor]:
+        """Build mapping from global expert IDs to local IDs (lazy, cached).
+
+        Returns None when ep_size == 1 (no remapping needed).
+        Non-local experts map to -1.
+        """
+        if self.ep_size <= 1:
+            return None
+        if self._local_expert_mapping is None:
+            mapping = torch.full(
+                (self.num_global_experts,), -1,
+                dtype=torch.int32, device=self.device,
+            )
+            start = self.ep_rank * self.num_experts
+            end = start + self.num_experts
+            mapping[start:end] = torch.arange(
+                self.num_experts, dtype=torch.int32, device=self.device,
+            )
+            self._local_expert_mapping = mapping
+        return self._local_expert_mapping
+
+    def _map_global_to_local_expert_id(self, global_id: int) -> int:
+        """Map a single global expert ID to local (for weight loading)."""
+        if self.ep_size <= 1:
+            return global_id
+        start = self.ep_rank * self.num_experts
+        if start <= global_id < start + self.num_experts:
+            return global_id - start
+        return -1
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -476,9 +538,16 @@ class HeterFusedMoE(nn.Module):
         topk_ids = topk_output.topk_ids
         router_logits = topk_output.router_logits
 
+        # EP: remap global expert IDs → local; non-local experts → -1.
+        mapping = self._get_local_expert_mapping()
+        if mapping is not None:
+            topk_ids = mapping[topk_ids]
+            non_local = topk_ids < 0
+            topk_weights = topk_weights.clone()
+            topk_weights[non_local] = 0.0
+
         # Sentinel = -1: Triton (BF16/INT8) fully skips expert ID -1.
         group_dispatches = self.policy.dispatch(topk_ids, topk_weights, sentinel=-1)
-        # print(group_dispatches)
 
         output = None
 
@@ -538,7 +607,17 @@ class HeterFusedMoE(nn.Module):
             else:
                 output.add_(group_out)
 
-        return output if output is not None else torch.zeros_like(hidden_states)
+        if output is None:
+            output = torch.zeros_like(hidden_states)
+
+        # EP: all-reduce across EP + MoE-TP ranks.
+        if self.reduce_results and (self.moe_tp_size > 1 or self.ep_size > 1):
+            from sglang.srt.distributed.communication_op import (
+                tensor_model_parallel_all_reduce,
+            )
+            output = tensor_model_parallel_all_reduce(output)
+
+        return output
 
 
 def apply_heter_precision(
