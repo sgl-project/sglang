@@ -90,7 +90,7 @@ class LoRAPipeline(ComposedPipelineBase):
         # Initialize from server_args
         self.device = get_local_torch_device()
         self.exclude_lora_layers = (
-            self.server_args.pipeline_config.dit_config.arch_config.exclude_lora_layers
+            self.server_args.pipeline_config.dit_config.exclude_lora_layers
         )
         self.lora_target_modules = self.server_args.lora_target_modules
         self.lora_path = self.server_args.lora_path

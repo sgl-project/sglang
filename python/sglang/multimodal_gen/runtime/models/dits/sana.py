@@ -247,7 +247,7 @@ class SanaTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _compile_conditions = [
         lambda n, m: isinstance(m, SanaTransformerBlock),
     ]
-    param_names_mapping = SanaConfig().arch_config.param_names_mapping
+    param_names_mapping = SanaConfig().param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(self, config: SanaConfig, hf_config=None, **kwargs):

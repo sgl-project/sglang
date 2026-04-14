@@ -411,7 +411,7 @@ def _resolve_quant_config(
             return quant_config
 
     param_names_mapping_dict = (
-        server_args.pipeline_config.dit_config.arch_config.param_names_mapping
+        server_args.pipeline_config.dit_config.param_names_mapping
     )
     quant_config = build_nvfp4_config_from_safetensors_list(
         safetensors_list, param_names_mapping_dict

@@ -273,9 +273,9 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _no_split_modules = ["ErnieImageSharedAdaLNBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
 
-    _fsdp_shard_conditions = ErnieImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = ErnieImageDitConfig()._fsdp_shard_conditions
     _compile_conditions = []
-    param_names_mapping = ErnieImageDitConfig().arch_config.param_names_mapping
+    param_names_mapping = ErnieImageDitConfig().param_names_mapping
     reverse_param_names_mapping = {}
 
     def __init__(

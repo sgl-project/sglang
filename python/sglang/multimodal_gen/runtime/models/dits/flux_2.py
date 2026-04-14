@@ -858,7 +858,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     """
 
-    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+    param_names_mapping = FluxConfig().param_names_mapping
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
     # FLUX.2 stays closer to the official diffusers output with Torch SDPA.
     # The generic FA path still produces a measurable image-level drift here.

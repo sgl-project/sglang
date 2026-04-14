@@ -41,12 +41,12 @@ class FluxVAEConfig(VAEConfig):
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
 
-    def __post_init__(self):
+    def refresh_model_config(self):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         ) * 2
 
-    def post_init(self):
+        # Calculate vae_scale_factor: prefer block_out_channels, fallback to dim_mult or scale_factor_spatial
         # Calculate vae_scale_factor: prefer block_out_channels, fallback to dim_mult or scale_factor_spatial
         if (
             hasattr(self.arch_config, "block_out_channels")

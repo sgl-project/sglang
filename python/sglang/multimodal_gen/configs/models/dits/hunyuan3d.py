@@ -30,10 +30,10 @@ class Hunyuan3DDiTArchConfig(DiTArchConfig):
     guidance_embed: bool = False
     time_factor: float = 1000.0
 
-    def __post_init__(self) -> None:
+    def refresh_derived_fields(self) -> None:
         if self.num_channels_latents == 0:
             self.num_channels_latents = self.in_channels
-        super().__post_init__()
+        super().refresh_derived_fields()
 
 
 @dataclass

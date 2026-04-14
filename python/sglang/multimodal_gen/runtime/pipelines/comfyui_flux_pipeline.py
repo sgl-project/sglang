@@ -431,8 +431,8 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
         dit_config.arch_config.guidance_embeds = True
         logger.info("Set guidance_embeds=True for ComfyUI Flux model")
 
-        if dit_config.arch_config.param_names_mapping is None:
-            dit_config.arch_config.param_names_mapping = {}
+        if dit_config.param_names_mapping is None:
+            dit_config.param_names_mapping = {}
 
         # ComfyUI Flux uses different parameter names than SGLang Flux
         # Key differences:
@@ -589,10 +589,10 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
 
         # Merge ComfyUI mappings with existing mappings (ComfyUI mappings take precedence)
         updated_mapping = {
-            **dit_config.arch_config.param_names_mapping,
+            **dit_config.param_names_mapping,
             **comfyui_flux_mappings,
         }
-        dit_config.arch_config.param_names_mapping = updated_mapping
+        dit_config.param_names_mapping = updated_mapping
         logger.info(
             "Added ComfyUI weight name mappings for Flux model. "
             f"Total mappings: {len(updated_mapping)}"

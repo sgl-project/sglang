@@ -52,22 +52,20 @@ class QwenImageArchConfig(TextEncoderArchConfig):
     image_token_id: int = 151655
     video_token_id: int = 151656
 
+
+@dataclass
+class Qwen2_5VLConfig(TextEncoderConfig):
+    arch_config: QwenImageArchConfig = field(default_factory=QwenImageArchConfig)
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
-            # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),  # type: ignore
-            (".gate_up_proj", ".up_proj", 1),  # type: ignore
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
     )
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
     )
-
-
-@dataclass
-class Qwen2_5VLConfig(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(default_factory=QwenImageArchConfig)
     # prefix: str = "qwen_image"

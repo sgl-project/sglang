@@ -22,7 +22,7 @@ class VAEArchConfig(ArchConfig):
 
 
 @dataclass
-class VAEConfig(ModelConfig):
+class VAEConfig(ModelConfig[VAEArchConfig]):
     arch_config: VAEArchConfig = field(default_factory=VAEArchConfig)
 
     # sglang-diffusion VAE-specific parameters
@@ -42,13 +42,10 @@ class VAEConfig(ModelConfig):
     use_parallel_tiling: bool = True
     use_temporal_scaling_frames: bool = True
 
-    def __post_init__(self):
+    def refresh_model_config(self):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         )
-
-    def post_init(self):
-        pass
 
     @staticmethod
     def add_cli_args(parser: Any, prefix: str = "vae-config") -> Any:

@@ -62,7 +62,7 @@ class WanVAEArchConfig(VAEArchConfig):
     scale_factor_spatial: int = 8
     clip_output: bool = True
 
-    def __post_init__(self):
+    def refresh_derived_fields(self):
         self.scaling_factor: torch.tensor = 1.0 / torch.tensor(self.latents_std).view(
             1, self.z_dim, 1, 1, 1
         )
@@ -85,7 +85,7 @@ class WanVAEConfig(VAEConfig):
     use_parallel_encode: bool = True
     use_parallel_decode: bool = True
 
-    def __post_init__(self):
+    def refresh_model_config(self):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         ) * 2

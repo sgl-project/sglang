@@ -35,8 +35,8 @@ class QwenImageArchConfig(DiTArchConfig):
         }
     )
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         self.out_channels = self.out_channels or self.in_channels
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
         self.num_channels_latents = self.out_channels
@@ -49,14 +49,14 @@ class QwenImageEditPlus_2511_ArchConfig(QwenImageArchConfig):
 
 @dataclass
 class QwenImageDitConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(default_factory=QwenImageArchConfig)
+    arch_config: QwenImageArchConfig = field(default_factory=QwenImageArchConfig)
 
     prefix: str = "qwenimage"
 
 
 @dataclass
 class QwenImageEditPlus_2511_DitConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(
+    arch_config: QwenImageEditPlus_2511_ArchConfig = field(
         default_factory=QwenImageEditPlus_2511_ArchConfig
     )
 

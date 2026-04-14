@@ -42,12 +42,11 @@ class ErnieImageVAEConfig(VAEConfig):
         # 8 spatial compression (VAE) * 2 patch = 16 total, consistent with pipeline config
         return self.arch_config.scale_factor_spatial
 
-    def __post_init__(self):
+    def refresh_model_config(self):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         ) * 2
 
-    def post_init(self):
         if self.arch_config.dim_mult:
             self.arch_config.vae_scale_factor = 2 ** (
                 len(self.arch_config.dim_mult) - 1

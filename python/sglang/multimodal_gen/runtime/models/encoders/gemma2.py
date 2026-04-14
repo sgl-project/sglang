@@ -378,9 +378,7 @@ class Gemma2Model(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        stacked_params_mapping = getattr(
-            self.config.arch_config, "stacked_params_mapping", None
-        )
+        stacked_params_mapping = getattr(self.config, "stacked_params_mapping", None)
         if stacked_params_mapping is None:
             stacked_params_mapping = [
                 (".qkv_proj", ".q_proj", "q"),

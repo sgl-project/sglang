@@ -4,7 +4,7 @@
 import json
 import os
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 from typing import Any
 
@@ -802,20 +802,11 @@ class PipelineConfig:
         del_keys = []
         for key, value in output_dict.items():
             if isinstance(value, ModelConfig):
-                model_dict = asdict(value)
-                # Model Arch Config should be hidden away from the users
-                model_dict.pop("arch_config")
-                output_dict[key] = model_dict
+                output_dict[key] = value.to_user_dict()
             elif isinstance(value, tuple) and all(
                 isinstance(v, ModelConfig) for v in value
             ):
-                model_dicts = []
-                for v in value:
-                    model_dict = asdict(v)
-                    # Model Arch Config should be hidden away from the users
-                    model_dict.pop("arch_config")
-                    model_dicts.append(model_dict)
-                output_dict[key] = model_dicts
+                output_dict[key] = [v.to_user_dict() for v in value]
             elif isinstance(value, tuple) and all(callable(f) for f in value):
                 # Skip dumping functions
                 del_keys.append(key)

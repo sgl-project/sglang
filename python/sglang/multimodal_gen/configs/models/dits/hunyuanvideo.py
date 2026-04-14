@@ -171,14 +171,14 @@ class HunyuanVideoArchConfig(DiTArchConfig):
         default_factory=lambda: ["img_in", "txt_in", "time_in", "vector_in"]
     )
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         self.hidden_size: int = self.attention_head_dim * self.num_attention_heads
         self.num_channels_latents: int = self.in_channels
 
 
 @dataclass
 class HunyuanVideoConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(default_factory=HunyuanVideoArchConfig)
+    arch_config: HunyuanVideoArchConfig = field(default_factory=HunyuanVideoArchConfig)
 
     prefix: str = "Hunyuan"

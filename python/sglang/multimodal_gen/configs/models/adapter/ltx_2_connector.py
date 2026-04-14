@@ -31,7 +31,8 @@ class LTX2ConnectorArchConfig(AdapterArchConfig):
 
 @dataclass
 class LTX2ConnectorConfig(AdapterConfig):
-
-    arch_config: AdapterArchConfig = field(default_factory=LTX2ConnectorArchConfig)
+    arch_config: LTX2ConnectorArchConfig = field(
+        default_factory=LTX2ConnectorArchConfig
+    )
 
     prefix: str = "LTX2"

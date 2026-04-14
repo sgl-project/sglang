@@ -82,9 +82,6 @@ class VAELoader(ComponentLoader):
         vae_config = getattr(server_args.pipeline_config, pipeline_vae_config_attr)
         vae_precision = getattr(server_args.pipeline_config, pipeline_vae_precision)
         vae_config.update_model_arch(config)
-        if hasattr(vae_config, "post_init"):
-            # NOTE: some post init logics are only available after updated with config
-            vae_config.post_init()
 
         should_offload = self.should_offload(server_args)
         target_device = self.target_device(should_offload)

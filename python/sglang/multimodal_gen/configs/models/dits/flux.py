@@ -101,8 +101,8 @@ class FluxArchConfig(DiTArchConfig):
         }
     )
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         self.out_channels = self.out_channels or self.in_channels
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
         self.num_channels_latents = self.out_channels
@@ -110,7 +110,6 @@ class FluxArchConfig(DiTArchConfig):
 
 @dataclass
 class FluxConfig(DiTConfig):
-
-    arch_config: DiTArchConfig = field(default_factory=FluxArchConfig)
+    arch_config: FluxArchConfig = field(default_factory=FluxArchConfig)
 
     prefix: str = "Flux"

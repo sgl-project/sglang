@@ -52,10 +52,15 @@ class Qwen3TextArchConfig(TextEncoderArchConfig):
     text_len: int = 512
     output_hidden_states: bool = True  # Klein needs hidden states from layers 9, 18, 27
 
-    # Stacked params for weight loading with tensor parallelism
+
+@dataclass
+class Qwen3TextConfig(TextEncoderConfig):
+    """Top-level config for Qwen3 text encoder."""
+
+    arch_config: Qwen3TextArchConfig = field(default_factory=Qwen3TextArchConfig)
+    prefix: str = "qwen3"
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
-            # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
@@ -63,24 +68,14 @@ class Qwen3TextArchConfig(TextEncoderArchConfig):
             (".gate_up_proj", ".up_proj", 1),
         ]
     )
-
-    # FSDP sharding conditions for CPU offload
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
     )
 
-    def __post_init__(self) -> None:
+    def refresh_model_config(self) -> None:
         self.tokenizer_kwargs = {
             "padding": "max_length",
             "truncation": True,
-            "max_length": self.text_len,
+            "max_length": self.arch_config.text_len,
             "return_tensors": "pt",
         }
-
-
-@dataclass
-class Qwen3TextConfig(TextEncoderConfig):
-    """Top-level config for Qwen3 text encoder."""
-
-    arch_config: TextEncoderArchConfig = field(default_factory=Qwen3TextArchConfig)
-    prefix: str = "qwen3"

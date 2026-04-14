@@ -45,9 +45,23 @@ class T5ArchConfig(TextEncoderArchConfig):
     eos_token_id: int = 1
     classifier_dropout: float = 0.0
     text_len: int = 512
+
+    # Referenced from https://github.com/huggingface/transformers/blob/main/src/transformers/models/t5/configuration_t5.py
+    def refresh_derived_fields(self):
+        act_info = self.feed_forward_proj.split("-")
+        self.dense_act_fn: str = act_info[-1]
+        self.is_gated_act: bool = act_info[0] == "gated"
+        if self.feed_forward_proj == "gated-gelu":
+            self.dense_act_fn = "gelu_new"
+
+
+@dataclass
+class T5Config(TextEncoderConfig):
+    arch_config: T5ArchConfig = field(default_factory=T5ArchConfig)
+
+    prefix: str = "t5"
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
-            # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q", "q"),
             (".qkv_proj", ".k", "k"),
             (".qkv_proj", ".v", "v"),
@@ -60,35 +74,20 @@ class T5ArchConfig(TextEncoderArchConfig):
             _is_final_layernorm,
         ]
     )
-
-    # Referenced from https://github.com/huggingface/transformers/blob/main/src/transformers/models/t5/configuration_t5.py
-    def __post_init__(self):
-        super().__post_init__()
-        act_info = self.feed_forward_proj.split("-")
-        self.dense_act_fn: str = act_info[-1]
-        self.is_gated_act: bool = act_info[0] == "gated"
-        if self.feed_forward_proj == "gated-gelu":
-            self.dense_act_fn = "gelu_new"
-
-        self.tokenizer_kwargs = {
-            "padding": "max_length",
-            "truncation": True,
-            "max_length": self.text_len,
-            "add_special_tokens": True,
-            "return_attention_mask": True,
-            "return_tensors": "pt",
-        }
-
-
-@dataclass
-class T5Config(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(default_factory=T5ArchConfig)
-
-    prefix: str = "t5"
     # Use the SP Group of the transformer as the TP Group of T5.
     parallel_folding: bool = False
     # "sp" or "ulysses" or "ring"
     parallel_folding_mode: str = "sp"
+
+    def refresh_model_config(self) -> None:
+        self.tokenizer_kwargs = {
+            "padding": "max_length",
+            "truncation": True,
+            "max_length": self.arch_config.text_len,
+            "add_special_tokens": True,
+            "return_attention_mask": True,
+            "return_tensors": "pt",
+        }
 
     @staticmethod
     def add_cli_args(

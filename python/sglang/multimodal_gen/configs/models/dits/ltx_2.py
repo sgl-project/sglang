@@ -164,8 +164,8 @@ class LTX2ArchConfig(DiTArchConfig):
     patch_size: tuple[int, int, int] = (1, 2, 2)
     text_len: int = 512
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         # Video derived values
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
         self.num_channels_latents = self.out_channels

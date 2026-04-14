@@ -50,8 +50,8 @@ class MOVAVideoArchConfig(DiTArchConfig):
     require_clip_embedding: bool = True
     fuse_vae_embedding_in_latents: bool = False
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         self.hidden_size = self.dim
         self.num_attention_heads = self.num_heads
         self.num_channels_latents = self.out_dim
@@ -62,5 +62,5 @@ class MOVAVideoArchConfig(DiTArchConfig):
 
 @dataclass
 class MOVAVideoConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(default_factory=MOVAVideoArchConfig)
+    arch_config: MOVAVideoArchConfig = field(default_factory=MOVAVideoArchConfig)
     prefix: str = "mova_video"

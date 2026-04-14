@@ -39,22 +39,6 @@ class CLIPTextArchConfig(TextEncoderArchConfig):
     bos_token_id: int = 49406
     eos_token_id: int = 49407
     text_len: int = 77
-    _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {
-            AttentionBackendEnum.TORCH_SDPA,  # Force TORCH_SDPA to support attention_mask
-        }
-    )
-    stacked_params_mapping: list[tuple[str, str, str]] = field(
-        default_factory=lambda: [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-    )
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer, _is_embeddings]
-    )
 
 
 @dataclass
@@ -73,29 +57,43 @@ class CLIPVisionArchConfig(ImageEncoderArchConfig):
     attention_dropout: float = 0.0
     initializer_range: float = 0.02
     initializer_factor: float = 1.0
+
+
+@dataclass
+class CLIPTextConfig(TextEncoderConfig):
+    arch_config: CLIPTextArchConfig = field(default_factory=CLIPTextArchConfig)
+
+    num_hidden_layers_override: int | None = None
+    require_post_norm: bool | None = None
+    prefix: str = "clip"
+    _supported_attention_backends: set[AttentionBackendEnum] = field(
+        default_factory=lambda: {
+            AttentionBackendEnum.TORCH_SDPA,
+        }
+    )
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
-            # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
     )
-
-
-@dataclass
-class CLIPTextConfig(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(default_factory=CLIPTextArchConfig)
-
-    num_hidden_layers_override: int | None = None
-    require_post_norm: bool | None = None
-    prefix: str = "clip"
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [_is_transformer_layer, _is_embeddings]
+    )
 
 
 @dataclass
 class CLIPVisionConfig(ImageEncoderConfig):
-    arch_config: ImageEncoderArchConfig = field(default_factory=CLIPVisionArchConfig)
+    arch_config: CLIPVisionArchConfig = field(default_factory=CLIPVisionArchConfig)
 
     num_hidden_layers_override: int | None = None
     require_post_norm: bool | None = None
     prefix: str = "clip"
+    stacked_params_mapping: list[tuple[str, str, str]] = field(
+        default_factory=lambda: [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
+    )

@@ -1,0 +1,10 @@
+{
+  "source_model_id": "Lightricks/LTX-2.3",
+  "materializer_version": "v1",
+  "custom_materializer": "_overlay/materialize.py",
+  "required_source_files": [
+    "ltx-2.3-22b-dev.safetensors",
+    "ltx-2.3-22b-distilled-lora-384.safetensors",
+    "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+  ]
+}

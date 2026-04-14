@@ -19,12 +19,8 @@ class ImageEncoderLoader(TextEncoderLoader):
         should_offload = server_args.image_encoder_cpu_offload
         if not should_offload:
             return False
-        # _fsdp_shard_conditions is in arch_config, not directly on model_config
-        arch_config = (
-            getattr(model_config, "arch_config", model_config) if model_config else None
-        )
         fsdp_shard_conditions = (
-            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+            getattr(model_config, "_fsdp_shard_conditions", []) if model_config else []
         )
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload

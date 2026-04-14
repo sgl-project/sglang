@@ -167,15 +167,15 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
         dit_config = QwenImageDitConfig(arch_config=comfyui_arch_config)
         server_args.pipeline_config.dit_config = dit_config
 
-        if dit_config.arch_config.param_names_mapping is None:
-            dit_config.arch_config.param_names_mapping = {}
+        if dit_config.param_names_mapping is None:
+            dit_config.param_names_mapping = {}
 
         comfyui_qwen_mappings = {r"^model\.diffusion_model\.(.*)$": r"\1"}
         updated_mapping = {
-            **dit_config.arch_config.param_names_mapping,
+            **dit_config.param_names_mapping,
             **comfyui_qwen_mappings,
         }
-        dit_config.arch_config.param_names_mapping = updated_mapping
+        dit_config.param_names_mapping = updated_mapping
         logger.info(
             "Added ComfyUI weight name mappings to param_names_mapping. "
             f"Total mappings: {len(updated_mapping)}"

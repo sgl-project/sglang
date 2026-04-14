@@ -752,7 +752,7 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
-    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+    param_names_mapping = FluxConfig().param_names_mapping
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:

@@ -46,6 +46,12 @@ class Mistral3EncoderArchConfig(TextEncoderArchConfig):
     hidden_state_skip_layer: int = 2  # Use second-to-last hidden state
     text_len: int = 0
 
+
+@dataclass
+class Mistral3EncoderConfig(TextEncoderConfig):
+    arch_config: Mistral3EncoderArchConfig = field(
+        default_factory=Mistral3EncoderArchConfig
+    )
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
             (".qkv_proj", ".q_proj", "q"),
@@ -55,18 +61,6 @@ class Mistral3EncoderArchConfig(TextEncoderArchConfig):
             (".gate_up_proj", ".up_proj", 1),
         ]
     )
-
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
-    )
-
-    def __post_init__(self):
-        # Let the parent populate tokenizer_kwargs["max_length"] = self.text_len
-        super().__post_init__()
-
-
-@dataclass
-class Mistral3EncoderConfig(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(
-        default_factory=Mistral3EncoderArchConfig
     )

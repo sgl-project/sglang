@@ -33,6 +33,15 @@ def build_flux2_text_messages(prompts: list[str]) -> list[list[dict]]:
 
 @dataclass
 class Flux2MistralTextArchConfig(TextEncoderArchConfig):
+    text_len: int = 512
+
+
+@dataclass
+class Flux2MistralTextConfig(TextEncoderConfig):
+    arch_config: Flux2MistralTextArchConfig = field(
+        default_factory=Flux2MistralTextArchConfig
+    )
+    prefix: str = "flux_2_mistral"
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
             ("qkv_proj", "q_proj", "q"),
@@ -44,20 +53,12 @@ class Flux2MistralTextArchConfig(TextEncoderArchConfig):
         default_factory=lambda: [_is_transformer_layer]
     )
 
-    def __post_init__(self) -> None:
+    def refresh_model_config(self) -> None:
         self.tokenizer_kwargs = {
             "padding": "max_length",
             "truncation": True,
-            "max_length": 512,
+            "max_length": self.arch_config.text_len,
             "add_special_tokens": True,
             "return_attention_mask": True,
             "return_tensors": "pt",
         }
-
-
-@dataclass
-class Flux2MistralTextConfig(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(
-        default_factory=Flux2MistralTextArchConfig
-    )
-    prefix: str = "flux_2_mistral"

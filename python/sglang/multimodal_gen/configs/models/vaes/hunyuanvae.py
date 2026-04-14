@@ -32,10 +32,10 @@ class HunyuanVAEArchConfig(VAEArchConfig):
     temporal_compression_ratio: int = 4
     mid_block_add_attention: bool = True
 
-    def __post_init__(self):
+    def refresh_derived_fields(self):
         self.spatial_compression_ratio: int = 2 ** (len(self.block_out_channels) - 1)
 
 
 @dataclass
 class HunyuanVAEConfig(VAEConfig):
-    arch_config: VAEArchConfig = field(default_factory=HunyuanVAEArchConfig)
+    arch_config: HunyuanVAEArchConfig = field(default_factory=HunyuanVAEArchConfig)

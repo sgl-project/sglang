@@ -1053,7 +1053,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
-    param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+    param_names_mapping = QwenImageDitConfig().param_names_mapping
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:

@@ -67,6 +67,11 @@ class Gemma2ArchConfig(TextEncoderArchConfig):
 
     text_len: int = 300
 
+
+@dataclass
+class Gemma2Config(TextEncoderConfig):
+    arch_config: Gemma2ArchConfig = field(default_factory=Gemma2ArchConfig)
+    prefix: str = "gemma_2"
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
             (".qkv_proj", ".q_proj", "q"),
@@ -79,9 +84,3 @@ class Gemma2ArchConfig(TextEncoderArchConfig):
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
     )
-
-
-@dataclass
-class Gemma2Config(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(default_factory=Gemma2ArchConfig)
-    prefix: str = "gemma_2"

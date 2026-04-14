@@ -609,6 +609,16 @@ class SamplingParams:
 
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
+
+        if (
+            getattr(server_args, "pipeline_class_name", None) == "LTX2TwoStagePipeline"
+            and sampling_params.__class__.__name__ == "LTX23SamplingParams"
+        ):
+            if "height" not in user_kwargs and sampling_params.height is not None:
+                sampling_params.height *= 2
+            if "width" not in user_kwargs and sampling_params.width is not None:
+                sampling_params.width *= 2
+
         user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(

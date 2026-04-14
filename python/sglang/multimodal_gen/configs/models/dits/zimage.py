@@ -64,8 +64,8 @@ class ZImageArchConfig(DiTArchConfig):
         }
     )
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         self.out_channels = self.out_channels or self.in_channels
         self.num_channels_latents = self.in_channels
         self.hidden_size = self.dim

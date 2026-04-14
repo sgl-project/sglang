@@ -225,8 +225,8 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             dit_config = ZImageDitConfig()
             server_args.pipeline_config.dit_config = dit_config
 
-        if dit_config.arch_config.param_names_mapping is None:
-            dit_config.arch_config.param_names_mapping = {}
+        if dit_config.param_names_mapping is None:
+            dit_config.param_names_mapping = {}
 
         # Add mappings for norm layers: map from ComfyUI format (k_norm/q_norm) to SGLang format (norm_k/norm_q)
         # The regex matches the source name from safetensors, and the tuple specifies the target name in the model
@@ -253,10 +253,10 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
         # Merge ComfyUI mappings with existing mappings (ComfyUI mappings take precedence)
         updated_mapping = {
-            **dit_config.arch_config.param_names_mapping,
+            **dit_config.param_names_mapping,
             **comfyui_norm_mappings,
         }
-        dit_config.arch_config.param_names_mapping = updated_mapping
+        dit_config.param_names_mapping = updated_mapping
         logger.info(
             "Added ComfyUI weight name mappings (k_norm/q_norm -> norm_k/norm_q) to param_names_mapping. "
             f"Total mappings: {len(updated_mapping)}"

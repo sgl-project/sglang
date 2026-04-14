@@ -31,12 +31,14 @@ class MOVADualTowerArchConfig(DiTArchConfig):
     pooled_adaln: bool = False
     eps: float = 1e-6
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         self.hidden_size = self.visual_hidden_dim
         self.num_attention_heads = self.visual_hidden_dim // self.head_dim
 
 
 @dataclass
 class MOVADualTowerConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(default_factory=MOVADualTowerArchConfig)
+    arch_config: MOVADualTowerArchConfig = field(
+        default_factory=MOVADualTowerArchConfig
+    )

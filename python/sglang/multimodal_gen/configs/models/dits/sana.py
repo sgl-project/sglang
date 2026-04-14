@@ -45,13 +45,13 @@ class SanaArchConfig(DiTArchConfig):
         }
     )
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
         self.num_channels_latents = self.out_channels
 
 
 @dataclass
 class SanaConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(default_factory=SanaArchConfig)
+    arch_config: SanaArchConfig = field(default_factory=SanaArchConfig)
     prefix: str = "Sana"

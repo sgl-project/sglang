@@ -882,11 +882,7 @@ class Gemma3TextModel(nn.Module):
                 f"(param={getattr(param, 'name', '<param>')})."
             )
 
-        stacked_params_mapping = getattr(
-            getattr(self.config, "arch_config", object()),
-            "stacked_params_mapping",
-            None,
-        )
+        stacked_params_mapping = getattr(self.config, "stacked_params_mapping", None)
         if stacked_params_mapping is None:
             stacked_params_mapping = [
                 # Fused QKV shards; downstream loaders may want "q/k/v" or 0/1/2.

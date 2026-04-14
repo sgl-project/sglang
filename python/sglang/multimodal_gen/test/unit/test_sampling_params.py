@@ -1,8 +1,10 @@
 import argparse
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
@@ -140,6 +142,44 @@ class TestSamplingParamsSubclass(unittest.TestCase):
                     teacache_params.get_skip_boundaries(50, do_cfg),
                     expected,
                 )
+
+    def test_ltx23_two_stage_defaults_use_final_resolution(self):
+        server_args = SimpleNamespace(
+            backend="sglang",
+            model_id=None,
+            pipeline_class_name="LTX2TwoStagePipeline",
+            pipeline_config=LTX2PipelineConfig(),
+            output_path=None,
+            num_gpus=1,
+            comfyui_mode=False,
+        )
+
+        params = SamplingParams.from_user_sampling_params_args(
+            "Lightricks/LTX-2.3",
+            server_args,
+        )
+
+        self.assertEqual(params.height, 1024)
+        self.assertEqual(params.width, 1536)
+
+    def test_ltx23_one_stage_defaults_keep_stage1_resolution(self):
+        server_args = SimpleNamespace(
+            backend="sglang",
+            model_id=None,
+            pipeline_class_name="LTX2Pipeline",
+            pipeline_config=LTX2PipelineConfig(),
+            output_path=None,
+            num_gpus=1,
+            comfyui_mode=False,
+        )
+
+        params = SamplingParams.from_user_sampling_params_args(
+            "Lightricks/LTX-2.3",
+            server_args,
+        )
+
+        self.assertEqual(params.height, 512)
+        self.assertEqual(params.width, 768)
 
 
 class TestSamplingParamsCliArgs(unittest.TestCase):

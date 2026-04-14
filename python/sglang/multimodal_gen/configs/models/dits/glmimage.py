@@ -25,8 +25,8 @@ class GlmImageArchConfig(DiTArchConfig):
         }
     )
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         self.out_channels = self.out_channels or self.in_channels
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
         self.num_channels_latents = self.out_channels
@@ -34,6 +34,6 @@ class GlmImageArchConfig(DiTArchConfig):
 
 @dataclass
 class GlmImageDitConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(default_factory=GlmImageArchConfig)
+    arch_config: GlmImageArchConfig = field(default_factory=GlmImageArchConfig)
 
     prefix: str = "glmimage"

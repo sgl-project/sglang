@@ -48,12 +48,11 @@ class GlmImageVAEConfig(VAEConfig):
     def get_vae_scale_factor(self):
         return 2 ** len(self.arch_config.temperal_downsample)
 
-    def __post_init__(self):
+    def refresh_model_config(self):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         ) * 2
 
-    def post_init(self):
         self.arch_config.vae_scale_factor = 2 ** (
             len(self.arch_config.temperal_downsample)
         )

@@ -713,7 +713,7 @@ class UMT5EncoderModel(TextEncoder):
                 param_name,
                 weight_name,
                 shard_id,
-            ) in self.config.arch_config.stacked_params_mapping:
+            ) in self.config.stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)

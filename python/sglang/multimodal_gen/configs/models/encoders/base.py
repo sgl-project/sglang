@@ -13,15 +13,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 @dataclass
 class EncoderArchConfig(ArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [])
     architectures: list[str] = field(default_factory=lambda: [])
-    _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.TORCH_SDPA,
-            AttentionBackendEnum.SAGE_ATTN_3,
-        }
-    )
     output_hidden_states: bool = False
     use_return_dict: bool = True
 
@@ -40,18 +32,6 @@ class TextEncoderArchConfig(EncoderArchConfig):
     output_past: bool = True
     scalable_attention: bool = True
     tie_word_embeddings: bool = False
-    stacked_params_mapping: list[tuple[str, str, str]] = field(
-        default_factory=list
-    )  # mapping from huggingface weight names to custom names
-    tokenizer_kwargs: dict[str, Any] = field(default_factory=dict)
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [])
-
-    def __post_init__(self) -> None:
-        self.tokenizer_kwargs = {
-            "truncation": True,
-            "max_length": self.text_len,
-            "return_tensors": "pt",
-        }
 
 
 @dataclass
@@ -69,24 +49,62 @@ class BaseEncoderOutput:
 
 
 @dataclass
-class EncoderConfig(ModelConfig):
-    arch_config: ArchConfig = field(default_factory=EncoderArchConfig)
+class EncoderConfig(ModelConfig[EncoderArchConfig]):
+    arch_config: EncoderArchConfig = field(default_factory=EncoderArchConfig)
+    _internal_config_fields = (
+        "_fsdp_shard_conditions",
+        "_supported_attention_backends",
+        "stacked_params_mapping",
+    )
 
     prefix: str = ""
     quant_config: QuantizationConfig | None = None
     lora_config: Any | None = None
+    stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
+    _fsdp_shard_conditions: list = field(default_factory=list)
+    _supported_attention_backends: set[AttentionBackendEnum] = field(
+        default_factory=lambda: {
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.SAGE_ATTN_3,
+        }
+    )
+
+    def refresh_model_config(self) -> None:
+        if hasattr(self.arch_config, "stacked_params_mapping"):
+            self.stacked_params_mapping = list(self.arch_config.stacked_params_mapping)
+        if hasattr(self.arch_config, "_fsdp_shard_conditions"):
+            self._fsdp_shard_conditions = list(self.arch_config._fsdp_shard_conditions)
+        if hasattr(self.arch_config, "_supported_attention_backends"):
+            self._supported_attention_backends = set(
+                self.arch_config._supported_attention_backends
+            )
 
 
 @dataclass
 class TextEncoderConfig(EncoderConfig):
-    arch_config: ArchConfig = field(default_factory=TextEncoderArchConfig)
+    arch_config: TextEncoderArchConfig = field(default_factory=TextEncoderArchConfig)
+    _internal_config_fields = EncoderConfig._internal_config_fields + (
+        "tokenizer_kwargs",
+    )
 
     # Use the SP Group of the transformer as the TP Group of T5.
     parallel_folding: bool = False
     # "sp" or "ulysses" or "ring"
     parallel_folding_mode: str = "sp"
+    tokenizer_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def refresh_model_config(self) -> None:
+        super().refresh_model_config()
+        self.tokenizer_kwargs = {
+            "truncation": True,
+            "max_length": self.arch_config.text_len,
+            "return_tensors": "pt",
+        }
+        if hasattr(self.arch_config, "tokenizer_kwargs"):
+            self.tokenizer_kwargs = dict(self.arch_config.tokenizer_kwargs)
 
 
 @dataclass
 class ImageEncoderConfig(EncoderConfig):
-    arch_config: ArchConfig = field(default_factory=ImageEncoderArchConfig)
+    arch_config: ImageEncoderArchConfig = field(default_factory=ImageEncoderArchConfig)

@@ -66,8 +66,8 @@ class HeliosArchConfig(DiTArchConfig):
     is_amplify_history: bool = False
     history_scale_mode: str = "per_head"
 
-    def __post_init__(self):
-        super().__post_init__()
+    def refresh_derived_fields(self):
+        super().refresh_derived_fields()
         self.out_channels = self.out_channels or self.in_channels
         self.hidden_size = self.num_attention_heads * self.attention_head_dim
         self.num_channels_latents = self.out_channels
@@ -75,6 +75,6 @@ class HeliosArchConfig(DiTArchConfig):
 
 @dataclass
 class HeliosConfig(DiTConfig):
-    arch_config: DiTArchConfig = field(default_factory=HeliosArchConfig)
+    arch_config: HeliosArchConfig = field(default_factory=HeliosArchConfig)
 
     prefix: str = "Helios"

@@ -34,10 +34,10 @@ class SanaVAEConfig(VAEConfig):
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
 
-    def post_init(self):
+    def refresh_model_config(self):
+        super().refresh_model_config()
         # Called by VAELoader AFTER update_model_arch() merges the HF config.json
-        # values into arch_config. Must be post_init() (not __post_init__) because
-        # __post_init__ fires at dataclass creation time, before the HF config merge.
+        # values into arch_config.
         #
         # The base VAEConfig.get_vae_scale_factor() derives from block_out_channels,
         # which DC-AE doesn't have. Set vae_scale_factor directly from the

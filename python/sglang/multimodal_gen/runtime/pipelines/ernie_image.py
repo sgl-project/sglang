@@ -145,9 +145,9 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 hasattr(pipeline_config, "text_encoder_configs")
                 and pipeline_config.text_encoder_configs
             ):
-                arch_config = pipeline_config.text_encoder_configs[0].arch_config
-                arch_config.text_len = text_model_max_length
-                arch_config.tokenizer_kwargs["max_length"] = text_model_max_length
+                text_encoder_config = pipeline_config.text_encoder_configs[0]
+                text_encoder_config.arch_config.text_len = text_model_max_length
+                text_encoder_config.refresh_model_config()
             # 2. Update text_encoder_extra_args used by TextEncodingStage tokenization
             if (
                 hasattr(pipeline_config, "text_encoder_extra_args")
