@@ -114,51 +114,26 @@ class UpdateWeightFromTensorChecker:
         target_module: str,
         expected_named_tensors_sha256: dict[str, str],
     ) -> tuple[bool, str]:
-        module, error_message = self._get_module_for_verification(
-            target_module=target_module,
-            expected_named_tensors_sha256=expected_named_tensors_sha256,
-        )
-        if error_message is not None:
-            return False, error_message
+        if not target_module:
+            return False, "target_module is required"
+        if not expected_named_tensors_sha256:
+            return False, "expected_named_tensors_sha256 is required"
+        if not isinstance(expected_named_tensors_sha256, dict):
+            return False, "expected_named_tensors_sha256 must be a dict[str, str]"
 
-        actual_named_tensors_sha256 = self._build_local_module_sha256(
-            module=module,
-            expected_named_tensors_sha256=expected_named_tensors_sha256,
+        module = self.pipeline.get_module(target_module)
+        if module is None:
+            return False, f"Module '{target_module}' is not initialized"
+
+        actual_named_tensors_sha256 = build_named_tensor_sha256(
+            self._iter_module_named_tensors(
+                module, expected_named_tensors_sha256.keys()
+            )
         )
         return self._compare_manifests(
             target_module=target_module,
             expected_named_tensors_sha256=expected_named_tensors_sha256,
             actual_named_tensors_sha256=actual_named_tensors_sha256,
-        )
-
-    def _get_module_for_verification(
-        self,
-        *,
-        target_module: str,
-        expected_named_tensors_sha256: dict[str, str],
-    ) -> tuple[torch.nn.Module | None, str | None]:
-        if not target_module:
-            return None, "target_module is required"
-        if not expected_named_tensors_sha256:
-            return None, "expected_named_tensors_sha256 is required"
-        if not isinstance(expected_named_tensors_sha256, dict):
-            return None, "expected_named_tensors_sha256 must be a dict[str, str]"
-
-        module = self.pipeline.get_module(target_module)
-        if module is None:
-            return None, f"Module '{target_module}' is not initialized"
-        return module, None
-
-    def _build_local_module_sha256(
-        self,
-        *,
-        module: torch.nn.Module,
-        expected_named_tensors_sha256: dict[str, str],
-    ) -> dict[str, str]:
-        return build_named_tensor_sha256(
-            self._iter_module_named_tensors(
-                module, expected_named_tensors_sha256.keys()
-            )
         )
 
     def _iter_module_named_tensors(
