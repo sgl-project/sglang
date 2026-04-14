@@ -104,9 +104,9 @@ struct Param {
        << ", min_bfs_breadth = " << min_bfs_breadth << ", max_bfs_breadth = " << max_bfs_breadth
        << ", max_trie_depth = " << max_trie_depth << ", draft_token_num = " << draft_token_num
        << ", external_corpus_max_tokens = " << external_corpus_max_tokens
-       << ", trie_source_prior = " << trie_source_prior << ", match_specificity_weight = "
-       << match_specificity_weight << ", match_confidence_weight = " << match_confidence_weight
-       << ", request_trie_mode = " << request_trie_mode << ", match_type = " << match_type;
+       << ", trie_source_prior = " << trie_source_prior << ", match_specificity_weight = " << match_specificity_weight
+       << ", match_confidence_weight = " << match_confidence_weight << ", request_trie_mode = " << request_trie_mode
+       << ", match_type = " << match_type;
     ss << ", batch_draft_token_num(" << batch_draft_token_num.size() << ") = ";
     for (int i = 0; i < batch_draft_token_num.size(); ++i) {
       ss << i << "|" << batch_draft_token_num[i] << ",";

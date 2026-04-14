@@ -193,18 +193,7 @@ void register_ngram_corpus() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<NgramCorpusObj>()
       .def(
-          refl::init<
-              int64_t,
-              int64_t,
-              int64_t,
-              int64_t,
-              int64_t,
-              int64_t,
-              int64_t,
-              int64_t,
-              double,
-              double,
-              double>(),
+          refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, double, double, double>(),
           "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("async_insert_stateful", &NgramCorpusObj::async_insert_stateful)

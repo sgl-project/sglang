@@ -270,9 +270,10 @@ Result Ngram::batchMatch(
     std::vector<RankedSourceResult> source_results;
     source_results.reserve(ordered_sams.size() + 1);
     if (trie_quality.has_match) {
-      source_results.push_back(RankedSourceResult{
-          computeSourceScore(trie_quality, effectiveTrieSourcePrior(param_.trie_source_prior), param_),
-          (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)});
+      source_results.push_back(
+          RankedSourceResult{
+              computeSourceScore(trie_quality, effectiveTrieSourcePrior(param_.trie_source_prior), param_),
+              (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)});
     }
 
     for (const auto& [_, sam] : ordered_sams) {
@@ -282,8 +283,9 @@ Result Ngram::batchMatch(
       if (score <= 0.0) {
         continue;
       }
-      source_results.push_back(RankedSourceResult{
-          score, (sam->*sam_anchored_build_fn)(anchors, suffix.back(), total_draft_token_num, param_)});
+      source_results.push_back(
+          RankedSourceResult{
+              score, (sam->*sam_anchored_build_fn)(anchors, suffix.back(), total_draft_token_num, param_)});
     }
 
     Result combined;
@@ -296,8 +298,7 @@ Result Ngram::batchMatch(
       });
       combined = std::move(source_results.front().result);
       for (size_t source_idx = 1; source_idx < source_results.size(); ++source_idx) {
-        combined = combineRootResults_(
-            suffix.back(), result_token_num, combined, source_results[source_idx].result);
+        combined = combineRootResults_(suffix.back(), result_token_num, combined, source_results[source_idx].result);
       }
     }
 
