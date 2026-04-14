@@ -452,9 +452,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     ),
     DiffusionTestCase(
         "flux_image_t2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST),
         T2I_sampling_params,
     ),
     # TODO: modeling of flux different from official flux, so weights can't be loaded
@@ -469,9 +467,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # ),
     DiffusionTestCase(
         "flux_2_image_t2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST),
         T2I_sampling_params,
     ),
     DiffusionTestCase(
@@ -495,9 +491,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     ),
     DiffusionTestCase(
         "zimage_image_t2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
         T2I_sampling_params,
     ),
     DiffusionTestCase(
@@ -524,9 +518,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST),
         TI2I_sampling_params,
     ),
     DiffusionTestCase(
@@ -666,9 +658,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # ),
     DiffusionTestCase(
         "flux_2_ti2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST),
         TI2I_sampling_params,
     ),
     DiffusionTestCase(
