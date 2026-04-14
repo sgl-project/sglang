@@ -919,7 +919,7 @@ TWO_GPU_CASES_A = [
     DiffusionTestCase(
         "ltx_2_3_two_stage_ti2v_2gpus",
         DiffusionServerArgs(
-            model_path="Lightricks/LTX-2",
+            model_path="Lightricks/LTX-2.3",
             modality="video",
             num_gpus=2,
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
