@@ -483,7 +483,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         w = layer.weight.data
         w_swapped = _prepare_nvfp4_weight_bytes(
-            w, swap_weight_nibbles=self.quant_config.swap_weight_nibbles
+            w,
+            swap_weight_nibbles=getattr(self.quant_config, "swap_weight_nibbles", True),
         )
 
         _, flashinfer_backend = _get_fp4_gemm_op()
