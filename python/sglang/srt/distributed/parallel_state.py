@@ -546,7 +546,7 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
-    def all_reduce(self, input_: torch.Tensor, fp_comm: bool = False) -> torch.Tensor:
+    def all_reduce(self, input_: torch.Tensor, quantize_communications: bool = False) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
         all-reduce operation.
@@ -599,9 +599,9 @@ class GroupCoordinator:
             return self.xpu_communicator.all_reduce(input_)
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
-            if fp_comm:
-                return self.npu_communicator.all_reduce(input_)
-            return self.npu_communicator.quant_all_reduce(input_)
+            if quantize_communications:
+                return self.npu_communicator.quant_all_reduce(input_)
+            return self.npu_communicator.all_reduce(input_)
 
         if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
             with self.pynccl_comm.change_state(
