@@ -2616,9 +2616,11 @@
             },
             "expected_e2e_ms": 34384.39,
             "expected_avg_denoise_ms": 782.76,
-            "expected_median_denoise_ms": 806.95
+            "expected_median_denoise_ms": 806.95,
+            "estimated_full_test_time_s": 216.7
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
+            "estimated_full_test_time_s": 249.9,
             "stages_ms": {
                 "InputValidationStage": 2.93,
                 "TextEncodingStage": 1613.49,
