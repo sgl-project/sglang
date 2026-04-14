@@ -598,13 +598,15 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-        if _is_cpu:
+        if _is_cpu_amx_available:
             if self.quant_config.desc_act and not (
                 self.quant_config.true_sequential and self.quant_config.static_groups
             ):
                 raise ValueError(
                     "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
                 )
+            if self.quant_config.weight_bits == 4:
+                raise ValueError("Currently, only 4bits is supported on CPU with AMX.")
             if self.use_v2_format:
                 raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
             _amx_process_weight_after_loading(
@@ -627,7 +629,7 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if _is_cpu:
+        if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
                 x,
                 layer.qweight,
@@ -1621,9 +1623,10 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
             raise ValueError(
                 "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
             )
+        if self.quant_config.weight_bits == 4:
+            raise ValueError("Currently, only 4bits is supported on CPU with AMX.")
         if self.use_v2_format:
             raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
-
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.linear import set_weight_attrs
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
