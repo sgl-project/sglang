@@ -7,6 +7,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.reasoning_kit import ReasoningTokenUsageMixin
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
@@ -20,13 +21,13 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1400, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=768, suite="stage-c-test-4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
 
 
-class TestQwen35FP4(unittest.TestCase):
+class TestQwen35FP4(CustomTestCase):
     def test_gsm8k(self):
         base_args = [
             "--tp-size",
@@ -82,11 +83,14 @@ class TestQwen35FP4(unittest.TestCase):
         )
 
 
-class TestQwen35FP4MTP(CustomTestCase):
+class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
+    reasoning_parser_name = "qwen3"
+
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN35_FP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.init_reasoning_token_verifier()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -149,7 +153,7 @@ class TestQwen35FP4MTP(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["score"], ACC_THRESHOLDS[self.model]["gsm8k"])
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -157,11 +161,14 @@ class TestQwen35FP4MTP(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 3.3)
 
 
-class TestQwen35FP4MTPV2(CustomTestCase):
+class TestQwen35FP4MTPV2(ReasoningTokenUsageMixin, CustomTestCase):
+    reasoning_parser_name = "qwen3"
+
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN35_FP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.init_reasoning_token_verifier()
         envs.SGLANG_ENABLE_SPEC_V2.set(True)
         cls.process = popen_launch_server(
             cls.model,
@@ -226,7 +233,7 @@ class TestQwen35FP4MTPV2(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["score"], ACC_THRESHOLDS[self.model]["gsm8k"])
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

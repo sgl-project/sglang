@@ -81,6 +81,18 @@ repos:
         language: system
         files: ^\.github/CI_PERMISSIONS\.json$
         pass_filenames: false
+      - id: check-workflow-job-names
+        name: check for duplicate workflow job names
+        entry: python3 scripts/ci/check_workflow_job_names.py
+        language: system
+        files: ^\.github/workflows/.*\.yml$
+        pass_filenames: false
+      - id: check-registered-tests
+        name: check registered tests have CI registry
+        entry: python3 scripts/ci/check_registered_tests.py
+        language: system
+        files: ^test/registered/.*\.py$
+        pass_filenames: false
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
     hooks:

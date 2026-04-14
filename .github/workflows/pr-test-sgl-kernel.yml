@@ -17,6 +17,10 @@ on:
         required: false
         type: string
         default: ''
+      skip_stage_health_check:
+        required: false
+        type: boolean
+        default: false
 
 # Workflow-level env is NOT inherited from the caller in reusable workflows.
 # The github context (including github.event_name) IS inherited from the caller.
@@ -24,6 +28,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
 
 jobs:
   sgl-kernel-unit-test:
@@ -35,11 +40,8 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
-        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -73,11 +75,8 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
-        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -111,11 +110,8 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
-        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -161,11 +157,8 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
-        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
