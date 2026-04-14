@@ -170,8 +170,6 @@ def _build_layer(
 
     _, flashinfer_backend = current_platform.get_modelopt_fp4_gemm_op()
     if flashinfer_backend == "trtllm":
-        from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
-
         expected_weight, _ = pad_nvfp4_weight(weight_fp4, n_alignment=128, k_alignment=0)
         expected_scale = weight_scale_linear
         if expected_scale.shape[0] != expected_weight.shape[0]:
@@ -187,9 +185,9 @@ def _build_layer(
             expected_weight = torch.nn.functional.pad(expected_weight, (0, pad_weight_k, 0, 0))
             expected_padding_cols = pad_weight_k
 
-        expected_weight = shuffle_matrix_a(expected_weight.view(torch.uint8), 128)
+        expected_weight = flashinfer.shuffle_matrix_a(expected_weight.view(torch.uint8), 128)
         expected_scale = (
-            shuffle_matrix_sf_a(expected_scale.view(torch.uint8), 128)
+            flashinfer.shuffle_matrix_sf_a(expected_scale.view(torch.uint8), 128)
             .reshape(expected_scale.shape)
             .view(torch.float8_e4m3fn)
         )
