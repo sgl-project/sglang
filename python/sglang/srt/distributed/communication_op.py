@@ -13,9 +13,9 @@ from .parallel_state import (
 )
 
 
-def tensor_model_parallel_all_reduce(input_: torch.Tensor, fp_comm=True) -> torch.Tensor:
+def tensor_model_parallel_all_reduce(input_: torch.Tensor, quantize_communications=False) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_, fp_comm=fp_comm)
+    return get_tp_group().all_reduce(input_, quantize_communications=quantize_communications)
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm(
@@ -55,9 +55,9 @@ def broadcast_tensor_dict(
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
 
 
-def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor, fp_comm=True) -> torch.Tensor:
+def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor, quantize_communications=False) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
-    return get_attn_tp_group().all_reduce(input_, fp_comm=fp_comm)
+    return get_attn_tp_group().all_reduce(input_, quantize_communications=quantize_communications)
 
 
 def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
