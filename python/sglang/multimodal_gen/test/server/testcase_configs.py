@@ -358,7 +358,7 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
-MODELOPT_T2I_SMOKE_sampling_params = DiffusionSamplingParams(
+MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="768x768",
     extras={"num_inference_steps": 12},
@@ -400,7 +400,7 @@ T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
 )
 
-MODELOPT_T2V_SMOKE_sampling_params = DiffusionSamplingParams(
+MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
     num_frames=17,
@@ -816,7 +816,7 @@ MODELOPT_WAN22_NVFP4_TRANSFORMER = (
 )
 
 
-def _make_modelopt_smoke_case(
+def _make_modelopt_ci_case(
     case_id: str,
     *,
     model_path: str,
@@ -841,46 +841,46 @@ def _make_modelopt_smoke_case(
 
 
 ONE_GPU_CASES_C = [
-    _make_modelopt_smoke_case(
+    _make_modelopt_ci_case(
         "flux1_modelopt_fp8_t2i",
         model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
         modality="image",
-        sampling_params=MODELOPT_T2I_SMOKE_sampling_params,
+        sampling_params=MODELOPT_T2I_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
     ),
-    _make_modelopt_smoke_case(
+    _make_modelopt_ci_case(
         "flux2_modelopt_fp8_t2i",
         model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
         modality="image",
-        sampling_params=MODELOPT_T2I_SMOKE_sampling_params,
+        sampling_params=MODELOPT_T2I_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
     ),
-    _make_modelopt_smoke_case(
+    _make_modelopt_ci_case(
         "wan22_modelopt_fp8_t2v",
         model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
         modality="video",
-        sampling_params=MODELOPT_T2V_SMOKE_sampling_params,
+        sampling_params=MODELOPT_T2V_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
     ),
-    _make_modelopt_smoke_case(
+    _make_modelopt_ci_case(
         "flux1_modelopt_nvfp4_t2i",
         model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
         modality="image",
-        sampling_params=MODELOPT_T2I_SMOKE_sampling_params,
+        sampling_params=MODELOPT_T2I_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
     ),
-    _make_modelopt_smoke_case(
+    _make_modelopt_ci_case(
         "flux2_modelopt_nvfp4_t2i",
         model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
         modality="image",
-        sampling_params=MODELOPT_T2I_SMOKE_sampling_params,
+        sampling_params=MODELOPT_T2I_CI_sampling_params,
         extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
     ),
-    _make_modelopt_smoke_case(
+    _make_modelopt_ci_case(
         "wan22_modelopt_nvfp4_t2v",
         model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
         modality="video",
-        sampling_params=MODELOPT_T2V_SMOKE_sampling_params,
+        sampling_params=MODELOPT_T2V_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
         env_vars={"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"},
     ),
@@ -906,7 +906,7 @@ TWO_GPU_CASES_A = [
         ),
         T2V_sampling_params,
     ),
-    # TeaCache smoke test for Wan2.2 T2V A14B — verifies enable_teacache=True
+    # TeaCache bring-up test for Wan2.2 T2V A14B — verifies enable_teacache=True
     # doesn't crash. Perf check disabled because Wan2.2-specific TeaCache
     # coefficients are not yet calibrated (teacache_params=None, so no speedup).
     DiffusionTestCase(

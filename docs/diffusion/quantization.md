@@ -51,7 +51,7 @@ backend.
 ## Validated ModelOpt Checkpoints
 
 This section is the canonical support matrix for the six diffusion ModelOpt
-checkpoints currently wired up in SGLang docs and smoke tests.
+checkpoints currently wired up in SGLang docs and B200 CI coverage.
 
 Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
@@ -69,7 +69,7 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 | `NVFP4` | `black-forest-labs/FLUX.2-dev` | `--transformer-weights-path` | `black-forest-labs/FLUX.2-dev-NVFP4` | packed-QKV load path | official raw export repo; validated packed export detection and runtime layout handling |
 | `NVFP4` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer` | primary `transformer` quantized with ModelOpt NVFP4, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint, and current B200/Blackwell bring-up uses `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn` |
 
-These six checkpoints are also the intended smoke set for the B200 diffusion CI
+These six checkpoints are also the intended case set for the B200 diffusion CI
 job (`multimodal-gen-test-1-b200`).
 
 ## ModelOpt FP8
