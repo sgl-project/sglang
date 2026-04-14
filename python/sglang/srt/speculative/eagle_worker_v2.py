@@ -1,6 +1,8 @@
 import contextlib
 import logging
 import time
+from copy import deepcopy
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
@@ -27,7 +29,11 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -95,7 +101,6 @@ class EagleDraftWorker(BaseDraftWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
@@ -115,10 +120,15 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
 
+        # Draft and target workers should not mutate the same ServerArgs instance.
+        # EAGLE3 draft models can use a different attention architecture than the
+        # target model, and model-specific adjustments must stay local to the draft.
+        draft_server_args = deepcopy(server_args)
+
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
+        backup_disable_cuda_graph = draft_server_args.disable_cuda_graph
+        draft_server_args.disable_cuda_graph = True
 
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
@@ -127,7 +137,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+        if draft_server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
@@ -136,7 +146,7 @@ class EagleDraftWorker(BaseDraftWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
-                server_args=server_args,
+                server_args=draft_server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 pp_rank=0,  # FIXME
@@ -167,7 +177,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Init attention backend and cuda graphs
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context if draft_server_args.enable_dp_attention else empty_context
         )
         with self.draft_tp_context(
             self.draft_runner.tp_group
@@ -666,6 +676,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             nccl_port,
             target_worker,
         )
+        self.target_server_args = target_worker.model_runner.server_args
+        self.draft_server_args = self._draft_worker.draft_runner.server_args
+        set_global_server_args_for_scheduler(self.target_server_args)
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -687,6 +700,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    @contextmanager
+    def _use_server_args(self, server_args: ServerArgs):
+        prev_server_args = get_global_server_args()
+        if prev_server_args is not server_args:
+            set_global_server_args_for_scheduler(server_args)
+        try:
+            yield
+        finally:
+            if prev_server_args is not server_args:
+                set_global_server_args_for_scheduler(prev_server_args)
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (
             model_worker_batch.forward_mode.is_extend()
@@ -694,13 +718,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(
-                model_worker_batch
-            )
+            with self._use_server_args(self.target_server_args):
+                batch_output = self.target_worker.forward_batch_generation(
+                    model_worker_batch
+                )
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with self.draft_worker.draft_tp_context(
+            with self._use_server_args(self.draft_server_args), self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 batch_output.next_draft_input = (
@@ -723,14 +748,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ), self._use_server_args(self.draft_server_args), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
+            with self._use_server_args(self.draft_server_args), self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.draft_worker._draft_extend_for_decode(
@@ -753,7 +778,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
-        with self.plan_stream_ctx:
+        with self._use_server_args(self.target_server_args), self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
@@ -771,14 +796,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Some values such as custom_mask and position depend on the output of draft,
             # so the previous plan step used the wrong values. Here, we need to run the related
             # computation again to update them to the correct values.
-            self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
-                verify_input,
-                (
-                    self.target_worker.model_runner.graph_runner.bs
-                    if can_run_cuda_graph
-                    else None
-                ),
-            )
+            with self._use_server_args(self.target_server_args):
+                self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+                    verify_input,
+                    (
+                        self.target_worker.model_runner.graph_runner.bs
+                        if can_run_cuda_graph
+                        else None
+                    ),
+                )
 
         # Prepare grammar data on CPU if needed
         if batch.has_grammar:
@@ -789,12 +815,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute)
-        forward_batch_output = self.target_worker.forward_batch_generation(
-            model_worker_batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
+        with self._use_server_args(self.target_server_args):
+            forward_batch_output = self.target_worker.forward_batch_generation(
+                model_worker_batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding
