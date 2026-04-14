@@ -23,7 +23,7 @@ class TestWatchdog(CustomTestCase):
 
     def test_watchdog_real(self):
         """Test Real watchdog feeding logic and creation."""
-        wd = Watchdog.create("test_real", 1.0)
+        wd = Watchdog.create("test_real", 1.0, soft=True)
         self.assertEqual(wd.__class__.__name__, "_WatchdogReal")
         self.assertTrue(wd._active)
         
