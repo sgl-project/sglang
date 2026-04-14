@@ -2189,6 +2189,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
+                "Step3p5ForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
