@@ -301,11 +301,11 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 | Argument                  | Defaults | Options   | Server supported |
 |---------------------------|----------|-----------|:----------------:|
-| --cpu-offload-gb          | `0`      | Type: int (must be used with `--disable-cuda-graph`) |      A2, A3      |
+| `--cpu-offload-gb`        | `0`      | Type: int (must be used with `--disable-cuda-graph`) |      A2, A3      |
 | `--offload-group-size`    | `-1`     | Type: int |      A2, A3      |
 | `--offload-num-in-group`  | `1`      | Type: int |      A2, A3      |
 | `--offload-prefetch-step` | `1`      | Type: int |      A2, A3      |
-| --offload-mode            | `cpu`    | `cpu`,<br/> `meta`,<br/> `sharded_gpu` (must be used with `--disable-cuda-graph`, only supported for DeepSeek) |      A2, A3      |
+| `--offload-mode`          | `cpu`    | `cpu`,<br/> `meta`,<br/> `sharded_gpu` (must be used with `--disable-cuda-graph`, only supported for DeepSeek) |      A2, A3      |
 
 ## Args for multi-item scoring
 
