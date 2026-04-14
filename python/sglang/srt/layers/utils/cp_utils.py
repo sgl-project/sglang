@@ -267,7 +267,6 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
     value_cache_full = cp_all_gather_rerange_kv_cache(
         v, cp_size, forward_batch, torch.cuda.current_stream()
     )
-
     forward_batch.token_to_kv_pool.set_kv_buffer(
         layer,
         cache_loc,
@@ -276,7 +275,6 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
         layer.k_scale,
         layer.v_scale,
     )
-
 
 def cp_attn_forward_extend(
     forward_batch,
