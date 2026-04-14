@@ -1068,9 +1068,16 @@ class LTX2DenoisingStage(DenoisingStage):
                 v_mod = v_mod.float()
                 a_v_mod = a_v_mod.float()
         else:
+            # NOTE: this flag must be identical across all SP ranks so that
+            # every rank executes the same number of model-forward calls (each
+            # of which contains NCCL collectives).
+            # _should_apply_ltx2_ti2v() is SP-rank-dependent (only the rank owning the first latent
+            # frame returns True), so we must NOT use it here.
+            # Instead we check the rank-invariant attribute that is always set on every
+            # rank when the request is a TI2V request.
             use_split_two_stage_ti2v_guider = (
                 server_args.pipeline_class_name == "LTX2TwoStagePipeline"
-                and self._should_apply_ltx2_ti2v(batch)
+                and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
             )
 
             def cat_or_none(items: list[torch.Tensor | None]) -> torch.Tensor | None:
