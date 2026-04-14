@@ -128,6 +128,9 @@ class PoolStats:
             stats.swa_token_usage = self.swa_token_usage
         if self.is_hybrid_ssm:
             stats.mamba_usage = self.mamba_usage
+        stats.kv_available_tokens = self.full_available_size
+        stats.kv_evictable_tokens = self.full_evictable_size
+        stats.kv_used_tokens = self.full_num_used
 
 
 class SchedulerRuntimeCheckerMixin:
