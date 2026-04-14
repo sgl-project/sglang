@@ -79,6 +79,36 @@ def _make_param_like(
     return new_param
 
 
+def _maybe_dequantize_fp8(
+    full_tensor: torch.Tensor,
+    target_dtype: torch.dtype,
+    target_param_name: str,
+    param_sd: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Auto-dequantize an FP8 checkpoint weight when the model parameter expects a higher-precision type.
+
+    Some modules (e.g. AdaLayerNormZero) don't accept quant_config, so their
+    parameters remain in higher precision even when the checkpoint stores FP8
+    weights.  In that case we multiply by the per-tensor weight_scale to
+    recover the original unquantized value.
+    """
+    if not (
+        full_tensor.dtype == torch.float8_e4m3fn and target_dtype != torch.float8_e4m3fn
+    ):
+        return full_tensor
+
+    scale_key = target_param_name.rsplit(".", 1)[0] + ".weight_scale"
+    scale_tensor = param_sd.get(scale_key)
+    if scale_tensor is not None:
+        full_tensor = full_tensor.to(torch.float32) * scale_tensor.float()
+        logger.debug(
+            "Auto-dequantized FP8 weight %s using %s",
+            target_param_name,
+            scale_key,
+        )
+    return full_tensor
+
+
 # TODO(PY): add compile option
 def maybe_load_fsdp_model(
     model_cls: type[nn.Module],
@@ -331,6 +361,10 @@ def load_model_from_full_model_state_dict(
         else:
             target_dtype = meta_sharded_param.dtype
 
+        full_tensor = _maybe_dequantize_fp8(
+            full_tensor, target_dtype, target_param_name, custom_param_sd
+        )
+
         if full_tensor.dtype != target_dtype:
             mismatch_key = (full_tensor.dtype, target_dtype)
             if (
@@ -376,7 +410,16 @@ def load_model_from_full_model_state_dict(
                 ):
                     requires_grad = False
                 temp_param.requires_grad = requires_grad
-                weight_loader(temp_param, full_tensor)
+                try:
+                    weight_loader(temp_param, full_tensor)
+                except AssertionError as exc:
+                    raise AssertionError(
+                        "Failed to shard/load parameter "
+                        f"{target_param_name}: full_tensor.shape={tuple(full_tensor.shape)}, "
+                        f"meta_sharded_param.shape={tuple(meta_sharded_param.shape)}, "
+                        f"temp_param.shape={tuple(temp_param.shape)}, "
+                        f"param_cls={type(actual_param).__name__}"
+                    ) from exc
                 sharded_tensor = temp_param.data
             else:
                 # In cases where parts of the model aren't sharded, some parameters will be plain tensors
