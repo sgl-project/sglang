@@ -686,6 +686,18 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), 0)
         tree.sanity_check()
 
+    def test_mamba_evict_result_accounting(self):
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 3)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        result = tree.evict(EvictParams(num_tokens=len(seq)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
+        self.assertGreaterEqual(result.mamba_num_evicted, 1)
+        tree.sanity_check()
+
     def test_mamba_evict_cascades_on_full_leaf(self):
         if not self.cfg.has_mamba:
             self.skipTest("requires Mamba component")
@@ -746,6 +758,20 @@ class UnifiedRadixCacheSuite:
 
         result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_short)))
         self.assertGreater(result.swa_num_tokens_evicted, 0)
+        tree.sanity_check()
+
+    def test_swa_evict_cascades_mamba(self):
+        """SWA eviction on an internal node cascades to Mamba."""
+        if not self.cfg.has_swa or not self.cfg.has_mamba:
+            self.skipTest("requires SWA and Mamba components")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq_short = self._make_seq(1, 3)
+        seq_long = seq_short + self._make_seq(500, 4)
+        self._insert(tree, allocator, req_to_token_pool, seq_short)
+        self._insert(tree, allocator, req_to_token_pool, seq_long)
+
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_short)))
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, 0)
         tree.sanity_check()
 
     def test_swa_evict_full_leaf_cascades_all(self):
