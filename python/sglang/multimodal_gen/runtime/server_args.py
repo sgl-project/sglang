@@ -130,8 +130,8 @@ class ServerArgs:
     dp_size: int = 1
     # number of gpu in a dp group
     dp_degree: int = 1
-    # cfg parallel
-    enable_cfg_parallel: bool = False
+    # cfg parallel (None = auto-decide based on num_gpus)
+    enable_cfg_parallel: Optional[bool] = None
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -428,12 +428,35 @@ class ServerArgs:
         sp_unspecified = self.sp_degree is None
         ulysses_unspecified = self.ulysses_degree is None
         ring_unspecified = self.ring_degree is None
+        cfg_unspecified = self.enable_cfg_parallel is None
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
 
         if self.tp_size is None:
             self.tp_size = 1
+
+        # Auto-enable CFG parallel when user hasn't set any parallelism flags
+        # and there are enough GPUs.  CFG parallel is the best default for most
+        # models (all that use classifier-free guidance, i.e. guidance_scale > 1).
+        if cfg_unspecified:
+            cfg_group_size = self.dp_size * self.tp_size * 2
+            if (
+                self.num_gpus >= 2
+                and self.num_gpus % cfg_group_size == 0
+                and sp_unspecified
+                and ulysses_unspecified
+                and ring_unspecified
+            ):
+                self.enable_cfg_parallel = True
+                logger.info(
+                    "Automatically enabled CFG parallel for %d GPUs. "
+                    "Use --sp-degree / --ulysses-degree to use sequence "
+                    "parallelism instead.",
+                    self.num_gpus,
+                )
+            else:
+                self.enable_cfg_parallel = False
 
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
@@ -679,8 +702,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cfg-parallel",
             action="store_true",
-            default=ServerArgs.enable_cfg_parallel,
-            help="Enable cfg parallel.",
+            default=None,
+            help="Enable cfg parallel. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
         )
         parser.add_argument(
             "--data-parallel-size",
