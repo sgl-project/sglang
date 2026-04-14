@@ -13,6 +13,15 @@ class UpdateWeightFromDiskReqInput:
 
 
 @dataclass
+class UpdateWeightFromTensorReqInput:
+    """Request to update model weights from tensor payloads for diffusion models."""
+
+    serialized_named_tensors: list[str | bytes]
+    load_format: str | None = None
+    target_modules: list[str] | None = None
+
+
+@dataclass
 class GetWeightsChecksumReqInput:
     """Compute SHA-256 checksum of loaded module weights for verification."""
 

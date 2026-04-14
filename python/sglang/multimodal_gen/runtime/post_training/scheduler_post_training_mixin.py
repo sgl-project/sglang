@@ -22,3 +22,17 @@ class SchedulerPostTrainingMixin:
             output={"success": success, "message": message},
             error=None if success else message,
         )
+
+    def _handle_update_weights_from_tensor(
+        self: Scheduler, reqs: List[Any]
+    ) -> OutputBatch:
+        req = reqs[0]
+        success, message = self.worker.update_weights_from_tensor(req)
+        if self.server_args.tp_size > 1:
+            import torch
+
+            torch.distributed.barrier(group=self.worker.tp_cpu_group)
+        return OutputBatch(
+            output={"success": success, "message": message},
+            error=None if success else message,
+        )

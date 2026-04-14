@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from sglang.multimodal_gen.runtime.distributed import get_tp_rank
 from sglang.multimodal_gen.runtime.loader.weights_updater import WeightsUpdater
+from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+        UpdateWeightFromTensorReqInput,
+    )
     from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 
 
@@ -28,3 +34,37 @@ class GPUWorkerPostTrainingMixin:
             self.server_args.model_path = model_path
             self.pipeline.model_path = model_path
         return success, message
+
+    def update_weights_from_tensor(
+        self: GPUWorker,
+        req: UpdateWeightFromTensorReqInput,
+    ) -> tuple[bool, str]:
+        if not self.pipeline:
+            return False, "Pipeline is not initialized"
+
+        payloads = req.serialized_named_tensors
+        if not payloads:
+            return False, "serialized_named_tensors is required"
+
+        tp_world_size = self.server_args.tp_size
+        if len(payloads) not in (1, tp_world_size):
+            return (
+                False,
+                "serialized_named_tensors size must be 1 or tp_size "
+                f"({tp_world_size}), got {len(payloads)}",
+            )
+
+        payload_idx = get_tp_rank() if len(payloads) == tp_world_size else 0
+
+        monkey_patch_torch_reductions()
+        try:
+            named_tensors = MultiprocessingSerializer.deserialize(payloads[payload_idx])
+        except Exception as e:
+            return False, f"Failed to deserialize serialized_named_tensors: {e}"
+
+        updater = WeightsUpdater(self.pipeline)
+        return updater.update_weights_from_tensor(
+            named_tensors=named_tensors,
+            load_format=req.load_format,
+            target_modules=req.target_modules,
+        )
