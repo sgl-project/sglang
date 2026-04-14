@@ -180,15 +180,43 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
     print("Permission granted. Triggering rerun of failed or skipped workflows.")
 
-    # Check if PR has sgl-kernel changes - if so, we need full reruns
-    # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts
+    # Check if PR has sgl-kernel changes - if so, we may need full reruns
+    # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
+    # However, if the wheel already built successfully for this commit,
+    # we can just rerun failed jobs — the artifact is already there.
     sgl_kernel_changes = has_sgl_kernel_changes(pr)
     if sgl_kernel_changes:
-        print("PR has sgl-kernel changes - will use full rerun to rebuild kernel")
+        print("PR has sgl-kernel changes - checking if kernel wheel already built")
 
     # Get the SHA of the latest commit in the PR
     head_sha = pr.head.sha
     print(f"Checking workflows for commit: {head_sha}")
+
+    # If PR has sgl-kernel changes, check whether the wheel build already
+    # succeeded for this commit. If so, we can skip the full rerun and just
+    # rerun failed jobs — avoids retriggering all tests (including flaky ones).
+    kernel_wheel_built = False
+    if sgl_kernel_changes:
+        try:
+            check_runs = gh_repo.get_commit(head_sha).get_check_runs()
+            for cr in check_runs:
+                if "sgl-kernel-build-wheels" in cr.name and cr.conclusion == "success":
+                    kernel_wheel_built = True
+                    print(
+                        f"sgl-kernel-build-wheels already passed (check run {cr.id})"
+                        " - using rerun_failed_jobs"
+                    )
+                    break
+            if not kernel_wheel_built:
+                print(
+                    "sgl-kernel-build-wheels has not passed yet"
+                    " - will use full rerun"
+                )
+        except Exception as e:
+            print(
+                f"Failed to check sgl-kernel-build-wheels status: {e}"
+                " - falling back to full rerun"
+            )
 
     # List all workflow runs for this commit
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
@@ -201,7 +229,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         if run.conclusion == "failure":
             print(f"Rerunning failed workflow: {run.name} (ID: {run.id})")
             try:
-                if sgl_kernel_changes:
+                if sgl_kernel_changes and not kernel_wheel_built:
                     # Full rerun to ensure sgl-kernel-build-wheels runs
                     # and produces fresh artifacts for dependent jobs
                     run.rerun()
@@ -271,6 +299,9 @@ def handle_rerun_stage(
         "stage-c-test-deepep-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
+        "multimodal-gen-component-accuracy-1-gpu",
+        "multimodal-gen-component-accuracy-2-gpu",
+        "multimodal-gen-test-1-b200",
     ]
 
     # Valid AMD stage names that support target_stage
@@ -474,56 +505,69 @@ def resolve_test_file(file_part):
     return file_part, None
 
 
-def detect_cuda_suite(file_path_from_test):
+def detect_suite(file_path_from_test):
     """
-    Read a test file and extract the suite from register_cuda_ci(suite="...").
+    Read a test file and extract the suite from register_cuda_ci or register_cpu_ci.
 
-    Returns (suite_name, runner_label, use_deepep, error_message).
+    Returns (suite_name, runner_label, use_deepep, is_cpu, error_message).
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
         content = f.read()
 
+    # Try CUDA first
     match = re.search(
         r'^[^#\n]*register_cuda_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
         content,
         re.MULTILINE,
     )
-    if not match:
-        return (
-            None,
-            None,
-            False,
-            (
-                f"No `register_cuda_ci()` found in `{full_path}`.\n\n"
-                f"This file may not be a registered CUDA CI test."
-            ),
-        )
+    if match:
+        suite = match.group(1)
+        runner = CUDA_SUITE_TO_RUNNER.get(suite)
+        if not runner:
+            known = ", ".join(f"`{s}`" for s in sorted(CUDA_SUITE_TO_RUNNER))
+            return (
+                suite,
+                None,
+                False,
+                False,
+                (
+                    f"Unknown CUDA suite `{suite}` in `{full_path}`.\n\n"
+                    f"Known suites: {known}"
+                ),
+            )
+        use_deepep = suite in DEEPEP_SUITES
+        return suite, runner, use_deepep, False, None
 
-    suite = match.group(1)
-    runner = CUDA_SUITE_TO_RUNNER.get(suite)
-    if not runner:
-        known = ", ".join(f"`{s}`" for s in sorted(CUDA_SUITE_TO_RUNNER))
-        return (
-            suite,
-            None,
-            False,
-            (
-                f"Unknown CUDA suite `{suite}` in `{full_path}`.\n\n"
-                f"Known suites: {known}"
-            ),
-        )
-    use_deepep = suite in DEEPEP_SUITES
-    return suite, runner, use_deepep, None
+    # Try CPU
+    match = re.search(
+        r'^[^#\n]*register_cpu_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
+        content,
+        re.MULTILINE,
+    )
+    if match:
+        suite = match.group(1)
+        return suite, "ubuntu-latest", False, True, None
+
+    return (
+        None,
+        None,
+        False,
+        False,
+        (
+            f"No `register_cuda_ci()` or `register_cpu_ci()` found in `{full_path}`.\n\n"
+            f"This file may not be a registered CI test."
+        ),
+    )
 
 
-def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
+def _resolve_test_spec(test_spec):
     """
-    Resolve a single test spec and dispatch a workflow run.
+    Resolve a single test spec into its components without dispatching.
 
-    Returns a dict with keys: spec, success, test_command, runner_label, run_url, error.
+    Returns a dict with keys: spec, resolved_path, test_command, suite,
+    runner_label, use_deepep, is_cpu, error.
     """
-    # Parse spec: split on :: to get file path and optional test selector
     if "::" in test_spec:
         file_part, test_selector = test_spec.split("::", 1)
     else:
@@ -534,25 +578,48 @@ def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
     if test_selector:
         test_selector = test_selector.strip()
 
-    # Resolve file path
     resolved_path, err = resolve_test_file(file_part)
     if err:
-        return {"spec": test_spec, "success": False, "error": err}
+        return {"spec": test_spec, "error": err}
 
-    # Detect suite and runner
-    suite, runner_label, use_deepep, err = detect_cuda_suite(resolved_path)
+    suite, runner_label, use_deepep, is_cpu, err = detect_suite(resolved_path)
     if err:
-        return {"spec": test_spec, "success": False, "error": err}
+        return {"spec": test_spec, "error": err}
 
-    # Build test_command: file path (+ optional test selector as unittest arg)
     test_command = resolved_path
     if test_selector:
         test_command = f"{resolved_path} {test_selector}"
 
     print(
         f"Resolved: file={resolved_path}, selector={test_selector}, "
-        f"suite={suite}, runner={runner_label}, deepep={use_deepep}, command='{test_command}'"
+        f"suite={suite}, runner={runner_label}, deepep={use_deepep}, "
+        f"cpu={is_cpu}, command='{test_command}'"
     )
+    return {
+        "spec": test_spec,
+        "test_command": test_command,
+        "suite": suite,
+        "runner_label": runner_label,
+        "use_deepep": use_deepep,
+        "is_cpu": is_cpu,
+        "error": None,
+    }
+
+
+def _dispatch_batch(gh_repo, pr, batch, token):
+    """
+    Dispatch a single workflow run for a batch of resolved test specs
+    that share the same (runner_label, use_deepep, is_cpu).
+
+    Returns a dict with keys: specs, success, test_commands, runner_label, run_url, error.
+    """
+    test_commands = [r["test_command"] for r in batch]
+    runner_label = batch[0]["runner_label"]
+    use_deepep = batch[0]["use_deepep"]
+    is_cpu = batch[0]["is_cpu"]
+
+    # Join multiple commands with newlines for the workflow to iterate over
+    combined_command = "\n".join(test_commands)
 
     try:
         workflow_name = "Rerun Test"
@@ -565,7 +632,7 @@ def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
 
         if not target_workflow:
             return {
-                "spec": test_spec,
+                "specs": [r["spec"] for r in batch],
                 "success": False,
                 "error": f"{workflow_name} workflow not found",
             }
@@ -575,22 +642,18 @@ def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
         )
 
         pr_head_sha = None
+        inputs = {
+            "test_command": combined_command,
+            "runner_label": runner_label,
+            "use_deepep": str(use_deepep).lower(),
+            "is_cpu": str(is_cpu).lower(),
+        }
         if is_fork:
             ref = "main"
             pr_head_sha = pr.head.sha
-            inputs = {
-                "test_command": test_command,
-                "runner_label": runner_label,
-                "pr_head_sha": pr_head_sha,
-                "use_deepep": str(use_deepep).lower(),
-            }
+            inputs["pr_head_sha"] = pr_head_sha
         else:
             ref = pr.head.ref
-            inputs = {
-                "test_command": test_command,
-                "runner_label": runner_label,
-                "use_deepep": str(use_deepep).lower(),
-            }
 
         dispatch_time = time.time()
 
@@ -607,12 +670,12 @@ def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
         if not success:
             print(f"Dispatch failed: {dispatch_resp.status_code} {dispatch_resp.text}")
             return {
-                "spec": test_spec,
+                "specs": [r["spec"] for r in batch],
                 "success": False,
                 "error": f"Dispatch failed: {dispatch_resp.status_code}",
             }
 
-        print(f"Successfully triggered rerun-test: {test_command}")
+        print(f"Successfully triggered rerun-test: {combined_command}")
 
         run_url = find_workflow_run_url(
             gh_repo,
@@ -623,25 +686,29 @@ def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
             dispatch_time,
             pr_head_sha=pr_head_sha,
             max_wait=30,
-            test_command=test_command,
+            test_command=combined_command,
         )
         return {
-            "spec": test_spec,
+            "specs": [r["spec"] for r in batch],
             "success": True,
-            "test_command": test_command,
+            "test_commands": test_commands,
             "runner_label": runner_label,
             "run_url": run_url,
         }
 
     except Exception as e:
-        print(f"Error triggering rerun-test for {test_spec}: {e}")
-        return {"spec": test_spec, "success": False, "error": str(e)}
+        print(f"Error triggering rerun-test for batch: {e}")
+        return {
+            "specs": [r["spec"] for r in batch],
+            "success": False,
+            "error": str(e),
+        }
 
 
 def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
     """
-    Handles the /rerun-test command. Accepts a list of test specs and dispatches
-    a workflow run for each, posting a single consolidated comment.
+    Handles the /rerun-test command. Resolves all test specs, groups them by
+    (runner_label, use_deepep, is_cpu), and dispatches one workflow per group.
     """
     # SECURITY: For fork PRs, only allow /rerun-test if the commenter has write+ permission.
     # This command checks out and executes code from the PR branch on self-hosted GPU
@@ -680,36 +747,60 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
         )
         return False
 
-    results = []
+    # Phase 1: Resolve all specs
+    resolved = []
+    resolve_failures = []
     for spec in test_specs:
-        results.append(_resolve_and_dispatch_ut(gh_repo, pr, spec, token))
+        r = _resolve_test_spec(spec)
+        if r.get("error"):
+            resolve_failures.append(r)
+        else:
+            resolved.append(r)
+
+    # Phase 2: Group by (runner_label, use_deepep, is_cpu)
+    groups = {}
+    for r in resolved:
+        key = (r["runner_label"], r["use_deepep"], r["is_cpu"])
+        groups.setdefault(key, []).append(r)
+
+    # Phase 3: Dispatch one workflow per group
+    dispatch_results = []
+    for batch in groups.values():
+        dispatch_results.append(_dispatch_batch(gh_repo, pr, batch, token))
 
     # Build consolidated comment
-    successes = [r for r in results if r["success"]]
-    failures = [r for r in results if not r["success"]]
-
     lines = []
-    for r in successes:
-        if r.get("run_url"):
-            lines.append(
-                f"✅ `{r['runner_label']}`: [View workflow run]({r['run_url']})\n"
-                f"```\ncd test/ && python3 {r['test_command']}\n```"
+    for dr in dispatch_results:
+        if dr["success"]:
+            cmds = "\n".join(
+                f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
             )
+            if dr.get("run_url"):
+                lines.append(
+                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
+                    f"[View workflow run]({dr['run_url']})\n"
+                    f"```\n{cmds}\n```"
+                )
+            else:
+                lines.append(
+                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}):\n"
+                    f"```\n{cmds}\n```\n"
+                    f"⚠️ Could not retrieve workflow run URL. "
+                    f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                )
         else:
-            lines.append(
-                f"✅ `{r['runner_label']}`:\n"
-                f"```\ncd test/ && python3 {r['test_command']}\n```\n"
-                f"⚠️ Could not retrieve workflow run URL. "
-                f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
-            )
-    for r in failures:
+            specs_str = ", ".join(f"`{s}`" for s in dr["specs"])
+            lines.append(f"❌ {specs_str}: {dr['error']}")
+
+    for r in resolve_failures:
         lines.append(f"❌ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
 
+    successes = [dr for dr in dispatch_results if dr["success"]]
     if successes:
         comment.create_reaction("+1")
-    if failures and not successes:
+    if not successes and (resolve_failures or dispatch_results):
         comment.create_reaction("confused")
 
     pr.create_issue_comment(body)

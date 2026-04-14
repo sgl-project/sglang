@@ -262,7 +262,6 @@ done
 2. SGLang Model Gateway (former Router):
 
 ```shell
-export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
