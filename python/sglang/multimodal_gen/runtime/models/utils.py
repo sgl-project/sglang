@@ -8,6 +8,17 @@ from typing import Any
 
 import torch
 
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_gfx95_supported,
+    is_hip,
+)
+
+_is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+
 
 def set_weight_attrs(
     weight: torch.Tensor,
