@@ -493,12 +493,10 @@ class ServerArgs:
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
 
     def _model_default_uses_cfg(self) -> bool:
-        """Check whether the model uses classifier-free guidance by default.
+        """
+        Check whether the model uses classifier-free guidance by default.
 
-        Mirrors the runtime CFG decision in ``Req.validate()``: CFG is active
-        when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
-        ``get_model_info`` is already cached from ``PipelineConfig.from_kwargs``,
-        so this adds no I/O.
+        CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
         """
         model_info = get_model_info(self.model_path, self.backend, self.model_id)
         if model_info is None:
