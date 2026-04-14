@@ -62,7 +62,8 @@ __device__ __forceinline__ float to_float(const T& x) {
   else
     return static_cast<float>(x);
 }
-hao template <typename T>
+
+template <typename T>
 __device__ __forceinline__ T from_float(float f) {
   if constexpr (std::is_same<T, __half>::value)
     return __float2half(f);
