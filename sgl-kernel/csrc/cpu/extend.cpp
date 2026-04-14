@@ -204,6 +204,7 @@ void extend_attention_kernel_impl(
             /* C     */ s_i);
 
         // apply causal mask
+        // [Note] condition to apply causal mask.
         // Mask any block whose last key (n + n_size - 1) is strictly after the first query position (m), i.e. n +
         // n_size - 1 > m. The original condition was `num_keys - n <= BLOCK_N` (last n-block only). That was correct
         // when BLOCK_M <= BLOCK_N/2 because earlier n-blocks were guaranteed to contain only past keys.  With
@@ -216,6 +217,7 @@ void extend_attention_kernel_impl(
         if (n + n_size - 1 > m) {
           for (int row = 0; row < m_size; ++row) {
             int last_col = m + row - n;
+            // [Note] mask the entire row if last_col < 0.
             // Clamp to -1: when n > m + row every key in this block is a future
             // key, so the entire row should be masked.  Without this clamp,
             // last_col+1 <= 0 and fill_stub would write before row_ptr.
