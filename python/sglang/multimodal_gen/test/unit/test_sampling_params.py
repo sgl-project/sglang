@@ -4,8 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
     is_ltx23_native_variant,
     sync_ltx23_runtime_vae_markers,
 )
@@ -199,9 +199,7 @@ class TestSamplingParamsSubclass(unittest.TestCase):
                     ltx_variant="ltx_2_3",
                     condition_encoder_subdir="ltx23_image_encoder",
                     video_decoder_variant="ltx_2_3",
-                    video_decoder_config={
-                        "_class_name": "AutoencoderKLLTX2Video"
-                    },
+                    video_decoder_config={"_class_name": "AutoencoderKLLTX2Video"},
                 )
             ),
         )

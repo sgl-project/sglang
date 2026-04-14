@@ -9,7 +9,9 @@ class _DummyQuantMethod:
     def __init__(self) -> None:
         self.last_bias = None
 
-    def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None):
+    def apply(
+        self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
+    ):
         self.last_bias = bias
         return F.linear(x, layer.weight, bias)
 
@@ -20,7 +22,9 @@ class _DummyRowParallelLinear(nn.Module):
         self.weight = nn.Parameter(
             torch.randn(8, 16, dtype=torch.bfloat16), requires_grad=False
         )
-        self.bias = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
+        self.bias = nn.Parameter(
+            torch.randn(8, dtype=torch.bfloat16), requires_grad=False
+        )
         self.input_is_parallel = True
         self.tp_size = 1
         self.tp_rank = 0

@@ -5,11 +5,11 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_dump import (
-    maybe_save_ltx23_ti2v_tensor,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_dump import (
+    maybe_save_ltx23_ti2v_tensor,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -88,10 +88,14 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
         phase = batch.extra.get("ltx2_phase")
         if phase == "stage1":
             maybe_save_ltx23_ti2v_tensor("sglang_stage1_video_latent", batch.latents)
-            maybe_save_ltx23_ti2v_tensor("sglang_stage1_audio_latent", batch.audio_latents)
+            maybe_save_ltx23_ti2v_tensor(
+                "sglang_stage1_audio_latent", batch.audio_latents
+            )
         elif phase == "stage2":
             maybe_save_ltx23_ti2v_tensor("sglang_stage2_video_latents", batch.latents)
-            maybe_save_ltx23_ti2v_tensor("sglang_stage2_audio_latents", batch.audio_latents)
+            maybe_save_ltx23_ti2v_tensor(
+                "sglang_stage2_audio_latents", batch.audio_latents
+            )
 
         if isinstance(self.transformer, OffloadableDiTMixin):
             for manager in self.transformer.layerwise_offload_managers:
@@ -173,9 +177,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             and batch.image_path is not None
             and isinstance(batch.latents, torch.Tensor)
         )
-        if (
-            is_native_ti2v
-        ):
+        if is_native_ti2v:
             # Official two-stage TI2V keeps the upsampled stage-2 latent as the
             # clean background and only overwrites the conditioned frame tokens.
             batch.ltx2_ti2v_clean_latent_background = batch.latents.detach().clone()
@@ -192,13 +194,15 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 zero_clean_latent=True,
                 clean_latent_background=batch.ltx2_ti2v_clean_latent_background,
             )
-            video_noise = self._randn_like_with_batch_generators(prepared_latents, batch)
-            scaled_mask = denoise_mask.to(
-                device=prepared_latents.device, dtype=torch.float32
-            ) * noise_scale
+            video_noise = self._randn_like_with_batch_generators(
+                prepared_latents, batch
+            )
+            scaled_mask = (
+                denoise_mask.to(device=prepared_latents.device, dtype=torch.float32)
+                * noise_scale
+            )
             batch.latents = (
-                video_noise * scaled_mask
-                + prepared_latents * (1 - scaled_mask)
+                video_noise * scaled_mask + prepared_latents * (1 - scaled_mask)
             ).to(prepared_latents.dtype)
         else:
             video_noise = self._randn_like_with_batch_generators(batch.latents, batch)
@@ -210,9 +214,10 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             audio_noise = self._randn_like_with_batch_generators(
                 batch.audio_latents, batch
             )
-            audio_scaled_mask = torch.ones_like(
-                batch.audio_latents[..., :1], dtype=torch.float32
-            ) * noise_scale
+            audio_scaled_mask = (
+                torch.ones_like(batch.audio_latents[..., :1], dtype=torch.float32)
+                * noise_scale
+            )
             batch.audio_latents = (
                 audio_noise * audio_scaled_mask
                 + batch.audio_latents * (1 - audio_scaled_mask)

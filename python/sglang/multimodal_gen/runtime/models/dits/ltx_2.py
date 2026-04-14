@@ -1594,10 +1594,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 "audio_num_frames must be provided for RoPE coordinate generation."
             )
         perturbation_configs = kwargs.get("perturbation_configs")
-        if (
-            perturbation_configs is not None
-            and len(perturbation_configs) != batch_size
-        ):
+        if perturbation_configs is not None and len(perturbation_configs) != batch_size:
             raise ValueError(
                 "perturbation_configs length must match batch size, got "
                 f"{len(perturbation_configs)=} {batch_size=}."

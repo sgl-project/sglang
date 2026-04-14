@@ -127,7 +127,9 @@ class LTX2UpsampleStage(PipelineStage):
             batch.width,
         )
         self._repack_audio_latents(batch, server_args)
-        maybe_save_ltx23_ti2v_tensor("sglang_stage2_input_video_latents_packed", batch.latents)
+        maybe_save_ltx23_ti2v_tensor(
+            "sglang_stage2_input_video_latents_packed", batch.latents
+        )
         maybe_save_ltx23_ti2v_tensor(
             "sglang_stage2_input_audio_latents_packed", batch.audio_latents
         )

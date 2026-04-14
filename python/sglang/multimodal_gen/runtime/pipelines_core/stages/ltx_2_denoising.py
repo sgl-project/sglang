@@ -187,8 +187,10 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         denoise_mask[:, :num_img_tokens, :] = 0.0
         if clean_latent_background is not None:
-            clean_latent = clean_latent_background.detach().clone().to(
-                device=latents.device, dtype=latents.dtype
+            clean_latent = (
+                clean_latent_background.detach()
+                .clone()
+                .to(device=latents.device, dtype=latents.dtype)
             )
         elif zero_clean_latent:
             clean_latent = torch.zeros_like(latents)
@@ -226,7 +228,10 @@ class LTX2DenoisingStage(DenoisingStage):
     def _ltx2_resolve_probe_root(module):
         candidates = [module, getattr(module, "model", None)]
         for candidate in candidates:
-            if candidate is not None and getattr(candidate, "adaln_single", None) is not None:
+            if (
+                candidate is not None
+                and getattr(candidate, "adaln_single", None) is not None
+            ):
                 return candidate
         return module
 
@@ -1246,20 +1251,14 @@ class LTX2DenoisingStage(DenoisingStage):
         batched_prompt_timestep_video = (
             None
             if prompt_timestep_video is None
-            else self._repeat_batch_dim(
-                prompt_timestep_video, expanded_batch_size
-            )
+            else self._repeat_batch_dim(prompt_timestep_video, expanded_batch_size)
         )
         batched_prompt_timestep_audio = (
             None
             if prompt_timestep_audio is None
-            else self._repeat_batch_dim(
-                prompt_timestep_audio, expanded_batch_size
-            )
+            else self._repeat_batch_dim(prompt_timestep_audio, expanded_batch_size)
         )
-        batched_encoder_attention_mask = cat_or_none(
-            [item[3] for item in pass_specs]
-        )
+        batched_encoder_attention_mask = cat_or_none([item[3] for item in pass_specs])
         batched_audio_encoder_attention_mask = cat_or_none(
             [item[3] for item in pass_specs]
         )
@@ -1276,30 +1275,22 @@ class LTX2DenoisingStage(DenoisingStage):
         batched_video_self_attention_mask = (
             None
             if video_self_attention_mask is None
-            else self._repeat_batch_dim(
-                video_self_attention_mask, expanded_batch_size
-            )
+            else self._repeat_batch_dim(video_self_attention_mask, expanded_batch_size)
         )
         batched_audio_self_attention_mask = (
             None
             if audio_self_attention_mask is None
-            else self._repeat_batch_dim(
-                audio_self_attention_mask, expanded_batch_size
-            )
+            else self._repeat_batch_dim(audio_self_attention_mask, expanded_batch_size)
         )
         batched_a2v_cross_attention_mask = (
             None
             if a2v_cross_attention_mask is None
-            else self._repeat_batch_dim(
-                a2v_cross_attention_mask, expanded_batch_size
-            )
+            else self._repeat_batch_dim(a2v_cross_attention_mask, expanded_batch_size)
         )
         batched_v2a_cross_attention_mask = (
             None
             if v2a_cross_attention_mask is None
-            else self._repeat_batch_dim(
-                v2a_cross_attention_mask, expanded_batch_size
-            )
+            else self._repeat_batch_dim(v2a_cross_attention_mask, expanded_batch_size)
         )
         split_sizes = [1] * expanded_batch_size
 
@@ -1348,10 +1339,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 split_or_none(batched_audio_self_attention_mask),
                 split_or_none(batched_a2v_cross_attention_mask),
                 split_or_none(batched_v2a_cross_attention_mask),
-                (
-                    (cfg,)
-                    for cfg in perturbation_configs
-                ),
+                ((cfg,) for cfg in perturbation_configs),
                 strict=True,
             ):
                 video_chunk, audio_chunk = step.current_model(
@@ -1428,30 +1416,22 @@ class LTX2DenoisingStage(DenoisingStage):
         denoised_video_perturbed = (
             None
             if v_ptb is None
-            else self._ltx2_velocity_to_x0(
-                ctx.latents, v_ptb, video_sigma_for_x0
-            )
+            else self._ltx2_velocity_to_x0(ctx.latents, v_ptb, video_sigma_for_x0)
         )
         denoised_audio_perturbed = (
             None
             if a_v_ptb is None
-            else self._ltx2_velocity_to_x0(
-                ctx.audio_latents, a_v_ptb, sigma_val
-            )
+            else self._ltx2_velocity_to_x0(ctx.audio_latents, a_v_ptb, sigma_val)
         )
         denoised_video_modality = (
             None
             if v_mod is None
-            else self._ltx2_velocity_to_x0(
-                ctx.latents, v_mod, video_sigma_for_x0
-            )
+            else self._ltx2_velocity_to_x0(ctx.latents, v_mod, video_sigma_for_x0)
         )
         denoised_audio_modality = (
             None
             if a_v_mod is None
-            else self._ltx2_velocity_to_x0(
-                ctx.audio_latents, a_v_mod, sigma_val
-            )
+            else self._ltx2_velocity_to_x0(ctx.audio_latents, a_v_mod, sigma_val)
         )
 
         if dump_guidance_prefix is not None:

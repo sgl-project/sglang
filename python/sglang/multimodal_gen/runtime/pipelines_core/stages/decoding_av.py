@@ -147,7 +147,9 @@ class LTX2AVDecodingStage(DecodingStage):
                         )
                 # Decode spectrogram to waveform
                 waveform = self.vocoder(spectrogram)
-            maybe_save_ltx23_ti2v_tensor("sglang_generated_mel_spectrograms", spectrogram)
+            maybe_save_ltx23_ti2v_tensor(
+                "sglang_generated_mel_spectrograms", spectrogram
+            )
             maybe_save_ltx23_ti2v_tensor("sglang_decoded_audio_waveform", waveform)
             output_batch.audio = waveform.cpu().float()
             try:
