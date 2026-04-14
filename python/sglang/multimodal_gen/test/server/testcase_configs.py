@@ -3,10 +3,10 @@ Configuration and data structures for diffusion performance tests.
 
 Usage:
 
-pytest python/sglang/multimodal_gen/test/server/test_server_a.py
-# for a single testcase, look for the name of the testcase in ONE_GPU_CASES_A,
-# ONE_GPU_CASES_B, ONE_GPU_CASES_C, TWO_GPU_CASES_A, or TWO_GPU_CASES_B
-pytest python/sglang/multimodal_gen/test/server/test_server_a.py -k qwen_image_t2i
+pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py
+# for a single testcase, look for the name of the testcase in ONE_GPU_CASES,
+# ONE_GPU_CASES_C, or TWO_GPU_CASES
+pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_image_t2i
 
 
 To add a new testcase:

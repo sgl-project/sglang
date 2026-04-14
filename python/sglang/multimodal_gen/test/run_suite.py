@@ -22,8 +22,7 @@ import tabulate
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
-    ONE_GPU_CASES_A,
-    ONE_GPU_CASES_B,
+    ONE_GPU_CASES,
     TWO_GPU_CASES,
     DiffusionTestCase,
 )
@@ -77,8 +76,7 @@ FILE_SUITES.update(suites_ascend)
 
 PARAMETRIZED_CASE_GROUPS = {
     "1-gpu": [
-        ("test_server_a.py", ONE_GPU_CASES_A),
-        ("test_server_b.py", ONE_GPU_CASES_B),
+        ("test_server_1_gpu.py", ONE_GPU_CASES),
     ],
     "2-gpu": [
         ("test_server_2_gpu.py", TWO_GPU_CASES),
