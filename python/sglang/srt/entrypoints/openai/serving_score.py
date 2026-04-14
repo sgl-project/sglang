@@ -1,6 +1,7 @@
 import logging
 from typing import Union
 
+import torch
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -42,13 +43,38 @@ class OpenAIServingScore(OpenAIServingBase):
     ) -> Union[ScoringResponse, ErrorResponse]:
         """Handle the scoring request"""
         try:
-            # Use tokenizer_manager's score_request method directly
+            # query_embed_overrides is [num_replacements][hidden_size] -> List[Tensor]
+            query_embed_overrides = (
+                [
+                    torch.tensor(v, dtype=torch.float32)
+                    for v in request.query_embed_overrides
+                ]
+                if request.query_embed_overrides is not None
+                else None
+            )
+            # item_embed_overrides is [num_items][num_replacements][hidden_size] -> List[Optional[List[Tensor]]]
+            item_embed_overrides = (
+                [
+                    (
+                        [torch.tensor(v, dtype=torch.float32) for v in per_item]
+                        if per_item is not None
+                        else None
+                    )
+                    for per_item in request.item_embed_overrides
+                ]
+                if request.item_embed_overrides is not None
+                else None
+            )
+
             result = await self.tokenizer_manager.score_request(
                 query=request.query,
                 items=request.items,
                 label_token_ids=request.label_token_ids,
                 apply_softmax=request.apply_softmax,
                 item_first=request.item_first,
+                embed_override_token_id=request.embed_override_token_id,
+                query_embed_overrides=query_embed_overrides,
+                item_embed_overrides=item_embed_overrides,
                 request=raw_request,
             )
 

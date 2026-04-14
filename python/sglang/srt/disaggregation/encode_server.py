@@ -124,7 +124,8 @@ def _convert(data):
 
 
 _mm_grid_attrs = {
-    Modality.IMAGE: ["image_grid_thw", "image_grid_hws"],
+    # Kimi K2.5 HF processor uses grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
+    Modality.IMAGE: ["image_grid_thw", "image_grid_hws", "grid_thws"],
     Modality.VIDEO: ["video_grid_thw"],
     Modality.AUDIO: ["audio_feature_lens_raw"],
 }
@@ -136,9 +137,14 @@ _mm_feature_attrs = {
 }
 
 
-def _get_mm_grid_dim(mm_inputs, modality):
-    for attr in _mm_grid_attrs[modality]:
-        if attr in mm_inputs:
+def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
+    # Kimi K2.5 vision processor only emits `grid_thws`; prefer it over generic keys
+    # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
+    attrs = _mm_grid_attrs[modality]
+    if (model_type or "").lower() == "kimi_k25" and modality == Modality.IMAGE:
+        attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+    for attr in attrs:
+        if attr in mm_inputs and mm_inputs[attr] is not None:
             return mm_inputs[attr]
     raise ValueError(f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}")
 
@@ -435,8 +441,13 @@ class MMEncoder:
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
+                img, _ = load_image(data, False)
+                if (
+                    discard_alpha_channel
+                    and not isinstance(img, torch.Tensor)
+                    and img.mode != "RGB"
+                ):
+                    # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
@@ -471,8 +482,8 @@ class MMEncoder:
         if self.model_type in ["qwen2_audio", "qwen2_5_omni"]:
             input_length = (feature_lens - 1) // 2 + 1
             return (input_length - 2) // 2 + 1
-        # qwen3_omni_moe
-        elif self.model_type == "qwen3_omni_moe":
+        # qwen3_asr / qwen3_omni_moe (same audio encoder architecture)
+        elif self.model_type in ["qwen3_asr", "qwen3_omni_moe"]:
             input_lengths_leave = feature_lens % 100
             feat_lengths = (input_lengths_leave - 1) // 2 + 1
             output_lengths = (
@@ -572,6 +583,18 @@ class MMEncoder:
         else:
             return int(grid[0] * grid[1] * grid[2])
 
+    def _kimi_k25_tokens_from_patch_grid(
+        self, grid: Union[torch.Tensor, List[int]]
+    ) -> int:
+        """MoonViT + tpool: output len is (h//mh)*(w//mw); temporal dim is pooled (not t*h*w/merge^2)."""
+        if isinstance(grid, torch.Tensor):
+            flat = grid.flatten()
+            _t, h, w = (int(x) for x in flat[:3].tolist())
+        else:
+            _t, h, w = int(grid[0]), int(grid[1]), int(grid[2])
+        merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
+        return (h * w) // (merge_h * merge_w)
+
     def get_num_tokens(
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
@@ -580,6 +603,8 @@ class MMEncoder:
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)
         else:
+            if self.model_type == "kimi_k25" and modality == Modality.IMAGE:
+                return self._kimi_k25_tokens_from_patch_grid(grid)
             merge_size = getattr(self.image_processor, "merge_size", 2)
             return self.get_num_patches(grid, modality) // (merge_size**2)
 
@@ -620,7 +645,7 @@ class MMEncoder:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
         # 1. Slice mm_feature to get only the patches for missing mm items
         sub_feature_list = []
@@ -668,8 +693,9 @@ class MMEncoder:
         part_idx: int,
         hashes: Optional[List[str]] = None,
     ) -> torch.Tensor:
+        # mm_inputs: dict
         mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
 
@@ -843,12 +869,31 @@ class MMEncoder:
         ]
         return timestamps
 
+    def _normalize_kimi_k25_encoder_images(self, images):
+        """KimiK25VisionProcessor.preprocess expects MediaInput dicts, not raw PIL."""
+        from PIL import Image as PILImage
+
+        def wrap_one(img):
+            if isinstance(img, dict) and img.get("type") in ("image", "video_chunk"):
+                return img
+            if isinstance(img, PILImage.Image):
+                return {"type": "image", "image": img}
+            return img
+
+        if not images:
+            return images
+        # Disagg may supply a nested list; Kimi preprocess expects a flat list of media.
+        if isinstance(images[0], (list, tuple)):
+            images = [x for group in images for x in group]
+        return [wrap_one(img) for img in images]
+
     async def _process_mm_items(self, mm_items, modality):
         if modality == Modality.IMAGE and self.image_processor:
             images = await self._flatten_and_load_images(mm_items)
             image_config = self.vision_config.get("image", {})
+            if self.model_type == "kimi_k25":
+                images = self._normalize_kimi_k25_encoder_images(images)
             processor_input = self.image_processor(images=images, **image_config)
-            feature = processor_input["pixel_values"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_image_feature
             else:
@@ -862,10 +907,11 @@ class MMEncoder:
             )
             # Get additional video metadata
             if (
-                self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+                self.model_type
+                in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
                 and video_processor_kwargs.get("video_metadata", None) is not None
             ):
-                # For qwen3-vl models, we need to store the video timestamps
+                # For qwen3-vl/qwen3.5 models, we need to store the video timestamps
                 video_metadata = video_processor_kwargs["video_metadata"]
                 try:
                     merge_size = (
@@ -903,7 +949,6 @@ class MMEncoder:
                 )
                 processor_input["second_per_grid_ts"] = second_per_grid_ts_tensor
 
-            feature = processor_input["pixel_values_videos"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_video_feature
             else:
@@ -924,7 +969,6 @@ class MMEncoder:
             processor_input["audio_feature_lens_raw"] = input_lengths
             output_lengths = self._get_feat_extract_output_lengths(input_lengths)
             processor_input["audio_feature_lens"] = output_lengths
-            feature = processor_input["input_features"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_audio_feature
             else:
@@ -981,7 +1025,11 @@ class MMEncoder:
                 self.profiler.step()
 
             aux_data = _build_mm_aux_data(mm_inputs)
-            return _get_mm_grid_dim(mm_inputs, modality), mm_embedding, aux_data
+            return (
+                _get_mm_grid_dim(mm_inputs, modality, self.model_type),
+                mm_embedding,
+                aux_data,
+            )
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:

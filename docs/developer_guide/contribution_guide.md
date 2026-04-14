@@ -31,28 +31,14 @@ pre-commit run --all-files
 - Link checking with lychee is **enforced in CI**. By default, it is not blocking local commits.
 - To run local link checks manually, use: `pre-commit run --hook-stage manual lychee --all-files`.
 
-### Link check guidance (lychee)
-
-- If your PR changes `docs/` or `README.md`, we recommend running local link checks before pushing.
-- Local lychee is optional (CI is the source of truth), but if you want a system installation, see the official project: [lycheeverse/lychee](https://github.com/lycheeverse/lychee).
-- Recommended local commands:
-
-```bash
-# Fast local/offline check (pre-commit config)
-pre-commit run --hook-stage manual lychee --all-files
-
-# CI-like online check (external links over network)
-lychee --config .github/linters/lychee-ci.toml README.md "docs/**/*.md" "docs/**/*.rst" "docs/**/*.ipynb"
-```
-
 ## Run and add unit tests
 
 If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
-SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework with [pytest](https://docs.pytest.org/) as the test runner.
 
 ### Unit tests (no server required)
 
 Unit tests live under [`test/registered/unit/`](https://github.com/sgl-project/sglang/tree/main/test/registered/unit), organized to mirror the `python/sglang/srt/` source tree. These tests validate component logic **without** launching a server or loading real model weights.
+SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework with [pytest](https://docs.pytest.org/) as the test runner.
 
 **When to add a unit test:** If you modify a file under `python/sglang/srt/`, check whether a corresponding test exists in `test/registered/unit/` and add coverage for your changes. For example:
 
@@ -140,7 +126,6 @@ If you don’t have permission and you’re not the PR author, please ask mainta
 ### CI rate limits
 
 Due to CI scheduling and limited resources, higher-priority PRs may preempt running jobs. In such cases, you may need to rerun the tests.
-
 We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources.
 
 Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default cooldown period is 120 minutes, and each workflow can override it via the `cool-down-minutes` input parameter:
@@ -153,7 +138,6 @@ cool-down-minutes:
 ```
 
 Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
-
 
 ## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
@@ -188,7 +172,12 @@ Follow these steps:
 
 ## Tips for newcomers
 
-If you want to contribute but don’t have a specific idea in mind, pick issues labeled [“good first issue” or “help wanted”](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase. Also check out this [code walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang’s workflow.
+If you want to contribute but don’t have a specific idea in mind, pick issues labeled [“good first issue” or “help wanted”](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase.
+
+Also check out the following materials as startup guide:
+- [Mini-SGLang](https://github.com/sgl-project/mini-sglang) for a quick overview on the structure of sglang.
+- [Code Walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang’s workflow.
+- [GTC-2026 Training Lab](https://drive.google.com/file/d/1mwOZEtipNLJzrflCTodj34KhuOZEoEw5/view?usp=drive_link) for hands-on practices of how to do optimization, benchmarking, or profiling on a launched SGLang instance.
 
 If you have any questions or want to start a discussion, please feel free to ask in our [Slack channel](https://slack.sglang.io).
 

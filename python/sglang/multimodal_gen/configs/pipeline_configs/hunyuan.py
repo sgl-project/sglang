@@ -56,10 +56,6 @@ def llama_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.te
     return last_hidden_state
 
 
-def clip_preprocess_text(prompt: str) -> str:
-    return prompt
-
-
 def clip_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.tensor:
     pooler_output: torch.tensor = outputs.pooler_output
     return pooler_output
@@ -84,8 +80,8 @@ class HunyuanConfig(PipelineConfig):
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (LlamaConfig(), CLIPTextConfig())
     )
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (llama_preprocess_text, clip_preprocess_text)
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (llama_preprocess_text, None)
     )
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.tensor], ...] = (
         field(default_factory=lambda: (llama_postprocess_text, clip_postprocess_text))

@@ -94,70 +94,16 @@ class WhisperAttention(torch.nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         if self.is_cross_attention:
+            # Cross-attention: KV cached during prefill, read from pool during decode.
             q, _ = self.q_proj(hidden_states)
+            q = q * self.scaling
             if cross_hidden_states is not None:
                 kv, _ = self.kv_proj(cross_hidden_states)
                 k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
             else:
-                k = torch.zeros_like(q)
-                v = torch.zeros_like(q)
-
-            q = q * self.scaling
-            num_heads = self.attn.tp_q_head_num
-            head_dim = self.attn.head_dim
-
-            q = q.view(-1, num_heads, head_dim)
-            k = k.view(-1, num_heads, head_dim)
-            v = v.view(-1, num_heads, head_dim)
-
-            q_len = q.shape[0]
-            kv_len = k.shape[0]
-
-            q = q.transpose(0, 1)
-            k = k.transpose(0, 1)
-            v = v.transpose(0, 1)
-
-            attn_weights = torch.bmm(q, k.transpose(1, 2))
-
-            # Apply block-diagonal mask for batched cross-attention
-            batch_size = forward_batch.batch_size if forward_batch else 1
-            if batch_size > 1 and kv_len > 0:
-                encoder_len_per_request = kv_len // batch_size
-                if encoder_len_per_request * batch_size == kv_len:
-                    is_decode = forward_batch.forward_mode.is_decode()
-                    if is_decode:
-                        mask = torch.zeros(
-                            (q_len, kv_len), device=q.device, dtype=torch.bool
-                        )
-                        for i in range(batch_size):
-                            enc_start = i * encoder_len_per_request
-                            enc_end = (i + 1) * encoder_len_per_request
-                            mask[i, enc_start:enc_end] = True
-                        attn_weights = attn_weights.masked_fill(
-                            ~mask.unsqueeze(0), float("-inf")
-                        )
-                    else:
-                        seq_lens = forward_batch.seq_lens
-                        if seq_lens is not None and len(seq_lens) == batch_size:
-                            seq_lens_list = seq_lens.tolist()
-                            mask = torch.zeros(
-                                (q_len, kv_len), device=q.device, dtype=torch.bool
-                            )
-                            q_start = 0
-                            for i, dec_len in enumerate(seq_lens_list):
-                                enc_start = i * encoder_len_per_request
-                                enc_end = (i + 1) * encoder_len_per_request
-                                q_end = q_start + dec_len
-                                mask[q_start:q_end, enc_start:enc_end] = True
-                                q_start = q_end
-                            attn_weights = attn_weights.masked_fill(
-                                ~mask.unsqueeze(0), float("-inf")
-                            )
-
-            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-            attn_output = torch.bmm(attn_weights, v)
-            attn_output = attn_output.transpose(0, 1)
-            attn_output = attn_output.reshape(q_len, num_heads * head_dim)
+                k = None
+                v = None
+            attn_output = self.attn(q, k, v, forward_batch)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.chunk(chunks=3, dim=-1)
@@ -346,6 +292,10 @@ class WhisperEncoder(torch.nn.Module):
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        device = self.conv1.weight.device
+        input_features = input_features.to(device=device)
+        position_ids = position_ids.to(device=device)
+
         inputs_embeds = torch.nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
 
@@ -394,6 +344,7 @@ class WhisperDecoder(torch.nn.Module):
         position_ids=None,
     ):
         inputs_embeds = self.embed_tokens(input_ids)
+        position_ids = position_ids.clamp(max=self.max_target_positions - 1)
         positions = self.embed_positions(position_ids)
         hidden_states = inputs_embeds + positions.to(inputs_embeds.device)
 
@@ -420,7 +371,6 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.config = config
-        self._encoder_cache = {}
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -468,8 +418,14 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], _mm_inputs: MultimodalInputs):
-        return input_ids
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        # Prepend dummy encoder tokens so that prepare_encoder_info_extend
+        # correctly allocates encoder KV cache locations in the KV pool.
+        # These dummy tokens are stripped before the model forward receives input_ids.
+        encoder_len = self.config.max_source_positions
+        mm_inputs.num_image_tokens = encoder_len
+        pad_ids = [0] * encoder_len
+        return pad_ids + input_ids
 
     def forward(
         self,
@@ -479,55 +435,45 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         **kwargs: Any,
     ) -> LogitsProcessorOutput:
         dtype = self.encoder.conv1.weight.dtype
-        is_decode = forward_batch.forward_mode.is_decode()
 
-        if is_decode:
-            encoder_outputs = None
-            if forward_batch.req_pool_indices is not None:
-                req_indices = forward_batch.req_pool_indices.tolist()
-                encoder_list = []
-                for req_idx in req_indices:
-                    if req_idx in self._encoder_cache:
-                        encoder_list.append(self._encoder_cache[req_idx])
-                if encoder_list:
-                    encoder_outputs = torch.cat(encoder_list, dim=0)
-        else:
-            encoder_list = []
+        # Run encoder for requests that haven't cached encoder output yet.
+        # During decode or when encoder is already cached, encoder_hidden_states
+        # is None and cross-attention reads KV from the pool via RadixAttention.
+        encoder_hidden_states = None
+        if not forward_batch.forward_mode.is_decode():
             mm_inputs_list = forward_batch.mm_inputs if forward_batch.mm_inputs else []
-            req_indices = (
-                forward_batch.req_pool_indices.tolist()
-                if forward_batch.req_pool_indices is not None
-                else []
+            encoder_cached_list = (
+                forward_batch.encoder_cached if forward_batch.encoder_cached else []
             )
 
-            for req_idx, mm_input in zip(req_indices, mm_inputs_list):
-                if mm_input is None or not mm_input.mm_items:
+            # Collect features from all uncached requests for batched encoding
+            features_to_encode = []
+            for mm_input, cached in zip(mm_inputs_list, encoder_cached_list):
+                if cached or mm_input is None or not mm_input.mm_items:
                     continue
-
                 features = mm_input.mm_items[0].feature
                 if features.ndim == 2:
                     features = features.unsqueeze(0)
+                features_to_encode.append(features.to(dtype))
 
-                encoder_len = features.shape[-1] // 2
-                encoder_position_ids = torch.arange(encoder_len).to(
-                    features.device, non_blocking=True
+            if features_to_encode:
+                # Batch all features and run encoder once instead of sequentially
+                features_batch = torch.cat(features_to_encode, dim=0)
+                encoder_len = features_batch.shape[-1] // 2
+                encoder_position_ids = torch.arange(
+                    encoder_len, device=features_batch.device
                 )
 
-                req_encoder_outputs = self.encoder(
-                    features.to(dtype), encoder_position_ids, forward_batch
+                batched_output = self.encoder(
+                    features_batch, encoder_position_ids, forward_batch
                 )
-                req_encoder_outputs = req_encoder_outputs.squeeze(0)
-
-                self._encoder_cache[req_idx] = req_encoder_outputs
-                encoder_list.append(req_encoder_outputs)
-
-            if encoder_list:
-                encoder_outputs = torch.cat(encoder_list, dim=0)
-            else:
-                encoder_outputs = None
+                # Flatten [N, seq_len, dim] → [N*seq_len, dim] for cross-attention
+                encoder_hidden_states = batched_output.reshape(
+                    -1, batched_output.shape[-1]
+                )
 
         decoder_outputs = self.decoder(
-            input_ids, encoder_outputs, forward_batch, positions
+            input_ids, encoder_hidden_states, forward_batch, positions
         )
 
         logits = self.logits_processor(
