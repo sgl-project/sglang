@@ -19,6 +19,7 @@ from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_quant_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -1516,8 +1517,11 @@ class RowParallelLinear(LinearBase):
                 quantize_communications = \
                     (not forward_batch.forward_mode.is_decode_or_idle() \
                     and get_global_server_args().quantize_tp_communications) \
-                    if forward_batch is not None else True
-                output = tensor_model_parallel_all_reduce(output_parallel, quantize_communications=quantize_communications)
+                    if forward_batch is not None else False
+                if quantize_communications:
+                    output = tensor_model_parallel_quant_all_reduce(output_parallel)
+                else:
+                    output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 
