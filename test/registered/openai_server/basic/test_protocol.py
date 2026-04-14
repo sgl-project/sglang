@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    SglExt,
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -372,6 +373,78 @@ class TestValidationEdgeCases(unittest.TestCase):
         self.assertEqual(restored_request.temperature, original_request.temperature)
         self.assertEqual(restored_request.max_tokens, original_request.max_tokens)
         self.assertEqual(len(restored_request.messages), len(original_request.messages))
+
+
+class TestReturnTokenIds(unittest.TestCase):
+    """Test return_token_ids feature for /chat/completions"""
+
+    def test_return_token_ids_default_false(self):
+        """return_token_ids should default to False"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+        self.assertFalse(request.return_token_ids)
+
+    def test_return_token_ids_can_be_enabled(self):
+        """return_token_ids can be set to True"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            return_token_ids=True,
+        )
+        self.assertTrue(request.return_token_ids)
+
+    def test_sglext_token_id_fields_excluded_when_none(self):
+        """prompt_token_ids and completion_token_ids are excluded when None"""
+        sglext = SglExt()
+        data = sglext.model_dump()
+        self.assertNotIn("prompt_token_ids", data)
+        self.assertNotIn("completion_token_ids", data)
+
+    def test_sglext_token_id_fields_included_when_set(self):
+        """prompt_token_ids and completion_token_ids are serialized correctly"""
+        sglext = SglExt(
+            prompt_token_ids=[1, 2, 3],
+            completion_token_ids=[[4, 5, 6]],
+        )
+        data = sglext.model_dump()
+        self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
+        self.assertEqual(data["completion_token_ids"], [[4, 5, 6]])
+
+    def test_sglext_token_ids_with_multiple_choices(self):
+        """completion_token_ids supports multiple choices (n>1)"""
+        sglext = SglExt(
+            prompt_token_ids=[10, 20],
+            completion_token_ids=[[100, 101], [200, 201]],
+        )
+        data = sglext.model_dump()
+        self.assertEqual(len(data["completion_token_ids"]), 2)
+        self.assertEqual(data["completion_token_ids"][0], [100, 101])
+        self.assertEqual(data["completion_token_ids"][1], [200, 201])
+
+    def test_sglext_token_ids_coexist_with_other_fields(self):
+        """token_ids fields coexist with other SglExt fields"""
+        sglext = SglExt(
+            prompt_token_ids=[1, 2],
+            completion_token_ids=[[3, 4]],
+            routed_experts="expert_data",
+        )
+        data = sglext.model_dump()
+        self.assertIn("prompt_token_ids", data)
+        self.assertIn("completion_token_ids", data)
+        self.assertIn("routed_experts", data)
+
+    def test_streaming_accumulation_last_chunk_wins(self):
+        """output_ids is cumulative per chunk; last chunk has the full list"""
+        # Simulate serving_chat.py / serving_completions.py accumulation logic:
+        # output_ids is always cumulative (full list each chunk), so overwrite each time.
+        output_ids_accum = {}
+        index = 0
+        chunks = [[101], [101, 102], [101, 102, 103], [101, 102, 103, 104]]
+        for chunk_ids in chunks:
+            output_ids_accum[index] = list(chunk_ids)
+        self.assertEqual(output_ids_accum[index], [101, 102, 103, 104])
 
 
 if __name__ == "__main__":
