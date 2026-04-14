@@ -325,7 +325,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     chunks = [loaded_weight.reshape(1)]
                 else:
                     split_dim = getattr(param, "output_dim", 0)
-                    chunks = loaded_weight.split(split_sizes, dim=split_dim)
+                    if _is_cpu:
+                        cpu_split_sizes = []
+                        split_size_sum = sum(split_sizes)
+                        target_size_sim = loaded_weight.size(split_dim)
+                        for i in range(len(split_sizes)):
+                            cpu_split_sizes.append(
+                                int(target_size_sim * split_sizes[i] / split_size_sum)
+                            )
+                        chunks = loaded_weight.split(cpu_split_sizes, dim=split_dim)
+                    else:
+                        chunks = loaded_weight.split(split_sizes, dim=split_dim)
 
                 assert len(chunks) == len(loaded_shard_id), (
                     f"Chunk/shard mismatch: {len(chunks)=}, "
