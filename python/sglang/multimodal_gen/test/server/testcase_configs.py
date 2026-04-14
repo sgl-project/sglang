@@ -987,6 +987,7 @@ TWO_GPU_CASES_B = [
             modality="video",
             custom_validator="video",
             num_gpus=2,
+            extras=["--ulysses-degree=2"]
         ),
         TI2V_sampling_params,
     ),

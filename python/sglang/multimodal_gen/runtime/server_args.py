@@ -505,10 +505,13 @@ class ServerArgs:
         default_params = model_info.sampling_param_cls()
 
         # for ltx2.3, cfg-parallel performs worse than ulysses-sp
+        is_ltx = "ltx" in type(default_params).__name__.lower()
+        if is_ltx:
+            return False
         return (
             getattr(default_params, "negative_prompt", None) is not None
             and getattr(default_params, "guidance_scale", 0) > 1.0
-        ) and not "lightricks/ltx-2.3" in type(default_params).__name__.lower()
+        )
 
     @staticmethod
     def _is_ltx23_model_path(model_path: str | None) -> bool:
