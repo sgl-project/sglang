@@ -1,7 +1,7 @@
 """
 Unit tests for the hook registry system.
 
-Covers: basic hooks (AROUND/AFTER/REPLACE), descriptor preservation
+Covers: basic hooks (AROUND/BEFORE/AFTER/REPLACE), descriptor preservation
 (classmethod/staticmethod), hook ordering, cross-target conflict detection,
 patch propagation, and edge cases.
 
@@ -10,7 +10,7 @@ Run:  python -m pytest test/registered/unit/plugins/test_hook_registry.py -v
 
 import sys
 import types
-import unittest
+import uuid
 
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType, plugin_hook
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,14 +23,11 @@ register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 # ---------------------------------------------------------------------------
 
 _SYNTH_MODULE_PREFIX = "_synth_hook_test_"
-_synth_counter = 0
 
 
 def _make_module(**attrs):
     """Create a throwaway module registered in sys.modules."""
-    global _synth_counter
-    _synth_counter += 1
-    name = f"{_SYNTH_MODULE_PREFIX}{_synth_counter}"
+    name = f"{_SYNTH_MODULE_PREFIX}{uuid.uuid4().hex[:8]}"
     mod = types.ModuleType(name)
     for k, v in attrs.items():
         setattr(mod, k, v)
@@ -45,14 +42,13 @@ def _cleanup_synth_modules():
         del sys.modules[k]
 
 
-# ===========================================================================
-# TestBasicHooks
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Base class for hook tests (shared setUp/tearDown)
+# ---------------------------------------------------------------------------
 
 
-class TestBasicHooks(CustomTestCase):
-    """AROUND / AFTER / REPLACE on plain functions, class REPLACE,
-    and the @plugin_hook decorator."""
+class _HookTestCase(CustomTestCase):
+    """Base class that resets HookRegistry and cleans up synth modules."""
 
     def setUp(self):
         HookRegistry.reset()
@@ -61,6 +57,16 @@ class TestBasicHooks(CustomTestCase):
     def tearDown(self):
         HookRegistry.reset()
         _cleanup_synth_modules()
+
+
+# ===========================================================================
+# TestBasicHooks
+# ===========================================================================
+
+
+class TestBasicHooks(_HookTestCase):
+    """AROUND / BEFORE / AFTER / REPLACE on plain functions, class REPLACE,
+    and the @plugin_hook decorator."""
 
     def test_around_function(self):
         def orig(x):
@@ -74,6 +80,34 @@ class TestBasicHooks(CustomTestCase):
         HookRegistry.register(f"{name}.orig", add_one, HookType.AROUND)
         HookRegistry.apply_hooks()
         self.assertEqual(mod.orig(3), 7)  # 3*2 + 1
+
+    def test_before_modifies_args(self):
+        """BEFORE hook returns (args, kwargs) to modify arguments."""
+        def orig(x, y=0):
+            return x + y
+
+        mod, name = _make_module(orig=orig)
+
+        def double_x(x, y=0):
+            return (x * 2,), {"y": y + 1}
+
+        HookRegistry.register(f"{name}.orig", double_x, HookType.BEFORE)
+        HookRegistry.apply_hooks()
+        self.assertEqual(mod.orig(3), 7)  # x=3*2=6, y=0+1=1, 6+1=7
+
+    def test_before_returning_none(self):
+        """BEFORE hook returning None leaves arguments unchanged."""
+        def orig(x):
+            return x * 2
+
+        mod, name = _make_module(orig=orig)
+
+        def before_noop(x):
+            return None  # leave args unchanged
+
+        HookRegistry.register(f"{name}.orig", before_noop, HookType.BEFORE)
+        HookRegistry.apply_hooks()
+        self.assertEqual(mod.orig(3), 6)  # args unchanged
 
     def test_after_function(self):
         def orig(x):
@@ -138,16 +172,8 @@ class TestBasicHooks(CustomTestCase):
 # ===========================================================================
 
 
-class TestDescriptorPreservation(CustomTestCase):
+class TestDescriptorPreservation(_HookTestCase):
     """Hooks on classmethod/staticmethod must preserve descriptor semantics."""
-
-    def setUp(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
-
-    def tearDown(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
 
     def _make_cls_module(self):
         class MyClass:
@@ -198,6 +224,18 @@ class TestDescriptorPreservation(CustomTestCase):
         result = mod.MyClass.sm(1)
         self.assertEqual(result, ("sm", 1, "around"))
 
+    def test_replace_staticmethod(self):
+        mod, name, MyClass = self._make_cls_module()
+
+        def new_sm(x):
+            return ("replaced_sm", x)
+
+        HookRegistry.register(f"{name}.MyClass.sm", new_sm, HookType.REPLACE)
+        HookRegistry.apply_hooks()
+
+        result = mod.MyClass.sm(1)
+        self.assertEqual(result, ("replaced_sm", 1))
+
     def test_classmethod_subclass_cls(self):
         mod, name, MyClass = self._make_cls_module()
 
@@ -219,16 +257,8 @@ class TestDescriptorPreservation(CustomTestCase):
 # ===========================================================================
 
 
-class TestHookOrdering(CustomTestCase):
+class TestHookOrdering(_HookTestCase):
     """Verify REPLACE is applied first, then other hooks wrap it."""
-
-    def setUp(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
-
-    def tearDown(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
 
     def test_replace_then_around(self):
         def orig(x):
@@ -276,16 +306,8 @@ class TestHookOrdering(CustomTestCase):
 # ===========================================================================
 
 
-class TestCrossTargetConflict(CustomTestCase):
+class TestCrossTargetConflict(_HookTestCase):
     """Verify warning for class REPLACE + method REPLACE combo."""
-
-    def setUp(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
-
-    def tearDown(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
 
     def test_class_replace_then_method_replace_warns(self):
         class Original:
@@ -316,18 +338,10 @@ class TestCrossTargetConflict(CustomTestCase):
 # ===========================================================================
 
 
-class TestPatchPropagation(CustomTestCase):
+class TestPatchPropagation(_HookTestCase):
     """Verify that patches propagate to other modules that imported the target."""
 
-    def setUp(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
-
-    def tearDown(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
-
-    def test_around_propagates(self):
+    def test_same_reference_propagates(self):
         def orig(x):
             return x * 2
 
@@ -349,16 +363,8 @@ class TestPatchPropagation(CustomTestCase):
 # ===========================================================================
 
 
-class TestEdgeCases(CustomTestCase):
+class TestEdgeCases(_HookTestCase):
     """Reset, type validation, multi-AROUND onion, idempotent apply."""
-
-    def setUp(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
-
-    def tearDown(self):
-        HookRegistry.reset()
-        _cleanup_synth_modules()
 
     def test_reset(self):
         def orig(x):
@@ -435,4 +441,6 @@ class TestEdgeCases(CustomTestCase):
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()

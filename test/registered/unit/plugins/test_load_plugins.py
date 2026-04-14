@@ -2,14 +2,15 @@
 Unit tests for the plugin loading flow.
 
 Covers: idempotency, apply_hooks invocation, exception resilience,
-SGLANG_PLUGINS whitelist, and SGLANG_PLATFORM exclusion logic.
+SGLANG_PLUGINS whitelist, SGLANG_PLATFORM exclusion logic,
+and _current_plugin_source context var reset.
 
 Run:  python -m pytest test/registered/unit/plugins/test_load_plugins.py -v
 """
 
-import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.plugins import _current_plugin_source, _get_excluded_dists, load_plugins, load_plugins_by_group
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -55,7 +56,6 @@ class TestLoadPlugins(CustomTestCase):
         """Second call is a no-op; first call invokes apply_hooks."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_envs.SGLANG_PLUGINS.get.return_value = ""
-        from sglang.srt.plugins import load_plugins
 
         load_plugins()
         self.assertEqual(mock_registry.apply_hooks.call_count, 1)
@@ -85,13 +85,14 @@ class TestLoadPlugins(CustomTestCase):
         ]
         mock_eps.return_value = eps
 
-        from sglang.srt.plugins import load_plugins
+        with self.assertLogs("sglang.srt.plugins", level="ERROR") as cm:
+            load_plugins()
 
-        load_plugins()  # should not raise
+        self.assertTrue(any("boom" in msg for msg in cm.output))
         self.assertEqual(good_call_log, ["ok"])
         mock_registry.apply_hooks.assert_called_once()
 
-    @patch("sglang.srt.plugins.entry_points", return_value=[])
+    @patch("sglang.srt.plugins.entry_points")
     @patch("sglang.srt.plugins.envs")
     def test_sglang_plugins_whitelist(self, mock_envs, mock_eps):
         """Only plugins named in SGLANG_PLUGINS should be loaded."""
@@ -109,8 +110,6 @@ class TestLoadPlugins(CustomTestCase):
         ]
         mock_eps.return_value = eps
 
-        from sglang.srt.plugins import load_plugins_by_group
-
         result = load_plugins_by_group("test.group")
         self.assertIn("alpha", result)
         self.assertNotIn("beta", result)
@@ -120,8 +119,6 @@ class TestLoadPlugins(CustomTestCase):
     @patch("sglang.srt.plugins.envs")
     def test_excluded_dists(self, mock_envs, mock_eps):
         """SGLANG_PLATFORM excludes other platform dists; empty when unset."""
-        from sglang.srt.plugins import _get_excluded_dists
-
         # Case 1: no env set → empty
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         self.assertEqual(_get_excluded_dists(), set())
@@ -136,6 +133,46 @@ class TestLoadPlugins(CustomTestCase):
         self.assertNotIn("kunlun-pkg", excluded)
         self.assertIn("other-pkg", excluded)
 
+    @patch("sglang.srt.plugins.HookRegistry")
+    @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points")
+    def test_current_plugin_source_set_during_and_reset_after(self, mock_eps, mock_envs, mock_registry):
+        """_current_plugin_source is set during plugin execution, reset after."""
+        sources_seen = []
+
+        def spy_plugin():
+            sources_seen.append(_current_plugin_source.get())
+
+        mock_eps.return_value = [_make_ep("spy", load_fn=spy_plugin)]
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+
+        load_plugins()
+        # During execution: source was set (not None)
+        self.assertEqual(len(sources_seen), 1)
+        self.assertIsNotNone(sources_seen[0])
+        self.assertEqual(sources_seen[0].plugin_name, "spy")
+        # After execution: source is back to None
+        self.assertIsNone(_current_plugin_source.get())
+
+    @patch("sglang.srt.plugins.HookRegistry")
+    @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points")
+    def test_current_plugin_source_reset_after_exception(self, mock_eps, mock_envs, mock_registry):
+        """_current_plugin_source is reset to None even when a plugin raises."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+
+        def bad_plugin():
+            raise RuntimeError("boom")
+
+        mock_eps.return_value = [_make_ep("bad", load_fn=bad_plugin)]
+
+        load_plugins()
+        self.assertIsNone(_current_plugin_source.get())
+
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()
