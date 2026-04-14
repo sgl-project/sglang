@@ -29,15 +29,11 @@ ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
 
 class TestQwen35FP4(CustomTestCase):
     def test_gsm8k(self):
-        base_args = [
+        common_args = [
             "--tp-size",
             "4",
             "--chunked-prefill-size",
             "2048",
-            "--mamba-scheduler-strategy",
-            "extra_buffer",
-            "--mamba-track-interval",
-            "128",
             "--mamba-ssm-dtype",
             "bfloat16",
             "--max-running-requests",
@@ -51,19 +47,35 @@ class TestQwen35FP4(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
+        extra_buffer_args = common_args + [
+            "--mamba-scheduler-strategy",
+            "extra_buffer",
+            "--mamba-track-interval",
+            "128",
+        ]
+        no_buffer_args = common_args + [
+            "--mamba-scheduler-strategy",
+            "no_buffer",
+        ]
 
         variants = [
             ModelLaunchSettings(
                 QWEN35_FP4_MODEL,
-                extra_args=base_args,
+                extra_args=extra_buffer_args,
                 variant="Triton",
             ),
-            # TODO: Fix this and re-enable it
-            # ModelLaunchSettings(
-            #     QWEN35_FP4_MODEL,
-            #     extra_args=base_args + ["--linear-attn-decode-backend", "flashinfer"],
-            #     variant="FlashInfer",
-            # ),
+            ModelLaunchSettings(
+                QWEN35_FP4_MODEL,
+                extra_args=extra_buffer_args
+                + ["--linear-attn-decode-backend", "flashinfer"],
+                variant="FlashInfer",
+            ),
+            ModelLaunchSettings(
+                QWEN35_FP4_MODEL,
+                extra_args=no_buffer_args
+                + ["--linear-attn-decode-backend", "flashinfer"],
+                variant="FlashInfer-NoBuffer",
+            ),
         ]
 
         run_combined_tests(
