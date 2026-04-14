@@ -2399,6 +2399,11 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
+        # Advance the logical clock once per batch cycle so that
+        # last_access_time is deterministic across PP ranks.
+        if hasattr(self.tree_cache, "inc_logical_clock"):
+            self.tree_cache.inc_logical_clock()
+
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
