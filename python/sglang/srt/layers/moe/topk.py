@@ -82,7 +82,7 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import moe_fused_gate
+    from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
 
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
@@ -1188,27 +1188,8 @@ def select_experts(
 
 
 # Register fake implementations for torch.compile support
+# Note: moe_fused_gate is now a JIT Python function, no fake registration needed.
 if _is_cuda:
-
-    @torch.library.register_fake("sgl_kernel::moe_fused_gate")
-    def _moe_fused_gate(
-        input_tensor,
-        bias,
-        num_expert_group,
-        topk_group,
-        topk,
-        num_fused_shared_experts=0,
-        routed_scaling_factor=0,
-        apply_routed_scaling_factor_on_output=False,
-    ):
-        num_rows = input_tensor.shape[0]
-        topk_weights = torch.empty(
-            (num_rows, topk), dtype=torch.float32, device=input_tensor.device
-        )
-        topk_ids = torch.empty(
-            (num_rows, topk), dtype=torch.int32, device=input_tensor.device
-        )
-        return topk_weights, topk_ids
 
     @register_fake_if_exists("sgl_kernel::kimi_k2_moe_fused_gate")
     def _kimi_k2_moe_fused_gate(
