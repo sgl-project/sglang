@@ -642,6 +642,7 @@ class Scheduler(
                     self.ipc_channels.recv_from_tokenizer,
                     self.ipc_channels.recv_from_rpc,
                 ],
+                can_empty_cache=lambda: not self._engine_paused,
             )
         else:
             self.idle_sleeper = None
