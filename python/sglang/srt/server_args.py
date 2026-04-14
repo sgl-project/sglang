@@ -521,7 +521,7 @@ class ServerArgs:
     speculative_ngram_trie_mode: Literal["global", "request"] = "global"
     speculative_ngram_max_trie_depth: int = 18
     speculative_ngram_trie_capacity: int = 10 * 1000 * 1000
-    speculative_ngram_trie_capacity_per_request: int = 10 * 1000 * 1000
+    speculative_ngram_trie_capacity_per_request: int = 500 * 1000
     speculative_ngram_external_corpus_path: Optional[str] = None
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     speculative_ngram_trie_source_prior: float = 0.0
@@ -3388,6 +3388,16 @@ class ServerArgs:
                     "--speculative-ngram-trie-capacity-per-request must be greater "
                     "than 0 when --speculative-ngram-trie-mode=request."
                 )
+            if (
+                self.speculative_ngram_trie_mode == "request"
+                and self.speculative_ngram_trie_capacity_per_request
+                < self.speculative_ngram_max_trie_depth
+            ):
+                raise ValueError(
+                    "--speculative-ngram-trie-capacity-per-request must be "
+                    "greater than or equal to --speculative-ngram-max-trie-depth "
+                    "when --speculative-ngram-trie-mode=request."
+                )
             if self.speculative_ngram_match_specificity_weight < 0:
                 raise ValueError(
                     "--speculative-ngram-match-specificity-weight must be greater than or equal to 0."
@@ -5255,7 +5265,7 @@ class ServerArgs:
             "--speculative-ngram-trie-capacity-per-request",
             type=int,
             default=ServerArgs.speculative_ngram_trie_capacity_per_request,
-            help="The cache capacity for each request-local online trie in request trie mode.",
+            help="The cache capacity for each request-local online trie in request trie mode. Larger values increase CPU memory per live request.",
         )
         parser.add_argument(
             "--speculative-ngram-external-corpus-path",

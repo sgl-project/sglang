@@ -323,6 +323,21 @@ class TestNgramCorpusRequestTrieMode(CustomTestCase):
         np.testing.assert_array_equal(ids_before, ids_after)
         np.testing.assert_array_equal(masks_before, masks_after)
 
+    def test_request_mode_capacity_equal_to_max_depth_supports_first_insert(self):
+        corpus = _make_corpus(
+            "BFS",
+            trie_mode="request",
+            draft_token_num=4,
+            max_trie_depth=4,
+            capacity=4,
+        )
+
+        corpus.batch_put([[1, 2, 3, 4]], req_ids=["req-a"])
+        corpus.synchronize()
+
+        ids, _ = _batch_get_with_state(corpus, "req-a", [1, 2, 3], 3)
+        self.assertEqual(ids.tolist(), [3, 4, 0, 0])
+
 
 class TestNgramCorpusNoMatch(CustomTestCase):
     """Verify behavior when query has no match in the corpus."""
@@ -393,6 +408,16 @@ class TestNgramCorpusSqueeze(CustomTestCase):
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 2002, "Last context token should be first")
         self.assertIn(2003, ids_list, "Recent sequence should still be matchable")
+
+    def test_large_unique_insert_remains_matchable(self):
+        corpus = _make_corpus("BFS", capacity=5000, max_trie_depth=6)
+        long_seq = list(range(1, 1400))
+
+        corpus.batch_put([long_seq])
+        corpus.synchronize()
+
+        ids, _ = _batch_get(corpus, [[1394, 1395, 1396]])
+        self.assertEqual(ids.tolist()[:4], [1396, 1397, 1398, 1399])
 
 
 class TestNgramCorpusLeafPaths(CustomTestCase):

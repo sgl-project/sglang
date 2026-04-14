@@ -518,6 +518,15 @@ class TestNgramExternalSamArgs(CustomTestCase):
             )._handle_speculative_decoding()
         self.assertIn("trie-capacity-per-request", str(context.exception))
 
+    def test_request_trie_capacity_must_cover_max_trie_depth(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_trie_mode="request",
+                speculative_ngram_max_trie_depth=18,
+                speculative_ngram_trie_capacity_per_request=17,
+            )._handle_speculative_decoding()
+        self.assertIn("max-trie-depth", str(context.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

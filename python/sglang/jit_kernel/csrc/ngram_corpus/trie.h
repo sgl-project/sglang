@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <functional>
 #include <list>
-#include <memory>
 #include <new>
 #include <set>
 #include <tuple>
@@ -87,8 +86,6 @@ class Trie {
   void reset();
 
  private:
-  void ensureFreeNodes_(size_t count);
-  void allocateChunk_(size_t min_nodes);
   TrieNode* getNode();
 
   // Recompute all cached anchors from the current tail. After this, for every
@@ -124,10 +121,7 @@ class Trie {
   }
 
   size_t capacity_;
-  size_t allocated_node_count_ = 0;
-  size_t next_chunk_size_ = 0;
-  std::vector<std::unique_ptr<TrieNode[]>> node_chunks_;
-  std::vector<size_t> chunk_sizes_;
+  std::vector<TrieNode> nodes_;
   std::vector<TrieNode*> node_pool_;
   size_t free_node_count_ = 0;
   std::list<TrieNode*> global_lru_;

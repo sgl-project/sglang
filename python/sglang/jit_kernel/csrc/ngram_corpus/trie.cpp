@@ -10,54 +10,18 @@
 
 namespace ngram {
 
-namespace {
-constexpr size_t kInitialChunkSize = 4096;
-}
-
 Trie::Trie(size_t capacity, const Param& param) : capacity_(capacity), param_(param) {
+  // Root allocation is outside the visible capacity budget so the configured
+  // capacity reflects evictable payload nodes only.
+  nodes_.resize(capacity_ + 1);
+  for (auto& node : nodes_) {
+    node_pool_.emplace_back(&node);
+  }
+  free_node_count_ = node_pool_.size();
   root_ = getNode();
 }
 
-void Trie::allocateChunk_(size_t min_nodes) {
-  const auto remaining_capacity = capacity_ - allocated_node_count_;
-  if (remaining_capacity == 0) {
-    return;
-  }
-
-  const auto target_chunk_size = next_chunk_size_ == 0 ? kInitialChunkSize : next_chunk_size_;
-  const auto chunk_size = std::min(remaining_capacity, std::max(min_nodes, target_chunk_size));
-
-  node_chunks_.emplace_back(std::make_unique<TrieNode[]>(chunk_size));
-  chunk_sizes_.emplace_back(chunk_size);
-
-  auto* chunk = node_chunks_.back().get();
-  node_pool_.reserve(node_pool_.size() + chunk_size);
-  for (size_t i = 0; i < chunk_size; ++i) {
-    node_pool_.emplace_back(&chunk[i]);
-  }
-  free_node_count_ += chunk_size;
-  allocated_node_count_ += chunk_size;
-
-  if (allocated_node_count_ == capacity_) {
-    next_chunk_size_ = 0;
-  } else {
-    const auto doubled_chunk_size = chunk_size > capacity_ / 2 ? capacity_ : chunk_size * 2;
-    next_chunk_size_ = std::min(capacity_ - allocated_node_count_, std::max(kInitialChunkSize, doubled_chunk_size));
-  }
-}
-
-void Trie::ensureFreeNodes_(size_t count) {
-  while (free_node_count_ < count && allocated_node_count_ < capacity_) {
-    allocateChunk_(count - free_node_count_);
-  }
-  if (free_node_count_ >= count) {
-    return;
-  }
-  squeeze(count - free_node_count_);
-}
-
 TrieNode* Trie::getNode() {
-  ensureFreeNodes_(1);
   if (free_node_count_ == 0) {
     throw std::runtime_error("Failed to allocate trie node");
   }
@@ -74,7 +38,9 @@ void Trie::insert(const int32_t* tokens, size_t len) {
   for (size_t i = 0; i < len; ++i) {
     auto start = tokens + i;
     auto end = start + std::min(len - i, param_.max_trie_depth);
-    ensureFreeNodes_(end - start);
+    if (static_cast<size_t>(end - start) > free_node_count_) {
+      squeeze(end - start - free_node_count_);
+    }
 
     TrieNode* cursor = root_;
     path_.clear();
@@ -143,22 +109,15 @@ void Trie::reset() {
   global_lru_.clear();
   path_.clear();
   node_pool_.clear();
-  node_pool_.reserve(allocated_node_count_);
-  free_node_count_ = 0;
-
-  for (size_t chunk_idx = 0; chunk_idx < node_chunks_.size(); ++chunk_idx) {
-    auto* chunk = node_chunks_[chunk_idx].get();
-    const auto chunk_size = chunk_sizes_[chunk_idx];
-    for (size_t i = 0; i < chunk_size; ++i) {
-      auto version = chunk[i].version;
-      chunk[i].~TrieNode();
-      new (&chunk[i]) TrieNode();
-      chunk[i].version = version;
-      node_pool_.emplace_back(&chunk[i]);
-    }
-    free_node_count_ += chunk_size;
+  node_pool_.reserve(nodes_.size());
+  for (auto& node : nodes_) {
+    auto version = node.version;
+    node.~TrieNode();
+    new (&node) TrieNode();
+    node.version = version;
+    node_pool_.emplace_back(&node);
   }
-
+  free_node_count_ = node_pool_.size();
   root_ = getNode();
 }
 

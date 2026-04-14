@@ -300,7 +300,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-ngram-match-type` | Ngram tree-building mode. `BFS` selects recency-based expansion and `PROB` selects frequency-based expansion. This setting is forwarded to the ngram cache implementation. | `BFS` | `BFS`, `PROB` |
 | `--speculative-ngram-max-trie-depth` | Maximum suffix length stored and matched by the ngram trie. | `18` | Type: int |
 | `--speculative-ngram-trie-capacity` | The cache capacity for the global online trie used by ngram speculative decoding. | `10000000` | Type: int |
-| `--speculative-ngram-trie-capacity-per-request` | The cache capacity for each request-local online trie when request trie mode is enabled. | `10000000` | Type: int |
+| `--speculative-ngram-trie-capacity-per-request` | The cache capacity for each request-local online trie when request trie mode is enabled. Each live request allocates its own trie slab up front, so larger values increase CPU memory usage proportionally. | `500000` | Type: int |
 
 ## Multi-layer Eagle speculative decoding
 | Argument | Description | Defaults | Options |

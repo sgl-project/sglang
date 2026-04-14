@@ -78,6 +78,11 @@ Ngram::Ngram(size_t capacity, const Param& param) : trie_capacity_(capacity), pa
   if (!(trie_capacity_ > 0)) {
     throw std::runtime_error("trie capacity must be greater than 0, current value: " + std::to_string(trie_capacity_));
   }
+  if (param_.request_trie_mode && trie_capacity_ < param_.max_trie_depth) {
+    throw std::runtime_error(
+        "request trie capacity must be greater than or equal to max_trie_depth, current trie capacity: " +
+        std::to_string(trie_capacity_) + ", max_trie_depth: " + std::to_string(param_.max_trie_depth));
+  }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config <= param_.draft_token_num)) {
