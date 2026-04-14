@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -1608,7 +1608,7 @@ def can_auto_enable_marlin_fp8() -> bool:
 
 
 def apply_fp8_ptpc_linear(
-    input: torch.Tensor,
+    input: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
@@ -1619,6 +1619,19 @@ def apply_fp8_ptpc_linear(
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
 ) -> torch.Tensor:
+    """FP8 per-token per-channel linear. Only used with the aiter (ROCm) backend."""
+    # Handle pre-quantized (fp8_tensor, scale) tuple from fused RMSNorm+Quant
+    if isinstance(input, tuple):
+        q_input, x_scale = input
+        q_input = q_input.view(-1, q_input.shape[-1])
+        output_shape = [*q_input.shape[:-1], weight.shape[0]]
+        output = aiter.gemm_a8w8_bpreshuffle(
+            q_input, weight, x_scale, weight_scale, None, torch.bfloat16
+        )
+        if bias is not None:
+            output = output + bias
+        return output.view(*output_shape)
+
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
 

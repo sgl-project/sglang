@@ -7,7 +7,7 @@ from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=430, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=422, suite="stage-c-test-4-gpu-h100")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
