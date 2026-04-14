@@ -575,6 +575,7 @@ class ServerArgs:
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
+    hicache_storage_async_concurrency: int = 1
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
@@ -5541,6 +5542,14 @@ class ServerArgs:
             choices=["best_effort", "wait_complete", "timeout"],
             default=ServerArgs.hicache_storage_prefetch_policy,
             help="Control when prefetching from the storage backend should stop.",
+        )
+        parser.add_argument(
+            "--hicache-storage-async-concurrency",
+            type=int,
+            default=ServerArgs.hicache_storage_async_concurrency,
+            help="Number of concurrent async prefetch operations. "
+            "1 means synchronous (default). >1 enables async prefetch "
+            "with the Mooncake backend. Other backends ignore this.",
         )
         parser.add_argument(
             "--hicache-storage-backend-extra-config",

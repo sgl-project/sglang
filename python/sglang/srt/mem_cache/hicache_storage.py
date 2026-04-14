@@ -263,6 +263,19 @@ class HiCacheStorage(ABC):
                 return i
         return len(keys)
 
+    def create_async_session(self, max_concurrency: int):
+        """Create an async session for concurrent batch get operations.
+
+        Returns an object implementing:
+          - INVALID_TOKEN: int (sentinel value for submit failure)
+          - in_flight: int (current number of pending operations)
+          - submit(keys, host_indices, extra_info) -> token | INVALID_TOKEN
+          - wait_any() -> (token, List[bool]) where bools indicate per-page success
+
+        Returns None if async is not supported by this backend.
+        """
+        return None
+
     def clear(self) -> None:
         pass
 
