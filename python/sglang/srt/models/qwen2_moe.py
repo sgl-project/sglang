@@ -208,9 +208,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # n_shared_experts is not defined, but shared_expert_intermediate_size is defined, so we use 1 as the number of shared experts
             self.num_shared_experts = 1
 
-        self.enable_shared_expert_fusion = False  # default to False
+        self.enable_shared_expert_fusion = False
         if _use_aiter:
-            # enable shared expert fusion when use aiter
             self.enable_shared_expert_fusion = (
                 support_shared_expert_fusion and can_fuse_shared_expert(config)
             )
@@ -323,20 +322,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_weights = self._get_shared_expert_weights(hidden_states)
         if shared_weights is None:
             return topk_output
-        M = topk_output.topk_ids.shape[0]
-        shared_expert_id = self.num_experts
-        shared_ids = torch.full(
-            (M, self.num_fused_shared_experts),
-            shared_expert_id,
-            dtype=topk_output.topk_ids.dtype,
-            device=topk_output.topk_ids.device,
+
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+            fused_append_shared_experts_with_weights,
         )
-        shared_weights = shared_weights.expand(M, self.num_fused_shared_experts).to(
-            topk_output.topk_weights.dtype
-        )
-        fused_topk_ids = torch.cat([topk_output.topk_ids, shared_ids], dim=-1)
-        fused_topk_weights = torch.cat(
-            [topk_output.topk_weights, shared_weights], dim=-1
+
+        fused_topk_ids, fused_topk_weights = fused_append_shared_experts_with_weights(
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            shared_weights,
+            self.num_fused_shared_experts,
+            N=self.num_experts,
         )
         return StandardTopKOutput(
             topk_weights=fused_topk_weights,
