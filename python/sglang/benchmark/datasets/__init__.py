@@ -11,6 +11,7 @@ from sglang.benchmark.datasets.mooncake import MooncakeDataset
 from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
 from sglang.benchmark.datasets.random import RandomDataset
 from sglang.benchmark.datasets.sharegpt import ShareGPTDataset
+from sglang.benchmark.datasets.token_trace import TokenTraceDataset
 
 DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "sharegpt": ShareGPTDataset,
@@ -24,6 +25,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "mmmu": MMMUDataset,
     "image": ImageDataset,
     "mooncake": MooncakeDataset,
+    "token-trace": TokenTraceDataset,
 }
 
 

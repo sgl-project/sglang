@@ -1937,6 +1937,7 @@ if __name__ == "__main__":
             "mmmu",
             "image",
             "mooncake",
+            "token-trace",
         ],
         help="Name of the dataset to benchmark on.",
     )

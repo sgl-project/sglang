@@ -299,7 +299,7 @@ class TestMamba(unittest.TestCase):
         print(available_and_evictable_str(tree))
         tree.sanity_check()
 
-    def _setup_tree_and_allocator(self):
+    def _setup_tree_and_allocator(self, eviction_policy: str = "lru"):
         """Helper to create a MambaRadixCache with allocator for testing."""
         set_global_server_args_for_scheduler(
             ServerArgs(model_path="dummy", page_size=1)
@@ -367,6 +367,7 @@ class TestMamba(unittest.TestCase):
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             disable=False,
+            eviction_policy=eviction_policy,
         )
         tree = MambaRadixCache(params=params)
 
@@ -476,6 +477,35 @@ class TestMamba(unittest.TestCase):
         leaf.mamba_value = torch.tensor([2], device=tree.device)
 
         self.assertEqual(tree._get_mamba_recompute_length(leaf), 6)
+
+    def test_full_seglen_reconsiders_new_leaf_parent(self):
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
+            eviction_policy="seglen"
+        )
+
+        req1 = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=allocator.alloc(3),
+                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        req2 = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4, 5]),
+                value=allocator.alloc(5),
+                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        result = tree.evict(EvictParams(num_tokens=4))
+        self.assertGreaterEqual(result.num_tokens_evicted, 4)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
+        self.assertEqual(len(match.device_indices), 0)
 
 
 if __name__ == "__main__":

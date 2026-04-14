@@ -1058,22 +1058,16 @@ class MambaRadixCache(BasePrefixCache):
 
         mamba_num_evicted = 0
 
-        # Collect and rank once per eviction call.
-        candidates = self._collect_unlocked_candidates(leaf_only=False)
-        if not candidates:
-            return 0
-
-        ranked = self._rank_candidates_seglen(candidates)
-
-        for x in ranked:
-            if mamba_num_evicted >= mamba_num:
+        while mamba_num_evicted < mamba_num:
+            candidates = self._collect_unlocked_candidates(leaf_only=False)
+            if not candidates:
                 break
 
-            # Skip if locked or already evicted since ranking.
-            if x.mamba_lock_ref != 0:
-                continue
-            if not self.mamba_lru_list.in_list(x):
-                continue
+            ranked = self._rank_candidates_seglen(candidates)
+            if not ranked:
+                break
+
+            x = ranked[0]
 
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
             assert (
@@ -1152,22 +1146,16 @@ class MambaRadixCache(BasePrefixCache):
 
         full_num_evicted = 0
 
-        # Collect and rank once per eviction call.
-        candidates = self._collect_unlocked_candidates(leaf_only=True)
-        if not candidates:
-            return 0
-
-        ranked = self._rank_candidates_seglen(candidates)
-
-        for x in ranked:
-            if full_num_evicted >= full_num_tokens:
+        while full_num_evicted < full_num_tokens:
+            candidates = self._collect_unlocked_candidates(leaf_only=True)
+            if not candidates:
                 break
 
-            # Skip if locked or already evicted since ranking.
-            if x.full_lock_ref != 0:
-                continue
-            if not self.full_lru_list.in_list(x):
-                continue
+            ranked = self._rank_candidates_seglen(candidates)
+            if not ranked:
+                break
+
+            x = ranked[0]
 
             assert (
                 x != self.root_node
