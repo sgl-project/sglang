@@ -288,6 +288,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            pack_qkv_a2a=True,
         )
 
     def forward(
@@ -476,6 +477,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             softmax_scale=None,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            pack_qkv_a2a=True,
         )
 
     def _patch_to_out_weight_loader(self) -> None:
