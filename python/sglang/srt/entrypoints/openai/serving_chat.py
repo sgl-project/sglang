@@ -99,6 +99,8 @@ def _fast_sse_content(
         usage=usage,
     )
     return _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
+
+
 from sglang.srt.entrypoints.openai.utils import (
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
@@ -788,10 +790,12 @@ class OpenAIServingChat(OpenAIServingBase):
                         object="chat.completion.chunk",
                         created=int(time.time()),
                         model=request.model,
-                        choices=[_StreamChoice(
-                            index=index,
-                            delta=_StreamDelta(role="assistant", content=""),
-                        )],
+                        choices=[
+                            _StreamChoice(
+                                index=index,
+                                delta=_StreamDelta(role="assistant", content=""),
+                            )
+                        ],
                     )
                     yield _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
                     stream_started = True
@@ -890,12 +894,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     object="chat.completion.chunk",
                     created=int(time.time()),
                     model=request.model,
-                    choices=[_StreamChoice(
-                        index=idx,
-                        delta=_StreamDelta(),
-                        finish_reason=final_finish_reason,
-                        matched_stop=matched_stop,
-                    )],
+                    choices=[
+                        _StreamChoice(
+                            index=idx,
+                            delta=_StreamDelta(),
+                            finish_reason=final_finish_reason,
+                            matched_stop=matched_stop,
+                        )
+                    ],
                 )
                 yield _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
 
