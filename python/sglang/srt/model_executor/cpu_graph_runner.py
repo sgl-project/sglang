@@ -222,6 +222,7 @@ def register_fake_ops():
         use_fp8_w8a16,
         qkv_a_proj_scale,
         q_b_proj_scale,
+        w_scale,
         is_vnni,
         block_size,
         q_lora_rank,

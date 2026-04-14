@@ -47,7 +47,7 @@ These options **trade output quality** for speed or VRAM savings. Results will d
 | **Approximate Attention** | `--attention-backend sage_attn` / `sage_attn_3` / `sliding_tile_attn` / `video_sparse_attn` / `sparse_video_gen_2_attn` / `vmoba_attn` / `sla_attn` / `sage_sla_attn` | Replaces exact attention with approximate or sparse variants. `sage_attn`: INT8/FP8 quantized Q·K; `sliding_tile_attn`: spatial-temporal tile skipping; others: model-specific sparse patterns. | ~1.5–2x on attention (varies by backend) | Quality degradation varies by backend and model. `sage_attn` is the most general; sparse backends (`sliding_tile_attn`, `video_sparse_attn`, etc.) are video-model-specific and may require config files (e.g. `--mask-strategy-file-path` for STA). Requires corresponding packages installed. |
 | **Cache-DiT** | `SGLANG_CACHE_DIT_ENABLED=true` + `--cache-dit-config <path>` | Caches intermediate residuals across denoising steps and skips redundant computations via a Selective Computation Mask (SCM). | ~1.5–2x on supported models | Quality depends on SCM config. Incompatible with `--dit-layerwise-offload`. Requires correct per-model config YAML. |
 | **Quantized Models (Nunchaku / SVDQuant)** | `--enable-svdquant --transformer-weights-path <path>` + optional `--quantization-precision int4\|nvfp4`, `--quantization-rank 32` | W4A4-style quantization via [Nunchaku](https://nunchaku.tech). Reduces DiT weight memory by ~4x. Precision/rank can be auto-inferred from weight filename or set explicitly. | ~1.5–2x compute speedup | Lossy quantization; quality depends on rank and precision. Requires pre-quantized weights. Ampere (SM8x) or SM12x only (no Hopper SM90). Higher rank = better quality but more memory. |
-| **Pre-quantized Weights** | `--transformer-weights-path <path>` | Load any pre-quantized transformer weights (FP8, INT8, etc.) from a single `.safetensors` file, a directory, or a HuggingFace repo ID. | ~1.3–1.5x compute (dtype dependent) | Requires a validated quantized transformer override, such as one produced by `tools/build_modelopt_fp8_transformer.py` for ModelOpt FP8. Quality slightly worse than BF16; varies by quantization format. |
+| **Pre-quantized Weights** | `--transformer-weights-path <path>` | Load any pre-quantized transformer weights (FP8, INT8, etc.) from a single `.safetensors` file, a directory, or a HuggingFace repo ID. | ~1.3–1.5x compute (dtype dependent) | Requires pre-converted weights (e.g. via `tools/convert_hf_to_fp8.py` for FP8). Quality slightly worse than BF16; varies by quantization format. |
 | **Component Precision Override** | `--dit-precision fp16`, `--vae-precision fp16\|bf16` | On-the-fly dtype conversion for individual components. E.g. convert a BF16 model to FP16 at load time, or run VAE in BF16 instead of FP32. | Reduces memory; FP16 can be faster on some GPUs | May affect numerical stability. VAE is FP32 by default for accuracy; lowering it is lossy. DiT defaults to BF16. |
 | **Fewer Inference Steps** | `--num-inference-steps N` (sampling param) | Reduces the number of denoising steps. Fewer steps = faster. | Linear speedup | Quality degrades with too few steps. Model-dependent optimal range. |
 
@@ -87,6 +87,37 @@ sglang generate --model-path Lightricks/LTX-2 \
 ```
 
 Note: this generate recipe is aligned with the nightly comparison case `ltx2_twostage_t2v`. After [PR #20707](https://github.com/sgl-project/sglang/pull/20707), `LTX2TwoStagePipeline` is a native path and auto-resolves the spatial upsampler plus distilled LoRA from the same model snapshot unless you override them.
+
+### Native baseline, 2 GPUs: LTX-2.3 one-stage
+
+```bash
+sglang generate --model-path Lightricks/LTX-2.3 \
+  --prompt "A beautiful sunset over the ocean" \
+  --negative-prompt "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width 768 --height 512 \
+  --num-frames 121 --fps 24 \
+  --num-inference-steps 30 --guidance-scale 3.0 \
+  --seed 1234 --num-gpus 2 \
+  --enable-torch-compile --warmup --save-output
+```
+
+Note: use this as the native `LTX2Pipeline` baseline for `LTX-2.3`. It keeps the validated one-stage resolution and explicit `LTX-2.3` sampling defaults, and matches the `ltx23-one-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
+
+### Benchmark target, 2 GPUs: LTX-2.3 two-stage
+
+```bash
+sglang generate --model-path Lightricks/LTX-2.3 \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --prompt "A beautiful sunset over the ocean" \
+  --negative-prompt "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width 1536 --height 1024 \
+  --num-frames 121 --fps 24 \
+  --num-inference-steps 30 --guidance-scale 3.0 \
+  --seed 1234 --num-gpus 2 \
+  --enable-torch-compile --warmup --save-output
+```
+
+Note: this is the recommended benchmark command for the new `LTX-2.3` two-stage path. It uses the native `LTX2TwoStagePipeline` and matches the `ltx23-two-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
 
 ### Maximum speed, image model, single GPU, lossless
 

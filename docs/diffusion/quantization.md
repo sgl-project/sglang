@@ -48,26 +48,6 @@ backend.
 | `nunchaku-svdq`  | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`   | `--transformer-weights-path`                         | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                            |
 | `msmodelslim`    | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                       | Wan2.2 family                                                | None                                  | Currently only compatible with the Ascend NPU family and supports both `w8a8` and `w4a4`                              |
 
-## Validated ModelOpt Checkpoints
-
-This section is the canonical support matrix for diffusion ModelOpt checkpoints
-that have been brought up and verified in SGLang.
-
-### FP8
-
-| Base Model | Validated Scope | HF DiT Weights | Notes |
-| --- | --- | --- | --- |
-| `black-forest-labs/FLUX.1-dev` | single-transformer override, deterministic latent/image comparison, H100 benchmark, torch-profiler trace | `BBuf/flux1-dev-modelopt-fp8-sglang-transformer` | SGLang converter keeps a validated BF16 fallback set for modulation and FF projection layers; use `--model-id FLUX.1-dev` for local mirrors |
-| `black-forest-labs/FLUX.2-dev` | single-transformer override load and generation path | `BBuf/flux2-dev-modelopt-fp8-sglang-transformer` | published SGLang-ready transformer override |
-| `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | primary `transformer` quantized, `transformer_2` kept BF16 | `BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer` | do not describe this as dual-transformer full-model FP8 unless that path is validated separately |
-
-### NVFP4
-
-| Base Model | Validated Scope | HF DiT Weights | Notes |
-| --- | --- | --- | --- |
-| `black-forest-labs/FLUX.1-dev` | mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace | `unpublished` | use `build_modelopt_nvfp4_transformer.py`; validated builder keeps selected FLUX.1 modules in BF16 and sets `swap_weight_nibbles=false` |
-| `black-forest-labs/FLUX.2-dev` | packed-QKV load path | `black-forest-labs/FLUX.2-dev-NVFP4` | validated packed export detection and runtime layout handling |
-
 ## ModelOpt FP8
 
 ### Usage Examples
@@ -103,7 +83,7 @@ sglang generate \
 - The layerwise offload path now preserves the non-contiguous FP8 weight stride
   expected by the runtime FP8 GEMM path.
 - To build the converted checkpoint yourself from a ModelOpt diffusers export,
-  use `python -m sglang.multimodal_gen.tools.build_modelopt_fp8_transformer`.
+  use `python -m sglang.multimodal_gen.tools.convert_modelopt_fp8_checkpoint`.
 
 ## NVFP4
 
