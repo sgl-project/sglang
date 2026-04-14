@@ -549,17 +549,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             extras={"enable_upscaling": True, "upscaling_scale": 4},
         ),
     ),
-    DiffusionTestCase(
-        "mova_360p_1gpu",
-        DiffusionServerArgs(
-            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
-            modality="video",
-            num_gpus=1,
-            dit_layerwise_offload=True,
-        ),
-        TI2V_sampling_params,
-        run_perf_check=False,
-    ),
 ]
 
 HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
@@ -918,19 +907,6 @@ TWO_GPU_CASES_A = [
         run_perf_check=False,
     ),
     DiffusionTestCase(
-        "mova_360p_ring2_uly1",
-        DiffusionServerArgs(
-            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
-            modality="video",
-            num_gpus=2,
-            ring_degree=2,
-            ulysses_degree=1,
-            dit_layerwise_offload=True,
-        ),
-        TI2V_sampling_params,
-        run_perf_check=False,
-    ),
-    DiffusionTestCase(
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
@@ -939,6 +915,16 @@ TWO_GPU_CASES_A = [
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         T2V_sampling_params,
+    ),
+    DiffusionTestCase(
+        "ltx_2_3_two_stage_ti2v_2gpus",
+        DiffusionServerArgs(
+            model_path="Lightricks/LTX-2.3",
+            modality="video",
+            num_gpus=2,
+            extras=["--pipeline-class-name LTX2TwoStagePipeline"],
+        ),
+        TI2V_sampling_params,
     ),
 ]
 
@@ -1098,7 +1084,6 @@ ACCURACY_ONE_GPU_CASES_A_IDS = (
     "qwen_image_edit_2511_ti2i",
     "qwen_image_layered_i2i",
     "flux_2_image_t2i_upscaling_4x",
-    "mova_360p_1gpu",
 )
 
 ACCURACY_ONE_GPU_CASES_B_IDS = (
@@ -1130,7 +1115,6 @@ ACCURACY_TWO_GPU_CASES_A_IDS = (
     "fsdp-inference",
     "mova_360p_tp2",
     "mova_360p_ring1_uly2",
-    "mova_360p_ring2_uly1",
     "ltx_2_two_stage_t2v",
 )
 

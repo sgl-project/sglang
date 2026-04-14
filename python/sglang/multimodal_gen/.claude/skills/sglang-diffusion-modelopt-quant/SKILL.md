@@ -23,8 +23,8 @@ This skill owns the ModelOpt-to-SGLang bridge. It is not a generic kernel-tuning
 - Benchmark only when BF16 and quantized commands are identical except for the checkpoint override being tested.
 - For diffusion FP8, keep `dit_cpu_offload=false`. `dit_layerwise_offload=true` is valid on the fixed path when you want lower DiT residency.
 - For multi-transformer pipelines, use per-component overrides when different components need different checkpoints.
-- When a branch is missing the validated helper tools, refresh `python/sglang/multimodal_gen/tools/convert_modelopt_fp8_checkpoint.py` and `python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py` instead of inventing one-off scripts elsewhere.
-- After validating a new ModelOpt quant path, update both the FP8 and NVFP4 support tables in this skill before closing the task.
+- When a branch is missing the validated helper tools, refresh `python/sglang/multimodal_gen/tools/build_modelopt_fp8_transformer.py`, `python/sglang/multimodal_gen/tools/build_modelopt_nvfp4_transformer.py`, and `python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py` instead of inventing one-off scripts elsewhere.
+- After validating a new ModelOpt quant path, update the ModelOpt support matrix in `docs/diffusion/quantization.md` before closing the task.
 
 ## Read First
 
@@ -38,7 +38,8 @@ Read these sources before changing code:
   - `python/sglang/multimodal_gen/runtime/utils/quantization_utils.py`
   - `python/sglang/multimodal_gen/runtime/loader/transformer_load_utils.py`
 - Helper tools in this repo:
-  - [`python/sglang/multimodal_gen/tools/convert_modelopt_fp8_checkpoint.py`](../../../tools/convert_modelopt_fp8_checkpoint.py)
+  - [`python/sglang/multimodal_gen/tools/build_modelopt_fp8_transformer.py`](../../../tools/build_modelopt_fp8_transformer.py)
+  - [`python/sglang/multimodal_gen/tools/build_modelopt_nvfp4_transformer.py`](../../../tools/build_modelopt_nvfp4_transformer.py)
   - [`python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py`](../../../tools/compare_diffusion_trajectory_similarity.py)
 
 If you are working on a new model family, inspect the transformer's config and tensor naming before changing the generic converter.
@@ -52,31 +53,16 @@ This repo now contains:
 - diffusion-side NVFP4 loading from ModelOpt exports
 - FLUX.2 packed-QKV detection that distinguishes packed NVFP4 checkpoints from standard diffusers exports
 - automatic protection against incompatible FP8 CPU offload while keeping layerwise DiT offload available
-- FP8 export conversion:
-  [`python/sglang/multimodal_gen/tools/convert_modelopt_fp8_checkpoint.py`](../../../tools/convert_modelopt_fp8_checkpoint.py)
+- FP8 transformer build:
+  [`python/sglang/multimodal_gen/tools/build_modelopt_fp8_transformer.py`](../../../tools/build_modelopt_fp8_transformer.py)
 - trajectory similarity validation:
   [`python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py`](../../../tools/compare_diffusion_trajectory_similarity.py)
 
 ## Documentation Maintenance
 
-- Keep two separate support tables in this skill: one for FP8 and one for NVFP4.
-- After finishing a new quant support path, update both tables in every mirrored copy of this skill.
-- Each row must record the validated scope, the Hugging Face repo or path for the quantized DiT weights, and the key caveats.
+- Keep the validated ModelOpt support matrix in `docs/diffusion/quantization.md`.
+- Each row should record the validated scope, the Hugging Face repo or path for the quantized DiT weights, and the key caveats.
 - If the quantized DiT weights are not published yet, write `unpublished` explicitly instead of leaving the field blank.
-
-## FP8 Supported Models
-
-| Base Model | Validated Scope | HF DiT Weights | Notes |
-| --- | --- | --- | --- |
-| `black-forest-labs/FLUX.1-dev` | single-transformer override, deterministic latent/image comparison, H100 benchmark, torch-profiler trace | `BBuf/flux1-dev-modelopt-fp8-sglang-transformer` | SGLang converter keeps a validated BF16 fallback set for modulation and FF projection layers; use `--model-id FLUX.1-dev` for local mirrors |
-| `black-forest-labs/FLUX.2-dev` | single-transformer override load and generation path | `BBuf/flux2-dev-modelopt-fp8-sglang-transformer` | published SGLang-ready transformer override |
-| `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | primary `transformer` quantized, `transformer_2` kept BF16 | `BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer` | do not describe this as dual-transformer full-model FP8 unless that path is validated separately |
-
-## NVFP4 Supported Models
-
-| Base Model | Validated Scope | HF DiT Weights | Notes |
-| --- | --- | --- | --- |
-| `black-forest-labs/FLUX.2-dev` | packed-QKV load path | `black-forest-labs/FLUX.2-dev-NVFP4` | validated packed export detection and runtime layout handling |
 
 ## FP8 Vs NVFP4
 
@@ -120,7 +106,7 @@ python quantize.py \
   --model <model-name> \
   --override-model-path <hf-repo-or-local-model> \
   --model-dtype <Half|BFloat16> \
-  --format <fp8|nvfp4> \
+  --format <fp8|fp4> \
   --batch-size 1 \
   --calib-size <calib-size> \
   --n-steps <calib-steps> \
@@ -129,6 +115,9 @@ python quantize.py \
   --quantized-torch-ckpt-save-path <out>/ckpt \
   --hf-ckpt-dir <out>/hf
 ```
+
+For current ModelOpt diffusion examples, use `--format fp4` for NVFP4 exports.
+Do not assume the checked-out ModelOpt version accepts a literal `nvfp4` format string unless you verified it locally.
 
 For multi-transformer models:
 
@@ -141,7 +130,7 @@ For multi-transformer models:
 FP8 requires an extra conversion step:
 
 ```bash
-PYTHONPATH=python python3 -m sglang.multimodal_gen.tools.convert_modelopt_fp8_checkpoint \
+PYTHONPATH=python python3 -m sglang.multimodal_gen.tools.build_modelopt_fp8_transformer \
   --modelopt-hf-dir <out>/hf \
   --modelopt-backbone-ckpt <out>/ckpt/backbone.pt \
   --base-transformer-dir <base-model-transformer-dir> \
@@ -166,8 +155,24 @@ For `FLUX.1-dev`, the validated fallback set currently keeps these modules in BF
 - `transformer_blocks.*.ff_context.net.0.proj`
 - `transformer_blocks.*.ff_context.net.2`
 - `single_transformer_blocks.*.norm.linear`
+- `single_transformer_blocks.*.proj_mlp`
 
 Use `--model-type flux1` to force that profile, or rely on `--model-type auto` when the export config identifies `FluxTransformer2DModel`.
+
+For FLUX.1-dev NVFP4 model families that need a mixed BF16+NVFP4 checkpoint, build the merged transformer explicitly:
+
+```bash
+PYTHONPATH=python python3 -m sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer \
+  --base-transformer-dir <base-model-transformer-dir> \
+  --modelopt-hf-dir <out>/hf/transformer \
+  --output-dir <out>/transformer-mixed \
+  --pattern-preset flux1-nvfp4
+```
+
+The validated FLUX.1-dev mixed builder also needs to preserve:
+
+- `quant_type: NVFP4` in `config.json`
+- `swap_weight_nibbles: false` for the validated diffusers export
 
 ### 4. Load The Quantized Checkpoint In SGLang
 
@@ -304,5 +309,5 @@ When documenting results:
 | `runtime/utils/quantization_utils.py` | resolves flat ModelOpt configs and reconstructs NVFP4 config from metadata |
 | `runtime/loader/transformer_load_utils.py` | guards incompatible FP8 offload modes |
 | `runtime/models/dits/flux_2.py` | packed-QKV handling for the packed FLUX.2 NVFP4 family |
-| `tools/convert_modelopt_fp8_checkpoint.py` | FP8 offline conversion into SGLang-native layout |
+| `tools/build_modelopt_fp8_transformer.py` | Build an SGLang-loadable FP8 transformer from a ModelOpt export |
 | `tools/compare_diffusion_trajectory_similarity.py` | reduced deterministic BF16-vs-quantized validation |
