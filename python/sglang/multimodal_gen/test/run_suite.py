@@ -543,11 +543,28 @@ def _extract_failure_tail(full_output: str, max_lines: int = 20) -> list[str]:
     return lines[-max_lines:]
 
 
+def _summary_has_retryable_failure(summary_lines: list[str]) -> bool:
+    for line in summary_lines:
+        lowered = line.lower()
+        if (
+            "[performance]" in line
+            or "SafetensorError" in line
+            or "FileNotFoundError" in line
+            or "TimeoutError" in line
+            or "out of memory" in lowered
+            or "oom killer" in lowered
+        ):
+            return True
+    return False
+
+
 def _is_retryable_failure(full_output: str) -> bool:
+    summary_lines = _extract_short_test_summary(full_output)
     is_perf_assertion = (
         "multimodal_gen/test/server/test_server_utils.py" in full_output
         and "AssertionError" in full_output
     )
+    is_aggregated_retryable_failure = _summary_has_retryable_failure(summary_lines)
 
     is_flaky_ci_assertion = (
         "SafetensorError" in full_output
@@ -559,7 +576,12 @@ def _is_retryable_failure(full_output: str) -> bool:
         "out of memory" in full_output.lower() or "oom killer" in full_output.lower()
     )
 
-    return is_perf_assertion or is_flaky_ci_assertion or is_oom_error
+    return (
+        is_perf_assertion
+        or is_aggregated_retryable_failure
+        or is_flaky_ci_assertion
+        or is_oom_error
+    )
 
 
 def _print_attempt_tail_summary(
