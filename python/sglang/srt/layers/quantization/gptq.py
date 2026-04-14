@@ -52,7 +52,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs, cpu_has_amx_support
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -77,7 +77,8 @@ logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
 
 _is_cpu = is_cpu()
-if _is_cpu:
+_is_cpu_amx_available = _is_cpu and cpu_has_amx_support()
+if _is_cpu_amx_available:
     from sglang.srt.layers.amx_utils import (
         CPUQuantMethod,
         _amx_process_weight_after_loading,
@@ -136,6 +137,8 @@ class GPTQConfig(QuantizationConfig):
         lm_head_quantized: bool,
         dynamic: Dict[str, Dict[str, Union[int, bool]]],
         checkpoint_format: str = "",
+        true_sequential: bool = False,
+        static_groups: bool = False,
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
@@ -172,6 +175,8 @@ class GPTQConfig(QuantizationConfig):
         # Currently GPTQModel stores v1 format checkpoints by default,
         # but provides the option to set `format="gptq_v2"` in `QuantizeConfig`.
         self.checkpoint_format = checkpoint_format
+        self.true_sequential = true_sequential
+        self.static_groups = static_groups
         if self.weight_bits not in [2, 3, 4, 8]:
             raise ValueError(
                 "Currently, only 2/3/4/8-bit weight quantization is "
@@ -202,7 +207,7 @@ class GPTQConfig(QuantizationConfig):
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return (
-            [torch.half] if not (_is_npu or _is_cpu) else [torch.half, torch.bfloat16]
+            [torch.half] if not (_is_npu or _is_cpu_amx_available) else [torch.half, torch.bfloat16]
         )
 
     @classmethod
@@ -231,6 +236,10 @@ class GPTQConfig(QuantizationConfig):
         checkpoint_format = cls.get_from_keys_or(
             config, ["checkpoint_format"], default=""
         )
+        true_sequential = cls.get_from_keys_or(
+            config, ["true_sequential"], default=False
+        )
+        static_groups = cls.get_from_keys_or(config, ["static_groups"], default=False)
         return cls(
             weight_bits,
             group_size,
@@ -238,6 +247,8 @@ class GPTQConfig(QuantizationConfig):
             lm_head_quantized,
             dynamic,
             checkpoint_format,
+            true_sequential,
+            static_groups,
         )
 
     def get_quant_method(
@@ -253,10 +264,15 @@ class GPTQConfig(QuantizationConfig):
             if isinstance(layer, LinearBase):
                 return GPTQLinearAscendMethod(self)
             return None
+        elif _is_cpu_amx_available:
+            if isinstance(layer, FusedMoE):
+                return GPTQMoEIntelAMXMethod(self)
+            if isinstance(layer, LinearBase):
+                return GPTQLinearIntelAMXMethod(self)
+            return None
+
         if isinstance(layer, FusedMoE):
-            return GPTQMoEIntelAMXMethod(self)
-        # if isinstance(layer, FusedMoE):
-        #     raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
+            raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
         else:
             return get_linear_quant_method(
                 self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
@@ -567,7 +583,6 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.register_parameter("g_idx", g_idx)
         layer.register_parameter("qzeros", qzeros)
         layer.register_parameter("scales", scales)
-        # breakpoint()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # for torch.compile
@@ -575,11 +590,6 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-        if _is_cpu:
-            _amx_process_weight_after_loading(
-                layer, ["qweight", "qzeros", "scales"], None, "gptq"
-            )
-            return
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
         if self.use_shuffle:
@@ -597,14 +607,7 @@ class GPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if _is_cpu:
-            return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-                x,
-                layer.qweight,
-                layer.qzeros,
-                layer.scales,
-                bias,
-            )
+
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
@@ -1174,206 +1177,6 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         )
 
 
-class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
-
-    def __init__(self, quant_config: GPTQConfig):
-        super().__init__()
-        self.quant_config = quant_config
-        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
-        self.moe_runner_config: Optional[MoeRunnerConfig] = None
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        # Delay the import to avoid circular dependency
-        from sglang.srt.layers.linear import set_weight_attrs
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
-        self.is_k_full = (not self.quant_config.desc_act) or layer.moe_tp_size == 1
-
-        if self.quant_config.group_size != -1:
-            scales_size13 = hidden_size // self.quant_config.group_size
-            if self.quant_config.desc_act:
-                w2_scales_size = intermediate_size_per_partition
-            else:
-                w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
-            scales_size2 = w2_scales_size // self.quant_config.group_size
-            strategy = FusedMoeWeightScaleSupported.GROUP.value
-        else:
-            scales_size13 = 1
-            scales_size2 = 1
-            strategy = FusedMoeWeightScaleSupported.CHANNEL.value
-
-        extra_weight_attrs.update({"quant_method": strategy, "is_transposed": True})
-        # Fused gate_up_proj (column parallel)
-        w13_qweight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size // self.quant_config.pack_factor,
-                2 * intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_qweight", w13_qweight)
-        set_weight_attrs(w13_qweight, extra_weight_attrs)
-        # down_proj (row parallel)
-        w2_qweight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition // self.quant_config.pack_factor,
-                hidden_size,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_qweight", w2_qweight)
-        set_weight_attrs(w2_qweight, extra_weight_attrs)
-        # up_proj scales
-        w13_scales = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                scales_size13,
-                2 * intermediate_size_per_partition,
-                dtype=torch.half,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_scales", w13_scales)
-        set_weight_attrs(w13_scales, extra_weight_attrs)
-        # down_proj scales
-        w2_scales = torch.nn.Parameter(
-            torch.empty(num_experts, scales_size2, hidden_size, dtype=torch.half),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_scales", w2_scales)
-        set_weight_attrs(w2_scales, extra_weight_attrs)
-        # dont shard the w2 scales when running act order
-        set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
-        # up_proj scales
-        w13_qzeros = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                scales_size13,
-                2 * intermediate_size_per_partition // self.quant_config.pack_factor,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_qzeros", w13_qzeros)
-        set_weight_attrs(w13_qzeros, extra_weight_attrs)
-        # down_proj scales
-        w2_qzeros = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                scales_size2,
-                hidden_size // self.quant_config.pack_factor,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_qzeros", w2_qzeros)
-        set_weight_attrs(w2_qzeros, extra_weight_attrs)
-        # dont shard the w2 scales when running act order
-        set_weight_attrs(w2_qzeros, {"load_full_w2": self.quant_config.desc_act})
-        w13_g_idx = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_g_idx", w13_g_idx)
-        set_weight_attrs(w13_g_idx, extra_weight_attrs)
-        w2_g_idx = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_g_idx", w2_g_idx)
-        set_weight_attrs(w2_g_idx, extra_weight_attrs)
-        w13_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
-        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
-        w2_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
-        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
-
-    def create_moe_runner(
-        self,
-        layer: torch.nn.Module,
-        moe_runner_config: MoeRunnerConfig,
-        **extra_weight_attrs,
-    ):
-        self.moe_runner_config = moe_runner_config
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_cpu:
-            _amx_process_weight_after_loading(
-                layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "gptq"
-            )
-            _amx_process_weight_after_loading(
-                layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "gptq"
-            )
-            return
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> torch.Tensor:
-        if _is_cpu:
-            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-            assert (
-                self.moe_runner_config.activation == "silu"
-            ), "Only SiLU activation is supported."
-
-            x = dispatch_output.hidden_states
-            topk_output = dispatch_output.topk_output
-            topk_weights, topk_ids, _ = topk_output
-            output = torch.ops.sgl_kernel.fused_experts_cpu(
-                x,
-                layer.w13_qweight,
-                layer.w2_qweight,
-                topk_weights,
-                topk_ids,
-                False,  # inplace See [Note] inplace should be False in fused_experts.
-                CPUQuantMethod.INT4_W4A8,
-                layer.w13_scales,  # w1_scale
-                layer.w2_scales,  # w2_scale
-                layer.w13_qzeros,
-                layer.w2_qzeros,
-                None,  # block_size
-                True,  # is_vnni
-            )
-            return StandardCombineInput(hidden_states=output)
-
-
 def unpack_from_int32(
     weight: torch.Tensor,
     num_bits: int,
@@ -1766,6 +1569,272 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         )
 
         return self.runner.run(dispatch_output, quant_info)
+
+
+class GPTQLinearIntelAMXMethod(GPTQLinearMethod):
+    """Linear method for GPTQ on Ascend NPU."""
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+        if self.quant_config.desc_act and not (
+            self.quant_config.true_sequential and self.quant_config.static_groups
+        ):
+            raise ValueError(
+                "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
+            )
+        if self.use_v2_format:
+            raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+
+        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+        layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
+        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+
+        _amx_process_weight_after_loading(
+            layer, ["qweight", "qzeros", "scales"], None, "gptq"
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+
+        return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x,
+            layer.qweight,
+            layer.qzeros,
+            layer.scales,
+            bias,
+        )
+
+
+class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
+
+    def __init__(self, quant_config: GPTQConfig):
+        super().__init__()
+        self.quant_config = quant_config
+        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
+        self.moe_runner_config: Optional[MoeRunnerConfig] = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        if self.quant_config.desc_act and not (
+            self.quant_config.true_sequential and self.quant_config.static_groups
+        ):
+            raise ValueError(
+                "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
+            )
+        if self.use_v2_format:
+            raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
+
+        # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import set_weight_attrs
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        self.is_k_full = (not self.quant_config.desc_act) or layer.moe_tp_size == 1
+
+        if self.quant_config.group_size != -1:
+            scales_size13 = hidden_size // self.quant_config.group_size
+            if self.quant_config.desc_act:
+                w2_scales_size = intermediate_size_per_partition
+            else:
+                w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
+            scales_size2 = w2_scales_size // self.quant_config.group_size
+            strategy = FusedMoeWeightScaleSupported.GROUP.value
+        else:
+            scales_size13 = 1
+            scales_size2 = 1
+            strategy = FusedMoeWeightScaleSupported.CHANNEL.value
+
+        extra_weight_attrs.update({"quant_method": strategy, "is_transposed": True})
+        # Fused gate_up_proj (column parallel)
+        w13_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size // self.quant_config.pack_factor,
+                2 * intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qweight", w13_qweight)
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+        # down_proj (row parallel)
+        w2_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition // self.quant_config.pack_factor,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qweight", w2_qweight)
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+        # up_proj scales
+        w13_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                scales_size13,
+                2 * intermediate_size_per_partition,
+                dtype=torch.half,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scales", w13_scales)
+        set_weight_attrs(w13_scales, extra_weight_attrs)
+        # down_proj scales
+        w2_scales = torch.nn.Parameter(
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=torch.half),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scales", w2_scales)
+        set_weight_attrs(w2_scales, extra_weight_attrs)
+        # dont shard the w2 scales when running act order
+        set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
+        # up_proj scales
+        w13_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                scales_size13,
+                2 * intermediate_size_per_partition // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qzeros", w13_qzeros)
+        set_weight_attrs(w13_qzeros, extra_weight_attrs)
+        # down_proj scales
+        w2_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                scales_size2,
+                hidden_size // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qzeros", w2_qzeros)
+        set_weight_attrs(w2_qzeros, extra_weight_attrs)
+        # dont shard the w2 scales when running act order
+        set_weight_attrs(w2_qzeros, {"load_full_w2": self.quant_config.desc_act})
+        w13_g_idx = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_g_idx", w13_g_idx)
+        set_weight_attrs(w13_g_idx, extra_weight_attrs)
+        w2_g_idx = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_g_idx", w2_g_idx)
+        set_weight_attrs(w2_g_idx, extra_weight_attrs)
+        w13_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
+        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
+        w2_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
+
+    def create_moe_runner(
+        self,
+        layer: torch.nn.Module,
+        moe_runner_config: MoeRunnerConfig,
+        **extra_weight_attrs,
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        _amx_process_weight_after_loading(
+            layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "gptq"
+        )
+        _amx_process_weight_after_loading(
+            layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "gptq"
+        )
+        return
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+        output = torch.ops.sgl_kernel.fused_experts_cpu(
+            x,
+            layer.w13_qweight,
+            layer.w2_qweight,
+            topk_weights,
+            topk_ids,
+            False,  # inplace See [Note] inplace should be False in fused_experts.
+            CPUQuantMethod.INT4_W4A8,
+            layer.w13_scales,  # w1_scale
+            layer.w2_scales,  # w2_scale
+            layer.w13_qzeros,
+            layer.w2_qzeros,
+            None,  # block_size
+            True,  # is_vnni
+        )
+        return StandardCombineInput(hidden_states=output)
 
 
 # Register fake implementations for torch.compile support
