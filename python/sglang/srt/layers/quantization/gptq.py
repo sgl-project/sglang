@@ -513,8 +513,12 @@ class GPTQLinearMethod(LinearMethodBase):
             group_size = input_size
 
         self.use_shuffle = True
-        scale_and_zero_size = input_size // group_size
-        scale_and_zero_input_dim = None
+        if _is_cpu_amx_available:
+            scale_and_zero_size = input_size_per_partition // group_size
+            scale_and_zero_input_dim = 0
+        else:
+            scale_and_zero_size = input_size // group_size
+            scale_and_zero_input_dim = None
         if (
             input_size != input_size_per_partition
             and self.quant_config.group_size != -1
