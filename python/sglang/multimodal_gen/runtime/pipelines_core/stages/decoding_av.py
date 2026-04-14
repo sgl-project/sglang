@@ -3,9 +3,6 @@ import torch
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_dump import (
-    maybe_save_ltx23_ti2v_tensor,
-)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -147,10 +144,6 @@ class LTX2AVDecodingStage(DecodingStage):
                         )
                 # Decode spectrogram to waveform
                 waveform = self.vocoder(spectrogram)
-            maybe_save_ltx23_ti2v_tensor(
-                "sglang_generated_mel_spectrograms", spectrogram
-            )
-            maybe_save_ltx23_ti2v_tensor("sglang_decoded_audio_waveform", waveform)
             output_batch.audio = waveform.cpu().float()
             try:
                 pipeline_audio_cfg = server_args.pipeline_config.audio_vae_config
