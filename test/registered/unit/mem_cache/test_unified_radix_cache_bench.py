@@ -724,34 +724,69 @@ def run_all_benchmarks(
 # pytest wrapper
 # ===================================================================
 _CI_BENCH_CONFIGS = [
-    ("FULL_MAMBA_ps1", (ComponentType.FULL, ComponentType.MAMBA), 1, 5000, 500_000),
-    ("FULL_SWA_ps1", (ComponentType.FULL, ComponentType.SWA), 1, 1000, 100_000),
-    ("FULL_ps16", (ComponentType.FULL,), 16, 1000, 100_000),
-    ("FULL_SWA_ps16", (ComponentType.FULL, ComponentType.SWA), 16, 1000, 100_000),
-    ("FULL_ps128", (ComponentType.FULL,), 128, 1000, 200_000),
-    ("FULL_SWA_ps128", (ComponentType.FULL, ComponentType.SWA), 128, 1000, 200_000),
+    dict(
+        label="FULL_MAMBA_ps1",
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        page_size=1,
+        num_seqs=5000,
+        kv_size=500_000,
+    ),
+    dict(
+        label="FULL_SWA_ps1",
+        components=(ComponentType.FULL, ComponentType.SWA),
+        page_size=1,
+        num_seqs=1000,
+        kv_size=100_000,
+    ),
+    dict(
+        label="FULL_ps16",
+        components=(ComponentType.FULL,),
+        page_size=16,
+        num_seqs=1000,
+        kv_size=100_000,
+    ),
+    dict(
+        label="FULL_SWA_ps16",
+        components=(ComponentType.FULL, ComponentType.SWA),
+        page_size=16,
+        num_seqs=1000,
+        kv_size=100_000,
+    ),
+    dict(
+        label="FULL_ps128",
+        components=(ComponentType.FULL,),
+        page_size=128,
+        num_seqs=1000,
+        kv_size=200_000,
+    ),
+    dict(
+        label="FULL_SWA_ps128",
+        components=(ComponentType.FULL, ComponentType.SWA),
+        page_size=128,
+        num_seqs=1000,
+        kv_size=200_000,
+    ),
 ]
 
 
 class _BenchSuite:
-    """Mixin: subclass must set bench_cfg = (label, components, page_size, num_seqs, kv_size)."""
+    """Mixin: subclass must set bench_cfg dict with keys: label, components, page_size, num_seqs, kv_size."""
 
     @classmethod
     def setUpClass(cls):
-        _, _, page_size, _, _ = cls.bench_cfg
         set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=page_size)
+            ServerArgs(model_path="dummy", page_size=cls.bench_cfg["page_size"])
         )
 
     def _run(self, bench_fn):
-        _, components, page_size, num_seqs, kv_size = self.bench_cfg
+        cfg = self.bench_cfg
         r = bench_fn(
-            num_seqs,
+            cfg["num_seqs"],
             _BENCH_CHUNK_LEN,
-            kv_size,
-            components=components,
+            cfg["kv_size"],
+            components=cfg["components"],
             verify=True,
-            page_size=page_size,
+            page_size=cfg["page_size"],
         )
         self.assertGreater(r.num_ops, 0)
         self.assertGreater(r.ops_per_sec, 0)
@@ -772,15 +807,15 @@ class _BenchSuite:
         self._run(bench_cache_finished)
 
 
-for _label, _components, _ps, _nseqs, _kvsz in _CI_BENCH_CONFIGS:
-    _name = f"TestBench_{_label}"
+for _cfg in _CI_BENCH_CONFIGS:
+    _name = f"TestBench_{_cfg['label']}"
     globals()[_name] = type(
         _name,
         (_BenchSuite, unittest.TestCase),
-        {"bench_cfg": (_label, _components, _ps, _nseqs, _kvsz)},
+        {"bench_cfg": _cfg},
     )
     globals()[_name].__module__ = __name__
-del _label, _components, _ps, _nseqs, _kvsz, _name
+del _cfg, _name
 
 
 # ===================================================================
