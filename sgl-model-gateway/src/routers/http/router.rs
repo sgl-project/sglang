@@ -25,8 +25,8 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{PolicyRegistry, SelectWorkerInfo},
+    extended_chat::ExtendedChatCompletionRequest,
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         common::GenerationRequest,
         completion::CompletionRequest,
@@ -748,7 +748,7 @@ impl RouterTrait for Router {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ExtendedChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/chat/completions", model_id)

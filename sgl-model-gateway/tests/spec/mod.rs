@@ -5,5 +5,6 @@
 mod chat_completion;
 mod chat_message;
 mod embedding;
+mod extended_chat;
 mod rerank;
 mod responses;

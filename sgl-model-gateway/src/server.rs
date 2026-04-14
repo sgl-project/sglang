@@ -33,6 +33,7 @@ use crate::{
         worker_manager::WorkerManager,
         Job,
     },
+    extended_chat::ExtendedChatCompletionRequest,
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
@@ -40,7 +41,6 @@ use crate::{
         otel_trace,
     },
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
@@ -184,7 +184,7 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(body): ValidatedJson<ExtendedChatCompletionRequest>,
 ) -> Response {
     state
         .router

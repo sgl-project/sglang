@@ -13,6 +13,7 @@ use crate::{
         UNKNOWN_MODEL_ID,
     },
     observability::metrics::{metrics_labels, Metrics},
+    extended_chat::ExtendedChatCompletionRequest,
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
     routers::RouterTrait,
 };
@@ -232,10 +233,14 @@ impl RouterTrait for GrpcPDRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ExtendedChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_chat_impl(headers, body, model_id).await
+        // gRPC PD intentionally drops the SGLang chat extras from
+        // ExtendedChatCompletionRequest. The scheduler protobuf doesn't model
+        // them — see the doc on ExtendedChatCompletionRequest. This path is
+        // HTTP-only by design.
+        self.route_chat_impl(headers, &body.inner, model_id).await
     }
 
     fn router_type(&self) -> &'static str {

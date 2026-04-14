@@ -20,8 +20,9 @@ use data_connector::{ResponseId, StoredResponse};
 use serde_json::json;
 use smg::{
     config::{ConfigError, HistoryBackend, OracleConfig, RouterConfig, RoutingMode},
+    extended_chat::ExtendedChatCompletionRequest,
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        chat::{ChatMessage, MessageContent},
         common::StringOrArray,
         completion::CompletionRequest,
         generate::GenerateRequest,
@@ -37,8 +38,10 @@ use tower::ServiceExt;
 
 use crate::common::mock_openai_server::MockOpenAIServer;
 
-/// Helper function to create a minimal chat completion request for testing
-fn create_minimal_chat_request() -> ChatCompletionRequest {
+/// Helper function to create a minimal chat completion request for testing.
+/// Returns the wrapper type so call sites can feed it directly into
+/// `RouterTrait::route_chat`.
+fn create_minimal_chat_request() -> ExtendedChatCompletionRequest {
     let val = json!({
         "model": "gpt-3.5-turbo",
         "messages": [
@@ -705,7 +708,7 @@ async fn test_openai_e2e_with_server() {
                     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
                     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
 
-                    let chat_request: ChatCompletionRequest =
+                    let chat_request: ExtendedChatCompletionRequest =
                         serde_json::from_str(&body_str).unwrap();
 
                     router
@@ -767,7 +770,7 @@ async fn test_openai_router_chat_streaming_with_mock() {
         "max_tokens": 10,
         "stream": true
     });
-    let chat_request: ChatCompletionRequest = serde_json::from_value(val).unwrap();
+    let chat_request: ExtendedChatCompletionRequest = serde_json::from_value(val).unwrap();
 
     let response = router.route_chat(None, &chat_request, None).await;
     assert_eq!(response.status(), StatusCode::OK);

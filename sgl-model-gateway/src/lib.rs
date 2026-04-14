@@ -5,6 +5,7 @@ pub mod core;
 pub mod middleware;
 pub mod observability;
 pub mod policies;
+pub mod extended_chat;
 pub use openai_protocol as protocols;
 pub use reasoning_parser;
 pub mod routers;

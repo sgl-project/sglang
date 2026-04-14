@@ -9,8 +9,9 @@ use axum::{
 use criterion::{criterion_group, criterion_main, Criterion};
 use http_body_util::BodyExt;
 use smg::{
-    app_context::AppContext, config::RouterConfig, middleware::wasm_middleware,
-    protocols::chat::ChatCompletionRequest, routers::RouterTrait, server::AppState,
+    app_context::AppContext, config::RouterConfig,
+    extended_chat::ExtendedChatCompletionRequest, middleware::wasm_middleware,
+    routers::RouterTrait, server::AppState,
 };
 use tokio::runtime::Runtime;
 use tower::{Layer, Service};
@@ -26,7 +27,7 @@ impl RouterTrait for MockRouter {
     async fn route_chat(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &ChatCompletionRequest,
+        _body: &ExtendedChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response<Body> {
         StatusCode::OK.into_response()
