@@ -154,7 +154,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--completion-template`   | `None`    | Type: str                                                                                                         |      A2, A3      |
 | `--enable-cache-report`   | `False`   | bool flag<br/> (set to enable)                                                                                    |      A2, A3      |
 | `--reasoning-parser`      | `None`    | `deepseek-r1`<br/>`deepseek-v3`<br/>`glm45`<br/>`gpt-oss`<br/>`kimi`<br/>`qwen3`<br/>`qwen3-thinking`<br/>`step3` |      A2, A3      |
-| `--tool-call-parser`      | `None`    | `llama3`<br/>``pythonic`<br/>`qwen`<br/> `qwen3_coder`                                                            |      A2, A3      |
+| `--tool-call-parser`      | `None`    | `llama3`<br/> `pythonic`<br/> `qwen`<br/> `qwen3_coder`                                                           |      A2, A3      |
 | `--sampling-defaults`     | `model`   | `openai`, `model`                                                                                                 |      A2, A3      |
 
 ## Data parallelism
