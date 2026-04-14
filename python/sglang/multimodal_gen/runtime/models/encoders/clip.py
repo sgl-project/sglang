@@ -594,6 +594,48 @@ class CLIPTextModel(TextEncoder):
         return loaded_params
 
 
+class CLIPTextModelWithProjection(CLIPTextModel):
+    """
+    CLIP text encoder with projection head for pooled_output.
+    """
+
+    def __init__(
+        self,
+        config: CLIPTextConfig,
+    ) -> None:
+        super().__init__(config)
+        self.text_projection = nn.Linear(
+            config.hidden_size, config.projection_dim, bias=False
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        output_hidden_states: bool | None = None,
+        **kwargs,
+    ) -> BaseEncoderOutput:
+        outputs: BaseEncoderOutput = self.text_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=output_hidden_states,
+        )
+
+        pooled_output = outputs.pooler_output
+        if pooled_output is not None:
+            pooled_output = self.text_projection(pooled_output)
+
+        return BaseEncoderOutput(
+            last_hidden_state=outputs.last_hidden_state,
+            pooler_output=pooled_output,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
 class CLIPVisionTransformer(nn.Module):
 
     def __init__(
@@ -759,4 +801,4 @@ class BertModel(CLIPTextModel):
     pass
 
 
-EntryClass = [CLIPTextModel, CLIPVisionModel]
+EntryClass = [CLIPTextModel, CLIPTextModelWithProjection, CLIPVisionModel]

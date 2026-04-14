@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
@@ -32,6 +31,7 @@ class PoolStats:
 
     is_hybrid_swa: bool = False
     is_hybrid_ssm: bool = False
+    is_hisparse: bool = False
 
     # For hybrid-swa pools
     swa_num_used: Optional[int] = None
@@ -44,6 +44,12 @@ class PoolStats:
     mamba_usage: Optional[float] = None
     mamba_available_size: Optional[int] = None
     mamba_evictable_size: Optional[int] = None
+
+    # HiSparse device/host breakdown for decode logs (plain KV pool only)
+    hisparse_device_tokens: Optional[int] = None
+    hisparse_device_token_usage: Optional[float] = None
+    hisparse_host_tokens: Optional[int] = None
+    hisparse_host_token_usage: Optional[float] = None
 
     def get_kv_token_stats(self) -> Tuple[int, float]:
         # NOTE: mamba pool is not included in the "token usage" calculation.
@@ -99,6 +105,13 @@ class PoolStats:
                 f"mamba num: {self.mamba_num_used}",
                 f"mamba usage: {self.mamba_usage:.2f}",
             ]
+        if self.is_hisparse:
+            parts += [
+                f"#gpu token: {self.hisparse_device_tokens}",
+                f"gpu token usage: {self.hisparse_device_token_usage:.2f}",
+                f"#cpu token: {self.hisparse_host_tokens}",
+                f"cpu token usage: {self.hisparse_host_token_usage:.2f}",
+            ]
         if not parts:
             parts.append(
                 f"#token: {self.full_num_used}, token usage: {self.full_token_usage:.2f}"
@@ -115,9 +128,19 @@ class PoolStats:
             stats.swa_token_usage = self.swa_token_usage
         if self.is_hybrid_ssm:
             stats.mamba_usage = self.mamba_usage
+        stats.kv_available_tokens = self.full_available_size
+        stats.kv_evictable_tokens = self.full_evictable_size
+        stats.kv_used_tokens = self.full_num_used
 
 
 class SchedulerRuntimeCheckerMixin:
+    def _alive_streaming_session_count(self: Scheduler) -> int:
+        return sum(
+            1
+            for session in self.session_controller.sessions.values()
+            if session.streaming
+        )
+
     def _session_held_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
             return self.tree_cache.session_held_tokens()
@@ -143,6 +166,8 @@ class SchedulerRuntimeCheckerMixin:
             pool_stats = self._get_swa_token_info()
         elif self.is_hybrid_ssm:
             return self._get_mamba_token_info()
+        elif self.enable_hisparse:
+            return self._get_hisparse_token_info()
         else:
             return self._get_token_info()
 
@@ -168,6 +193,20 @@ class SchedulerRuntimeCheckerMixin:
             full_available_size=available_size,
             full_evictable_size=evictable_size,
         )
+
+    def _get_hisparse_token_info(self: Scheduler) -> PoolStats:
+        pool_stats = self._get_token_info()
+        if self.enable_hisparse and self.hisparse_coordinator is not None:
+            h = self.hisparse_coordinator.get_token_stats()
+            return dataclasses.replace(
+                pool_stats,
+                is_hisparse=True,
+                hisparse_device_tokens=h.device_tokens,
+                hisparse_device_token_usage=h.device_token_usage,
+                hisparse_host_tokens=h.host_tokens,
+                hisparse_host_token_usage=h.host_token_usage,
+            )
+        return pool_stats
 
     def _get_mamba_token_info(self: Scheduler):
         is_mamba_radix_cache = (
@@ -323,33 +362,43 @@ class SchedulerRuntimeCheckerMixin:
             )
         return leak, msg
 
-    def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
-        ret = 0
-        for req in batch.reqs:
-            assert req.kv_committed_freed == req.kv_overallocated_freed
-            uncached_len = 0
-            if not req.kv_committed_freed:
+    def _get_total_uncached_sizes(self: Scheduler) -> Tuple[int, int]:
+        """Sum uncached tokens for full and SWA pools across all active batches.
+
+        Returns (full_uncached, swa_uncached). For non-SWA models, swa_uncached is 0.
+
+        For full pool: uncached = allocated - cache_protected_len
+        For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
+        """
+        # After decode: running_batch IS last_batch (same object), count once.
+        # After prefill: they differ, both hold uncached tokens.
+        batches = [self.last_batch]
+        if (
+            self.running_batch not in (None, self.last_batch)
+            and not self.running_batch.is_empty()
+        ):
+            batches.append(self.running_batch)
+
+        full_uncached = 0
+        swa_uncached = 0
+        for batch in batches:
+            for req in batch.reqs:
+                assert req.kv_committed_freed == req.kv_overallocated_freed
+                if req.kv_committed_freed or req.req_pool_idx is None:
+                    continue
+
                 allocated_len = req.kv_allocated_len
                 if self.page_size > 1:
                     allocated_len = ceil_align(allocated_len, self.page_size)
                     assert req.cache_protected_len % self.page_size == 0
-                uncached_len = allocated_len - req.cache_protected_len
 
-            ret += uncached_len
+                full_uncached += allocated_len - req.cache_protected_len
+                if self.is_hybrid_swa:
+                    swa_uncached += allocated_len - max(
+                        req.cache_protected_len, req.swa_evicted_seqlen
+                    )
 
-        return ret
-
-    def _get_total_uncached_size(self: Scheduler) -> int:
-        """Sum uncached tokens across the current and running batches."""
-        current_batch: ScheduleBatch = self.last_batch
-        uncached_size = self._get_batch_uncached_size(current_batch)
-        if (
-            current_batch.forward_mode.is_extend()
-            and self.running_batch is not None
-            and not self.running_batch.is_empty()
-        ):
-            uncached_size += self._get_batch_uncached_size(self.running_batch)
-        return uncached_size
+        return full_uncached, swa_uncached
 
     def self_check_during_busy(self: Scheduler):
         if self.last_batch is None:
@@ -362,12 +411,21 @@ class SchedulerRuntimeCheckerMixin:
             )
             return
 
-        uncached = self._get_total_uncached_size()
-        leak, msg = self._check_full_pool(self.get_pool_stats(), uncached=uncached)
+        ps = self.get_pool_stats()
+        full_uncached, swa_uncached = self._get_total_uncached_sizes()
+
+        full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
+
+        swa_leak, swa_msg = False, ""
+        if self.is_hybrid_swa:
+            swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
 
         if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
-            logger.info(f"[Mem Check (BUSY)] {msg}")
-        assert not leak, f"Mem Leak Detected! {msg}"
+            logger.info(f"[Mem Check (BUSY)] {full_msg}")
+            if swa_msg:
+                logger.info(f"[Mem Check (BUSY)] {swa_msg}")
+        assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
+        assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
 
     def _check_req_pool(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -433,6 +491,8 @@ class SchedulerRuntimeCheckerMixin:
             return
 
         self.get_pool_stats().update_scheduler_stats(self.stats)
+        self.stats.num_streaming_sessions = self._alive_streaming_session_count()
+        self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
         priority_enabled = self.enable_priority_scheduling
         self.stats.num_running_reqs = QueueCount.from_reqs(
