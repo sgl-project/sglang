@@ -7,6 +7,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -40,6 +41,10 @@ def fused_topk_npu(
                 else topk_weights[:, :-1]
             )
         topk_weights = topk_weights.to(torch.float32)
+        get_global_experts_capturer().capture(
+            layer_id=layer_id,
+            topk_ids=topk_ids,
+        )
 
     # Grouped top-k with correction bias
     elif use_grouped_topk and correction_bias is not None:
@@ -56,6 +61,10 @@ def fused_topk_npu(
                 1 if renormalize else topk_config.routed_scaling_factor
             ),
             eps=float(1e-20),
+        )
+        get_global_experts_capturer().capture(
+            layer_id=layer_id,
+            topk_ids=topk_ids,
         )
 
     # npu_moe_gating_top_k is not yet supported custom_routing_function
