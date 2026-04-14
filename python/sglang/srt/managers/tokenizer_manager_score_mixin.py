@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.configs.model_config import is_cross_encoding_pooler_model
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
@@ -19,6 +20,7 @@ class ScoreResult:
     # CPU tensors when return_pooled_hidden_states=True; kept as tensors so
     # in-process consumers (gRPC, engine API) avoid a .tolist() round-trip.
     # The HTTP path converts to lists in serving_score.py before JSON serialization.
+    # Same layout as scores: one tensor per item (not a single packed 2D tensor).
     pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
 
 
@@ -659,12 +661,22 @@ class TokenizerManagerScoreMixin:
                 "Invalid combination of query/items types for score_request."
             )
 
-        if return_pooled_hidden_states and is_generation:
-            raise ValueError(
-                "return_pooled_hidden_states is not supported for CausalLM models. "
-                "It requires a model with a task-specific head "
-                "(e.g. SequenceClassification or RewardModel)."
-            )
+        if return_pooled_hidden_states:
+            if is_generation:
+                raise ValueError(
+                    "return_pooled_hidden_states is not supported for CausalLM models. "
+                    "It requires a model with a task-specific head "
+                    "(e.g. SequenceClassification or RewardModel)."
+                )
+            model_config = getattr(self, "model_config", None)
+            if model_config is not None:
+                archs = getattr(model_config.hf_config, "architectures", []) or []
+                if is_cross_encoding_pooler_model(archs):
+                    raise ValueError(
+                        f"return_pooled_hidden_states is not supported for "
+                        f"{archs[0]}. This model uses CrossEncodingPooler which "
+                        f"does not expose pre-head hidden states."
+                    )
 
         # Create the appropriate request type
         if is_generation:

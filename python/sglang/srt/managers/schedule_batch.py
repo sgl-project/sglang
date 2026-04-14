@@ -1602,6 +1602,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for r in reqs
             ]
 
+        # OR across the batch so ForwardBatch matches a single fused forward; requests
+        # that did not ask for PHS still skip attaching it in the output processor.
         self.return_pooled_hidden_states = any(
             r.return_pooled_hidden_states for r in reqs
         )

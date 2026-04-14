@@ -206,6 +206,9 @@ class PiecewiseCudaGraphRunner:
 
         self.is_multimodal = model_runner.is_multimodal
         self.mamba_track_enabled = self.is_mamba_track_enabled()
+        # Classification/reward forwards branch on return_pooled_hidden_states; piecewise
+        # CUDA graph capture must use the same flag value as replay for those models.
+        self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # Graph inputs
         with torch.device(self.device):
@@ -389,6 +392,7 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
         # Attention backend
@@ -549,6 +553,7 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -745,7 +750,10 @@ class PiecewiseCudaGraphRunner:
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
-            return_pooled_hidden_states=forward_batch.return_pooled_hidden_states,
+            return_pooled_hidden_states=(
+                self.capture_return_pooled_hidden_states
+                or forward_batch.return_pooled_hidden_states
+            ),
         )
 
         if out_cache_loc_swa is not None:
