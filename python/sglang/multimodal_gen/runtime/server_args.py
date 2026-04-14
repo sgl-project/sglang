@@ -508,7 +508,7 @@ class ServerArgs:
         return (
             getattr(default_params, "negative_prompt", None) is not None
             and getattr(default_params, "guidance_scale", 0) > 1.0
-        ) and not "lightricks/ltx-2.3" in default_params.__name__.lower()
+        ) and not "lightricks/ltx-2.3" in type(default_params).__name__.lower()
 
     @staticmethod
     def _is_ltx23_model_path(model_path: str | None) -> bool:
