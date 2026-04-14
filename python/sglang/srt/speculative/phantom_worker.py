@@ -819,6 +819,132 @@ class _GhostScaler:
         self._last_time = time.monotonic()
 
 
+class _DynamicGammaController:
+    """EMA-based adaptive speculative draft length (γ) controller.
+
+    Calibrates to the model's characteristic acceptance rate during a warmup
+    period, then adjusts γ using relative thresholds. This avoids the problem
+    of fixed thresholds (e.g. 0.7 grow / 0.3 shrink) which would pin γ to
+    minimum on low-acceptance models like Bonsai-4B (~15% n-gram acceptance).
+
+    Lifecycle:
+      - Created in PhantomWorker.__init__
+      - update() called each verification round with per-token acceptance
+      - freeze() when auto-fallback activates (no signal available)
+      - unfreeze() when auto-fallback deactivates (decay EMA toward baseline)
+      - reset() on clear_cache_pool (new context, new model)
+    """
+
+    def __init__(self, initial_gamma: int, min_gamma: int, max_gamma: int,
+                 alpha: float = 0.15, calibration_rounds: int = 20,
+                 warmup_rounds: int = 5, cooldown_rounds: int = 3):
+        self.gamma = initial_gamma
+        self.initial_gamma = initial_gamma
+        self.min_gamma = min_gamma
+        self.max_gamma = max_gamma
+        self._alpha = alpha
+        self._calibration_rounds = calibration_rounds
+        self._warmup = warmup_rounds
+        self._cooldown_max = cooldown_rounds
+
+        # Internal state
+        self._accept_ema: float = -1.0  # sentinel: uninitialized
+        self._baseline: float = -1.0  # learned after calibration
+        self._rounds: int = 0
+        self._cooldown: int = 0
+        self._frozen: bool = False
+
+    def update(self, accept_rate: float) -> int:
+        """Feed acceptance rate (num_accepted / (bs * K)), returns new γ."""
+        if self._frozen:
+            return self.gamma
+
+        self._rounds += 1
+
+        # Initialize EMA on first sample
+        if self._accept_ema < 0:
+            self._accept_ema = accept_rate
+        else:
+            self._accept_ema = ((1 - self._alpha) * self._accept_ema
+                                + self._alpha * accept_rate)
+
+        # Learn baseline after calibration window
+        if self._rounds == self._calibration_rounds and self._baseline < 0:
+            self._baseline = max(self._accept_ema, 0.01)
+            logger.info("PHANTOM γ-ctrl: baseline acceptance=%.3f (from %d rounds)",
+                        self._baseline, self._calibration_rounds)
+
+        # No adaptation during warmup or cooldown
+        if self._rounds < self._warmup:
+            return self.gamma
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            return self.gamma
+
+        a = self._accept_ema
+        base = self._baseline if self._baseline >= 0 else max(a, 0.01)
+
+        # Relative thresholds calibrated to model's acceptance regime
+        grow_fast = base * 2.0    # 2× baseline → aggressive grow
+        grow_mild = base * 1.3    # 1.3× baseline → mild grow
+        shrink_mild = base * 0.6  # 0.6× baseline → mild shrink
+        shrink_fast = base * 0.3  # 0.3× baseline → aggressive shrink
+
+        if a >= grow_fast:
+            delta = 2
+        elif a >= grow_mild:
+            delta = 1
+        elif a <= shrink_fast:
+            delta = -2
+        elif a <= shrink_mild:
+            delta = -1
+        else:
+            delta = 0
+
+        if delta != 0:
+            old = self.gamma
+            self.gamma = max(self.min_gamma, min(self.max_gamma, self.gamma + delta))
+            if self.gamma != old:
+                self._cooldown = self._cooldown_max
+                logger.debug("PHANTOM γ-ctrl: %d→%d (ema=%.3f, base=%.3f)",
+                             old, self.gamma, a, base)
+
+        return self.gamma
+
+    def freeze(self):
+        """Freeze updates (called when auto-fallback activates)."""
+        self._frozen = True
+
+    def unfreeze(self):
+        """Unfreeze updates (called when auto-fallback deactivates).
+
+        Decays EMA toward baseline to avoid stale signal after a long
+        fallback period where no acceptance data was collected.
+        """
+        self._frozen = False
+        if self._baseline >= 0 and self._accept_ema >= 0:
+            self._accept_ema = 0.5 * self._accept_ema + 0.5 * self._baseline
+
+    def reset(self, initial_gamma: Optional[int] = None):
+        """Full reset (called on clear_cache_pool / context switch)."""
+        self.gamma = initial_gamma if initial_gamma is not None else self.initial_gamma
+        self._accept_ema = -1.0
+        self._baseline = -1.0
+        self._rounds = 0
+        self._cooldown = 0
+        self._frozen = False
+
+    @property
+    def accept_ema(self) -> float:
+        """Current acceptance EMA (for logging/diagnostics)."""
+        return self._accept_ema if self._accept_ema >= 0 else 0.0
+
+    @property
+    def baseline(self) -> float:
+        """Learned baseline acceptance (for logging/diagnostics)."""
+        return self._baseline if self._baseline >= 0 else 0.0
+
+
 class _FrozenCorpus:
     """Read-only snapshot of an n-gram corpus for lock-free CPU access.
 
@@ -1002,6 +1128,13 @@ class PhantomWorker:
         self._min_draft = 2
         self._max_draft = self._max_draft_alloc
 
+        # Dynamic γ controller — EMA-based with baseline calibration
+        self._gamma_ctrl = _DynamicGammaController(
+            initial_gamma=self.draft_token_num,
+            min_gamma=self._min_draft,
+            max_gamma=self._max_draft,
+        )
+
         # Detect HSA capability
         self._is_hsa = self._detect_hsa()
 
@@ -1048,6 +1181,7 @@ class PhantomWorker:
         self._fallback_active = False
         self._fallback_streak = 0
         self._fallback_probe_counter = 0
+        self._gamma_ctrl.reset(self._initial_draft_num)
         self.draft_token_num = self._initial_draft_num
         self._neg_filter.reset()
         self._neg_controller = AdaptiveThresholdController(
@@ -1337,25 +1471,18 @@ class PhantomWorker:
             if self._fallback_streak >= self._fb_streak_limit and not self._fallback_active:
                 self._fallback_active = True
                 self._fallback_probe_counter = 0
+                self._gamma_ctrl.freeze()
                 logger.info("PHANTOM: auto-fallback ENABLED (acceptance=%.2f for %d rounds)",
                             accept_rate, self._fallback_streak)
             elif self._fallback_active and accept_rate >= self._fb_reenable:
                 self._fallback_active = False
                 self._fallback_streak = 0
+                self._gamma_ctrl.unfreeze()
                 logger.info("PHANTOM: auto-fallback DISABLED (acceptance recovered to %.2f)",
                             accept_rate)
 
-            # ── Dynamic γ: adjust draft length based on acceptance ──
-            if len(self._accept_window) >= 5:
-                avg_accept = sum(self._accept_window) / len(self._accept_window)
-                if avg_accept > 0.7 and self.draft_token_num < self._max_draft:
-                    self.draft_token_num = min(self.draft_token_num + 1, self._max_draft)
-                    logger.debug("PHANTOM: γ increased to %d (avg_accept=%.2f)",
-                                 self.draft_token_num, avg_accept)
-                elif avg_accept < 0.3 and self.draft_token_num > self._min_draft:
-                    self.draft_token_num = max(self.draft_token_num - 1, self._min_draft)
-                    logger.debug("PHANTOM: γ decreased to %d (avg_accept=%.2f)",
-                                 self.draft_token_num, avg_accept)
+            # ── Dynamic γ: adaptive draft length via EMA controller ──
+            self.draft_token_num = self._gamma_ctrl.update(accept_rate)
 
             # Update corpus with accepted tokens (keeps it growing)
             self._update_corpus(batch)
@@ -1567,11 +1694,12 @@ class PhantomWorker:
             pool_active = self._ghost_pool.active_count
             logger.info(
                 "PHANTOM stats: rounds=%d, ghost=%.1f%% (%d/%d), "
-                "accept=%.2f, γ=%d, corpus_hit=%.1f%%, fallback=%s, "
-                "buf=%s, neg_filter=%d (age_lim=%d), pool=%d/%d workers, "
-                "patch_ema=%.2f τ=%.0f %s",
+                "accept=%.2f (ema=%.3f base=%.3f), γ=%d, corpus_hit=%.1f%%, "
+                "fallback=%s, buf=%s, neg_filter=%d (age_lim=%d), "
+                "pool=%d/%d workers, patch_ema=%.2f τ=%.0f %s",
                 self.total_rounds, ghost_pct, self.ghost_hits, total,
-                avg_accept, self.draft_token_num, corpus_pct,
+                avg_accept, self._gamma_ctrl.accept_ema, self._gamma_ctrl.baseline,
+                self.draft_token_num, corpus_pct,
                 "ON" if self._fallback_active else "off",
                 "HSA" if self._is_hsa else "pinned",
                 neg_size, self._neg_filter._age_limit,
