@@ -1059,7 +1059,9 @@ class MHATokenToKVPool(KVCache):
         if layer is not None and getattr(layer, "kivi_runtime_enabled", False):
             from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
-            disable_roundtrip = os.getenv("SGLANG_KIVI_DISABLE_ROUNDTRIP", "").lower() in (
+            disable_roundtrip = os.getenv(
+                "SGLANG_KIVI_DISABLE_ROUNDTRIP", ""
+            ).lower() in (
                 "1",
                 "true",
                 "yes",
@@ -1472,7 +1474,9 @@ class HybridLinearKVPool(KVCache):
         self, layer: RadixAttention, kv_indices: torch.Tensor, kv_indices_len: int
     ) -> None:
         with self._transfer_id_context(layer):
-            self.full_kv_pool.kivi_roundtrip_on_indices(layer, kv_indices, kv_indices_len)
+            self.full_kv_pool.kivi_roundtrip_on_indices(
+                layer, kv_indices, kv_indices_len
+            )
 
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]

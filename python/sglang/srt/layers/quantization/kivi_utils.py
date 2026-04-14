@@ -40,14 +40,13 @@ def unpack_tensor(v_code: torch.Tensor, bits: int, pack_dim: int) -> torch.Tenso
     packed_indices = [slice(None)] * len(new_shape)
     packed_indices[pack_dim] = i
     if pack_dim == 2:
-        return (
-            (v_code[tuple(packed_indices)] >> (j * bits)[None, None, :, None]).to(
-                torch.int16
-            )
-            & mask_bits
-        )
+        return (v_code[tuple(packed_indices)] >> (j * bits)[None, None, :, None]).to(
+            torch.int16
+        ) & mask_bits
     if pack_dim == 3:
-        return ((v_code[tuple(packed_indices)] >> (j * bits)).to(torch.int16)) & mask_bits
+        return (
+            (v_code[tuple(packed_indices)] >> (j * bits)).to(torch.int16)
+        ) & mask_bits
     raise ValueError(f"Unsupported pack_dim={pack_dim}.")
 
 
