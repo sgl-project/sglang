@@ -690,6 +690,10 @@ class Step3p5DecoderLayer(nn.Module):
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
+            # Dense MLP uses reduce_results=True, so the output is already
+            # all-reduced.  Do NOT set the fusion flag — otherwise the next
+            # layer would all-reduce again, multiplying values by world_size.
+            should_allreduce_fusion = False
         self._dump_tensor("mlp_output", hidden_states, dump_step)
 
         if should_allreduce_fusion:
