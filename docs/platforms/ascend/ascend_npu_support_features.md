@@ -154,7 +154,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--completion-template`   | `None`    | Type: str                                                                                                         |      A2, A3      |
 | `--enable-cache-report`   | `False`   | bool flag<br/> (set to enable)                                                                                    |      A2, A3      |
 | `--reasoning-parser`      | `None`    | `deepseek-r1`<br/>`deepseek-v3`<br/>`glm45`<br/>`gpt-oss`<br/>`kimi`<br/>`qwen3`<br/>`qwen3-thinking`<br/>`step3` |      A2, A3      |
-| `--tool-call-parser`      | `None`    | `llama3`<br/>``pythonic`<br/>`qwen`<br/> `qwen3_coder`                                                            |      A2, A3      |
+| `--tool-call-parser`      | `None`    | `llama3`<br/> `pythonic`<br/> `qwen`<br/> `qwen3_coder`                                                           |      A2, A3      |
 | `--sampling-defaults`     | `model`   | `openai`, `model`                                                                                                 |      A2, A3      |
 
 ## Data parallelism
@@ -301,11 +301,11 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 | Argument                  | Defaults | Options   | Server supported |
 |---------------------------|----------|-----------|:----------------:|
-| `--cpu-offload-gb`        | `0`      | Type: int |      A2, A3      |
-| `--offload-group-size`    | `-1`     | Type: int |      Planned     |
-| `--offload-num-in-group`  | `1`      | Type: int |      Planned     |
-| `--offload-prefetch-step` | `1`      | Type: int |      Planned     |
-| `--offload-mode`          | `cpu`    | Type: str |      Planned     |
+| `--cpu-offload-gb`        | `0`      | Type: int (must be used with `--disable-cuda-graph`) |      A2, A3      |
+| `--offload-group-size`    | `-1`     | Type: int |      A2, A3      |
+| `--offload-num-in-group`  | `1`      | Type: int |      A2, A3      |
+| `--offload-prefetch-step` | `1`      | Type: int |      A2, A3      |
+| `--offload-mode`          | `cpu`    | `cpu`,<br/> `meta`,<br/> `sharded_gpu` (must be used with `--disable-cuda-graph`, only supported for DeepSeek) |      A2, A3      |
 
 ## Args for multi-item scoring
 
