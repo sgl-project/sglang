@@ -429,7 +429,10 @@ jobs:
       matrix:
         include:
           - python-version: "3.10"
-            cuda-version: "13.0"
+            cuda-version: "12.9"
+          # Add back when CUDA 13.0 is supported on CI
+          # - python-version: "3.10"
+          #   cuda-version: "13.0"
     name: Build Wheel
     steps:
       - name: Cleanup
@@ -477,7 +480,7 @@ jobs:
       matrix:
         include:
           - python-version: "3.10"
-            cuda-version: "13.0"
+            cuda-version: "12.9"
     name: Build Wheel Arm
     steps:
       - name: Cleanup
@@ -584,7 +587,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -691,7 +694,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -749,7 +752,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -804,7 +807,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -857,7 +860,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -946,7 +949,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1000,7 +1003,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1070,7 +1073,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1120,7 +1123,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1180,7 +1183,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1246,7 +1249,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1300,7 +1303,7 @@ jobs:
   #       with:
   #         path: sgl-kernel/dist/
   #         merge-multiple: true
-  #         pattern: wheel-python3.10-cuda13.0-aarch64
+  #         pattern: wheel-python3.10-cuda12.9-aarch64
   #
   #     - name: Install dependencies
   #       timeout-minutes: 20
