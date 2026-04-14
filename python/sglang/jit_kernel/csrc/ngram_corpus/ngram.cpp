@@ -180,6 +180,8 @@ void Ngram::insertWorker() {
     if (!insert_queue_.dequeue(item)) {
       break;
     }
+    // Still a per-Ngram lock because of contention with batchMatch()
+    // and getOrCreateTrie_(), which modifies TrieArena
     std::unique_lock<std::mutex> lock(mutex_);
     auto* trie = getOrCreateTrie_(item.state_id);
     trie->insert(item.tokens.data(), item.tokens.size());
@@ -189,6 +191,7 @@ void Ngram::insertWorker() {
   }
 }
 
+// See C++ Core Guidelines F.7 and R.3 for why the return type is a raw pointer.
 Trie* Ngram::getOrCreateTrie_(int64_t state_id) {
   if (!param_.request_trie_mode) {
     if (!global_trie_) {
