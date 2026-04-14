@@ -22,7 +22,7 @@ dependencies = [
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
-  "cuda-python>=13.0",
+  "cuda-python==12.9",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "datasets",
   "einops",
@@ -86,14 +86,14 @@ url = "https://pypi.org/simple"
 default = true
 
 [[tool.uv.index]]
-name = "torch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "torch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv.sources]
 torch = [
   { index = "pypi", marker = "platform_machine == 'x86_64'"},
-  { index = "torch-cu130", marker = "platform_machine == 'aarch64'"},
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
 ]
 
 [project.optional-dependencies]
@@ -205,7 +205,7 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
