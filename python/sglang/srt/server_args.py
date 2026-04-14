@@ -230,7 +230,7 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "cula"]
 
 
 # Allow external code to add more choices
@@ -2695,7 +2695,24 @@ class ServerArgs:
                 "defaulting --linear-attn-decode-backend to flashinfer."
             )
 
+        # cuLA is prefill-only; auto-set decode backend to triton if not specified.
+        if (
+            self.linear_attn_backend == "cula"
+            and self.linear_attn_decode_backend is None
+        ):
+            self.linear_attn_decode_backend = "triton"
+
+        # Validate CUDA-only backends early.
+        prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        decode = self.linear_attn_decode_backend or self.linear_attn_backend
+        if prefill == "cula" and not is_cuda():
+            raise ValueError("--linear-attn-prefill-backend cula requires CUDA")
+        if decode == "cutedsl" and not is_cuda():
+            raise ValueError("--linear-attn-decode-backend cutedsl requires CUDA")
+
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
+        import torch
+
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
             decode == "flashinfer"

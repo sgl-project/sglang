@@ -97,6 +97,15 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
+# cuLA (CUDA Linear Attention)
+FetchContent_Declare(
+    repo-cula
+    GIT_REPOSITORY https://github.com/inclusionAI/cuLA
+    GIT_TAG        93cc9aa592321909b232cd73b0090b0fafad8b79
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-cula)
+
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
@@ -499,6 +508,55 @@ if (SGL_KERNEL_ENABLE_FA3)
         list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)
     endif()
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
+
+    # ============================ Optional Install: cuLA KDA ============================= #
+    # cuLA KDA prefill kernel for SM90a (Hopper) - requires CUDA >= 12.4 (same as FA3)
+    set(CULA_KDA_SOURCES
+        "csrc/kda/kda_sm90_api.cu"
+        "${repo-cula_SOURCE_DIR}/csrc/kda/sm90/kda_fwd_sm90.cu"
+        "${repo-cula_SOURCE_DIR}/csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu"
+    )
+
+    set(CULA_KDA_CUDA_FLAGS
+        "-DNDEBUG"
+        "-DOPERATOR_NAMESPACE=sgl-kernel"
+        "-O3"
+        "-Xcompiler"
+        "-fPIC"
+        "-gencode=arch=compute_90a,code=sm_90a"
+        "-std=c++20"
+        "-DCUTE_USE_PACKED_TUPLE=1"
+        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
+        "-DCUTLASS_VERSIONS_GENERATED"
+        "-DCUTLASS_TEST_LEVEL=0"
+        "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
+        "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90"
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"
+        "-DCULA_SM90A_ENABLED"
+        "--expt-relaxed-constexpr"
+        "--expt-extended-lambda"
+        "--use_fast_math"
+        "--threads=${SGL_KERNEL_COMPILE_THREADS}"
+        "-Xcompiler=-Wno-clang-format-violations"
+        "-Xcompiler=-Wno-conversion"
+        "-Xcompiler=-Wno-deprecated-declarations"
+        "-Xcompiler=-Wno-terminate"
+        "-Xcudafe=--diag_suppress=177"
+        "-Xcudafe=--diag_suppress=2361"
+    )
+
+    Python_add_library(cula_kda_ops MODULE WITH_SOABI ${CULA_KDA_SOURCES})
+    target_compile_options(cula_kda_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CULA_KDA_CUDA_FLAGS}>)
+    target_include_directories(cula_kda_ops PRIVATE
+        ${repo-cutlass_SOURCE_DIR}/include
+        ${repo-cutlass_SOURCE_DIR}/tools/util/include
+        ${repo-cula_SOURCE_DIR}/csrc/kerutils/include
+        ${repo-cula_SOURCE_DIR}/csrc
+        ${TORCH_INCLUDE_DIRS}
+    )
+    target_link_libraries(cula_kda_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+    install(TARGETS cula_kda_ops LIBRARY DESTINATION sgl_kernel)
 endif()
 
 # Build spatial_ops as a separate, optional extension for green contexts
