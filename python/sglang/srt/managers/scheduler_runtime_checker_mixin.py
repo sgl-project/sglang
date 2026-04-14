@@ -31,6 +31,7 @@ class PoolStats:
 
     is_hybrid_swa: bool = False
     is_hybrid_ssm: bool = False
+    is_hisparse: bool = False
 
     # For hybrid-swa pools
     swa_num_used: Optional[int] = None
@@ -43,6 +44,12 @@ class PoolStats:
     mamba_usage: Optional[float] = None
     mamba_available_size: Optional[int] = None
     mamba_evictable_size: Optional[int] = None
+
+    # HiSparse device/host breakdown for decode logs (plain KV pool only)
+    hisparse_device_tokens: Optional[int] = None
+    hisparse_device_token_usage: Optional[float] = None
+    hisparse_host_tokens: Optional[int] = None
+    hisparse_host_token_usage: Optional[float] = None
 
     def get_kv_token_stats(self) -> Tuple[int, float]:
         # NOTE: mamba pool is not included in the "token usage" calculation.
@@ -98,6 +105,13 @@ class PoolStats:
                 f"mamba num: {self.mamba_num_used}",
                 f"mamba usage: {self.mamba_usage:.2f}",
             ]
+        if self.is_hisparse:
+            parts += [
+                f"#gpu token: {self.hisparse_device_tokens}",
+                f"gpu token usage: {self.hisparse_device_token_usage:.2f}",
+                f"#cpu token: {self.hisparse_host_tokens}",
+                f"cpu token usage: {self.hisparse_host_token_usage:.2f}",
+            ]
         if not parts:
             parts.append(
                 f"#token: {self.full_num_used}, token usage: {self.full_token_usage:.2f}"
@@ -114,6 +128,9 @@ class PoolStats:
             stats.swa_token_usage = self.swa_token_usage
         if self.is_hybrid_ssm:
             stats.mamba_usage = self.mamba_usage
+        stats.kv_available_tokens = self.full_available_size
+        stats.kv_evictable_tokens = self.full_evictable_size
+        stats.kv_used_tokens = self.full_num_used
 
 
 class SchedulerRuntimeCheckerMixin:
@@ -149,6 +166,8 @@ class SchedulerRuntimeCheckerMixin:
             pool_stats = self._get_swa_token_info()
         elif self.is_hybrid_ssm:
             return self._get_mamba_token_info()
+        elif self.enable_hisparse:
+            return self._get_hisparse_token_info()
         else:
             return self._get_token_info()
 
@@ -174,6 +193,20 @@ class SchedulerRuntimeCheckerMixin:
             full_available_size=available_size,
             full_evictable_size=evictable_size,
         )
+
+    def _get_hisparse_token_info(self: Scheduler) -> PoolStats:
+        pool_stats = self._get_token_info()
+        if self.enable_hisparse and self.hisparse_coordinator is not None:
+            h = self.hisparse_coordinator.get_token_stats()
+            return dataclasses.replace(
+                pool_stats,
+                is_hisparse=True,
+                hisparse_device_tokens=h.device_tokens,
+                hisparse_device_token_usage=h.device_token_usage,
+                hisparse_host_tokens=h.host_tokens,
+                hisparse_host_token_usage=h.host_token_usage,
+            )
+        return pool_stats
 
     def _get_mamba_token_info(self: Scheduler):
         is_mamba_radix_cache = (
