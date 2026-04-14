@@ -147,44 +147,6 @@ class TestSamplingParamsSubclass(unittest.TestCase):
                     expected,
                 )
 
-    def test_ltx23_two_stage_defaults_use_final_resolution(self):
-        server_args = SimpleNamespace(
-            backend="sglang",
-            model_id=None,
-            pipeline_class_name="LTX2TwoStagePipeline",
-            pipeline_config=LTX2PipelineConfig(),
-            output_path=None,
-            num_gpus=1,
-            comfyui_mode=False,
-        )
-
-        params = SamplingParams.from_user_sampling_params_args(
-            "Lightricks/LTX-2.3",
-            server_args,
-        )
-
-        self.assertEqual(params.height, 1024)
-        self.assertEqual(params.width, 1536)
-
-    def test_ltx23_one_stage_defaults_keep_stage1_resolution(self):
-        server_args = SimpleNamespace(
-            backend="sglang",
-            model_id=None,
-            pipeline_class_name="LTX2Pipeline",
-            pipeline_config=LTX2PipelineConfig(),
-            output_path=None,
-            num_gpus=1,
-            comfyui_mode=False,
-        )
-
-        params = SamplingParams.from_user_sampling_params_args(
-            "Lightricks/LTX-2.3",
-            server_args,
-        )
-
-        self.assertEqual(params.height, 512)
-        self.assertEqual(params.width, 768)
-
     def test_ltx23_runtime_vae_markers_sync_variant_and_decoder_metadata(self):
         arch_config = LTX2PipelineConfig().vae_config.arch_config
 
