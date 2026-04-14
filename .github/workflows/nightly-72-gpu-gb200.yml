@@ -6,6 +6,7 @@ name: Nightly Test (GB200 72GPU)
 on:
   schedule:
     - cron: '0 2 * * *'  # 2 AM UTC daily (offset from other nightly runs)
+  workflow_dispatch:  # allow manual trigger; gated by gb200-ci environment
 
 concurrency:
   group: nightly-test-gb200
@@ -47,6 +48,7 @@ jobs:
   prepare-image:
     needs: setup
     if: github.repository == 'sgl-project/sglang'
+    environment: gb200-ci
     runs-on: 72-gpu-gb200
     outputs:
       squash_file: ${{ steps.import.outputs.squash_file }}
