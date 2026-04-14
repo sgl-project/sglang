@@ -24,8 +24,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
     ONE_GPU_CASES_A,
     ONE_GPU_CASES_B,
-    TWO_GPU_CASES_A,
-    TWO_GPU_CASES_B,
+    TWO_GPU_CASES,
     DiffusionTestCase,
 )
 
@@ -54,13 +53,15 @@ def _discover_unit_tests() -> list[str]:
 
 FILE_SUITES = {
     "unit": _discover_unit_tests(),
+    "component-accuracy": [
+        "test_component_accuracy_1_gpu.py",
+        "test_component_accuracy_2_gpu.py",
+    ],
     "component-accuracy-1-gpu": [
-        "test_accuracy_1_gpu_a.py",
-        "test_accuracy_1_gpu_b.py",
+        "test_component_accuracy_1_gpu.py",
     ],
     "component-accuracy-2-gpu": [
-        "test_accuracy_2_gpu_a.py",
-        "test_accuracy_2_gpu_b.py",
+        "test_component_accuracy_2_gpu.py",
     ],
     "1-gpu-b200": [
         "test_server_c.py",
@@ -80,8 +81,7 @@ PARAMETRIZED_CASE_GROUPS = {
         ("test_server_b.py", ONE_GPU_CASES_B),
     ],
     "2-gpu": [
-        ("test_server_2_gpu_a.py", TWO_GPU_CASES_A),
-        ("test_server_2_gpu_b.py", TWO_GPU_CASES_B),
+        ("test_server_2_gpu.py", TWO_GPU_CASES),
     ],
 }
 
@@ -116,8 +116,13 @@ SUITES = {
 
 STRICT_SUITES = {"unit"}
 COMPONENT_ACCURACY_SUITES = {
+    "component-accuracy",
     "component-accuracy-1-gpu",
     "component-accuracy-2-gpu",
+}
+COMPONENT_ACCURACY_FILE_NUM_GPUS = {
+    "test_component_accuracy_1_gpu.py": 1,
+    "test_component_accuracy_2_gpu.py": 2,
 }
 
 
@@ -710,17 +715,17 @@ def partition_test_files(files, partition_id, total_partitions):
     ]
 
 
-def run_component_accuracy_files(
-    files, suite: str, filter_expr=None, continue_on_error=False
-):
+def run_component_accuracy_files(files, filter_expr=None, continue_on_error=False):
     exit_code = 0
     for file_path in files:
-        if suite == "component-accuracy-2-gpu":
+        file_name = Path(file_path).name
+        num_gpus = COMPONENT_ACCURACY_FILE_NUM_GPUS.get(file_name, 1)
+        if num_gpus > 1:
             cmd = [
                 sys.executable,
                 "-m",
                 "torch.distributed.run",
-                "--nproc_per_node=2",
+                f"--nproc_per_node={num_gpus}",
                 "-m",
                 "pytest",
                 "-s",
@@ -1143,7 +1148,6 @@ def main():
 
         exit_code = run_component_accuracy_files(
             my_files,
-            suite=args.suite,
             filter_expr=args.filter,
             continue_on_error=args.continue_on_error,
         )
