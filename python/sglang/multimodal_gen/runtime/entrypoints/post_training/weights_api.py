@@ -40,11 +40,9 @@ async def update_weights_from_disk(request: Request):
         )
 
     result = response.output
-    success = result.get("success", False)
-    message = result.get("message", "Unknown status")
     return orjson_response(
-        {"success": success, "message": message},
-        status_code=200 if success else 400,
+        result,
+        status_code=200 if result["success"] else 400,
     )
 
 
@@ -74,11 +72,9 @@ async def update_weights_from_tensor(request: Request):
         )
 
     result = response.output
-    success = result.get("success", False)
-    message = result.get("message", "Unknown status")
     return orjson_response(
-        {"success": success, "message": message},
-        status_code=200 if success else 400,
+        result,
+        status_code=200 if result["success"] else 400,
     )
 
 
