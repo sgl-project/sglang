@@ -47,7 +47,7 @@ class MatchPrefixParams:
 class InsertParams:
     """Unified parameters for insert across different cache types"""
 
-    key: RadixKey
+    key: Optional[RadixKey] = None
     value: Optional[torch.Tensor] = None
 
     # Mamba specific

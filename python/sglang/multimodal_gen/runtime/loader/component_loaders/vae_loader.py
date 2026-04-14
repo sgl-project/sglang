@@ -129,6 +129,13 @@ class VAELoader(ComponentLoader):
             vae = vae_cls(vae_config).to(target_device)
 
         safetensors_list = _list_safetensors_files(component_model_path)
+        safetensors_list = server_args.pipeline_config.select_vae_weight_files(
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+            component_name=component_name,
+            vae_precision=vae_precision,
+        )
+
         assert (
             len(safetensors_list) >= 1
         ), f"Found no safetensors files in {component_model_path}"

@@ -46,6 +46,15 @@ router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
 
 
+def _get_extra_field(request, field_name):
+    """Get a field from model_extra, with fallback to nested extra_body dict."""
+    extra = request.model_extra or {}
+    value = extra.get(field_name)
+    if value is None and isinstance(extra.get("extra_body"), dict):
+        value = extra["extra_body"].get(field_name)
+    return value
+
+
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
     """Read and base64-encode each file. Must be called before cloud upload deletes them."""
     result = []
@@ -148,6 +157,7 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
+            use_pe=_get_extra_field(request, "use_pe"),
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
