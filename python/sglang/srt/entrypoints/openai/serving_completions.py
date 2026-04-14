@@ -222,6 +222,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         completion_tokens = {}
         reasoning_tokens = {}
         cached_tokens = {}
+        cached_tokens_details = {}
         hidden_states = {}
         routed_experts = {}
 
@@ -246,6 +247,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                cached_tokens_details[index] = content["meta_info"].get(
+                    "cached_tokens_details", None
+                )
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
@@ -373,19 +377,34 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
-            if request.return_routed_experts and routed_experts:
-                # Get first non-None routed_experts value
-                first_routed_experts = next(
-                    (v for v in routed_experts.values() if v is not None), None
+            if (
+                (request.return_routed_experts and routed_experts)
+                or (
+                    request.return_cached_tokens_details and cached_tokens_details
                 )
-                if first_routed_experts is not None:
+            ):
+                first_routed_experts = next(
+                    (v for v in routed_experts.values() if v is not None),
+                    None,
+                )
+                first_cached_tokens_details = next(
+                    (v for v in cached_tokens_details.values() if v is not None),
+                    None,
+                )
+                if (
+                    first_routed_experts is not None
+                    or first_cached_tokens_details is not None
+                ):
                     routed_experts_chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         created=created,
                         object="text_completion",
                         choices=[],  # sglext is at response level
                         model=request.model,
-                        sglext=SglExt(routed_experts=first_routed_experts),
+                        sglext=SglExt(
+                            routed_experts=first_routed_experts,
+                            cached_tokens_details=first_cached_tokens_details,
+                        ),
                     )
                     yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
