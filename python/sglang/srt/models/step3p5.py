@@ -492,8 +492,7 @@ class Step3p5DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         max_position_embeddings = config.max_position_embeddings
         head_dim = config.head_dim
-        moe_layers_list = [int(x) for x in config.moe_layers_enum.split(",")]
-        moe_layers_set = set(moe_layers_list)
+        moe_layers_set = {int(x) for x in config.moe_layers_enum.split(",")}
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_attention_groups
         self.is_moe_layer = layer_id in moe_layers_set
@@ -552,20 +551,15 @@ class Step3p5DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-            # Use reduce_results=False so the share_expert output stays
-            # unreduced.  It is combined with the (also unreduced) MoE output
-            # and a single all-reduce covers both — saving one full-TP
-            # all-reduce per layer vs reducing each independently.
-            share_expert_tp_size = None
-            share_expert_tp_rank = None
+            # reduce_results=False: share_expert output stays unreduced and is
+            # combined with the (also unreduced) MoE output, then a single
+            # all-reduce covers both — saving one full-TP all-reduce per layer.
             self.share_expert = Step3p5MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.share_expert_dim,
                 swiglu_limit=swiglu_limit_shared,
                 quant_config=quant_config,
                 prefix=add_prefix("share_expert", prefix),
-                tp_size=share_expert_tp_size,
-                tp_rank=share_expert_tp_rank,
                 reduce_results=False,
             )
             self.use_moe = True
