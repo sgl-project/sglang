@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=420, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=630, suite="stage-c-test-4-gpu-b200")
 
 MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 MXFP8_MODEL_PATH = "zianglih/Qwen3-4B-Instruct-2507-MXFP8"

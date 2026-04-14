@@ -338,6 +338,15 @@ class HiCacheController:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
+    def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
+        """Derive CP rank/size from the attn_cp process group."""
+        if self.attn_cp_group is not None:
+            return (
+                torch.distributed.get_rank(group=self.attn_cp_group),
+                torch.distributed.get_world_size(group=self.attn_cp_group),
+            )
+        return 0, 1
+
     def _create_prefetch_sync_groups(self) -> None:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
@@ -512,7 +521,10 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]) or (
+            if (
+                self.storage_backend_type
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+            ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -620,11 +632,15 @@ class HiCacheController:
                 and tp_lcm_size > self.tp_size
             )
 
+        attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
             is_mla_model=is_mla_backend,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
