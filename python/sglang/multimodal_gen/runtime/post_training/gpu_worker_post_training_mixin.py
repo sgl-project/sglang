@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.post_training.tensor_update_checker import (
-    UpdateWeightFromTensorChecker,
+    TensorUpdateChecker,
 )
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     WeightsUpdater,
@@ -86,7 +86,7 @@ class GPUWorkerPostTrainingMixin:
         if error is not None:
             return False, error
 
-        checker = UpdateWeightFromTensorChecker(self.pipeline)
+        checker = TensorUpdateChecker(self.pipeline)
         return checker.verify_across_tp(
             target_module=req.target_module,
             expected_named_tensors_sha256=expected_named_tensors_sha256,

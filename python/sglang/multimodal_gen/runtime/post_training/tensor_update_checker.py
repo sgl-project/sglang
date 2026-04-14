@@ -15,24 +15,15 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
 _MAX_DISPLAY_TENSORS = 5
 
 
-def _materialize_tensor_for_sha256(tensor: torch.Tensor) -> torch.Tensor:
+def compute_tensor_sha256(tensor: torch.Tensor) -> str:
     if isinstance(tensor, DTensor):
         tensor = tensor._local_tensor
-    return tensor.detach().cpu().contiguous()
-
-
-def _compute_sha256_from_materialized(materialized: torch.Tensor) -> str:
-    materialized = materialized.contiguous()
-
+    tensor = tensor.detach().cpu().contiguous()
     hasher = hashlib.sha256()
-    hasher.update(str(materialized.dtype).encode("utf-8"))
-    hasher.update(repr(tuple(materialized.shape)).encode("utf-8"))
-    hasher.update(materialized.view(torch.uint8).numpy().tobytes())
+    hasher.update(str(tensor.dtype).encode("utf-8"))
+    hasher.update(repr(tuple(tensor.shape)).encode("utf-8"))
+    hasher.update(tensor.view(torch.uint8).numpy().tobytes())
     return hasher.hexdigest()
-
-
-def compute_tensor_sha256(tensor: torch.Tensor) -> str:
-    return _compute_sha256_from_materialized(_materialize_tensor_for_sha256(tensor))
 
 
 def build_named_tensor_sha256(
@@ -44,7 +35,7 @@ def build_named_tensor_sha256(
     return sha256_by_name
 
 
-class UpdateWeightFromTensorChecker:
+class TensorUpdateChecker:
     def __init__(self, pipeline):
         self.pipeline = pipeline
 
