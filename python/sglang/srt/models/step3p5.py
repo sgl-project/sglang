@@ -662,7 +662,7 @@ class Step3p5DecoderLayer(nn.Module):
             residual,
             forward_batch,
         )
-        self._dump_tensor("post_attn_residual", hidden_states, dump_step)
+        self._dump_tensor("post_attn_residual", residual, dump_step)
         self._dump_tensor("mlp_input", hidden_states, dump_step)
 
         should_allreduce_fusion = (
