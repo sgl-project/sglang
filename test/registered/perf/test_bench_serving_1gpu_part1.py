@@ -19,8 +19,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=1000, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=1100, suite="stage-b-test-large-1-gpu-amd")
+register_cuda_ci(est_time=1184, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-large-amd")
 
 
 class TestBenchServing1GPUPart1(CustomTestCase):
@@ -141,7 +141,7 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
 
-    def test_lora_online_latency(self):
+    def test_online_lora_latency(self):
         if is_in_amd_ci():
             pass
 
@@ -149,14 +149,14 @@ class TestBenchServing1GPUPart1(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_lora_online_latency\n"
+                f"### test_online_lora_latency\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 2400)
             self.assertLess(res["median_ttft_ms"], 58)
 
-    def test_lora_online_latency_with_concurrent_adapter_updates(self):
+    def test_online_lora_latency_with_concurrent_adapter_updates(self):
         if is_in_amd_ci():
             pass
 
@@ -164,7 +164,7 @@ class TestBenchServing1GPUPart1(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_lora_online_latency\n"
+                f"### test_online_lora_latency_with_concurrent_adapter_updates\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )

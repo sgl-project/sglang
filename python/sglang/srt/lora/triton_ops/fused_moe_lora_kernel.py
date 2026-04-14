@@ -186,7 +186,7 @@ def _fused_moe_lora_kernel(
             mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
             other=0.0,
         )
-        accumulator += tl.dot(a, b)
+        accumulator += tl.dot(a, b.to(a.dtype))
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
@@ -237,6 +237,7 @@ def _fused_moe_lora_shrink(
     num_warps: int,
     num_stages: int,
     split_k: int,
+    top_k_divisor: int = None,
     mul_routed_weight: bool = False,
 ) -> None:
     w1_lora_a_stacked = lora_a_stacked[0]
@@ -292,7 +293,11 @@ def _fused_moe_lora_shrink(
         slice_c_size=a_intermediate_cache1.numel() // num_slices,
         num_slice_a=1,
         num_slice_c=num_slices,
-        top_k=1 if mul_routed_weight else top_k_num,
+        top_k=(
+            top_k_divisor
+            if top_k_divisor is not None
+            else (1 if mul_routed_weight else top_k_num)
+        ),
         MUL_ROUTED_WEIGHT=False,
         IS_PRIMARY=True,
         **shrink_config,
@@ -464,6 +469,11 @@ def _fused_moe_lora(
     num_tokens = M * top_k_num
     w1_output_dim_size = w1_lora_b_stacked.shape[2]
 
+    # Detect whether input is already expanded (down path: [M*top_k, dim])
+    # or not (gate_up path: [M, dim]). Down path needs divisor=1.
+    input_is_expanded = qcurr_hidden_states.shape[0] == M * top_k_num
+    shrink_top_k_divisor = 1 if input_is_expanded else top_k_num
+
     a_intermediate_cache1 = torch.zeros(
         (num_slices, M, top_k_num, max_lora_rank),
         dtype=output.dtype,
@@ -503,6 +513,7 @@ def _fused_moe_lora(
         shrink_num_warps,
         shrink_num_stages,
         shrink_split_k,
+        top_k_divisor=shrink_top_k_divisor,
         mul_routed_weight=False,
     )
 

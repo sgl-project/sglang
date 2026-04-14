@@ -12,6 +12,7 @@ import os
 from typing import Tuple
 
 import numpy as np
+from sglang.multimodal_gen.csrc.render import load_extension_with_recovery
 
 _abs_path = os.path.dirname(os.path.abspath(__file__))
 _mesh_processor_kernel = None
@@ -24,9 +25,7 @@ def _load_mesh_processor():
     if _mesh_processor_kernel is not None:
         return _mesh_processor_kernel
 
-    from torch.utils.cpp_extension import load
-
-    _mesh_processor_kernel = load(
+    _mesh_processor_kernel = load_extension_with_recovery(
         name="mesh_processor_kernel",
         sources=[
             f"{_abs_path}/mesh_processor.cpp",

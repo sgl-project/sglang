@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
@@ -29,11 +30,16 @@ def _json_safe(obj: Any):
     """
     Recursively convert objects to JSON-serializable forms.
     - Enums -> their name
+    - Callables -> stable module-qualified name
     - Sets/Tuples -> lists
     - Dicts/Lists -> recursively processed
     """
     if isinstance(obj, Enum):
         return obj.name
+    if callable(obj):
+        module = getattr(obj, "__module__", None)
+        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
+        return f"{module}.{qualname}" if module else qualname
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
@@ -123,7 +129,7 @@ class SamplingParams:
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 42
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: str | None = None  # None means use the pipeline/model default
 
     # Original dimensions (before VAE scaling)
     num_frames: int = 1  # Default for image models
@@ -172,6 +178,13 @@ class SamplingParams:
     # Misc
     save_output: bool = True
     return_frames: bool = False
+    rollout: bool = False
+    rollout_sde_type: str = "sde"
+    rollout_noise_level: float = 0.7
+    rollout_log_prob_no_const: bool = False  # exclude constants in rollout logprob
+    rollout_debug_mode: bool = (
+        False  # return rollout debug tensors (intermediate states)
+    )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
     # if True, disallow user params to override subclass-defined protected fields
@@ -183,6 +196,9 @@ class SamplingParams:
 
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
+
+    # Prompt enhancement (ErnieImage)
+    use_pe: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -247,6 +263,21 @@ class SamplingParams:
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+    def build_request_extra(self) -> dict[str, Any]:
+        """Return optional request-scoped extras for downstream pipeline stages."""
+        extra = {}
+        diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
+        if diffusers_kwargs:
+            extra["diffusers_kwargs"] = diffusers_kwargs
+        explicit_fields = getattr(self, "_explicit_fields", None)
+        if explicit_fields is not None:
+            extra["explicit_fields"] = sorted(explicit_fields)
+        return extra
+
+    def apply_request_extra(self, req: Any) -> None:
+        """Merge request extras (model specific, e.g., LTX2.3) into an already-created pipeline request."""
+        req.extra.update(self.build_request_extra())
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
@@ -340,6 +371,8 @@ class SamplingParams:
                 raise ValueError(
                     f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
                 )
+
+        RLRolloutArgs.validate_sampling_params(self)
 
     def check_sampling_param(self):
         # Keep backward-compatibility for old call sites.
@@ -581,6 +614,7 @@ class SamplingParams:
         sampling_params._merge_with_user_params(
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
         )
+        sampling_params._explicit_fields = set(user_kwargs.keys())
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
@@ -649,7 +683,7 @@ class SamplingParams:
         add_argument(
             "--prompt-path",
             type=str,
-            help="Path to a text file containing the prompt",
+            help="Path to a text file containing prompts (one per line)",
         )
         add_argument(
             "--output-file-name",
@@ -680,7 +714,7 @@ class SamplingParams:
             "--generator-device",
             type=str,
             choices=["cuda", "musa", "cpu"],
-            help="Device for random generator (cuda, musa or cpu). Default: cuda",
+            help="Device for random generator (cuda, musa or cpu). Default: use the model-specific setting.",
         )
         add_argument(
             "--num-frames",
@@ -745,6 +779,12 @@ class SamplingParams:
             help="Secondary guidance scale for dual-guidance models (e.g., Wan low-noise expert)",
         )
         add_argument(
+            "--true-cfg-scale",
+            type=float,
+            dest="true_cfg_scale",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
+        )
+        add_argument(
             "--guidance-rescale",
             type=float,
             help="Guidance rescale factor",
@@ -797,6 +837,10 @@ class SamplingParams:
             action="store_true",
             help="Whether to return the trajectory",
         )
+
+        # Rollout arguments
+        RLRolloutArgs.add_cli_args(parser, add_argument=add_argument)
+
         add_argument(
             "--return-trajectory-decoded",
             action="store_true",

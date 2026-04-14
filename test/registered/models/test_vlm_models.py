@@ -1,6 +1,4 @@
-import argparse
 import random
-import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -8,7 +6,6 @@ from types import SimpleNamespace
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import (
-    DEFAULT_MEM_FRACTION_STATIC,
     MMMUMultiModelTestBase,
 )
 from sglang.test.test_utils import is_in_ci
@@ -16,8 +13,8 @@ from sglang.test.test_utils import is_in_ci
 # VLM (Vision Language Model) tests
 
 
-register_cuda_ci(est_time=228, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=850, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=176, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=850, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
 
 _is_hip = is_hip()
 # VLM models for testing
@@ -48,20 +45,4 @@ class TestVLMModels(MMMUMultiModelTestBase):
 
 
 if __name__ == "__main__":
-    # Define and parse arguments here, before unittest.main
-    parser = argparse.ArgumentParser(description="Test VLM models")
-    parser.add_argument(
-        "--mem-fraction-static",
-        type=float,
-        help="Static memory fraction for the model",
-        default=DEFAULT_MEM_FRACTION_STATIC,
-    )
-
-    # Parse args intended for unittest
-    args = parser.parse_args()
-
-    # Store the parsed args object on the class
-    TestVLMModels.parsed_args = args
-
-    # Pass args to unittest
-    unittest.main(argv=[sys.argv[0]])
+    unittest.main()
