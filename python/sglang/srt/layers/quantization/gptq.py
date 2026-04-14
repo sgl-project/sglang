@@ -276,7 +276,7 @@ class GPTQConfig(QuantizationConfig):
             if isinstance(layer, FusedMoE):
                 return GPTQMoEIntelAMXMethod(self)
             if isinstance(layer, LinearBase):
-                return GPTQLinearIntelAMXMethod(self)
+                return GPTQLinearMethod(self)
             return None
 
         if isinstance(layer, FusedMoE):
@@ -605,13 +605,14 @@ class GPTQLinearMethod(LinearMethodBase):
                 raise ValueError(
                     "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
                 )
-            if self.quant_config.weight_bits == 4:
+            if self.quant_config.weight_bits != 4:
                 raise ValueError("Currently, only 4bits is supported on CPU with AMX.")
             if self.use_v2_format:
                 raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
             _amx_process_weight_after_loading(
                 layer, ["qweight", "qzeros", "scales"], None, "gptq"
             )
+            return
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
         if self.use_shuffle:
@@ -1623,15 +1624,13 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
             raise ValueError(
                 "Currently, desc_act (True) is only supported with sequential and static group on CPU with AMX."
             )
-        if self.quant_config.weight_bits == 4:
+        if self.quant_config.weight_bits != 4:
             raise ValueError("Currently, only 4bits is supported on CPU with AMX.")
         if self.use_v2_format:
             raise ValueError("Currently, gptq_v2 is not supported on CPU with AMX.")
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.linear import set_weight_attrs
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
-        self.is_k_full = (not self.quant_config.desc_act) or layer.moe_tp_size == 1
 
         if self.quant_config.group_size != -1:
             scales_size13 = hidden_size // self.quant_config.group_size
@@ -1738,26 +1737,6 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_g_idx", w2_g_idx)
         set_weight_attrs(w2_g_idx, extra_weight_attrs)
-        w13_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
-        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
-        w2_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
-        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
 
     def create_moe_runner(
         self,
@@ -1774,7 +1753,6 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
         _amx_process_weight_after_loading(
             layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "gptq"
         )
-        return
 
     def apply(
         self,
