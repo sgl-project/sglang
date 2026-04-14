@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -53,7 +54,12 @@ from sglang.srt.utils.common import (
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
-from sglang.srt.utils.network import NetworkAddress, bind_port, get_zmq_socket
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    bind_port,
+    get_zmq_socket,
+    get_zmq_socket_on_host,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -213,6 +219,7 @@ class DataParallelController:
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
+                (ProfileReq, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
@@ -372,14 +379,26 @@ class DataParallelController:
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
     ):
+        if server_args.dist_init_addr is None:
+            bind_host = "127.0.0.1"
+        else:
+            bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
+
         # Pre-allocate worker ports on node 0 to avoid conflicts
         worker_ports = []
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
-                port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
-                worker_ports.append(port_and_socket[0])
-                self.workers[dp_rank] = port_and_socket[1]
-                logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
+                worker_port, worker_socket = get_zmq_socket_on_host(
+                    self.context, zmq.PUSH, host=bind_host
+                )
+                worker_ports.append(worker_port)
+                self.workers[dp_rank] = worker_socket
+                logger.debug(
+                    "Assigned port %s to worker %s on host %s",
+                    worker_port,
+                    dp_rank,
+                    bind_host,
+                )
 
         broadcasted_ports = self._broadcast_worker_ports(
             server_args, worker_ports if worker_ports else None

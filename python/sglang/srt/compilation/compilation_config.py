@@ -28,6 +28,7 @@ class CompilationConfig:
         self.enable_debug_mode = enable_debug_mode
         self.split_ops = []
         self.split_ops.extend(SPLIT_OPS)
+        self.configure_inductor()
 
     def add_split_op(self, op: str):
         self.split_ops.append(op)
@@ -43,3 +44,16 @@ class CompilationConfig:
 
     def get_enable_debug_mode(self):
         return self.enable_debug_mode
+
+    def configure_inductor(self):
+        """Apply inductor-specific optimizations when using inductor compiler."""
+        if self.compiler != "inductor":
+            return
+
+        import torch._inductor.config as inductor_config
+
+        # Horizontal fusion for sibling ops with different shapes,
+        # e.g. fusing q_norm + k_norm into a single triton kernel.
+        if hasattr(inductor_config, "combo_kernels"):
+            inductor_config.combo_kernels = True
+            inductor_config.benchmark_combo_kernel = True

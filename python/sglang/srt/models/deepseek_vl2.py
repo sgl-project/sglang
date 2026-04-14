@@ -270,9 +270,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         for item in items:
             assert item.feature.dim() == 4
             image_feature = self.vision.forward_features(
-                item.feature.type(next(self.vision.parameters()).dtype).to(
-                    device=next(self.vision.parameters()).device
-                )
+                item.feature.type(next(self.vision.parameters()).dtype)
             )
             images_embeds = self.projector(image_feature)
             _, hw, n_dim = images_embeds.shape

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -20,6 +21,9 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
+
+logger = logging.getLogger(__name__)
 
 
 class _VirtualNode:
@@ -58,6 +62,11 @@ class SessionSlot:
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
+    # True while the slot's KV has been restored to an active request.
+    # Prevents double-counting in token accounting (the request's tokens
+    # are already tracked via uncached_size in the busy mem check).
+    is_active: bool = False
+
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
@@ -65,6 +74,7 @@ class SessionSlot:
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
+        self.is_active = False
         self.req_pool_idx = req.req_pool_idx
         self.kv_committed_len = req.kv_committed_len
         self.kv_allocated_len = req.kv_allocated_len
@@ -97,6 +107,8 @@ class SessionSlot:
         req.mamba_next_track_idx = self.mamba_next_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
+
+        self.is_active = True
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
         # from the slot. During chunked prefill, a request may be rejected by
@@ -179,6 +191,16 @@ class SessionAwareCache(BasePrefixCache):
         if slot is None or slot.req_pool_idx is None:
             return self.inner.match_prefix(params)
 
+        # If the request is destined for abort (e.g. input too long),
+        # do NOT restore the slot's KV state.  set_finish_with_abort
+        # truncates origin_input_ids to [0], so alloc_for_extend would
+        # overwrite the slot's req_to_token row with a 1-token prefix,
+        # destroying the session's accumulated KV mapping.  By skipping
+        # restore, the request gets a fresh pool slot from alloc_for_extend
+        # and the session slot remains untouched.
+        if req.to_finish is not None:
+            return self.inner.match_prefix(params)
+
         slot.restore_to_req(req)
 
         # logprob_start_len is already forced to -1 for streaming sessions
@@ -200,12 +222,55 @@ class SessionAwareCache(BasePrefixCache):
         if not _is_streaming(req):
             return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
         is_first = slot is None
+
+        # When an aborted streaming-session request was scheduled (e.g.
+        # input too long), match_prefix skipped restore_to_req so the
+        # request got a fresh pool slot from alloc_for_extend.  Don't
+        # overwrite the session slot -- free the transient KV and pool slot.
+        if not is_first and isinstance(req.finished_reason, FINISH_ABORT):
+            if req.req_pool_idx is not None:
+                # Free all KV pages allocated for this aborted request.
+                end = req.kv_allocated_len
+                if end > 0:
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :end
+                    ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+                self.req_to_token_pool.free_slots.append(req.req_pool_idx)
+                req.req_pool_idx = None
+            return
+
         if is_first:
             slot = SessionSlot()
             self.slots[session_id] = slot
+
+        # If the session's KV is shrinking (e.g. client sent a shorter
+        # prompt after an abort), free the orphaned tail pages before
+        # save_from_req overwrites the slot's committed length.
+        # Never free tree-protected tokens — those are managed by the tree.
+        if (
+            not is_first
+            and slot.is_holding_kv
+            and req.kv_committed_len < slot.kv_committed_len
+        ):
+            old_end = slot.kv_allocated_len
+            new_end = req.kv_committed_len
+            if self.page_size > 1:
+                new_end = ceil_align(new_end, self.page_size)
+            new_end = max(new_end, slot.cache_protected_len)
+            if new_end < old_end:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    slot.req_pool_idx, new_end:old_end
+                ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+            slot.cache_protected_len = min(
+                slot.cache_protected_len, req.kv_committed_len
+            )
 
         slot.save_from_req(req, is_first=is_first)
 
@@ -244,22 +309,37 @@ class SessionAwareCache(BasePrefixCache):
     # -- Session lifecycle --
 
     def release_session(self, session_id: str):
-        """Release all KV resources held by a streaming session."""
+        """Release all KV resources held by a streaming session.
+
+        `slot.last_node` + `slot.cache_protected_len` are trusted directly: radix
+        tree splits mutate TreeNode objects in place (see RadixCache._split_node),
+        so a saved TreeNode reference remains valid and the locked prefix length
+        is unchanged. No rematch needed -- and `match_prefix` here would cause
+        further splits that disturb accounting.
+        """
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
+        protected_len = slot.cache_protected_len
+        lock_node = slot.last_node
+        tokens_freed = (
+            max(0, slot.kv_allocated_len - protected_len) if slot.is_holding_kv else 0
+        )
+        logger.info(
+            "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
+        )
 
-        if slot.last_node is not None:
+        if lock_node is not None:
             if slot.swa_uuid_for_lock is not None:
                 self.inner.dec_lock_ref(
-                    slot.last_node,
+                    lock_node,
                     DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
                 )
             else:
-                self.inner.dec_lock_ref(slot.last_node)
+                self.inner.dec_lock_ref(lock_node)
 
         if slot.is_holding_kv:
-            start = slot.cache_protected_len
+            start = protected_len
             end = slot.kv_allocated_len
             if start < end:
                 kv_indices = self.req_to_token_pool.req_to_token[
@@ -269,10 +349,14 @@ class SessionAwareCache(BasePrefixCache):
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
 
     def session_held_tokens(self) -> int:
-        """Total KV tokens held by session slots, not tracked by the tree."""
+        """Total KV tokens held by session slots, not tracked by the tree.
+
+        Excludes active slots whose tokens are already counted as part of
+        the running request's uncached_size in the busy mem check.
+        """
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv:
+            if slot.is_holding_kv and not slot.is_active:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - slot.cache_protected_len
         return total
@@ -285,7 +369,7 @@ class SessionAwareCache(BasePrefixCache):
         """Total SWA tokens held by session slots, not tracked by the tree."""
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv:
+            if slot.is_holding_kv and not slot.is_active:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - max(
                     slot.cache_protected_len, slot.swa_evicted_seqlen
@@ -294,7 +378,7 @@ class SessionAwareCache(BasePrefixCache):
 
     def session_held_req_count(self) -> int:
         """Number of req pool slots held by session slots."""
-        return sum(s.is_holding_kv for s in self.slots.values())
+        return sum(s.is_holding_kv and not s.is_active for s in self.slots.values())
 
     # -- Pass-through methods --
 

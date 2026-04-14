@@ -27,7 +27,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.11.post1"
+ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -37,7 +37,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.11.post1"
+ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
 # Base image 950 and args
@@ -47,7 +47,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.11.post1"
+ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -57,7 +57,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.11.post1"
+ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
 # Chosen arch and args
@@ -79,6 +79,8 @@ ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT=""
+ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
 
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
@@ -88,7 +90,7 @@ ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
-ARG TILELANG_COMMIT="ebf4a7cb8881432165ae8760e99d209d905c704a"
+ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
 
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
@@ -171,35 +173,15 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-RUN pip uninstall -y aiter \
- && pip install flydsl==0.0.1.dev95158637 \
- && pip install psutil pybind11 # Required by AITER setup.py
+RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
- && git submodule update --init --recursive
+ && git submodule update --init --recursive \
+ && pip install -r requirements.txt
 
-# Hot patches for AITER in v0.1.10.post3
-# This is for ROCm 7.2 only, because of the image rebase from vllm
-# to rocm/pytorch.
-RUN set -eux; \
-    case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        cd aiter \
-        && sed -i '459 s/if.*:/if False:/' aiter/ops/triton/attention/pa_mqa_logits.py; \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        ;; \
-    esac
-# [WA] from kk-huang
-# add sed -i '/c1 = torch.empty((M, D, S1 + S3) for aiter triton gemm config issue
-# the corresponding pr is https://github.com/ROCm/aiter/pull/2173
-# it will be removed when server launched issue is fixed by aiter
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
-     && sed -i '/c1 = torch.empty((M, D, S1 + S3), dtype=dtype, device=x.device)/i\    config = dict(config)' aiter/ops/triton/gemm/fused/fused_gemm_afp4wfp4_split_cat.py \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install -e ."; \

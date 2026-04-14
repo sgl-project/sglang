@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputFormat,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -137,7 +138,6 @@ class MultimodalSpecialTokens:
     def get_token_id_by_modality(self, modality: Modality) -> Optional[int]:
         return {
             Modality.IMAGE: self.image_token_id,
-            Modality.MULTI_IMAGES: self.image_token_id,
             Modality.VIDEO: self.video_token_id,
             Modality.AUDIO: self.audio_token_id,
         }.get(modality)
@@ -183,6 +183,11 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+
+        mm_process_config = self.server_args.mm_process_config
+        self.image_config = mm_process_config.get("image", {})
+        self.video_config = mm_process_config.get("video", {})
+        self.audio_config = mm_process_config.get("audio", {})
 
         # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
         # directly as _processor rather than a processor that wraps a tokenizer.
@@ -359,19 +364,19 @@ class BaseMultimodalProcessor(ABC):
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
-                    offsets=offset,
+                    offsets=[offset],
                     precomputed_embeddings=embedding_slice,
                 )
             )
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.IM_TOKEN_ID,
-            "video_token_id": getattr(self, "VIDEO_TOKEN_ID", None),
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            im_token_id=self.IM_TOKEN_ID,
+            video_token_id=getattr(self, "VIDEO_TOKEN_ID", None),
+        )
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -381,21 +386,29 @@ class BaseMultimodalProcessor(ABC):
         """
         if images:
             kwargs["images"] = images
+            if self.image_config:
+                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
+            if self.video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
+                "Gemma4Processor",
                 "GlmAsrProcessor",
                 "Qwen2AudioProcessor",
+                "Qwen3ASRProcessor",
                 "Qwen3OmniMoeProcessor",
             }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
-                kwargs["audio_kwargs"] = {}
+                kwargs.setdefault("audio_kwargs", {})
                 kwargs["audio_kwargs"].setdefault("truncation", False)
             else:
                 kwargs["audios"] = audios
+            if self.audio_config:
+                kwargs.setdefault("audio_kwargs", {}).update(self.audio_config)
 
         processor = self._processor
         if (
@@ -998,7 +1011,8 @@ class BaseMultimodalProcessor(ABC):
         self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
         """
-        Create mm_items directly from processor output, with one item for each modality
+        Create mm_items from processor output. Initially creates one item per modality;
+        these are later split into per-image/video items by get_new_expanded_mm_items.
 
         Note that the data_dict can be passed via offline engine api
         """
@@ -1140,6 +1154,11 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
+
+        # Split bundled items into per-image/video items for better cache granularity
+        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+        all_collected_items = get_new_expanded_mm_items(all_collected_items)
 
         """
         solution for cuda-ipc memory-leak:

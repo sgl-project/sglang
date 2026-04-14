@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from sglang.jit_kernel.flash_attention_v4 import flash_attn_varlen_func
+from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-1-gpu-large")
@@ -826,6 +826,7 @@ def test_flash_attn_varlen_output(
                 sinks=learnable_sink,  # FA4 uses learnable_sink, not sinks
                 pack_gqa=pack_gqa,
                 return_softmax_lse=True,
+                ver=4,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -1384,6 +1385,7 @@ def test_flash_attn_kvcache(
                     softcap=0.0,
                     pack_gqa=None,
                     return_softmax_lse=True,
+                    ver=4,
                 )
                 if varlen_q:
                     out = output_pad_fn(out)

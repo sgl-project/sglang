@@ -333,24 +333,31 @@ class ImageVAEEncodingStage(PipelineStage):
             latent_condition = server_args.pipeline_config.postprocess_vae_encode(
                 latent_condition, self.vae
             )
-
-            scaling_factor, shift_factor = (
-                server_args.pipeline_config.get_decode_scale_and_shift(
-                    device=latent_condition.device,
-                    dtype=latent_condition.dtype,
-                    vae=self.vae,
+            normalized_latent_condition = (
+                server_args.pipeline_config.normalize_vae_encode(
+                    latent_condition, self.vae
                 )
             )
+            if normalized_latent_condition is None:
+                scaling_factor, shift_factor = (
+                    server_args.pipeline_config.get_decode_scale_and_shift(
+                        device=latent_condition.device,
+                        dtype=latent_condition.dtype,
+                        vae=self.vae,
+                    )
+                )
 
-            # apply shift & scale if needed
-            if isinstance(shift_factor, torch.Tensor):
-                shift_factor = shift_factor.to(latent_condition.device)
+                # apply shift & scale if needed
+                if isinstance(shift_factor, torch.Tensor):
+                    shift_factor = shift_factor.to(latent_condition.device)
 
-            if isinstance(scaling_factor, torch.Tensor):
-                scaling_factor = scaling_factor.to(latent_condition.device)
+                if isinstance(scaling_factor, torch.Tensor):
+                    scaling_factor = scaling_factor.to(latent_condition.device)
 
-            latent_condition -= shift_factor
-            latent_condition = latent_condition * scaling_factor
+                latent_condition -= shift_factor
+                latent_condition = latent_condition * scaling_factor
+            else:
+                latent_condition = normalized_latent_condition
 
             if condition_latents is not None:
                 condition_latents.append(latent_condition)
