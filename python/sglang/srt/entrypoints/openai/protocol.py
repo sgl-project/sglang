@@ -166,6 +166,7 @@ class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
     structures: List[StructuresResponseFormat]
     triggers: List[str]
+    at_least_one: bool = False
 
 
 StructuralTagResponseFormat: TypeAlias = Union[
