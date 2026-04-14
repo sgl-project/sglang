@@ -78,7 +78,7 @@ def _assign_by_score_gpu(
         k_high = round(num_experts * group_size_ratios[1])
         expert_to_group.zero_()
         _, top_indices = torch.topk(scores, k_high)
-        expert_to_group[top_indices] = 1
+        expert_to_group.scatter_(0, top_indices, 1)
         return expert_to_group
     else:
         assert group_labels is not None, (
@@ -101,6 +101,8 @@ class HeterDispatchPolicy(abc.ABC):
         num_experts: int,
         group_size_ratios: List[float],
         device: Optional[torch.device] = None,
+        int4_only_mask: Optional[torch.Tensor] = None,
+        int4_group_idx: int = 0,
     ):
         self._num_experts = num_experts
         self._group_size_ratios = group_size_ratios
@@ -113,6 +115,10 @@ class HeterDispatchPolicy(abc.ABC):
         if len(group_size_ratios) > 2:
             self._group_labels = _build_group_labels(
                 num_experts, group_size_ratios, device)
+
+        # INT4-only constraint: force these experts to int4_group_idx
+        self._int4_only_mask = int4_only_mask
+        self._int4_group_idx = int4_group_idx
 
     @property
     def num_experts(self) -> int:
@@ -166,6 +172,10 @@ class HeterDispatchPolicy(abc.ABC):
         sentinel: int = -1,
     ) -> List[GroupDispatchTuple]:
         """Build per-group dispatch tuples using torch.where (fixed shapes)."""
+        # Force INT4-only experts to INT4 group before building dispatches
+        if self._int4_only_mask is not None:
+            expert_to_group[self._int4_only_mask] = self._int4_group_idx
+
         num_groups = self.num_groups
         slot_groups = expert_to_group[token_selected_experts.long()]
 
@@ -190,8 +200,11 @@ class RandomHeterDispatch(HeterDispatchPolicy):
         group_size_ratios: List[float],
         seed: int = 42,
         device: Optional[torch.device] = None,
+        int4_only_mask: Optional[torch.Tensor] = None,
+        int4_group_idx: int = 0,
     ):
-        super().__init__(num_experts, group_size_ratios, device=device)
+        super().__init__(num_experts, group_size_ratios, device=device,
+                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx)
         gen = torch.Generator(device=self._device).manual_seed(seed)
         scores = torch.rand(
             num_experts, device=self._device, generator=gen)
@@ -217,14 +230,20 @@ class ConfidenceThresholdHeterDispatch(HeterDispatchPolicy):
         confidence_threshold: float = 0.5,
         fallback_seed: int = 42,
         device: Optional[torch.device] = None,
+        int4_only_mask: Optional[torch.Tensor] = None,
+        int4_group_idx: int = 0,
     ):
-        super().__init__(num_experts, group_size_ratios, device=device)
+        super().__init__(num_experts, group_size_ratios, device=device,
+                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx)
         self._confidence_threshold = confidence_threshold
         self._fallback = RandomHeterDispatch(
-            num_experts, group_size_ratios, seed=fallback_seed, device=device)
+            num_experts, group_size_ratios, seed=fallback_seed, device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx)
         self._expert_weight_sum = torch.empty(
             num_experts, device=self._device, dtype=torch.float32)
         self._expert_count_buf = torch.zeros(
+            num_experts, device=self._device, dtype=torch.float32)
+        self._ones_buf = torch.ones(
             num_experts, device=self._device, dtype=torch.float32)
 
     def _assign(self, token_selected_experts, token_final_scales):
@@ -235,15 +254,16 @@ class ConfidenceThresholdHeterDispatch(HeterDispatchPolicy):
         buf = self._expert_weight_sum
         flat_experts = token_selected_experts.reshape(-1).long()
         flat_scales = token_final_scales.reshape(-1)
+        n = flat_experts.shape[0]
+        if self._ones_buf.shape[0] < n:
+            self._ones_buf = torch.ones(n, device=self._device, dtype=torch.float32)
 
         buf.zero_()
         buf.scatter_add_(0, flat_experts, flat_scales)
 
         expert_count = self._expert_count_buf
         expert_count.zero_()
-        expert_count.scatter_add_(
-            0, flat_experts,
-            torch.ones_like(flat_experts, dtype=torch.float32))
+        expert_count.scatter_add_(0, flat_experts, self._ones_buf[:n])
         expert_count.clamp_min_(1.0)
         buf.div_(expert_count)
 
@@ -265,10 +285,14 @@ class TotalWeightHeterDispatch(HeterDispatchPolicy):
         group_size_ratios: List[float],
         fallback_seed: int = 42,
         device: Optional[torch.device] = None,
+        int4_only_mask: Optional[torch.Tensor] = None,
+        int4_group_idx: int = 0,
     ):
-        super().__init__(num_experts, group_size_ratios, device=device)
+        super().__init__(num_experts, group_size_ratios, device=device,
+                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx)
         self._fallback = RandomHeterDispatch(
-            num_experts, group_size_ratios, seed=fallback_seed, device=device)
+            num_experts, group_size_ratios, seed=fallback_seed, device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx)
         self._weight_sum_buf = torch.empty(
             num_experts, device=self._device, dtype=torch.float32)
 
@@ -302,11 +326,17 @@ class ExpertLoadHeterDispatch(HeterDispatchPolicy):
         group_size_ratios: List[float],
         fallback_seed: int = 42,
         device: Optional[torch.device] = None,
+        int4_only_mask: Optional[torch.Tensor] = None,
+        int4_group_idx: int = 0,
     ):
-        super().__init__(num_experts, group_size_ratios, device=device)
+        super().__init__(num_experts, group_size_ratios, device=device,
+                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx)
         self._fallback = RandomHeterDispatch(
-            num_experts, group_size_ratios, seed=fallback_seed, device=device)
+            num_experts, group_size_ratios, seed=fallback_seed, device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx)
         self._count_buf = torch.zeros(
+            num_experts, device=self._device, dtype=torch.float32)
+        self._ones_buf = torch.ones(
             num_experts, device=self._device, dtype=torch.float32)
 
     def _assign(self, token_selected_experts, token_final_scales):
@@ -315,11 +345,12 @@ class ExpertLoadHeterDispatch(HeterDispatchPolicy):
                 token_selected_experts, token_final_scales)
 
         flat_experts = token_selected_experts.reshape(-1).long()
+        n = flat_experts.shape[0]
+        if self._ones_buf.shape[0] < n:
+            self._ones_buf = torch.ones(n, device=self._device, dtype=torch.float32)
         counts = self._count_buf
         counts.zero_()
-        counts.scatter_add_(
-            0, flat_experts,
-            torch.ones_like(flat_experts, dtype=torch.float32))
+        counts.scatter_add_(0, flat_experts, self._ones_buf[:n])
 
         return _assign_by_score_gpu(
             counts, self._num_experts, self._group_size_ratios,

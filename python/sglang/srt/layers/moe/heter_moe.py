@@ -50,6 +50,13 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
     assert abs(total_ratio - 1.0) < 1e-3, (
         f"size_ratios must sum to 1.0, got {total_ratio}"
     )
+    # Load per-layer INT4-only expert lists if specified
+    int4_only_file = cfg.get("int4_only_experts_file")
+    if int4_only_file is not None:
+        with open(int4_only_file) as f:
+            cfg["_int4_only_by_layer"] = json.load(f)
+    else:
+        cfg["_int4_only_by_layer"] = {}
     return cfg
 
 
@@ -77,6 +84,8 @@ class HeterFusedMoE(nn.Module):
         num_global_experts: Optional[int] = None,
         reduce_results: bool = False,
         moe_tp_size: int = 1,
+        # INT4-only expert support: list of expert IDs that are INT4-only
+        int4_only_experts: Optional[list] = None,
     ):
         super().__init__()
         self.num_experts = num_experts  # local expert count
@@ -94,6 +103,35 @@ class HeterFusedMoE(nn.Module):
         self.moe_tp_size = moe_tp_size
         self._local_expert_mapping: Optional[torch.Tensor] = None
 
+        # INT4-only expert support: build mask for dispatch remasking
+        # and compact BF16 tensor (only dual-precision experts get BF16 weights)
+        self._int4_only_experts = int4_only_experts or []
+        if self._int4_only_experts:
+            int4_only_set = set(self._int4_only_experts)
+            mask = torch.zeros(num_experts, dtype=torch.bool, device=self.device)
+            for eid in self._int4_only_experts:
+                assert 0 <= eid < num_experts, f"Invalid expert ID {eid}"
+                mask[eid] = True
+            self._int4_only_mask = mask
+            # Find which group index is the INT4 group
+            self._int4_group_idx = next(
+                (i for i, g in enumerate(heter_config["groups"])
+                 if g.get("num_bits", 16) == 4),
+                0,
+            )
+            # BF16 compact tensor support: remap original expert IDs to [0, D)
+            dual_experts = sorted(e for e in range(num_experts) if e not in int4_only_set)
+            self._num_bf16_experts = len(dual_experts)
+            remap = torch.full((num_experts,), -1, dtype=torch.long, device=self.device)
+            for compact_idx, orig_idx in enumerate(dual_experts):
+                remap[orig_idx] = compact_idx
+            self._bf16_id_remap = remap
+        else:
+            self._int4_only_mask = None
+            self._int4_group_idx = 0
+            self._num_bf16_experts = num_experts
+            self._bf16_id_remap = None
+
         self.group_cfgs = heter_config["groups"]
         self.num_groups = len(self.group_cfgs)
         self.group_ratios = [g["size_ratio"] for g in self.group_cfgs]
@@ -105,6 +143,8 @@ class HeterFusedMoE(nn.Module):
             num_experts=num_experts,
             group_size_ratios=self.group_ratios,
             device=self.device,
+            int4_only_mask=self._int4_only_mask,
+            int4_group_idx=self._int4_group_idx,
             **policy_kwargs,
         )
 
@@ -124,7 +164,7 @@ class HeterFusedMoE(nn.Module):
         for idx, gcfg in enumerate(self.group_cfgs):
             num_bits = gcfg.get("num_bits", 16)
             if num_bits == 16:
-                if not hasattr(self, "w13_weight"):
+                if not hasattr(self, "w13_weight") and self._num_bf16_experts > 0:
                     self._init_bf16_params(E, H, I)
             elif num_bits == 4:
                 if not hasattr(self, "int4_w13_qweight"):
@@ -157,6 +197,7 @@ class HeterFusedMoE(nn.Module):
         cls,
         fused_moe: nn.Module,
         heter_config: Dict[str, Any],
+        int4_only_experts: Optional[list] = None,
     ) -> "HeterFusedMoE":
         """Create HeterFusedMoE from an already-loaded BF16 FusedMoE.
 
@@ -190,28 +231,49 @@ class HeterFusedMoE(nn.Module):
             num_global_experts=num_global_experts,
             reduce_results=reduce_results,
             moe_tp_size=moe_tp_size,
+            int4_only_experts=int4_only_experts,
         )
 
-        instance.w13_weight = nn.Parameter(
-            fused_moe.w13_weight.data, requires_grad=False
-        )
-        instance.w2_weight = nn.Parameter(fused_moe.w2_weight.data, requires_grad=False)
+        # Copy BF16 weights: compact (dual-precision only) or full
+        if int4_only_experts:
+            int4_only_set = set(int4_only_experts)
+            dual_experts = sorted(e for e in range(E) if e not in int4_only_set)
+            if dual_experts:
+                instance.w13_weight = nn.Parameter(
+                    fused_moe.w13_weight.data[dual_experts].clone(), requires_grad=False
+                )
+                instance.w2_weight = nn.Parameter(
+                    fused_moe.w2_weight.data[dual_experts].clone(), requires_grad=False
+                )
+            # else: all experts INT4-only, no BF16 weights needed
+        else:
+            instance.w13_weight = nn.Parameter(
+                fused_moe.w13_weight.data, requires_grad=False
+            )
+            instance.w2_weight = nn.Parameter(
+                fused_moe.w2_weight.data, requires_grad=False
+            )
 
         return instance
 
     def _init_bf16_params(self, E: int, H: int, I: int) -> None:
-        """Create BF16 weight containers."""
+        """Create BF16 weight containers.
+
+        Uses compact size D (dual-precision experts only) when int4_only_experts
+        is configured, otherwise full E.
+        """
+        D = self._num_bf16_experts
         self.register_parameter(
             "w13_weight",
             nn.Parameter(
-                torch.empty(E, 2 * I, H, dtype=self.dtype, device=self.device),
+                torch.empty(D, 2 * I, H, dtype=self.dtype, device=self.device),
                 requires_grad=False,
             ),
         )
         self.register_parameter(
             "w2_weight",
             nn.Parameter(
-                torch.empty(E, H, I, dtype=self.dtype, device=self.device),
+                torch.empty(D, H, I, dtype=self.dtype, device=self.device),
                 requires_grad=False,
             ),
         )
@@ -557,6 +619,14 @@ class HeterFusedMoE(nn.Module):
             num_bits = gcfg.get("num_bits", 16)
 
             if num_bits == 16:
+                # Skip BF16 kernel if all experts are INT4-only for this layer
+                if self._num_bf16_experts == 0:
+                    continue
+                # Remap expert IDs to compact BF16 tensor indices
+                if self._bf16_id_remap is not None:
+                    safe_ids = group_ids.clamp(min=0)
+                    remapped = self._bf16_id_remap[safe_ids]
+                    group_ids = torch.where(group_ids >= 0, remapped, group_ids)
                 group_out = outplace_fused_experts(
                     hidden_states,
                     self.w13_weight,
@@ -588,6 +658,13 @@ class HeterFusedMoE(nn.Module):
                     inplace=False,
                 )
             elif num_bits == 8:
+                if self._num_bf16_experts == 0:
+                    continue
+                # INT8 shares w13_weight/w2_weight — same remap as BF16
+                if self._bf16_id_remap is not None:
+                    safe_ids = group_ids.clamp(min=0)
+                    remapped = self._bf16_id_remap[safe_ids]
+                    group_ids = torch.where(group_ids >= 0, remapped, group_ids)
                 group_out = outplace_fused_experts(
                     hidden_states,
                     self.w13_weight,
@@ -635,6 +712,7 @@ def apply_heter_precision(
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     heter_config = _parse_heter_config(config_path)
+    int4_only_by_layer = heter_config.get("_int4_only_by_layer", {})
 
     # Find INT4 group's checkpoint path
     int4_checkpoint = None
@@ -675,7 +753,10 @@ def apply_heter_precision(
             continue
 
         # Create HeterFusedMoE from the loaded BF16 FusedMoE
-        heter_moe = HeterFusedMoE.from_fused_moe(fused_moe, heter_config)
+        int4_only_experts = int4_only_by_layer.get(str(layer_id))
+        heter_moe = HeterFusedMoE.from_fused_moe(
+            fused_moe, heter_config, int4_only_experts=int4_only_experts
+        )
 
         # Load INT4 expert weights
         heter_moe.load_int4_weights(int4_checkpoint, layer_id)
