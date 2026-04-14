@@ -12,6 +12,7 @@ import os
 
 import openai
 import pytest
+from ws_utils import gateway_ws_url as _gateway_ws_url
 
 GET_WEATHER_FUNCTION = {
     "type": "function",
@@ -65,13 +66,6 @@ CALCULATE_CHAT_TOOL = {
 
 _TEXT_SMOKE_MODEL = os.environ.get("SGLANG_TEXT_SMOKE_MODEL", "llama-1b")
 _TOOL_SMOKE_MODEL = os.environ.get("SGLANG_TOOL_SMOKE_MODEL", "qwen-7b")
-
-
-def _gateway_ws_url(base_url: str) -> str:
-    """Convert the router base URL into a websocket endpoint URL."""
-    if base_url.startswith("https://"):
-        return f"wss://{base_url.removeprefix('https://')}/v1/responses"
-    return f"ws://{base_url.removeprefix('http://')}/v1/responses"
 
 
 def _ws_request(

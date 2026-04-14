@@ -59,6 +59,102 @@ use crate::{
     },
 };
 
+/// Generate a unique item ID with the given prefix (e.g. `"fc"` → `"fc_a1b2c3..."`).
+fn generate_item_id(prefix: &str) -> String {
+    format!("{}_{}", prefix, Uuid::new_v4().to_string().replace("-", ""))
+}
+
+// ============================================================================
+// Shared SSE body parser — single implementation for both MCP and non-MCP paths
+// ============================================================================
+
+/// What a parsed SSE `data:` line contains.
+enum SseDataRecord {
+    /// A parsed `ChatCompletionStreamResponse` chunk.
+    ChatChunk(ChatCompletionStreamResponse),
+    /// A raw JSON payload that did not parse as a chat chunk (e.g. upstream error).
+    RawJson(String),
+    /// The `data: [DONE]` sentinel.
+    Done,
+}
+
+/// Incrementally parse SSE records from an HTTP body stream.
+///
+/// Handles split and coalesced chunks using an internal pending buffer with
+/// offset-based compaction (O(n) amortised).  Both the non-MCP and MCP
+/// streaming paths use this so the SSE-byte-parsing logic lives in one place.
+struct SseBodyParser {
+    pending: String,
+    offset: usize,
+}
+
+impl SseBodyParser {
+    fn new() -> Self {
+        Self {
+            pending: String::new(),
+            offset: 0,
+        }
+    }
+
+    /// Append raw bytes from a body chunk.
+    fn push(&mut self, chunk: &[u8]) {
+        let text = String::from_utf8_lossy(chunk).replace("\r\n", "\n");
+        self.pending.push_str(&text);
+    }
+
+    /// Yield the next complete SSE `data:` record, if one is available.
+    fn next_record(&mut self) -> Option<SseDataRecord> {
+        let rel_end = self.pending[self.offset..].find("\n\n")?;
+        let record_end = self.offset + rel_end;
+
+        // Extract and advance offset before any compaction so we don't
+        // borrow `self.pending` across the mutation.
+        let record = self.pending[self.offset..record_end].trim().to_string();
+        self.offset = record_end + 2;
+
+        // Compact when consumed prefix exceeds half the buffer.
+        if self.offset > self.pending.len() / 2 {
+            self.pending = self.pending[self.offset..].to_string();
+            self.offset = 0;
+        }
+
+        if record.is_empty() {
+            return self.next_record();
+        }
+
+        if record == "data: [DONE]" {
+            return Some(SseDataRecord::Done);
+        }
+
+        let Some(json_str) = record.strip_prefix("data: ") else {
+            return self.next_record();
+        };
+        let json_str = json_str.trim();
+
+        match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
+            Ok(chunk) => Some(SseDataRecord::ChatChunk(chunk)),
+            Err(_) => Some(SseDataRecord::RawJson(json_str.to_string())),
+        }
+    }
+
+    /// Flush any remaining partial data after the body stream ends.
+    fn flush(&mut self) -> Option<SseDataRecord> {
+        let remaining = self.pending[self.offset..].trim();
+        if remaining.is_empty() || remaining == "data: [DONE]" {
+            return None;
+        }
+        // Reset offset so we don't flush twice.
+        self.offset = self.pending.len();
+
+        let json_str = remaining.strip_prefix("data: ")?.trim();
+
+        match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
+            Ok(chunk) => Some(SseDataRecord::ChatChunk(chunk)),
+            Err(_) => Some(SseDataRecord::RawJson(json_str.to_string())),
+        }
+    }
+}
+
 // ============================================================================
 // Non-MCP Streaming Path
 // ============================================================================
@@ -180,25 +276,19 @@ async fn process_and_transform_stream(
         .send_event(&event, sink)
         .map_err(|_| "Failed to send response.in_progress event".to_string())?;
 
-    // Convert body to data stream
+    // Parse SSE records from the body stream using the shared parser.
     let mut stream = body.into_data_stream();
     let mut upstream_error_forwarded = false;
     let mut function_call_events = BTreeMap::new();
-    let mut pending_sse = String::new();
+    let mut parser = SseBodyParser::new();
 
-    // Process stream chunks, handling SSE records even when multiple events are
-    // coalesced into one body chunk or split across chunk boundaries.
     'stream: while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
-        let chunk_str = String::from_utf8_lossy(&chunk).replace("\r\n", "\n");
-        pending_sse.push_str(&chunk_str);
+        parser.push(&chunk);
 
-        while let Some(record_end) = pending_sse.find("\n\n") {
-            let record = pending_sse[..record_end].to_string();
-            pending_sse = pending_sse[record_end + 2..].to_string();
-
-            match process_non_mcp_sse_record(
-                &record,
+        while let Some(record) = parser.next_record() {
+            match process_non_mcp_sse_data_record(
+                record,
                 &mut accumulator,
                 &mut event_emitter,
                 sink,
@@ -214,15 +304,18 @@ async fn process_and_transform_stream(
         }
     }
 
-    if !upstream_error_forwarded && !pending_sse.trim().is_empty() {
-        if let SseRecordOutcome::UpstreamError = process_non_mcp_sse_record(
-            &pending_sse,
-            &mut accumulator,
-            &mut event_emitter,
-            sink,
-            &mut function_call_events,
-        )? {
-            upstream_error_forwarded = true;
+    // Flush any remaining partial record after the body stream ends.
+    if !upstream_error_forwarded {
+        if let Some(record) = parser.flush() {
+            if let SseRecordOutcome::UpstreamError = process_non_mcp_sse_data_record(
+                record,
+                &mut accumulator,
+                &mut event_emitter,
+                sink,
+                &mut function_call_events,
+            )? {
+                upstream_error_forwarded = true;
+            }
         }
     }
 
@@ -277,29 +370,17 @@ enum SseRecordOutcome {
     UpstreamError,
 }
 
-fn process_non_mcp_sse_record(
-    event: &str,
+/// Process a pre-parsed SSE data record on the non-MCP streaming path.
+fn process_non_mcp_sse_data_record(
+    record: SseDataRecord,
     accumulator: &mut StreamingResponseAccumulator,
     event_emitter: &mut ResponseStreamEventEmitter,
     sink: &impl ResponseEventSink,
     function_call_events: &mut BTreeMap<usize, FunctionCallEventState>,
 ) -> Result<SseRecordOutcome, String> {
-    let event = event.trim();
-    if event.is_empty() {
-        return Ok(SseRecordOutcome::Continue);
-    }
-
-    if event == "data: [DONE]" {
-        return Ok(SseRecordOutcome::StopStream);
-    }
-
-    let Some(json_str) = event.strip_prefix("data: ") else {
-        return Ok(SseRecordOutcome::Continue);
-    };
-    let json_str = json_str.trim();
-
-    match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
-        Ok(chat_chunk) => {
+    match record {
+        SseDataRecord::Done => Ok(SseRecordOutcome::StopStream),
+        SseDataRecord::ChatChunk(chat_chunk) => {
             accumulator.process_chunk(&chat_chunk);
 
             let has_tool_call_delta = chat_chunk
@@ -320,11 +401,11 @@ fn process_non_mcp_sse_record(
 
             Ok(SseRecordOutcome::Continue)
         }
-        Err(_) => {
-            debug!("Non-chunk SSE event, passing through: {}", event);
-            sink.send_raw_json(json_str)?;
+        SseDataRecord::RawJson(json_str) => {
+            debug!("Non-chunk SSE event, passing through: {}", json_str);
+            sink.send_raw_json(&json_str)?;
 
-            if is_upstream_error_payload(json_str) {
+            if is_upstream_error_payload(&json_str) {
                 Ok(SseRecordOutcome::UpstreamError)
             } else {
                 Ok(SseRecordOutcome::Continue)
@@ -493,7 +574,10 @@ impl StreamingResponseAccumulator {
 
         // Process first choice (responses API doesn't support n>1)
         if let Some(choice) = chunk.choices.first() {
-            // Accumulate content
+            // Accumulate content only when no tool calls have been seen.
+            // When tool calls are present, content is typically empty or
+            // whitespace; including it would create a spurious Message
+            // output item alongside the FunctionToolCall items.
             if let Some(content) = &choice.delta.content {
                 if self.tool_calls.is_empty() {
                     self.content_buffer.push_str(content);
@@ -511,10 +595,11 @@ impl StreamingResponseAccumulator {
                     // Use index directly (it's a u32, not Option<u32>)
                     let index = delta.index as usize;
 
-                    // Ensure we have enough tool calls
+                    // Ensure we have enough tool calls.  The item `id` is
+                    // pre-generated so it remains stable across deltas.
                     while self.tool_calls.len() <= index {
                         self.tool_calls.push(ResponseOutputItem::FunctionToolCall {
-                            id: String::new(),
+                            id: generate_item_id("fc"),
                             call_id: String::new(),
                             name: String::new(),
                             arguments: String::new(),
@@ -525,16 +610,18 @@ impl StreamingResponseAccumulator {
 
                     // Update the tool call at this index
                     if let ResponseOutputItem::FunctionToolCall {
-                        id,
                         call_id,
                         name,
                         arguments,
                         ..
                     } = &mut self.tool_calls[index]
                     {
+                        // The tool call ID arrives on the first delta; assign
+                        // once rather than appending on every chunk.
                         if let Some(delta_id) = &delta.id {
-                            id.push_str(delta_id);
-                            call_id.push_str(delta_id);
+                            if call_id.is_empty() {
+                                call_id.clone_from(delta_id);
+                            }
                         }
                         if let Some(function) = &delta.function {
                             if let Some(delta_name) = &function.name {
@@ -719,7 +806,7 @@ pub(super) async fn execute_tool_loop_streaming_with_sink(
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
-    outbound_tx: mpsc::UnboundedSender<Message>,
+    outbound_tx: mpsc::Sender<Message>,
 ) -> Result<ResponsesResponse, String> {
     let sink = WsResponseEventSink::new(outbound_tx);
     execute_tool_loop_streaming_internal(
@@ -1238,7 +1325,10 @@ async fn execute_tool_loop_streaming_internal(
     }
 }
 
-/// Convert chat stream to Responses API events while accumulating for tool call detection
+/// Convert chat stream to Responses API events while accumulating for tool call detection.
+///
+/// Uses the shared `SseBodyParser` so the SSE-byte-parsing logic lives in one
+/// place (removing the architectural violation flagged in RFC 0001 / T0).
 async fn convert_and_accumulate_stream(
     body: Body,
     emitter: &mut ResponseStreamEventEmitter,
@@ -1246,28 +1336,31 @@ async fn convert_and_accumulate_stream(
 ) -> Result<ChatCompletionResponse, String> {
     let mut accumulator = ChatResponseAccumulator::new();
     let mut stream = body.into_data_stream();
+    let mut parser = SseBodyParser::new();
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| format!("Stream read error: {}", e))?;
+        parser.push(&chunk);
 
-        // Parse chunk
-        let event_str = String::from_utf8_lossy(&chunk);
-        let event = event_str.trim();
-
-        if event == "data: [DONE]" {
-            break;
-        }
-
-        if let Some(json_str) = event.strip_prefix("data: ") {
-            let json_str = json_str.trim();
-            if let Ok(chat_chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
-                // Convert chat chunk to Responses API events and emit
-                emitter.process_chunk(&chat_chunk, sink)?;
-
-                // Accumulate for tool call detection
-                accumulator.process_chunk(&chat_chunk);
+        while let Some(record) = parser.next_record() {
+            match record {
+                SseDataRecord::Done => return Ok(accumulator.finalize()),
+                SseDataRecord::ChatChunk(chat_chunk) => {
+                    emitter.process_chunk(&chat_chunk, sink)?;
+                    accumulator.process_chunk(&chat_chunk);
+                }
+                SseDataRecord::RawJson(_) => {
+                    // MCP path ignores non-chat payloads (upstream errors are
+                    // handled at the tool-loop level).
+                }
             }
         }
+    }
+
+    // Flush any remaining partial record.
+    if let Some(SseDataRecord::ChatChunk(chat_chunk)) = parser.flush() {
+        emitter.process_chunk(&chat_chunk, sink)?;
+        accumulator.process_chunk(&chat_chunk);
     }
 
     Ok(accumulator.finalize())
@@ -1659,5 +1752,85 @@ mod tests {
             serialized_output["arguments"],
             "{\"expression\":\"42 * 17\"}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // T3: MCP path — coalesced / split SSE chunk handling
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_convert_and_accumulate_stream_handles_coalesced_sse_records() {
+        // All SSE records arrive in a single body chunk.
+        let body = Body::from_stream(stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+            concat!(
+                "data: {\"id\":\"chatcmpl_mcp\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl_mcp\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl_mcp\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        ))]));
+
+        let sink = RecordingSink::default();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_mcp_test".into(), "mock-model".into(), 1);
+        let created = emitter.emit_created();
+        emitter.send_event(&created, &sink).unwrap();
+        let in_prog = emitter.emit_in_progress();
+        emitter.send_event(&in_prog, &sink).unwrap();
+
+        let result = convert_and_accumulate_stream(body, &mut emitter, &sink)
+            .await
+            .expect("coalesced MCP stream should succeed");
+
+        assert_eq!(result.choices[0].message.content.as_deref(), Some("hello"));
+        assert!(result.usage.is_some());
+
+        let events = sink.events();
+        let text_deltas: Vec<&str> = events
+            .iter()
+            .filter(|e| {
+                e.get("type").and_then(|t| t.as_str()) == Some("response.output_text.delta")
+            })
+            .filter_map(|e| e.get("delta").and_then(|d| d.as_str()))
+            .collect();
+        assert_eq!(text_deltas, vec!["hel", "lo"]);
+    }
+
+    #[tokio::test]
+    async fn test_convert_and_accumulate_stream_handles_split_sse_records() {
+        // One SSE record is split across two body chunks.
+        let first_half = "data: {\"id\":\"chatcmpl_split\",\"object\":\"chat.completion.chunk\",";
+        let second_half = "\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"split\"},\"finish_reason\":null}]}\n\n\
+                           data: {\"id\":\"chatcmpl_split\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                           data: [DONE]\n\n";
+
+        let body = Body::from_stream(stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from(first_half)),
+            Ok(Bytes::from(second_half)),
+        ]));
+
+        let sink = RecordingSink::default();
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_split_test".into(), "mock-model".into(), 1);
+        let created = emitter.emit_created();
+        emitter.send_event(&created, &sink).unwrap();
+        let in_prog = emitter.emit_in_progress();
+        emitter.send_event(&in_prog, &sink).unwrap();
+
+        let result = convert_and_accumulate_stream(body, &mut emitter, &sink)
+            .await
+            .expect("split MCP stream should succeed");
+
+        assert_eq!(result.choices[0].message.content.as_deref(), Some("split"));
+
+        let events = sink.events();
+        let text_deltas: Vec<&str> = events
+            .iter()
+            .filter(|e| {
+                e.get("type").and_then(|t| t.as_str()) == Some("response.output_text.delta")
+            })
+            .filter_map(|e| e.get("delta").and_then(|d| d.as_str()))
+            .collect();
+        assert_eq!(text_deltas, vec!["split"]);
     }
 }

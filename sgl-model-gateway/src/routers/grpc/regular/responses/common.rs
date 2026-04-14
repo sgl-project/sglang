@@ -401,7 +401,10 @@ pub(crate) async fn load_conversation_history_with_cache(
                 modified_request.input = ResponseInput::Items(items);
             }
             Err(e) => {
-                warn!("Failed to load conversation history: {}", e);
+                return Err(error::internal_error(
+                    "load_conversation_history_failed",
+                    format!("Failed to load conversation history: {}", e),
+                ));
             }
         }
     }
@@ -497,38 +500,15 @@ pub(super) fn build_next_request(
     // Append all conversation history (function calls and outputs)
     input_items.extend_from_slice(&state.conversation_history);
 
-    // Build new request for next iteration
+    // Build new request for next iteration, inheriting all fields from the
+    // current request except the ones we explicitly override.
     ResponsesRequest {
         input: ResponseInput::Items(input_items),
-        model: current_request.model.clone(),
-        instructions: current_request.instructions.clone(),
-        tools: current_request.tools.clone(),
-        max_output_tokens: current_request.max_output_tokens,
-        temperature: current_request.temperature,
-        top_p: current_request.top_p,
-        stream: current_request.stream,
         store: Some(false), // Don't store intermediate responses
         background: Some(false),
-        max_tool_calls: current_request.max_tool_calls,
-        tool_choice: current_request.tool_choice.clone(),
-        parallel_tool_calls: current_request.parallel_tool_calls,
         previous_response_id: None,
         conversation: None,
-        user: current_request.user.clone(),
-        metadata: current_request.metadata.clone(),
-        include: current_request.include.clone(),
-        reasoning: current_request.reasoning.clone(),
-        service_tier: current_request.service_tier.clone(),
-        top_logprobs: current_request.top_logprobs,
-        truncation: current_request.truncation.clone(),
-        text: current_request.text.clone(),
         request_id: None,
-        priority: current_request.priority,
-        frequency_penalty: current_request.frequency_penalty,
-        presence_penalty: current_request.presence_penalty,
-        stop: current_request.stop.clone(),
-        top_k: current_request.top_k,
-        min_p: current_request.min_p,
-        repetition_penalty: current_request.repetition_penalty,
+        ..current_request.clone()
     }
 }

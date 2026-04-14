@@ -285,16 +285,7 @@ impl GrpcRouter {
                 model_id.unwrap_or(UNKNOWN_MODEL_ID),
                 body.stream.unwrap_or(false)
             );
-            let harmony_ctx = ResponsesContext::new(
-                Arc::new(self.harmony_pipeline.clone()),
-                self.shared_components.clone(),
-                self.harmony_responses_context.response_storage.clone(),
-                self.harmony_responses_context.conversation_storage.clone(),
-                self.harmony_responses_context
-                    .conversation_item_storage
-                    .clone(),
-                self.harmony_responses_context.mcp_manager.clone(),
-            );
+            let harmony_ctx = self.harmony_responses_context.clone_for_request();
 
             if body.stream.unwrap_or(false) {
                 serve_harmony_responses_stream(&harmony_ctx, body.clone()).await

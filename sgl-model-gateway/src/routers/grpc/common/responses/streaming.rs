@@ -161,11 +161,11 @@ impl ResponseEventSink for mpsc::UnboundedSender<Result<Bytes, std::io::Error>> 
 
 #[derive(Clone)]
 pub(crate) struct WsResponseEventSink {
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::Sender<Message>,
 }
 
 impl WsResponseEventSink {
-    pub fn new(tx: mpsc::UnboundedSender<Message>) -> Self {
+    pub fn new(tx: mpsc::Sender<Message>) -> Self {
         Self { tx }
     }
 }
@@ -181,8 +181,10 @@ impl ResponseEventSink for WsResponseEventSink {
                 event_type, delta_chars, "forwarding responses stream event"
             );
         }
-        if self.tx.send(Message::Text(event_json.into())).is_err() {
-            return Err("Client disconnected".to_string());
+        // Use try_send to avoid blocking the tokio runtime from a sync context.
+        // A full channel means the client can't keep up; treat as disconnect.
+        if self.tx.try_send(Message::Text(event_json.into())).is_err() {
+            return Err("Client disconnected or outbound buffer full".to_string());
         }
 
         if response_event_timing_enabled() && should_log_response_event(event_type) {
@@ -201,10 +203,10 @@ impl ResponseEventSink for WsResponseEventSink {
     fn send_raw_json(&self, payload: &str) -> Result<(), String> {
         if self
             .tx
-            .send(Message::Text(payload.to_string().into()))
+            .try_send(Message::Text(payload.to_string().into()))
             .is_err()
         {
-            return Err("Client disconnected".to_string());
+            return Err("Client disconnected or outbound buffer full".to_string());
         }
         Ok(())
     }
@@ -923,8 +925,15 @@ impl ResponseStreamEventEmitter {
             // Check for finish_reason to emit completion events
             if let Some(reason) = &choice.finish_reason {
                 if reason == "stop" || reason == "length" {
-                    let output_index = self.current_message_output_index.unwrap();
-                    let item_id = self.current_item_id.clone().unwrap(); // Clone to avoid borrow checker issues
+                    // Guard: finish_reason can arrive without prior content
+                    // deltas (e.g. empty responses).  Skip completion events
+                    // if we never allocated an output slot.
+                    let (Some(output_index), Some(item_id)) = (
+                        self.current_message_output_index,
+                        self.current_item_id.clone(),
+                    ) else {
+                        return Ok(());
+                    };
                     let content_index = 0;
 
                     // Emit closing events

@@ -6,7 +6,10 @@
 //! configurable lifetime (default 60 minutes) with ping/pong liveness checks.
 
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,7 +20,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, info, warn};
 
 use crate::protocols::responses::{
@@ -25,8 +28,11 @@ use crate::protocols::responses::{
 };
 
 const DEFAULT_WS_SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
+/// Bounded outbound channel capacity.  Large enough to absorb bursts from the
+/// LLM streaming pipeline while still providing backpressure if a client falls
+/// behind.
+const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 const ACTIVE_REQUEST_HANDOFF_TIMEOUT: Duration = Duration::from_millis(50);
-const ACTIVE_REQUEST_HANDOFF_POLL: Duration = Duration::from_millis(1);
 
 fn ws_writer_timing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -71,9 +77,11 @@ impl CachedWsResponse {
 
         for output_item in &self.response.output {
             let Ok(value) = serde_json::to_value(output_item) else {
+                warn!("failed to serialize output item for conversation cache");
                 continue;
             };
             let Ok(item) = serde_json::from_value::<ResponseInputOutputItem>(value) else {
+                warn!("failed to deserialize output item into ResponseInputOutputItem for conversation cache");
                 continue;
             };
             items.push(item);
@@ -135,14 +143,25 @@ pub trait WsResponsesExecutor: Send + Sync {
         request: ResponsesRequest,
         options: WsResponseCreateOptions,
         cached_response: Option<CachedWsResponse>,
-        outbound_tx: mpsc::UnboundedSender<Message>,
+        outbound_tx: mpsc::Sender<Message>,
     ) -> Result<CachedWsResponse, WsClientError>;
 }
 
-#[derive(Default)]
 struct WsSessionState {
     active_request: bool,
     cached_response: Option<CachedWsResponse>,
+    /// Signalled when `active_request` transitions from true -> false.
+    request_done: Arc<Notify>,
+}
+
+impl Default for WsSessionState {
+    fn default() -> Self {
+        Self {
+            active_request: false,
+            cached_response: None,
+            request_done: Arc::new(Notify::new()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -230,8 +249,9 @@ pub async fn serve_responses_ws_with_config(
     runtime_config: WsRuntimeConfig,
 ) {
     let (mut sink, mut stream) = socket.split();
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Message>();
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(OUTBOUND_CHANNEL_CAPACITY);
     let session = Arc::new(Mutex::new(WsSessionState::default()));
+    let closing = Arc::new(AtomicBool::new(false));
 
     let writer = tokio::spawn(async move {
         let session_started_at = Instant::now();
@@ -262,6 +282,7 @@ pub async fn serve_responses_ws_with_config(
 
     let session_timeout = {
         let outbound_tx = outbound_tx.clone();
+        let closing = closing.clone();
         let max_session_lifetime = runtime_config.max_session_lifetime;
         tokio::spawn(async move {
             if max_session_lifetime.is_zero() {
@@ -269,19 +290,26 @@ pub async fn serve_responses_ws_with_config(
             }
 
             tokio::time::sleep(max_session_lifetime).await;
+            closing.store(true, Ordering::Release);
             let message = session_lifetime_message(max_session_lifetime);
             send_client_error_json(
                 &outbound_tx,
                 &WsClientError::new("websocket_connection_limit_reached", &message)
                     .with_type("invalid_request_error"),
                 None,
-            );
-            let _ = outbound_tx.send(Message::Close(Some(CloseFrame {
-                code: axum::extract::ws::close_code::NORMAL,
-                reason: message.into(),
-            })));
+            )
+            .await;
+            let _ = outbound_tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: axum::extract::ws::close_code::NORMAL,
+                    reason: message.into(),
+                })))
+                .await;
         })
     };
+
+    // Track the current executor task so we can abort it on disconnect.
+    let mut executor_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     while let Some(message_result) = stream.next().await {
         let message = match message_result {
@@ -294,14 +322,20 @@ pub async fn serve_responses_ws_with_config(
 
         match message {
             Message::Text(text) => {
-                handle_text_event(
+                if closing.load(Ordering::Acquire) {
+                    break;
+                }
+                let handle = handle_text_event(
                     text.as_ref(),
-                    headers.clone(),
+                    &headers,
                     executor.clone(),
                     session.clone(),
                     outbound_tx.clone(),
                 )
                 .await;
+                if let Some(h) = handle {
+                    executor_handle = Some(h);
+                }
             }
             Message::Binary(_) => {
                 send_error_json(
@@ -309,33 +343,40 @@ pub async fn serve_responses_ws_with_config(
                     "unsupported_message_type",
                     "Binary WebSocket messages are not supported on /v1/responses.",
                     None,
-                );
+                )
+                .await;
             }
             Message::Ping(payload) => {
-                let _ = outbound_tx.send(Message::Pong(payload));
+                let _ = outbound_tx.send(Message::Pong(payload)).await;
             }
             Message::Pong(_) => {}
             Message::Close(_) => break,
         }
     }
 
+    // Client disconnected — abort any in-flight executor task to avoid wasted compute.
+    if let Some(handle) = executor_handle.take() {
+        handle.abort();
+    }
     session_timeout.abort();
     drop(outbound_tx);
     let _ = writer.await;
 }
 
+/// Handle an incoming text event.  Returns a [`JoinHandle`] when an executor
+/// task is spawned so the caller can abort it on disconnect.
 async fn handle_text_event(
     payload: &str,
-    headers: HeaderMap,
+    headers: &HeaderMap,
     executor: Arc<dyn WsResponsesExecutor>,
     session: Arc<Mutex<WsSessionState>>,
-    outbound_tx: mpsc::UnboundedSender<Message>,
-) {
+    outbound_tx: mpsc::Sender<Message>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let raw_event = match parse_client_event(payload) {
         Ok(raw_event) => raw_event,
         Err(err) => {
-            send_client_error_json(&outbound_tx, &err, None);
-            return;
+            send_client_error_json(&outbound_tx, &err, None).await;
+            return None;
         }
     };
 
@@ -347,8 +388,9 @@ async fn handle_text_event(
                     "missing_response",
                     "The `response.create` event requires a valid Responses request body.",
                     raw_event.event_id.as_deref(),
-                );
-                return;
+                )
+                .await;
+                return None;
             };
 
             if !acquire_request_slot(&session).await {
@@ -357,8 +399,9 @@ async fn handle_text_event(
                     "concurrent_response_create",
                     "Only one in-flight `response.create` is allowed per connection.",
                     raw_event.event_id.as_deref(),
-                );
-                return;
+                )
+                .await;
+                return None;
             }
             let session_guard = session.lock().await;
             let cached_response = session_guard.cached_response.clone();
@@ -378,9 +421,10 @@ async fn handle_text_event(
                 generate = options.generate.unwrap_or(true),
                 "accepted websocket response.create request"
             );
+            let headers = headers.clone();
             let session_clone = session.clone();
             let outbound_clone = outbound_tx.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let result = executor
                     .execute_response_create(
                         headers,
@@ -392,8 +436,8 @@ async fn handle_text_event(
                     .await;
 
                 let mut session_guard = session_clone.lock().await;
-                session_guard.active_request = false;
-
+                // Update cache *before* clearing active_request to prevent
+                // a TOCTOU race where a new request reads stale cache.
                 match result {
                     Ok(cached_response) => {
                         debug!(
@@ -420,17 +464,28 @@ async fn handle_text_event(
                         if should_evict_cached_response {
                             session_guard.cached_response = None;
                         }
+                        // Release lock before sending error to avoid holding
+                        // it while the bounded channel potentially blocks.
+                        let notify = session_guard.request_done.clone();
+                        session_guard.active_request = false;
                         drop(session_guard);
+                        notify.notify_waiters();
                         debug!(
                             event_id = event_id.as_deref().unwrap_or(""),
                             error_code = %err.code,
                             elapsed_ms = request_started_at.elapsed().as_secs_f64() * 1000.0,
                             "websocket response.create request failed"
                         );
-                        send_client_error_json(&outbound_clone, &err, event_id.as_deref());
+                        send_client_error_json(&outbound_clone, &err, event_id.as_deref()).await;
+                        return;
                     }
                 }
+                let notify = session_guard.request_done.clone();
+                session_guard.active_request = false;
+                drop(session_guard);
+                notify.notify_waiters();
             });
+            Some(handle)
         }
         other => {
             send_error_json(
@@ -438,26 +493,39 @@ async fn handle_text_event(
                 "unsupported_event",
                 format!("Unsupported WebSocket client event type: {}", other),
                 raw_event.event_id.as_deref(),
-            );
+            )
+            .await;
+            None
         }
     }
 }
 
 async fn acquire_request_slot(session: &Arc<Mutex<WsSessionState>>) -> bool {
-    let deadline = Instant::now() + ACTIVE_REQUEST_HANDOFF_TIMEOUT;
-    loop {
-        let mut session_guard = session.lock().await;
-        if !session_guard.active_request {
-            session_guard.active_request = true;
+    // Fast path: slot is free.
+    {
+        let mut guard = session.lock().await;
+        if !guard.active_request {
+            guard.active_request = true;
             return true;
         }
-        drop(session_guard);
+    }
 
-        if Instant::now() >= deadline {
-            return false;
+    // Slow path: wait for the in-flight request to complete.
+    let notify = {
+        let guard = session.lock().await;
+        guard.request_done.clone()
+    };
+
+    match tokio::time::timeout(ACTIVE_REQUEST_HANDOFF_TIMEOUT, notify.notified()).await {
+        Ok(()) => {
+            let mut guard = session.lock().await;
+            if !guard.active_request {
+                guard.active_request = true;
+                return true;
+            }
+            false
         }
-
-        tokio::time::sleep(ACTIVE_REQUEST_HANDOFF_POLL).await;
+        Err(_) => false,
     }
 }
 
@@ -557,17 +625,17 @@ fn take_bool_field(object: &mut serde_json::Map<String, Value>, key: &str) -> Op
     object.remove(key).and_then(|value| value.as_bool())
 }
 
-pub(crate) fn send_error_json(
-    outbound_tx: &mpsc::UnboundedSender<Message>,
+pub(crate) async fn send_error_json(
+    outbound_tx: &mpsc::Sender<Message>,
     code: &str,
     message: impl Into<String>,
     event_id: Option<&str>,
 ) {
-    send_client_error_json(outbound_tx, &WsClientError::new(code, message), event_id);
+    send_client_error_json(outbound_tx, &WsClientError::new(code, message), event_id).await;
 }
 
-pub(crate) fn send_client_error_json(
-    outbound_tx: &mpsc::UnboundedSender<Message>,
+pub(crate) async fn send_client_error_json(
+    outbound_tx: &mpsc::Sender<Message>,
     error: &WsClientError,
     event_id: Option<&str>,
 ) {
@@ -593,6 +661,7 @@ pub(crate) fn send_client_error_json(
 
     if outbound_tx
         .send(Message::Text(error_json.to_string().into()))
+        .await
         .is_err()
     {
         warn!("responses websocket client disconnected before error delivery");

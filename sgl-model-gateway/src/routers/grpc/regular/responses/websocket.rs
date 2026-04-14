@@ -19,10 +19,7 @@ use super::{
 };
 use crate::{
     core::WorkerRegistry,
-    protocols::{
-        responses::{generate_id, ResponseStatus, ResponsesRequest, ResponsesResponse},
-        validated::Normalizable,
-    },
+    protocols::responses::{generate_id, ResponseStatus, ResponsesRequest, ResponsesResponse},
     routers::{
         error,
         grpc::{
@@ -63,10 +60,9 @@ impl WsResponsesExecutor for GrpcWsResponsesExecutor {
         mut request: ResponsesRequest,
         options: WsResponseCreateOptions,
         cached_response: Option<CachedWsResponse>,
-        outbound_tx: mpsc::UnboundedSender<Message>,
+        outbound_tx: mpsc::Sender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
         let request_started_at = Instant::now();
-        request.normalize();
         // WebSocket Responses is inherently event-streamed, so force streaming
         // on the downstream chat pipeline regardless of the client payload.
         request.stream = Some(true);
@@ -182,7 +178,8 @@ async fn response_to_ws_error(response: axum::response::Response) -> WsClientErr
         .and_then(|value| value.to_str().ok())
         .unwrap_or("responses_ws_error")
         .to_string();
-    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.ok();
+    // Cap error-body reads to 1 MiB to prevent OOM on malformed upstream responses.
+    let body_bytes = to_bytes(response.into_body(), 1_048_576).await.ok();
     let parsed_error = body_bytes
         .as_ref()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
@@ -210,7 +207,7 @@ async fn warmup_response_create(
     ctx: &ResponsesContext,
     request: &ResponsesRequest,
     modified_request: &ResponsesRequest,
-    outbound_tx: mpsc::UnboundedSender<Message>,
+    outbound_tx: mpsc::Sender<Message>,
 ) -> Result<CachedWsResponse, WsClientError> {
     let response = ResponsesResponse::builder(generate_id("resp"), &request.model)
         .copy_from_request(request)
@@ -218,23 +215,19 @@ async fn warmup_response_create(
         .output(vec![])
         .build();
 
-    let created = json!({
-        "type": "response.created",
-        "response": {
-            "id": response.id,
-            "object": "response",
-            "status": "in_progress",
-            "model": response.model,
-            "output": []
-        }
-    });
-    send_ws_message(&outbound_tx, created)?;
-
-    let completed = json!({
-        "type": "response.completed",
-        "response": response.clone(),
-    });
-    send_ws_message(&outbound_tx, completed)?;
+    let in_progress_response = ResponsesResponse::builder(&response.id, &response.model)
+        .copy_from_request(request)
+        .status(ResponseStatus::InProgress)
+        .output(vec![])
+        .build();
+    send_ws_message(
+        &outbound_tx,
+        json!({ "type": "response.created", "response": in_progress_response }),
+    )?;
+    send_ws_message(
+        &outbound_tx,
+        json!({ "type": "response.completed", "response": response.clone() }),
+    )?;
 
     persist_response_if_needed(
         ctx.conversation_storage.clone(),
@@ -252,15 +245,15 @@ async fn warmup_response_create(
 }
 
 fn send_ws_message(
-    outbound_tx: &mpsc::UnboundedSender<Message>,
+    outbound_tx: &mpsc::Sender<Message>,
     payload: serde_json::Value,
 ) -> Result<(), WsClientError> {
     outbound_tx
-        .send(Message::Text(payload.to_string().into()))
+        .try_send(Message::Text(payload.to_string().into()))
         .map_err(|_| {
             WsClientError::new(
                 "client_disconnected",
-                "WebSocket client disconnected before response delivery.",
+                "WebSocket client disconnected or outbound buffer full.",
             )
             .with_status(499)
         })

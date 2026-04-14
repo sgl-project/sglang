@@ -18,6 +18,8 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+from ws_utils import gateway_ws_url as _gateway_ws_url
+from ws_utils import percentile as _percentile_impl
 
 logger = logging.getLogger(__name__)
 
@@ -31,23 +33,9 @@ _WS_BENCHMARK_MODEL = os.environ.get("SGLANG_WS_BENCHMARK_MODEL", "llama-1b")
 _WS_BENCH_BACKENDS = ["grpc"]
 
 
-def _gateway_ws_url(base_url: str) -> str:
-    if base_url.startswith("https://"):
-        return f"wss://{base_url.removeprefix('https://')}/v1/responses"
-    return f"ws://{base_url.removeprefix('http://')}/v1/responses"
-
-
 def _percentile(values: list[float], percentile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    rank = (len(ordered) - 1) * percentile
-    lower = int(rank)
-    upper = min(lower + 1, len(ordered) - 1)
-    weight = rank - lower
-    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+    """Wrapper to keep call-sites unchanged (0-1 scale -> 0-100 scale)."""
+    return _percentile_impl(values, percentile * 100)
 
 
 def _benchmark_request_body(model: str) -> dict:
@@ -512,6 +500,11 @@ async def _run_concurrency_profile(
     concurrency_levels: list[int],
     samples_per_concurrency: int,
 ) -> dict:
+    # Warmup: run a single request to exclude cold-start costs (model load,
+    # JIT compilation, connection pool init) from timed samples.
+    logger.info("Warmup: sending one request before timed samples")
+    await _run_single_ws_sample(ws_url, model)
+
     results = []
     for concurrency in concurrency_levels:
         samples: list[dict[str, float | int]] = []
@@ -1066,7 +1059,7 @@ class TestWsMicrobench:
         print(f"\n{'=' * 50}")
         print(f"  WS Microbenchmark  |  model: {model}")
         print(f"{'=' * 50}")
-        for profile in payload.get("profiles", []):
+        for profile in payload.get("results", []):
             c = profile.get("concurrency", "?")
             s = profile.get("summary", {})
             print(

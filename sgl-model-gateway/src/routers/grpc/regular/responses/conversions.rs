@@ -54,36 +54,38 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
             });
         }
         ResponseInput::Items(items) => {
-            // Structured items → convert each to appropriate chat message
+            // Structured items → convert each to appropriate chat message.
+            // Consecutive FunctionToolCall items are grouped into a single
+            // assistant message with multiple tool_calls so that backends
+            // that require parallel tool calls in one message work correctly.
+            let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
+            let mut pending_tool_outputs: Vec<(String, String)> = Vec::new();
+
+            /// Flush accumulated parallel tool calls into `messages`.
+            fn flush_tool_calls(
+                messages: &mut Vec<ChatMessage>,
+                pending_tool_calls: &mut Vec<ToolCall>,
+                pending_tool_outputs: &mut Vec<(String, String)>,
+            ) {
+                if pending_tool_calls.is_empty() {
+                    return;
+                }
+                messages.push(ChatMessage::Assistant {
+                    content: None,
+                    name: None,
+                    tool_calls: Some(std::mem::take(pending_tool_calls)),
+                    reasoning_content: None,
+                });
+                for (call_id, output_text) in pending_tool_outputs.drain(..) {
+                    messages.push(ChatMessage::Tool {
+                        content: MessageContent::Text(output_text),
+                        tool_call_id: call_id,
+                    });
+                }
+            }
+
             for item in items {
                 match item {
-                    ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
-                        // Convert SimpleInputMessage to chat message
-                        let text = match content {
-                            StringOrContentParts::String(s) => s.clone(),
-                            StringOrContentParts::Array(parts) => {
-                                // Extract text from content parts (only InputText supported)
-                                parts
-                                    .iter()
-                                    .filter_map(|part| match part {
-                                        ResponseContentPart::InputText { text } => {
-                                            Some(text.as_str())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            }
-                        };
-
-                        messages.push(role_to_chat_message(role.as_str(), text));
-                    }
-                    ResponseInputOutputItem::Message { role, content, .. } => {
-                        // Extract text from content parts
-                        let text = extract_text_from_content(content);
-
-                        messages.push(role_to_chat_message(role.as_str(), text));
-                    }
                     ResponseInputOutputItem::FunctionToolCall {
                         call_id,
                         name,
@@ -91,62 +93,89 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         output,
                         ..
                     } => {
-                        // Tool call from history - add as assistant message with tool call
-                        // followed by tool response if output exists
-
-                        // Add assistant message with tool_calls (the LLM's decision)
-                        messages.push(ChatMessage::Assistant {
-                            content: None,
-                            name: None,
-                            tool_calls: Some(vec![ToolCall {
-                                id: call_id.clone(),
-                                tool_type: "function".to_string(),
-                                function: FunctionCallResponse {
-                                    name: name.clone(),
-                                    arguments: Some(arguments.clone()),
-                                },
-                            }]),
-                            reasoning_content: None,
+                        // Accumulate — will be flushed when a non-tool-call
+                        // item is encountered or at the end.
+                        pending_tool_calls.push(ToolCall {
+                            id: call_id.clone(),
+                            tool_type: "function".to_string(),
+                            function: FunctionCallResponse {
+                                name: name.clone(),
+                                arguments: Some(arguments.clone()),
+                            },
                         });
-
-                        // Add tool result message if output exists
                         if let Some(output_text) = output {
-                            messages.push(ChatMessage::Tool {
-                                content: MessageContent::Text(output_text.clone()),
-                                tool_call_id: call_id.clone(),
-                            });
+                            pending_tool_outputs.push((call_id.clone(), output_text.clone()));
                         }
                     }
-                    ResponseInputOutputItem::Reasoning { content, .. } => {
-                        // Reasoning content - add as assistant message with reasoning_content
-                        let reasoning_text = content
-                            .iter()
-                            .map(|c| match c {
-                                ReasoningText { text } => text.as_str(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                    other => {
+                        // Flush any pending parallel tool calls before
+                        // processing a non-tool-call item.
+                        flush_tool_calls(
+                            &mut messages,
+                            &mut pending_tool_calls,
+                            &mut pending_tool_outputs,
+                        );
 
-                        messages.push(ChatMessage::Assistant {
-                            content: None,
-                            name: None,
-                            tool_calls: None,
-                            reasoning_content: Some(reasoning_text),
-                        });
-                    }
-                    ResponseInputOutputItem::FunctionCallOutput {
-                        call_id, output, ..
-                    } => {
-                        // Function call output - add as tool message
-                        // Note: The function name is looked up from prev_outputs in Harmony path
-                        // For Chat path, we just use the call_id
-                        messages.push(ChatMessage::Tool {
-                            content: MessageContent::Text(output.clone()),
-                            tool_call_id: call_id.clone(),
-                        });
+                        match other {
+                            ResponseInputOutputItem::SimpleInputMessage {
+                                content, role, ..
+                            } => {
+                                let text = match content {
+                                    StringOrContentParts::String(s) => s.clone(),
+                                    StringOrContentParts::Array(parts) => parts
+                                        .iter()
+                                        .filter_map(|part| match part {
+                                            ResponseContentPart::InputText { text } => {
+                                                Some(text.as_str())
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" "),
+                                };
+                                messages.push(role_to_chat_message(role.as_str(), text));
+                            }
+                            ResponseInputOutputItem::Message { role, content, .. } => {
+                                let text = extract_text_from_content(content);
+                                messages.push(role_to_chat_message(role.as_str(), text));
+                            }
+                            ResponseInputOutputItem::Reasoning { content, .. } => {
+                                let reasoning_text = content
+                                    .iter()
+                                    .map(|c| match c {
+                                        ReasoningText { text } => text.as_str(),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+
+                                messages.push(ChatMessage::Assistant {
+                                    content: None,
+                                    name: None,
+                                    tool_calls: None,
+                                    reasoning_content: Some(reasoning_text),
+                                });
+                            }
+                            ResponseInputOutputItem::FunctionCallOutput {
+                                call_id, output, ..
+                            } => {
+                                messages.push(ChatMessage::Tool {
+                                    content: MessageContent::Text(output.clone()),
+                                    tool_call_id: call_id.clone(),
+                                });
+                            }
+                            // FunctionToolCall is handled in the outer match arm
+                            ResponseInputOutputItem::FunctionToolCall { .. } => unreachable!(),
+                        }
                     }
                 }
             }
+
+            // Flush any remaining tool calls at end of items
+            flush_tool_calls(
+                &mut messages,
+                &mut pending_tool_calls,
+                &mut pending_tool_outputs,
+            );
         }
     }
 
@@ -227,8 +256,11 @@ fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
             content: MessageContent::Text(text),
             name: None,
         },
-        _ => {
-            // Unknown role, treat as user message
+        other => {
+            tracing::warn!(
+                role = other,
+                "unknown message role in responses input, treating as user"
+            );
             ChatMessage::User {
                 content: MessageContent::Text(text),
                 name: None,

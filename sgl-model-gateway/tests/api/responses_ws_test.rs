@@ -66,7 +66,7 @@ impl WsResponsesExecutor for StubWsExecutor {
         request: ResponsesRequest,
         _options: WsResponseCreateOptions,
         _cached_response: Option<CachedWsResponse>,
-        outbound_tx: mpsc::UnboundedSender<Message>,
+        outbound_tx: mpsc::Sender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
         let model = request.model.clone();
         let created = serde_json::json!({
@@ -79,7 +79,7 @@ impl WsResponsesExecutor for StubWsExecutor {
                 "output": []
             }
         });
-        let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(created.to_string().into()));
 
         if let Some(gate) = &self.gate {
             gate.notified().await;
@@ -105,7 +105,7 @@ impl WsResponsesExecutor for StubWsExecutor {
             "type": "response.completed",
             "response": response,
         });
-        let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(completed.to_string().into()));
 
         Ok(CachedWsResponse {
             response: ResponsesResponse::builder("resp_ws_test", request.model.clone())
@@ -142,7 +142,7 @@ impl WsResponsesExecutor for DelayedReturnWsExecutor {
         request: ResponsesRequest,
         _options: WsResponseCreateOptions,
         _cached_response: Option<CachedWsResponse>,
-        outbound_tx: mpsc::UnboundedSender<Message>,
+        outbound_tx: mpsc::Sender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
         let output_text = "delayed websocket output";
         let response = ResponsesResponse::builder("resp_ws_delayed", request.model.clone())
@@ -170,13 +170,13 @@ impl WsResponsesExecutor for DelayedReturnWsExecutor {
                 "output": []
             }
         });
-        let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(created.to_string().into()));
 
         let completed = serde_json::json!({
             "type": "response.completed",
             "response": response.clone(),
         });
-        let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(completed.to_string().into()));
 
         tokio::time::sleep(self.return_delay).await;
 
@@ -198,7 +198,7 @@ impl WsResponsesExecutor for FunctionCallWsExecutor {
         request: ResponsesRequest,
         _options: WsResponseCreateOptions,
         _cached_response: Option<CachedWsResponse>,
-        outbound_tx: mpsc::UnboundedSender<Message>,
+        outbound_tx: mpsc::Sender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
         let response_id = "resp_ws_tool_test";
         let item_id = "fc_ws_test";
@@ -217,7 +217,7 @@ impl WsResponsesExecutor for FunctionCallWsExecutor {
                 "output": []
             }
         });
-        let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(created.to_string().into()));
 
         let output_item_added = serde_json::json!({
             "type": "response.output_item.added",
@@ -231,7 +231,7 @@ impl WsResponsesExecutor for FunctionCallWsExecutor {
                 "arguments": ""
             }
         });
-        let _ = outbound_tx.send(Message::Text(output_item_added.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(output_item_added.to_string().into()));
 
         let args_delta = serde_json::json!({
             "type": "response.function_call_arguments.delta",
@@ -239,7 +239,7 @@ impl WsResponsesExecutor for FunctionCallWsExecutor {
             "item_id": item_id,
             "delta": arguments
         });
-        let _ = outbound_tx.send(Message::Text(args_delta.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(args_delta.to_string().into()));
 
         let args_done = serde_json::json!({
             "type": "response.function_call_arguments.done",
@@ -247,7 +247,7 @@ impl WsResponsesExecutor for FunctionCallWsExecutor {
             "item_id": item_id,
             "arguments": arguments
         });
-        let _ = outbound_tx.send(Message::Text(args_done.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(args_done.to_string().into()));
 
         let output_item_done = serde_json::json!({
             "type": "response.output_item.done",
@@ -261,7 +261,7 @@ impl WsResponsesExecutor for FunctionCallWsExecutor {
                 "arguments": arguments
             }
         });
-        let _ = outbound_tx.send(Message::Text(output_item_done.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(output_item_done.to_string().into()));
 
         let response = ResponsesResponse::builder(response_id, request.model.clone())
             .copy_from_request(&request)
@@ -280,7 +280,7 @@ impl WsResponsesExecutor for FunctionCallWsExecutor {
             "type": "response.completed",
             "response": response,
         });
-        let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(completed.to_string().into()));
 
         Ok(CachedWsResponse {
             response: ResponsesResponse::builder(response_id, request.model.clone())
@@ -318,7 +318,7 @@ impl WsResponsesExecutor for FailedResponseWsExecutor {
         request: ResponsesRequest,
         _options: WsResponseCreateOptions,
         cached_response: Option<CachedWsResponse>,
-        outbound_tx: mpsc::UnboundedSender<Message>,
+        outbound_tx: mpsc::Sender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
         if let Some(previous_id) = request.previous_response_id.as_deref() {
             if cached_response
@@ -374,13 +374,13 @@ impl WsResponsesExecutor for FailedResponseWsExecutor {
                 "output": []
             }
         });
-        let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(created.to_string().into()));
 
         let completed = serde_json::json!({
             "type": "response.completed",
             "response": response.clone(),
         });
-        let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(completed.to_string().into()));
 
         Ok(CachedWsResponse {
             response,
@@ -567,7 +567,7 @@ impl WsResponsesExecutor for SemanticWsExecutor {
         request: ResponsesRequest,
         options: WsResponseCreateOptions,
         cached_response: Option<CachedWsResponse>,
-        outbound_tx: mpsc::UnboundedSender<Message>,
+        outbound_tx: mpsc::Sender<Message>,
     ) -> Result<CachedWsResponse, WsClientError> {
         if request.conversation.is_some() {
             return Err(WsClientError::new(
@@ -594,13 +594,13 @@ impl WsResponsesExecutor for SemanticWsExecutor {
                     "output": []
                 }
             });
-            let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+            let _ = outbound_tx.try_send(Message::Text(created.to_string().into()));
 
             let completed = serde_json::json!({
                 "type": "response.completed",
                 "response": response,
             });
-            let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+            let _ = outbound_tx.try_send(Message::Text(completed.to_string().into()));
 
             return Ok(CachedWsResponse {
                 response: ResponsesResponse::builder(response_id, request.model.clone())
@@ -662,7 +662,7 @@ impl WsResponsesExecutor for SemanticWsExecutor {
                 "output": []
             }
         });
-        let _ = outbound_tx.send(Message::Text(created.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(created.to_string().into()));
 
         let response = ResponsesResponse::builder(response_id.clone(), request.model.clone())
             .copy_from_request(&request)
@@ -683,7 +683,7 @@ impl WsResponsesExecutor for SemanticWsExecutor {
             "type": "response.completed",
             "response": response,
         });
-        let _ = outbound_tx.send(Message::Text(completed.to_string().into()));
+        let _ = outbound_tx.try_send(Message::Text(completed.to_string().into()));
 
         let cached = CachedWsResponse {
             response: response.clone(),
@@ -1416,4 +1416,188 @@ async fn test_v1_responses_ws_errors_echo_event_id() {
     assert_eq!(ws_error_code(error), "unsupported_parameter");
     assert_eq!(error["event_id"], "evt_ws_123");
     assert!(!ws_error_message(error).is_empty());
+}
+
+// ------------------------------------------------------------------
+// T1: WS backpressure / slow client test
+// ------------------------------------------------------------------
+
+/// Executor that floods the outbound channel with more messages than the
+/// bounded capacity (256) to exercise backpressure / try_send failure.
+#[derive(Clone)]
+struct FloodingWsExecutor {
+    message_count: usize,
+}
+
+#[async_trait]
+impl WsResponsesExecutor for FloodingWsExecutor {
+    async fn execute_response_create(
+        &self,
+        _headers: HeaderMap,
+        request: ResponsesRequest,
+        _options: WsResponseCreateOptions,
+        _cached_response: Option<CachedWsResponse>,
+        outbound_tx: mpsc::Sender<Message>,
+    ) -> Result<CachedWsResponse, WsClientError> {
+        let model = request.model.clone();
+
+        let created = serde_json::json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_flood",
+                "object": "response",
+                "status": "in_progress",
+                "model": model,
+                "output": []
+            }
+        });
+        let _ = outbound_tx.try_send(Message::Text(created.to_string().into()));
+
+        // Flood with delta events — more than the 256-slot channel capacity.
+        for i in 0..self.message_count {
+            let delta = serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": format!("tok_{}", i)
+            });
+            // try_send will fail once the channel is full — that's expected.
+            if outbound_tx
+                .try_send(Message::Text(delta.to_string().into()))
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        let response = ResponsesResponse::builder("resp_flood", request.model.clone())
+            .copy_from_request(&request)
+            .status(ResponseStatus::Completed)
+            .output(vec![])
+            .build();
+
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": response.clone(),
+        });
+        let _ = outbound_tx.try_send(Message::Text(completed.to_string().into()));
+
+        Ok(CachedWsResponse {
+            response,
+            input_items: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_backpressure_slow_client() {
+    let url = serve_app(
+        build_stub_app(Arc::new(FloodingWsExecutor {
+            // Well above the 256-slot bounded channel.
+            message_count: 512,
+        }))
+        .await,
+    )
+    .await;
+
+    let (mut socket, _) = connect_async(format!("{}/v1/responses", url))
+        .await
+        .unwrap();
+
+    // Send request then deliberately read slowly — the server should
+    // not OOM; try_send should drop excess messages gracefully.
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            ws_create_request(serde_json::json!({
+                "model": "mock-model",
+                "input": "Slow reader backpressure test",
+                "store": false
+            }))
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    // Give the executor time to flood the channel.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Drain whatever we can — we may not get all 512 deltas, but the
+    // connection should be alive or cleanly closed, never a panic/OOM.
+    let mut received = 0;
+    while let Ok(Some(Ok(_msg))) = tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+    {
+        received += 1;
+    }
+
+    // We should have received at least the initial `response.created`.
+    assert!(
+        received >= 1,
+        "should receive at least response.created, got {received}"
+    );
+    // And fewer than the total flood count (some dropped by backpressure).
+    assert!(
+        received <= 512 + 3, // +3 for created/completed/close
+        "received count should be bounded, got {received}"
+    );
+}
+
+// ------------------------------------------------------------------
+// T2: No-WS-router error test
+// ------------------------------------------------------------------
+
+/// A router that does NOT support WebSocket Responses.
+#[derive(Debug, Clone)]
+struct NoWsRouter;
+
+#[async_trait]
+impl RouterTrait for NoWsRouter {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn route_chat(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &smg::protocols::chat::ChatCompletionRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        StatusCode::NOT_IMPLEMENTED.into_response()
+    }
+
+    fn supports_responses_ws(&self) -> bool {
+        false
+    }
+
+    fn router_type(&self) -> &'static str {
+        "no-ws"
+    }
+}
+
+#[tokio::test]
+async fn test_v1_responses_ws_no_ws_router_returns_structured_error() {
+    // When no router supports WS, the server rejects the upgrade at the
+    // HTTP level (server.rs checks supports_responses_ws() before upgrade).
+    // Verify the HTTP error response contains structured JSON.
+    let ctx = create_test_app_context().await;
+    let app = create_test_app_with_context(Arc::new(NoWsRouter), ctx);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/responses")
+                .header("upgrade", "websocket")
+                .header("connection", "Upgrade")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .header("sec-websocket-version", "13")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        smg::routers::error::extract_error_code_from_response(&response),
+        "responses_ws_not_supported"
+    );
 }

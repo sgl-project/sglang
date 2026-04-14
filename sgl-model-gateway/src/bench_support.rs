@@ -196,7 +196,7 @@ fn emit_text_stream_batch(
 
 #[doc(hidden)]
 pub fn bench_emit_ws_text_stream(delta_events: usize, delta_bytes: usize) -> usize {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::channel::<Message>(4096);
     let sink = WsResponseEventSink::new(tx);
     let payload_bytes = emit_text_stream_batch(&sink, delta_events, delta_bytes);
     let mut drained = 0usize;

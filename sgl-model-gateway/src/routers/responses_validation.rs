@@ -98,7 +98,7 @@ fn validation_error_response(validation_errors: ValidationErrors) -> Response {
             "error": {
                 "message": validation_errors.to_string(),
                 "type": "invalid_request_error",
-                "code": 400
+                "code": "validation_error"
             }
         })),
     )
