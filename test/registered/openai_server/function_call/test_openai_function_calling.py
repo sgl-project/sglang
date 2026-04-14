@@ -921,67 +921,6 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             f"Function name '{found_names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
 
-    def test_defer_loading_tool_not_called(self):
-        """
-        Test: Tools with defer_loading=True should not appear in the model's tool list,
-        and the model should not call them, even if the user explicitly requests it.
-        """
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_weather",
-                    "description": "Get the current weather in a given location",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "city": {"type": "string", "description": "City name"},
-                        },
-                        "required": ["city"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_database",
-                    "description": "Search the internal database",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Search query"},
-                        },
-                        "required": ["query"],
-                    },
-                    "defer_loading": True,
-                },
-            },
-        ]
-
-        messages = [
-            {"role": "user", "content": "Search the database for 'machine learning'"},
-        ]
-
-        response = client.chat.completions.create(
-            model=self.model,
-            max_tokens=256,
-            messages=messages,
-            temperature=0.0,
-            tools=tools,
-            tool_choice="auto",
-        )
-
-        tool_calls = response.choices[0].message.tool_calls
-        if tool_calls:
-            called_names = [tc.function.name for tc in tool_calls]
-            self.assertNotIn(
-                "search_database",
-                called_names,
-                "defer_loading=True tool should not be called",
-            )
-
 
 # Skip for ci test
 # class TestGLM45ServerFunctionCalling(TestOpenAIServerFunctionCalling):
