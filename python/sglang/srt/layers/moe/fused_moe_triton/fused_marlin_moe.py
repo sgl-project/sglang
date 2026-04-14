@@ -124,7 +124,7 @@ def fused_marlin_moe(
     scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
     scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
 
-    intermediate_cache2 = torch.empty(
+    intermediate_cache2 = torch.zeros(
         (M * topk_ids.shape[1], N),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
@@ -173,7 +173,26 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
+    def _nan_check(name, t):
+        if not t.isfinite().all():
+            _flat = t.view(-1)
+            _bad = (~_flat.isfinite()).sum().item()
+            print(f"[NaN] {name}: {_bad}/{_flat.numel()} non-finite")
+        else:
+            print(f"[OK]  {name}: all finite")
+
+    _nan_check("after GEMM1 (cache1)", intermediate_cache1)
+
+    # Marlin kernel skips expert_id=-1 blocks but leaves their output
+    # uninitialized (garbage/NaN). Replace with zeros before silu_and_mul.
+    # TODO: fix in the Marlin CUDA kernel to write zeros for skipped blocks.
+    intermediate_cache1.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+
+    _nan_check("after nan_to_num (cache1)", intermediate_cache1)
+
     silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+
+    _nan_check("after silu_and_mul (cache2)", intermediate_cache2)
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -207,6 +226,8 @@ def fused_marlin_moe(
         is_zp_float=False,
     ).view(-1, topk, K)
 
+    _nan_check("after GEMM2 (cache3)", intermediate_cache3)
+
     output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if routed_scaling_factor is None:
@@ -217,4 +238,7 @@ def fused_marlin_moe(
         output,
         routed_scaling_factor,
     )
+
+    _nan_check("after moe_sum_reduce (output)", output)
+
     return output
