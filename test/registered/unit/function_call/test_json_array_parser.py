@@ -61,9 +61,10 @@ class TestJsonArrayParser(CustomTestCase):
         # Chunk 2: arguments and closing
         res2 = parser.parse_streaming_increment(', "arguments": {}}]', self.tools)
         self.assertIsNotNone(res2)
-        # After the final chunk, the tool call should be recognized
-        if res2.calls:
-            self.assertEqual(res2.calls[0].name, "test_tool")
+        # Verify that across both chunks, the tool was recognized
+        all_calls = (res1.calls or []) + (res2.calls or [])
+        tool_names = [c.name for c in all_calls if c.name]
+        self.assertIn("test_tool", tool_names)
 
 
 register_cpu_ci(TestJsonArrayParser)
