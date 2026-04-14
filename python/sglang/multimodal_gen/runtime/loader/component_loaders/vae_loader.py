@@ -27,6 +27,19 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
+def _backfill_ltx2_audio_vae_latent_stats(
+    loaded: dict[str, torch.Tensor], component_name: str
+) -> None:
+    if component_name != "audio_vae":
+        return
+    mean_key = "per_channel_statistics.mean-of-means"
+    std_key = "per_channel_statistics.std-of-means"
+    if "latents_mean" not in loaded and mean_key in loaded:
+        loaded["latents_mean"] = loaded[mean_key]
+    if "latents_std" not in loaded and std_key in loaded:
+        loaded["latents_std"] = loaded[std_key]
+
+
 def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
     """
     Convert Conv3d weights to channels_last_3d (NDHWC) memory format.
@@ -142,6 +155,7 @@ class VAELoader(ComponentLoader):
         loaded = {}
         for sf_path in safetensors_list:
             loaded.update(safetensors_load_file(sf_path))
+        _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
         vae.load_state_dict(loaded, strict=False)
 
         state_keys = set(vae.state_dict().keys())
