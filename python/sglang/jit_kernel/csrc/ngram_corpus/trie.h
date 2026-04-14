@@ -53,9 +53,23 @@ struct MatchState {
   std::vector<NodeRef> anchors;
 };
 
+class TrieArena {
+ public:
+  explicit TrieArena(size_t capacity);
+
+ private:
+  friend class Trie;
+
+  std::vector<TrieNode> nodes_;
+  std::vector<TrieNode*> node_pool_;
+  size_t free_node_count_ = 0;
+  std::list<TrieNode*> global_lru_;
+};
+
 class Trie {
  public:
-  Trie(size_t capacity, const Param& param);
+  Trie(TrieArena* arena, const Param& param);
+  ~Trie();
 
   void insert(const int32_t* tokens, size_t len);
 
@@ -86,6 +100,9 @@ class Trie {
   void reset();
 
  private:
+  void clear_(bool release_root);
+  void releaseNode_(TrieNode* node);
+
   // Recompute all cached anchors from the current tail. After this, for every
   // d in [1, min(len, max_trie_depth)], anchors[d - 1] represents the suffix of
   // length d ending at context[len - 1].
@@ -106,11 +123,11 @@ class Trie {
   NodeRef rootRef() const {
     return NodeRef{root_, root_->version};
   }
-  NodeRef capture(TrieNode* node) const {
+  NodeRef capture(const TrieNode* node) const {
     if (node == nullptr) {
       return {};
     }
-    return NodeRef{node, node->version};
+    return NodeRef{const_cast<TrieNode*>(node), node->version};
   }
   void retireNode(TrieNode* node) {
     if (node != nullptr) {
@@ -119,7 +136,7 @@ class Trie {
   }
 
   TrieNode* getNode() {
-    auto node = node_pool_[--free_node_count_];
+    auto node = arena_->node_pool_[--arena_->free_node_count_];
     auto version = node->version;
     node->~TrieNode();
     new (node) TrieNode();
@@ -127,10 +144,7 @@ class Trie {
     return node;
   }
 
-  std::vector<TrieNode> nodes_;
-  std::vector<TrieNode*> node_pool_;
-  size_t free_node_count_;
-  std::list<TrieNode*> global_lru_;
+  TrieArena* arena_;
   TrieNode* root_;
   std::vector<TrieNode*> path_;
   Param param_;

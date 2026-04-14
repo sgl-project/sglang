@@ -41,6 +41,7 @@ class NGRAMWorker:
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
+        self.trie_mode: str = server_args.speculative_ngram_trie_mode
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
@@ -51,6 +52,7 @@ class NGRAMWorker:
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
             match_type=server_args.speculative_ngram_match_type,
+            trie_mode=server_args.speculative_ngram_trie_mode,
             capacity=server_args.speculative_ngram_capacity,
             max_trie_depth=server_args.speculative_ngram_max_trie_depth,
             draft_token_num=server_args.speculative_num_draft_tokens,
@@ -82,6 +84,13 @@ class NGRAMWorker:
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
+
+    def cleanup_request_state(self, req_ids: List[str]) -> None:
+        if not req_ids:
+            return
+        if self.trie_mode == "request":
+            self.ngram_corpus.synchronize()
+        self.ngram_corpus.erase_request_state(req_ids)
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
@@ -238,6 +247,7 @@ class NGRAMWorker:
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
     def _update_ngram_corpus(self, batch: ScheduleBatch):
+        req_ids = []
         batch_tokens = []
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
@@ -248,8 +258,9 @@ class NGRAMWorker:
             put_ids = self._efficient_concat_last_n(
                 req.origin_input_ids, req.output_ids, self.max_trie_depth
             )
+            req_ids.append(req.rid)
             batch_tokens.append(put_ids)
-        self.ngram_corpus.batch_put(batch_tokens)
+        self.ngram_corpus.batch_put(batch_tokens, req_ids=req_ids)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
@@ -305,16 +316,17 @@ class NGRAMWorker:
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_corpus(batch)
-            # Clean up per-request match state for finished/retracted requests.
-            # State entries are created in _prepare_draft_tokens and cleaned here.
-            # If a request is removed without passing through verify, the entry
-            # persists until reset(); this is acceptable because MatchState is small.
             finished_req_ids = []
+            retracted_req_ids = []
             for req in batch.reqs:
-                if req.finished() or req.is_retracted:
+                if req.finished():
                     finished_req_ids.append(req.rid)
+                elif req.is_retracted:
+                    retracted_req_ids.append(req.rid)
             if finished_req_ids:
-                self.ngram_corpus.erase_match_state(finished_req_ids)
+                self.cleanup_request_state(finished_req_ids)
+            if retracted_req_ids:
+                self.ngram_corpus.erase_match_state(retracted_req_ids)
             batch.forward_mode = ForwardMode.DECODE
 
         else:

@@ -2,6 +2,7 @@
 
 #include "trie.h"
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -80,7 +81,10 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
     }
   }
 
-  trie_ = std::make_unique<Trie>(capacity, param_);
+  trie_arena_ = std::make_unique<TrieArena>(capacity);
+  if (!param_.request_trie_mode) {
+    global_trie_ = std::make_unique<Trie>(trie_arena_.get(), param_);
+  }
 
   insert_worker_ = std::thread(&Ngram::insertWorker, this);
 }
@@ -97,20 +101,21 @@ void Ngram::synchronize() const {
   sync_cv_.wait(lock, [this] { return pending_count_ == 0; });
 }
 
-void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+void Ngram::asyncInsert(std::vector<InsertWorkItem>&& items) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    pending_count_ += tokens.size();
+    pending_count_ += items.size();
   }
-  for (auto&& token : tokens) {
-    insert_queue_.enqueue(std::move(token));
+  for (auto&& item : items) {
+    insert_queue_.enqueue(std::move(item));
   }
 }
 
 // NOTE: staging operations (start/append/finish) are called from a background
 // thread during async corpus loading. They do NOT hold mutex_ because
-// staging_sam_ is disjoint from sams_ / trie_. Only finishExternalCorpusLoad
-// briefly acquires mutex_ when moving the completed SAM into sams_.
+// staging_sam_ is disjoint from sams_ / online trie state. Only
+// finishExternalCorpusLoad briefly acquires mutex_ when moving the completed
+// SAM into sams_.
 void Ngram::startExternalCorpusLoad() {
   if (staging_sam_) {
     throw std::runtime_error("startExternalCorpusLoad called while another load is in progress");
@@ -171,16 +176,35 @@ std::vector<std::pair<std::string, int64_t>> Ngram::listExternalCorpora() const 
 
 void Ngram::insertWorker() {
   for (;;) {
-    std::vector<int32_t> data;
-    if (!insert_queue_.dequeue(data)) {
+    InsertWorkItem item;
+    if (!insert_queue_.dequeue(item)) {
       break;
     }
     std::unique_lock<std::mutex> lock(mutex_);
-    trie_->insert(data.data(), data.size());
+    auto* trie = getOrCreateTrie_(item.state_id);
+    trie->insert(item.tokens.data(), item.tokens.size());
     --pending_count_;
     lock.unlock();
     sync_cv_.notify_all();
   }
+}
+
+Trie* Ngram::getOrCreateTrie_(int64_t state_id) {
+  if (!param_.request_trie_mode) {
+    if (!global_trie_) {
+      global_trie_ = std::make_unique<Trie>(trie_arena_.get(), param_);
+    }
+    return global_trie_.get();
+  }
+
+  if (state_id < 0) {
+    throw std::runtime_error("request_trie_mode requires non-negative state ids");
+  }
+  auto& trie = request_tries_[state_id];
+  if (!trie) {
+    trie = std::make_unique<Trie>(trie_arena_.get(), param_);
+  }
+  return trie.get();
 }
 
 Result Ngram::batchMatch(
@@ -227,11 +251,12 @@ Result Ngram::batchMatch(
     }
 
     auto& state = match_state_[state_ids[i]];
-    auto trie_anchors = trie_->match(suffix.data(), suffix.size(), state, total_lens[i]);
-    auto trie_quality = trie_->summarizeMatchQuality(trie_anchors, param_);
+    auto* trie = getOrCreateTrie_(state_ids[i]);
+    auto trie_anchors = trie->match(suffix.data(), suffix.size(), state, total_lens[i]);
+    auto trie_quality = trie->summarizeMatchQuality(trie_anchors, param_);
 
     if (ordered_sams.empty()) {
-      auto res = (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
+      auto res = (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
       continue;
@@ -247,7 +272,7 @@ Result Ngram::batchMatch(
     if (trie_quality.has_match) {
       source_results.push_back(RankedSourceResult{
           computeSourceScore(trie_quality, effectiveTrieSourcePrior(param_.trie_source_prior), param_),
-          (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)});
+          (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)});
     }
 
     for (const auto& [_, sam] : ordered_sams) {
@@ -263,7 +288,7 @@ Result Ngram::batchMatch(
 
     Result combined;
     if (source_results.empty()) {
-      combined = (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
+      combined = (trie->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
     } else {
       // Merge stronger sources first so the final cap keeps their branches when the tree saturates.
       std::stable_sort(source_results.begin(), source_results.end(), [](const auto& lhs, const auto& rhs) {
@@ -287,6 +312,25 @@ void Ngram::eraseMatchState(const std::vector<int64_t>& state_ids) {
   for (const auto& sid : state_ids) {
     match_state_.erase(sid);
   }
+}
+
+void Ngram::eraseRequestState(const std::vector<int64_t>& state_ids) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (const auto& sid : state_ids) {
+    match_state_.erase(sid);
+    if (param_.request_trie_mode) {
+      request_tries_.erase(sid);
+    }
+  }
+}
+
+void Ngram::reset() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (global_trie_) {
+    global_trie_->reset();
+  }
+  request_tries_.clear();
+  match_state_.clear();
 }
 
 }  // namespace ngram

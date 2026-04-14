@@ -518,6 +518,7 @@ class ServerArgs:
     speculative_ngram_min_bfs_breadth: int = 1
     speculative_ngram_max_bfs_breadth: int = 10
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
+    speculative_ngram_trie_mode: Literal["global", "request"] = "global"
     speculative_ngram_max_trie_depth: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: Optional[str] = None
@@ -5216,6 +5217,13 @@ class ServerArgs:
             choices=["BFS", "PROB"],
             default=ServerArgs.speculative_ngram_match_type,
             help="The match type for cache tree.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-trie-mode",
+            type=str,
+            choices=["global", "request"],
+            default=ServerArgs.speculative_ngram_trie_mode,
+            help="Whether the online ngram trie is shared globally or isolated per request.",
         )
         parser.add_argument(
             "--speculative-ngram-max-trie-depth",

@@ -231,6 +231,53 @@ class TestNgramCorpusReset(CustomTestCase):
         )
 
 
+class TestNgramCorpusRequestTrieMode(CustomTestCase):
+    def test_request_tries_are_isolated(self):
+        corpus = _make_corpus("BFS", trie_mode="request", draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 10, 11]], req_ids=["req-a"])
+        corpus.batch_put([[1, 2, 3, 20, 21]], req_ids=["req-b"])
+        corpus.synchronize()
+
+        ids_a, _ = _batch_get_with_state(corpus, "req-a", [1, 2, 3], 3)
+        ids_b, _ = _batch_get_with_state(corpus, "req-b", [1, 2, 3], 3)
+
+        self.assertIn(10, ids_a.tolist())
+        self.assertNotIn(20, ids_a.tolist())
+        self.assertIn(20, ids_b.tolist())
+        self.assertNotIn(10, ids_b.tolist())
+
+    def test_erase_request_state_removes_only_finished_request(self):
+        corpus = _make_corpus("BFS", trie_mode="request", draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 10, 11]], req_ids=["req-a"])
+        corpus.batch_put([[1, 2, 3, 20, 21]], req_ids=["req-b"])
+        corpus.synchronize()
+
+        corpus.erase_request_state(["req-a"])
+
+        ids_a, _ = _batch_get_with_state(corpus, "req-a", [1, 2, 3], 3)
+        ids_b, _ = _batch_get_with_state(corpus, "req-b", [1, 2, 3], 3)
+
+        self.assertEqual(ids_a.tolist(), [3, 0, 0, 0])
+        self.assertIn(20, ids_b.tolist())
+
+    def test_erase_match_state_preserves_request_trie(self):
+        corpus = _make_corpus("BFS", trie_mode="request", draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 10, 11]], req_ids=["req-a"])
+        corpus.synchronize()
+
+        ids_before, masks_before = _batch_get_with_state(corpus, "req-a", [1, 2, 3], 3)
+        corpus.erase_match_state(["req-a"])
+        ids_after, masks_after = _batch_get_with_state(corpus, "req-a", [1, 2, 3], 3)
+
+        np.testing.assert_array_equal(ids_before, ids_after)
+        np.testing.assert_array_equal(masks_before, masks_after)
+
+    def test_request_mode_batch_put_requires_req_ids(self):
+        corpus = _make_corpus("BFS", trie_mode="request")
+        with self.assertRaisesRegex(ValueError, "requires req_ids"):
+            corpus.batch_put([[1, 2, 3, 4]])
+
+
 class TestNgramCorpusNoMatch(CustomTestCase):
     """Verify behavior when query has no match in the corpus."""
 

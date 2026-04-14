@@ -4,18 +4,76 @@
 #include <cstring>
 #include <list>
 #include <queue>
+#include <stdexcept>
 #include <tuple>
 #include <vector>
 
 namespace ngram {
 
-Trie::Trie(size_t capacity, const Param& param) : param_(param) {
+TrieArena::TrieArena(size_t capacity) {
   nodes_.resize(capacity);
+  node_pool_.reserve(capacity);
   for (auto& node : nodes_) {
     node_pool_.emplace_back(&node);
   }
   free_node_count_ = node_pool_.size();
+}
+
+Trie::Trie(TrieArena* arena, const Param& param) : arena_(arena), param_(param) {
   root_ = getNode();
+}
+
+Trie::~Trie() {
+  clear_(true);
+}
+
+void Trie::releaseNode_(TrieNode* node) {
+  retireNode(node);
+  arena_->node_pool_[arena_->free_node_count_++] = node;
+}
+
+void Trie::clear_(bool release_root) {
+  if (root_ == nullptr) {
+    return;
+  }
+
+  std::vector<TrieNode*> stack;
+  stack.reserve(root_->child.size());
+  for (const auto& [_, child] : root_->child) {
+    stack.push_back(child);
+  }
+
+  std::vector<TrieNode*> postorder;
+  postorder.reserve(stack.size());
+  while (!stack.empty()) {
+    TrieNode* current = stack.back();
+    stack.pop_back();
+    postorder.push_back(current);
+    for (const auto& [_, child] : current->child) {
+      stack.push_back(child);
+    }
+  }
+
+  for (auto it = postorder.rbegin(); it != postorder.rend(); ++it) {
+    TrieNode* current = *it;
+    arena_->global_lru_.erase(current->global_lru_pos);
+    current->parent->lru.erase(current->parent_lru_pos);
+    current->parent->sorted_children.erase(current);
+    current->parent->child.erase(current->token);
+    releaseNode_(current);
+  }
+
+  path_.clear();
+  if (release_root) {
+    releaseNode_(root_);
+    root_ = nullptr;
+    return;
+  }
+
+  auto version = root_->version;
+  root_->~TrieNode();
+  new (root_) TrieNode();
+  root_->version = version;
 }
 
 void Trie::insert(const int32_t* tokens, size_t len) {
@@ -23,8 +81,8 @@ void Trie::insert(const int32_t* tokens, size_t len) {
     auto start = tokens + i;
     auto end = start + std::min(len - i, param_.max_trie_depth);
 
-    if (static_cast<size_t>(end - start) > free_node_count_) {
-      squeeze(end - start - free_node_count_);
+    if (static_cast<size_t>(end - start) > arena_->free_node_count_) {
+      squeeze(end - start - arena_->free_node_count_);
     }
 
     TrieNode* cursor = root_;
@@ -37,12 +95,12 @@ void Trie::insert(const int32_t* tokens, size_t len) {
         auto node = iter->second;
 
         cursor->lru.emplace_front(node);
-        global_lru_.emplace_back(node);
+        arena_->global_lru_.emplace_back(node);
 
         node->token = token;
         node->parent = cursor;
         node->parent_lru_pos = cursor->lru.begin();
-        node->global_lru_pos = --global_lru_.end();
+        node->global_lru_pos = --arena_->global_lru_.end();
         node->freq = 1;
         cursor->sorted_children.insert(node);
       } else {
@@ -59,21 +117,21 @@ void Trie::insert(const int32_t* tokens, size_t len) {
 
     for (auto it = path_.rbegin(); it != path_.rend(); ++it) {
       TrieNode* node = *it;
-      global_lru_.splice(global_lru_.begin(), global_lru_, node->global_lru_pos);
+      arena_->global_lru_.splice(arena_->global_lru_.begin(), arena_->global_lru_, node->global_lru_pos);
     }
   }
 }
 
 void Trie::squeeze(size_t count) {
-  if (!(node_pool_.size() >= free_node_count_ + count)) {
+  if (arena_->global_lru_.size() < count) {
     throw std::runtime_error(
         "Insufficient node size to release required nodes. "
         "available to release: " +
-        std::to_string(node_pool_.size() - free_node_count_) + ", required to release: " + std::to_string(count));
+        std::to_string(arena_->global_lru_.size()) + ", required to release: " + std::to_string(count));
   }
   while (count--) {
-    auto last = global_lru_.back();
-    global_lru_.pop_back();
+    auto last = arena_->global_lru_.back();
+    arena_->global_lru_.pop_back();
 
     if (!last->child.empty()) {
       throw std::runtime_error(
@@ -84,24 +142,13 @@ void Trie::squeeze(size_t count) {
     last->parent->lru.erase(last->parent_lru_pos);
     last->parent->sorted_children.erase(last);
     last->parent->child.erase(last->token);
-    retireNode(last);
-
-    node_pool_[free_node_count_++] = last;
+    releaseNode_(last);
   }
 }
 
 void Trie::reset() {
-  // Epoch bump invalidates all cached MatchState objects, so we do not need to
-  // retireNode() on every node individually.
   ++trie_epoch_;
-  global_lru_.clear();
-  path_.clear();
-  node_pool_.clear();
-  for (auto& node : nodes_) {
-    node_pool_.emplace_back(&node);
-  }
-  free_node_count_ = node_pool_.size();
-  root_ = getNode();
+  clear_(false);
 }
 
 const TrieNode* Trie::resolve(const MatchState& state, const NodeRef& ref) const {

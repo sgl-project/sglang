@@ -434,6 +434,8 @@ class TestNgramExternalSamArgs(CustomTestCase):
                 "dummy",
                 "--speculative-algorithm",
                 "NGRAM",
+                "--speculative-ngram-trie-mode",
+                "request",
                 "--speculative-ngram-external-corpus-path",
                 "/tmp/ngram-corpus.jsonl",
                 "--speculative-ngram-external-corpus-max-tokens",
@@ -450,6 +452,7 @@ class TestNgramExternalSamArgs(CustomTestCase):
             server_args.speculative_ngram_external_corpus_path,
             "/tmp/ngram-corpus.jsonl",
         )
+        self.assertEqual(server_args.speculative_ngram_trie_mode, "request")
         self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
         self.assertEqual(server_args.speculative_ngram_trie_source_prior, 1.5)
         self.assertEqual(server_args.speculative_ngram_match_specificity_weight, 0.6)
