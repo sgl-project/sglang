@@ -7,6 +7,11 @@ on:
   schedule:
     - cron: '0 2 * * *'  # 2 AM UTC daily (offset from other nightly runs)
   workflow_dispatch:  # allow manual trigger; gated by gb200-ci environment
+    inputs:
+      image:
+        description: 'SGLang Docker image to benchmark'
+        required: false
+        default: 'lmsysorg/sglang:dev-cu13'
 
 concurrency:
   group: nightly-test-gb200
@@ -54,7 +59,7 @@ jobs:
       squash_file: ${{ steps.import.outputs.squash_file }}
       nginx_squash_file: ${{ steps.import.outputs.nginx_squash_file }}
     env:
-      IMAGE: lmsysorg/sglang:dev-cu13
+      IMAGE: ${{ inputs.image || 'lmsysorg/sglang:dev-cu13' }}
       NGINX_IMAGE: nginx:1.27.4
     steps:
       - name: Import Docker images to Lustre

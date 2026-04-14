@@ -604,7 +604,7 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
-            self.stats.num_streaming_sessions = self._alive_streaming_session_count()
+            self.stats.num_streaming_sessions = self._streaming_session_count()
             self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
             # Speculative decoding
