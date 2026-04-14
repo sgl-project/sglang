@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import gc
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
@@ -57,6 +58,10 @@ from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import Diffusers
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.weight_sync.tensor_bucket import (
+    FlattenedTensorBucket,
+    FlattenedTensorMetadata,
+)
 
 logger = init_logger(__name__)
 
@@ -291,3 +296,158 @@ class WeightsUpdater:
                 continue
             weights_iter = _get_weights_iter(str(weights_dir))
             _load_weights_into_module(module, weights_iter)
+
+    def update_weights_from_tensor(
+        self,
+        named_tensors: Any,
+        load_format: str | None = None,
+        target_modules: list[str] | None = None,
+    ) -> tuple[bool, str]:
+        """Update module weights from in-memory tensor payloads."""
+        try:
+            modules_to_update = self._collect_modules(target_modules)
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
+        if not modules_to_update:
+            error_msg = (
+                f"No matching modules found for update. "
+                f"Requested: {target_modules}. "
+                f"Available nn.Module(s): {list(get_updatable_modules(self.pipeline).keys())}"
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+        try:
+            module_payloads = self._resolve_module_payloads(
+                named_tensors=named_tensors,
+                modules_to_update=modules_to_update,
+            )
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
+        updated_modules: list[str] = []
+        for module_name, module in modules_to_update:
+            try:
+                payload = module_payloads[module_name]
+                weights_iter = self._materialize_weights_iter(payload, load_format)
+                _load_weights_into_module(module, weights_iter)
+                updated_modules.append(module_name)
+            except Exception as e:
+                rollback_list = updated_modules + [module_name]
+                logger.error(
+                    f"Tensor weight update failed for module '{module_name}': {e}. "
+                    f"Rolling back {len(rollback_list)} module(s) "
+                    f"(including partially-loaded '{module_name}'): "
+                    f"{rollback_list}.",
+                    exc_info=True,
+                )
+                self._rollback(rollback_list)
+                return False, (
+                    f"Failed to update module '{module_name}' from tensor: {e}. "
+                    f"All modules rolled back to original weights."
+                )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        names = ", ".join(updated_modules)
+        message = f"Updated {len(updated_modules)} modules from tensor ({names})."
+        logger.info(message)
+        return True, message
+
+    def _resolve_module_payloads(
+        self,
+        named_tensors: Any,
+        modules_to_update: list[tuple[str, torch.nn.Module]],
+    ) -> dict[str, Any]:
+        """Resolve a generic tensor payload to per-module payload mapping."""
+        module_names = [name for name, _ in modules_to_update]
+
+        # Preferred format for multi-module update:
+        # {
+        #   "transformer": <module_payload>,
+        #   "vae": <module_payload>,
+        # }
+        if isinstance(named_tensors, dict):
+            missing = [name for name in module_names if name not in named_tensors]
+            if missing:
+                raise ValueError(
+                    f"Missing tensor payload for module(s): {missing}. "
+                    f"Provided modules: {list(named_tensors.keys())}"
+                )
+            return {name: named_tensors[name] for name in module_names}
+
+        # Single-module shortcut: allow direct payload when exactly one target module exists.
+        if len(module_names) == 1:
+            return {module_names[0]: named_tensors}
+
+        raise ValueError(
+            "Ambiguous tensor payload for multi-module update. "
+            "Provide a dict mapping module_name -> module payload, "
+            f"requested modules: {module_names}."
+        )
+
+    def _materialize_weights_iter(self, module_payload: Any, load_format: str | None):
+        """Convert one module payload to an iterator of (param_name, tensor)."""
+        if load_format == "flattened_bucket":
+            if not isinstance(module_payload, dict):
+                raise ValueError(
+                    "flattened_bucket payload must be a dict with "
+                    "'flattened_tensor' and 'metadata'."
+                )
+            flattened_tensor = module_payload.get("flattened_tensor")
+            metadata = module_payload.get("metadata")
+            if flattened_tensor is None or metadata is None:
+                raise ValueError(
+                    "flattened_bucket payload missing 'flattened_tensor' or 'metadata'."
+                )
+            return self._reconstruct_from_flattened_bucket(flattened_tensor, metadata)
+
+        # Default/direct format: list/tuple of (name, tensor)
+        if isinstance(module_payload, (list, tuple)):
+            return iter(module_payload)
+
+        raise ValueError(
+            f"Unsupported module payload type for load_format={load_format}: "
+            f"{type(module_payload).__name__}"
+        )
+
+    def _reconstruct_from_flattened_bucket(self, flattened_tensor: Any, metadata: Any):
+        """Reconstruct [(name, tensor), ...] from flattened-bucket payload."""
+        if not isinstance(flattened_tensor, torch.Tensor):
+            raise ValueError(
+                "flattened_bucket 'flattened_tensor' must be a torch.Tensor."
+            )
+        if not isinstance(metadata, list):
+            raise ValueError("flattened_bucket 'metadata' must be a list.")
+
+        converted_metadata: list[FlattenedTensorMetadata] = []
+        for meta in metadata:
+            converted_meta = FlattenedTensorMetadata(
+                name=meta.name,
+                shape=torch.Size(meta.shape),
+                dtype=self._normalize_torch_dtype(meta.dtype),
+                start_idx=int(meta.start_idx),
+                end_idx=int(meta.end_idx),
+                numel=int(meta.numel),
+            )
+            converted_metadata.append(converted_meta)
+
+        bucket = FlattenedTensorBucket(
+            flattened_tensor=flattened_tensor,
+            metadata=converted_metadata,
+        )
+        return bucket.reconstruct_tensors()
+
+    def _normalize_torch_dtype(self, dtype: Any) -> torch.dtype:
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        if isinstance(dtype, str):
+            # Supports "torch.float16" and "float16".
+            name = dtype.split(".")[-1]
+            normalized = getattr(torch, name, None)
+            if isinstance(normalized, torch.dtype):
+                return normalized
+        raise ValueError(f"Unsupported dtype in flattened_bucket metadata: {dtype!r}")
