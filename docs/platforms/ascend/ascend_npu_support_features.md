@@ -315,64 +315,64 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Optimization/debug options
 
-| Argument                                                | Defaults | Options                        | Server supported |
-|---------------------------------------------------------|----------|--------------------------------|:----------------:|
-| `--disable-radix-cache`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--cuda-graph-max-bs`                                   | `None`   | Type: int                      |      A2, A3      |
-| `--cuda-graph-bs`                                       | `None`   | List[int]                      |      A2, A3      |
-| `--disable-cuda-graph`                                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-cuda-graph-`<br/>`padding`                   | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-profile-`<br/>`cuda-graph`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-cudagraph-gc`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-nccl-nvls`                                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-symm-mem`                                     | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--disable-flashinfer-`<br/>`cutlass-moe-fp4-allgather` | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-tokenizer-`<br/>`batch-encode`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-tokenizer-`<br/>`batch-decode`               | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-mscclpp`                                      | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-torch-`<br/>`symm-mem`                        | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--disable-overlap`<br/>`-schedule`                     | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-mixed-`<br/>`chunk`                           | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-dp-attention`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-dp-lm-head`                                   | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-two-`<br/>`batch-overlap`                     | `False`  | bool flag<br/> (set to enable) |     Planned      |
-| `--enable-single-`<br/>`batch-overlap`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--tbo-token-`<br/>`distribution-threshold`             | `0.48`   | Type: float                    |     Planned      |
-| `--enable-torch-`<br/>`compile`                         | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-torch-`<br/>`compile-debug-mode`              | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-piecewise-`<br/>`cuda-graph`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--piecewise-cuda-`<br/>`graph-tokens`                  | `None`   | Type: JSON<br/> list           |      A2, A3      |
-| `--piecewise-cuda-`<br/>`graph-compiler`                | `eager`  | ["eager", "inductor"]          |      A2, A3      |
-| `--torch-compile-max-bs`                                | `32`     | Type: int                      |      A2, A3      |
-| `--piecewise-cuda-`<br/>`graph-max-tokens`              | `None`   | Type: int                      |      A2, A3      |
-| `--torchao-config`                                      | ``       | Type: str                      | Special for GPU  |
-| `--enable-nan-detection`                                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-p2p-check`                                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--triton-attention-`<br/>`reduce-in-fp32`              | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--triton-attention-`<br/>`num-kv-splits`               | `8`      | Type: int                      | Special for GPU  |
-| `--triton-attention-`<br/>`split-tile-size`             | `None`   | Type: int                      | Special for GPU  |
-| `--delete-ckpt-`<br/>`after-loading`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-memory-saver`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-weights-`<br/>`cpu-backup`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-draft-weights-`<br/>`cpu-backup`              | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--allow-auto-truncate`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-custom-`<br/>`logit-processor`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--flashinfer-mla-`<br/>`disable-ragged`                | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--disable-shared-`<br/>`experts-fusion`                | `True`   | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-chunked-`<br/>`prefix-cache`                 | `True`   | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-fast-`<br/>`image-processor`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--keep-mm-feature-`<br/>`on-device`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-return-`<br/>`hidden-states`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-return-`<br/>`routed-experts`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--scheduler-recv-`<br/>`interval`                      | `1`      | Type: int                      |      A2, A3      |
-| `--numa-node`                                           | `None`   | List[int]                      |      A2, A3      |
-| `--enable-deterministic-`<br/>`inference`               | `False`  | bool flag<br/> (set to enable) |     Planned      |
-| `--rl-on-policy-target`                                 | `None`   | `fsdp`                         |     Planned      |
-| `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable) |   Experimental   |
-| `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-fused-qk-`<br/>`norm-rope`                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| Argument                                                | Defaults | Options                                                                                                              | Server supported |
+|---------------------------------------------------------|----------|----------------------------------------------------------------------------------------------------------------------|:----------------:|
+| `--disable-radix-cache`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--cuda-graph-max-bs`                                   | `None`   | Type: int                                                                                                            |      A2, A3      |
+| `--cuda-graph-bs`                                       | `None`   | List[int]                                                                                                            |      A2, A3      |
+| `--disable-cuda-graph`                                  | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-cuda-graph-`<br/>`padding`                   | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-profile-`<br/>`cuda-graph`                    | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-cudagraph-gc`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-nccl-nvls`                                    | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-symm-mem`                                     | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--disable-flashinfer-`<br/>`cutlass-moe-fp4-allgather` | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-tokenizer-`<br/>`batch-encode`                | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-tokenizer-`<br/>`batch-decode`               | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-mscclpp`                                      | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-torch-`<br/>`symm-mem`                        | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--disable-overlap`<br/>`-schedule`                     | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-mixed-`<br/>`chunk`                           | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-dp-attention`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-dp-lm-head`                                   | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-two-`<br/>`batch-overlap`                     | `False`  | bool flag<br/> (set to enable)                                                                                       |     Planned      |
+| `--enable-single-`<br/>`batch-overlap`                  | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--tbo-token-`<br/>`distribution-threshold`             | `0.48`   | Type: float                                                                                                          |     Planned      |
+| `--enable-torch-`<br/>`compile`                         | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-torch-`<br/>`compile-debug-mode`              | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-piecewise-`<br/>`cuda-graph`                  | `False`  | bool flag<br/> (set to enable); <br/> Currently, Llama-3.1-8B-Instruct and Qwen2.5-7B-Instruct models are supported. |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-tokens`                  | `None`   | Type: JSON<br/> list                                                                                                 |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-compiler`                | `eager`  | `eager`                                                                                                              |      A2, A3      |
+| `--torch-compile-max-bs`                                | `32`     | Type: int                                                                                                            |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-max-tokens`              | `None`   | Type: int                                                                                                            |      A2, A3      |
+| `--torchao-config`                                      | ``       | Type: str                                                                                                            | Special for GPU  |
+| `--enable-nan-detection`                                | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-p2p-check`                                    | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--triton-attention-`<br/>`reduce-in-fp32`              | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--triton-attention-`<br/>`num-kv-splits`               | `8`      | Type: int                                                                                                            | Special for GPU  |
+| `--triton-attention-`<br/>`split-tile-size`             | `None`   | Type: int                                                                                                            | Special for GPU  |
+| `--delete-ckpt-`<br/>`after-loading`                    | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-memory-saver`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-weights-`<br/>`cpu-backup`                    | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-draft-weights-`<br/>`cpu-backup`              | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--allow-auto-truncate`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-custom-`<br/>`logit-processor`                | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--flashinfer-mla-`<br/>`disable-ragged`                | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--disable-shared-`<br/>`experts-fusion`                | `True`   | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-chunked-`<br/>`prefix-cache`                 | `True`   | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-fast-`<br/>`image-processor`                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--keep-mm-feature-`<br/>`on-device`                    | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-return-`<br/>`hidden-states`                  | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-return-`<br/>`routed-experts`                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--scheduler-recv-`<br/>`interval`                      | `1`      | Type: int                                                                                                            |      A2, A3      |
+| `--numa-node`                                           | `None`   | List[int]                                                                                                            |      A2, A3      |
+| `--enable-deterministic-`<br/>`inference`               | `False`  | bool flag<br/> (set to enable)                                                                                       |     Planned      |
+| `--rl-on-policy-target`                                 | `None`   | `fsdp`                                                                                                               |     Planned      |
+| `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable)                                                                                       |   Experimental   |
+| `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-fused-qk-`<br/>`norm-rope`                    | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
 
 ## Dynamic batch tokenizer
 
