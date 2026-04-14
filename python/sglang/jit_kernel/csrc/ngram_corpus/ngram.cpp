@@ -109,6 +109,13 @@ void Ngram::synchronize() const {
 }
 
 void Ngram::asyncInsert(std::vector<InsertWorkItem>&& items) {
+  if (param_.request_trie_mode) {
+    for (const auto& item : items) {
+      if (item.state_id < 0) {
+        throw std::runtime_error("request_trie_mode requires non-negative state ids for asyncInsert");
+      }
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(mutex_);
     pending_count_ += items.size();
@@ -199,6 +206,7 @@ void Ngram::insertWorker() {
 }
 
 // See C++ Core Guidelines F.7 and R.3 for why the return type is a raw pointer.
+// Read-only version for match, not to be confused with the write version for insert below
 Trie* Ngram::getTrieForMatch_(int64_t state_id) {
   if (!param_.request_trie_mode) {
     return global_trie_.get();
@@ -212,6 +220,7 @@ Trie* Ngram::getTrieForMatch_(int64_t state_id) {
 }
 
 // See C++ Core Guidelines F.7 and R.3 for why the return type is a raw pointer.
+// Write version for insert, not to be confused with the read-only version for match above
 Trie* Ngram::getOrCreateTrieForInsert_(int64_t state_id) {
   if (!param_.request_trie_mode) {
     if (!global_trie_) {

@@ -6,6 +6,7 @@ import uuid
 
 import numpy as np
 
+from sglang.jit_kernel.ngram_corpus import get_ngram_corpus_cls
 from sglang.srt.speculative.cpp_ngram.external_corpus import (
     iter_external_corpus_chunks,
 )
@@ -63,6 +64,25 @@ def _batch_get_with_state(
     total_len: int,
 ):
     return corpus.batch_get([req_id], [current_tokens], [total_len])
+
+
+def _make_low_level_corpus(**kwargs):
+    defaults = dict(
+        capacity=100000,
+        max_trie_depth=12,
+        min_bfs_breadth=1,
+        max_bfs_breadth=8,
+        draft_token_num=8,
+        match_type="BFS",
+        trie_mode="global",
+        external_corpus_max_tokens=10000000,
+        trie_source_prior=0.0,
+        match_specificity_weight=0.7,
+        match_confidence_weight=0.3,
+    )
+    defaults.update(kwargs)
+    cls = get_ngram_corpus_cls()
+    return cls(**defaults)
 
 
 class _IntTokenizer:
@@ -337,6 +357,20 @@ class TestNgramCorpusRequestTrieMode(CustomTestCase):
 
         ids, _ = _batch_get_with_state(corpus, "req-a", [1, 2, 3], 3)
         self.assertEqual(ids.tolist(), [3, 4, 0, 0])
+
+
+class TestNgramCorpusLowLevelRequestTrieMode(CustomTestCase):
+    def test_low_level_insert_requires_state_ids_in_request_mode(self):
+        corpus = _make_low_level_corpus(trie_mode="request", draft_token_num=4)
+
+        with self.assertRaisesRegex(ValueError, "requires state_ids"):
+            corpus.insert([[1, 2, 3, 4]])
+
+    def test_low_level_insert_rejects_negative_state_id_in_request_mode(self):
+        corpus = _make_low_level_corpus(trie_mode="request", draft_token_num=4)
+
+        with self.assertRaisesRegex(RuntimeError, "non-negative state ids"):
+            corpus.insert([[1, 2, 3, 4]], state_ids=[-1])
 
 
 class TestNgramCorpusNoMatch(CustomTestCase):
