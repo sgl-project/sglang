@@ -872,6 +872,7 @@ class Scheduler(
         if server_args.enable_streaming_session:
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
+        self.enable_hisparse = self.tp_worker.model_runner.enable_hisparse
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator

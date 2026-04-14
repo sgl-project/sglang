@@ -369,3 +369,99 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
         )
+
+
+class NPUHiSparseTokenToKVPool(NPUMLATokenToKVPool):
+    """
+    NPU-specific HiSparse token to KV pool.
+    Extends NPUMLATokenToKVPool with full-to-hisparse device index mapping,
+    enabling the hierarchical sparse attention mechanism on Ascend NPU.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        index_head_dim: Optional[int],
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        host_to_device_ratio: int = 2,
+        kv_cache_dim: Optional[int] = None,
+    ):
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            index_head_dim=index_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        # Override kv_cache_dim if provided (for FP8 NSA models)
+        if kv_cache_dim is not None:
+            self.kv_cache_dim = kv_cache_dim
+        self.bytes_per_token = self.kv_cache_dim * dtype.itemsize
+
+    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
+        """Register the logical-to-hisparse-device index mapping."""
+        self.full_to_hisparse_device_index_mapping = (
+            full_to_hisparse_device_index_mapping
+        )
+
+    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
+        """Translate logical token indices to Hisparse device buffer indices."""
+        return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
+            torch.int32
+        )
+
+    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
+        """Internal version without dtype conversion."""
+        return self.full_to_hisparse_device_index_mapping[compressed_indices]
+
+    def set_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        loc = self.translate_loc_to_hisparse_device(loc)
+        super().set_kv_buffer(layer, loc, cache_k, cache_v)
+
+    def set_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        loc = self.translate_loc_to_hisparse_device(loc)
+        super().set_mla_kv_buffer(layer, loc, cache_k, cache_v)
+
+    def get_mla_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        loc = self.translate_loc_to_hisparse_device(loc)
+        return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    def set_index_k_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ):
+        loc = self.translate_loc_to_hisparse_device(loc)
+        super().set_index_k_buffer(layer_id, loc, index_k)

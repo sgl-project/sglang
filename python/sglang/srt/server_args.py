@@ -6571,23 +6571,24 @@ class ServerArgs:
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-            for attr, label in [
-                ("nsa_prefill_backend", "prefill"),
-                ("nsa_decode_backend", "decode"),
-            ]:
-                backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
-                    raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                        f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
-                    )
+            if not is_npu():
+                for attr, label in [
+                    ("nsa_prefill_backend", "prefill"),
+                    ("nsa_decode_backend", "decode"),
+                ]:
+                    backend = getattr(self, attr)
+                    if backend is not None and backend != "flashmla_sparse":
+                        raise ValueError(
+                            f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                            f"but got --nsa-{label}-backend={backend}. "
+                            f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                        )
 
-            if self.kv_cache_dtype != "bfloat16":
-                raise ValueError(
-                    f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
-                    f"Please use --kv-cache-dtype=bfloat16."
-                )
+                if self.kv_cache_dtype != "bfloat16":
+                    raise ValueError(
+                        f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
+                        f"Please use --kv-cache-dtype=bfloat16."
+                    )
 
         assert (
             self.schedule_conservativeness >= 0

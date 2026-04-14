@@ -1,0 +1,430 @@
+diff --git a/python/sglang/srt/hardware_backend/npu/memory_pool_npu.py b/python/sglang/srt/hardware_backend/npu/memory_pool_npu.py
+index ea81f4e58..dd44825c0 100644
+--- a/python/sglang/srt/hardware_backend/npu/memory_pool_npu.py
++++ b/python/sglang/srt/hardware_backend/npu/memory_pool_npu.py
+@@ -369,3 +369,99 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
+             loc.view(-1, 1),
+             index_k.view(-1, 1, self.index_head_dim),
+         )
++
++
++class NPUHiSparseTokenToKVPool(NPUMLATokenToKVPool):
++    """
++    NPU-specific HiSparse token to KV pool.
++    Extends NPUMLATokenToKVPool with full-to-hisparse device index mapping,
++    enabling the hierarchical sparse attention mechanism on Ascend NPU.
++    """
++
++    def __init__(
++        self,
++        size: int,
++        page_size: int,
++        dtype: torch.dtype,
++        kv_lora_rank: int,
++        qk_rope_head_dim: int,
++        index_head_dim: Optional[int],
++        layer_num: int,
++        device: str,
++        enable_memory_saver: bool,
++        start_layer: Optional[int] = None,
++        end_layer: Optional[int] = None,
++        host_to_device_ratio: int = 2,
++        kv_cache_dim: Optional[int] = None,
++    ):
++        super().__init__(
++            size=size,
++            page_size=page_size,
++            dtype=dtype,
++            kv_lora_rank=kv_lora_rank,
++            qk_rope_head_dim=qk_rope_head_dim,
++            index_head_dim=index_head_dim,
++            layer_num=layer_num,
++            device=device,
++            enable_memory_saver=enable_memory_saver,
++            start_layer=start_layer,
++            end_layer=end_layer,
++        )
++        # Override kv_cache_dim if provided (for FP8 NSA models)
++        if kv_cache_dim is not None:
++            self.kv_cache_dim = kv_cache_dim
++        self.bytes_per_token = self.kv_cache_dim * dtype.itemsize
++
++    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
++        """Register the logical-to-hisparse-device index mapping."""
++        self.full_to_hisparse_device_index_mapping = (
++            full_to_hisparse_device_index_mapping
++        )
++
++    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
++        """Translate logical token indices to Hisparse device buffer indices."""
++        return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
++            torch.int32
++        )
++
++    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
++        """Internal version without dtype conversion."""
++        return self.full_to_hisparse_device_index_mapping[compressed_indices]
++
++    def set_kv_buffer(
++        self,
++        layer: "RadixAttention",
++        loc: torch.Tensor,
++        cache_k: torch.Tensor,
++        cache_v: torch.Tensor,
++    ):
++        loc = self.translate_loc_to_hisparse_device(loc)
++        super().set_kv_buffer(layer, loc, cache_k, cache_v)
++
++    def set_mla_kv_buffer(
++        self,
++        layer: "RadixAttention",
++        loc: torch.Tensor,
++        cache_k: torch.Tensor,
++        cache_v: torch.Tensor,
++    ):
++        loc = self.translate_loc_to_hisparse_device(loc)
++        super().set_mla_kv_buffer(layer, loc, cache_k, cache_v)
++
++    def get_mla_kv_buffer(
++        self,
++        layer: "RadixAttention",
++        loc: torch.Tensor,
++        dst_dtype: Optional[torch.dtype] = None,
++    ):
++        loc = self.translate_loc_to_hisparse_device(loc)
++        return super().get_mla_kv_buffer(layer, loc, dst_dtype)
++
++    def set_index_k_buffer(
++        self,
++        layer_id: int,
++        loc: torch.Tensor,
++        index_k: torch.Tensor,
++    ):
++        loc = self.translate_loc_to_hisparse_device(loc)
++        super().set_index_k_buffer(layer_id, loc, index_k)
+diff --git a/python/sglang/srt/managers/hisparse_coordinator.py b/python/sglang/srt/managers/hisparse_coordinator.py
+index 07c3aa7ae..d6a1eb80e 100644
+--- a/python/sglang/srt/managers/hisparse_coordinator.py
++++ b/python/sglang/srt/managers/hisparse_coordinator.py
+@@ -11,11 +11,16 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
+     HiSparseTokenToKVPoolAllocator,
+ )
+ from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+-from sglang.srt.utils import get_device_module
++from sglang.srt.utils import get_device_module, is_npu
+ 
+ device_module = get_device_module()
+ 
+ from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
++
++if not is_npu():
++    from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
++else:
++    load_cache_to_device_buffer_mla = None
+ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+ 
+ logger = logging.getLogger(__name__)
+@@ -109,7 +114,7 @@ class HiSparseCoordinator:
+             device=device,
+         )
+         self._lru_init = torch.arange(
+-            self.device_buffer_size, dtype=torch.int16, device=device
++            self.device_buffer_size, dtype=torch.int32, device=device
+         )
+         self.lru_slots = (
+             self._lru_init.view(1, 1, -1)
+@@ -671,6 +676,14 @@ class HiSparseCoordinator:
+         num_reqs = req_pool_indices.size(0)
+         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+         top_k_indices.fill_(-1)
++        # On NPU, fall back to naive per-request loop since JIT CUDA kernel is unavailable
++        if is_npu():
++            return self.naive_load_topk(
++                req_pool_indices=req_pool_indices,
++                seq_lens=seq_lens,
++                top_k_tokens=top_k_result,
++                layer_id=layer_id,
++            )
+         # todo, adjustable for performance
+         block_size = 1024
+         load_cache_to_device_buffer_mla(
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 5297f070b..937fef5e1 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -872,6 +872,7 @@ class Scheduler(
+         if server_args.enable_streaming_session:
+             self.tree_cache = SessionAwareCache(self.tree_cache)
+ 
++        self.enable_hisparse = self.tp_worker.model_runner.enable_hisparse
+         if self.enable_hisparse:
+             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
+             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+diff --git a/python/sglang/srt/mem_cache/allocator.py b/python/sglang/srt/mem_cache/allocator.py
+index c0ce15e20..304cd7104 100644
+--- a/python/sglang/srt/mem_cache/allocator.py
++++ b/python/sglang/srt/mem_cache/allocator.py
+@@ -287,7 +287,7 @@ def alloc_extend_kernel(
+         seq_len // page_size * page_size
+         - (pre_len + page_size - 1) // page_size * page_size
+     )
+-    BLOCK_EXTEND: tl.constexpr = 4096
++    BLOCK_EXTEND: tl.constexpr = 2048
+     num_blocks = (num_part2 + BLOCK_EXTEND - 1) // BLOCK_EXTEND
+     for block_id in range(num_blocks):
+         offset_in_block = tl.arange(0, BLOCK_EXTEND)
+diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
+index e5fd2da76..89d4ee9fe 100644
+--- a/python/sglang/srt/mem_cache/memory_pool_host.py
++++ b/python/sglang/srt/mem_cache/memory_pool_host.py
+@@ -934,6 +934,10 @@ class MLATokenToKVPoolHost(HostKVCache):
+                         indices_src=host_indices,
+                         element_dim=self.kv_cache_dim,
+                     )
++                elif _is_npu:
++                    self._npu_load_mla_layer(
++                        device_pool, host_indices, device_indices, layer_id
++                    )
+                 else:
+                     transfer_kv_per_layer_mla(
+                         src=self.kv_buffer[layer_id],
+@@ -1004,6 +1008,52 @@ class MLATokenToKVPoolHost(HostKVCache):
+         else:
+             raise ValueError(f"Unsupported IO backend: {io_backend}")
+ 
++    def _npu_load_mla_layer(self, device_pool, host_indices, device_indices, layer_id):
++        """NPU torch fallback: load KV from host to device (separate k/v buffers)."""
++        device = device_pool.k_buffer[layer_id].device
++        host_device = self.kv_buffer[layer_id].device
++        if host_indices.device != host_device:
++            host_indices = host_indices.to(host_device)
++        if device_indices.device != device:
++            device_indices = device_indices.to(device)
++
++        kv_lora_rank = device_pool.kv_lora_rank
++        host_kv = self.kv_buffer[layer_id][host_indices]  # [N, 1, kv_cache_dim]
++        host_k = host_kv[..., :kv_lora_rank].view(-1, 1, kv_lora_rank)
++        host_v = host_kv[..., kv_lora_rank:].view(-1, 1, device_pool.qk_rope_head_dim)
++        if host_k.device != device:
++            host_k = host_k.to(device, non_blocking=True)
++            host_v = host_v.to(device, non_blocking=True)
++
++        dst_k = device_pool.k_buffer[layer_id].view(-1, 1, kv_lora_rank)
++        dst_v = device_pool.v_buffer[layer_id].view(-1, 1, device_pool.qk_rope_head_dim)
++        dst_k[device_indices] = host_k
++        dst_v[device_indices] = host_v
++
++    def _npu_backup_mla_all_layer(self, device_pool, host_indices, device_indices):
++        """NPU torch fallback: backup KV from device to host across all layers."""
++        host_device = self.kv_buffer[0].device
++        if host_indices.device != host_device:
++            host_indices = host_indices.to(host_device)
++
++        kv_lora_rank = device_pool.kv_lora_rank
++        for layer_id in range(self.layer_num):
++            device = device_pool.k_buffer[layer_id].device
++            layer_device_indices = device_indices
++            if layer_device_indices.device != device:
++                layer_device_indices = layer_device_indices.to(device)
++
++            src_k = device_pool.k_buffer[layer_id].view(-1, 1, kv_lora_rank)[
++                layer_device_indices
++            ]
++            src_v = device_pool.v_buffer[layer_id].view(
++                -1, 1, device_pool.qk_rope_head_dim
++            )[layer_device_indices]
++            host_kv = torch.cat([src_k, src_v], dim=-1)
++            if host_kv.device != host_device:
++                host_kv = host_kv.to(host_device, non_blocking=True)
++            self.kv_buffer[layer_id][host_indices] = host_kv
++
+     def backup_from_device_all_layer(
+         self, device_pool, host_indices, device_indices, io_backend
+     ):
+@@ -1019,6 +1069,10 @@ class MLATokenToKVPoolHost(HostKVCache):
+                         cache_src_stride_bytes=self.token_stride_size,
+                         element_size=self.kv_cache_dim * self.dtype.itemsize,
+                     )
++                elif _is_npu:
++                    self._npu_backup_mla_all_layer(
++                        device_pool, host_indices, device_indices
++                    )
+                 else:
+                     transfer_kv_all_layer_mla(
+                         src_layers=device_pool.data_ptrs,
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 74cec2565..47995f45b 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -351,6 +351,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         self.init_new_workspace = False
+         self.draft_model_idx = draft_model_idx
+         self.enable_hisparse = server_args.enable_hisparse
++        if self.enable_hisparse:
++            from sglang.srt.configs.model_config import is_deepseek_nsa
++
++            if not is_deepseek_nsa(self.model_config.hf_config):
++                logger.warning(
++                    "Hisparse requires DeepSeek NSA architecture with index_top config."
++                    "Disabling Hisparse for this model."
++                )
++                self.enable_hisparse = False
+ 
+         self.remote_instance_transfer_engine = None
+         self.remote_instance_transfer_engine_session_id = ""
+@@ -690,24 +699,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+ 
+         # Init hisparse coordinator (must happen before CUDA graph capture)
+         if self.enable_hisparse:
++            from sglang.srt.configs.model_config import is_deepseek_nsa
+             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+ 
+-            hisparse_cfg = parse_hisparse_config(self.server_args)
+-            self.hisparse_coordinator = HiSparseCoordinator(
+-                req_to_token_pool=self.req_to_token_pool,
+-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+-                top_k=hisparse_cfg.top_k,
+-                device_buffer_size=hisparse_cfg.device_buffer_size,
+-                device=self.device,
+-                tp_group=(
+-                    self.attention_tp_group.cpu_group
+-                    if self.server_args.enable_dp_attention
+-                    else self.tp_group.cpu_group
+-                ),
+-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+-            )
+-
++            is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
++            if is_nsa_model:
++                hisparse_cfg = parse_hisparse_config(self.server_args)
++                self.hisparse_coordinator = HiSparseCoordinator(
++                    req_to_token_pool=self.req_to_token_pool,
++                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
++                    top_k=hisparse_cfg.top_k,
++                    device_buffer_size=hisparse_cfg.device_buffer_size,
++                    device=self.device,
++                    tp_group=(
++                        self.attention_tp_group.cpu_group
++                        if self.server_args.enable_dp_attention
++                        else self.tp_group.cpu_group
++                    ),
++                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
++                )
+         # Init routed experts capturer
+         self.init_routed_experts_capturer()
+ 
+diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+index 9ecc0c414..408c4eacb 100644
+--- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
++++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+@@ -15,7 +15,6 @@ from sglang.srt.mem_cache.allocator import (
+ )
+ from sglang.srt.mem_cache.hisparse_memory_pool import (
+     HiSparseNSATokenToKVPool,
+-    HiSparseTokenToKVPoolAllocator,
+ )
+ from sglang.srt.mem_cache.memory_pool import (
+     DoubleSparseTokenToKVPool,
+@@ -319,11 +318,12 @@ class ModelRunnerKVCacheMixin:
+                 )
+             elif self.use_mla_backend:
+                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
++                    NPUHiSparseTokenToKVPool,
+                     NPUMLATokenToKVPool,
+                 )
+ 
+-                self.token_to_kv_pool = NPUMLATokenToKVPool(
+-                    self.max_total_num_tokens,
++                pool_kwargs = dict(
++                    size=self.max_total_num_tokens,
+                     page_size=self.page_size,
+                     dtype=self.kv_cache_dtype,
+                     kv_lora_rank=self.model_config.kv_lora_rank,
+@@ -337,6 +337,18 @@ class ModelRunnerKVCacheMixin:
+                     start_layer=self.start_layer,
+                     end_layer=self.end_layer,
+                 )
++                if self.enable_hisparse and is_nsa_model:
++                    # Use Hisparse-aware pool on NPU
++                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
++
++                    hisparse_cfg = parse_hisparse_config(self.server_args)
++                    pool_kwargs["host_to_device_ratio"] = (
++                        hisparse_cfg.host_to_device_ratio
++                    )
++                    pool_kwargs["kv_cache_dim"] = self.calculate_mla_kv_cache_dim()
++                    self.token_to_kv_pool = NPUHiSparseTokenToKVPool(**pool_kwargs)
++                else:
++                    self.token_to_kv_pool = NPUMLATokenToKVPool(**pool_kwargs)
+             else:
+                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                     NPUMHATokenToKVPool,
+@@ -542,6 +554,22 @@ class ModelRunnerKVCacheMixin:
+                         kvcache=self.token_to_kv_pool,
+                         need_sort=need_sort,
+                     )
++                elif self.enable_hisparse and is_nsa_model:
++                    from sglang.srt.mem_cache.hisparse_memory_pool import (
++                        HiSparseTokenToKVPoolAllocator,
++                    )
++                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
++
++                    hisparse_cfg = parse_hisparse_config(self.server_args)
++                    self.token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
++                        self.max_total_num_tokens,
++                        page_size=self.page_size,
++                        dtype=self.kv_cache_dtype,
++                        device=self.device,
++                        kvcache=self.token_to_kv_pool,
++                        need_sort=need_sort,
++                        host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
++                    )
+                 else:
+                     from sglang.srt.hardware_backend.npu.allocator_npu import (
+                         NPUPagedTokenToKVPoolAllocator,
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 0a45c1dc6..c2e315201 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -6571,24 +6571,25 @@ class ServerArgs:
+             assert (
+                 self.disable_radix_cache
+             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+-            for attr, label in [
+-                ("nsa_prefill_backend", "prefill"),
+-                ("nsa_decode_backend", "decode"),
+-            ]:
+-                backend = getattr(self, attr)
+-                if backend is not None and backend != "flashmla_sparse":
++            if not is_npu():
++                for attr, label in [
++                    ("nsa_prefill_backend", "prefill"),
++                    ("nsa_decode_backend", "decode"),
++                ]:
++                    backend = getattr(self, attr)
++                    if backend is not None and backend != "flashmla_sparse":
++                        raise ValueError(
++                            f"HiSparse requires flashmla_sparse NSA {label} backend, "
++                            f"but got --nsa-{label}-backend={backend}. "
++                            f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
++                        )
++
++                if self.kv_cache_dtype != "bfloat16":
+                     raise ValueError(
+-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
+-                        f"but got --nsa-{label}-backend={backend}. "
+-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
++                        f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
++                        f"Please use --kv-cache-dtype=bfloat16."
+                     )
+ 
+-            if self.kv_cache_dtype != "bfloat16":
+-                raise ValueError(
+-                    f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
+-                    f"Please use --kv-cache-dtype=bfloat16."
+-                )
+-
+         assert (
+             self.schedule_conservativeness >= 0
+         ), "schedule_conservativeness must be non-negative"

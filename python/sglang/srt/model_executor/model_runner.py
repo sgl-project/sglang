@@ -351,6 +351,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        if self.enable_hisparse:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            if not is_deepseek_nsa(self.model_config.hf_config):
+                logger.warning(
+                    "Hisparse requires DeepSeek NSA architecture with index_top config."
+                    "Disabling Hisparse for this model."
+                )
+                self.enable_hisparse = False
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -690,24 +699,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init hisparse coordinator (must happen before CUDA graph capture)
         if self.enable_hisparse:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            hisparse_cfg = parse_hisparse_config(self.server_args)
-            self.hisparse_coordinator = HiSparseCoordinator(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                top_k=hisparse_cfg.top_k,
-                device_buffer_size=hisparse_cfg.device_buffer_size,
-                device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-            )
-
+            is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+            if is_nsa_model:
+                hisparse_cfg = parse_hisparse_config(self.server_args)
+                self.hisparse_coordinator = HiSparseCoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    top_k=hisparse_cfg.top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
+                    device=self.device,
+                    tp_group=(
+                        self.attention_tp_group.cpu_group
+                        if self.server_args.enable_dp_attention
+                        else self.tp_group.cpu_group
+                    ),
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                )
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
