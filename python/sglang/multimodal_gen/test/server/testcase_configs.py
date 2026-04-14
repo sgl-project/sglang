@@ -1054,6 +1054,7 @@ if not current_platform.is_hip():
         )
     )
 
+
 def _with_default_num_gpus(
     cases: list[DiffusionTestCase], num_gpus: int
 ) -> list[DiffusionTestCase]:

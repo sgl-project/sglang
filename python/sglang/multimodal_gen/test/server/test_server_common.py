@@ -1124,9 +1124,7 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
         if case.run_t2v_input_reference_check:
             run_case_check(
                 "t2v input_reference rejection",
-                lambda: self._test_t2v_rejects_input_reference(
-                    diffusion_server, case
-                ),
+                lambda: self._test_t2v_rejects_input_reference(diffusion_server, case),
             )
 
         if case.run_consistency_check:
