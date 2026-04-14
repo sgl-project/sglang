@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
+    _usp_input_all_to_all_packed_qkv,
     _usp_output_all_to_all,
     ring_attn,
 )
@@ -338,6 +339,7 @@ class USPAttention(nn.Module):
         prefix: str = "",
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
+        pack_qkv_a2a: bool = False,
         **extra_impl_args,
     ) -> None:
         """
@@ -392,6 +394,7 @@ class USPAttention(nn.Module):
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
+        self.pack_qkv_a2a = pack_qkv_a2a
 
     def forward(
         self,
@@ -474,9 +477,12 @@ class USPAttention(nn.Module):
 
             sp_size = get_ulysses_parallel_world_size()
             if sp_size > 1:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+                if self.pack_qkv_a2a:
+                    q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v, head_dim=2)
+                else:
+                    q = _usp_input_all_to_all(q, head_dim=2)
+                    k = _usp_input_all_to_all(k, head_dim=2)
+                    v = _usp_input_all_to_all(v, head_dim=2)
 
             gathered_mask = sequence_model_parallel_all_gather(
                 attn_mask.contiguous(), dim=1
@@ -520,9 +526,12 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            if self.pack_qkv_a2a:
+                q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v, head_dim=2)
+            else:
+                q = _usp_input_all_to_all(q, head_dim=2)
+                k = _usp_input_all_to_all(k, head_dim=2)
+                v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -571,9 +580,14 @@ class USPAttention(nn.Module):
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        if self.pack_qkv_a2a:
+            q_shard, k_shard, v_shard = _usp_input_all_to_all_packed_qkv(
+                q_shard, k_shard, v_shard, head_dim=2
+            )
+        else:
+            q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
+            k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
+            v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
 
         h_local = q_shard.shape[2]
         h_start = sp_rank * h_local

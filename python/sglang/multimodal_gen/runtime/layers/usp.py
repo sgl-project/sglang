@@ -102,6 +102,76 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
+def _usp_input_all_to_all_packed_qkv(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, head_dim: int = 1
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Pack Q, K, V into a single tensor and perform one Ulysses all-to-all
+    instead of three separate calls.
+
+    Semantically equivalent to calling ``_usp_input_all_to_all`` on each of
+    Q, K, V individually, but uses a single collective.
+
+    Requires Q, K, V to have identical shapes.
+
+    Args:
+        q, k, v: 4D tensors with the same shape.
+        head_dim: Which dimension index corresponds to heads (1 or 2).
+
+    Returns:
+        Transformed (q, k, v) with heads sharded and sequence gathered.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return q, k, v
+
+    assert q.ndim == 4, f"q must have 4 dimensions, got {q.ndim}"
+    assert q.shape == k.shape == v.shape, (
+        f"packed QKV all-to-all requires identical shapes, "
+        f"got q={q.shape}, k={k.shape}, v={v.shape}"
+    )
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+
+    if head_dim == 1:
+        b, h_global, s_local, d = q.shape
+    else:
+        b, s_local, h_global, d = q.shape
+
+    assert (
+        h_global % world_size == 0
+    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+
+    h_local = h_global // world_size
+    s_global = s_local * world_size
+
+    # [3, b, ..., h_global, ..., d]
+    qkv = torch.stack([q, k, v], dim=0)
+
+    if head_dim == 1:
+        # [3, b, h_global, s_local, d] -> [3, b, P, h_local, s_local, d]
+        qkv = qkv.view(3, b, world_size, h_local, s_local, d)
+        # -> [P, 3, b, h_local, s_local, d]
+        qkv = qkv.permute(2, 0, 1, 3, 4, 5).contiguous()
+    else:
+        # [3, b, s_local, h_global, d] -> [3, b, s_local, P, h_local, d]
+        qkv = qkv.view(3, b, s_local, world_size, h_local, d)
+        # -> [P, 3, b, s_local, h_local, d]
+        qkv = qkv.permute(3, 0, 1, 2, 4, 5).contiguous()
+
+    qkv = _usp_all_to_all_single(qkv)
+
+    if head_dim == 1:
+        # [P, 3, b, h_local, s_local, d] -> [3, b, h_local, P, s_local, d]
+        qkv = qkv.permute(1, 2, 3, 0, 4, 5).contiguous()
+        qkv = qkv.reshape(3, b, h_local, s_global, d)
+    else:
+        # [P, 3, b, s_local, h_local, d] -> [3, b, P, s_local, h_local, d]
+        qkv = qkv.permute(1, 2, 0, 3, 4, 5).contiguous()
+        qkv = qkv.reshape(3, b, s_global, h_local, d)
+
+    return torch.unbind(qkv, dim=0)
+
+
 def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
