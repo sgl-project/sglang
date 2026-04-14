@@ -308,81 +308,20 @@ class SessionAwareCache(BasePrefixCache):
 
     # -- Session lifecycle --
 
-    def _resolve_release_state(
-        self, slot: SessionSlot, req: Optional[Req]
-    ) -> tuple[int, Any]:
-        """Resolve the currently tree-owned prefix for a session slot.
+    def release_session(self, session_id: str):
+        """Release all KV resources held by a streaming session.
 
-        A long-lived session can outlive radix-tree splits caused by unrelated
-        traffic. In that case, the saved `last_node` may no longer represent the
-        full protected prefix even though the slot's req_to_token row still
-        contains tree-owned indices at the front. Re-match the current request
-        text, then intersect the returned tree indices with the slot's row so
-        release uses the prefix that is still actually backed by the tree.
+        `slot.last_node` + `slot.cache_protected_len` are trusted directly: radix
+        tree splits mutate TreeNode objects in place (see RadixCache._split_node),
+        so a saved TreeNode reference remains valid and the locked prefix length
+        is unchanged. No rematch needed -- and `match_prefix` here would cause
+        further splits that disturb accounting.
         """
-        protected_len = slot.cache_protected_len
-        lock_node = slot.last_node
-
-        # TODO: re-match logic disabled — match_prefix has side effects
-        # (splits) that disturb tree accounting. Directly using
-        # slot.last_node + cache_protected_len is safe after split analysis.
-        return protected_len, lock_node
-
-        if (
-            req is None
-            or not slot.is_holding_kv
-            or slot.req_pool_idx is None
-            or protected_len <= 0
-        ):
-            return protected_len, lock_node
-
-        from sglang.srt.mem_cache.radix_cache import RadixKey
-
-        token_ids = (req.origin_input_ids + req.output_ids)[: slot.kv_committed_len]
-        if not token_ids:
-            return 0, None
-
-        match = self.inner.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
-                req=None,
-            )
-        )
-        if len(match.device_indices) == 0:
-            return 0, None
-
-        max_protected_len = min(len(match.device_indices), protected_len)
-        row_indices = self.req_to_token_pool.req_to_token[
-            slot.req_pool_idx, :max_protected_len
-        ].to(dtype=torch.int64)
-        match_indices = match.device_indices[:max_protected_len]
-        mismatches = (match_indices != row_indices).nonzero(as_tuple=False)
-        if mismatches.numel() == 0 and max_protected_len == len(match.device_indices):
-            common_len = max_protected_len
-            return common_len, match.last_device_node
-
-        common_len = (
-            int(mismatches[0].item()) if mismatches.numel() > 0 else max_protected_len
-        )
-        if self.page_size > 1:
-            common_len = (common_len // self.page_size) * self.page_size
-        if common_len <= 0:
-            return 0, None
-
-        rematch = self.inner.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(token_ids=token_ids[:common_len], extra_key=req.extra_key),
-                req=None,
-            )
-        )
-        return len(rematch.device_indices), rematch.last_device_node
-
-    def release_session(self, session_id: str, req: Optional[Req] = None):
-        """Release all KV resources held by a streaming session."""
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
-        protected_len, lock_node = self._resolve_release_state(slot, req)
+        protected_len = slot.cache_protected_len
+        lock_node = slot.last_node
         tokens_freed = (
             max(0, slot.kv_allocated_len - protected_len) if slot.is_holding_kv else 0
         )
