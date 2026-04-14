@@ -343,7 +343,7 @@ class SessionAwareCache(BasePrefixCache):
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.
 
-        Excludes slots whose KV is currently owned by a running request —
+        Excludes slots whose KV is currently owned by an owning request —
         those tokens are counted via uncached_size in the busy mem check.
         A slot's pool_idx being in active_pool_idxs indicates a req owns it.
         """

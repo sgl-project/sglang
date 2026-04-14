@@ -144,7 +144,7 @@ class SchedulerRuntimeCheckerMixin:
     def _active_pool_idxs(self: Scheduler) -> set:
         """Pool idxs currently owned by reqs in last_batch / running_batch.
 
-        Used to decide which session slots' KV is "borrowed" by running reqs
+        Used to decide which session slots' KV is owned by batch reqs
         (and thus counted via uncached_size, not session_held).
         """
         idxs = set()
