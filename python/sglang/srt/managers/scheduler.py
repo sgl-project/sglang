@@ -3695,7 +3695,14 @@ def run_scheduler_process(
     pipe_writer,
 ):
     dp_rank = configure_scheduler_process(
-        server_args, gpu_id, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+        server_args,
+        gpu_id,
+        tp_rank,
+        attn_cp_rank,
+        moe_dp_rank,
+        moe_ep_rank,
+        pp_rank,
+        dp_rank,
     )
     parent_process = psutil.Process().parent()
 
