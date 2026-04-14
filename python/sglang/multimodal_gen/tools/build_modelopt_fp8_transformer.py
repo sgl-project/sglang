@@ -1,4 +1,4 @@
-"""Convert a ModelOpt diffusion FP8 export into an SGLang-loadable checkpoint.
+"""Build an SGLang-loadable ModelOpt FP8 diffusion transformer.
 
 The core conversion path is model-agnostic:
 - read the ModelOpt diffusers transformer export
@@ -12,7 +12,7 @@ remains reusable across future diffusion backbones.
 
 Example:
 
-    python -m sglang.multimodal_gen.tools.convert_modelopt_fp8_checkpoint \
+    python -m sglang.multimodal_gen.tools.build_modelopt_fp8_transformer \
         --modelopt-hf-dir /tmp/modelopt_flux2_fp8/hf \
         --modelopt-backbone-ckpt /tmp/modelopt_flux2_fp8/ckpt/backbone.pt \
         --base-transformer-dir /path/to/FLUX.2-dev/transformer \
@@ -56,6 +56,21 @@ DEFAULT_FLUX1_KEEP_BF16_PATTERNS = [
     r"^transformer_blocks\.\d+\.ff_context\.net\.0\.proj$",
     r"^transformer_blocks\.\d+\.ff_context\.net\.2$",
     r"^single_transformer_blocks\.\d+\.norm\.linear$",
+]
+DEFAULT_LTX2_KEEP_BF16_PATTERNS = [
+    r"^(audio_)?adaln_single\.emb\.timestep_embedder\.linear_[12]$",
+    r"^(audio_)?adaln_single\.linear$",
+    r"^audio_caption_projection\.linear_[12]$",
+    r"^audio_patchify_proj$",
+    r"^audio_proj_out$",
+    r"^av_ca_(a2v_gate|audio_scale_shift|v2a_gate|video_scale_shift)_adaln_single\.emb\.timestep_embedder\.linear_[12]$",
+    r"^av_ca_(a2v_gate|audio_scale_shift|v2a_gate|video_scale_shift)_adaln_single\.linear$",
+    r"^caption_projection\.linear_[12]$",
+    r"^patchify_proj$",
+    r"^proj_out$",
+    r"^transformer_blocks\.(0|43|44|45|46|47)\.(attn1|attn2|audio_attn1|audio_attn2|audio_to_video_attn|video_to_audio_attn)\.to_(q|k|v)$",
+    r"^transformer_blocks\.(0|43|44|45|46|47)\.(attn1|attn2|audio_attn1|audio_attn2|audio_to_video_attn|video_to_audio_attn)\.to_out\.0$",
+    r"^transformer_blocks\.(0|43|44|45|46|47)\.(ff|audio_ff)\.proj_(in|out)$",
 ]
 
 
@@ -126,9 +141,116 @@ def _load_config(model_dir: str) -> dict:
         return json.load(f)
 
 
+def _load_first_shard_metadata(
+    model_dir: str, weight_map: Mapping[str, str]
+) -> dict[str, str]:
+    if not weight_map:
+        return {}
+    first_shard = next(iter(weight_map.values()))
+    with safe_open(
+        os.path.join(model_dir, first_shard), framework="pt", device="cpu"
+    ) as f:
+        return dict(f.metadata() or {})
+
+
+def _module_name_variants(weight_name: str) -> list[str]:
+    module_name = weight_name[:-7] if weight_name.endswith(".weight") else weight_name
+    variants = [module_name]
+
+    for prefix in ("model.diffusion_model.", "velocity_model."):
+        if module_name.startswith(prefix):
+            variants.append(module_name[len(prefix) :])
+
+    canonicalized: list[str] = []
+    for variant in variants:
+        canonicalized.append(
+            re.sub(r"(\.audio_ff|\.ff)\.net\.0\.proj$", r"\1.proj_in", variant)
+        )
+        canonicalized.append(
+            re.sub(r"(\.audio_ff|\.ff)\.net\.2$", r"\1.proj_out", variant)
+        )
+    variants.extend(canonicalized)
+
+    deduped: list[str] = []
+    for variant in variants:
+        if variant not in deduped:
+            deduped.append(variant)
+    return deduped
+
+
+def _preferred_module_name(weight_name: str) -> str:
+    return _module_name_variants(weight_name)[-1]
+
+
+def _scale_key_candidates(weight_name: str) -> list[str]:
+    candidates = [weight_name]
+    if weight_name.startswith("model.diffusion_model."):
+        candidates.append(
+            "velocity_model." + weight_name[len("model.diffusion_model.") :]
+        )
+    return candidates
+
+
+def _resolve_scale_key(
+    weight_name: str,
+    scale_map: Mapping[str, Mapping[str, torch.Tensor]],
+) -> str | None:
+    for candidate in _scale_key_candidates(weight_name):
+        if candidate in scale_map:
+            return candidate
+    return None
+
+
+def _is_ltx2_x0_export(
+    *,
+    config: Mapping[str, object],
+    source_metadata: Mapping[str, str],
+    source_weight_map: Mapping[str, str],
+) -> bool:
+    if config.get("_class_name") != "X0Model":
+        return False
+    if not any(name.startswith("model.diffusion_model.") for name in source_weight_map):
+        return False
+    try:
+        metadata_config = json.loads(str(source_metadata.get("config", "")))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(metadata_config.get("transformer"), dict)
+
+
+def _build_output_config(
+    *,
+    source_config: Mapping[str, object],
+    source_metadata: Mapping[str, str],
+    quant_config: Mapping[str, object],
+    is_ltx2_x0_export: bool,
+) -> dict[str, object]:
+    if is_ltx2_x0_export:
+        metadata_config = json.loads(str(source_metadata["config"]))
+        output_config = dict(metadata_config["transformer"])
+        output_config["_class_name"] = "LTX2VideoTransformer3DModel"
+    else:
+        output_config = dict(source_config)
+
+    output_config["quantization_config"] = dict(quant_config)
+    return output_config
+
+
+def _should_keep_ltx2_transformer_key(weight_name: str) -> bool:
+    if not weight_name.startswith("model.diffusion_model."):
+        return False
+    connector_prefixes = (
+        "model.diffusion_model.audio_embeddings_connector.",
+        "model.diffusion_model.video_embeddings_connector.",
+    )
+    return not weight_name.startswith(connector_prefixes)
+
+
 def get_default_keep_bf16_patterns(
     *, model_type: str, class_name: str | None
 ) -> list[str]:
+    if model_type == "ltx2":
+        return list(DEFAULT_LTX2_KEEP_BF16_PATTERNS)
     if model_type == "flux1":
         return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if model_type == "flux2":
@@ -149,8 +271,11 @@ def should_keep_bf16(
     if not keep_bf16_patterns:
         return False
 
-    module_name = weight_name[:-7] if weight_name.endswith(".weight") else weight_name
-    return any(re.search(pattern, module_name) for pattern in keep_bf16_patterns)
+    return any(
+        re.search(pattern, module_name)
+        for pattern in keep_bf16_patterns
+        for module_name in _module_name_variants(weight_name)
+    )
 
 
 def is_ignored_by_modelopt(
@@ -160,10 +285,12 @@ def is_ignored_by_modelopt(
     if not ignore_patterns:
         return False
 
-    module_name = weight_name[:-7] if weight_name.endswith(".weight") else weight_name
     for pattern in ignore_patterns:
         regex_str = pattern.replace(".", r"\.").replace("*", r".*")
-        if re.fullmatch(regex_str, module_name):
+        if any(
+            re.fullmatch(regex_str, module_name)
+            for module_name in _module_name_variants(weight_name)
+        ):
             return True
     return False
 
@@ -242,7 +369,7 @@ def _load_selected_tensors(
     return tensors
 
 
-def convert_modelopt_fp8_checkpoint(
+def build_modelopt_fp8_transformer(
     *,
     modelopt_hf_dir: str,
     modelopt_backbone_ckpt: str,
@@ -265,23 +392,29 @@ def convert_modelopt_fp8_checkpoint(
         raise ValueError(
             "Expected a flat quantization_config dict in the ModelOpt export."
         )
-    if (
-        quant_config.get("quant_method") != "modelopt"
-        or "FP8" not in str(quant_config.get("quant_algo", "")).upper()
-    ):
+    if quant_config.get("quant_method") != "modelopt":
         raise ValueError(
             "This tool only supports ModelOpt diffusers FP8 exports "
-            "(quant_method=modelopt, quant_algo=FP8)."
+            "(quant_method=modelopt)."
         )
 
+    source_weight_map_all, index_filename = _load_weight_map(source_dir)
+    source_metadata = _load_first_shard_metadata(source_dir, source_weight_map_all)
+    is_ltx2_export = _is_ltx2_x0_export(
+        config=config,
+        source_metadata=source_metadata,
+        source_weight_map=source_weight_map_all,
+    )
     class_name = config.get("_class_name")
     ignore_patterns = list(quant_config.get("ignore", []) or [])
     patterns = list(
         get_default_keep_bf16_patterns(model_type=model_type, class_name=class_name)
     )
+    if is_ltx2_export and model_type == "auto":
+        patterns.extend(DEFAULT_LTX2_KEEP_BF16_PATTERNS)
     if keep_bf16_patterns:
         patterns.extend(keep_bf16_patterns)
-    if patterns and base_dir is None:
+    if patterns and base_dir is None and not is_ltx2_export:
         raise ValueError(
             "BF16 fallback patterns are enabled, but --base-transformer-dir was not provided."
         )
@@ -298,25 +431,73 @@ def convert_modelopt_fp8_checkpoint(
 
     _copy_non_shard_files(source_dir, str(output_path))
 
-    source_weight_map, index_filename = _load_weight_map(source_dir)
+    if is_ltx2_export:
+        source_weight_map = {
+            name: filename
+            for name, filename in source_weight_map_all.items()
+            if _should_keep_ltx2_transformer_key(name)
+        }
+    else:
+        source_weight_map = source_weight_map_all
     base_weight_map: dict[str, str] = {}
     if base_dir is not None:
         base_weight_map, _ = _load_weight_map(base_dir)
-
-    backbone_state = torch.load(backbone_ckpt_path, map_location="cpu")[
-        "model_state_dict"
-    ]
-    fp8_scale_map = build_fp8_scale_map(backbone_state, maxbound=maxbound)
-    serialized_quant_config = json.dumps(quant_config, sort_keys=True)
-
     fallback_weight_names = sorted(
         weight_name
         for weight_name in source_weight_map
         if weight_name.endswith(".weight") and should_keep_bf16(weight_name, patterns)
     )
+    fallback_weight_names_set = set(fallback_weight_names)
+
+    backbone_state = torch.load(backbone_ckpt_path, map_location="cpu")[
+        "model_state_dict"
+    ]
+    fp8_scale_map = build_fp8_scale_map(backbone_state, maxbound=maxbound)
+    quant_algo = str(quant_config.get("quant_algo", "")).upper()
+    if quant_algo and "FP8" not in quant_algo:
+        raise ValueError(
+            "This tool only supports ModelOpt diffusers FP8 exports, "
+            f"got quant_algo={quant_config.get('quant_algo')!r}."
+        )
+    if not quant_algo and not fp8_scale_map:
+        raise ValueError(
+            "Could not infer an FP8 ModelOpt export: quantization_config.quant_algo "
+            "is missing and backbone.pt does not contain FP8 scale tensors."
+        )
+    effective_quant_config = json.loads(json.dumps(quant_config))
+    if not quant_algo:
+        effective_quant_config["quant_algo"] = "FP8"
+
+    auto_ignore_modules = sorted(
+        {
+            _preferred_module_name(weight_name)
+            for weight_name in source_weight_map
+            if weight_name.endswith(".weight")
+            and _resolve_scale_key(weight_name, fp8_scale_map) is None
+        }
+    )
+    fallback_ignore_modules = sorted(
+        {_preferred_module_name(weight_name) for weight_name in fallback_weight_names}
+    )
+    ignore_patterns = sorted(
+        {
+            *ignore_patterns,
+            *auto_ignore_modules,
+            *fallback_ignore_modules,
+        }
+    )
+    effective_quant_config["ignore"] = ignore_patterns
+    serialized_quant_config = json.dumps(effective_quant_config, sort_keys=True)
+    output_config = _build_output_config(
+        source_config=config,
+        source_metadata=source_metadata,
+        quant_config=effective_quant_config,
+        is_ltx2_x0_export=is_ltx2_export,
+    )
+
     fallback_tensors = (
         _load_selected_tensors(base_dir, base_weight_map, fallback_weight_names)
-        if fallback_weight_names
+        if fallback_weight_names and base_dir is not None
         else {}
     )
     fallback_scale_names = {
@@ -340,15 +521,23 @@ def convert_modelopt_fp8_checkpoint(
     for filename, names in sorted(weights_by_file.items()):
         shard_path = os.path.join(source_dir, filename)
         shard_tensors = load_file(shard_path, device="cpu")
+        selected_names = set(names)
 
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             metadata = dict(f.metadata() or {})
 
         metadata.setdefault("format", "pt")
+        metadata["_class_name"] = str(
+            output_config.get("_class_name", metadata.get("_class_name", ""))
+        )
+        metadata["config"] = json.dumps(output_config, sort_keys=True)
         metadata["quantization_config"] = serialized_quant_config
         metadata["_quantization_metadata"] = serialized_quant_config
 
         for name in list(shard_tensors.keys()):
+            if name not in selected_names:
+                del shard_tensors[name]
+                continue
             if "_quantizer." in name:
                 del shard_tensors[name]
                 continue
@@ -362,12 +551,14 @@ def convert_modelopt_fp8_checkpoint(
                 continue
             if name in fallback_tensors:
                 shard_tensors[name] = fallback_tensors[name]
+            scale_key = _resolve_scale_key(name, fp8_scale_map)
             if (
                 name.endswith(".weight")
-                and name in fp8_scale_map
+                and scale_key is not None
                 and name not in fallback_tensors
+                and name not in fallback_weight_names_set
             ):
-                scale_tensors = fp8_scale_map[name]
+                scale_tensors = fp8_scale_map[scale_key]
                 shard_tensors[name] = quantize_fp8_weight(
                     shard_tensors[name], scale_tensors["weight_scale"]
                 )
@@ -397,12 +588,15 @@ def convert_modelopt_fp8_checkpoint(
             sort_keys=True,
         )
 
+    with open(output_path / "config.json", "w", encoding="utf-8") as f:
+        json.dump(output_config, f, indent=2, sort_keys=True)
+
     return {
         "quantized_weights": sum(
             1
             for name in source_weight_map
             if name.endswith(".weight")
-            and name in fp8_scale_map
+            and _resolve_scale_key(name, fp8_scale_map) is not None
             and not is_ignored_by_modelopt(name, ignore_patterns)
         ),
         "bf16_fallback_weights": len(fallback_weight_names),
@@ -415,8 +609,8 @@ def convert_modelopt_fp8_checkpoint(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Inject FP8 scales from ModelOpt backbone.pt into a diffusers export so "
-            "SGLang diffusion can load it natively."
+            "Build an SGLang-loadable ModelOpt FP8 diffusion transformer from a "
+            "ModelOpt diffusers export."
         )
     )
     parser.add_argument(
@@ -443,11 +637,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-type",
-        choices=["auto", "flux1", "flux2", "none"],
+        choices=["auto", "flux1", "flux2", "ltx2", "none"],
         default="auto",
         help=(
             "Optional model-family BF16 fallback profile. 'none' uses the generic "
-            "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 "
+            "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 / LTX-2 "
             "fallback set when the export config matches those transformer classes."
         ),
     )
@@ -477,7 +671,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    stats = convert_modelopt_fp8_checkpoint(
+    stats = build_modelopt_fp8_transformer(
         modelopt_hf_dir=args.modelopt_hf_dir,
         modelopt_backbone_ckpt=args.modelopt_backbone_ckpt,
         output_dir=args.output_dir,
