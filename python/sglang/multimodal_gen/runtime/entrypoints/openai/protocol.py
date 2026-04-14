@@ -50,6 +50,7 @@ class ImageGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
+    calibrate_cache: Optional[bool] = False
     # Upscaling
     enable_upscaling: Optional[bool] = False
     upscaling_model_path: Optional[str] = None
@@ -102,6 +103,7 @@ class VideoGenerationsRequest(BaseModel):
     )
     negative_prompt: Optional[str] = None
     enable_teacache: Optional[bool] = False
+    calibrate_cache: Optional[bool] = False
     # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False
     frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×

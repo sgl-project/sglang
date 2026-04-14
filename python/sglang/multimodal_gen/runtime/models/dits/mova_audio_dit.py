@@ -182,7 +182,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
         self.num_channels_latents = out_dim
         self.layer_names = ["blocks"]
         self.cnt = 0
-        self.teacache_thresh = 0
+        self.rel_l1_thresh = 0
         self.coefficients = []
         self.accumulated_rel_l1_distance = 0
         self.previous_modulated_input = None

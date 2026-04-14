@@ -8,16 +8,13 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models import DiTConfig
-
-# NOTE: TeaCacheContext and TeaCacheMixin have been moved to
-# sglang.multimodal_gen.runtime.cache.teacache
-# For backwards compatibility, re-export from the new location
-from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext  # noqa: F401
-from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
+from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheStrategy
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
-# TODO
 class BaseDiT(nn.Module, ABC):
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
@@ -87,11 +84,15 @@ class BaseDiT(nn.Module, ABC):
         return next(self.parameters()).device
 
 
-class CachableDiT(TeaCacheMixin, BaseDiT):
-    """
-    An intermediate base class that adds TeaCache optimization functionality to DiT models.
+_CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
 
-    Inherits TeaCacheMixin for cache logic and BaseDiT for core DiT functionality.
+
+class CachableDiT(BaseDiT):
+    """
+    An intermediate base class that adds timestep-caching support for DiT models
+    such as TeaCache.
+
+    Inherits `BaseDiT` for core DiT functionality and stores cache logic in `self.cache`.
     """
 
     # These are required class attributes that should be overridden by concrete implementations
@@ -109,8 +110,53 @@ class CachableDiT(TeaCacheMixin, BaseDiT):
     )
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
+        """
+        Args:
+            config: DiT model configuration.
+            **kwargs: Passed through to BaseDiT (e.g. hf_config).
+
+        Attributes:
+            cache: Active cache strategy, or a sentinel:
+                - None: uninitialized; init_cache() has not been called yet.
+                - False: no cache strategy requested.
+                - DiffusionCache: an active cache strategy (e.g. TeaCacheStrategy).
+            calibrate_cache: When True, run every forward pass to calibrate
+                the values needed for caching.
+        """
         super().__init__(config, **kwargs)
-        self._init_teacache_state()
+        self.cache: TeaCacheStrategy | bool | None = None
+        self.calibrate_cache: bool = False
+
+    def init_cache(self) -> None:
+        """Construct the cache strategy from the current forward_batch context.
+
+        Called lazily on the first forward pass because sampling params
+        (e.g. `enable_teacache`) are only available then.
+        """
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        fb = get_forward_context().forward_batch
+        if fb is None:
+            return
+
+        # caching strategies may handle pos/neg cfg separately
+        supports_cfg = self.config.prefix.lower() in _CFG_SUPPORTED_PREFIXES
+
+        # select caching strategy
+        if fb.enable_teacache:
+            self.cache = TeaCacheStrategy(supports_cfg)
+        else:
+            self.cache = False
+
+        if fb.calibrate_cache:
+            if self.cache:
+                self.calibrate_cache = fb.calibrate_cache
+            else:
+                logger.warning(
+                    "Calibrate cache is set to True but no cache is defined."
+                )
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, dict[str, Any]]:

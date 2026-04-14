@@ -162,9 +162,8 @@ class SamplingParams:
 
     # TeaCache parameters
     enable_teacache: bool = False
-    teacache_params: Any = (
-        None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
-    )
+    cache_params: Any | None = None
+    calibrate_cache: bool = False
 
     # Profiling
     profile: bool = False
@@ -645,6 +644,12 @@ class SamplingParams:
             "--enable-teacache",
             action="store_true",
         )
+        parser.add_argument(
+            "--calibrate-cache",
+            action="store_true",
+            default=SamplingParams.calibrate_cache,
+            help="Run in calibration mode: collect magnitude ratio statistics instead of skipping steps.",
+        )
 
         # profiling
         add_argument(
@@ -1005,4 +1010,4 @@ class SamplingParams:
 
 @dataclass
 class CacheParams:
-    cache_type: str = "none"
+    pass

@@ -22,7 +22,7 @@ class ZImageTurboSamplingParams(SamplingParams):
 
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
-            teacache_thresh=0.15,
+            rel_l1_thresh=0.15,
             coefficients=[
                 7.33226126e02,
                 -4.01131952e02,

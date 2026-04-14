@@ -4,12 +4,10 @@
 
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import HunyuanVideoConfig
-from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
@@ -36,12 +34,10 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     TimestepEmbedder,
     unpatchify,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import modulate
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
-    current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 
@@ -580,9 +576,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         Returns:
             Tuple of (output)
         """
-        forward_context = get_forward_context()
-        forward_batch = forward_context.forward_batch
-        enable_teacache = forward_batch is not None and forward_batch.enable_teacache
+
+        # if caching is enabled, we might initialize or reset the cache state
+        if self.cache is None:
+            self.init_cache()
+        if self.cache:
+            self.cache.maybe_reset()
 
         if guidance is None:
             guidance = torch.tensor(
@@ -635,14 +634,17 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
-        should_skip_forward = self.should_skip_forward_for_cached_states(
-            img=img, vec=vec
-        )
+        # if caching is enabled, we might be able to skip the forward pass
+        should_skip_forward = False
+        if self.cache and not self.calibrate_cache:
+            modulated_input = self._get_modulated_input(img.clone(), vec.clone())
+            should_skip_forward = self.cache.should_skip(modulated_input)
 
         if should_skip_forward:
-            img = self.retrieve_cached_states(img)
+            # compute img using the cached state
+            img = self.cache.read(img)
         else:
-            if enable_teacache:
+            if self.cache and not self.calibrate_cache:
                 original_img = img.clone()
 
             # Process through double stream blocks
@@ -666,8 +668,12 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # Extract image features
             img = x[:, :img_seq_len, ...]
 
-            if enable_teacache:
-                self.maybe_cache_states(img, original_img)
+            if self.cache and not self.calibrate_cache:
+                self.cache.write(
+                    img,
+                    original_img,
+                    modulated_input=modulated_input,
+                )
 
         # Final layer processing
         img = self.final_layer(img, vec)
@@ -676,112 +682,13 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         return img
 
-    def maybe_cache_states(
-        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
-    ) -> None:
-        self.previous_residual = hidden_states - original_hidden_states
-
-    def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
-
-        forward_context = get_forward_context()
-        forward_batch = forward_context.forward_batch
-        if forward_batch is None:
-            return False
-        current_timestep = forward_context.current_timestep
-        enable_teacache = forward_batch.enable_teacache
-
-        if not enable_teacache:
-            return False
-        raise NotImplementedError("teacache is not supported yet for HunyuanVideo")
-
-        teacache_params = forward_batch.teacache_params
-        assert teacache_params is not None, "teacache_params is not initialized"
-        assert isinstance(
-            teacache_params, TeaCacheParams
-        ), "teacache_params is not a TeaCacheParams"
-        num_inference_steps = forward_batch.num_inference_steps
-        teache_thresh = teacache_params.teacache_thresh
-
-        coefficients = teacache_params.coefficients
-
-        if current_timestep == 0:
-            self.cnt = 0
-
-        inp = kwargs["img"].clone()
-        vec_ = kwargs["vec"].clone()
-        # convert to DTensor
-        vec_ = torch.distributed.tensor.DTensor.from_local(
-            vec_,
-            torch.distributed.DeviceMesh(
-                current_platform.device_type,
-                list(range(get_sp_world_size())),
-                mesh_dim_names=("dp",),
-            ),
-            [torch.distributed.tensor.Replicate()],
-        )
-
-        inp = torch.distributed.tensor.DTensor.from_local(
-            inp,
-            torch.distributed.DeviceMesh(
-                current_platform.device_type,
-                list(range(get_sp_world_size())),
-                mesh_dim_names=("dp",),
-            ),
-            [torch.distributed.tensor.Replicate()],
-        )
-
-        # txt_ = kwargs["txt"].clone()
-
-        # inp = img.clone()
-        # vec_ = vec.clone()
-        # txt_ = txt.clone()
-        (
-            img_mod1_shift,
-            img_mod1_scale,
-            img_mod1_gate,
-            img_mod2_shift,
-            img_mod2_scale,
-            img_mod2_gate,
-        ) = (
-            self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
+    def _get_modulated_input(self, inp, vec) -> bool:
+        img_mod1_shift, img_mod1_scale = (
+            self.double_blocks[0].img_mod(vec).chunk(6, dim=-1)[:2]
         )
         normed_inp = self.double_blocks[0].img_attn_norm.norm(inp)
         modulated_inp = modulate(normed_inp, shift=img_mod1_shift, scale=img_mod1_scale)
-        if self.cnt == 0 or self.cnt == num_inference_steps - 1:
-            should_calc = True
-            self.accumulated_rel_l1_distance = 0
-        else:
-            coefficients = [
-                7.33226126e02,
-                -4.01131952e02,
-                6.75869174e01,
-                -3.14987800e00,
-                9.61237896e-02,
-            ]
-            rescale_func = np.poly1d(coefficients)
-            assert (
-                self.previous_modulated_input is not None
-            ), "previous_modulated_input is not initialized"
-            self.accumulated_rel_l1_distance += rescale_func(
-                (
-                    (modulated_inp - self.previous_modulated_input).abs().mean()
-                    / self.previous_modulated_input.abs().mean()
-                )
-                .cpu()
-                .item()
-            )
-            if self.accumulated_rel_l1_distance < teache_thresh:
-                should_calc = False
-            else:
-                should_calc = True
-                self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = modulated_inp
-        self.cnt += 1
-
-        return not should_calc
-
-    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states + self.previous_residual
+        return modulated_inp
 
 
 class SingleTokenRefiner(nn.Module):

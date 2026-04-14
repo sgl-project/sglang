@@ -100,7 +100,7 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         params = SamplingParams(
             prompt="callable teacache",
-            teacache_params=TeaCacheParams(
+            cache_params=TeaCacheParams(
                 coefficients_callback=coefficients_callback,
             ),
         )

@@ -17,7 +17,7 @@ class TeaCacheParams(CacheParams):
     Attributes:
         cache_type: (`str`, defaults to `teacache`):
             A string labeling these parameters as belonging to teacache.
-        teacache_thresh (`float`, defaults to `0.0`):
+        rel_l1_thresh (`float`, defaults to `0.0`):
             Threshold for accumulated relative L1 distance. When below this threshold, the
             forward pass is skipped. Recommended values: 0.25 for ~1.5x speedup, 0.4 for ~1.8x,
             0.6 for ~2.0x.
@@ -48,7 +48,7 @@ class TeaCacheParams(CacheParams):
     """
 
     cache_type: str = "teacache"
-    teacache_thresh: float = 0.0
+    rel_l1_thresh: float = 0.0
     start_skipping: int | float = 5
     end_skipping: int | float = -1
     coefficients: list[float] = field(default_factory=list)

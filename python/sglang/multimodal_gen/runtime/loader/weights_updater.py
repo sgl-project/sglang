@@ -46,13 +46,13 @@ from pathlib import Path
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
 
-from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -213,8 +213,8 @@ class WeightsUpdater:
 
         if success and flush_cache:
             for _, module in modules_to_update:
-                if isinstance(module, TeaCacheMixin):
-                    module.reset_teacache_state()
+                if isinstance(module, CachableDiT) and module.cache:
+                    module.cache.reset()
 
         logger.info(message)
         return success, message
