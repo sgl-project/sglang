@@ -44,7 +44,6 @@ ACCURACY_ONE_GPU_CASE_IDS = (
     "fastwan2_2_ti2v_5b",
     "hunyuan3d_shape_gen",
     "turbo_wan2_1_t2v_1.3b",
-    "flux_2_nvfp4_t2i",
     "flux_2_ti2i_multi_image_cache_dit",
 )
 
