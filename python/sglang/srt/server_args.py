@@ -3165,6 +3165,9 @@ class ServerArgs:
                     self.quantization == "modelslim"
                 ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
         if self.moe_a2a_backend == "flashinfer":
+            assert (
+                self.enable_dp_attention and self.dp_size == self.tp_size
+            ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
             self.ep_size = self.tp_size
             logger.warning(
                 f"Flashinfer MoE A2A is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."

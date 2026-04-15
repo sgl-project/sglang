@@ -2056,7 +2056,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 ensure_cutedsl_wrapper,
             )
 
-            ensure_cutedsl_wrapper(layer)
+            ensure_cutedsl_wrapper(layer, dispatch_output.hidden_states.shape[0])
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
             w1_weight_sf = getattr(
                 layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled

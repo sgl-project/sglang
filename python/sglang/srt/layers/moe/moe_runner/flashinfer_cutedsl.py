@@ -218,8 +218,16 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
-def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
+def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
+
+    Args:
+        layer: The FusedMoE layer module.
+        num_tokens: Current token count entering the MoE layer.  Used as
+            the buffer size for the non-a2a (allgather) path, where the
+            autotune dummy run passes req_to_token_pool.size * dp_size —
+            the worst-case post-allgather batch.  For the a2a path this
+            is ignored in favour of the dispatcher's workspace limit.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
     it depends on final weight shapes and EP configuration.  The wrapper's
@@ -249,16 +257,19 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
 
     server_args = get_global_server_args()
     use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
-    max_num_tokens = max(
-        getattr(server_args, "cuda_graph_max_bs", None) or 512,
-        getattr(server_args, "chunked_prefill_size", None) or 8192,
-    )
-    # In DP attention + EP mode, MoE receives tokens from all DP ranks:
-    # - Standard path (allgather): dp_size * local_tokens
-    # - A2A path (dispatch): ep_size * runtime_max_per_rank
-    dp_size = getattr(server_args, "dp_size", 1) or 1
-    if dp_size > 1:
-        max_num_tokens *= dp_size
+
+    # Buffer size must cover the worst-case token count the MoE layer can see.
+    # - A2A path: bounded by the dispatcher's workspace allocation.
+    # - Standard allgather path: dp_size * max local tokens per rank.
+    dispatcher = getattr(layer, "dispatcher", None)
+    if hasattr(dispatcher, "max_num_tokens"):
+        # A2A path: bounded by the dispatcher's workspace allocation.
+        max_num_tokens = dispatcher.max_num_tokens
+    else:
+        # Standard allgather path: num_tokens from the first forward is
+        # req_to_token_pool.size * dp_size (the autotune dummy run's batch),
+        # which is the worst-case post-allgather token count.
+        max_num_tokens = max(num_tokens, 1)
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
