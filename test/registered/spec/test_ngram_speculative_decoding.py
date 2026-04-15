@@ -182,7 +182,7 @@ class TestNgramSpeculativeDecodingFlashinfer(TestNgramSpeculativeDecodingBase):
         self.assertEqual(resp.status_code, 200, resp.text)
         payload = resp.json()
         self.assertTrue(payload["success"], payload.get("message"))
-        for corpus_id in payload["corpus_ids"]:
+        for corpus_id in payload["corpus_token_counts"]:
             remove_resp = requests.post(
                 self.base_url + "/remove_external_corpus",
                 json={"corpus_id": corpus_id},
