@@ -435,6 +435,7 @@ class SDARInterleavedWorker:
 
         # next_token_ids: the last token of each block (used for scheduling)
         next_token_ids = block_tokens[:, -1]
+        print(f"[SDAR_DBG] decode done: accepted={total_accepted}, next_tok={next_token_ids.tolist()}, seq_lens={batch.seq_lens.tolist()}, mask_remain={int((block_tokens==mask_id).sum())}", flush=True)
 
         return GenerationBatchResult(
             logits_output=None,
