@@ -54,6 +54,7 @@ from fastapi import (
     Query,
     Request,
     UploadFile,
+    WebSocket,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -1578,6 +1579,12 @@ async def openai_v1_audio_transcriptions(
             raw_request=raw_request,
         )
     )
+
+
+@app.websocket("/v1/audio/transcriptions/stream")
+async def openai_v1_audio_transcriptions_ws(ws: WebSocket):
+    """WebSocket endpoint for real-time streaming audio transcription."""
+    await ws.app.state.openai_serving_transcription.handle_websocket(ws)
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)

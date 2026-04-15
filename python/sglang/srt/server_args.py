@@ -441,6 +441,7 @@ class ServerArgs:
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
+    asr_max_buffer_seconds: int = 60
 
     # Data parallelism
     dp_size: int = 1
@@ -4828,6 +4829,15 @@ class ServerArgs:
             "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
             "'model' uses the model's generation_config.json to get the recommended "
             "sampling parameters if available. Default is 'model'.",
+        )
+        parser.add_argument(
+            "--asr-max-buffer-seconds",
+            type=int,
+            default=ServerArgs.asr_max_buffer_seconds,
+            help="Maximum seconds of PCM audio the streaming ASR WebSocket handler "
+            "will accumulate before closing the session with a buffer_overflow "
+            "error. Guards against OOM when a client streams audio faster than "
+            "inference can consume it. Default 60s.",
         )
 
         # Data parallelism
