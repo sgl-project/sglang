@@ -213,13 +213,36 @@ def process_content_for_template_format(
 
     elif content_format == "string":
         # String format: flatten to text only (for templates like DeepSeek)
+        # Still extract multimodal data for the processor pipeline.
         text_parts = []
         for chunk in msg_dict["content"]:
-            if isinstance(chunk, dict) and chunk.get("type") == "text":
+            if not isinstance(chunk, dict):
+                continue
+            chunk_type = chunk.get("type")
+            if chunk_type == "text":
                 text_parts.append(chunk["text"])
-            # Note: For string format, we ignore images/audio since the template
-            # doesn't expect structured content - multimodal placeholders would
-            # need to be inserted differently
+            elif chunk_type == "image_url":
+                image_obj = chunk.get("image_url") or {}
+                image_data.append(
+                    ImageData(
+                        url=image_obj["url"],
+                        detail=image_obj.get("detail", "auto"),
+                        max_dynamic_patch=image_obj.get("max_dynamic_patch"),
+                    )
+                )
+                if chunk.get("modalities"):
+                    modalities.append(chunk.get("modalities"))
+            elif chunk_type == "video_url":
+                video_obj = chunk.get("video_url") or {}
+                mdp = video_obj.get("max_dynamic_patch")
+                if mdp is None:
+                    video_data.append(video_obj["url"])
+                else:
+                    video_data.append({"url": video_obj["url"], "max_dynamic_patch": mdp})
+                if chunk.get("modalities"):
+                    modalities.append(chunk.get("modalities"))
+            elif chunk_type == "audio_url":
+                audio_data.append(chunk["audio_url"]["url"])
 
         new_msg = msg_dict.copy()
         new_msg["content"] = " ".join(text_parts) if text_parts else ""
