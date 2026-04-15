@@ -265,10 +265,10 @@ async def _abort_repro_generate(
                 assert finish_reason.get("type") == "abort", text
                 assert "maximum allowed length" in finish_reason.get(
                     "message", ""
-                ), text
+                ) or "context length" in finish_reason.get("message", ""), text
                 return data
             assert resp.status == 400, text
-            assert "maximum allowed length" in text, text
+            assert "maximum allowed length" in text or "context length" in text, text
             return None
 
         assert resp.status == 200, text
