@@ -1,14 +1,3 @@
-"""
-Streaming session tests: KV cache mechanics, logprob leak, chunked prefill leak.
-
-All tests share a single server (DEFAULT_SMALL_MODEL) with streaming sessions
-and chunked prefill enabled.
-
-Usage:
-    python -m pytest test_streaming_session.py -xvs
-    python -m unittest test_streaming_session.TestStreamingSession
-"""
-
 import asyncio
 import json
 import time

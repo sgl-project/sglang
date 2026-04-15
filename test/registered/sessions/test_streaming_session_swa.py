@@ -1,14 +1,3 @@
-"""
-Streaming session tests on a hybrid-SWA model (openai/gpt-oss-20b).
-
-Mirrors test_streaming_session.py, but exercises the swa_token pool accounting
-path (session_held_swa_tokens, swa_evicted_seqlen tracking, swa_protected_size).
-
-Usage:
-    python -m pytest test_streaming_session_swa.py -xvs
-    python -m unittest test_streaming_session_swa.TestStreamingSessionSWA
-"""
-
 import os
 import sys
 import unittest
