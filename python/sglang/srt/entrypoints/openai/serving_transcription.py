@@ -12,11 +12,16 @@
 # limitations under the License.
 # ==============================================================================
 """
-OpenAI-compatible transcription endpoint handler for Whisper models.
+OpenAI-compatible transcription endpoint handler for audio ASR models.
+
+New ASR models are supported by subclassing ``TranscriptionAdapter`` and
+registering via the ``@register_transcription_adapter`` decorator.
+See ``transcription_adapters/`` for built-in implementations.
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import math
@@ -32,13 +37,17 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     TranscriptionRequest,
     TranscriptionResponse,
-    TranscriptionSegment,
     TranscriptionStreamChoice,
     TranscriptionStreamResponse,
     TranscriptionUsage,
     TranscriptionVerboseResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.streaming_asr import (
+    StreamingASRState,
+    split_audio_chunks,
+)
+from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 if TYPE_CHECKING:
@@ -46,16 +55,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Whisper timestamp token constants
-TIMESTAMP_BASE_TOKEN_ID = 50365  # <|0.00|>
-TIMESTAMP_BASE_OFFSET = 0.02  # Each token step = 0.02 seconds
-
 
 class OpenAIServingTranscription(OpenAIServingBase):
     """Handler for /v1/audio/transcriptions requests"""
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         super().__init__(tokenizer_manager)
+        model_config = tokenizer_manager.model_config
+        self._adapter = resolve_adapter(
+            getattr(model_config.hf_config, "architectures", [])
+        )
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
@@ -71,19 +80,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, TranscriptionRequest]:
         """Convert transcription request to internal format."""
-        # Build sampling params - include language for WhisperProcessor
-        sampling_params = {
-            "temperature": request.temperature,
-            "max_new_tokens": 448,  # Whisper default max tokens
-            "language": request.language,  # Pass to WhisperProcessor for language-specific decoding
-        }
-
-        if request.timestamp_granularities:
-            sampling_params["timestamp_granularities"] = request.timestamp_granularities
-
-        # For Whisper, we pass audio_data and let the processor handle it
+        sampling_params = self._adapter.build_sampling_params(request)
         adapted_request = GenerateReqInput(
-            text="",  # Empty text - Whisper processor will set proper decoder tokens
+            text="",  # Empty text — the multimodal processor sets proper decoder/prompt tokens
             audio_data=request.audio_data,
             sampling_params=sampling_params,
             stream=request.stream,
@@ -93,7 +92,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _get_audio_duration(self, audio_data: bytes) -> float:
+    @staticmethod
+    def _get_audio_duration(audio_data: bytes) -> float:
         """Calculate audio duration in seconds."""
         try:
             import soundfile as sf
@@ -103,77 +103,6 @@ class OpenAIServingTranscription(OpenAIServingBase):
         except Exception as e:
             logger.warning(f"Could not calculate audio duration: {e}")
             return 0.0
-
-    def _parse_segments(
-        self, output_ids: List[int], tokenizer
-    ) -> tuple[str, List[TranscriptionSegment]]:
-        """Parse timestamp tokens from output_ids into segments.
-
-        The decoder prompt ends with <|0.00|>, so the first segment starts at
-        t=0.  The model then outputs:
-            text_tokens <|end_ts|> [<|start_ts|> text_tokens <|end_ts|> ...]
-        Each timestamp token marks the end of the current segment; its value
-        also becomes the start of the next segment.
-        """
-        # Token IDs for special tokens we want to strip from segment text
-        eos_token_id = getattr(tokenizer, "eos_token_id", 50257)
-
-        segments = []
-        full_text_parts = []
-        current_text_tokens = []
-        current_start = 0.0  # First segment starts at 0.0 (from prompt <|0.00|>)
-        seg_id = 0
-
-        for token_id in output_ids:
-            if token_id >= TIMESTAMP_BASE_TOKEN_ID:
-                # This is a timestamp token — marks the end of current segment
-                timestamp = (token_id - TIMESTAMP_BASE_TOKEN_ID) * TIMESTAMP_BASE_OFFSET
-
-                if current_text_tokens:
-                    text = tokenizer.decode(
-                        current_text_tokens, skip_special_tokens=True
-                    ).strip()
-                    if text:
-                        segments.append(
-                            TranscriptionSegment(
-                                id=seg_id,
-                                start=round(current_start, 2),
-                                end=round(timestamp, 2),
-                                text=text,
-                            )
-                        )
-                        full_text_parts.append(text)
-                        seg_id += 1
-                    current_text_tokens = []
-
-                # Next segment starts at this timestamp
-                current_start = timestamp
-
-            elif token_id == eos_token_id:
-                # Skip end-of-text token
-                continue
-            else:
-                # Regular text token
-                current_text_tokens.append(token_id)
-
-        # Handle any trailing text tokens without a closing timestamp
-        if current_text_tokens:
-            text = tokenizer.decode(
-                current_text_tokens, skip_special_tokens=True
-            ).strip()
-            if text:
-                segments.append(
-                    TranscriptionSegment(
-                        id=seg_id,
-                        start=round(current_start, 2),
-                        end=round(current_start, 2),
-                        text=text,
-                    )
-                )
-                full_text_parts.append(text)
-
-        full_text = " ".join(full_text_parts)
-        return full_text, segments
 
     async def create_transcription(
         self,
@@ -231,7 +160,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         except ValueError as e:
             return self.create_error_response(str(e))
 
-        text = ret.get("text", "")
+        text = self._adapter.postprocess_text(ret.get("text", ""))
         usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
         # Build response based on format
@@ -239,16 +168,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
             return Response(content=text, media_type="text/plain")
 
         if request.response_format == "verbose_json":
-            output_ids = ret.get("output_ids", [])
             tokenizer = self.tokenizer_manager.tokenizer
-            parsed_text, segments = self._parse_segments(output_ids, tokenizer)
-
-            return TranscriptionVerboseResponse(
-                language=request.language or "en",
-                duration=round(request.audio_duration_s, 2),
-                text=parsed_text or text,
-                segments=segments,
-                usage=usage,
+            return self._adapter.build_verbose_response(
+                request, text, ret, tokenizer, usage
             )
 
         # Default JSON format
@@ -261,6 +183,15 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming transcription request."""
+        if self._adapter.supports_chunked_streaming:
+            # No background abort_task: each chunk is a separate request;
+            # client disconnection is detected via is_disconnected() in the loop.
+            return StreamingResponse(
+                self._generate_chunked_asr_stream(
+                    adapted_request, request, raw_request
+                ),
+                media_type="text/event-stream",
+            )
         return StreamingResponse(
             self._generate_transcription_stream(adapted_request, request, raw_request),
             media_type="text/event-stream",
@@ -320,6 +251,117 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
+            error = self.create_streaming_error_response(str(e))
+            yield f"data: {error}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    async def _generate_chunked_asr_stream(
+        self,
+        adapted_request: GenerateReqInput,
+        request: TranscriptionRequest,
+        raw_request: Request,
+    ) -> AsyncGenerator[str, None]:
+        """Chunk-based streaming for ASR with prefix rollback.
+
+        Audio is split into chunks and each chunk is processed as an
+        independent request. Partial transcripts are emitted via SSE
+        with prefix rollback to reduce boundary jitter.
+
+        TODO:
+        - Token-level streaming within chunks (stream=True)
+        - Encoder window caching across chunks
+        - Cross-chunk KV cache reuse
+        - WebSocket endpoint for real-time audio input
+        """
+        created_time = int(time.time())
+        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+        model = request.model
+        state = StreamingASRState(**self._adapter.chunked_streaming_config)
+        first_word = True
+
+        try:
+            chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
+
+            for i, chunk_audio in enumerate(chunks):
+                if await raw_request.is_disconnected():
+                    logger.info("[streaming_asr] client disconnected, stopping")
+                    break
+                is_last = i == len(chunks) - 1
+                prompt = self._adapter.prompt_template + state.get_prefix_text()
+
+                chunk_request = GenerateReqInput(
+                    text=prompt,
+                    audio_data=chunk_audio,
+                    sampling_params=adapted_request.sampling_params,
+                    stream=False,
+                    modalities=["audio"],
+                    routing_key=self.extract_routing_key(raw_request),
+                )
+
+                try:
+                    ret = None
+                    async for ret in self.tokenizer_manager.generate_request(
+                        chunk_request, raw_request
+                    ):
+                        break
+                except asyncio.CancelledError:
+                    raise
+                except ValueError as e:
+                    logger.warning(
+                        "[streaming_asr] chunk %d failed with ValueError: %s", i, e
+                    )
+                    continue
+
+                if ret is None:
+                    logger.warning("[streaming_asr] empty response for chunk %d", i)
+                    continue
+
+                text = self._adapter.postprocess_text(ret.get("text", ""))
+
+                if is_last:
+                    state.full_transcript = text
+                    delta = state.finalize()
+                else:
+                    delta = state.update(text)
+
+                if delta:
+                    for word in delta.split(" "):
+                        if not word:
+                            continue
+                        content = word if first_word else " " + word
+                        first_word = False
+                        chunk_resp = TranscriptionStreamResponse(
+                            id=request_id,
+                            created=created_time,
+                            model=model,
+                            choices=[
+                                TranscriptionStreamChoice(
+                                    delta=DeltaMessage(content=content),
+                                    finish_reason=None,
+                                )
+                            ],
+                        )
+                        yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+            # Send final stop
+            chunk_resp = TranscriptionStreamResponse(
+                id=request_id,
+                created=created_time,
+                model=model,
+                choices=[
+                    TranscriptionStreamChoice(
+                        delta=DeltaMessage(),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("[streaming_asr] unrecoverable error")
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 

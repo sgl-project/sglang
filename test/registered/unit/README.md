@@ -81,7 +81,11 @@ from sglang.srt.managers.scheduler import Scheduler
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 ```
 
-The same pattern can be applied to other GPU-only packages: try importing the real package, and if it fails, register a `sys.meta_path` finder that stubs it. See `maybe_stub_sgl_kernel()` in `python/sglang/test/test_utils.py` for the implementation.
+The same pattern (`sys.meta_path` finder) can be applied to other GPU-only packages.
+See `maybe_stub_sgl_kernel()` in `python/sglang/test/test_utils.py` for the
+implementation. Do not directly mutate `sys.modules` at module level — pytest
+imports all test files before running any, so such mutations pollute the entire
+process. If you must stub, use `patch.dict("sys.modules", ...)` with proper cleanup.
 
 ## Rules
 

@@ -19,11 +19,11 @@ struct ActDtype<false> {
   using type = uint8_t;
 };
 
+#if defined(CPU_CAPABILITY_AVX512)
 struct alignas(32) m256i_wrapper {
   __m256i data;
 };
 
-#if defined(CPU_CAPABILITY_AVX512)
 inline std::array<m256i_wrapper, 2> load_zps_4vnni(const int8_t* __restrict__ zps) {
   // broadcast 01234567 to
   // 01234567012345670123456701234567

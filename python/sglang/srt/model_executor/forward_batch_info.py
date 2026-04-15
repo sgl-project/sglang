@@ -359,6 +359,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
 
+    # For token embedding overrides (sparse replacement at specific positions)
+    replace_embeds: Optional[torch.Tensor] = None
+    replace_positions: Optional[torch.Tensor] = None
+
     # For cross-encoder model
     token_type_ids: Optional[torch.Tensor] = None
 
@@ -473,6 +477,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
+            replace_embeds=batch.replace_embeds,
+            replace_positions=batch.replace_positions,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
