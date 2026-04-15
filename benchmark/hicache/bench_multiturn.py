@@ -643,17 +643,8 @@ class WorkloadGenerator:
 
     def _send_heartbeat(self, input_len=100, output_len=20):
         """Send a small heartbeat request to the server."""
-        if self.api_format == "openai":
-            heartbeat_text = " ".join(["1"] * input_len)
-            payload = gen_payload_openai(
-                [{"role": "user", "content": heartbeat_text}],
-                output_len,
-                self.model_path,
-                self.args.cache_report,
-            )
-        else:
-            heartbeat_input = [1] * input_len
-            payload = gen_payload(heartbeat_input, output_len, self.lora_path)
+        heartbeat_input = [1] * input_len
+        payload = gen_payload(heartbeat_input, output_len, self.lora_path)
         try:
             requests.post(self.url, json=payload, timeout=30)
         except Exception as e:
