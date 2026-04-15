@@ -631,7 +631,196 @@ void multimodal_rotary_embedding_2D_kernel_impl(
   });
 }
 
+// Apply multidimensional RoPE to a single tensor x.
+// x: [num_tokens, num_heads, head_dim], cos/sin: [num_tokens, head_dim]
+// Splits head_dim into ndim=2 chunks and applies standard rotary to each independently.
+// cos/sin layout per chunk (chunk_size elements): [cos_half0, cos_half1] matching
+// rotate_half pattern: out_x = x_first * cos_first - x_second * sin_first
+//                      out_y = x_second * cos_second + x_first * sin_second
+template <typename scalar_t, typename param_t>
+void apply_multidimensional_rope_kernel_impl(
+    scalar_t* __restrict__ x,
+    param_t* __restrict__ cos,
+    param_t* __restrict__ sin,
+    int64_t x_stride_s,
+    int64_t num_heads,
+    int64_t head_dim,
+    int64_t num_tokens) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t bVecSize = bVec::size();
+  constexpr int64_t fVecSize = fVec::size();
+
+  constexpr int64_t ndim = 2;
+  int64_t chunk_size = head_dim / ndim;
+  int64_t embed_dim = chunk_size / 2;
+
+  bool flag = (embed_dim % bVecSize == 0);
+  int64_t loop_upper = flag ? embed_dim : embed_dim - bVecSize;
+
+  // Vectorized compute loop for a single chunk within a single head.
+  // token_head: offset into x for (token, head)
+  // cos_ptr/sin_ptr: pointer to the cos/sin data for the chunk
+  auto compute_loop = [&](int64_t token_head, param_t* cos_ptr, param_t* sin_ptr) {
+    int64_t j = 0;
+    for (; j < loop_upper; j += bVecSize) {
+      int64_t x_index = j;
+      int64_t y_index = embed_dim + j;
+
+      int64_t out_x = token_head + x_index;
+      int64_t out_y = token_head + y_index;
+
+      // Load cos/sin vectors
+      fVec _cos_x_0, _cos_x_1, _sin_x_0, _sin_x_1;
+      fVec _cos_y_0, _cos_y_1, _sin_y_0, _sin_y_1;
+      if constexpr (std::is_same_v<param_t, float>) {
+        _cos_x_0 = fVec::loadu(cos_ptr + x_index);
+        _sin_x_0 = fVec::loadu(sin_ptr + x_index);
+        _cos_x_1 = fVec::loadu(cos_ptr + x_index + fVecSize);
+        _sin_x_1 = fVec::loadu(sin_ptr + x_index + fVecSize);
+
+        _cos_y_0 = fVec::loadu(cos_ptr + y_index);
+        _sin_y_0 = fVec::loadu(sin_ptr + y_index);
+        _cos_y_1 = fVec::loadu(cos_ptr + y_index + fVecSize);
+        _sin_y_1 = fVec::loadu(sin_ptr + y_index + fVecSize);
+      } else {
+        using pVec = at::vec::Vectorized<param_t>;
+        pVec _cos_x = pVec::loadu(cos_ptr + x_index);
+        pVec _sin_x = pVec::loadu(sin_ptr + x_index);
+        pVec _cos_y = pVec::loadu(cos_ptr + y_index);
+        pVec _sin_y = pVec::loadu(sin_ptr + y_index);
+        std::tie(_cos_x_0, _cos_x_1) = at::vec::convert_to_float(_cos_x);
+        std::tie(_sin_x_0, _sin_x_1) = at::vec::convert_to_float(_sin_x);
+        std::tie(_cos_y_0, _cos_y_1) = at::vec::convert_to_float(_cos_y);
+        std::tie(_sin_y_0, _sin_y_1) = at::vec::convert_to_float(_sin_y);
+      }
+
+      bVec _q_x = bVec::loadu(x + out_x);
+      bVec _q_y = bVec::loadu(x + out_y);
+      fVec _q_x_0, _q_x_1;
+      std::tie(_q_x_0, _q_x_1) = at::vec::convert_to_float(_q_x);
+      fVec _q_y_0, _q_y_1;
+      std::tie(_q_y_0, _q_y_1) = at::vec::convert_to_float(_q_y);
+
+      auto out1_0 = _q_x_0 * _cos_x_0 - _q_y_0 * _sin_x_0;
+      auto out1_1 = _q_x_1 * _cos_x_1 - _q_y_1 * _sin_x_1;
+      auto out1 = convert_from_float_ext<scalar_t>(out1_0, out1_1);
+      out1.store(x + out_x);
+
+      auto out2_0 = _q_y_0 * _cos_y_0 + _q_x_0 * _sin_y_0;
+      auto out2_1 = _q_y_1 * _cos_y_1 + _q_x_1 * _sin_y_1;
+      auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
+      out2.store(x + out_y);
+    }
+    if (!flag) {
+      for (; j < embed_dim; ++j) {
+        int64_t x_index = j;
+        int64_t y_index = embed_dim + j;
+
+        int64_t out_x = token_head + x_index;
+        int64_t out_y = token_head + y_index;
+
+        float _cos_x = cos_ptr[x_index];
+        float _sin_x = sin_ptr[x_index];
+        float _cos_y = cos_ptr[y_index];
+        float _sin_y = sin_ptr[y_index];
+
+        float _q_x = x[out_x];
+        float _q_y = x[out_y];
+
+        x[out_x] = _q_x * _cos_x - _q_y * _sin_x;
+        x[out_y] = _q_y * _cos_y + _q_x * _sin_y;
+      }
+    }
+  };
+
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    int64_t token_idx = {0};
+    data_index_init(begin, token_idx, num_tokens);
+    for (int64_t i = begin; i < end; ++i) {
+      for (int64_t d = 0; d < ndim; ++d) {
+        int64_t chunk_offset = d * chunk_size;
+        param_t* cos_ptr = cos + token_idx * head_dim + chunk_offset;
+        param_t* sin_ptr = sin + token_idx * head_dim + chunk_offset;
+
+        for (int64_t h = 0; h < num_heads; ++h) {
+          int64_t token_head = token_idx * x_stride_s + h * head_dim + chunk_offset;
+          compute_loop(token_head, cos_ptr, sin_ptr);
+        }
+      }
+      data_index_step(token_idx, num_tokens);
+    }
+  });
+}
+
 }  // namespace
+
+// query: [num_tokens, num_heads, head_dim]
+// key:   [num_tokens, num_heads, head_dim]
+// cos:   [num_tokens, head_dim]
+// sin:   [num_tokens, head_dim]
+// Applies 2-D multidimensional RoPE: splits head_dim into 2 chunks and applies
+// standard rotary embedding to each independently (in-place on query and key).
+std::tuple<at::Tensor, at::Tensor>
+apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
+  RECORD_FUNCTION("sgl-kernel::apply_multidimensional_rope_cpu", std::vector<c10::IValue>({query, key}));
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
+  CHECK_INPUT(cos);
+  CHECK_INPUT(sin);
+  CHECK_DIM(3, query);
+  CHECK_DIM(3, key);
+  CHECK_DIM(2, cos);
+  CHECK_DIM(2, sin);
+  const auto input_dtype = query.scalar_type();
+  int64_t num_tokens = query.size(0);
+  CHECK_EQ(num_tokens, key.size(0));
+  CHECK_EQ(num_tokens, cos.size(0));
+  CHECK_EQ(num_tokens, sin.size(0));
+  int64_t num_heads = query.size(1);
+  CHECK_EQ(num_heads, key.size(1));
+  int64_t head_dim = query.size(2);
+  CHECK_EQ(head_dim, key.size(2));
+  CHECK_EQ(head_dim, cos.size(1));
+  CHECK_EQ(head_dim, sin.size(1));
+  TORCH_CHECK(head_dim % 2 == 0, "head_dim must be divisible by 2 (ndim=2)");
+  TORCH_CHECK(head_dim % 4 == 0, "head_dim must be divisible by 4 so each RoPE chunk is even");
+  TORCH_CHECK(
+      query.stride(1) == head_dim,
+      "query must be contiguous across heads: expected stride(1) == head_dim, got stride(1)=",
+      query.stride(1),
+      " and head_dim=",
+      head_dim);
+  TORCH_CHECK(
+      key.stride(1) == head_dim,
+      "key must be contiguous across heads: expected stride(1) == head_dim, got stride(1)=",
+      key.stride(1),
+      " and head_dim=",
+      head_dim);
+  int64_t q_stride_s = query.stride(0);
+  int64_t k_stride_s = key.stride(0);
+  TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
+  TORCH_CHECK(cos.scalar_type() == sin.scalar_type(), "cos and sin must have the same data type");
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input_dtype, cos.scalar_type(), "apply_multidimensional_rope_cpu", [&] {
+    apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
+        query.data_ptr<scalar_t>(),
+        cos.data_ptr<param_t>(),
+        sin.data_ptr<param_t>(),
+        q_stride_s,
+        num_heads,
+        head_dim,
+        num_tokens);
+    apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
+        key.data_ptr<scalar_t>(),
+        cos.data_ptr<param_t>(),
+        sin.data_ptr<param_t>(),
+        k_stride_s,
+        num_heads,
+        head_dim,
+        num_tokens);
+  });
+  return std::make_tuple(query, key);
+}
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
