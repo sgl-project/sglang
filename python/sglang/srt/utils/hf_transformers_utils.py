@@ -87,6 +87,8 @@ from sglang.srt.configs import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    Qwen3VLConfig,
+    Qwen3VLMoeConfig,
     Step3p5Config,
     Step3VLConfig,
 )
@@ -121,6 +123,8 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DeepseekVLV2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3VLConfig,
+    Qwen3VLMoeConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,

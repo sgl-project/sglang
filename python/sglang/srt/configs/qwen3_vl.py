@@ -236,6 +236,17 @@ class Qwen3VLConfig(PretrainedConfig):
     }
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        config = super().from_dict(config_dict, **kwargs)
+        if isinstance(getattr(config, "vision_config", None), dict):
+            config.vision_config = cls.sub_configs["vision_config"](
+                **config.vision_config
+            )
+        if isinstance(getattr(config, "text_config", None), dict):
+            config.text_config = cls.sub_configs["text_config"](**config.text_config)
+        return config
+
     def __init__(
         self,
         text_config=None,
@@ -251,11 +262,15 @@ class Qwen3VLConfig(PretrainedConfig):
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            self.vision_config = vision_config
 
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
+        else:
+            self.text_config = text_config
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
@@ -543,6 +558,17 @@ class Qwen3VLMoeConfig(PretrainedConfig):
     }
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        config = super().from_dict(config_dict, **kwargs)
+        if isinstance(getattr(config, "vision_config", None), dict):
+            config.vision_config = cls.sub_configs["vision_config"](
+                **config.vision_config
+            )
+        if isinstance(getattr(config, "text_config", None), dict):
+            config.text_config = cls.sub_configs["text_config"](**config.text_config)
+        return config
+
     def __init__(
         self,
         text_config=None,
@@ -558,11 +584,15 @@ class Qwen3VLMoeConfig(PretrainedConfig):
             self.vision_config = self.sub_configs["vision_config"](**vision_config)
         elif vision_config is None:
             self.vision_config = self.sub_configs["vision_config"]()
+        else:
+            self.vision_config = vision_config
 
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
+        else:
+            self.text_config = text_config
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id
