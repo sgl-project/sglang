@@ -233,9 +233,10 @@ class SDARInterleavedWorker:
         **kwargs,
     ) -> GenerationBatchResult:
         if isinstance(batch, ModelWorkerBatch):
-            # Overlap scheduler path; fall back to target-only.
+            print(f"[SDAR_DBG] forward_batch_generation: ModelWorkerBatch → target fallback", flush=True)
             return self.target_worker.forward_batch_generation(batch, **kwargs)
 
+        print(f"[SDAR_DBG] forward_batch_generation: mode={batch.forward_mode}, bs={batch.batch_size()}", flush=True)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             return self._forward_prefill(batch, **kwargs)
         else:
