@@ -1655,7 +1655,8 @@
             },
             "expected_e2e_ms": 149864.99,
             "expected_avg_denoise_ms": 3608.89,
-            "expected_median_denoise_ms": 2400.38
+            "expected_median_denoise_ms": 2400.38,
+            "estimated_full_test_time_s": 253.9
         },
         "wan2_1_t2v_14b_2gpu": {
             "stages_ms": {

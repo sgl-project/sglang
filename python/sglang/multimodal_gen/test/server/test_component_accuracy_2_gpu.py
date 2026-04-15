@@ -5,33 +5,47 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
     get_skip_reason,
     should_skip_component,
 )
+from sglang.multimodal_gen.test.server.accuracy_testcase_configs import (
+    ACCURACY_TWO_GPU_CASES,
+)
 from sglang.multimodal_gen.test.server.accuracy_utils import (
     run_native_component_accuracy_case,
     run_text_encoder_accuracy_case,
 )
 from sglang.multimodal_gen.test.server.component_accuracy import AccuracyEngine
-from sglang.multimodal_gen.test.server.testcase_configs import ACCURACY_TWO_GPU_CASES_B
 
 
-@pytest.mark.parametrize("case", ACCURACY_TWO_GPU_CASES_B, ids=lambda x: x.id)
-class TestAccuracy2GPU_B:
-    """2-GPU Component Accuracy Suite (Set B)."""
+@pytest.mark.parametrize("case", ACCURACY_TWO_GPU_CASES, ids=lambda case: case.id)
+class TestComponentAccuracy2GPU:
+    """2-GPU component accuracy suite."""
 
     def test_vae_accuracy(self, case):
         if should_skip_component(case, ComponentType.VAE):
             pytest.skip(get_skip_reason(case, ComponentType.VAE))
         run_native_component_accuracy_case(
-            AccuracyEngine, case, ComponentType.VAE, "diffusers", 2
+            AccuracyEngine,
+            case,
+            ComponentType.VAE,
+            "diffusers",
+            case.server_args.num_gpus,
         )
 
     def test_transformer_accuracy(self, case):
         if should_skip_component(case, ComponentType.TRANSFORMER):
             pytest.skip(get_skip_reason(case, ComponentType.TRANSFORMER))
         run_native_component_accuracy_case(
-            AccuracyEngine, case, ComponentType.TRANSFORMER, "diffusers", 2
+            AccuracyEngine,
+            case,
+            ComponentType.TRANSFORMER,
+            "diffusers",
+            case.server_args.num_gpus,
         )
 
     def test_encoder_accuracy(self, case):
         if should_skip_component(case, ComponentType.TEXT_ENCODER):
             pytest.skip(get_skip_reason(case, ComponentType.TEXT_ENCODER))
-        run_text_encoder_accuracy_case(AccuracyEngine, case, 2)
+        run_text_encoder_accuracy_case(
+            AccuracyEngine,
+            case,
+            case.server_args.num_gpus,
+        )

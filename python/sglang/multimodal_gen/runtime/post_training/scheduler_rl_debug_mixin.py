@@ -33,7 +33,8 @@ class SchedulerRLDebugMixin:
     ) -> None:
         rollout_session_data = batch._rollout_session_data
         batch_size = variance_noise.shape[0]
-        rollout_session_data.local_variance_noises.append(variance_noise)
+        # the underlying noise buffer in batch._rollout_session_data.noise_buffer is reused.
+        rollout_session_data.local_variance_noises.append(variance_noise.clone())
         rollout_session_data.local_prev_sample_means.append(prev_sample_mean)
         rollout_session_data.local_noise_std_devs.append(
             noise_std_dev.expand((batch_size, 1))
@@ -86,13 +87,13 @@ class SchedulerRLDebugMixin:
 
             # Gather on packed tensors first.
             variance_noises_packed = pipeline_config.gather_latents_for_sp(
-                variance_noises_packed
+                variance_noises_packed, batch=batch
             )
             prev_sample_means_packed = pipeline_config.gather_latents_for_sp(
-                prev_sample_means_packed
+                prev_sample_means_packed, batch=batch
             )
             model_outputs_packed = pipeline_config.gather_latents_for_sp(
-                model_outputs_packed
+                model_outputs_packed, batch=batch
             )
 
             # Unpack back to [B, T, ...].
