@@ -136,18 +136,16 @@
             }
         },
         {
-            "id": "ltx2.3_twostage_t2v_2gpus",
+            "id": "ltx2.3_twostage_ti2v_2gpus",
             "model": "Lightricks/LTX-2.3",
-            "task": "text-to-video",
-            "prompt": "A cat and a dog baking a cake together in a kitchen.",
-            "width": 768,
-            "height": 512,
+            "task": "image-to-video",
+            "prompt": "The cat starts walking slowly towards the camera.",
             "num_frames": 121,
             "seed": 42,
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--enable-torch-compile --warmup --enable-cfg-parallel --pipeline-class-name LTX2TwoStagePipeline",
+                    "serve_args": "--enable-torch-compile --warmup --pipeline-class-name LTX2TwoStagePipeline",
                     "extra_env": {}
                 }
             }

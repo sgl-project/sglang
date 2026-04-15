@@ -379,10 +379,6 @@ class Scheduler(
             )
         )
 
-        self.enable_kv_cache_events = bool(
-            server_args.kv_events_config and self.attn_tp_rank == 0
-        )
-
         # Init model configs
         self.init_model_config()
 
@@ -3629,8 +3625,9 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_normal_disagg_decode()
 
 
-def configure_scheduler(
+def configure_scheduler_process(
     server_args: ServerArgs,
+    gpu_id: int,
     tp_rank: int,
     attn_cp_rank: int,
     moe_dp_rank: int,
@@ -3643,6 +3640,8 @@ def configure_scheduler(
     Returns:
         dp_rank
     """
+    kill_itself_when_parent_died()
+
     # Generate the logger prefix
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
@@ -3670,6 +3669,16 @@ def configure_scheduler(
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
+    # Set cpu affinity to this gpu process
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
+        set_gpu_proc_affinity(
+            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
+        )
+    if not envs.SGLANG_NUMA_BIND_V2.get():
+        numa_node = get_numa_node_if_available(server_args, gpu_id)
+        if numa_node is not None:
+            numa_bind_to_node(numa_node)
+
     return dp_rank
 
 
@@ -3685,22 +3694,17 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    dp_rank = configure_scheduler(
-        server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
+    dp_rank = configure_scheduler_process(
+        server_args,
+        gpu_id,
+        tp_rank,
+        attn_cp_rank,
+        moe_dp_rank,
+        moe_ep_rank,
+        pp_rank,
+        dp_rank,
     )
-
-    kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
-
-    # Set cpu affinity to this gpu process
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        set_gpu_proc_affinity(
-            server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
-        )
-    if not envs.SGLANG_NUMA_BIND_V2.get():
-        numa_node = get_numa_node_if_available(server_args, gpu_id)
-        if numa_node is not None:
-            numa_bind_to_node(numa_node)
 
     # Set up tracing
     if server_args.enable_trace:
