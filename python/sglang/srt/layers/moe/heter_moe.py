@@ -611,9 +611,17 @@ class HeterFusedMoE(nn.Module):
         # Sentinel = -1: Triton (BF16/INT8) fully skips expert ID -1.
         group_dispatches = self.policy.dispatch(topk_ids, topk_weights, sentinel=-1)
 
+        # Host-side: number of tokens in this batch (used by short-circuit
+        # policies like batch_size). For other policies should_skip_group()
+        # always returns False.
+        num_tokens = topk_ids.shape[0]
+
         output = None
 
         for group_idx, gcfg in enumerate(self.group_cfgs):
+            if self.policy.should_skip_group(group_idx, num_tokens):
+                continue
+
             group_ids, group_weights = group_dispatches[group_idx]
 
             num_bits = gcfg.get("num_bits", 16)

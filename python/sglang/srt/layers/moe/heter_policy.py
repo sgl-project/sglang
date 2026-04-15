@@ -164,6 +164,15 @@ class HeterDispatchPolicy(abc.ABC):
             expert_to_group, token_selected_experts, token_final_scales,
             sentinel=sentinel)
 
+    def should_skip_group(self, group_idx: int, num_tokens: int) -> bool:
+        """Return True if this group's post-mask dispatch is empty.
+
+        Default: never skip (other policies always populate every group).
+        Override in policies that can statically prove a group is empty
+        for a given batch size (e.g. batch-size gating).
+        """
+        return False
+
     def _dispatch_from_expert_to_group(
         self,
         expert_to_group: torch.Tensor,
@@ -357,11 +366,75 @@ class ExpertLoadHeterDispatch(HeterDispatchPolicy):
             self._expert_to_group_buf, self._group_labels)
 
 
+class BatchSizeGatedHeterDispatch(HeterDispatchPolicy):
+    """Gate hot/cold by current batch token count.
+
+    Below ``threshold`` tokens, every expert is treated as cold (INT4 group).
+    At or above ``threshold``, every expert is treated as hot (BF16 group);
+    INT4-only experts are still forced back to INT4 by the base dispatch
+    helper.
+
+    No per-expert scoring -- the gate is a single binary decision per batch.
+    Assumes a 2-group setup (one INT4, one BF16); ``bf16_group_idx`` defaults
+    to ``1 - int4_group_idx``.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        group_size_ratios: List[float],
+        threshold: int = 128,
+        device: Optional[torch.device] = None,
+        int4_only_mask: Optional[torch.Tensor] = None,
+        int4_group_idx: int = 0,
+        bf16_group_idx: Optional[int] = None,
+    ):
+        super().__init__(num_experts, group_size_ratios, device=device,
+                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx)
+        self._threshold = threshold
+        self._bf16_group_idx = (
+            bf16_group_idx if bf16_group_idx is not None
+            else (1 - int4_group_idx)
+        )
+        # Static per-layer fact, computed once -- one host sync at init,
+        # never per-forward.
+        self._has_int4_only = (
+            int4_only_mask is not None and bool(int4_only_mask.any().item())
+        )
+
+    @property
+    def threshold(self) -> int:
+        return self._threshold
+
+    def _assign(self, token_selected_experts, token_final_scales):
+        if token_selected_experts is None:
+            self._expert_to_group_buf.fill_(self._int4_group_idx)
+            return self._expert_to_group_buf
+
+        n = token_selected_experts.shape[0]
+        target = (
+            self._bf16_group_idx if n >= self._threshold
+            else self._int4_group_idx
+        )
+        self._expert_to_group_buf.fill_(target)
+        return self._expert_to_group_buf
+
+    def should_skip_group(self, group_idx: int, num_tokens: int) -> bool:
+        if num_tokens >= self._threshold:
+            # Gate -> BF16. INT4 group only has experts forced by mask.
+            if group_idx == self._int4_group_idx:
+                return not self._has_int4_only
+            return False
+        # Gate -> INT4. BF16 group is empty.
+        return group_idx == self._bf16_group_idx
+
+
 _POLICY_REGISTRY = {
     "expert_load": ExpertLoadHeterDispatch,
     "confidence": ConfidenceThresholdHeterDispatch,
     "total_weight": TotalWeightHeterDispatch,
     "random": RandomHeterDispatch,
+    "batch_size": BatchSizeGatedHeterDispatch,
 }
 
 

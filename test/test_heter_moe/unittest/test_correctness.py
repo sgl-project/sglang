@@ -276,5 +276,127 @@ class TestMixedPrecisionSplit:
     # Will add INT8 tests if we decide to support it in production.
 
 
+# ---------------------------------------------------------------------------
+# 1.3.3 Batch-size-gated policy: small batch -> pure INT4, large batch -> pure BF16
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestBatchSizeGatedForward:
+    """End-to-end: HeterFusedMoE.forward routes through the right kernel."""
+
+    def _make_gated_layer(self, shared_weights, threshold):
+        bf16_w13, bf16_w2 = shared_weights
+        cfg = {
+            "groups": [
+                {"name": "int4", "num_bits": 4, "size_ratio": 0.5,
+                 "group_size": GROUP_SIZE},
+                {"name": "bf16", "num_bits": 16, "size_ratio": 0.5},
+            ],
+            "policy": "batch_size",
+            "policy_params": {"threshold": threshold},
+        }
+        layer = _make_layer(cfg)
+        layer.w13_weight.data.copy_(bf16_w13)
+        layer.w2_weight.data.copy_(bf16_w2)
+        _fill_int4(layer, bf16_w13, bf16_w2)
+        return layer
+
+    def _make_pure_layer(self, shared_weights, num_bits):
+        bf16_w13, bf16_w2 = shared_weights
+        cfg = {
+            "groups": [
+                {"name": "all", "num_bits": num_bits, "size_ratio": 1.0,
+                 **({"group_size": GROUP_SIZE} if num_bits == 4 else {})},
+            ],
+            "policy": "random", "policy_params": {"seed": SEED},
+        }
+        layer = _make_layer(cfg)
+        if num_bits == 16:
+            layer.w13_weight.data.copy_(bf16_w13)
+            layer.w2_weight.data.copy_(bf16_w2)
+        else:
+            _fill_int4(layer, bf16_w13, bf16_w2)
+        return layer
+
+    def _make_inputs_n(self, n, with_logits=False):
+        torch.manual_seed(0)
+        x = torch.randn(n, H, dtype=torch.bfloat16, device="cuda")
+        topk_ids = torch.randint(0, E, (n, K), device="cuda")
+        topk_weights = torch.rand(n, K, dtype=torch.bfloat16, device="cuda")
+        router_logits = torch.randn(n, E, device="cuda") if with_logits else None
+        return x, make_topk_output(topk_weights, topk_ids, router_logits)
+
+    def test_small_batch_matches_pure_int4(self, shared_weights):
+        """n < threshold: gated layer's output equals pure-INT4 output (bit-exact).
+
+        The BF16 kernel must be skipped so no BF16 contribution leaks in.
+        """
+        threshold = 128
+        gated = self._make_gated_layer(shared_weights, threshold=threshold)
+        int4 = self._make_pure_layer(shared_weights, num_bits=4)
+
+        x, topk_out = self._make_inputs_n(n=64, with_logits=True)
+        out_gated = gated(x, topk_out)
+        out_int4 = int4(x, topk_out)
+
+        assert out_gated.isfinite().all()
+        # Bit-exact: gated's INT4 kernel runs on identical inputs as pure INT4
+        # and the BF16 kernel is short-circuited (no addition).
+        torch.testing.assert_close(out_gated, out_int4, atol=0, rtol=0)
+
+    def test_large_batch_matches_pure_bf16(self, shared_weights):
+        """n >= threshold: gated layer's output equals pure-BF16 output (bit-exact).
+
+        The INT4 kernel must be skipped (no int4-only experts in this layer).
+        """
+        threshold = 128
+        gated = self._make_gated_layer(shared_weights, threshold=threshold)
+        bf16 = self._make_pure_layer(shared_weights, num_bits=16)
+
+        x, topk_out = self._make_inputs_n(n=256, with_logits=True)
+        out_gated = gated(x, topk_out)
+        out_bf16 = bf16(x, topk_out)
+
+        assert out_gated.isfinite().all()
+        torch.testing.assert_close(out_gated, out_bf16, atol=0, rtol=0)
+
+    def test_int4_only_mask_keeps_int4_kernel_live(self, shared_weights):
+        """With INT4-only experts, large batch still hits both kernels."""
+        from sglang.srt.layers.moe.heter_moe import HeterFusedMoE
+
+        bf16_w13, bf16_w2 = shared_weights
+        cfg = {
+            "groups": [
+                {"name": "int4", "num_bits": 4, "size_ratio": 0.5,
+                 "group_size": GROUP_SIZE},
+                {"name": "bf16", "num_bits": 16, "size_ratio": 0.5},
+            ],
+            "policy": "batch_size",
+            "policy_params": {"threshold": 128},
+        }
+        layer = HeterFusedMoE(
+            num_experts=E, hidden_size=H, intermediate_size=I, top_k=K,
+            heter_config=cfg, dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+            int4_only_experts=[0, 3],
+        )
+        # BF16 weights are compact (only dual-precision experts: 1,2,4,5,6,7)
+        dual = sorted(e for e in range(E) if e not in {0, 3})
+        layer.w13_weight.data.copy_(bf16_w13[dual])
+        layer.w2_weight.data.copy_(bf16_w2[dual])
+        _fill_int4(layer, bf16_w13, bf16_w2)
+
+        # Sanity: hook reports neither group skippable above threshold.
+        assert layer.policy.should_skip_group(0, 256) is False
+        assert layer.policy.should_skip_group(1, 256) is False
+
+        x, topk_out = self._make_inputs_n(n=256, with_logits=True)
+        out = layer(x, topk_out)
+        assert out.shape == x.shape
+        assert out.isfinite().all()
+        assert out.abs().sum() > 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
