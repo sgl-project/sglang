@@ -565,6 +565,11 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
     )
 
 
+def round_up_to_multiple(x: int, m: int) -> int:
+    """Round up *x* to the nearest multiple of *m*."""
+    return (x + m - 1) // m * m
+
+
 def swizzle_blockscale(scale: torch.Tensor):
     """
     Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
@@ -576,9 +581,8 @@ def swizzle_blockscale(scale: torch.Tensor):
         scale = scale.unsqueeze(0)
     assert scale.ndim == 3
     B, M, K = scale.shape
-    round_up_multiple = lambda x, m: (x + m - 1) // m * m
-    M_padded = round_up_multiple(M, 128)
-    K_padded = round_up_multiple(K, 4)
+    M_padded = round_up_to_multiple(M, 128)
+    K_padded = round_up_to_multiple(K, 4)
     padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
     padded_scale[:B, :M, :K] = scale
     batches, rows, cols = padded_scale.shape
@@ -625,6 +629,7 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     hidden_size,
     intermediate_size,
     num_experts,
+    is_gated: bool = True,
 ):
     from flashinfer import nvfp4_block_scale_interleave
     from flashinfer.fused_moe.core import (
@@ -636,14 +641,16 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
     epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
 
+    gemm1_rows = (2 if is_gated else 1) * intermediate_size
+
     # Convert quantized weights to proper formats
     gemm1_weights_fp4 = gemm1_weights.view(torch.float8_e4m3fn).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 2
+        num_experts, gemm1_rows, hidden_size // 2
     )  # packed fp4
     gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
     ).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 16
+        num_experts, gemm1_rows, hidden_size // 16
     )  # fp8 scaling factors
 
     gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
@@ -660,14 +667,11 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     gemm2_weights_fp4_shuffled = []
     gemm2_scales_fp4_shuffled = []
     for i in range(num_experts):
-        # Calculate the permute indices for the following:
-        # 1. Reorder rows of W1 and scales for fused gated activation
-        # 2. Shuffle weights and scaling factors for transposed mma output
-        # for both w3_w1 and w2 weights and scale factors
         permute_indices = _maybe_get_cached_w3_w1_permute_indices(
             _cache_permute_indices,
             gemm1_weights_fp4[i].view(torch.uint8),
             epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
         )
         gemm1_weights_fp4_shuffled.append(
             gemm1_weights_fp4[i]
@@ -680,6 +684,7 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             gemm1_scales_linear_fp4[i].view(torch.uint8),
             epilogue_tile_m,
             num_elts_per_sf=16,
+            is_gated_act_gemm=is_gated,
         )
         gemm1_scales_fp4_shuffled.append(
             nvfp4_block_scale_interleave(
@@ -723,7 +728,7 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     gemm1_scales_fp4_shuffled = (
         torch.stack(gemm1_scales_fp4_shuffled)
         .view(torch.float8_e4m3fn)
-        .reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
+        .reshape(num_experts, gemm1_rows, hidden_size // 16)
     )
 
     gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)

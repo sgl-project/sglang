@@ -1664,6 +1664,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_local_experts = int(getattr(layer, "num_local_experts"))
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
 
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                _get_activation_type,
+            )
+
+            activation_type = _get_activation_type(self.moe_runner_config.activation)
+
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -1704,6 +1710,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     if not self.block_quant
                     else None
                 ),
+                activation_type=activation_type,
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
