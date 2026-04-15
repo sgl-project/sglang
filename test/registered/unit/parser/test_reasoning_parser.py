@@ -269,6 +269,48 @@ class TestQwen3ForcedReasoningDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")  # Buffer cleared
         self.assertEqual(result.normal_text, "The answer is 42.")
 
+    def test_detect_and_parse_tool_call_without_think_close(self):
+        """
+        Regression test: when force_reasoning=True and the model emits <tool_call>
+        without first closing </think>, the tool_call must be split into normal_text
+        so the downstream tool-call parser can still see it. Otherwise the entire
+        output is silently swallowed into reasoning_content and the function call
+        is lost (observed with Qwen3.5-27B serving via SGLang in production).
+        """
+        text = "I should call the tool.<tool_call>\n<function=foo>\n</function>\n</tool_call>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I should call the tool.")
+        self.assertEqual(
+            result.normal_text,
+            "<tool_call>\n<function=foo>\n</function>\n</tool_call>",
+        )
+
+    def test_streaming_tool_call_without_think_close(self):
+        """
+        Streaming regression: same scenario as above but for incremental parsing.
+        Once <tool_call> appears while still in reasoning state, the parser must
+        flip to normal_text and forward <tool_call>... downstream.
+        """
+        # Initial reasoning chunks (no </think>)
+        result = self.detector.parse_streaming_increment("Let me ")
+        self.assertEqual(result.reasoning_text, "Let me ")
+        self.assertEqual(result.normal_text, "")
+
+        result = self.detector.parse_streaming_increment("call the tool.")
+        self.assertEqual(result.reasoning_text, "call the tool.")
+        self.assertEqual(result.normal_text, "")
+
+        # Tool call appears WITHOUT a preceding </think>
+        result = self.detector.parse_streaming_increment(
+            "<tool_call>\n<function=foo>\n</function>\n</tool_call>"
+        )
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(
+            result.normal_text,
+            "<tool_call>\n<function=foo>\n</function>\n</tool_call>",
+        )
+        self.assertFalse(self.detector._in_reasoning)
+
 
 class TestKimiDetector(CustomTestCase):
     def setUp(self):
