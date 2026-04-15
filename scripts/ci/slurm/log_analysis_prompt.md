@@ -118,7 +118,11 @@ attributable to a specific repo, open a GitHub issue using `gh issue create`.
 - File against the correct repo:
   - **`NVIDIA/srt-slurm`**: orchestration bugs, config handling, srtctl behavior,
     recipe/YAML issues, incorrect flags or environment variables being passed to
-    workers, worker launch failures caused by srt-slurm itself.
+    workers, worker launch failures caused by srt-slurm itself. **Important**: if
+    a recipe or config passes an incompatible combination of flags to SGLang
+    (e.g., two flags that SGLang does not support together), that is a recipe bug
+    and should be filed against srt-slurm — even if the error itself appears in
+    SGLang code. The recipe is responsible for only requesting valid combinations.
   - **`sgl-project/sglang`**: Do NOT auto-file issues here. Instead, use `gh` to
     review recent commits from the past day on the sglang repo:
     ```
