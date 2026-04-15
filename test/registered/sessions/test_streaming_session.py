@@ -1044,58 +1044,6 @@ class TestStreamingSessionEagleV2(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionEagleRetract(TestStreamingSession):
-    """Streaming session with EAGLE3 speculative decoding under retract pressure.
-
-    Combines spec decode (which changes KV commit patterns) with retract
-    (which forces KV rollback mid-decode). --disable-overlap-schedule is
-    required for spec + streaming session.
-    """
-
-    kv_inherit_offset = -1
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_TARGET_MODEL_EAGLE3
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
-            2
-        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(
-            True
-        ):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--enable-streaming-session",
-                    "--disable-overlap-schedule",
-                    "--chunked-prefill-size",
-                    "128",
-                    "--dtype=float16",
-                    "--speculative-algorithm",
-                    "EAGLE3",
-                    "--speculative-draft-model",
-                    DEFAULT_DRAFT_MODEL_EAGLE3,
-                    "--speculative-num-steps",
-                    "3",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "4",
-                    "--mem-fraction-static",
-                    "0.7",
-                ],
-            )
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
 class TestStreamingSessionEagleRetractLargePage(TestStreamingSession):
     """Eagle spec + retract + page_size > 1: hits PagedTokenToKVPoolAllocator
     with both spec tail and retract alloc-commit gap. Maximal coverage of
@@ -1148,8 +1096,8 @@ class TestStreamingSessionEagleRetractLargePage(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionEagleV2Retract(TestStreamingSession):
-    """Streaming session with EAGLE3 spec v2 under retract pressure."""
+class TestStreamingSessionEagleV2RetractLargePage(TestStreamingSession):
+    """Streaming session with EAGLE3 spec v2 + retract + page=256."""
 
     @classmethod
     def setUpClass(cls):
@@ -1171,7 +1119,7 @@ class TestStreamingSessionEagleV2Retract(TestStreamingSession):
                 other_args=[
                     "--enable-streaming-session",
                     "--chunked-prefill-size",
-                    "128",
+                    "4096",
                     "--dtype=float16",
                     "--speculative-algorithm",
                     "EAGLE3",
@@ -1185,6 +1133,8 @@ class TestStreamingSessionEagleV2Retract(TestStreamingSession):
                     "4",
                     "--mem-fraction-static",
                     "0.7",
+                    "--page-size",
+                    "256",
                 ],
             )
         cls.tokenizer = get_tokenizer(cls.model)
