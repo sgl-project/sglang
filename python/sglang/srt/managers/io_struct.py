@@ -221,6 +221,12 @@ class GenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # Fuzzy matching: cache range specification
+    # cache_start_pos: Starting token position to cache (0-based index)
+    # cache_end_pos: Ending token position to cache (exclusive, -1 means end)
+    cache_start_pos: Optional[Union[List[int], int]] = None
+    cache_end_pos: Optional[Union[List[int], int]] = None
+
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
@@ -776,6 +782,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
+    
+    # Fuzzy matching: cache range specification
+    cache_start_pos: Optional[int] = None
+    cache_end_pos: Optional[int] = None
 
 
 @dataclass

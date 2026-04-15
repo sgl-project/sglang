@@ -137,6 +137,7 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        cache_protected_len: Length of prefix that should NOT be freed in cache_finished_req.
     """
 
     device_indices: torch.Tensor
@@ -145,6 +146,7 @@ class MatchResult(NamedTuple):
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    fuzzy_matched_len: Optional[int] = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):

@@ -327,6 +327,9 @@ class OpenAIServingChat(OpenAIServingBase):
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+            # Fuzzy matching: cache range specification
+            cache_start_pos=request.cache_start_pos,
+            cache_end_pos=request.cache_end_pos,
         )
 
         return adapted_request, request

@@ -436,6 +436,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # For fuzzy prefix matching
+    fuzzy_matched_len: int = 0  # Number of tokens from fuzzy match
+    fuzzy_cached_start_pos: int = 0  # Original position where fuzzy KV was computed
+
     @classmethod
     def init_new(
         cls,
@@ -486,6 +490,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
+
+        # Populate fuzzy match info from the first request (single-request batch assumption)
+        if batch.reqs and len(batch.reqs) > 0:
+            first_req = batch.reqs[0]
+            ret.fuzzy_matched_len = getattr(first_req, 'cache_fuzzy_matched_len', 0)
+            fuzzy_match_result = getattr(first_req, 'fuzzy_match_result', None)
+            if fuzzy_match_result is not None:
+                ret.fuzzy_cached_start_pos = getattr(fuzzy_match_result, 'cached_start_pos', 0)
+
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (

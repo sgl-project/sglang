@@ -128,6 +128,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            # Fuzzy matching: cache range specification
+            cache_start_pos=request.cache_start_pos,
+            cache_end_pos=request.cache_end_pos,
         )
 
         return adapted_request, request

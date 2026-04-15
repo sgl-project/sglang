@@ -64,6 +64,13 @@ from sglang.srt.mem_cache.evict_policy import (
 )
 from sglang.srt.mem_cache.utils import get_hash_str, hash_str_to_int64
 
+# Fuzzy matching imports
+from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
+from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import (
+    FuzzyMatchProvider,
+    FuzzyMatchResult,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -331,6 +338,15 @@ class RadixCache(BasePrefixCache):
             )
 
         self.evictable_leaves = set()
+        
+        # Node registry: maps node_id -> TreeNode for non_prefix_store to resolve pool indices
+        self._node_registry: Dict[int, TreeNode] = {}
+        
+        # Fuzzy matching support
+        self.fuzzy_config: Optional[FuzzyMatchConfig] = None
+        self.fuzzy_match_provider: Optional[FuzzyMatchProvider] = None
+        self._fuzzy_cache_enabled: bool = False
+        
         self.reset()
 
     @classmethod
@@ -365,6 +381,27 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
+    
+    def init_fuzzy_match(self, config: FuzzyMatchConfig, provider: FuzzyMatchProvider):
+        """Initialize fuzzy matching support.
+        
+        Args:
+            config: Fuzzy matching configuration.
+            provider: Semantic provider instance.
+        """
+        self.fuzzy_config = config
+        self.fuzzy_match_provider = provider
+        self._fuzzy_cache_enabled = config.cache_fuzzy_results
+        
+        # Pass node registry to non_prefix_store for resolving pool indices
+        if hasattr(self.fuzzy_match_provider, 'non_prefix_store'):
+            self.fuzzy_match_provider.non_prefix_store.set_node_registry(self._node_registry)
+        
+        logger.info(
+            f"Fuzzy matching initialized with provider={config.fuzzy_match_provider}, "
+            f"min_match_length={config.fuzzy_min_match_length}, "
+            f"cache_results={config.cache_fuzzy_results}"
+        )
 
     def maybe_bigram_convert(
         self, key: RadixKey, value: Optional[torch.Tensor] = None
@@ -420,6 +457,7 @@ class RadixCache(BasePrefixCache):
                 ),
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                fuzzy_matched_len=0,
             )
 
         if self.disable or len(key) == 0:
@@ -432,16 +470,120 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return empty_match_result()
 
+        # Step 1: Exact prefix matching
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        
+        exact_matched_len = len(value)
+        total_len = len(key.token_ids) if hasattr(key, 'token_ids') else len(key)
+        
+        logger.info(
+            f"[FUZZY RADIX] match_prefix: exact_matched_len={exact_matched_len}, "
+            f"total_len={total_len}, will_try_fuzzy={exact_matched_len < total_len}"
+        )
+        
+        # Step 2: If exact match is incomplete, try fuzzy matching
+        if exact_matched_len < total_len:
+            logger.info(
+                f"[FUZZY RADIX] Exact match incomplete ({exact_matched_len}/{total_len}), "
+                f"attempting fuzzy matching..."
+            )
+            
+            fuzzy_result = self.match_prefix_fuzzy(
+                params=MatchPrefixParams(key=key),
+                exact_matched_len=exact_matched_len,
+            )
+            
+            if fuzzy_result is not None:
+                # Merge exact and fuzzy KV indices
+                # No repositioning here - RoPE reversal is handled at the model level
+                # in forward_prepare_native using fuzzy_cached_start_pos
+                fuzzy_kv_indices = torch.tensor(
+                    fuzzy_result.kv_cache_indices,
+                    device=value.device,
+                    dtype=value.dtype,
+                )
+                
+                logger.info(
+                    f"[FUZZY RADIX] ✓ Fuzzy match successful: "
+                    f"exact={exact_matched_len}, fuzzy={fuzzy_result.cached_token_count}, "
+                    f"cached_start_pos={fuzzy_result.cached_start_pos}"
+                )
+                
+                # Mark request as fuzzy-matched - RoPE reversal will be handled at model level
+                if params.req is not None:
+                    params.req.fuzzy_match_result = fuzzy_result
+                
+                merged_value = torch.cat([value, fuzzy_kv_indices])
+                return MatchResult(
+                    device_indices=merged_value,
+                    last_device_node=last_node,
+                    last_host_node=last_node,
+                    fuzzy_matched_len=fuzzy_result.cached_token_count,
+                    cache_protected_len=exact_matched_len + fuzzy_result.cached_token_count,
+                )
+            else:
+                logger.info(
+                    f"[FUZZY RADIX] ✗ Fuzzy match failed, returning exact match only"
+                )
+        
+        # Return exact match result (with or without fuzzy matching)
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            fuzzy_matched_len=0,
         )
+    
+    def match_prefix_fuzzy(
+        self,
+        params: MatchPrefixParams,
+        exact_matched_len: int,
+    ) -> Optional[FuzzyMatchResult]:
+        """Perform fuzzy prefix matching when exact matching falls short.
+        
+        Called from match_prefix when exact_matched_len < total_len.
+        """
+        # Check minimum match length: need enough exact match to anchor fuzzy search
+        if exact_matched_len > 0 and exact_matched_len < self.fuzzy_config.fuzzy_min_match_length:
+            logger.info(
+                f"[FUZZY RADIX] Skipping fuzzy match: exact_matched_len({exact_matched_len}) "
+                f"< fuzzy_min_match_length({self.fuzzy_config.fuzzy_min_match_length})"
+            )
+            return None
+        
+        try:
+            result = self.fuzzy_match_provider.match_on_prefix_miss(
+                prompt_token_ids=params.key.token_ids,
+                already_matched_len=exact_matched_len,
+            )
+            
+            # Note: non_prefix_store entries don't need additional locking here.
+            # Node references are resolved from the radix tree's node registry,
+            # and the radix tree manages node lifecycle independently.
+            
+            if result is not None:
+                logger.info(
+                    f"[FUZZY RADIX] Fuzzy match success: cached={result.cached_token_count}, "
+                    f"prompt={result.prompt_token_count}, offset={result.position_offset}"
+                )
+            else:
+                logger.info(
+                    f"[FUZZY RADIX] Fuzzy match failed: no suitable match found"
+                )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(
+                f"[FUZZY RADIX] Exception during fuzzy matching: {e}"
+            )
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -458,11 +600,18 @@ class RadixCache(BasePrefixCache):
         key, value = self.maybe_bigram_convert(key, value)
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
+        
+        # Register the root node (always registered)
+        self._register_node(self.root_node)
+        
         return InsertResult(prefix_len=prefix_len)
+    
+    def _register_node(self, node: TreeNode):
+        """Register a TreeNode in the node registry for reference resolution by non_prefix_store."""
+        self._node_registry[node.id] = node
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
-        # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
 
@@ -479,32 +628,99 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = page_align_keys(keys, self.page_size)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
-        # Radix Cache takes one ref in memory pool
+        fuzzy_realized = False
+        new_prefix_len = 0
+
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
-            result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
-            )
-            new_prefix_len = result.prefix_len
-            # Free the duplicates that were already in the tree
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
-            )
+
+            if self._fuzzy_cache_enabled and req.cache_fuzzy_matched_len > 0:
+                # Fuzzy-matched tokens borrow indices from another request's tree.
+                # Allocate new pool slots and copy KV data to realize them,
+                # so they can be inserted into the radix tree for future exact matching.
+                protected_len = req.cache_protected_len
+                new_indices = self.token_to_kv_pool_allocator.alloc(protected_len)
+
+                if new_indices is not None:
+                    borrowed_indices = kv_indices[:protected_len]
+                    kvcache = self.token_to_kv_pool_allocator._kvcache
+                    layer_num = kvcache.layer_num
+
+                    for layer_idx in range(kvcache.start_layer, kvcache.start_layer + layer_num):
+                        k_buffer, v_buffer = kvcache.get_kv_buffer(layer_idx)
+                        k_buffer[new_indices] = k_buffer[borrowed_indices]
+                        v_buffer[new_indices] = v_buffer[borrowed_indices]
+
+                    realized_values = values.clone()
+                    realized_values[:protected_len] = new_indices
+                    kv_indices[:protected_len] = new_indices
+
+                    # Borrowed indices are NOT freed - they belong to another request's tree
+                    # (via non_prefix_store) and will be freed on eviction.
+
+                    logger.info(
+                        f"[FUZZY RADIX] Realized {protected_len} matched tokens with new pool slots"
+                    )
+
+                    result = self.insert(
+                        InsertParams(key=radix_key, value=realized_values, priority=priority)
+                    )
+                    new_prefix_len = result.prefix_len
+                    fuzzy_realized = True
+                else:
+                    logger.warning("[FUZZY RADIX] Failed to alloc slots for fuzzy tokens")
+            else:
+                result = self.insert(
+                    InsertParams(key=radix_key, value=values, priority=priority)
+                )
+                new_prefix_len = result.prefix_len
+
+        # Cache to non_prefix_store BEFORE freeing indices, since non_prefix_store
+        # saves pool indices that must still be valid.
+        # Skip if fuzzy tokens were already realized and inserted into the radix tree.
+        if self._fuzzy_cache_enabled and not fuzzy_realized:
+            try:
+                cache_start = getattr(req, 'cache_start_pos', None)
+                cache_end = getattr(req, 'cache_end_pos', None)
+
+                if cache_start is None:
+                    cache_start = 0
+                if cache_end is None or cache_end == -1:
+                    cache_end = len(token_ids)
+
+                self.fuzzy_match_provider.cache_on_request_finished(
+                    request=req,
+                    token_ids=token_ids,
+                    kv_cache=kv_indices,
+                    cache_start_pos=cache_start,
+                    cache_end_pos=cache_end,
+                    radix_tree=self,
+                )
+            except Exception as e:
+                logger.warning(f"[FUZZY RADIX] cache_on_request_finished failed: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+
+        # Free duplicates already in the tree
+        if is_insert:
+            free_start = req.cache_protected_len
+            free_end = new_prefix_len
+            if free_start < free_end:
+                self.token_to_kv_pool_allocator.free(kv_indices[free_start:free_end])
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : len(keys)]
+                kv_indices[req.cache_fuzzy_matched_len : len(keys)]
             )
 
-        # free the unaligned tail
+        # Free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
 
-        # Remove req slot release the cache lock
+        # Remove req slot and release the cache lock
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
@@ -523,28 +739,63 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
 
-        # Radix Cache takes one ref in memory pool
-        result = self.insert(
-            InsertParams(
-                key=radix_key,
-                value=values,
-                chunked=chunked,
-                priority=getattr(req, "priority", 0) or 0,
+        # For fuzzy-matched requests, skip the fuzzy prefix during insert
+        # to avoid double-counting pool indices that are already in another request's tree nodes
+        fuzzy_matched_len = req.cache_fuzzy_matched_len
+        
+        if fuzzy_matched_len > 0 and fuzzy_matched_len < len(keys):
+            # Only insert tokens after the fuzzy prefix
+            trimmed_keys = keys[fuzzy_matched_len:]
+            trimmed_values = values[fuzzy_matched_len:]
+            trimmed_radix_key = RadixKey(trimmed_keys, req.extra_key, is_bigram=self.is_eagle)
+            
+            priority = getattr(req, "priority", 0) or 0
+            result = self.insert(
+                InsertParams(key=trimmed_radix_key, value=trimmed_values, chunked=chunked, priority=priority)
             )
-        )
-        new_prefix_len = result.prefix_len
+            # The prefix_len from insert is relative to the trimmed keys
+            new_prefix_len = fuzzy_matched_len + result.prefix_len
+        else:
+            # Radix Cache takes one ref in memory pool
+            result = self.insert(
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    chunked=chunked,
+                    priority=getattr(req, "priority", 0) or 0,
+                )
+            )
+            new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
         )
 
-        # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
-        )
-        assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
+        # For fuzzy-matched requests, match_prefix won't find the fuzzy-matched tokens
+        # in the radix tree (they're in non_prefix_store, not the tree).
+        # So we skip match_prefix and use kv_indices directly.
+        if fuzzy_matched_len > 0:
+            # Use existing kv_indices directly
+            new_indices = kv_indices[:len(keys)]
+            # Find the last node for the newly inserted portion
+            # The new tokens were inserted starting at fuzzy_matched_len
+            # We need to find the node that contains the last token
+            new_last_node = req.last_node  # Keep the existing node as fallback
+            
+            # Try to find the proper last node by matching the newly inserted portion
+            if len(keys) > fuzzy_matched_len:
+                trimmed_radix_key = RadixKey(keys[fuzzy_matched_len:], req.extra_key, is_bigram=self.is_eagle)
+                trimmed_match = self.match_prefix(MatchPrefixParams(key=trimmed_radix_key))
+                if trimmed_match.last_device_node is not None:
+                    new_last_node = trimmed_match.last_device_node
+        else:
+            # The prefix indices could be updated, reuse it
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+            new_indices, new_last_node = (
+                match_result.device_indices,
+                match_result.last_device_node,
+            )
+            assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
@@ -556,6 +807,10 @@ class RadixCache(BasePrefixCache):
         # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.cache_protected_len = len(new_indices)
+        # For non-fuzzy requests (no fuzzy_match_result set), cache_fuzzy_matched_len is 0.
+        # For fuzzy requests, keep the values from init_next_round_input.
+        if not hasattr(req, 'fuzzy_match_result') or req.fuzzy_match_result is None:
+            req.cache_fuzzy_matched_len = 0
 
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
@@ -700,10 +955,21 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        self._register_node(new_node)
+        self._register_node(child)  # child's value was modified, re-register
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
+
+        # Update NodeRefs in non_prefix_store to reflect the split.
+        # child.id is the old node (now holds suffix), new_node.id is the new node (holds prefix).
+        if self.fuzzy_match_provider is not None and hasattr(self.fuzzy_match_provider, 'non_prefix_store'):
+            self.fuzzy_match_provider.non_prefix_store.update_node_refs_on_split(
+                old_node_id=child.id,
+                new_node_id=new_node.id,
+                split_len=split_len,
+            )
 
         # Split hash_value if it was already computed, otherwise leave as None
         new_node.hash_value, child.hash_value = split_node_hash_value(
@@ -765,6 +1031,7 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            self._register_node(new_node)
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)

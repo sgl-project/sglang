@@ -596,6 +596,9 @@ class Req(ReqDllmMixin):
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
+        # Fuzzy matching: cache range specification
+        cache_start_pos: Optional[int] = None,
+        cache_end_pos: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -613,6 +616,11 @@ class Req(ReqDllmMixin):
         self.session = session
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
+        
+        # Fuzzy matching: cache range specification
+        self.cache_start_pos = cache_start_pos
+        self.cache_end_pos = cache_end_pos
+
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -724,6 +732,10 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # The fuzzy-matched prefix length. These indices come from another
+        # request's tree nodes via non_prefix_store and should NOT be freed
+        # in cache_finished_req since they're not this request's own allocation.
+        self.cache_fuzzy_matched_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1009,6 +1021,13 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+
+            # Track fuzzy-matched length to avoid freeing these indices
+            if match_result.fuzzy_matched_len is not None:
+                self.cache_fuzzy_matched_len = match_result.fuzzy_matched_len
+            else:
+                self.cache_fuzzy_matched_len = 0
+
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()

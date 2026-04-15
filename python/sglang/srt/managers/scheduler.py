@@ -873,6 +873,28 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
+        # Initialize fuzzy matching if enabled
+        if server_args.enable_fuzzy_match:
+            from sglang.srt.mem_cache.fuzzy_match import (
+                FuzzyMatchConfig,
+                create_fuzzy_match_provider,
+            )
+
+            fuzzy_config = FuzzyMatchConfig.from_server_args(server_args)
+            fuzzy_match_provider = create_fuzzy_match_provider(fuzzy_config)
+
+            if hasattr(self.tree_cache, 'init_fuzzy_match'):
+                self.tree_cache.init_fuzzy_match(fuzzy_config, fuzzy_match_provider)
+                logger.info(
+                    f"Fuzzy prefix matching enabled: provider={fuzzy_config.fuzzy_match_provider}, "
+                    f"min_match_length={fuzzy_config.fuzzy_min_match_length}"
+                )
+            else:
+                logger.warning(
+                    "Fuzzy matching is enabled but not supported by the current cache type. "
+                    "Only Python RadixCache is supported."
+                )
+
         if server_args.enable_streaming_session:
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
@@ -1842,6 +1864,9 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
+                # Fuzzy matching: cache range specification
+                cache_start_pos=recv_req.cache_start_pos,
+                cache_end_pos=recv_req.cache_end_pos,
             )
             req.tokenizer = self.tokenizer
 
