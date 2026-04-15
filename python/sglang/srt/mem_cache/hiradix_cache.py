@@ -178,6 +178,9 @@ class HiRadixCache(RadixCache):
 
         # PP write-backup ack count sync: upstream rank records how many acks
         # it consumed, downstream rank caps its consumption accordingly.
+        # NOTE: must be None (not 0) — None means "no budget signal received yet,
+        # skip capping entirely". Using 0 would cap all acks to zero on startup
+        # before any upstream signal arrives, causing write-through deadlock.
         self._pp_write_ack_budget_from_upstream: Optional[int] = None
         self._pp_last_write_ack_consumed: int = 0
 
@@ -782,8 +785,8 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
         # PP upstream: record consumed count for sync to downstream
-        if self.pp_size > 1 and self.pp_rank == 0:
-            self._pp_last_write_ack_consumed = consumed_count
+        if self.pp_size > 1 and self.pp_rank < self.pp_size - 1:
+            self._pp_last_write_ack_consumed += consumed_count
 
     def loading_check(self):
         finish_count = 0
