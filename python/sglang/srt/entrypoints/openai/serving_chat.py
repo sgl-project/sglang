@@ -54,15 +54,14 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
-_SSE_DATA = "data: "
-_SSE_NL = "\n\n"
+_SSE_DATA_B = b"data: "
+_SSE_NL_B = b"\n\n"
 
 
-class _StreamDelta(msgspec.Struct):
+class _StreamDelta(msgspec.Struct, omit_defaults=True):
     role: Optional[str] = None
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
-    tool_calls: Optional[Any] = None
 
 
 class _StreamChoice(msgspec.Struct):
@@ -73,22 +72,16 @@ class _StreamChoice(msgspec.Struct):
     matched_stop: Union[None, int, str] = None
 
 
-class _StreamChunk(msgspec.Struct):
+class _StreamChunk(msgspec.Struct, omit_defaults=True):
     id: str
     object: str
     created: int
     model: str
     choices: List[_StreamChoice]
-    usage: Optional[Any] = None
+    usage: Optional[dict] = None
 
 
-def _enc_hook(obj: Any) -> Any:
-    if hasattr(obj, "model_dump"):
-        return obj.model_dump()
-    raise TypeError(f"Unsupported type: {type(obj)}")
-
-
-_stream_encoder = msgspec.json.Encoder(enc_hook=_enc_hook)
+_stream_encoder = msgspec.json.Encoder()
 
 
 def _fast_sse_content(
@@ -96,15 +89,23 @@ def _fast_sse_content(
     created: int,
     model: str,
     index: int,
-    content: str = None,
-    reasoning_content: str = None,
-    finish_reason=None,
+    role: Optional[str] = None,
+    content: Optional[str] = None,
+    reasoning_content: Optional[str] = None,
+    finish_reason: Optional[str] = None,
     logprobs=None,
-    usage=None,
+    matched_stop: Union[None, int, str] = None,
+    usage: Optional[dict] = None,
 ) -> str:
-    delta = _StreamDelta(content=content, reasoning_content=reasoning_content)
+    delta = _StreamDelta(
+        role=role, content=content, reasoning_content=reasoning_content
+    )
     choice = _StreamChoice(
-        index=index, delta=delta, logprobs=logprobs, finish_reason=finish_reason
+        index=index,
+        delta=delta,
+        logprobs=logprobs,
+        finish_reason=finish_reason,
+        matched_stop=matched_stop,
     )
     chunk = _StreamChunk(
         id=chunk_id,
@@ -114,7 +115,7 @@ def _fast_sse_content(
         choices=[choice],
         usage=usage,
     )
-    return _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
+    return (_SSE_DATA_B + _stream_encoder.encode(chunk) + _SSE_NL_B).decode()
 
 
 if TYPE_CHECKING:
@@ -785,19 +786,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    chunk = _StreamChunk(
-                        id=content["meta_info"]["id"],
-                        object="chat.completion.chunk",
+                    yield _fast_sse_content(
+                        chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
                         model=request.model,
-                        choices=[
-                            _StreamChoice(
-                                index=index,
-                                delta=_StreamDelta(role="assistant", content=""),
-                            )
-                        ],
+                        index=index,
+                        role="assistant",
+                        content="",
                     )
-                    yield _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
                     stream_started = True
 
                 stream_buffer = stream_buffers.get(index, "")
@@ -820,7 +816,7 @@ class OpenAIServingChat(OpenAIServingBase):
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
-                            )
+                            ).model_dump()
 
                         yield _fast_sse_content(
                             chunk_id=content["meta_info"]["id"],
@@ -867,7 +863,7 @@ class OpenAIServingChat(OpenAIServingBase):
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
-                            )
+                            ).model_dump()
 
                         yield _fast_sse_content(
                             chunk_id=content["meta_info"]["id"],
@@ -889,21 +885,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
-                chunk = _StreamChunk(
-                    id=content["meta_info"]["id"],
-                    object="chat.completion.chunk",
+                yield _fast_sse_content(
+                    chunk_id=content["meta_info"]["id"],
                     created=int(time.time()),
                     model=request.model,
-                    choices=[
-                        _StreamChoice(
-                            index=idx,
-                            delta=_StreamDelta(),
-                            finish_reason=final_finish_reason,
-                            matched_stop=matched_stop,
-                        )
-                    ],
+                    index=idx,
+                    finish_reason=final_finish_reason,
+                    matched_stop=matched_stop,
                 )
-                yield _SSE_DATA + _stream_encoder.encode(chunk).decode() + _SSE_NL
 
             # Send hidden states if requested
             if request.return_hidden_states and hidden_states:

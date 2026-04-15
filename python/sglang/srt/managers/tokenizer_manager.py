@@ -1634,7 +1634,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
-        pending_notify: dict = {}
+        pending_notify: dict[str, ReqState] = {}
+        batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1829,7 +1830,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 state.out_list.append(out_dict)
                 pending_notify[rid] = state
 
-                if len(pending_notify) >= self.server_args.batch_notify_size:
+                if len(pending_notify) >= batch_notify_size:
                     for s in pending_notify.values():
                         s.event.set()
                     pending_notify = {}
@@ -1842,6 +1843,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
 
+        # handle_loop awaits next recv immediately
         for s in pending_notify.values():
             s.event.set()
 
