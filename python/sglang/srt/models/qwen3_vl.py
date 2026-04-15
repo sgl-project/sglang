@@ -1239,7 +1239,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         self.language_model_only = getattr(config, "language_model_only", False)
-        if not self.language_model_only:
+        if self.language_model_only:
+            self.visual = None
+        else:
             self.visual = Qwen3VLMoeVisionModel(
                 config.vision_config,
                 # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -1249,11 +1251,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,
             )
-        else:
-            logger.info(
-                f"[language_model_only] Skipping ViT initialization, forward will call self.model() directly (config.language_model_only={self.language_model_only})"
-            )
-            self.visual = None
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1297,7 +1294,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.lm_head = None
 
         self.is_mrope_enabled = (
-            "mrope_section" in self.config.rope_scaling and not self.language_model_only
+            not self.language_model_only and "mrope_section" in self.config.rope_scaling
         )
 
         self.logits_processor = LogitsProcessor(self.config)
@@ -1307,12 +1304,26 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
-        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        if not self.language_model_only:
+            self.deepstack_visual_indexes = (
+                config.vision_config.deepstack_visual_indexes
+            )
+            self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+            self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        else:
+            self.deepstack_visual_indexes = []
+            self.num_deepstack_embeddings = 0
+            self.use_deepstack = {}
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    def _require_vision(self) -> None:
+        if self.language_model_only:
+            raise RuntimeError(
+                "Checkpoint is marked language_model_only=True and was loaded "
+                "without a vision encoder; multimodal inputs are not supported."
+            )
 
     def separate_deepstack_embeds(self, embedding):
         assert (
@@ -1338,10 +1349,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return int(getattr(cfg, "num_hidden_layers", 0))
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        if mm_inputs and mm_inputs.mm_items:
+            self._require_vision()
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._require_vision()
         pixel_values = materialize_multimodal_features(
             [item.feature for item in items],
             device=self.visual.device,
@@ -1362,6 +1376,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._require_vision()
         pixel_values = materialize_multimodal_features(
             [item.feature for item in items],
             device=self.visual.device,
