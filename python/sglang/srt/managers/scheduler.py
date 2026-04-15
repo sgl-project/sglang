@@ -2444,6 +2444,16 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
+        if self.server_args.ttft_preemption_threshold > 0 and self.enable_priority_preemption:
+            now_ts = time.perf_counter()
+            for req in self.waiting_queue:
+                wait_ms = (now_ts - req.time_stats.wait_queue_entry_time) * 1000
+                if wait_ms > self.server_args.ttft_preemption_threshold:
+                    req.priority = max(
+                        req.priority,
+                        self.server_args.priority_scheduling_preemption_threshold + 1
+                    )
+
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
 

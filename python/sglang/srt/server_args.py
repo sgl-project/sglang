@@ -356,6 +356,7 @@ class ServerArgs:
     abort_on_priority_when_disabled: bool = False
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
+    ttft_preemption_threshold: float = 0.0
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
@@ -4333,6 +4334,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.priority_scheduling_preemption_threshold,
             help="Minimum difference in priorities for an incoming request to have to preempt running request(s).",
+        )
+        parser.add_argument(
+            "--ttft-preemption-threshold",
+            type=float,
+            default=ServerArgs.ttft_preemption_threshold,
+            help="Maximum wait time (in milliseconds) for a request in the waiting queue before it triggers decode preemption to guarantee TTFT. A value of 0 means disabled.",
         )
         parser.add_argument(
             "--schedule-conservativeness",
