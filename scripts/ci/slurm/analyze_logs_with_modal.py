@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import re
 import shlex
 import shutil
 import tarfile
@@ -39,6 +41,30 @@ DEFAULT_REPOS = [
     "https://github.com/sgl-project/sglang.git",
 ]
 PROMPT_PATH = Path(__file__).with_name("log_analysis_prompt.md")
+
+# Matches common API key / token patterns (sk-..., ak-..., as-..., key-..., etc.)
+_SECRET_PATTERN = re.compile(
+    r"""(?:"""
+    r"""(?:sk|ak|as|key|token|secret|bearer)[-_][A-Za-z0-9_\-]{16,}"""
+    r"""|"""
+    r"""(?:OPENROUTER_API_KEY|MODAL_TOKEN_ID|MODAL_TOKEN_SECRET|ANTHROPIC_API_KEY)"""
+    r"""[=:]\s*\S+"""
+    r""")""",
+    re.IGNORECASE,
+)
+
+
+def sanitize(text: str) -> str:
+    """Redact strings that look like API keys or secrets."""
+    if not text:
+        return text
+    sanitized = _SECRET_PATTERN.sub("[REDACTED]", text)
+    # Also redact any env var values we know are secrets
+    for var in ("OPENROUTER_API_KEY", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"):
+        val = os.environ.get(var)
+        if val and len(val) > 8:
+            sanitized = sanitized.replace(val, "[REDACTED]")
+    return sanitized
 
 
 def configure_logging(verbose: bool) -> None:
@@ -284,7 +310,7 @@ ls -la /workspace/logs > /workspace/logs/log_dir_listing.txt
 
         stderr = process.stderr.read()
         if stderr:
-            logger.warning("runner stderr: %s", stderr[:500])
+            logger.warning("runner stderr: %s", sanitize(stderr[:500]))
 
         exitcode = read_optional_file(sandbox, "/workspace/logs/opencode.exitcode")
         opencode_stdout = (
@@ -297,22 +323,22 @@ ls -la /workspace/logs > /workspace/logs/log_dir_listing.txt
         try:
             ai_analysis = read_optional_file(sandbox, "/workspace/logs/ai_analysis.md")
             if ai_analysis and ai_analysis.strip():
-                return ai_analysis
+                return sanitize(ai_analysis)
 
             if opencode_stdout.strip():
-                return opencode_stdout
+                return sanitize(opencode_stdout)
 
             raise RuntimeError("opencode completed without producing analysis output")
         except Exception as exc:
             stdout = process.stdout.read()
             if stdout:
-                return stdout
+                return sanitize(stdout)
             details = [
                 f"opencode analysis did not produce a usable report: {exc}",
                 f"exitcode={exitcode!r}",
-                f"stdout_preview={opencode_stdout[:500]!r}",
-                f"stderr_preview={(opencode_stderr or '')[:500]!r}",
-                f"log_dir_listing={(log_dir_listing or '')[:500]!r}",
+                f"stdout_preview={sanitize(opencode_stdout[:500])!r}",
+                f"stderr_preview={sanitize((opencode_stderr or '')[:500])!r}",
+                f"log_dir_listing={sanitize((log_dir_listing or '')[:500])!r}",
             ]
             raise RuntimeError(" ".join(details)) from exc
     finally:
