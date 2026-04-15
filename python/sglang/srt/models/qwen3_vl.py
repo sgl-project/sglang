@@ -1123,7 +1123,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling and not self.language_model_only
+        self.is_mrope_enabled = not self.language_model_only and "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -1132,9 +1132,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
-        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        if not self.language_model_only:
+            self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
+            self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+            self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        else:
+            self.deepstack_visual_indexes = []
+            self.num_deepstack_embeddings = 0
+            self.use_deepstack = {}
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
