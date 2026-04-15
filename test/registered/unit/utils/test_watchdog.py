@@ -4,8 +4,10 @@ from unittest.mock import patch, MagicMock
 from multiprocessing import Process
 
 from sglang.srt.utils.watchdog import Watchdog, SubprocessWatchdog
-from sglang.test.test_utils import CustomTestCase
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
 def dummy_worker(sleep_time: float):
@@ -47,6 +49,18 @@ class TestWatchdog(CustomTestCase):
 
 
 class TestSubprocessWatchdog(CustomTestCase):
+    def setUp(self):
+        self._processes = []
+        self._watchdog = None
+
+    def tearDown(self):
+        if self._watchdog is not None:
+            self._watchdog.stop()
+        for p in self._processes:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=1)
+
     def test_subprocess_watchdog_healthy(self):
         """Test that watchdog stays quiet with healthy processes."""
         processes = []
@@ -55,7 +69,9 @@ class TestSubprocessWatchdog(CustomTestCase):
             p.start()
             processes.append(p)
 
+        self._processes = processes
         wd = SubprocessWatchdog(processes, ["p1", "p2"], interval=0.05)
+        self._watchdog = wd
         wd.start()
 
         for p in processes:
@@ -63,24 +79,22 @@ class TestSubprocessWatchdog(CustomTestCase):
 
         crashed = wd._check_processes()
         self.assertFalse(crashed)
-        wd.stop()
 
     def test_subprocess_watchdog_stop(self):
         """Test watchdog stop logic terminates the inner thread."""
         p = Process(target=dummy_worker, args=(0.5,))
         p.start()
+        self._processes = [p]
 
         wd = SubprocessWatchdog([p], ["p_long"], interval=0.05)
+        self._watchdog = wd
         wd.start()
         self.assertIsNotNone(wd._thread)
         self.assertTrue(wd._thread.is_alive())
 
         wd.stop()
+        self._watchdog = None  # already stopped
         self.assertIsNone(wd._thread)
-        p.join()
-
-
-register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 
 if __name__ == "__main__":
     unittest.main()
