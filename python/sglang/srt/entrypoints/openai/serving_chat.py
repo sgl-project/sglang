@@ -67,7 +67,7 @@ class _StreamDelta(msgspec.Struct, omit_defaults=True):
 class _StreamChoice(msgspec.Struct):
     index: int
     delta: _StreamDelta
-    logprobs: Optional[Any] = None
+    logprobs: Optional[dict] = None
     finish_reason: Optional[str] = None
     matched_stop: Union[None, int, str] = None
 
@@ -93,7 +93,7 @@ def _fast_sse_content(
     content: Optional[str] = None,
     reasoning_content: Optional[str] = None,
     finish_reason: Optional[str] = None,
-    logprobs=None,
+    logprobs: Optional[dict] = None,
     matched_stop: Union[None, int, str] = None,
     usage: Optional[dict] = None,
 ) -> str:
@@ -760,7 +760,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if n_prev_token < total_output_logprobs:
                         choice_logprobs = self._process_streaming_logprobs(
                             content, n_prev_token, total_output_logprobs
-                        )
+                        ).model_dump()
                     n_prev_tokens[index] = total_output_logprobs
 
                 finish_reason = content["meta_info"].get("finish_reason", None)
