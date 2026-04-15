@@ -980,6 +980,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             enable_fused_qk_norm_rope_set_kv_aiter(forward_batch)
             and is_gfx95_supported()
         ):
+            if self.attn_output_gate:
+                qkv = torch.cat([q, k, v], dim=-1)
             q, k, v = self._fused_qk_norm_rope_cache_quant_aiter(
                 qkv,
                 positions,
