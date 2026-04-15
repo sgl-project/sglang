@@ -29,27 +29,7 @@ from typing import Sequence
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.registry import get_model_info
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.test_utils import (
-    DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
-    DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-    DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
-    DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
-    DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
-    DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
-    DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
-    DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
-    DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST,
-    DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
-    DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-    DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST,
-    DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
-    DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
-    DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST,
-)
 
 
 @dataclass
@@ -436,6 +416,7 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
 
+
 def _with_default_num_gpus(
     cases: list[DiffusionTestCase], num_gpus: int
 ) -> list[DiffusionTestCase]:
@@ -443,6 +424,7 @@ def _with_default_num_gpus(
         replace(case, server_args=replace(case.server_args, num_gpus=num_gpus))
         for case in cases
     ]
+
 
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(

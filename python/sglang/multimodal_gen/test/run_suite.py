@@ -20,13 +20,13 @@ from pathlib import Path
 import tabulate
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.testcase_configs import (
-    BASELINE_CONFIG,
-    DiffusionTestCase,
-)
 from sglang.multimodal_gen.test.server.gpu_cases import (
     ONE_GPU_CASES,
     TWO_GPU_CASES,
+)
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    BASELINE_CONFIG,
+    DiffusionTestCase,
 )
 
 logger = init_logger(__name__)

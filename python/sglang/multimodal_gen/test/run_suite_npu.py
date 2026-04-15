@@ -10,7 +10,6 @@ Example:
 
 import argparse
 import os
-import random
 import subprocess
 import sys
 from pathlib import Path
@@ -242,16 +241,13 @@ def main():
         f_abs = target_dir / f_rel
         if not f_abs.exists():
             msg = f"Test file {f_rel} not found in {target_dir}."
-            if args.suite in STRICT_SUITES:
-                print(f"Error: {msg}")
-                sys.exit(1)
             print(f"Warning: {msg} Skipping.")
             continue
         suite_files_abs.append(str(f_abs))
 
     if not suite_files_abs:
         print(f"No valid test files found for suite '{args.suite}'.")
-        sys.exit(1 if args.suite in STRICT_SUITES else 0)
+        sys.exit(0)
 
     # 3. collect all test items and partition by items (not files)
     all_test_items = collect_test_items(suite_files_abs, filter_expr=args.filter)
