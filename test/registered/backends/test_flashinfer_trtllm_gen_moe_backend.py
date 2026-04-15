@@ -248,5 +248,102 @@ class TestFlashinferTrtllmGenMoeBackendNVFP4Routed(
     backend = "flashinfer_trtllm_routed"
 
 
+# --- Non-gated (relu2) NemotronH tests ---
+
+
+class FlashinferTrtllmGenMoeBackendNemotronNVFP4Base:
+    """NemotronH NVFP4 base: non-gated MoE with relu2 activation."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--moe-runner-backend",
+                "flashinfer_trtllm",
+                "--tp-size",
+                "4",
+                "--trust-remote-code",
+                "--disable-radix-cache",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            num_shots=4,
+            num_examples=200,
+            max_tokens=4096,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.90)
+
+
+class FlashinferTrtllmGenMoeBackendNemotronFP8Base:
+    """NemotronH FP8 base: non-gated MoE with relu2 activation."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--moe-runner-backend",
+                "flashinfer_trtllm",
+                "--tp-size",
+                "2",
+                "--trust-remote-code",
+                "--disable-radix-cache",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            num_shots=4,
+            num_examples=200,
+            max_tokens=4096,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.90)
+
+
+class TestFlashinferTrtllmGenMoeBackendNemotronNVFP4(
+    FlashinferTrtllmGenMoeBackendNemotronNVFP4Base, CustomTestCase
+):
+    pass
+
+
+class TestFlashinferTrtllmGenMoeBackendNemotronFP8(
+    FlashinferTrtllmGenMoeBackendNemotronFP8Base, CustomTestCase
+):
+    pass
+
+
 if __name__ == "__main__":
     unittest.main()
