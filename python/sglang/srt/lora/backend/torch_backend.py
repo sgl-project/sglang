@@ -37,6 +37,25 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device)
+        self._b_output_offset_cache: dict[int, torch.Tensor] = {}
+        self._gate_up_output_offset_cache: dict[tuple[int, int], torch.Tensor] = {}
+
+    def _get_b_output_offset(self, weight_out_dim: int) -> torch.Tensor:
+        if weight_out_dim not in self._b_output_offset_cache:
+            self._b_output_offset_cache[weight_out_dim] = torch.tensor(
+                [0, weight_out_dim], dtype=torch.int32, device="cpu"
+            )
+        return self._b_output_offset_cache[weight_out_dim]
+
+    def _get_gate_up_output_offset(
+        self, slice_size: int, weight_out_dim: int
+    ) -> torch.Tensor:
+        key = (slice_size, weight_out_dim)
+        if key not in self._gate_up_output_offset_cache:
+            self._gate_up_output_offset_cache[key] = torch.tensor(
+                [0, slice_size, weight_out_dim], dtype=torch.int32, device="cpu"
+            )
+        return self._gate_up_output_offset_cache[key]
 
     def run_lora_a_sgemm(
         self,
@@ -67,9 +86,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         **kwargs,
     ) -> torch.Tensor:
         _, weight_out_dim, _ = weights.shape
-        output_offset = torch.tensor(
-            [0, weight_out_dim], dtype=torch.int32, device="cpu"
-        )
+        output_offset = self._get_b_output_offset(weight_out_dim)
         output_tensor = sgemm_lora_b_fwd(
             inputs=x,
             weights=weights,
@@ -129,9 +146,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         num_slices = 2
         _, weight_out_dim, _ = gate_up_lora_b.shape
         slice_size = weight_out_dim // num_slices
-        output_offset = torch.tensor(
-            [0, slice_size, weight_out_dim], dtype=torch.int32, device="cpu"
-        )
+        output_offset = self._get_gate_up_output_offset(slice_size, weight_out_dim)
 
         lora_a_output = sgemm_lora_a_fwd(
             inputs=x,
