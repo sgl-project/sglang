@@ -294,6 +294,7 @@ class SDARInterleavedWorker:
         spec_state = batch.spec_info
         if not isinstance(spec_state, SDARInterleavedDraftState):
             # Fallback: plain target forward
+            print(f"[SDAR_DBG] _forward_decode FALLBACK: spec_info type={type(spec_state)}", flush=True)
             mwb = batch.get_model_worker_batch()
             return self.target_worker.forward_batch_generation(mwb, **kwargs)
 
