@@ -669,13 +669,12 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
-            if (
-                self.stats.max_running_requests_under_SLO is not None
-                and self.stats.max_running_requests_under_SLO > 0
-            ):
+            max_reqs = self.stats.max_running_requests_under_SLO
+            if max_reqs is None or max_reqs <= 0:
+                max_reqs = self.max_running_requests
+            if max_reqs is not None and max_reqs > 0:
                 self.stats.utilization = max(
-                    self.stats.num_running_reqs.total
-                    / self.stats.max_running_requests_under_SLO,
+                    self.stats.num_running_reqs.total / max_reqs,
                     self.stats.token_usage / 0.9,
                 )
 
