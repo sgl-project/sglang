@@ -48,7 +48,6 @@ from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
     expand_path_fields,
-    expand_path_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -131,8 +130,8 @@ class ServerArgs:
     dp_size: int = 1
     # number of gpu in a dp group
     dp_degree: int = 1
-    # cfg parallel
-    enable_cfg_parallel: bool = False
+    # cfg parallel (None = auto-decide based on num_gpus)
+    enable_cfg_parallel: Optional[bool] = None
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -150,6 +149,7 @@ class ServerArgs:
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
@@ -189,8 +189,7 @@ class ServerArgs:
     )
 
     # Master port for distributed inference
-    # TODO: do not hard code
-    master_port: int | None = None
+    master_port: int = 30005
 
     # http server endpoint config
     host: str | None = "127.0.0.1"
@@ -201,6 +200,9 @@ class ServerArgs:
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+
+    # Strict port mode: fail if requested port is unavailable instead of auto-selecting
+    strict_ports: bool = False
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
@@ -230,6 +232,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     @property
     def broker_port(self) -> int:
@@ -372,6 +375,21 @@ class ServerArgs:
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
+            if (
+                current_platform.is_cuda()
+                and self.pipeline_class_name is None
+                and self.num_gpus == 1
+                and self.tp_size == 1
+                and self.sp_degree == 1
+                and self.ulysses_degree == 1
+                and self.ring_degree == 1
+                and self._is_ltx23_model_path(self.model_path)
+            ):
+                self.attention_backend = "fa"
+                logger.info(
+                    "Automatically set attention_backend=fa for LTX-2.3 one-stage on 1 GPU to preserve precision"
+                )
+                return
             self._set_default_attention_backend()
 
     def _adjust_warmup(self):
@@ -383,25 +401,64 @@ class ServerArgs:
                 "Warmup enabled, the launch time is expected to be longer than usual"
             )
 
+    @staticmethod
+    def _require_port(port: int, name: str) -> None:
+        """Raise if *port* is occupied (used under ``--strict-ports``)."""
+        if not is_port_available(port):
+            raise RuntimeError(
+                f"{name} port {port} is unavailable and --strict-ports is enabled. "
+                f"Either use a different port or disable --strict-ports."
+            )
+
     def _adjust_network_ports(self):
-        self.port = self.settle_port(self.port)
-        initial_scheduler_port = self.scheduler_port + (
-            random.randint(0, 100) if self.scheduler_port == 5555 else 0
-        )
-        self.scheduler_port = self.settle_port(initial_scheduler_port)
-        initial_master_port = (
-            self.master_port
-            if self.master_port is not None
-            else (30005 + random.randint(0, 100))
-        )
-        self.master_port = self.settle_port(initial_master_port, 37)
+        if self.strict_ports:
+            self._require_port(self.port, "HTTP")
+            self._require_port(self.scheduler_port, "Scheduler")
+            self._require_port(self.master_port, "Master")
+        else:
+            self.port = self.settle_port(self.port)
+            initial_scheduler_port = self.scheduler_port + (
+                random.randint(0, 100) if self.scheduler_port == 5555 else 0
+            )
+            self.scheduler_port = self.settle_port(initial_scheduler_port)
+            self.master_port = self.settle_port(self.master_port, 37)
 
     def _adjust_parallelism(self):
-        if self.tp_size is None:
-            self.tp_size = 1
+        tp_unspecified = self.tp_size is None
+        sp_unspecified = self.sp_degree is None
+        ulysses_unspecified = self.ulysses_degree is None
+        ring_unspecified = self.ring_degree is None
+        cfg_unspecified = self.enable_cfg_parallel is None
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
+
+        if self.tp_size is None:
+            self.tp_size = 1
+
+        # Auto-enable CFG parallel when user hasn't set any parallelism flags
+        # and there are enough GPUs.  Only auto-enable for models whose default
+        # SamplingParams use classifier-free guidance (negative_prompt is not None),
+        # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
+        if cfg_unspecified:
+            cfg_group_size = self.dp_size * self.tp_size * 2
+            if (
+                self.num_gpus >= 2
+                and self.num_gpus % cfg_group_size == 0
+                and sp_unspecified
+                and ulysses_unspecified
+                and ring_unspecified
+                and self._model_default_uses_cfg()
+            ):
+                self.enable_cfg_parallel = True
+                logger.info(
+                    "Automatically enabled CFG parallel for %d GPUs. "
+                    "Use --sp-degree / --ulysses-degree to use sequence "
+                    "parallelism instead.",
+                    self.num_gpus,
+                )
+            else:
+                self.enable_cfg_parallel = False
 
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
@@ -433,6 +490,42 @@ class ServerArgs:
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def _model_default_uses_cfg(self) -> bool:
+        """
+        Check whether the model uses classifier-free guidance by default.
+
+        CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        """
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(self.model_path, self.backend, self.model_id)
+        if model_info is None:
+            return False
+        default_params = model_info.sampling_param_cls()
+
+        # for ltx2.3, cfg-parallel performs worse than ulysses-sp
+        is_ltx = "ltx" in type(default_params).__name__.lower()
+        if is_ltx:
+            return False
+        return (
+            getattr(default_params, "negative_prompt", None) is not None
+            and getattr(default_params, "guidance_scale", 0) > 1.0
+        )
+
+    @staticmethod
+    def _is_ltx23_model_path(model_path: str | None) -> bool:
+        if not model_path:
+            return False
+        normalized = model_path.lower()
+        return any(
+            token in normalized
+            for token in (
+                "lightricks/ltx-2.3",
+                "models--lightricks--ltx-2.3",
+                "lightricks__ltx-2.3",
+            )
+        )
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
@@ -551,6 +644,15 @@ class ServerArgs:
                 "(e.g. 'Qwen-Image' for 'Qwen/Qwen-Image')."
             ),
         )
+        parser.add_argument(
+            "--pipeline-class-name",
+            type=str,
+            default=ServerArgs.pipeline_class_name,
+            help=(
+                "Override pipeline class selection from model_index.json. "
+                "Must match a registered pipeline_name."
+            ),
+        )
         # attention
         parser.add_argument(
             "--attention-backend",
@@ -624,8 +726,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cfg-parallel",
             action="store_true",
-            default=ServerArgs.enable_cfg_parallel,
-            help="Enable cfg parallel.",
+            default=None,
+            help="Enable cfg parallel. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -779,6 +881,12 @@ class ServerArgs:
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--strict-ports",
+            action=StoreBoolean,
+            default=ServerArgs.strict_ports,
+            help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
+        )
+        parser.add_argument(
             "--webui",
             action=StoreBoolean,
             default=ServerArgs.webui,
@@ -823,6 +931,12 @@ class ServerArgs:
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
         )
+        parser.add_argument(
+            "--lora-weight-name",
+            type=str,
+            default=ServerArgs.lora_weight_name,
+            help="Specific safetensors filename to load from a multi-file LoRA repo",
+        )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
 
@@ -832,6 +946,15 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+        parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
         )
         parser.add_argument(
             "--backend",
@@ -899,7 +1022,11 @@ class ServerArgs:
         unknown_args: list[str],
     ) -> tuple[dict[str, str], list[str]]:
         """
-        Extract dynamic ``--<component>-path`` args from unrecognised CLI args.
+        Extract dynamic component path args from unrecognised CLI args.
+
+        Supported forms:
+        - ``--<component>-path /path/to/component``
+        - ``--component-paths.<component> /path/to/component`` (expanded from config)
         """
         component_paths: dict[str, str] = {}
         remaining: list[str] = []
@@ -907,8 +1034,15 @@ class ServerArgs:
         while i < len(unknown_args):
             arg = unknown_args[i]
             key_part = arg.split("=", 1)[0] if "=" in arg else arg
-            if key_part.startswith("--") and key_part.endswith("-path"):
+            component = None
+            if key_part.startswith("--component-paths."):
+                component = key_part[len("--component-paths.") :].replace("-", "_")
+            elif key_part.startswith("--component_paths."):
+                component = key_part[len("--component_paths.") :].replace("-", "_")
+            elif key_part.startswith("--") and key_part.endswith("-path"):
                 component = key_part[2:-5].replace("-", "_")
+
+            if component is not None:
                 if "=" in arg:
                     component_paths[component] = arg.split("=", 1)[1]
                 elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
@@ -960,7 +1094,6 @@ class ServerArgs:
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
-        kwargs = expand_path_kwargs(dict(kwargs))
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
 

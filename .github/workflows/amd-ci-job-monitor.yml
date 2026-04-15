@@ -20,10 +20,8 @@ on:
         type: string
 
 jobs:
-  # Single job filter mode
-  custom-report:
-    name: Custom Job Report
-    if: ${{ inputs.job_filter }}
+  fetch-actions-data:
+    name: Fetch Actions Snapshot
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -39,6 +37,55 @@ jobs:
       - name: Install dependencies
         run: pip install tabulate
 
+      - name: Select workflows for snapshot
+        id: select-workflows
+        run: |
+          if [[ -n "${{ inputs.job_filter }}" ]]; then
+            echo "workflows=pr-test-amd.yml" >> "$GITHUB_OUTPUT"
+          else
+            echo "workflows=pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch Actions data snapshot
+        timeout-minutes: 30
+        run: |
+          python scripts/ci/utils/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --workflow "${{ steps.select-workflows.outputs.workflows }}" \
+            --hours ${{ inputs.hours || '24' }} \
+            --dump-data-file actions-job-snapshot.json
+
+      - name: Upload Actions data snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: actions-job-snapshot.json
+          if-no-files-found: error
+
+  # Single job filter mode
+  custom-report:
+    name: Custom Job Report
+    if: ${{ inputs.job_filter }}
+    needs: fetch-actions-data
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
+
       - name: Generate Custom Job Report
         timeout-minutes: 30
         run: |
@@ -47,6 +94,7 @@ jobs:
             --job "${{ inputs.job_filter }}" \
             --workflow "pr-test-amd.yml" \
             --hours ${{ inputs.hours || '24' }} \
+            --input-data-file ci-data/actions-job-snapshot.json \
             --summary
 
   # Parse workflow files to get job names dynamically
@@ -57,6 +105,8 @@ jobs:
     outputs:
       pr_jobs: ${{ steps.parse.outputs.pr_jobs }}
       nightly_jobs: ${{ steps.parse.outputs.nightly_jobs }}
+      pr_rocm720_jobs: ${{ steps.parse.outputs.pr_rocm720_jobs }}
+      nightly_rocm720_jobs: ${{ steps.parse.outputs.nightly_rocm720_jobs }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -80,18 +130,32 @@ jobs:
           echo "nightly_jobs=$nightly_jobs" >> $GITHUB_OUTPUT
           echo "Nightly jobs: $nightly_jobs"
 
+          # Parse pr-test-amd-rocm720.yml (exclude utility jobs)
+          # Excluded: call-gate, check-changes, pr-test-amd-finish, cancel, check-all-jobs
+          pr_rocm720_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-amd-rocm720.yml | \
+            grep -v -E '^(call-gate|check-changes|pr-test-amd-finish|cancel|check-all-jobs)$' | \
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "pr_rocm720_jobs=$pr_rocm720_jobs" >> $GITHUB_OUTPUT
+          echo "PR ROCm 7.2 jobs: $pr_rocm720_jobs"
+
+          # Parse nightly-test-amd-rocm720.yml (exclude utility jobs)
+          # Excluded: check-all-jobs
+          nightly_rocm720_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/nightly-test-amd-rocm720.yml | \
+            grep -v -E '^(check-all-jobs)$' | \
+            jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "nightly_rocm720_jobs=$nightly_rocm720_jobs" >> $GITHUB_OUTPUT
+          echo "Nightly ROCm 7.2 jobs: $nightly_rocm720_jobs"
+
   # PR CI reports using dynamic matrix
   pr-ci-reports:
     name: PR - ${{ matrix.job_name }}
-    needs: parse-workflows
+    needs: [parse-workflows, fetch-actions-data]
     if: ${{ !inputs.job_filter }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         job_name: ${{ fromJson(needs.parse-workflows.outputs.pr_jobs) }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -103,6 +167,12 @@ jobs:
 
       - name: Install dependencies
         run: pip install tabulate
+
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
 
       - name: Generate Report
         timeout-minutes: 15
@@ -112,20 +182,19 @@ jobs:
             --job "${{ matrix.job_name }}" \
             --workflow "pr-test-amd.yml" \
             --hours ${{ inputs.hours || '24' }} \
+            --input-data-file ci-data/actions-job-snapshot.json \
             --summary
 
   # Nightly AMD test reports using dynamic matrix
   nightly-reports:
     name: Nightly - ${{ matrix.job_name }}
-    needs: parse-workflows
+    needs: [parse-workflows, fetch-actions-data]
     if: ${{ !inputs.job_filter }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         job_name: ${{ fromJson(needs.parse-workflows.outputs.nightly_jobs) }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -138,6 +207,12 @@ jobs:
       - name: Install dependencies
         run: pip install tabulate
 
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
+
       - name: Generate Nightly Report
         timeout-minutes: 15
         run: |
@@ -146,4 +221,118 @@ jobs:
             --job "${{ matrix.job_name }}" \
             --workflow "nightly-test-amd.yml" \
             --hours ${{ inputs.hours || '24' }} \
+            --input-data-file ci-data/actions-job-snapshot.json \
+            --summary
+
+  # PR ROCm 7.2 CI reports using dynamic matrix
+  pr-rocm720-ci-reports:
+    name: PR ROCm720 - ${{ matrix.job_name }}
+    needs: [parse-workflows, fetch-actions-data]
+    if: ${{ !inputs.job_filter }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.pr_rocm720_jobs) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
+
+      - name: Generate PR ROCm 7.2 Report
+        timeout-minutes: 15
+        run: |
+          python scripts/ci/utils/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ matrix.job_name }}" \
+            --workflow "pr-test-amd-rocm720.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --input-data-file ci-data/actions-job-snapshot.json \
+            --summary
+
+  # Nightly ROCm 7.2 reports using dynamic matrix
+  nightly-rocm720-reports:
+    name: Nightly ROCm720 - ${{ matrix.job_name }}
+    needs: [parse-workflows, fetch-actions-data]
+    if: ${{ !inputs.job_filter }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        job_name: ${{ fromJson(needs.parse-workflows.outputs.nightly_rocm720_jobs) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
+
+      - name: Generate Nightly ROCm 7.2 Report
+        timeout-minutes: 15
+        run: |
+          python scripts/ci/utils/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --job "${{ matrix.job_name }}" \
+            --workflow "nightly-test-amd-rocm720.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --input-data-file ci-data/actions-job-snapshot.json \
+            --summary
+
+  # Runner fleet report - cross-workflow runner analytics in a single pass
+  runner-fleet-report:
+    name: Runner Fleet Report
+    if: ${{ !inputs.job_filter }}
+    needs: fetch-actions-data
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install tabulate
+
+      - name: Download Actions data snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: ci-data
+
+      - name: Generate Runner Fleet Report
+        timeout-minutes: 30
+        run: |
+          python scripts/ci/utils/query_job_status.py \
+            --repo ${{ github.repository }} \
+            --runner-report \
+            --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" \
+            --hours ${{ inputs.hours || '24' }} \
+            --input-data-file ci-data/actions-job-snapshot.json \
             --summary

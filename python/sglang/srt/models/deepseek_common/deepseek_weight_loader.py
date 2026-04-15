@@ -50,6 +50,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_fp8_fnuz,
     _is_hip,
     _is_npu,
+    _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
@@ -497,7 +498,7 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        _is_cuda
+                        (_is_cuda or _is_xpu)
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
@@ -559,6 +560,9 @@ class DeepseekV2WeightLoaderMixin:
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
+                and self.config.architectures
+                and self.config.architectures[0]
+                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")

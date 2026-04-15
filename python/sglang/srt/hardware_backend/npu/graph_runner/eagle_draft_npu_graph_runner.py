@@ -83,22 +83,28 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def _get_update_attr_type(self):
         return self.attr_type[AttentionArch.MLA]
 
-    def _replay_update(self, seq_lens):
+    def _replay_update(self, seq_lens_list):
         if isinstance(self.update_attr_type, torch.Tensor):
-            seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+            seq_lens = torch.from_numpy(np.array(seq_lens_list).astype(np.int32))
 
         self.graphs[self.bs].update(
-            cpu_update_input=[{self.update_attr_name: seq_lens}]
+            cpu_update_input=[
+                {self.update_attr_name: seq_lens} for seq_lens in seq_lens_list
+            ]
         )
 
     def _replay(self, forward_batch: ForwardBatch):
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
-            seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
-                self.bs - self.raw_bs
+            seq_lens_for_each_draft_step = []
+            for speculative_step_id in range(self.speculative_num_steps - 1):
+                seq_lens_cpu = forward_batch.seq_lens_cpu + speculative_step_id + 1
+                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                seq_lens_for_each_draft_step.append(seq_lens)
+            thread = threading.Thread(
+                target=self._replay_update, args=(seq_lens_for_each_draft_step,)
             )
-            thread = threading.Thread(target=self._replay_update, args=(seq_lens,))
             thread.start()
             self.graphs[self.bs].replay()
             thread.join()
