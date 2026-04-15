@@ -267,6 +267,19 @@ class BaseMultimodalProcessor(ABC):
         """
         return None, None
 
+    async def compute_pad_and_mrope_only(
+        self,
+        image_data,
+        audio_data,
+        input_text,
+        request_obj,
+        **kwargs,
+    ) -> Optional[MultimodalProcessorOutput]:
+        """PD-disagg decode-side fast path: produce padded input_ids (+ mrope_delta
+        if applicable) without running processor.__call__. Return None to fall
+        back to the full path."""
+        return None
+
     @property
     def spatial_merge_size(self):
         return self.hf_config.vision_config.spatial_merge_size

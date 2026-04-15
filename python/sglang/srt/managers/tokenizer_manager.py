@@ -748,8 +748,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             self._validate_mm_limits(obj)
 
             mm_inputs = None
+            is_decode_disagg = self.disaggregation_mode == DisaggregationMode.DECODE
 
-            if (
+            # On D, try the fast path that skips processor.__call__.
+            if is_decode_disagg:
+                mm_inputs = await self.mm_processor.compute_pad_and_mrope_only(
+                    image_data=obj.image_data,
+                    audio_data=obj.audio_data,
+                    input_text=(input_text or input_ids),
+                    request_obj=obj,
+                    max_req_input_len=self.max_req_input_len,
+                )
+
+            if mm_inputs is None and (
                 not self.server_args.language_only
                 or self.server_args.encoder_transfer_backend
                 in ["zmq_to_tokenizer", "mooncake"]
@@ -769,7 +780,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
-            elif (
+            elif mm_inputs is None and (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
                 and not obj.need_wait_for_mm_inputs
@@ -798,6 +809,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 for item in mm_inputs.mm_items:
                     if isinstance(item, MultimodalDataItem):
                         item.set_pad_value()
+
+            # On D, drop mm_inputs unless we need to forward an M-RoPE delta.
+            if (
+                is_decode_disagg
+                and mm_inputs is not None
+                and mm_inputs.mrope_position_delta is None
+            ):
+                mm_inputs = None
         else:
             mm_inputs = None
 
