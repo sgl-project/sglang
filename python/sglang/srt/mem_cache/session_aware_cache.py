@@ -22,8 +22,6 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
-logger = logging.getLogger(__name__)
-
 
 logger = logging.getLogger(__name__)
 
