@@ -4,7 +4,8 @@ from unittest.mock import patch, MagicMock
 from multiprocessing import Process
 
 from sglang.srt.utils.watchdog import Watchdog, SubprocessWatchdog
-from sglang.test.test_utils import CustomTestCase, register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
 
 
 def dummy_worker(sleep_time: float):
@@ -79,8 +80,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         p.join()
 
 
-register_cpu_ci(TestWatchdog)
-register_cpu_ci(TestSubprocessWatchdog)
+register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 
 if __name__ == "__main__":
     unittest.main()

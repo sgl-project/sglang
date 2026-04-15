@@ -2,7 +2,8 @@ import asyncio
 import unittest
 
 from sglang.srt.utils.aio_rwlock import RWLock
-from sglang.test.test_utils import CustomTestCase, register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
 
 
 class TestAIORWLock(CustomTestCase):
@@ -165,7 +166,7 @@ class TestAIORWLock(CustomTestCase):
         asyncio.run(main())
 
 
-register_cpu_ci(TestAIORWLock)
+register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,8 @@ import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Tool, Function
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.test.test_utils import CustomTestCase, register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_cpu_ci
 
 
 class TestJsonArrayParser(CustomTestCase):
@@ -67,7 +68,7 @@ class TestJsonArrayParser(CustomTestCase):
         self.assertIn("test_tool", tool_names)
 
 
-register_cpu_ci(TestJsonArrayParser)
+register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 
 if __name__ == "__main__":
     unittest.main()
