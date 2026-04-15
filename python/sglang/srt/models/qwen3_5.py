@@ -910,7 +910,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     rotary_dim=getattr(rotary_emb, "rotary_dim", head_size),
                 )
             except Exception as e:
-                logger.error(f"aiter should be upgraded to use partial rotary embeddings in fused_qk_norm_mrope_3d_cache_pts_quant_shuffle: {e}")
+                logger.error(
+                    f"aiter should be upgraded to use partial rotary embeddings in fused_qk_norm_mrope_3d_cache_pts_quant_shuffle: {e}"
+                )
                 raise e
         else:
             try:
@@ -942,7 +944,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     rotary_dim=getattr(rotary_emb, "rotary_dim", head_size),
                 )
             except Exception as e:
-                logger.error(f"aiter should be upgraded to use partial rotary embeddings in fused_qk_norm_rope_cache_pts_quant_shuffle: {e}")
+                logger.error(
+                    f"aiter should be upgraded to use partial rotary embeddings in fused_qk_norm_rope_cache_pts_quant_shuffle: {e}"
+                )
                 raise e
 
         q_out = q_out.view(num_tokens, -1)
