@@ -2900,6 +2900,14 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.process_batch_result_idle(batch, result)
 
+        # Inject MLX backend cache hit count into prefill stats for logging
+        if (
+            isinstance(result, GenerationBatchResult)
+            and result.mlx_cache_hit_tokens > 0
+            and batch.prefill_stats is not None
+        ):
+            batch.prefill_stats.log_hit_tokens = result.mlx_cache_hit_tokens
+
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()

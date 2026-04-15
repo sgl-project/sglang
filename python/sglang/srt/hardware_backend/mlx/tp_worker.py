@@ -60,10 +60,15 @@ class MlxTpModelWorker(TpModelWorker):
 
         # Initialize the MLX model runner (loads weights via MLX, not PyTorch)
         logger.info("Initializing MlxModelRunner for end-to-end MLX inference")
-        self._mlx_runner = MlxModelRunner(
+        init_kwargs = dict(
             model_path=self.server_args.model_path,
             trust_remote_code=self.server_args.trust_remote_code,
+            disable_radix_cache=self.server_args.disable_radix_cache,
+            mem_fraction_static=self.server_args.mem_fraction_static,
         )
+        if self.server_args.max_total_tokens is not None:
+            init_kwargs["pool_size"] = self.server_args.max_total_tokens
+        self._mlx_runner = MlxModelRunner(**init_kwargs)
         self._mlx_active_rids: set[str] = set()
 
     def get_pad_input_ids_func(self):
@@ -111,14 +116,22 @@ class MlxTpModelWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
 
-        # Auto-cleanup: remove MLX state for requests no longer in the batch
+        # Auto-cleanup: remove MLX state for requests no longer in the batch.
+        # Only clean up during DECODE batches, because EXTEND batches may
+        # contain only newly-prefilled requests while running decode requests
+        # are handled in a subsequent DECODE batch.
         current_rids = {req.rid for req in reqs}
-        stale_rids = self._mlx_active_rids - current_rids
-        for rid in stale_rids:
-            self._mlx_runner.remove_request(rid)
-        self._mlx_active_rids = current_rids
+        if forward_mode.is_decode():
+            stale_rids = self._mlx_active_rids - current_rids
+            for rid in stale_rids:
+                self._mlx_runner.remove_request(rid)
+            self._mlx_active_rids = current_rids
+        else:
+            # EXTEND mode: add new request IDs without removing existing ones
+            self._mlx_active_rids |= current_rids
 
         next_token_ids_list = []
+        total_cache_hits = 0
 
         if forward_mode.is_extend():
             # Prefill (or MIXED): extract per-request tokens from concatenated input_ids
@@ -126,17 +139,31 @@ class MlxTpModelWorker(TpModelWorker):
             extend_seq_lens = model_worker_batch.extend_seq_lens
             offset = 0
             prefill_rids = []
+            extend_rids = []
             decode_rids = []
             for i, req in enumerate(reqs):
                 seq_len = extend_seq_lens[i]
                 req_token_ids = input_ids_cpu[offset : offset + seq_len]
                 offset += seq_len
-                if req.rid in self._mlx_runner._request_states:
-                    # MIXED mode: this request already has MLX state, decode it
-                    decode_rids.append(req.rid)
+                if self._mlx_runner.has_request(req.rid):
+                    if seq_len > 1:
+                        # Chunked prefill continuation: process more prompt tokens
+                        next_token = self._mlx_runner.extend(req.rid, req_token_ids)
+                        extend_rids.append((req.rid, next_token))
+                    else:
+                        # MIXED mode: single-token decode for existing request
+                        decode_rids.append(req.rid)
                 else:
-                    # Prefill: new request
-                    next_token = self._mlx_runner.prefill(req.rid, req_token_ids)
+                    # Prefill: new request — use the FULL prompt from
+                    # req.fill_ids because the scheduler may have already
+                    # stripped cached prefix tokens from batch input_ids.
+                    # The MLX runner does its own radix-trie prefix matching
+                    # and needs the complete token sequence.
+                    full_token_ids = list(req.fill_ids)
+                    next_token, prefix_len = self._mlx_runner.prefill(
+                        req.rid, full_token_ids
+                    )
+                    total_cache_hits += prefix_len
                     prefill_rids.append((req.rid, next_token))
 
             # Batch decode all existing requests at once
@@ -147,11 +174,14 @@ class MlxTpModelWorker(TpModelWorker):
                 decode_map = {}
 
             prefill_map = dict(prefill_rids)
+            extend_map = dict(extend_rids)
 
             # Reassemble in original request order
             for req in reqs:
                 if req.rid in decode_map:
                     next_token_ids_list.append(decode_map[req.rid])
+                elif req.rid in extend_map:
+                    next_token_ids_list.append(extend_map[req.rid])
                 else:
                     next_token_ids_list.append(prefill_map[req.rid])
 
@@ -173,4 +203,5 @@ class MlxTpModelWorker(TpModelWorker):
             logits_output=LogitsProcessorOutput(next_token_logits=None),
             next_token_ids=next_token_ids,
             can_run_cuda_graph=False,
+            mlx_cache_hit_tokens=total_cache_hits,
         )

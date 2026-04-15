@@ -524,10 +524,15 @@ class _MlxBenchRunner:
     def __init__(self, model_runner, server_args):
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
-        self.mlx_runner = MlxModelRunner(
+        init_kwargs = dict(
             model_path=server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
+            disable_radix_cache=server_args.disable_radix_cache,
+            mem_fraction_static=server_args.mem_fraction_static,
         )
+        if server_args.max_total_tokens is not None:
+            init_kwargs["pool_size"] = server_args.max_total_tokens
+        self.mlx_runner = MlxModelRunner(**init_kwargs)
         self.fake_torch_runner = model_runner
 
     def clear(self):
