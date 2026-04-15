@@ -298,6 +298,21 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     )
 
 
+def should_use_dp_reduce_scatterv():
+    """
+    Use reduce_scatterv in the standard dispatcher's combine() for DP attention
+    with EP, replacing the default all-reduce + dp_scatter path.
+    Only changes the combine (post-kernel) communication; dispatch is unchanged.
+    """
+    return (
+        not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        and get_moe_a2a_backend().is_none()
+        and is_dp_attention_enabled()
+        and get_attention_dp_size() > 1
+        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+    )
+
+
 @contextmanager
 def speculative_moe_backend_context():
     """

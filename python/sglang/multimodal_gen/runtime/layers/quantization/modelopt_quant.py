@@ -202,6 +202,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         checkpoint_uses_packed_qkv: bool = False,
+        swap_weight_nibbles: bool = True,
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -212,6 +213,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             )
         self.group_size = group_size
         self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
+        self.swap_weight_nibbles = swap_weight_nibbles
 
     @classmethod
     def get_name(cls) -> str:
@@ -259,6 +261,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     def from_config(cls, config: Dict[str, Any]) -> ModelOptFp4Config:
         group_size = None
         exclude_modules = []
+        swap_weight_nibbles = True
 
         # Flat format (config.json quantization_config)
         quant_method = config.get("quant_algo")
@@ -270,6 +273,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     first_group = next(iter(config_groups.values()), {})
                     group_size = first_group.get("weights", {}).get("group_size")
             exclude_modules = config.get("ignore", [])
+            swap_weight_nibbles = config.get("swap_weight_nibbles", True)
         else:
             # Nested format (hf_quant_config.json)
             try:
@@ -277,6 +281,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 quant_method = quant_config["quant_algo"]
                 group_size = ModelOptFp4Config.common_group_size(config)
                 exclude_modules = quant_config.get("exclude_modules", [])
+                swap_weight_nibbles = quant_config.get(
+                    "swap_weight_nibbles",
+                    config.get("swap_weight_nibbles", True),
+                )
             except (ValueError, KeyError):
                 raise ValueError("Cannot find 'quant_algo' in quantization config.")
 
@@ -296,6 +304,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             exclude_modules=exclude_modules,
             packed_modules_mapping=config.get("packed_modules_mapping"),
             checkpoint_uses_packed_qkv=config.get("checkpoint_uses_packed_qkv", False),
+            swap_weight_nibbles=swap_weight_nibbles,
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):

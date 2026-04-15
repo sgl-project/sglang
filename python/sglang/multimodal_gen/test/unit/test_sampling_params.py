@@ -1,8 +1,14 @@
 import argparse
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    is_ltx23_native_variant,
+    sync_ltx23_runtime_vae_markers,
+)
 from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
@@ -140,6 +146,33 @@ class TestSamplingParamsSubclass(unittest.TestCase):
                     teacache_params.get_skip_boundaries(50, do_cfg),
                     expected,
                 )
+
+    def test_ltx23_runtime_vae_markers_sync_variant_and_decoder_metadata(self):
+        arch_config = LTX2PipelineConfig().vae_config.arch_config
+
+        self.assertFalse(is_ltx23_native_variant(arch_config))
+        self.assertEqual(arch_config.video_decoder_variant, "ltx_2")
+        self.assertEqual(arch_config.condition_encoder_subdir, "")
+
+        sync_ltx23_runtime_vae_markers(
+            arch_config,
+            SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    ltx_variant="ltx_2_3",
+                    condition_encoder_subdir="ltx23_image_encoder",
+                    video_decoder_variant="ltx_2_3",
+                    video_decoder_config={"_class_name": "AutoencoderKLLTX2Video"},
+                )
+            ),
+        )
+
+        self.assertTrue(is_ltx23_native_variant(arch_config))
+        self.assertEqual(arch_config.condition_encoder_subdir, "ltx23_image_encoder")
+        self.assertEqual(arch_config.video_decoder_variant, "ltx_2_3")
+        self.assertEqual(
+            arch_config.video_decoder_config,
+            {"_class_name": "AutoencoderKLLTX2Video"},
+        )
 
 
 class TestSamplingParamsCliArgs(unittest.TestCase):
