@@ -172,6 +172,7 @@ class Ernie4DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             bias=config.use_bias,
+            force_native_attention_path=True,
         )
         moe_layer_start_index = getattr(
             config, "moe_layer_start_index", config.num_hidden_layers
