@@ -1,31 +1,202 @@
 ---
-title: Qwen-Image
-metatags:
-    description: "Deploy Qwen-Image with SGLang - community contribution guide for Qwen's image generation model."
+title: "Qwen-Image"
 ---
 
-## 📝 Community Contribution Welcome
+import { QwenImageDeployment } from '/src/snippets/diffusion/qwen-image-deployment.jsx';
 
-This guide is currently under development. We welcome community contributions!
+## 1. Model Introduction
 
-If you have experience deploying **Qwen-Image** with SGLang, please help us complete this documentation.
+[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is a text-to-image diffusion model developed by the Qwen team.
 
-## 🚀 How to Contribute
+For more details, please refer to the [official Qwen-Image HuggingFace page](https://huggingface.co/Qwen/Qwen-Image), the [Blog](https://qwenlm.github.io/blog/qwen-image/), and the [Tech Report](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/Qwen_Image.pdf).
 
-```shell Command
-git clone https://github.com/YOUR_USERNAME/sglang-cookbook.git
-cd sglang-cookbook
-git checkout -b add-qwen-image-guide
-# Edit this file and submit a PR
+## 2. SGLang-diffusion Installation
+
+SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang-diffusion installation guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/install.md) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+Qwen-Image is a text-to-image model. The recommended launch configurations vary by hardware.
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
+
+<QwenImageDeployment />
+
+### 3.2 Configuration Tips
+
+Current supported optimization all listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
+
+- `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
+- `--num-gpus`: Number of GPUs to use
+- `--tp-size`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
+- `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
+- `--ring-degree`: The degree of ring attention-style SP in USP
+
+**AMD ROCm Notes**: Requires SGLang >= v0.5.8.
+
+## 4. API Usage
+
+For complete API documentation, please refer to the [official API usage guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/openai_api.md).
+
+### 4.1 Generate an Image
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.generate(
+    model="Qwen/Qwen-Image",
+    prompt="A logo With Bold Large text: SGL Diffusion",
+    n=1,
+    response_format="b64_json",
+)
+
+# Save the generated image
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("output.png", "wb") as f:
+    f.write(image_bytes)
 ```
 
-## 📚 Reference
+### 4.2 Advanced Usage
 
-- [Wan2.2](../Wan/Wan2.2)
-- [DeepSeek-V3.2](../../autoregressive/DeepSeek/DeepSeek-V3_2)
-- [Benchmark](../../base/benchmarks/diffusion_model_benchmark.mdx)
-- [README](../README)
+#### 4.2.1 Cache-DiT Acceleration
 
----
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/cache_dit.md).
 
-**Let's build this together!** 🌟
+**Basic Usage**
+
+```bash
+SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Qwen/Qwen-Image
+```
+
+**Advanced Usage**
+
+- DBCache Parameters: DBCache controls block-level caching behavior:
+
+  | Parameter | Env Variable                | Default | Description                              |
+  | --------- | --------------------------- | ------- | ---------------------------------------- |
+  | Fn        | `SGLANG_CACHE_DIT_FN`     | 1       | Number of first blocks to always compute |
+  | Bn        | `SGLANG_CACHE_DIT_BN`     | 0       | Number of last blocks to always compute  |
+  | W         | `SGLANG_CACHE_DIT_WARMUP` | 4       | Warmup steps before caching starts       |
+  | R         | `SGLANG_CACHE_DIT_RDT`    | 0.24    | Residual difference threshold            |
+  | MC        | `SGLANG_CACHE_DIT_MC`     | 3       | Maximum continuous cached steps          |
+- TaylorSeer Configuration: TaylorSeer improves caching accuracy using Taylor expansion:
+
+  | Parameter | Env Variable                    | Default | Description                     |
+  | --------- | ------------------------------- | ------- | ------------------------------- |
+  | Enable    | `SGLANG_CACHE_DIT_TAYLORSEER` | false   | Enable TaylorSeer calibrator    |
+  | Order     | `SGLANG_CACHE_DIT_TS_ORDER`   | 1       | Taylor expansion order (1 or 2) |
+
+  Combined Configuration Example:
+
+```bash
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+sglang serve --model-path Qwen/Qwen-Image
+```
+
+#### 4.2.2 CPU Offload
+
+- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if run out of memory.
+- `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference.
+- `--vae-cpu-offload`: Use CPU offload for VAE.
+- `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
+
+## 5. Benchmark
+
+Test Environment:
+
+- Hardware: AMD Instinct MI300X GPU (1x)
+- Model: Qwen/Qwen-Image
+- Docker Image: lmsysorg/sglang:v0.5.8-rocm700-mi30x
+- sglang diffusion version: 0.5.8
+
+### 5.1 Speedup Benchmark
+
+#### 5.1.1 Generate an image
+
+**Server Command**:
+
+```
+sglang serve --model-path Qwen/Qwen-Image \
+    --ulysses-degree=1 --ring-degree=1 --port 30000
+```
+
+**Benchmark Command**:
+
+```
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
+```
+
+**Result**:
+
+```
+================= Serving Benchmark Result =================
+Task:                                    text-to-image
+Model:                                   Qwen/Qwen-Image
+Dataset:                                 vbench
+--------------------------------------------------
+Benchmark duration (s):                  29.04
+Request rate:                            inf
+Max request concurrency:                 1
+Successful requests:                     1/1
+--------------------------------------------------
+Request throughput (req/s):              0.03
+Latency Mean (s):                        29.0378
+Latency Median (s):                      29.0378
+Latency P99 (s):                         29.0378
+--------------------------------------------------
+Peak Memory Max (MB):                    48018.83
+Peak Memory Mean (MB):                   48018.83
+Peak Memory Median (MB):                 48018.83
+============================================================
+```
+
+#### 5.1.2 Generate images with high concurrency
+
+**Benchmark Command**:
+
+```
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
+```
+
+**Result**:
+
+```
+================= Serving Benchmark Result =================
+Task:                                    text-to-image
+Model:                                   Qwen/Qwen-Image
+Dataset:                                 vbench
+--------------------------------------------------
+Benchmark duration (s):                  300.79
+Request rate:                            inf
+Max request concurrency:                 20
+Successful requests:                     14/20
+--------------------------------------------------
+Request throughput (req/s):              0.05
+Latency Mean (s):                        154.5368
+Latency Median (s):                      154.8363
+Latency P99 (s):                         285.4603
+--------------------------------------------------
+Peak Memory Max (MB):                    48030.31
+Peak Memory Mean (MB):                   48030.30
+Peak Memory Median (MB):                 48030.29
+============================================================
+```

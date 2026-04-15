@@ -277,176 +277,149 @@
             "pages": [
               "cookbook/intro",
               {
-                "group": "Large Language Models",
+                "group": "Autoregressive Models",
                 "pages": [
-                  "cookbook/llm/intro",
+                  "cookbook/autoregressive/intro",
                   {
                     "group": "Qwen",
                     "pages": [
-                      "cookbook/llm/Qwen/Qwen3.5",
-                      "cookbook/llm/Qwen/Qwen3",
-                      "cookbook/llm/Qwen/Qwen3-Next",
-                      "cookbook/llm/Qwen/Qwen3-Coder",
-                      "cookbook/llm/Qwen/Qwen3-Coder-Next"
+                      "cookbook/autoregressive/Qwen/Qwen3.5",
+                      "cookbook/autoregressive/Qwen/Qwen3",
+                      "cookbook/autoregressive/Qwen/Qwen3-Next",
+                      "cookbook/autoregressive/Qwen/Qwen3-Coder",
+                      "cookbook/autoregressive/Qwen/Qwen3-Coder-Next",
+                      "cookbook/autoregressive/Qwen/Qwen3-VL",
+                      "cookbook/autoregressive/Qwen/Qwen2.5-VL"
                     ]
                   },
                   {
                     "group": "DeepSeek",
                     "pages": [
-                      "cookbook/llm/DeepSeek/DeepSeek-V3_2",
-                      "cookbook/llm/DeepSeek/DeepSeek-V3_1",
-                      "cookbook/llm/DeepSeek/DeepSeek-V3",
-                      "cookbook/llm/DeepSeek/DeepSeek-R1"
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V3_1",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V3",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-R1",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-Math-V2",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-OCR",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-OCR-2"
                     ]
                   },
                   {
                     "group": "Llama",
                     "pages": [
-                      "cookbook/llm/Llama/Llama3.3-70B",
-                      "cookbook/llm/Llama/Llama3.1"
+                      "cookbook/autoregressive/Llama/Llama4",
+                      "cookbook/autoregressive/Llama/Llama3.3-70B",
+                      "cookbook/autoregressive/Llama/Llama3.1"
                     ]
                   },
                   {
                     "group": "GLM",
                     "pages": [
-                      "cookbook/llm/GLM/GLM-4.5",
-                      "cookbook/llm/GLM/GLM-4.6",
-                      "cookbook/llm/GLM/GLM-4.7",
-                      "cookbook/llm/GLM/GLM-4.7-Flash",
-                      "cookbook/llm/GLM/GLM-5",
-                      "cookbook/llm/GLM/GLM-5.1"
+                      "cookbook/autoregressive/GLM/GLM-4.5",
+                      "cookbook/autoregressive/GLM/GLM-4.6",
+                      "cookbook/autoregressive/GLM/GLM-4.7",
+                      "cookbook/autoregressive/GLM/GLM-4.7-Flash",
+                      "cookbook/autoregressive/GLM/GLM-5",
+                      "cookbook/autoregressive/GLM/GLM-5.1",
+                      "cookbook/autoregressive/GLM/GLM-Glyph",
+                      "cookbook/autoregressive/GLM/GLM-OCR",
+                      "cookbook/autoregressive/GLM/GLM-4.5V",
+                      "cookbook/autoregressive/GLM/GLM-4.6V"
+                    ]
+                  },
+                  {
+                    "group": "Google",
+                    "pages": [
+                      "cookbook/autoregressive/Google/Gemma4"
                     ]
                   },
                   {
                     "group": "OpenAI",
                     "pages": [
-                      "cookbook/llm/OpenAI/GPT-OSS"
+                      "cookbook/autoregressive/OpenAI/GPT-OSS"
                     ]
                   },
                   {
                     "group": "Moonshotai",
                     "pages": [
-                      "cookbook/llm/Moonshotai/Kimi-K2",
-                      "cookbook/llm/Moonshotai/Kimi-K2.5",
-                      "cookbook/llm/Moonshotai/Kimi-Linear"
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
+                      "cookbook/autoregressive/Moonshotai/Kimi-Linear"
                     ]
                   },
                   {
                     "group": "MiniMax",
                     "pages": [
-                      "cookbook/llm/MiniMax/MiniMax-M2.7",
-                      "cookbook/llm/MiniMax/MiniMax-M2",
-                      "cookbook/llm/MiniMax/MiniMax-M2.5"
+                      "cookbook/autoregressive/MiniMax/MiniMax-M2.7",
+                      "cookbook/autoregressive/MiniMax/MiniMax-M2",
+                      "cookbook/autoregressive/MiniMax/MiniMax-M2.5"
                     ]
                   },
                   {
                     "group": "NVIDIA",
                     "pages": [
-                      "cookbook/llm/NVIDIA/Nemotron3-Nano"
+                      "cookbook/autoregressive/NVIDIA/Nemotron3-Nano",
+                      "cookbook/autoregressive/NVIDIA/Nemotron3-Super"
                     ]
                   },
                   {
                     "group": "Ernie",
                     "pages": [
-                      "cookbook/llm/Ernie/Ernie4.5"
+                      "cookbook/autoregressive/Ernie/Ernie4.5",
+                      "cookbook/autoregressive/Ernie/Ernie4.5-VL"
                     ]
                   },
                   {
                     "group": "StepFun",
                     "pages": [
-                      "cookbook/llm/StepFun/Step3.5"
+                      "cookbook/autoregressive/StepFun/Step3.5",
+                      "cookbook/autoregressive/StepFun/Step3-VL-10B"
                     ]
                   },
                   {
                     "group": "InclusionAI",
                     "pages": [
-                      "cookbook/llm/InclusionAI/Ling-2.5-1T",
-                      "cookbook/llm/InclusionAI/Ring-2.5-1T",
-                      "cookbook/llm/LLaDA/LLaDA-2.1"
+                      "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
+                      "cookbook/autoregressive/InclusionAI/Ring-2.5-1T",
+                      "cookbook/autoregressive/InclusionAI/LLaDA-2.1"
                     ]
                   },
                   {
                     "group": "InternLM",
                     "pages": [
-                      "cookbook/llm/InternLM/Intern-S1"
-                    ]
-                  },
-                  {
-                    "group": "Jina AI",
-                    "pages": [
-                      "cookbook/llm/Jina/Jina-reranker-m0"
-                    ]
-                  },
-                  {
-                    "group": "Mistral",
-                    "pages": [
-                      "cookbook/llm/Mistral/Mistral-3",
-                      "cookbook/llm/Mistral/Devstral-2"
-                    ]
-                  },
-                  {
-                    "group": "Xiaomi",
-                    "pages": [
-                      "cookbook/llm/Xiaomi/MiMo-V2-Flash"
-                    ]
-                  },
-                  {
-                    "group": "FlashLabs",
-                    "pages": [
-                      "cookbook/llm/FlashLabs/Chroma1.0"
-                    ]
-                  }
-                ]
-              },
-              {
-                "group": "Vision Language Models",
-                "pages": [
-                  "cookbook/vlm/intro",
-                  {
-                    "group": "Qwen",
-                    "pages": [
-                      "cookbook/vlm/Qwen/Qwen3-VL",
-                      "cookbook/vlm/Qwen/Qwen2.5-VL"
-                    ]
-                  },
-                  {
-                    "group": "DeepSeek",
-                    "pages": [
-                      "cookbook/vlm/DeepSeek/DeepSeek-OCR",
-                      "cookbook/vlm/DeepSeek/DeepSeek-OCR-2"
-                    ]
-                  },
-                  {
-                    "group": "Llama",
-                    "pages": [
-                      "cookbook/vlm/Llama/Llama4-Scout"
-                    ]
-                  },
-                  {
-                    "group": "GLM",
-                    "pages": [
-                      "cookbook/vlm/GLM/GLM-Glyph",
-                      "cookbook/vlm/GLM/GLM-OCR",
-                      "cookbook/vlm/GLM/GLM-4.5V",
-                      "cookbook/vlm/GLM/GLM-4.6V"
-                    ]
-                  },
-                  {
-                    "group": "Ernie",
-                    "pages": [
-                      "cookbook/vlm/Ernie/Ernie4.5-VL"
-                    ]
-                  },
-                  {
-                    "group": "StepFun",
-                    "pages": [
-                      "cookbook/vlm/StepFun/Step3-VL-10B"
+                      "cookbook/autoregressive/InternLM/Intern-S1"
                     ]
                   },
                   {
                     "group": "InternVL",
                     "pages": [
-                      "cookbook/vlm/InternVL/InternVL3.5"
+                      "cookbook/autoregressive/InternVL/InternVL3.5"
+                    ]
+                  },
+                  {
+                    "group": "Jina AI",
+                    "pages": [
+                      "cookbook/autoregressive/Jina/Jina-reranker-m0"
+                    ]
+                  },
+                  {
+                    "group": "Mistral",
+                    "pages": [
+                      "cookbook/autoregressive/Mistral/Ministral-3",
+                      "cookbook/autoregressive/Mistral/Mistral-Small-4",
+                      "cookbook/autoregressive/Mistral/Devstral-2"
+                    ]
+                  },
+                  {
+                    "group": "Xiaomi",
+                    "pages": [
+                      "cookbook/autoregressive/Xiaomi/MiMo-V2-Flash"
+                    ]
+                  },
+                  {
+                    "group": "FlashLabs",
+                    "pages": [
+                      "cookbook/autoregressive/FlashLabs/Chroma1.0"
                     ]
                   }
                 ]
@@ -529,7 +502,7 @@
                 "pages": [
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/attention-backends",
-                  "docs/sglang-diffusion/performance/profiling",
+                  "docs/sglang-diffusion/profiling",
                   "docs/sglang-diffusion/ci-performance"
                 ]
               },
@@ -545,8 +518,7 @@
                 "group": "References",
                 "pages": [
                   "docs/sglang-diffusion/environment-variables",
-                  "docs/sglang-diffusion/support-new-models",
-                  "docs/sglang-diffusion/contributing"
+                  "docs/sglang-diffusion/supported-models"
                 ]
               }
             ]

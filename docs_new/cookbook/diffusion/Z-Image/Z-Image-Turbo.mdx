@@ -1,8 +1,8 @@
 ---
-title: Z-Image-Turbo
-metatags:
-    description: "Deploy Z-Image-Turbo with SGLang - community contribution guide for Z-Image's fast image generation model."
+title: "Z-Image-Turbo"
 ---
+
+import { ZImageTurboDeployment } from '/src/snippets/diffusion/zimage-turbo-deployment.jsx';
 
 ## 1. Model Introduction
 
@@ -36,20 +36,20 @@ Z-Image-Turbo is optimized for high-quality image generation with only 8 inferen
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
 
-import { ZImageTurboDeployment } from '/src/snippets/diffusion/zimage-turbo-deployment.jsx'
-
 <ZImageTurboDeployment />
 
 ### 3.2 Configuration Tips
 
 Current supported optimization all listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
 
-- `--vae-path`: Path to a custom VAE model or HuggingFace model ID. If not specified, the VAE will be loaded from the main model path.
+- `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
 - `--tp-size`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
 - `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree`: The degree of ring attention-style SP in USP
+
+**AMD ROCm Notes**: Requires SGLang >= v0.5.8.
 
 ## 4. API Usage
 
@@ -61,12 +61,11 @@ For complete API documentation, please refer to the [official API usage guide](h
 import base64
 from openai import OpenAI
 
-client = OpenAI(api_key="EMPTY", base_url="http://localhost:3000/v1")
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
 
 response = client.images.generate(
     model="Tongyi-MAI/Z-Image-Turbo",
-    prompt="Young Chinese woman in red Hanfu, intricate embroidery. Impeccable makeup, red floral forehead pattern. Elaborate high bun, golden phoenix headdress, red flowers, beads. Holds round folding fan with lady, trees, bird. Soft-lit outdoor night background, silhouetted tiered pagoda, blurred colorful distant lights.",
-    size="1024x1024",
+    prompt="A logo With Bold Large text: SGL Diffusion",
     n=1,
     response_format="b64_json",
 )
@@ -93,86 +92,19 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
 
 - DBCache Parameters: DBCache controls block-level caching behavior:
 
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "25.0%"}} />
-    <col style={{width: "25.0%"}} />
-    <col style={{width: "25.0%"}} />
-    <col style={{width: "25.0%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Fn</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_FN`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of first blocks to always compute</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Bn</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_BN`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of last blocks to always compute</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>W</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_WARMUP`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Warmup steps before caching starts</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>R</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_RDT`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.24</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Residual difference threshold</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MC</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_MC`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum continuous cached steps</td>
-    </tr>
-  </tbody>
-</table>
+  | Parameter | Env Variable                | Default | Description                              |
+  | --------- | --------------------------- | ------- | ---------------------------------------- |
+  | Fn        | `SGLANG_CACHE_DIT_FN`     | 1       | Number of first blocks to always compute |
+  | Bn        | `SGLANG_CACHE_DIT_BN`     | 0       | Number of last blocks to always compute  |
+  | W         | `SGLANG_CACHE_DIT_WARMUP` | 4       | Warmup steps before caching starts       |
+  | R         | `SGLANG_CACHE_DIT_RDT`    | 0.24    | Residual difference threshold            |
+  | MC        | `SGLANG_CACHE_DIT_MC`     | 3       | Maximum continuous cached steps          |
 - TaylorSeer Configuration: TaylorSeer improves caching accuracy using Taylor expansion:
 
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "25.0%"}} />
-    <col style={{width: "25.0%"}} />
-    <col style={{width: "25.0%"}} />
-    <col style={{width: "25.0%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Enable</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TAYLORSEER`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable TaylorSeer calibrator</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Order</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TS_ORDER`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Taylor expansion order (1 or 2)</td>
-    </tr>
-  </tbody>
-</table>
+  | Parameter | Env Variable                    | Default | Description                     |
+  | --------- | ------------------------------- | ------- | ------------------------------- |
+  | Enable    | `SGLANG_CACHE_DIT_TAYLORSEER` | false   | Enable TaylorSeer calibrator    |
+  | Order     | `SGLANG_CACHE_DIT_TS_ORDER`   | 1       | Taylor expansion order (1 or 2) |
 
   Combined Configuration Example:
 
@@ -197,21 +129,22 @@ sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
 
 ## 5. Benchmark
 
-### 5.1 Speedup Benchmark
-
-#### 5.1.1 Generate a image
-
 Test Environment:
 
-- Hardware: NVIDIA B300 SXM6 AC (1x)
+- Hardware: AMD Instinct MI300X GPU (1x)
 - Model: Tongyi-MAI/Z-Image-Turbo
-- sglang version: 0.0.0.dev1+gf4417475b
-- git revision: f441747
+- Docker Image: lmsysorg/sglang:v0.5.8-rocm700-mi30x
+- sglang diffusion version: 0.5.8
+
+### 5.1 Speedup Benchmark
+
+#### 5.1.1 Generate an image
 
 **Server Command**:
 
 ```
-sglang serve --model-path Tongyi-MAI/Z-Image-Turbo --port 30000
+sglang serve --model-path Tongyi-MAI/Z-Image-Turbo \
+    --ulysses-degree=1 --ring-degree=1 --port 30000
 ```
 
 **Benchmark Command**:
@@ -229,38 +162,32 @@ Task:                                    text-to-image
 Model:                                   Tongyi-MAI/Z-Image-Turbo
 Dataset:                                 vbench
 --------------------------------------------------
-Benchmark duration (s):                  13.59
+Benchmark duration (s):                  1.84
 Request rate:                            inf
 Max request concurrency:                 1
 Successful requests:                     1/1
 --------------------------------------------------
-Request throughput (req/s):              0.07
-Latency Mean (s):                        13.5904
-Latency Median (s):                      13.5904
-Latency P99 (s):                         13.5904
+Request throughput (req/s):              0.54
+Latency Mean (s):                        1.8435
+Latency Median (s):                      1.8435
+Latency P99 (s):                         1.8435
 --------------------------------------------------
-Peak Memory Max (MB):                    16984.45
-Peak Memory Mean (MB):                   16984.45
-Peak Memory Median (MB):                 16984.45
+Peak Memory Max (MB):                    30689.20
+Peak Memory Mean (MB):                   30689.20
+Peak Memory Median (MB):                 30689.20
 ============================================================
 ```
 
 #### 5.1.2 Generate images with high concurrency
 
-**Server Command** :
-
-```
-sglang serve --model-path Tongyi-MAI/Z-Image-Turbo --port 30000
-```
-
-**Benchmark Command** :
+**Benchmark Command**:
 
 ```
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
 ```
 
-**Result** :
+**Result**:
 
 ```
 ================= Serving Benchmark Result =================
@@ -268,18 +195,18 @@ Task:                                    text-to-image
 Model:                                   Tongyi-MAI/Z-Image-Turbo
 Dataset:                                 vbench
 --------------------------------------------------
-Benchmark duration (s):                  30.15
+Benchmark duration (s):                  35.32
 Request rate:                            inf
 Max request concurrency:                 20
 Successful requests:                     20/20
 --------------------------------------------------
-Request throughput (req/s):              0.66
-Latency Mean (s):                        21.2048
-Latency Median (s):                      21.1990
-Latency P99 (s):                         29.9739
+Request throughput (req/s):              0.57
+Latency Mean (s):                        18.5672
+Latency Median (s):                      18.5573
+Latency P99 (s):                         34.9880
 --------------------------------------------------
-Peak Memory Max (MB):                    16984.51
-Peak Memory Mean (MB):                   16984.47
-Peak Memory Median (MB):                 16984.46
+Peak Memory Max (MB):                    30689.26
+Peak Memory Mean (MB):                   30689.21
+Peak Memory Median (MB):                 30689.21
 ============================================================
 ```
