@@ -9,26 +9,25 @@
 #                              nightly-test-<runner>.yml workflow.
 # Never edit workflow YAML files directly for these changes.
 
-# TODO: re-enable after testing log analyzer (see follow-up PR)
-# dsr1-fp8-gb200-dynamo-sglang:
-#   model: deepseek-ai/DeepSeek-R1-0528
-#   model-prefix: dsr1
-#   runner: gb200
-#   precision: fp8
-#   framework: dynamo-sglang
-#   multinode: true
-#   disagg: true
-#   seq-len-configs:
-#     - isl: 1024
-#       osl: 1024
-#       search-space:
-#         - conc-list: [1024, 2048, 4096, 6144]
-#           # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp8/1k1k/max-tpt.yaml
-#           config_file: recipes/gb200-fp8/1k1k/max-tpt.yaml
-#
-#         - conc-list: [4096]
-#           # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp8/1k1k/ultra-tpt.yaml
-#           config_file: recipes/gb200-fp8/1k1k/ultra-tpt.yaml
+dsr1-fp8-gb200-dynamo-sglang:
+  model: deepseek-ai/DeepSeek-R1-0528
+  model-prefix: dsr1
+  runner: gb200
+  precision: fp8
+  framework: dynamo-sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1024, 2048, 4096, 6144]
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp8/1k1k/max-tpt.yaml
+          config_file: recipes/gb200-fp8/1k1k/max-tpt.yaml
+
+        - conc-list: [4096]
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp8/1k1k/ultra-tpt.yaml
+          config_file: recipes/gb200-fp8/1k1k/ultra-tpt.yaml
 
 dsr1-fp4-gb200-dynamo-sglang:
   model: nvidia/DeepSeek-R1-0528-NVFP4-v2
