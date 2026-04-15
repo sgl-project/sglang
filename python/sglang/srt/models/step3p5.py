@@ -1,5 +1,3 @@
-import logging
-import os
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
@@ -57,7 +55,6 @@ from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, mak
 
 Step3p5Config = None
 
-logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
 
@@ -595,33 +592,6 @@ class Step3p5DecoderLayer(nn.Module):
         )
 
         self.layer_id = layer_id
-        self.dump_intermediate = (
-            os.environ.get("SGLANG_DUMP_STEP3P5_INTERMEDIATE") == "1"
-        )
-        self._dump_step = 0
-
-    def _dump_tensor(
-        self,
-        name: str,
-        tensor: Optional[torch.Tensor],
-        step_id: Optional[int] = None,
-    ) -> None:
-        if not self.dump_intermediate or tensor is None or not torch.is_tensor(tensor):
-            return
-        dump_dir = "/sgl-workspace/sgl"
-        try:
-            os.makedirs(dump_dir, exist_ok=True)
-            tp_rank = get_tensor_model_parallel_rank()
-            step_part = f"_step{step_id}" if step_id is not None else ""
-            path = os.path.join(
-                dump_dir,
-                f"step3p5_layer{self.layer_id}{step_part}_{name}_tp{tp_rank}.pt",
-            )
-            torch.save(tensor.detach().cpu(), path)
-        except Exception:
-            logger.exception(
-                "Failed to dump tensor %s for layer %s", name, self.layer_id
-            )
 
     def forward(
         self,
@@ -638,26 +608,18 @@ class Step3p5DecoderLayer(nn.Module):
             forward_batch,
             post_residual_addition=post_residual_addition,
         )
-        dump_step = None
-        if self.dump_intermediate:
-            dump_step = self._dump_step
-            self._dump_step += 1
-            self._dump_tensor("attn_input", hidden_states, dump_step)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        self._dump_tensor("attn_output", hidden_states, dump_step)
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states,
             residual,
             forward_batch,
         )
-        self._dump_tensor("post_attn_residual", residual, dump_step)
-        self._dump_tensor("mlp_input", hidden_states, dump_step)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -688,7 +650,6 @@ class Step3p5DecoderLayer(nn.Module):
             # all-reduced.  Do NOT set the fusion flag — otherwise the next
             # layer would all-reduce again, multiplying values by world_size.
             should_allreduce_fusion = False
-        self._dump_tensor("mlp_output", hidden_states, dump_step)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -696,7 +657,6 @@ class Step3p5DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
-        self._dump_tensor("layer_output", hidden_states, dump_step)
         return hidden_states, residual
 
 
