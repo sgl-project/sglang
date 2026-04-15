@@ -1,4 +1,10 @@
-from sglang.multimodal_gen.test.server.testcase_configs import *
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    T2V_PROMPT,
+    DiffusionSamplingParams,
+    DiffusionServerArgs,
+    DiffusionTestCase,
+    T2I_sampling_params,
+)
 
 ONE_NPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===

@@ -1,5 +1,19 @@
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.test.server.testcase_configs import *
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    T2V_PROMPT,
+    DiffusionSamplingParams,
+    DiffusionServerArgs,
+    DiffusionTestCase,
+    HUNYUAN3D_SHAPE_sampling_params,
+    MULTI_FRAME_I2I_sampling_params,
+    MULTI_IMAGE_TI2I_sampling_params,
+    MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+    T2I_sampling_params,
+    T2V_sampling_params,
+    TI2I_sampling_params,
+    TI2V_sampling_params,
+    _with_default_num_gpus,
+)
 from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
