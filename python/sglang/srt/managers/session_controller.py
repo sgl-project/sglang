@@ -100,6 +100,28 @@ class Session:
             return False
         return time.monotonic() - self.last_active_time > self.timeout
 
+    @staticmethod
+    def _trim_bos(req: TokenizedGenerateReqInput, tokenizer):
+        if (
+            tokenizer is not None
+            and req.input_ids
+            and req.input_ids[0] == tokenizer.bos_token_id
+        ):
+            req.input_ids = req.input_ids[1:]
+            # Adjust mm_item offsets since they were computed on
+            # the pre-strip sequence (with BOS at position 0)
+            if req.mm_inputs:
+                for item in req.mm_inputs.mm_items:
+                    if item.offsets:
+                        if any(s == 0 for s, _ in item.offsets):
+                            logging.warning(
+                                "mm_item offset starts at 0 (BOS position), "
+                                "clamping to 0 after BOS strip"
+                            )
+                        item.offsets = [
+                            (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
+                        ]
+
     def create_req(
         self,
         req: TokenizedGenerateReqInput,
@@ -115,8 +137,9 @@ class Session:
         last_req = None
         abort = False
         abort_message = ""
+        kv_reuse_len: Optional[int] = None
         if self.streaming:
-            # Streaming sessions: only simple appends allowed; reject otherwise.
+            # Streaming sessions: simple appends + offset-based backtracking only.
             if session_params.replace:
                 abort = True
                 abort_message = "Streaming sessions do not support replace."
@@ -125,9 +148,6 @@ class Session:
                 abort_message = (
                     "Streaming sessions do not support drop_previous_output."
                 )
-            elif session_params.offset and session_params.offset != 0:
-                abort = True
-                abort_message = "Streaming sessions do not support offset."
             elif self.req_nodes:
                 assert len(self.req_nodes) == 1
                 _, last_req_node = self.req_nodes.popitem()
@@ -159,26 +179,7 @@ class Session:
                         logging.warning(abort_message)
 
         if last_req is not None:
-            # trim bos token if it is an append
-            if (
-                tokenizer is not None
-                and req.input_ids
-                and req.input_ids[0] == tokenizer.bos_token_id
-            ):
-                req.input_ids = req.input_ids[1:]
-                # Adjust mm_item offsets since they were computed on
-                # the pre-strip sequence (with BOS at position 0)
-                if req.mm_inputs:
-                    for item in req.mm_inputs.mm_items:
-                        if item.offsets:
-                            if any(s == 0 for s, _ in item.offsets):
-                                logging.warning(
-                                    "mm_item offset starts at 0 (BOS position), "
-                                    "clamping to 0 after BOS strip"
-                                )
-                            item.offsets = [
-                                (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
-                            ]
+            self._trim_bos(req, tokenizer)
 
             input_ids = (
                 last_req.origin_input_ids
@@ -206,6 +207,10 @@ class Session:
                 )
             else:
                 input_ids_unpadded += req.input_ids
+
+            if self.streaming:
+                if session_params.offset and session_params.offset != 0:
+                    kv_reuse_len = session_params.offset
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
@@ -236,6 +241,9 @@ class Session:
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
+
+        if self.streaming:
+            new_req.kv_reuse_len = kv_reuse_len
 
         if abort:
             new_req.set_finish_with_abort(abort_message)

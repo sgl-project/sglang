@@ -195,10 +195,15 @@ class SessionAwareCache(BasePrefixCache):
 
         slot.restore_to_req(req)
 
+        max_reuse = req.kv_committed_len
+        if req.kv_reuse_len is not None and req.kv_reuse_len < max_reuse:
+            self._truncate_slot(slot, req, req.kv_reuse_len)
+            max_reuse = req.kv_reuse_len
+
         # logprob_start_len is already forced to -1 for streaming sessions
         # (in Req.init_next_round_input), so the prefix key is not truncated
         # and we can directly reuse the committed KV length.
-        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
+        prefix_len = min(max_reuse, max(len(params.key.token_ids) - 1, 0))
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
@@ -297,6 +302,26 @@ class SessionAwareCache(BasePrefixCache):
         if isinstance(node, _VirtualNode):
             return DecLockRefResult()
         return self.inner.dec_lock_ref(node, params)
+
+    def _truncate_slot(self, slot: SessionSlot, req: "Req", new_len: int):
+        """Truncate KV state to new_len, freeing excess entries.
+
+        Tokens below cache_protected_len belong to the radix tree and must
+        not be freed here (they are released via dec_lock_ref on session close).
+        The effective truncation length is clamped to cache_protected_len to
+        preserve the invariant kv_committed_len >= cache_protected_len.
+        """
+        new_len = max(new_len, slot.cache_protected_len)
+        old_allocated = slot.kv_allocated_len
+        if new_len < old_allocated:
+            excess = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, new_len:old_allocated
+            ]
+            self.token_to_kv_pool_allocator.free(excess)
+        slot.kv_committed_len = new_len
+        slot.kv_allocated_len = new_len
+        req.kv_committed_len = new_len
+        req.kv_allocated_len = new_len
 
     # -- Session lifecycle --
 

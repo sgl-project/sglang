@@ -617,6 +617,7 @@ class Req(ReqDllmMixin):
         # For req-level memory management
         self.kv_committed_len = 0
         self.kv_allocated_len = 0
+        self.kv_reuse_len: Optional[int] = None
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
