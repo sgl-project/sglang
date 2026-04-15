@@ -41,6 +41,10 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Qwen3-32B       | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K | 17ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-17ms-on-a3-2-cards-mixed-mode)      |
 | Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)        |
 | Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 9ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-6k-1_5k-9ms-on-a3-1-cards-mixed-mode)        |
+| Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 10ms | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-6k-1_5k-10ms-on-a3-1-cards-mixed-mode)  |
+| Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 8ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-1k-0_3k-8ms-on-a3-1-cards-mixed-mode)   |
+| Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 14.21ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-1k-0_3k-14_21ms-on-a3-2-cards-mixed-mode)      |
+| Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K | 15.62ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-6k-1_5k-15_62ms-on-a3-2-cards-mixed-mode)      |
 
 ### High Throughput
 
@@ -2395,7 +2399,6 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=400
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -2408,7 +2411,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
     --tp-size 4 --mem-fraction-static 0.843 --cuda-graph-bs 1 4 8 16 --dtype bfloat16
@@ -2468,7 +2471,6 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=400
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -2481,7 +2483,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
     --tp-size 4 --mem-fraction-static 0.843 --cuda-graph-bs 1 4 10 15 16 --dtype bfloat16
@@ -2541,7 +2543,6 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=400
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -2554,7 +2555,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
     --tp-size 2 --mem-fraction-static 0.894 --cuda-graph-bs 1 2 4 6 9 10 15 16 --dtype bfloat16
@@ -2614,7 +2615,6 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=400
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
@@ -2627,7 +2627,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 16384  \
     --tp-size 2 --mem-fraction-static 0.894 --cuda-graph-bs 1 5 15 16 --dtype bfloat16
@@ -2778,4 +2778,320 @@ We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 120 --random-output-len 2000 --random-input-len 2000 --num-prompts 120 --random-range-ratio 1
+```
+
+### Qwen3-30B-A3B 6K-1_5K 10ms on A3 1 Cards Mixed Mode
+
+Model: Qwen3-30B-A3B
+
+Hardware: Atlas 800I A3 1Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 6K+1.5K
+
+TPOT: 10ms
+
+#### Model Deployment
+
+```shell
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+MODEL_PATH=xxx
+
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+export HCCL_BUFFSIZE=400
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
+    --attention-backend ascend --device npu --quantization modelslim \
+    --max-running-requests 16 \
+    --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
+    --chunked-prefill-size -1 --max-prefill-tokens 35000  \
+    --tp-size 2 --mem-fraction-static 0.6 --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 --dtype bfloat16
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 7339 --random-range-ratio 1 --max-concurrency 16 --random-output-len 1500 --random-input-len 6144 --num-prompts 16
+```
+
+### Qwen3-30B-A3B 1K-0_3K 8ms on A3 1 Cards Mixed Mode
+
+Model: Qwen3-30B-A3B
+
+Hardware: Atlas 800I A3 1Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 1K+0.3K
+
+TPOT: 8ms
+
+#### Model Deployment
+
+```shell
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+MODEL_PATH=xxx
+
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+export HCCL_BUFFSIZE=400
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
+    --attention-backend ascend --device npu --quantization modelslim \
+    --max-running-requests 8 \
+    --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
+    --chunked-prefill-size -1 --max-prefill-tokens 35000  \
+    --tp-size 2 --mem-fraction-static 0.7 --cuda-graph-bs 1 2 3 4 5 6 7 8 --dtype bfloat16
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 7339 --random-range-ratio 1 --max-concurrency 8 --random-output-len 300 --random-input-len 1024 --num-prompts 8
+```
+
+### Qwen3-Next 1K-0_3K 14_21ms on A3 2 Cards Mixed Mode
+
+Model: Qwen3-Next-80B-A3B-Instruct
+
+Hardware: Atlas 800I A3 2Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 1K+0.3K
+
+TPOT: 14.21ms
+
+#### Model Deployment
+
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+
+export SGLANG_WARMUP_TIMEOUT=3600
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+
+MODEL_PATH=xxx
+
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+export HCCL_BUFFSIZE=2000
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+
+python3 -m sglang.launch_server --model-path ${MODEL_PATH} \--page-size 128 \
+    --tp-size 4 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port 6699 \
+    --mem-fraction-static 0.75 \
+    --disable-radix-cache --max-prefill-tokens 14080 --context-length 26384 \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  --speculative-draft-model-quantization  unquant \
+    --chunked-prefill-size -1 --max-running-requests 312 \
+    --cuda-graph-bs 2 4 16 32 48 64 80 96 128 140 156 \
+    --mamba-ssm-dtype bfloat16 \
+    --base-gpu-id 0 \
+    --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
+    --quantization modelslim \
+    --moe-a2a-backend deepep --deepep-mode auto \
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 16 --random-output-len 300 --random-input-len 1024 --num-prompts 16
+```
+
+### Qwen3-Next 6K-1_5K 15_62ms on A3 2 Cards Mixed Mode
+
+Model: Qwen3-Next-80B-A3B-Instruct
+
+Hardware: Atlas 800I A3 2Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 6K+1.5K
+
+TPOT: 15.62ms
+
+#### Model Deployment
+
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_USE_MULTI_STREAM=1
+
+export SGLANG_WARMUP_TIMEOUT=3600
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+
+MODEL_PATH=xxx
+
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+export HCCL_BUFFSIZE=2000
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+
+python3 -m sglang.launch_server --model-path ${MODEL_PATH} \--page-size 128 \
+    --tp-size 4 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port 6699 \
+    --mem-fraction-static 0.75 \
+    --disable-radix-cache --max-prefill-tokens 14080 --context-length 26384 \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  --speculative-draft-model-quantization  unquant \
+    --chunked-prefill-size -1 --max-running-requests 312 \
+    --cuda-graph-bs 2 4 16 32 48 64 80 96 128 140 156 \
+    --mamba-ssm-dtype bfloat16 \
+    --base-gpu-id 0 \
+    --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
+    --quantization modelslim \
+    --moe-a2a-backend deepep --deepep-mode auto \
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 16 --random-output-len 1500 --random-input-len 6144 --num-prompts 16i
 ```

@@ -187,6 +187,12 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
+    rollout_return_denoising_env: bool = (
+        False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
+    )
+    rollout_return_dit_trajectory: bool = (
+        False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
+    )
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
@@ -196,6 +202,9 @@ class SamplingParams:
 
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
+
+    # Prompt enhancement (ErnieImage)
+    use_pe: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -267,6 +276,9 @@ class SamplingParams:
         diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
         if diffusers_kwargs:
             extra["diffusers_kwargs"] = diffusers_kwargs
+        explicit_fields = getattr(self, "_explicit_fields", None)
+        if explicit_fields is not None:
+            extra["explicit_fields"] = sorted(explicit_fields)
         return extra
 
     def apply_request_extra(self, req: Any) -> None:
@@ -603,11 +615,13 @@ class SamplingParams:
 
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
+
         user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
         )
+        sampling_params._explicit_fields = set(user_kwargs.keys())
         sampling_params._adjust(server_args)
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
@@ -786,7 +800,7 @@ class SamplingParams:
             "--cfg-normalization",
             type=float,
             dest="cfg_normalization",
-            help=("CFG renormalization factor (for Z-Image). "),
+            help="CFG renormalization factor (for Z-Image). ",
         )
         add_argument(
             "--boundary-ratio",

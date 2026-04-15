@@ -929,7 +929,6 @@ def biased_grouped_topk_cpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    assert not apply_routed_scaling_factor_on_output, "Not implemented"
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
         gating_output,
@@ -939,7 +938,7 @@ def biased_grouped_topk_cpu(
         num_expert_group,
         topk_group,
         num_fused_shared_experts,
-        routed_scaling_factor,
+        routed_scaling_factor if apply_routed_scaling_factor_on_output else None,
         # num_token_non_padded must be None since it is not supported in kernel
         num_token_non_padded=None,
     )
@@ -1018,9 +1017,21 @@ def _post_process_topk_ids(
         topk_ids=topk_ids,
     )
     if _is_cuda:
-        topk_ids = _biased_grouped_topk_postprocess(
-            topk_ids, expert_location_dispatch_info, num_token_non_padded
-        )
+        # When shared experts are fused (appended as extra columns in topk_ids),
+        # EPLB dispatch must only remap the routed expert columns.
+        # The shared expert column (value = n_routed_experts) would be out-of-bounds
+        # for the logical-to-physical dispatch table.
+        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+            shared_cols = topk_ids[:, -num_fused_shared_experts:]
+            routed_cols = topk_ids[:, :-num_fused_shared_experts]
+            routed_cols = _biased_grouped_topk_postprocess(
+                routed_cols, expert_location_dispatch_info, num_token_non_padded
+            )
+            topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+        else:
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids, expert_location_dispatch_info, num_token_non_padded
+            )
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
