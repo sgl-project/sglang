@@ -398,6 +398,9 @@ def launch_pool_disagg_server(
     )
     diffusion_server.start()
 
+    if not diffusion_server.wait_ready(timeout=30.0):
+        raise RuntimeError("DiffusionServer failed to bind sockets within 30 seconds")
+
     if launch_http_server:
         logger.info(
             "Starting FastAPI server (connected to DiffusionServer at port %d).",
@@ -522,6 +525,9 @@ def launch_disagg_server(server_args: ServerArgs):
         timeout_s=float(server_args.disagg_timeout),
     )
     diffusion_server.start()
+
+    if not diffusion_server.wait_ready(timeout=30.0):
+        raise RuntimeError("DiffusionServer failed to bind sockets within 30 seconds")
 
     logger.info(
         "Starting HTTP server (connected to DiffusionServer at port %d).",

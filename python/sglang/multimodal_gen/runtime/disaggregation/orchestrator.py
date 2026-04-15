@@ -116,6 +116,7 @@ class DiffusionServer:
 
         self._context = zmq.Context(io_threads=2)
         self._running = False
+        self._ready = threading.Event()
         self._thread: threading.Thread | None = None
 
         self._pending: dict[str, bytes] = {}  # request_id -> client ZMQ identity
@@ -187,6 +188,10 @@ class DiffusionServer:
             self._decoder_free_slots[0] if self._decoder_free_slots else 0,
         )
 
+    def wait_ready(self, timeout: float = 30.0) -> bool:
+        """Block until the event loop has bound all sockets, or *timeout* elapses."""
+        return self._ready.wait(timeout=timeout)
+
     def stop(self) -> None:
         self._running = False
         if self._thread is not None:
@@ -233,6 +238,8 @@ class DiffusionServer:
         self._denoiser_pushes = denoiser_pushes
         self._decoder_pushes = decoder_pushes
         self._frontend = frontend
+
+        self._ready.set()
 
         all_sockets = (
             [frontend, encoder_result_pull, denoiser_result_pull, decoder_result_pull]
@@ -281,8 +288,43 @@ class DiffusionServer:
         if role == RoleType.DECODER:
             self._handle_decoder_result_frames(frames)
         else:
+            # Non-transfer frames from encoder/denoiser are error results
+            # sent via send_tensors (e.g., _disagg_error).
+            self._handle_role_error_frames(frames, role)
+
+    def _handle_role_error_frames(self, frames: list, role: RoleType) -> None:
+        """Handle non-transfer error results from encoder/denoiser roles."""
+        try:
+            tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
+        except Exception as e:
             logger.warning(
-                "DiffusionServer: unexpected non-transfer frames from %s", role.value
+                "DiffusionServer: failed to unpack non-transfer frames from %s: %s",
+                role.value,
+                e,
+            )
+            return
+
+        request_id = scalar_fields.get("request_id")
+        disagg_error = scalar_fields.get("_disagg_error")
+
+        if request_id and disagg_error:
+            logger.error(
+                "DiffusionServer: %s error for %s: %s",
+                role.value,
+                request_id,
+                disagg_error,
+            )
+            self._complete_with_error(request_id, f"{role.value} error: {disagg_error}")
+        elif request_id:
+            logger.warning(
+                "DiffusionServer: non-transfer frames from %s for %s without error",
+                role.value,
+                request_id,
+            )
+        else:
+            logger.warning(
+                "DiffusionServer: non-transfer frames from %s without request_id",
+                role.value,
             )
 
     def _handle_client_request(self, frontend: zmq.Socket) -> None:

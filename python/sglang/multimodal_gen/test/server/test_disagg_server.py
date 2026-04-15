@@ -253,6 +253,11 @@ def _generate_image(api_port: int, model: str) -> bytes:
         },
         timeout=600,
     )
+    if resp.status_code != 200:
+        print(
+            f"[disagg-test] Server returned {resp.status_code}: {resp.text[:2000]}",
+            flush=True,
+        )
     resp.raise_for_status()
     data = resp.json()
     return base64.b64decode(data["data"][0]["b64_json"])
@@ -295,6 +300,13 @@ class _DisaggTestBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         if cls.cluster is not None:
+            # Dump log tails for debugging CI failures
+            for role_name, log_path in cls.cluster._logs.items():
+                print(
+                    f"\n=== [{cls.cluster_name}] {role_name} log tail ===",
+                    flush=True,
+                )
+                print(_tail_log(log_path, n=80), flush=True)
             cls.cluster.stop()
             cls.cluster = None
         super().tearDownClass()
