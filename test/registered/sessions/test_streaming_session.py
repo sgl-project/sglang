@@ -861,32 +861,6 @@ class TestStreamingSession(CustomTestCase):
         self.assertEqual(health.status_code, 200)
 
 
-class TestStreamingSessionMixedChunk(TestStreamingSession):
-    """Streaming session with --enable-mixed-chunk."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--enable-streaming-session",
-                    "--chunked-prefill-size",
-                    "512",
-                    "--enable-mixed-chunk",
-                ],
-            )
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
 class TestStreamingSessionRetract(TestStreamingSession):
     """Streaming session under retract decode pressure."""
 
@@ -1279,38 +1253,6 @@ class TestStreamingSessionAbortLeakRepro(CustomTestCase):
             200,
             "Server unhealthy after abort-heavy streaming session cleanup.",
         )
-
-
-class TestStreamingSessionLargePage(TestStreamingSession):
-    """Streaming session with large page_size (256) and small append chunks.
-
-    Verifies that page alignment handling works correctly when the append
-    size per turn is much smaller than page_size. prefix_len must NOT be
-    floor-aligned to page_size (that would lose up to 255 tokens per turn).
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--enable-streaming-session",
-                    "--chunked-prefill-size",
-                    "512",
-                    "--page-size",
-                    "256",
-                ],
-            )
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":

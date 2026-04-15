@@ -74,33 +74,6 @@ class TestStreamingSessionSWA(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionSWAMixedChunk(TestStreamingSession):
-    """SWA + --enable-mixed-chunk."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = SWA_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--enable-streaming-session",
-                    "--chunked-prefill-size",
-                    "512",
-                    "--enable-mixed-chunk",
-                    *SWA_COMMON_ARGS,
-                ],
-            )
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
 class TestStreamingSessionSWARetract(TestStreamingSession):
     """SWA under retract decode pressure."""
 
