@@ -179,8 +179,10 @@ def unified_attention_with_output(
         if hasattr(token_to_kv_pool, "set_swa_loc"):
             token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
-    # Store pre-allocated output for FA backend to write directly into
-    forward_batch._attn_output = output
+    # Store pre-allocated output for FA backend to write directly into.
+    # Must slice to real_num_tokens to match the narrowed query shape —
+    # the FA kernel validates out.size(0) == q.size(0).
+    forward_batch._attn_output = output[:real_num_tokens]
 
     ret = forward_batch.attn_backend.forward(
         query,
