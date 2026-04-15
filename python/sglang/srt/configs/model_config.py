@@ -196,8 +196,16 @@ class ModelConfig:
         self.is_image_understandable_model = enable_multimodal and hasattr(
             self.hf_config, "vision_config"
         )
-        self.is_audio_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "audio_config"
+
+        # Models expose audio_config at different nesting levels:
+        #   - top-level audio_config: e.g. Qwen2Audio
+        #   - thinker_config.audio_config: Qwen3-Omni, Qwen3-ASR (nested thinker arch)
+        #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)\
+        # TODO: Handle this more robustly by standardizing the config structure in the future
+        self.is_audio_understandable_model = enable_multimodal and (
+            hasattr(self.hf_config, "audio_config")
+            or hasattr(getattr(self.hf_config, "thinker_config", None), "audio_config")
+            or is_audio_model(self.hf_config.architectures)
         )
 
         self.is_multimodal_chunked_prefill_supported = (
@@ -566,6 +574,12 @@ class ModelConfig:
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
+        )
+        self.first_k_dense_replace = getattr(
+            self.hf_text_config, "first_k_dense_replace", None
+        )
+        self.full_attention_interval = getattr(
+            self.hf_text_config, "full_attention_interval", None
         )
 
         # for Dbrx and MPT models
@@ -1057,8 +1071,10 @@ class ModelConfig:
                     f"supported in ROCm."
                 )
             if self.quantization not in optimized_quantization_methods:
-                # Don't warn for MXFP4 on SM100 since it has optimized kernels
-                if not (self.quantization == "mxfp4" and is_sm100_supported()):
+                # Don't warn for MXFP4/MXFP8 on SM100 since they have optimized kernels
+                if not (
+                    self.quantization in ["mxfp4", "mxfp8"] and is_sm100_supported()
+                ):
                     logger.warning(
                         "%s quantization is not fully "
                         "optimized yet. The speed can be slower than "
@@ -1332,6 +1348,7 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
@@ -1380,6 +1397,7 @@ def is_multimodal_model(model_architectures: List[str]):
 def is_audio_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
+        "Qwen3ASRForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
