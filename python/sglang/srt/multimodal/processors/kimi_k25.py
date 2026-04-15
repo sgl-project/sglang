@@ -285,6 +285,8 @@ class KimiGPUProcessorWrapper:
             images, resize_configs, image_mean, image_std_inv, self._patch_size
         )
 
+        grid_thws = grid_thws.cpu()
+
         return {
             "input_ids": text_inputs["input_ids"],
             "pixel_values": pixel_values,
