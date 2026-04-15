@@ -62,7 +62,12 @@ if _is_npu:
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-    from flashinfer.fused_moe.core import ActivationType
+    from flashinfer.fused_moe.core import (
+        ActivationType,
+        _maybe_get_cached_w3_w1_permute_indices,
+        convert_to_block_layout,
+        get_w2_permute_indices_with_cache,
+    )
 except ImportError:
     flashinfer_cutlass_fused_moe = None
 
@@ -251,12 +256,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
-            from flashinfer.fused_moe.core import (
-                _maybe_get_cached_w3_w1_permute_indices,
-                convert_to_block_layout,
-                get_w2_permute_indices_with_cache,
-            )
-
             # w1 and w3 have been swapped, so we don't need do that here
             epilogue_tile_m = 128
             block_k = 128
@@ -363,6 +362,95 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
 
         param.data = param.data.reshape(expected_shape)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Undo FlashInfer TRT-LLM block-layout before weight sync.
+
+        No-op when ``use_flashinfer_trtllm_moe`` is False (sm90/H100, or
+        ``--moe-runner-backend triton``).
+        """
+        if not self.use_flashinfer_trtllm_moe:
+            return
+
+        self._undo_flashinfer_trtllm_block_layout(layer)
+
+    def _undo_flashinfer_trtllm_block_layout(self, layer: torch.nn.Module) -> None:
+        """Reverse the FlashInfer TRT-LLM block-layout transformation applied
+        by ``process_weights_after_loading``, converting expert weights from
+        the inference-optimized 4-D format back to the standard 3-D row-major
+        layout used by ``load_weights``.
+
+        ``process_weights_after_loading`` applies two transformations for
+        FlashInfer TRT-LLM inference on sm100+ (B200):
+
+        1. **Row permutation** — rows of w13/w2 are reordered via
+           ``_maybe_get_cached_w3_w1_permute_indices`` /
+           ``get_w2_permute_indices_with_cache`` to match the FlashInfer
+           kernel's expected access pattern.
+        2. **Block-layout conversion** — the 2-D ``[N, K]`` per-expert matrix
+           is converted to 4-D ``[Kb, N, block_k]`` via
+           ``convert_to_block_layout`` with ``block_k=128``.
+
+        This function undoes both steps in reverse order:
+        undo block-layout (4-D -> 2-D) then undo row permutation (inverse
+        argsort).  The result is the original 3-D ``[E, N, K]`` row-major
+        tensor that ``load_weights`` expects.
+
+        Called during P2P RDMA weight sync.  RDMA writes raw bytes from a CPU
+        replica to GPU memory, so the GPU buffer must be in the same 3-D
+        row-major layout as the CPU buffer.  The cycle per weight update is:
+
+        1. sglang GPU: ``post_process_weights(restore_weights_before_load=True)``
+           calls this to undo block-layout.
+        2. miles CPU replica: ``maybe_restore_cpu_model_weights`` calls this once
+           at model creation to keep the CPU buffer in 3-D row-major.
+        3. RDMA write: raw bytes match because both sides are 3-D row-major.
+        4. ``process_weights_after_loading`` re-applies block-layout for
+           FlashInfer inference.
+        """
+        epilogue_tile_m = 128
+
+        for weight_name in ["w13_weight", "w2_weight"]:
+            weight = getattr(layer, weight_name)
+            if weight.data.ndim != 4:
+                continue
+
+            E = weight.data.shape[0]
+            Kb, N, block_bf16 = weight.data.shape[1:]
+            K = Kb * block_bf16
+            K_bytes = K * 2
+
+            # Process each expert while tensor is still 4D so data[i] gives
+            # the correct [Kb, N, block_bf16] view for undoing block layout.
+            restored_experts = []
+            for i in range(E):
+                # Step 1: Undo block-layout (4-D → 2-D row-major bytes)
+                expert_bytes = weight.data[i].view(torch.uint8)  # [Kb, N, block_k=128]
+                restored = (
+                    expert_bytes.permute(1, 0, 2).contiguous().reshape(N, K_bytes)
+                )
+
+                # Step 2: Undo row permutation via inverse argsort
+                if weight_name == "w13_weight":
+                    perm = _maybe_get_cached_w3_w1_permute_indices(
+                        self._cache_permute_indices,
+                        restored,
+                        epilogue_tile_m,
+                    )
+                else:
+                    perm = get_w2_permute_indices_with_cache(
+                        self._cache_permute_indices,
+                        restored,
+                        epilogue_tile_m,
+                    )
+                inv_perm = torch.argsort(perm)
+                restored = restored[inv_perm].contiguous()
+                restored_experts.append(restored.view(torch.bfloat16))
+
+            # Reshape to 3D then copy restored row-major data back in-place
+            weight.data = weight.data.reshape(E, N, K)
+            for i in range(E):
+                weight.data[i] = restored_experts[i]
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
