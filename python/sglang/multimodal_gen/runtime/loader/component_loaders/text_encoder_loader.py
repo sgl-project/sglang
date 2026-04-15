@@ -1,6 +1,7 @@
 import dataclasses
 import glob
 import os
+import re
 from collections.abc import Generator, Iterable
 from typing import cast
 
@@ -218,21 +219,21 @@ class TextEncoderLoader(ComponentLoader):
             component_path=component_model_path
         )
 
-        def is_not_first_encoder(module_name):
-            return "2" in module_name
-
         # TODO(mick): had to throw an exception for different text-encoder arch
-        if not is_not_first_encoder(component_name):
-            encoder_config = server_args.pipeline_config.text_encoder_configs[0]
-            encoder_config.update_model_arch(model_config)
+        encoder_index = self._extract_encoder_index(component_name)
+        assert encoder_index < len(
+            server_args.pipeline_config.text_encoder_configs
+        ) and encoder_index < len(server_args.pipeline_config.text_encoder_precisions)
+
+        encoder_config = server_args.pipeline_config.text_encoder_configs[encoder_index]
+        encoder_config.update_model_arch(model_config)
+
+        if encoder_index == 0:
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
-            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
-        else:
-            assert len(server_args.pipeline_config.text_encoder_configs) == 2
-            encoder_config = server_args.pipeline_config.text_encoder_configs[1]
-            encoder_config.update_model_arch(model_config)
-            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
+        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
+            encoder_index
+        ]
         # TODO(will): add support for other dtypes
         return self.load_model(
             component_model_path,
@@ -241,6 +242,28 @@ class TextEncoderLoader(ComponentLoader):
             encoder_dtype,
             cpu_offload_flag=cpu_offload_flag,
         )
+
+    @staticmethod
+    def _extract_encoder_index(component_name: str) -> int:
+        """
+        Map text encoder component names to zero-based indices.
+
+        Examples:
+        - text_encoder -> 0
+        - text_encoder_2 -> 1
+        - text_encoder_3 -> 2
+        """
+        match = re.search(r"_(\d+)$", component_name)
+        if match is None:
+            return 0
+
+        suffix_num = int(match.group(1))
+        if suffix_num <= 0:
+            raise ValueError(
+                f"Invalid text encoder component name '{component_name}': "
+                "numeric suffix must be >= 1."
+            )
+        return suffix_num - 1
 
     def load_model(
         self,

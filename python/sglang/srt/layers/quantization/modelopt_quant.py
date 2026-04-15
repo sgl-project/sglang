@@ -1980,9 +1980,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
 
-        # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
-        # backend is flashinfer_trtllm
-        if hasattr(layer, "gemm1_weights_fp4_shuffled"):
+        # FlashInfer TRTLLM FP4 path
+        if self.enable_flashinfer_trtllm_moe and hasattr(layer, "g1_scale_c"):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
             )
@@ -1994,10 +1993,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             quant_info = FlashInferTrtllmFp4MoeQuantInfo(
-                gemm1_weights_fp4_shuffled=layer.gemm1_weights_fp4_shuffled.data,
-                gemm2_weights_fp4_shuffled=layer.gemm2_weights_fp4_shuffled.data,
-                gemm1_scales_fp4_shuffled=layer.gemm1_scales_fp4_shuffled.data,
-                gemm2_scales_fp4_shuffled=layer.gemm2_scales_fp4_shuffled.data,
+                w13_weight=layer.w13_weight.data,
+                w2_weight=layer.w2_weight.data,
+                w13_weight_scale=layer.w13_weight_scale.data,
+                w2_weight_scale=layer.w2_weight_scale.data,
                 g1_scale_c=layer.g1_scale_c.data,
                 g1_alphas=layer.g1_alphas.data,
                 g2_alphas=layer.g2_alphas.data,
