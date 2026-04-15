@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -54,6 +55,9 @@ class SWAKVPool(KVCache):
         self.start_layer = 0
         self.page_size = page_size
         self.swa_loc = None
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
 
         kwargs["page_size"] = page_size
         kwargs["enable_memory_saver"] = enable_memory_saver
