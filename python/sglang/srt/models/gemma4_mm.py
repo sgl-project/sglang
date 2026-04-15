@@ -847,20 +847,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # return input_dim, output_dim
         # Gemma 4 has heterogeneous attention: full-attention layers use
         # head_dim/num_key_value_heads, sliding-attention layers use
-        # swa_head_dim/swa_num_key_value_heads. The LoRA buffer for o_proj
-        # (and the qkv_proj output dim) must be sized per-layer.
-        is_full = self.config.layer_types[layer_idx] == "full_attention"
+        # swa_head_dim/swa_num_key_value_heads. layer_types only exists on
+        # the *text* sub-config, not the multimodal wrapper config.
+        text_cfg = getattr(self.config, "text_config", self.config)
+        is_full = text_cfg.layer_types[layer_idx] == "full_attention"
         if is_full:
-            attn_head_dim = self.config.head_dim
-            kv_heads = self.config.num_key_value_heads
+            attn_head_dim = text_cfg.head_dim
+            kv_heads = text_cfg.num_key_value_heads
         else:
-            attn_head_dim = getattr(
-                self.config, "swa_head_dim", self.config.head_dim
-            )
+            attn_head_dim = getattr(text_cfg, "swa_head_dim", text_cfg.head_dim)
             kv_heads = getattr(
-                self.config,
-                "swa_num_key_value_heads",
-                self.config.num_key_value_heads,
+                text_cfg, "swa_num_key_value_heads", text_cfg.num_key_value_heads
             )
         if module_name == "qkv_proj":
             return (
