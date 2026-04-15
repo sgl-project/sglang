@@ -645,9 +645,6 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # NOTE: aux hidden state capture (eagle3/dflash) is already
-        # configured by model_runner.init_aux_hidden_state_capture()
-        # before init_device_graphs() — no need to call it again here.
 
         # Capture
         try:
