@@ -1019,6 +1019,7 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            req_ids=None,
         )
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
