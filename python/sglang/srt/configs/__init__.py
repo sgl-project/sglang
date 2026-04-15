@@ -25,6 +25,7 @@ from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLMoeConfig
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,
@@ -65,4 +66,6 @@ __all__ = [
     "JetVLMConfig",
     "Step3p5Config",
     "Qwen3ASRConfig",
+    "Qwen3VLConfig",
+    "Qwen3VLMoeConfig",
 ]
