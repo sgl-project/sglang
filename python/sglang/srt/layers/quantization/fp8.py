@@ -237,7 +237,9 @@ class Fp8Config(QuantizationConfig):
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
                 return UnquantizedFusedMoEMethod(
-                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                    layer.use_triton_kernels,
+                    layer.use_flashinfer_trtllm_moe,
+                    layer.use_flashinfer_mxfp4_moe,
                 )
             return Fp8MoEMethod(self)
         elif isinstance(layer, RadixAttention):
