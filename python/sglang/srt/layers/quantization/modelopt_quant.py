@@ -171,7 +171,6 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 FP4_GEMM_ALIGNMENT = 32
 
 
-
 def pad_nvfp4_weight(
     weight: torch.Tensor,
     n_alignment: int = FP4_GEMM_ALIGNMENT,
