@@ -79,6 +79,21 @@ CONFIGS = {
             speculative_num_draft_tokens=5,
         ),
     ),
+    # SDAR_INTERLEAVED: dLLM 专用 interleaved speculative decoding
+    #   block_size = 16 (speculative_num_draft_tokens)
+    #   draft_length = 4 (speculative_num_steps, 每轮大模型候选数)
+    #   num_branches = 3 (speculative_eagle_topk, 小模型分支数)
+    "sdar-interleaved": dict(
+        target="JetLM/SDAR-8B-Chat",
+        draft="JetLM/SDAR-1.7B-Chat",
+        base_engine=dict(mem_fraction_static=0.35, tp_size=4, trust_remote_code=True),
+        spec_kwargs=dict(
+            speculative_algorithm="SDAR_INTERLEAVED",
+            speculative_num_draft_tokens=16,   # block_size
+            speculative_num_steps=4,           # draft_length per round
+            speculative_eagle_topk=3,          # num_branches
+        ),
+    ),
 }
 
 BATCH_SIZES = [1, 4]
@@ -137,7 +152,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", choices=list(CONFIGS), default="qwen-32b",
-        help="qwen-32b | llama-70b | sdar-8b"
+        help="qwen-32b | llama-70b | sdar-8b | sdar-interleaved"
     )
     args = parser.parse_args()
     cfg = CONFIGS[args.config]

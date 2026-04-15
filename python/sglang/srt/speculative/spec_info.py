@@ -21,6 +21,7 @@ class SpeculativeAlgorithm(Enum):
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
+    SDAR_INTERLEAVED = auto()  # dLLM interleaved speculative decoding for SDAR models
 
     @classmethod
     def from_string(cls, name: Optional[str]) -> SpeculativeAlgorithm:
@@ -52,6 +53,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_sdar_interleaved(self) -> bool:
+        return self == SpeculativeAlgorithm.SDAR_INTERLEAVED
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
@@ -118,6 +122,17 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+
+        elif self.is_sdar_interleaved():
+            if enable_overlap:
+                raise ValueError(
+                    "SDAR_INTERLEAVED does not support overlap scheduling (spec v2)."
+                )
+            from sglang.srt.speculative.sdar_interleaved_worker import (
+                SDARInterleavedWorker,
+            )
+
+            return SDARInterleavedWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 

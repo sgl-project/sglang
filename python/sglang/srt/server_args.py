@@ -3163,6 +3163,49 @@ class ServerArgs:
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
                 )
 
+        if self.speculative_algorithm == "SDAR_INTERLEAVED":
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "SDAR_INTERLEAVED speculative decoding requires "
+                    "--speculative-draft-model-path (e.g. JetLM/SDAR-1.7B-Chat)."
+                )
+            # block_size: how many positions per SDAR block
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = 16
+                logger.warning(
+                    "SDAR_INTERLEAVED: speculative_num_draft_tokens not set; "
+                    "defaulting to block_size=16."
+                )
+            # draft_length: large-model candidates per round
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 4
+                logger.warning(
+                    "SDAR_INTERLEAVED: speculative_num_steps not set; "
+                    "defaulting to draft_length=4."
+                )
+            # num_branches: small-model branches per round
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 3
+                logger.warning(
+                    "SDAR_INTERLEAVED: speculative_eagle_topk not set; "
+                    "defaulting to num_branches=3."
+                )
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. "
+                    "You can override this by explicitly setting --max-running-requests."
+                )
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using SDAR_INTERLEAVED speculative decoding."
+            )
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using SDAR_INTERLEAVED speculative decoding."
+                )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding

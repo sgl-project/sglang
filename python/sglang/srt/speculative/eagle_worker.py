@@ -664,11 +664,12 @@ class EAGLEWorker(TpModelWorker):
             # Set inputs
             forward_batch.input_ids = input_ids
             # This is a temporary fix for the case that the user is using standalone
-            # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
-            # rope kernel needs cache_loc to be contiguous.
+            # speculative decoding and the draft model architecture is gpt-oss or sdar.
+            # Their rope kernel needs cache_loc to be contiguous.
             if (
                 self.server_args.speculative_algorithm == "STANDALONE"
-                and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+                and self.model_config.hf_config.architectures[0]
+                in ("GptOssForCausalLM", "SDARForCausalLM")
             ):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
