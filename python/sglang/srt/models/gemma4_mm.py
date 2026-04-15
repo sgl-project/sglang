@@ -845,18 +845,32 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def get_hidden_dim(self, module_name, layer_idx):
         # return input_dim, output_dim
+        # Gemma 4 has heterogeneous attention: full-attention layers use
+        # head_dim/num_key_value_heads, sliding-attention layers use
+        # swa_head_dim/swa_num_key_value_heads. The LoRA buffer for o_proj
+        # (and the qkv_proj output dim) must be sized per-layer.
+        is_full = self.config.layer_types[layer_idx] == "full_attention"
+        if is_full:
+            attn_head_dim = self.config.head_dim
+            kv_heads = self.config.num_key_value_heads
+        else:
+            attn_head_dim = getattr(
+                self.config, "swa_head_dim", self.config.head_dim
+            )
+            kv_heads = getattr(
+                self.config,
+                "swa_num_key_value_heads",
+                self.config.num_key_value_heads,
+            )
         if module_name == "qkv_proj":
             return (
                 self.config.hidden_size,
-                self.config.head_dim
-                * (
-                    self.config.num_attention_heads
-                    + self.config.num_key_value_heads * 2
-                ),
+                attn_head_dim
+                * (self.config.num_attention_heads + kv_heads * 2),
             )
         elif module_name == "o_proj":
             return (
-                self.config.head_dim * self.config.num_attention_heads,
+                attn_head_dim * self.config.num_attention_heads,
                 self.config.hidden_size,
             )
         elif module_name == "gate_up_proj":
