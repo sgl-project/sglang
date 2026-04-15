@@ -263,8 +263,18 @@ class TestTransformerQuantHelpers(unittest.TestCase):
     @patch(
         "sglang.multimodal_gen.runtime.layers.linear.get_tp_group", return_value=None
     )
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+        return_value=1,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_global_server_args",
+        return_value=SimpleNamespace(attention_backend=None),
+    )
     def test_flux_single_transformer_block_modelopt_excludes_use_full_prefix(
         self,
+        _mock_server_args,
+        _mock_ring_world_size,
         _mock_tp_group,
         _mock_group_size,
         _mock_group_rank,

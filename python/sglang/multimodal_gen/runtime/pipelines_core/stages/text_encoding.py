@@ -12,8 +12,6 @@ import inspect
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
-from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -263,11 +261,11 @@ class TextEncodingStage(PipelineStage):
             ).to(target_device)
 
             input_ids = text_inputs["input_ids"]
-            is_flux_v1 = isinstance(
-                server_args.pipeline_config, FluxPipelineConfig
-            ) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
-
-            attention_mask = None if is_flux_v1 else text_inputs["attention_mask"]
+            attention_mask = (
+                server_args.pipeline_config.get_text_encoder_attention_mask(
+                    text_inputs, i
+                )
+            )
             encoder_forward_kwargs = {
                 "input_ids": input_ids,
                 "output_hidden_states": True,
@@ -292,12 +290,13 @@ class TextEncodingStage(PipelineStage):
                 prompt_embeds = prompt_embeds.to(device=target_device)
 
             embeds_list.append(prompt_embeds)
-            if is_flux_v1 and outputs.pooler_output is not None:
-                # FLUX.1 only consumes the pooled CLIP projection. The T5
-                # encoder in the same pipeline has no pooler output.
-                pooled_embeds_list.append(
-                    outputs.pooler_output.to(device=target_device)
-                )
+
+            pooled_output = server_args.pipeline_config.get_text_encoder_pooler_output(
+                outputs, i
+            )
+            if pooled_output is not None:
+                pooled_embeds_list.append(pooled_output.to(device=target_device))
+
             if return_attention_mask:
                 mask_to_store = (
                     attention_mask.to(device=target_device)

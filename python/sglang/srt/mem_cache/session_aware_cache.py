@@ -62,11 +62,6 @@ class SessionSlot:
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
-    # True while the slot's KV has been restored to an active request.
-    # Prevents double-counting in token accounting (the request's tokens
-    # are already tracked via uncached_size in the busy mem check).
-    is_active: bool = False
-
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
@@ -74,7 +69,6 @@ class SessionSlot:
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
-        self.is_active = False
         self.req_pool_idx = req.req_pool_idx
         self.kv_committed_len = req.kv_committed_len
         self.kv_allocated_len = req.kv_allocated_len
@@ -107,8 +101,6 @@ class SessionSlot:
         req.mamba_next_track_idx = self.mamba_next_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
-
-        self.is_active = True
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
         # from the slot. During chunked prefill, a request may be rejected by
@@ -308,81 +300,20 @@ class SessionAwareCache(BasePrefixCache):
 
     # -- Session lifecycle --
 
-    def _resolve_release_state(
-        self, slot: SessionSlot, req: Optional[Req]
-    ) -> tuple[int, Any]:
-        """Resolve the currently tree-owned prefix for a session slot.
+    def release_session(self, session_id: str):
+        """Release all KV resources held by a streaming session.
 
-        A long-lived session can outlive radix-tree splits caused by unrelated
-        traffic. In that case, the saved `last_node` may no longer represent the
-        full protected prefix even though the slot's req_to_token row still
-        contains tree-owned indices at the front. Re-match the current request
-        text, then intersect the returned tree indices with the slot's row so
-        release uses the prefix that is still actually backed by the tree.
+        `slot.last_node` + `slot.cache_protected_len` are trusted directly: radix
+        tree splits mutate TreeNode objects in place (see RadixCache._split_node),
+        so a saved TreeNode reference remains valid and the locked prefix length
+        is unchanged. No rematch needed -- and `match_prefix` here would cause
+        further splits that disturb accounting.
         """
-        protected_len = slot.cache_protected_len
-        lock_node = slot.last_node
-
-        # TODO: re-match logic disabled — match_prefix has side effects
-        # (splits) that disturb tree accounting. Directly using
-        # slot.last_node + cache_protected_len is safe after split analysis.
-        return protected_len, lock_node
-
-        if (
-            req is None
-            or not slot.is_holding_kv
-            or slot.req_pool_idx is None
-            or protected_len <= 0
-        ):
-            return protected_len, lock_node
-
-        from sglang.srt.mem_cache.radix_cache import RadixKey
-
-        token_ids = (req.origin_input_ids + req.output_ids)[: slot.kv_committed_len]
-        if not token_ids:
-            return 0, None
-
-        match = self.inner.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
-                req=None,
-            )
-        )
-        if len(match.device_indices) == 0:
-            return 0, None
-
-        max_protected_len = min(len(match.device_indices), protected_len)
-        row_indices = self.req_to_token_pool.req_to_token[
-            slot.req_pool_idx, :max_protected_len
-        ].to(dtype=torch.int64)
-        match_indices = match.device_indices[:max_protected_len]
-        mismatches = (match_indices != row_indices).nonzero(as_tuple=False)
-        if mismatches.numel() == 0 and max_protected_len == len(match.device_indices):
-            common_len = max_protected_len
-            return common_len, match.last_device_node
-
-        common_len = (
-            int(mismatches[0].item()) if mismatches.numel() > 0 else max_protected_len
-        )
-        if self.page_size > 1:
-            common_len = (common_len // self.page_size) * self.page_size
-        if common_len <= 0:
-            return 0, None
-
-        rematch = self.inner.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(token_ids=token_ids[:common_len], extra_key=req.extra_key),
-                req=None,
-            )
-        )
-        return len(rematch.device_indices), rematch.last_device_node
-
-    def release_session(self, session_id: str, req: Optional[Req] = None):
-        """Release all KV resources held by a streaming session."""
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
-        protected_len, lock_node = self._resolve_release_state(slot, req)
+        protected_len = slot.cache_protected_len
+        lock_node = slot.last_node
         tokens_freed = (
             max(0, slot.kv_allocated_len - protected_len) if slot.is_holding_kv else 0
         )
@@ -409,37 +340,51 @@ class SessionAwareCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
 
-    def session_held_tokens(self) -> int:
+    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.
 
-        Excludes active slots whose tokens are already counted as part of
-        the running request's uncached_size in the busy mem check.
+        Excludes slots whose KV is currently owned by an owning request —
+        those tokens are counted via uncached_size in the busy mem check.
+        A slot's pool_idx being in active_pool_idxs indicates a req owns it.
         """
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv and not slot.is_active:
+            in_batch = (
+                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+            )
+            if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - slot.cache_protected_len
         return total
 
-    def session_held_full_tokens(self) -> int:
+    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """An alias to align the naming style of SWA"""
-        return self.session_held_tokens()
+        return self.session_held_tokens(active_pool_idxs)
 
-    def session_held_swa_tokens(self) -> int:
+    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total SWA tokens held by session slots, not tracked by the tree."""
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv and not slot.is_active:
+            in_batch = (
+                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+            )
+            if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - max(
                     slot.cache_protected_len, slot.swa_evicted_seqlen
                 )
         return total
 
-    def session_held_req_count(self) -> int:
+    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
         """Number of req pool slots held by session slots."""
-        return sum(s.is_holding_kv and not s.is_active for s in self.slots.values())
+
+        def _owned(s):
+            in_batch = (
+                active_pool_idxs is not None and s.req_pool_idx in active_pool_idxs
+            )
+            return s.is_holding_kv and not in_batch
+
+        return sum(_owned(s) for s in self.slots.values())
 
     # -- Pass-through methods --
 
