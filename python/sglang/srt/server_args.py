@@ -3492,6 +3492,7 @@ class ServerArgs:
         _MISTRAL_NATIVE_CONFIG_PATTERNS = (
             "mistral-large-3",
             "mistral-small-4",
+            "mistral-medium",
             "leanstral",
         )
 

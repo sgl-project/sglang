@@ -13,8 +13,10 @@
 # ==============================================================================
 """Inference-only Mistral model."""
 
+from collections.abc import Iterable
 from typing import List
 
+import regex as re
 import torch
 from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
 
@@ -24,6 +26,58 @@ from sglang.srt.models.llama import LlamaForCausalLM
 
 class MistralForCausalLM(LlamaForCausalLM):
     pass
+
+
+class MistralForCausalLMMistralFormat(MistralForCausalLM):
+    """Mistral GQA model loaded from mistral native format (params.json).
+
+    Handles weight name remapping from mistral native format to HF/Llama
+    format. This is the GQA counterpart to MistralLarge3ForCausalLM which
+    handles MLA models in mistral native format.
+    """
+
+    # fmt: off
+    remapping = {
+        r"layers\.(\d+)\.attention_norm\.weight": r"model.layers.\1.input_layernorm.weight",
+        r"layers\.(\d+)\.attention\.wq\.(\w+)": r"model.layers.\1.self_attn.q_proj.\2",
+        r"layers\.(\d+)\.attention\.wk\.(\w+)": r"model.layers.\1.self_attn.k_proj.\2",
+        r"layers\.(\d+)\.attention\.wv\.(\w+)": r"model.layers.\1.self_attn.v_proj.\2",
+        r"layers\.(\d+)\.attention\.wo\.(\w+)": r"model.layers.\1.self_attn.o_proj.\2",
+        r"layers\.(\d+)\.ffn_norm\.weight": r"model.layers.\1.post_attention_layernorm.weight",
+        r"layers\.(\d+)\.feed_forward\.w1\.(\w+)": r"model.layers.\1.mlp.gate_proj.\2",
+        r"layers\.(\d+)\.feed_forward\.w2\.(\w+)": r"model.layers.\1.mlp.down_proj.\2",
+        r"layers\.(\d+)\.feed_forward\.w3\.(\w+)": r"model.layers.\1.mlp.up_proj.\2",
+        r"norm\.weight": "model.norm.weight",
+        r"tok_embeddings\.weight": "model.embed_tokens.weight",
+        r"output\.weight": "lm_head.weight",
+    }
+    # fmt: on
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        return super().load_weights(self._remap_mistral_to_llama(weights))
+
+    def _remap_mistral_to_llama(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Remap Mistral native format weight names to HF/Llama format."""
+        for name, loaded_weight in weights:
+            for k, v in self.remapping.items():
+                match = re.fullmatch(k, name)
+                if match:
+                    name = re.sub(k, v, name)
+                    break
+            else:
+                import logging
+
+                logging.warning(f"Unrecognized weight: {name}. Skipping.")
+                continue
+
+            if name.endswith(".qscale_act"):
+                name = re.sub(r"\.qscale_act$", ".input_scale", name)
+            elif name.endswith(".qscale_weight"):
+                name = re.sub(r"\.qscale_weight$", ".weight_scale", name)
+
+            yield name, loaded_weight
 
 
 class Mistral3ForConditionalGeneration:

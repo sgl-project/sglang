@@ -503,6 +503,7 @@ def get_config(
     if (
         "mistral-large-3" in str(model).lower()
         or "mistral-small-4" in str(model).lower()
+        or "mistral-medium" in str(model).lower()
         or "leanstral" in str(model).lower()
     ):
         config = _load_mistral_large_3_for_causal_LM(
@@ -1237,6 +1238,7 @@ def get_processor(
     if (
         "mistral-large-3" in str(tokenizer_name).lower()
         or "mistral-small-4" in str(tokenizer_name).lower()
+        or "mistral-medium" in str(tokenizer_name).lower()
         or "leanstral" in str(tokenizer_name).lower()
     ):
         config = _load_mistral_large_3_for_causal_LM(
