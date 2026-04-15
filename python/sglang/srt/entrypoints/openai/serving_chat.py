@@ -297,11 +297,18 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        extra_body = request.extra_body if isinstance(request.extra_body, dict) else {}
+        history_traj = (
+            request.history_traj
+            or extra_body.get("history_traj")
+        )
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
+            history_traj=history_traj,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
@@ -661,6 +668,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        pred_traj_map = {}
 
         stream_started = False
         try:
@@ -684,6 +692,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                pred_traj_map[index] = content["meta_info"].get("pred_traj", None)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -883,20 +892,31 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
-            if request.return_routed_experts and routed_experts:
-                # Get first non-None routed_experts value
-                first_routed_experts = next(
-                    (v for v in routed_experts.values() if v is not None), None
+            first_routed_experts = next(
+                (v for v in routed_experts.values() if v is not None), None
+            )
+            first_pred_traj = next(
+                (v for v in pred_traj_map.values() if v is not None), None
+            )
+            if (
+                (request.return_routed_experts and first_routed_experts is not None)
+                or first_pred_traj is not None
+            ):
+                routed_experts_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[],  # sglext is at response level
+                    model=request.model,
+                    sglext=SglExt(
+                        routed_experts=(
+                            first_routed_experts
+                            if request.return_routed_experts
+                            else None
+                        ),
+                        pred_traj=first_pred_traj,
+                    ),
                 )
-                if first_routed_experts is not None:
-                    routed_experts_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=int(time.time()),
-                        choices=[],  # sglext is at response level
-                        model=request.model,
-                        sglext=SglExt(routed_experts=first_routed_experts),
-                    )
-                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
+                yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
             if include_usage:
@@ -965,11 +985,13 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        pred_traj = first_ret["meta_info"].get("pred_traj", None)
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or pred_traj is not None:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                pred_traj=pred_traj,
             )
 
         for idx, ret_item in enumerate(ret):

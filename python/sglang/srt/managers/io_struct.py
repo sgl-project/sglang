@@ -153,6 +153,8 @@ class GenerateReqInput(BaseReq):
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
+    # History trajectory for Alpamayo
+    history_traj: Optional[Dict[str, Any]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Whether to return logprobs.
@@ -631,6 +633,7 @@ class GenerateReqInput(BaseReq):
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
+            history_traj=self.history_traj,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
@@ -710,6 +713,8 @@ class TokenizedGenerateReqInput(BaseReq):
     token_ids_logprob: List[int]
     # Whether to stream output
     stream: bool
+    # History trajectory for Alpamayo
+    history_traj: Optional[Dict[str, Any]] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False

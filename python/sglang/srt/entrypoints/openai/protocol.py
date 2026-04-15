@@ -341,6 +341,7 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    pred_traj: Optional[List] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -621,6 +622,10 @@ class ChatCompletionRequest(BaseModel):
     # SGLang multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    # History trajectory for VLA processors.
+    history_traj: Optional[Dict[str, Any]] = None
+    # Compatibility field for clients that nest extension params.
+    extra_body: Optional[Dict[str, Any]] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

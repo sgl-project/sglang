@@ -254,6 +254,96 @@ def get_hf_text_config(config: PretrainedConfig):
     return config
 
 
+# Temporary hack for Alpamayo-R1 model
+def _load_alpamayo_config(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    """Load Alpamayo-R1 config by building a proper Qwen3-VL config.
+
+    The original config has model_type='alpamayo_r1' which AutoConfig does not
+    recognize, and it's a flat JSON without nested text_config/vision_config.
+    We load the Qwen3-VL base config from tokenizer_path (which should point
+    to the base Qwen3-VL model), then overlay Alpamayo-specific fields.
+    """
+    local_path = download_from_hf(model_path)
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        alpamayo_json = json.load(f)
+
+    # Load the Qwen3-VL base config from tokenizer_path (the actual Qwen3-VL
+    # model directory) so we get correct text_config/vision_config dimensions.
+    # We try multiple sources for the tokenizer path since get_config may be
+    # called before global server_args is initialized.
+    tokenizer_path = None
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        tokenizer_path = server_args.tokenizer_path
+    except (ValueError, RuntimeError):
+        # Global server args not set yet (e.g. during ServerArgs.__post_init__).
+        # Fall back to reading --tokenizer-path from sys.argv.
+        import sys
+
+        for i, arg in enumerate(sys.argv):
+            if arg in ("--tokenizer-path", "--tokenizer_path") and i + 1 < len(
+                sys.argv
+            ):
+                tokenizer_path = sys.argv[i + 1]
+                break
+
+    if (
+        tokenizer_path
+        and tokenizer_path != model_path
+        and os.path.exists(tokenizer_path)
+    ):
+        config = AutoConfig.from_pretrained(
+            tokenizer_path, trust_remote_code=trust_remote_code, revision=revision
+        )
+    else:
+        config = AutoConfig.from_pretrained(
+            "Qwen/Qwen3-VL-8B-Instruct",
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+
+    # Overlay all Alpamayo-specific fields onto the config
+    for key, value in alpamayo_json.items():
+        if key in ("model_type", "transformers_version"):
+            continue
+        setattr(config, key, value)
+
+    # Update vocab_size in text_config to match Alpamayo's extended vocab
+    if hasattr(config, "text_config") and "vocab_size" in alpamayo_json:
+        config.text_config.vocab_size = alpamayo_json["vocab_size"]
+
+    # Synthesize rope_parameters on text_config for transformers-v5 compatibility.
+    # qwen3.py expects config.rope_parameters dict; Qwen3VLTextConfig (transformers v4)
+    # only has rope_theta / rope_scaling as separate attributes.
+    if hasattr(config, "text_config") and not hasattr(
+        config.text_config, "rope_parameters"
+    ):
+        tc = config.text_config
+        rope_params = {
+            "rope_type": "default",
+            "rope_theta": getattr(tc, "rope_theta", 1000000),
+        }
+        if getattr(tc, "rope_scaling", None):
+            rope_params.update(tc.rope_scaling)
+        tc.rope_parameters = rope_params
+
+    # so current model_type is pretended to be qwen3_vl
+    setattr(config, "_name_or_path", model_path)
+    return config
+
+
 # Temporary hack for DeepSeek-V3.2 model
 def _load_deepseek_v32_model(
     model_path: str,
@@ -514,12 +604,23 @@ def get_config(
             config = AutoConfig.from_pretrained(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
-        except ValueError as e:
-            if not "deepseek_v32" in str(e):
+        except (ValueError, KeyError) as e:
+            if "alpamayo" in str(e) or "alpamayo" in str(model).lower():
+                config = _load_alpamayo_config(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            elif "deepseek_v32" in str(e):
+                config = _load_deepseek_v32_model(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
                 raise e
-            config = _load_deepseek_v32_model(
-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
         except KeyError as e:
             # Transformers v5 may register a built-in config class that
             # conflicts with sglang's custom one (e.g. NemotronHConfig
@@ -892,6 +993,17 @@ def get_tokenizer(
                 "or using the `--trust-remote-code` flag in the CLI."
             )
             raise RuntimeError(err_msg) from e
+        elif "alpamayo" in str(e) or "alpamayo" in tokenizer_name.lower():
+            # Alpamayo model has no tokenizer files; fall back to the base
+            # Qwen3-VL tokenizer automatically.
+            tokenizer = AutoTokenizer.from_pretrained(
+                "Qwen/Qwen3-VL-8B-Instruct",
+                *args,
+                trust_remote_code=trust_remote_code,
+                tokenizer_revision=tokenizer_revision,
+                clean_up_tokenization_spaces=False,
+                **kwargs,
+            )
         else:
             raise e
 
@@ -1246,12 +1358,26 @@ def get_processor(
         )
     else:
         _ensure_llama_flash_attention2_compat()
-        config = AutoConfig.from_pretrained(
-            tokenizer_name,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        try:
+            config = AutoConfig.from_pretrained(
+                tokenizer_name,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        except (ValueError, KeyError) as e:
+            if "alpamayo" in str(e) or "alpamayo" in tokenizer_name.lower():
+                # Alpamayo model has no tokenizer files; fall back to the base
+                # Qwen3-VL tokenizer/processor automatically.
+                tokenizer_name = "Qwen/Qwen3-VL-8B-Instruct"
+                config = AutoConfig.from_pretrained(
+                    tokenizer_name,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
+                raise
     if _is_deepseek_ocr_model(config):
         # Temporary hack for load deepseek-ocr
         config.model_type = "deepseek-ocr"

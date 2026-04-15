@@ -1370,6 +1370,8 @@ multimodal_model_archs = [
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "Alpamayo1_5",
+    "AlpamayoR1"
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [
