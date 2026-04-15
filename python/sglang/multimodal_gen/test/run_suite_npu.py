@@ -5,7 +5,7 @@ Usage:
     python3 run_suite.py --suite <suite_name> --partition-id <id> --total-partitions <num>
 
 Example:
-    python3 run_suite.py --suite 1-gpu --partition-id 0 --total-partitions 4
+    python3 run_suite_npu.py --suite 1-npu --partition-id 0 --total-partitions 4
 """
 
 import argparse
@@ -215,10 +215,6 @@ def run_pytest(files, filter_expr=None, exitfirst=False):
 
     print(f"Max retry exceeded")
     return returncode
-
-
-def _is_in_ci() -> bool:
-    return os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("1", "true", "yes", "on")
 
 
 def main():

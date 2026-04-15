@@ -1,3 +1,4 @@
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.testcase_configs import *
 from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
