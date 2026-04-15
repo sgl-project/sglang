@@ -185,7 +185,7 @@ class FINISH_ABORT(BaseFinishReason):
     def __init__(self, message=None, status_code=None, err_type=None):
         super().__init__(is_error=True)
         self.message = message or "Aborted"
-        self.status_code = status_code
+        self.status_code = status_code or HTTPStatus.INTERNAL_SERVER_ERROR
         self.err_type = err_type
 
     def to_json(self):

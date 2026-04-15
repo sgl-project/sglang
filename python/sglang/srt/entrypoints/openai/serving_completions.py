@@ -308,8 +308,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
                 # If the abort is from scheduler.
                 if finish_reason_type == "abort":
-                    code = finish_reason.get(
-                        "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                    code = (
+                        finish_reason.get(
+                            "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
+                        )
+                        or HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
