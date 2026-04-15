@@ -9,6 +9,12 @@ import torch
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.nsa.dequant_fp4_to_fp8 import (
+    FP8_TOTAL_DIM,
+    dequant_fp4_paged_decode,
+    dequant_fp4_paged_extend,
+    get_fp8_dtype_for_dequant,
+)
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     NativeSparseAttnBackendMTPPrecomputeMixin,
@@ -308,6 +314,9 @@ class NativeSparseAttnBackend(
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
+        self.nsa_kv_cache_store_fp4 = getattr(
+            model_runner.token_to_kv_pool, "nsa_kv_cache_store_fp4", False
+        )
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -334,6 +343,31 @@ class NativeSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
+
+        if self.nsa_kv_cache_store_fp4:
+            assert (
+                self.nsa_decode_impl == "tilelang"
+            ), f"FP4 KV cache requires tilelang decode backend, got {self.nsa_decode_impl}"
+            assert self.nsa_prefill_impl in (
+                "tilelang",
+                "flashmla_auto",
+            ), (
+                f"FP4 KV cache requires tilelang or flashmla_auto prefill backend, "
+                f"got {self.nsa_prefill_impl}"
+            )
+
+        if self.nsa_kv_cache_store_fp4:
+            max_bs = model_runner.req_to_token_pool.size
+            fp4_init_entries = max_bs * self.nsa_index_topk
+            fp8_dtype = get_fp8_dtype_for_dequant()
+            self._fp4_fp8_workspace = torch.empty(
+                (fp4_init_entries, 1, FP8_TOTAL_DIM),
+                dtype=fp8_dtype,
+                device=self.device,
+            )
+            self._fp4_new_page_table = torch.full(
+                (max_bs, 2048), -1, dtype=torch.int32, device=self.device
+            )
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -802,6 +836,18 @@ class NativeSparseAttnBackend(
                 else None
             ),
         }
+
+        if self.nsa_kv_cache_store_fp4:
+            cg_entries = max_num_tokens * self.nsa_index_topk
+            fp8_dtype = get_fp8_dtype_for_dequant()
+            self._fp4_fp8_workspace = torch.empty(
+                (cg_entries, 1, FP8_TOTAL_DIM),
+                dtype=fp8_dtype,
+                device=self.device,
+            )
+            self._fp4_new_page_table = torch.full(
+                (max_num_tokens, 2048), -1, dtype=torch.int32, device=self.device
+            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1415,6 +1461,10 @@ class NativeSparseAttnBackend(
         if nsa_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.nsa_kv_cache_store_fp4:
+                kv_cache, page_table_1 = dequant_fp4_paged_extend(
+                    kv_cache, page_table_1
+                )
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1599,6 +1649,16 @@ class NativeSparseAttnBackend(
         elif self.nsa_decode_impl == "tilelang":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.nsa_kv_cache_store_fp4:
+                bs = page_table_1.shape[0]
+                pt_valid = page_table_1[:, : self.nsa_index_topk].contiguous()
+                kv_cache = dequant_fp4_paged_decode(
+                    kv_cache,
+                    pt_valid,
+                    fp8_workspace=self._fp4_fp8_workspace,
+                    new_page_table=self._fp4_new_page_table,
+                )
+                page_table_1 = self._fp4_new_page_table[:bs]
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,

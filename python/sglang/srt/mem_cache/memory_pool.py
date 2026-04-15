@@ -1469,11 +1469,10 @@ class MLATokenToKVPool(KVCache):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
-        # When override_kv_cache_dim is provided with nsa model, we assume the
-        # override kv cache dim is correct and use it directly.
+        # When override_kv_cache_dim is provided, use it directly (covers FP8 and FP4).
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.nsa_kv_cache_store_fp8
+            if override_kv_cache_dim is not None
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -1961,6 +1960,118 @@ class NSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
+
+
+class NSATokenToKVPoolFP4(NSATokenToKVPool):
+    """NSA KV pool that stores the MLA KV cache in FP4 (E2M1) format.
+
+    Buffer layout per token (400 bytes, uint8):
+      [0:256)    packed FP4 nope  (512 values, 2 per byte)
+      [256:272)  uint8 block scales  (16 blocks of 32 values)
+      [272:400)  BF16 rope bytes  (64 values × 2 bytes)
+
+    At decode time the caller gathers topk pages and dequantises to FP8
+    before passing them to the existing FP8 TileLang kernel.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        kv_lora_rank: int,
+        dtype: torch.dtype,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        index_head_dim: int,
+        enable_memory_saver: bool,
+        kv_cache_dim: int,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        index_buf_size: Optional[int] = None,
+    ):
+        from sglang.srt.mem_cache.utils import FP4_KV_CACHE_DIM
+
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            kv_lora_rank=kv_lora_rank,
+            dtype=dtype,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            index_head_dim=index_head_dim,
+            enable_memory_saver=enable_memory_saver,
+            kv_cache_dim=FP4_KV_CACHE_DIM,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            index_buf_size=index_buf_size,
+        )
+        self.nsa_kv_cache_store_fp4 = True
+        self.nsa_kv_cache_store_fp8 = False
+
+    def _create_buffers(self):
+        from sglang.srt.mem_cache.utils import FP4_KV_CACHE_DIM
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                self.store_dtype = torch.uint8
+                self.kv_buffer = [
+                    torch.zeros(
+                        (m, 1, FP4_KV_CACHE_DIM),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def get_key_buffer(self, layer_id: int):
+        """Return the raw FP4 uint8 buffer (no dequant)."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.kv_buffer[layer_id - self.start_layer]
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        raise NotImplementedError("NSATokenToKVPoolFP4 only supports set_mla_kv_buffer")
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        from sglang.srt.mem_cache.utils import set_mla_kv_buffer_triton_fp4_quant
+
+        layer_id = layer.layer_id
+        set_mla_kv_buffer_triton_fp4_quant(
+            self.kv_buffer[layer_id - self.start_layer],
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+        )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        raise NotImplementedError(
+            "NSATokenToKVPoolFP4 stores data in FP4 format; "
+            "use get_key_buffer() and dequantize explicitly"
+        )
 
 
 class DoubleSparseTokenToKVPool(KVCache):
