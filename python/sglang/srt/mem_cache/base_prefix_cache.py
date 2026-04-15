@@ -212,6 +212,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def protected_size(self):
         return 0
 
+    def get_memory_relocation_version(self) -> int:
+        """Get memory version for CUDA graph invalidation.
+
+        Override in subclasses that have a token_to_kv_pool_allocator.
+        """
+        return 0
+
     def full_protected_size(self):
         return 0
 

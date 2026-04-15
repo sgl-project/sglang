@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -37,6 +38,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
@@ -433,6 +436,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
+    # For hierarchical cache - disable CUDA graphs when loading is active
+    hicache_consumer_index: int = -1
+    # Memory relocation version - for invalidating CUDA graphs after HiCache relocates memory
+    hicache_memory_version: int = 0
+
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
@@ -483,8 +491,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            hicache_consumer_index=batch.hicache_consumer_index,
+            hicache_memory_version=batch.hicache_memory_version,
             rids=[req.rid for req in batch.reqs],
         )
+
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:

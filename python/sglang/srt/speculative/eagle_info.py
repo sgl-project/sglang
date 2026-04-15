@@ -124,11 +124,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             prefix_lens_cpu = batch.seq_lens_cpu
             end_offset = prefix_lens + self.draft_token_num
             end_offset_cpu = prefix_lens_cpu + self.draft_token_num
+
+            # Store version BEFORE getting last_loc
+            version_before = batch.tree_cache.get_memory_relocation_version()
+
             last_loc = get_last_loc(
                 batch.req_to_token_pool.req_to_token,
                 batch.req_pool_indices,
                 prefix_lens,
             )
+
+            # Clamp last_loc to valid KV cache range (no GPU sync)
+            total_slots = batch.token_to_kv_pool_allocator.size
+            last_loc = last_loc.clamp(0, total_slots)
+
             batch.out_cache_loc = alloc_paged_token_slots_extend(
                 batch.tree_cache,
                 prefix_lens,
@@ -138,6 +147,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 last_loc,
                 len(batch.input_ids),
             )
+
+            # Check if HiCache relocated memory during allocation
+            version_after = batch.tree_cache.get_memory_relocation_version()
+
+            if version_after != version_before:
+                # Memory was relocated - recompute last_loc with new indices
+                last_loc = get_last_loc(
+                    batch.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    prefix_lens,
+                )
+
             self.last_loc = last_loc
 
         bs = batch.batch_size()

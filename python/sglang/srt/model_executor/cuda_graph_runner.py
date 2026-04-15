@@ -745,13 +745,20 @@ class CudaGraphRunner:
             else True
         )
 
-        return (
+        # Check if hierarchical cache loading is inactive
+        is_hicache_loading_inactive = forward_batch.hicache_consumer_index < 0
+
+        # Compute final result
+        can_run = (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_hicache_loading_inactive
         )
+
+        return can_run
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(
@@ -1237,6 +1244,7 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
+
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 

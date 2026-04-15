@@ -249,6 +249,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
+        # Disable CUDA graph when hierarchical cache loading is active
+        if forward_batch.hicache_consumer_index >= 0:
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
