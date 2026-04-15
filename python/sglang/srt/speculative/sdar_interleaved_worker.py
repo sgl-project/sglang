@@ -636,16 +636,23 @@ class SDARInterleavedWorker:
         block_positions: torch.Tensor,    # [block_size]
     ) -> torch.Tensor:
         """
-        Run model on each state in all_states for request req_idx.
+        Run model on all states in one batched forward for request req_idx.
         Returns tensor [num_states, block_size, vocab_size].
         """
-        logits_list = []
-        for state in all_states:
-            logits = self._run_single_state(
-                model_runner, batch, req_idx, state, block_positions
-            )
-            logits_list.append(logits)
-        return torch.stack(logits_list, dim=0)  # [num_states, block_size, vocab]
+        n = len(all_states)
+        state_batch = torch.stack(all_states, dim=0)         # [n, block_size]
+        exp_positions = block_positions.unsqueeze(0).expand(n, -1)  # [n, block_size]
+        exp_req_pool = [batch.req_pool_indices[req_idx]] * n
+        exp_seq_lens = batch.seq_lens[req_idx : req_idx + 1].expand(n)
+
+        return self._run_model_on_block_subset(
+            model_runner,
+            batch,
+            state_batch,
+            exp_positions,
+            exp_req_pool,
+            exp_seq_lens,
+        )  # [n, block_size, vocab_size]
 
     # ------------------------------------------------------------------
     # Low-level forward helpers
