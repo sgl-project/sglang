@@ -279,6 +279,12 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         """
         return self.language_model.get_attention_sliding_window_size()
 
+    def set_eagle3_layers_to_capture(self, layers_to_capture):
+        self.language_model.layers_to_capture = layers_to_capture
+
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
     def get_image_feature(self, items: List[MultimodalDataItem]):
         """
         Projects the last hidden state from the vision model into language model space.

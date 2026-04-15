@@ -533,6 +533,10 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
     def forward(self, input_ids: torch.Tensor):
         return super().forward(input_ids) * self.embed_scale
 
+    @property
+    def device(self):
+        return self.weight.device
+
 
 class Gemma3TextModel(PreTrainedModel):
     def __init__(
@@ -544,6 +548,7 @@ class Gemma3TextModel(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
+        self.layers_to_capture = None
 
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -614,6 +619,9 @@ class Gemma3TextModel(PreTrainedModel):
         else:
             hidden_states = input_embeds
 
+        if self.layers_to_capture is not None:
+            forward_batch.eagle_hidden_states = {}
+
         if _is_cpu and _is_cpu_amx_available:
             for layer in self.layers:
                 layer_outputs = layer(
@@ -625,6 +633,8 @@ class Gemma3TextModel(PreTrainedModel):
                     **kwargs,
                 )
                 hidden_states = layer_outputs[0]
+                if self.layers_to_capture is not None and layer.layer_id in self.layers_to_capture:
+                    forward_batch.eagle_hidden_states[layer.layer_id] = hidden_states
         else:
             if positions.dim() == 1:
                 positions = einops.rearrange(positions, "s -> 1 s")
@@ -641,6 +651,8 @@ class Gemma3TextModel(PreTrainedModel):
                     **kwargs,
                 )
                 hidden_states = layer_outputs[0]
+                if self.layers_to_capture is not None and layer.layer_id in self.layers_to_capture:
+                    forward_batch.eagle_hidden_states[layer.layer_id] = hidden_states
 
         hidden_states = self.norm(hidden_states)
 
@@ -724,6 +736,9 @@ class Gemma3ForCausalLM(PreTrainedModel):
             )
         self.post_init()
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
@@ -732,6 +747,9 @@ class Gemma3ForCausalLM(PreTrainedModel):
 
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
+
+    def set_eagle3_layers_to_capture(self, layers_to_capture):
+        self.model.layers_to_capture = layers_to_capture
 
     @torch.no_grad()
     def forward(
@@ -780,6 +798,8 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 "position_embeddings_global": position_embeddings_global,
                 "position_embeddings_local": position_embeddings_local,
             }
+            if self.model.layers_to_capture is not None:
+                forward_batch.eagle_hidden_states = {}
 
         # decoder layer
         for i in range(start, end):
@@ -796,6 +816,8 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 forward_batch=forward_batch,
             )
             forward_batch.hidden_states = layer_output[0]
+            if self.model.layers_to_capture is not None and i in self.model.layers_to_capture:
+                forward_batch.eagle_hidden_states[i] = forward_batch.hidden_states
 
         if end == self.model.config.num_hidden_layers:
             # norm
