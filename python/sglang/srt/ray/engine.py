@@ -29,7 +29,8 @@ from sglang.srt.entrypoints.engine import (
     _compute_parallelism_ranks,
 )
 from sglang.srt.ray.scheduler_actor import SchedulerActor
-from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA, PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils.network import get_free_port
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,8 @@ class RayEngine(Engine):
         ]
 
         rank0_node_ip = engine_ip
-        dist_init_addr = f"{rank0_node_ip}:{server_args.port + ZMQ_TCP_PORT_DELTA}"
+        dist_init_port = get_free_port()
+        dist_init_addr = f"{rank0_node_ip}:{dist_init_port}"
         logger.info(f"dist_init_addr: {dist_init_addr}")
 
         scheduler_actors = []
@@ -149,7 +151,7 @@ class RayEngine(Engine):
                     actor = SchedulerActor.options(
                         num_cpus=0,
                         num_gpus=1,
-                        name=f"sglang_scheduler_rank0node={rank0_node_ip}_pp{pp_rank}_tp{tp_rank}",
+                        name=f"sglang_scheduler_rank0node={rank0_node_ip}:{dist_init_port}_pp{pp_rank}_tp{tp_rank}",
                         scheduling_strategy=PlacementGroupSchedulingStrategy(
                             placement_group=pg,
                             placement_group_bundle_index=bundle_idx,
