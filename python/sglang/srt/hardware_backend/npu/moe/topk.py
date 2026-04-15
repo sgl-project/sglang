@@ -43,9 +43,8 @@ def fused_topk_npu(
 
     # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
     elif (
-        correction_bias is not None
+        (correction_bias is not None and num_token_non_padded is not None)
         or topk_config.scoring_func == "sigmoid"
-        or num_token_non_padded is not None
     ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
