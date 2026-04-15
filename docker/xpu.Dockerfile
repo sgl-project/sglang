@@ -11,7 +11,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Define build arguments
 ARG PYTHON_VERSION=3.10
 
-ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git
+ARG SG_LANG_REPO=https://github.com/MingxuZh/sglang.git
 ARG SG_LANG_BRANCH=main
 
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
