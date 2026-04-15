@@ -292,6 +292,107 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(strict, True)
 
 
+class TestPreferredSamplingParamsInteraction(unittest.TestCase):
+    """Test that to_sampling_params() only includes user-set fields,
+    allowing preferred_sampling_params to take effect for unset fields."""
+
+    def _make_chat_request(self, **kwargs):
+        defaults = {"model": "x", "messages": [{"role": "user", "content": "Hi"}]}
+        defaults.update(kwargs)
+        return ChatCompletionRequest(**defaults)
+
+    def test_unset_fields_omitted_for_preferred_params(self):
+        """preferred_sampling_params should take effect when user does not set the field."""
+        req = self._make_chat_request()
+        params = req.to_sampling_params(stop=[], model_generation_config={})
+        # These should NOT be present so preferred_sampling_params can fill them
+        for key in ("temperature", "top_p", "top_k", "min_p", "repetition_penalty"):
+            self.assertNotIn(key, params, f"{key} should be omitted when not user-set")
+        for key in (
+            "max_new_tokens",
+            "presence_penalty",
+            "frequency_penalty",
+            "ignore_eos",
+        ):
+            self.assertNotIn(key, params, f"{key} should be omitted when not user-set")
+
+    def test_user_set_fields_override_preferred(self):
+        """User-set fields should always appear in params (overriding preferred)."""
+        req = self._make_chat_request(
+            temperature=0.5,
+            top_k=50,
+            presence_penalty=0.3,
+            max_tokens=200,
+        )
+        params = req.to_sampling_params(stop=[], model_generation_config={})
+        self.assertEqual(params["temperature"], 0.5)
+        self.assertEqual(params["top_k"], 50)
+        self.assertEqual(params["presence_penalty"], 0.3)
+        self.assertEqual(params["max_new_tokens"], 200)
+
+    def test_model_generation_config_used_when_user_unset(self):
+        """model_generation_config should fill in when user hasn't set the field."""
+        req = self._make_chat_request()
+        gen_config = {"temperature": 0.3, "top_k": 40}
+        params = req.to_sampling_params(stop=[], model_generation_config=gen_config)
+        self.assertEqual(params["temperature"], 0.3)
+        self.assertEqual(params["top_k"], 40)
+        # Fields not in gen_config should remain omitted
+        self.assertNotIn("top_p", params)
+
+    def test_user_set_overrides_model_generation_config(self):
+        """User-set values should beat model_generation_config."""
+        req = self._make_chat_request(temperature=0.9)
+        gen_config = {"temperature": 0.3}
+        params = req.to_sampling_params(stop=[], model_generation_config=gen_config)
+        self.assertEqual(params["temperature"], 0.9)
+
+    def test_max_completion_tokens_zero(self):
+        """max_completion_tokens=0 should not be dropped by falsy check."""
+        req = self._make_chat_request(max_completion_tokens=0, max_tokens=100)
+        params = req.to_sampling_params(stop=[], model_generation_config={})
+        self.assertEqual(params["max_new_tokens"], 0)
+
+    def test_max_completion_tokens_precedence_over_max_tokens(self):
+        """max_completion_tokens takes precedence over max_tokens when both set."""
+        req = self._make_chat_request(max_completion_tokens=50, max_tokens=100)
+        params = req.to_sampling_params(stop=[], model_generation_config={})
+        self.assertEqual(params["max_new_tokens"], 50)
+
+    def test_max_tokens_fallback(self):
+        """max_tokens used when max_completion_tokens is not set."""
+        req = self._make_chat_request(max_tokens=200)
+        params = req.to_sampling_params(stop=[], model_generation_config={})
+        self.assertEqual(params["max_new_tokens"], 200)
+
+    def test_stop_always_included(self):
+        """stop is always included regardless of user setting."""
+        req = self._make_chat_request()
+        params = req.to_sampling_params(
+            stop=["</s>", "<|end|>"], model_generation_config={}
+        )
+        self.assertEqual(params["stop"], ["</s>", "<|end|>"])
+
+    def test_consistent_with_completions_endpoint(self):
+        """Both endpoints should omit unset get_param fields identically."""
+        chat_req = self._make_chat_request()
+        chat_params = chat_req.to_sampling_params(stop=[], model_generation_config={})
+        comp_req = CompletionRequest(model="x", prompt="Hello", max_tokens=16)
+        # CompletionRequest uses _build_sampling_params via serving layer,
+        # but we can check model_fields_set behavior directly
+        comp_user_set = comp_req.model_fields_set
+        for name in ("temperature", "top_p", "top_k", "min_p", "repetition_penalty"):
+            chat_has = name in chat_params
+            comp_explicit = name in comp_user_set
+            # If user didn't explicitly set in either, both should allow preferred to win
+            self.assertEqual(
+                chat_has,
+                comp_explicit,
+                f"Asymmetry for '{name}': chat_params has={chat_has}, "
+                f"comp explicit={comp_explicit}",
+            )
+
+
 class TestModelSerialization(unittest.TestCase):
     """Test model serialization with hidden states"""
 

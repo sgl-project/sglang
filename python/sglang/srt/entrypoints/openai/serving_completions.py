@@ -133,32 +133,45 @@ class OpenAIServingCompletion(OpenAIServingBase):
         return adapted_request, request
 
     def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
-        """Build sampling parameters for the request"""
-        # Start with common parameters
-        sampling_params = {
-            "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
-            "min_new_tokens": request.min_tokens,
-            "stop": request.stop,
-            "stop_token_ids": request.stop_token_ids,
-            "stop_regex": request.stop_regex,
-            "top_p": request.top_p,
-            "top_k": request.top_k,
-            "min_p": request.min_p,
-            "presence_penalty": request.presence_penalty,
-            "frequency_penalty": request.frequency_penalty,
-            "repetition_penalty": request.repetition_penalty,
-            "regex": request.regex,
-            "json_schema": request.json_schema,
-            "ebnf": request.ebnf,
-            "n": request.n,
-            "no_stop_trim": request.no_stop_trim,
-            "ignore_eos": request.ignore_eos,
-            "skip_special_tokens": request.skip_special_tokens,
-            "logit_bias": request.logit_bias,
-            "custom_params": request.custom_params,
-            "sampling_seed": request.seed,
+        """Build sampling parameters for the request.
+
+        Only explicitly user-provided parameters are included in the returned dict,
+        so that server-level preferred_sampling_params are not silently overridden
+        by protocol-level defaults.
+        """
+        user_set = request.model_fields_set
+
+        # IMPORTANT: When adding new optional sampling fields to CompletionRequest,
+        # add them here to ensure they participate in the preferred_sampling_params mechanism.
+        _field_to_param = {
+            "temperature": "temperature",
+            "max_tokens": "max_new_tokens",
+            "min_tokens": "min_new_tokens",
+            "stop": "stop",
+            "stop_token_ids": "stop_token_ids",
+            "stop_regex": "stop_regex",
+            "top_p": "top_p",
+            "top_k": "top_k",
+            "min_p": "min_p",
+            "presence_penalty": "presence_penalty",
+            "frequency_penalty": "frequency_penalty",
+            "repetition_penalty": "repetition_penalty",
+            "regex": "regex",
+            "json_schema": "json_schema",
+            "ebnf": "ebnf",
+            "n": "n",
+            "no_stop_trim": "no_stop_trim",
+            "ignore_eos": "ignore_eos",
+            "skip_special_tokens": "skip_special_tokens",
+            "logit_bias": "logit_bias",
+            "custom_params": "custom_params",
+            "seed": "sampling_seed",
         }
+
+        sampling_params = {}
+        for field_name, param_key in _field_to_param.items():
+            if field_name in user_set:
+                sampling_params[param_key] = getattr(request, field_name)
 
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":

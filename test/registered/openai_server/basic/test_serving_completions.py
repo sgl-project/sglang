@@ -162,6 +162,37 @@ class ServingCompletionTestCase(unittest.TestCase):
         # (but might have json_schema from the legacy json_schema field)
         self.assertIsNone(sampling_params.get("structural_tag"))
 
+    # ---------- preferred_sampling_params interaction ----------
+    def test_unset_fields_omitted_for_preferred_params(self):
+        """Fields not explicitly set should be omitted from sampling_params,
+        allowing preferred_sampling_params to take effect."""
+        req = CompletionRequest(model="x", prompt="Hello", max_tokens=100)
+        params = self.sc._build_sampling_params(req)
+        # max_tokens is explicitly set, should be present
+        self.assertEqual(params["max_new_tokens"], 100)
+        # These were not set, should be absent
+        for key in ("temperature", "top_p", "top_k", "min_p", "repetition_penalty"):
+            self.assertNotIn(key, params, f"{key} should be omitted when not user-set")
+        for key in ("presence_penalty", "frequency_penalty", "ignore_eos"):
+            self.assertNotIn(key, params, f"{key} should be omitted when not user-set")
+
+    def test_user_set_fields_included(self):
+        """Explicitly set fields should always appear in sampling_params."""
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello",
+            max_tokens=100,
+            temperature=0.5,
+            top_k=50,
+            presence_penalty=0.3,
+            ignore_eos=True,
+        )
+        params = self.sc._build_sampling_params(req)
+        self.assertEqual(params["temperature"], 0.5)
+        self.assertEqual(params["top_k"], 50)
+        self.assertEqual(params["presence_penalty"], 0.3)
+        self.assertEqual(params["ignore_eos"], True)
+
     def test_logprobs_false_non_streaming(self):
         """Test that logprobs=False doesn't cause KeyError in non-streaming response."""
         req = CompletionRequest(
