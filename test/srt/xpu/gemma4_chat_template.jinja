@@ -1,0 +1,5 @@
+{{ bos_token }}{% for message in messages %}{% if message['role'] == 'user' %}<start_of_turn>user
+{% if message['content'] is string %}{{ message['content'] }}{% else %}{% for part in message['content'] %}{% if part['type'] == 'text' %}{{ part['text'] }}{% endif %}{% endfor %}{% endif %}<end_of_turn>
+{% elif message['role'] == 'model' or message['role'] == 'assistant' %}<start_of_turn>model
+{{ message['content'] }}<end_of_turn>
+{% endif %}{% endfor %}<start_of_turn>model
