@@ -59,6 +59,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MULTIMODAL_TYPES = frozenset(("image_url", "video_url", "audio_url"))
+_MULTIMODAL_ERROR = (
+    "Multimodal input (images, videos, or audio) is not supported by this model "
+    "or server configuration. To enable multimodal support, start the server "
+    "with --enable-multimodal."
+)
+
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
@@ -127,6 +134,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+        self._is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
     def _handle_last_assistant_message(
         self,
@@ -196,10 +204,31 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
+    def _reject_multimodal_if_disabled(
+        self, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        if self._is_multimodal:
+            return None
+
+        for message in request.messages:
+            content = message.content
+            if not isinstance(content, list):
+                continue
+
+            for part in content:
+                if getattr(part, "type", None) in _MULTIMODAL_TYPES:
+                    return _MULTIMODAL_ERROR
+
+        return None
+
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
         if not request.messages:
             return "Messages cannot be empty."
+
+        err = self._reject_multimodal_if_disabled(request)
+        if err:
+            return err
 
         if (
             isinstance(request.tool_choice, str)
@@ -263,7 +292,7 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = reasoning_effort
 
         """Convert OpenAI chat completion request to internal format"""
-        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+        is_multimodal = self._is_multimodal
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
