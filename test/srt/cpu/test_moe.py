@@ -309,7 +309,7 @@ class TestFusedExperts(CustomTestCase):
         for i in range(E):
             packed_weight_13_i, packed_zero_13_i, packed_scales_13_i = (
                 torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                    awq_w13_weight[i], awq_w13_zero[i], awq_w13_scales[i]
+                    awq_w13_weight[i], awq_w13_zero[i], awq_w13_scales[i], 0
                 )
             )
             awq_w13_weight_pack.append(packed_weight_13_i)
@@ -317,7 +317,7 @@ class TestFusedExperts(CustomTestCase):
             awq_w13_scales_pack.append(packed_scales_13_i)
             packed_weight_2_i, packed_zero_2_i, packed_scales_2_i = (
                 torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                    awq_w2_weight[i], awq_w2_zero[i], awq_w2_scales[i]
+                    awq_w2_weight[i], awq_w2_zero[i], awq_w2_scales[i], 0
                 )
             )
             awq_w2_weight_pack.append(packed_weight_2_i)

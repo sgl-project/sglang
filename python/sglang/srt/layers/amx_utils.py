@@ -16,6 +16,11 @@ class CPUQuantMethod(IntEnum):
     INT4_W4A8 = 3
 
 
+class CPUQuantAlgo(IntEnum):
+    AWQ = 0
+    GPTQ = 1
+
+
 def amx_process_weight_after_loading(weight, is_conv=False):
     if weight.device != torch.device("cpu"):
         return weight
@@ -129,7 +134,7 @@ def _amx_process_weight_after_loading(
             qweight_tensor,
             qzeros_tensor,
             scales_tensor,
-            0 if qweight_packed_method is "awq" else 1,
+            CPUQuantAlgo.AWQ if qweight_packed_method == "awq" else CPUQuantAlgo.GPTQ,
         )
         packed_qweight = torch.nn.Parameter(
             qweight.detach(),
