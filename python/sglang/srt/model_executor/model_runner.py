@@ -2864,6 +2864,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        elastic_ep_state = ElasticEPStateManager.instance()
+        if elastic_ep_state is not None:
+            if elastic_ep_state.try_consume_ready_snapshot():
+                if self.eplb_manager is not None:
+                    logging.info("EPLB due to rank faults")
+                    gen = self.eplb_manager.rebalance()
+                    while True:
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            break
+                elastic_ep_state.mark_snapshot_handled()
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
@@ -2876,27 +2888,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            elastic_ep_state = ElasticEPStateManager.instance()
-            if (
-                elastic_ep_state is not None
-                and not elastic_ep_state.is_active_equal_last()
-            ):
-                elastic_ep_state.snapshot_active_to_last()
-                elastic_ep_state.sync_active_to_cpu()
-                logging.info("EPLB due to rank faults")
-                gen = self.eplb_manager.rebalance()
-                while True:
-                    try:
-                        next(gen)
-                    except StopIteration:
-                        break
-                output = self._forward_raw(
-                    forward_batch,
-                    skip_attn_backend_init,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
-                )
+        if elastic_ep_state is not None:
+            elastic_ep_state.submit_active_snapshot()
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache

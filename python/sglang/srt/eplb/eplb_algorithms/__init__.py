@@ -63,9 +63,11 @@ def rebalance_experts(
                 algorithm == EplbAlgorithm.elasticity_aware_hierarchical
             ),
             active_ranks=(
-                ElasticEPStateManager.instance().active_ranks
+                ElasticEPStateManager.instance().active_ranks_cpu
                 if ElasticEPStateManager.instance() is not None
-                else ElasticEPStateManager.healthy_rank_state()
+                else ElasticEPStateManager.healthy_rank_state(
+                    device=torch.device("cpu")
+                )
             ),
         )
 
