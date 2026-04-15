@@ -134,26 +134,41 @@ class PoolStats:
 
 
 class SchedulerRuntimeCheckerMixin:
-    def _alive_streaming_session_count(self: Scheduler) -> int:
+    def _streaming_session_count(self: Scheduler) -> int:
         return sum(
             1
             for session in self.session_controller.sessions.values()
             if session.streaming
         )
 
+    def _active_pool_idxs(self: Scheduler) -> set:
+        """Pool idxs currently owned by reqs in last_batch / running_batch.
+
+        Used to decide which session slots' KV is owned by batch reqs
+        (and thus counted via uncached_size, not session_held).
+        """
+        idxs = set()
+        for batch in [self.last_batch, self.running_batch]:
+            if batch is None or batch.is_empty():
+                continue
+            for req in batch.reqs:
+                if req.req_pool_idx is not None:
+                    idxs.add(req.req_pool_idx)
+        return idxs
+
     def _session_held_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_tokens()
+            return self.tree_cache.session_held_tokens(self._active_pool_idxs())
         return 0
 
     def _session_held_full_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_full_tokens()
+            return self.tree_cache.session_held_full_tokens(self._active_pool_idxs())
         return 0
 
     def _session_held_swa_tokens(self: Scheduler) -> int:
         if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_swa_tokens()
+            return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs())
         return 0
 
     def _session_held_req_count(self: Scheduler) -> int:
@@ -491,7 +506,7 @@ class SchedulerRuntimeCheckerMixin:
             return
 
         self.get_pool_stats().update_scheduler_stats(self.stats)
-        self.stats.num_streaming_sessions = self._alive_streaming_session_count()
+        self.stats.num_streaming_sessions = self._streaming_session_count()
         self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
         priority_enabled = self.enable_priority_scheduling
