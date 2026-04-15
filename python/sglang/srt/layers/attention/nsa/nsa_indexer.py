@@ -219,7 +219,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.bfloat16 if _is_cuda else torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(
@@ -271,9 +271,9 @@ class Indexer(MultiPlatformOp):
             deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
             return out
 
-        if _is_hip:
-            x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
+        if _is_hip:
+            return weights
         return weights.float()
 
     @torch.compile(dynamic=True)
