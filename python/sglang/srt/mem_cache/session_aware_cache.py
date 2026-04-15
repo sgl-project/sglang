@@ -433,6 +433,9 @@ class SessionAwareCache(BasePrefixCache):
     def supports_mamba(self):
         return self.inner.supports_mamba()
 
+    def supports_streaming_session(self):
+        return True
+
     def is_chunk_cache(self):
         return self.inner.is_chunk_cache()
 

@@ -9,7 +9,7 @@ import triton.language as tl
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache, _is_streaming
+from sglang.srt.mem_cache.session_aware_cache import _is_streaming
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
@@ -487,7 +487,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # cache_finished_req below (which also sets req_pool_idx = None).
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
-    is_streaming_session = isinstance(tree_cache, SessionAwareCache) and _is_streaming(
+    is_streaming_session = tree_cache.supports_streaming_session() and _is_streaming(
         req
     )
     is_aborted_streaming = is_streaming_session and isinstance(

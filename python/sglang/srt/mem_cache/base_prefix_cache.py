@@ -256,6 +256,24 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def take_events(self):
         return []
 
+    def supports_streaming_session(self) -> bool:
+        return False
+
+    def release_session(self, session_id: str) -> None:
+        pass
+
+    def session_held_tokens(self, active_pool_idxs=None) -> int:
+        return 0
+
+    def session_held_full_tokens(self, active_pool_idxs=None) -> int:
+        return 0
+
+    def session_held_swa_tokens(self, active_pool_idxs=None) -> int:
+        return 0
+
+    def session_held_req_count(self, active_pool_idxs=None) -> int:
+        return 0
+
     def supports_swa(self) -> bool:
         return False
 

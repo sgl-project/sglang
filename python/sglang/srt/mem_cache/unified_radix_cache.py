@@ -4,7 +4,7 @@ import logging
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
@@ -28,6 +28,11 @@ from sglang.srt.mem_cache.radix_cache import (
     maybe_bigram_convert,
     page_align_keys,
 )
+from sglang.srt.mem_cache.session_aware_cache import (
+    SessionSlot,
+    _is_streaming,
+    _VirtualNode,
+)
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -40,6 +45,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -208,6 +214,12 @@ class UnifiedRadixCache(BasePrefixCache):
             self.key_convert_fn = convert_to_bigram_key
         else:
             self.key_convert_fn = lambda key: key
+        # -- Streaming session state --
+        self.enable_streaming_session: bool = getattr(
+            params, "enable_streaming_session", False
+        )
+        self.slots: Dict[str, SessionSlot] = {}
+
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
@@ -222,8 +234,14 @@ class UnifiedRadixCache(BasePrefixCache):
         self.lru_lists = {
             ct: UnifiedLRUList(ct, self.tree_components) for ct in self.tree_components
         }
+        self.slots.clear()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if self._should_hijack_for_session(params.req):
+            result = self._match_prefix_streaming(params)
+            if result is not None:
+                return result
+
         key = params.key
         key, _ = maybe_bigram_convert(self.is_eagle, key)
         if self.disable or len(key) == 0:
@@ -272,7 +290,9 @@ class UnifiedRadixCache(BasePrefixCache):
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
 
-    def inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
+        if isinstance(node, _VirtualNode):
+            return IncLockRefResult()
         if self.disable:
             return IncLockRefResult()
         result = IncLockRefResult()
@@ -281,8 +301,10 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def dec_lock_ref(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams] = None
+        self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
+        if isinstance(node, _VirtualNode):
+            return DecLockRefResult()
         if self.disable:
             return DecLockRefResult()
         for component in self._components_tuple:
@@ -290,7 +312,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
+        if self._should_hijack_for_session(req):
+            return self._cache_finished_req_streaming(req, is_insert=is_insert)
+
         kv_committed_len = req.pop_committed_kv_cache()
 
         if self.disable:
@@ -359,7 +384,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(self, req: Req, chunked=False, **kwargs) -> None:
+        if self._should_hijack_for_session(req):
+            if chunked:
+                # Chunked prefill for streaming: skip radix insertion,
+                # just snapshot current KV indices as prefix.
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : len(req.fill_ids)
+                ]
+                req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+                return
+            if req.session.session_id in self.slots:
+                # Subsequent turns: slot exists, skip radix entirely.
+                return
+            # First turn (no slot): fall through to normal radix path
+            # for tree insertion, lock management, cache_protected_len updates.
+
         token_ids = req.fill_ids
 
         if self.disable:
@@ -898,6 +938,13 @@ class UnifiedRadixCache(BasePrefixCache):
         """Thorough sanity check: verify LRU membership, lock state, linked-list
         integrity, and evictable sizes for every component.
         Expensive — use only in tests or idle checks."""
+        # Skip sanity check when streaming sessions hold tree locks,
+        # because the check asserts all nodes are unlocked during idle.
+        if self.enable_streaming_session and any(
+            s.is_holding_kv for s in self.slots.values()
+        ):
+            return
+
         try:
             # 1. Collect all nodes from tree
             all_nodes = self._collect_all_nodes()
@@ -984,3 +1031,198 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             for child in node.children.values():
                 stack.append((child, indent + 2))
+
+    # ---- Streaming Session Support ----
+
+    def _should_hijack_for_session(self, req: Any) -> bool:
+        """Return True when this request belongs to a streaming session
+        and the cache has integrated session management enabled.
+        All session-specific fast-paths gate on this single predicate."""
+        return self.enable_streaming_session and _is_streaming(req)
+
+    def supports_streaming_session(self) -> bool:
+        return self.enable_streaming_session
+
+    def _match_prefix_streaming(
+        self, params: MatchPrefixParams
+    ) -> Optional[MatchResult]:
+        """Fast-path for streaming session requests.
+        Returns a MatchResult if the session slot has KV to restore,
+        or None to fall through to the normal radix match."""
+        req = params.req
+        session_id = req.session.session_id
+        slot = self.slots.get(session_id)
+        if slot is None or slot.req_pool_idx is None:
+            return None
+
+        # If the request is destined for abort (e.g. input too long),
+        # do NOT restore the slot's KV state.  set_finish_with_abort
+        # truncates origin_input_ids to [0], so alloc_for_extend would
+        # overwrite the slot's req_to_token row with a 1-token prefix,
+        # destroying the session's accumulated KV mapping.  By skipping
+        # restore, the request gets a fresh pool slot from alloc_for_extend
+        # and the session slot remains untouched.
+        if req.to_finish is not None:
+            return None
+
+        slot.restore_to_req(req)
+
+        # logprob_start_len is already forced to -1 for streaming sessions
+        # (in Req.init_next_round_input), so the prefix key is not truncated
+        # and we can directly reuse the committed KV length.
+        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
+        device_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :prefix_len
+        ].to(dtype=torch.int64)
+
+        return MatchResult(
+            device_indices=device_indices,
+            last_device_node=slot.virtual_node,
+            last_host_node=slot.virtual_node,
+            cache_protected_len=slot.cache_protected_len,
+        )
+
+    def _cache_finished_req_streaming(self, req: Req, is_insert: bool = True) -> None:
+        """Handle cache_finished_req for streaming session requests.
+        Mirrors SessionAwareCache.cache_finished_req."""
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+        session_id = req.session.session_id
+        slot = self.slots.get(session_id)
+        is_first = slot is None
+
+        # When an aborted streaming-session request was scheduled (e.g.
+        # input too long), match_prefix skipped restore_to_req so the
+        # request got a fresh pool slot from alloc_for_extend.  Don't
+        # overwrite the session slot -- free the transient KV and pool slot.
+        if not is_first and isinstance(req.finished_reason, FINISH_ABORT):
+            if req.req_pool_idx is not None:
+                # Free all KV pages allocated for this aborted request.
+                end = req.kv_allocated_len
+                if end > 0:
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :end
+                    ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+                self.req_to_token_pool.free_slots.append(req.req_pool_idx)
+                req.req_pool_idx = None
+            return
+
+        if is_first:
+            slot = SessionSlot()
+            self.slots[session_id] = slot
+
+        # If the session's KV is shrinking (e.g. client sent a shorter
+        # prompt after an abort), free the orphaned tail pages before
+        # save_from_req overwrites the slot's committed length.
+        # Never free tree-protected tokens — those are managed by the tree.
+        if (
+            not is_first
+            and slot.is_holding_kv
+            and req.kv_committed_len < slot.kv_committed_len
+        ):
+            old_end = slot.kv_allocated_len
+            new_end = req.kv_committed_len
+            if self.page_size > 1:
+                new_end = ceil_align(new_end, self.page_size)
+            new_end = max(new_end, slot.cache_protected_len)
+            if new_end < old_end:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    slot.req_pool_idx, new_end:old_end
+                ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+            slot.cache_protected_len = min(
+                slot.cache_protected_len, req.kv_committed_len
+            )
+
+        slot.save_from_req(req, is_first=is_first)
+
+    # ---- Streaming Session Lifecycle ----
+
+    def release_session(self, session_id: str):
+        """Release all KV resources held by a streaming session.
+
+        `slot.last_node` + `slot.cache_protected_len` are trusted directly: radix
+        tree splits mutate TreeNode objects in place (see RadixCache._split_node),
+        so a saved TreeNode reference remains valid and the locked prefix length
+        is unchanged. No rematch needed -- and `match_prefix` here would cause
+        further splits that disturb accounting.
+        """
+        if not self.enable_streaming_session:
+            return
+        slot = self.slots.pop(session_id, None)
+        if slot is None:
+            return
+        protected_len = slot.cache_protected_len
+        lock_node = slot.last_node
+        tokens_freed = (
+            max(0, slot.kv_allocated_len - protected_len) if slot.is_holding_kv else 0
+        )
+        logger.info(
+            "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
+        )
+
+        if lock_node is not None:
+            if slot.swa_uuid_for_lock is not None:
+                self.dec_lock_ref(
+                    lock_node,
+                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
+                )
+            else:
+                self.dec_lock_ref(lock_node)
+
+        if slot.is_holding_kv:
+            start = protected_len
+            end = slot.kv_allocated_len
+            if start < end:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    slot.req_pool_idx, start:end
+                ]
+                self.token_to_kv_pool_allocator.free(kv_indices)
+            self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
+
+    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        """Total KV tokens held by session slots, not tracked by the tree.
+
+        Excludes slots whose KV is currently owned by an owning request —
+        those tokens are counted via uncached_size in the busy mem check.
+        A slot's pool_idx being in active_pool_idxs indicates a req owns it.
+        """
+        total = 0
+        for slot in self.slots.values():
+            in_batch = (
+                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+            )
+            if slot.is_holding_kv and not in_batch:
+                allocated = ceil_align(slot.kv_allocated_len, self.page_size)
+                total += allocated - slot.cache_protected_len
+        return total
+
+    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        """An alias to align the naming style of SWA"""
+        return self.session_held_tokens(active_pool_idxs)
+
+    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        """Total SWA tokens held by session slots, not tracked by the tree."""
+        total = 0
+        for slot in self.slots.values():
+            in_batch = (
+                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+            )
+            if slot.is_holding_kv and not in_batch:
+                allocated = ceil_align(slot.kv_allocated_len, self.page_size)
+                total += allocated - max(
+                    slot.cache_protected_len, slot.swa_evicted_seqlen
+                )
+        return total
+
+    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
+        """Number of req pool slots held by session slots."""
+
+        def _owned(s):
+            in_batch = (
+                active_pool_idxs is not None and s.req_pool_idx in active_pool_idxs
+            )
+            return s.is_holding_kv and not in_batch
+
+        return sum(_owned(s) for s in self.slots.values())
