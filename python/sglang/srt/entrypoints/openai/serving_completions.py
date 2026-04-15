@@ -214,7 +214,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         created = int(time.time())
 
         # State tracking for streaming
-        stream_buffers = {}
+        stream_offsets = {}
         n_prev_tokens = {}
 
         # Usage tracking
@@ -249,9 +249,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
-                stream_buffer = stream_buffers.get(index, "")
+                is_first_chunk = index not in stream_offsets
+                offset = stream_offsets.get(index, 0)
                 # Handle echo for first chunk
-                if not stream_buffer:  # The first chunk
+                if is_first_chunk:  # The first chunk
                     if request.echo:
                         echo_text = self._get_echo_text(request, index)
                         text = echo_text + text
@@ -260,7 +261,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = None
                 if request.logprobs is not None:
                     # The first chunk and echo is enabled.
-                    if not stream_buffer and request.echo:
+                    if is_first_chunk and request.echo:
                         input_token_logprobs = content["meta_info"][
                             "input_token_logprobs"
                         ]
@@ -277,21 +278,32 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         n_prev_token < total_output_logprobs
                         or input_token_logprobs is not None
                     ):
+                        output_token_logprobs = content["meta_info"][
+                            "output_token_logprobs"
+                        ]
+                        output_top_logprobs = content["meta_info"].get(
+                            "output_top_logprobs", []
+                        )
+                        if (
+                            not self.tokenizer_manager.server_args.incremental_streaming_output
+                        ):
+                            output_token_logprobs = output_token_logprobs[
+                                n_prev_token:total_output_logprobs
+                            ]
+                            output_top_logprobs = output_top_logprobs[
+                                n_prev_token:total_output_logprobs
+                            ]
                         logprobs = to_openai_style_logprobs(
                             input_token_logprobs=input_token_logprobs,
                             input_top_logprobs=input_top_logprobs,
-                            output_token_logprobs=content["meta_info"][
-                                "output_token_logprobs"
-                            ][n_prev_token:total_output_logprobs],
-                            output_top_logprobs=content["meta_info"].get(
-                                "output_top_logprobs", []
-                            )[n_prev_token:total_output_logprobs],
+                            output_token_logprobs=output_token_logprobs,
+                            output_top_logprobs=output_top_logprobs,
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
                 # Generate delta
-                delta = text[len(stream_buffer) :]
-                stream_buffers[index] = stream_buffer + delta
+                delta = text[offset:]
+                stream_offsets[index] = len(content["text"])
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 

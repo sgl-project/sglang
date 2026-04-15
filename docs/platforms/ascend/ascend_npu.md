@@ -6,7 +6,7 @@ You can install SGLang using any of the methods below. Please go through `System
 ## Component Version Mapping For SGLang
 | Component         | Version                 | Obtain Way                                                                                                                                                                                                                   |
 |-------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| HDK               | 25.3.RC1                  | [link](https://www.hiascend.com/hardware/firmware-drivers/commercial?product=7&model=33) |
+| HDK               | 25.5.2                  | [link](https://www.hiascend.com/hardware/firmware-drivers/commercial?product=7&model=33) |
 | CANN              | 8.5.0                     | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
 | Pytorch Adapter   | 7.3.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
 | MemFabric         | 1.0.5                   | `pip install memfabric-hybrid==1.0.5`                                                                                                                                                                 |
@@ -38,7 +38,7 @@ conda activate sglang_npu
 
 #### CANN
 
-Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC2 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.5.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
 
 #### MemFabric-Hybrid
 
@@ -53,7 +53,7 @@ pip install memfabric-hybrid==1.0.5
 ```shell
 PYTORCH_VERSION=2.8.0
 TORCHVISION_VERSION=0.23.0
-TORCH_NPU_VERSION=2.8.0
+TORCH_NPU_VERSION=2.8.0.post2
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 pip install torch_npu==$TORCH_NPU_VERSION
 ```
@@ -74,6 +74,17 @@ We provide SGL kernels for Ascend NPU, check [installation guide](https://github
 
 #### DeepEP-compatible Library
 We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+
+#### Some other dependencies
+
+```shell
+# libGL
+apt update
+apt install libgl1 libglib2.0-0
+
+# ensure setuptools contains pkg_resources module
+pip install "setuptools<80"
+```
 
 #### Installing SGLang from source
 
@@ -104,7 +115,8 @@ cd sglang/docker
 
 # Build the docker image
 # If there are network errors, please modify the Dockerfile to use offline dependencies or use a proxy
-docker build -t <image_name> -f npu.Dockerfile .
+# <arch_tag> is the target architecture of the image, e.g. amd64, arm64
+docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
 ```
 
 #### Create Docker
