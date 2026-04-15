@@ -2658,6 +2658,19 @@ def _get_processor_wrapper(server_args):
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
         )
+    except ImportError:
+        # Some models (e.g. Eagle2.5-VL) lack a fast image processor.
+        logger.info(
+            f"Fast image processor for {server_args.tokenizer_path} failed to import. "
+            f"Falling back to slow version"
+        )
+        processor = get_processor(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            use_fast=False,
+        )
     except ValueError as e:
         error_message = str(e)
         if "does not have a slow version" in error_message:

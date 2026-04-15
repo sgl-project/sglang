@@ -21,13 +21,13 @@ import tempfile
 import warnings
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 # Compatibility shim: flash-attn-4 registers a bare ``flash_attn`` namespace
 # that makes ``is_flash_attn_2_available()`` return True, but lacks the v2 API
@@ -71,6 +71,7 @@ from sglang.srt.configs import (
     DeepseekVL2Config,
     DotsOCRConfig,
     DotsVLMConfig,
+    Eagle2_5_VLConfig,
     ExaoneConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
@@ -104,6 +105,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DbrxConfig,
     ExaoneConfig,
     DeepseekVL2Config,
+    Eagle2_5_VLConfig,
     MultiModalityConfig,
     KimiVLConfig,
     InternVLChatConfig,
@@ -489,9 +491,6 @@ def get_config(
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
-    if is_runai_obj_uri(model):
-        model = ObjectStorageModel.get_path(model)
-
     if is_remote_url(model):
         # BaseConnector implements __del__() to clean up the local dir.
         # Since config files need to exist all the time, so we DO NOT use
@@ -742,57 +741,6 @@ class TokenizerWarningsFilter(logging.Filter):
         return "Calling super().encode with" not in record.getMessage()
 
 
-_is_base_mistral_patched = False
-
-# transformers version where _patch_mistral_regex calls model_info() on every tokenizer load
-_TRANSFORMERS_PATCHED_VERSION = "5.3.0"
-
-
-def _patch_is_base_mistral_in_ci():
-    """Patch transformers' _patch_mistral_regex to avoid HF API calls in CI.
-
-    transformers defines is_base_mistral as a local function inside
-    _patch_mistral_regex, so it cannot be patched via module attribute.
-    Instead we replace the entire _patch_mistral_regex classmethod with a
-    version that simply returns the tokenizer unchanged.
-
-    In CI this prevents exhausting the 3000 req/5min HF API rate limit.
-    """
-    global _is_base_mistral_patched
-    if _is_base_mistral_patched:
-        return
-
-    from sglang.srt.environ import envs
-
-    if not envs.SGLANG_IS_IN_CI.get():
-        return
-
-    import transformers
-
-    if transformers.__version__ != _TRANSFORMERS_PATCHED_VERSION:
-        logger.warning(
-            "transformers version changed to %s (expected %s), "
-            "_patch_mistral_regex patch skipped — may need update if 429 errors recur",
-            transformers.__version__,
-            _TRANSFORMERS_PATCHED_VERSION,
-        )
-        _is_base_mistral_patched = True  # don't warn repeatedly
-        return
-
-    from transformers import PreTrainedTokenizerFast
-
-    if hasattr(PreTrainedTokenizerFast, "_patch_mistral_regex"):
-
-        @classmethod
-        def _noop_patch_mistral_regex(cls, tokenizer, *args, **kwargs):
-            return tokenizer
-
-        PreTrainedTokenizerFast._patch_mistral_regex = _noop_patch_mistral_regex
-        logger.info("CI: patched _patch_mistral_regex to skip HF API calls")
-
-    _is_base_mistral_patched = True
-
-
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -828,9 +776,6 @@ def get_tokenizer(
         kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
 
-    if is_runai_obj_uri(tokenizer_name):
-        tokenizer_name = ObjectStorageModel.get_path(tokenizer_name)
-
     if is_remote_url(tokenizer_name):
         # BaseConnector implements __del__() to clean up the local dir.
         # Since config files need to exist all the time, so we DO NOT use
@@ -838,8 +783,6 @@ def get_tokenizer(
         client = create_remote_connector(tokenizer_name)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         tokenizer_name = client.get_local_dir()
-
-    _patch_is_base_mistral_in_ci()
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -863,25 +806,9 @@ def get_tokenizer(
         )
         raise RuntimeError(err_msg) from e
     except ValueError as e:
-        # MistralCommon tokenizers reject standard HF kwargs like
-        # trust_remote_code, use_fast etc. Retry without them.
-        if "are not supported by" in str(e) and "MistralCommon" in str(e):
-            for k in (
-                "trust_remote_code",
-                "tokenizer_revision",
-                "use_fast",
-                "_from_auto",
-                "clean_up_tokenization_spaces",
-            ):
-                kwargs.pop(k, None)
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_name,
-                *args,
-                **kwargs,
-            )
         # If the error pertains to the tokenizer class not existing or not
         # currently being imported, suggest using the --trust-remote-code flag.
-        elif not trust_remote_code and (
+        if not trust_remote_code and (
             "does not exist or is not currently imported." in str(e)
             or "requires you to execute the tokenizer file" in str(e)
         ):
@@ -899,6 +826,11 @@ def get_tokenizer(
     # when trust_remote_code=False and the model requires a custom tokenizer.
     # Detect this and auto-retry with trust_remote_code=True.
     if not trust_remote_code and type(tokenizer).__name__ == "TokenizersBackend":
+        logger.info(
+            "Detected generic TokenizersBackend for %s, "
+            "retrying with trust_remote_code=True",
+            tokenizer_name,
+        )
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
             *args,
@@ -917,7 +849,6 @@ def get_tokenizer(
             "slowdown. Consider using a fast tokenizer instead."
         )
 
-    _patch_mistral_common_tokenizer(tokenizer)
     _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     tokenizer = patch_tokenizer(tokenizer)
@@ -1051,15 +982,6 @@ def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
         if config_val is None:
             # Key missing or null → use v4 default for this tokenizer class
             config_val = _V4_DEFAULTS.get(attr, False)
-        # Fast tokenizers in v4 used tokenizer.json post-processor for EOS —
-        # the add_eos_token Python attribute was set but the post-processor
-        # came from tokenizer.json, not from the attribute. In v5, the flag is
-        # stripped and both sglang and HF reference end up with add_eos_token=False.
-        # Restoring add_eos_token for fast tokenizers makes sglang diverge from
-        # the HF reference (which doesn't restore it), breaking embedding models
-        # like intfloat/e5-mistral-7b-instruct (cosine similarity drops to ~0.33).
-        if attr == "add_eos_token" and isinstance(tokenizer, PreTrainedTokenizerFast):
-            config_val = _V4_DEFAULTS["add_eos_token"]  # False
         current_val = getattr(tokenizer, attr, None)
         if current_val != config_val:
             logger.info(
@@ -1223,6 +1145,48 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _should_build_local_eagle2_5_processor(config, exc: Exception) -> bool:
+    if getattr(config, "model_type", None) != "eagle_2_5_vl":
+        return False
+
+    message = str(exc)
+    return any(
+        marker in message
+        for marker in (
+            "DefaultFastImageProcessorKwargs",
+            "image_processing_eagle2_5_vl_fast",
+            "does not have a slow version",
+        )
+    )
+
+
+def _build_local_eagle2_5_processor(
+    model_path: str,
+    *,
+    tokenizer_mode: str,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    use_fast: Optional[bool],
+    config,
+):
+    # Eagle2.5-VL uses SGLang's local multimodal processor path. The remote HF
+    # image processor only supplies config-like defaults, so a light shim is
+    # sufficient when the dynamic module is incompatible with local transformers.
+    tokenizer = get_tokenizer(
+        model_path,
+        tokenizer_mode=tokenizer_mode,
+        trust_remote_code=trust_remote_code,
+        tokenizer_revision=revision,
+        use_fast=use_fast,
+    )
+    image_processor = SimpleNamespace(
+        min_dynamic_tiles=getattr(config, "min_dynamic_tiles", 1),
+        max_dynamic_tiles=getattr(config, "max_dynamic_tiles", 6),
+        use_thumbnail=bool(getattr(config, "use_thumbnail", False)),
+    )
+    return SimpleNamespace(tokenizer=tokenizer, image_processor=image_processor)
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -1298,34 +1262,52 @@ def get_processor(
 
     except ValueError as e:
         error_message = str(e)
-        if "does not have a slow version" in error_message:
+        if _should_build_local_eagle2_5_processor(config, e):
+            logger.warning(
+                "Falling back to local Eagle2.5-VL processor for %s due to "
+                "transformers/HF processor incompatibility: %s",
+                tokenizer_name,
+                error_message,
+            )
+            processor = _build_local_eagle2_5_processor(
+                tokenizer_name,
+                tokenizer_mode=tokenizer_mode,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                use_fast=use_fast,
+                config=config,
+            )
+        elif "does not have a slow version" in error_message:
             logger.info(
                 f"Processor {tokenizer_name} does not have a slow version. Automatically use fast version"
             )
             kwargs["use_fast"] = True
-            processor = AutoProcessor.from_pretrained(
-                tokenizer_name,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
-        elif (
-            "are not supported by" in error_message and "MistralCommon" in error_message
-        ):
-            logger.info(
-                "AutoProcessor for %s rejected standard kwargs, "
-                "retrying without trust_remote_code/use_fast",
-                tokenizer_name,
-            )
-            kwargs.pop("use_fast", None)
-            kwargs.pop("_from_auto", None)
-            processor = AutoProcessor.from_pretrained(
-                tokenizer_name,
-                *args,
-                revision=revision,
-                **kwargs,
-            )
+            try:
+                processor = AutoProcessor.from_pretrained(
+                    tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            except Exception as retry_error:
+                if _should_build_local_eagle2_5_processor(config, retry_error):
+                    logger.warning(
+                        "Falling back to local Eagle2.5-VL processor for %s after "
+                        "fast retry failed: %s",
+                        tokenizer_name,
+                        retry_error,
+                    )
+                    processor = _build_local_eagle2_5_processor(
+                        tokenizer_name,
+                        tokenizer_mode=tokenizer_mode,
+                        trust_remote_code=trust_remote_code,
+                        revision=revision,
+                        use_fast=True,
+                        config=config,
+                    )
+                else:
+                    raise
         elif "Unrecognized feature extractor" in error_message:
             logger.info(
                 "AutoProcessor failed on feature extractor for %s, "
@@ -1341,6 +1323,24 @@ def get_processor(
             )
         else:
             raise e
+    except ImportError as e:
+        if _should_build_local_eagle2_5_processor(config, e):
+            logger.warning(
+                "Falling back to local Eagle2.5-VL processor for %s due to "
+                "remote import failure: %s",
+                tokenizer_name,
+                e,
+            )
+            processor = _build_local_eagle2_5_processor(
+                tokenizer_name,
+                tokenizer_mode=tokenizer_mode,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                use_fast=use_fast,
+                config=config,
+            )
+        else:
+            raise
     # If processor is a bare tokenizer (e.g. Mistral-Small-4 has no processor_config.json)
     # and the model is a vision model (pixtral), wrap it in a proper PixtralProcessor
     # so that image data is actually processed through the image processor.
@@ -1374,7 +1374,6 @@ def get_processor(
         )
 
     tokenizer = get_tokenizer_from_processor(processor)
-    _patch_mistral_common_tokenizer(tokenizer)
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(
@@ -1399,86 +1398,6 @@ def attach_additional_stop_token_ids(tokenizer):
         )
     else:
         tokenizer.additional_stop_token_ids = None
-
-
-def _patch_mistral_common_tokenizer(tokenizer):
-    """Patch MistralCommonTokenizer/Backend to be compatible with HF tokenizer API.
-
-    MistralCommon tokenizers (used by Voxtral, Pixtral, etc.) reject several
-    standard kwargs and lack some attributes that sglang expects.  We wrap the
-    offending methods once at load time so that the rest of the codebase does
-    not need any special-casing.
-    """
-    cls_name = type(tokenizer).__name__
-    if "MistralCommon" not in cls_name:
-        return tokenizer
-    if getattr(tokenizer, "_mistral_common_patched", False):
-        return tokenizer
-    tokenizer._mistral_common_patched = True
-
-    # Missing attributes
-    if not hasattr(tokenizer, "get_added_vocab"):
-        tokenizer.get_added_vocab = lambda: {}
-
-    # Set a chat_template containing "audio" so that sglang's content format
-    # detector returns "openai" (which preserves audio_url extraction).
-    # The actual template rendering is done by MistralCommon's apply_chat_template.
-    if not hasattr(tokenizer, "chat_template") or tokenizer.chat_template is None:
-        tokenizer.chat_template = "<!-- audio/image multimodal -->"
-
-    # convert_tokens_to_ids asserts on multi-token strings
-    _orig_convert = tokenizer.convert_tokens_to_ids
-
-    def _safe_convert(val):
-        try:
-            return _orig_convert(val)
-        except AssertionError:
-            return getattr(tokenizer, "unk_token_id", None)
-
-    tokenizer.convert_tokens_to_ids = _safe_convert
-
-    # Wrap methods that reject certain kwargs
-    def _drop_kwargs(fn, keys):
-        def wrapper(*args, **kwargs):
-            for k in keys:
-                kwargs.pop(k, None)
-            return fn(*args, **kwargs)
-
-        return wrapper
-
-    tokenizer.decode = _drop_kwargs(tokenizer.decode, ["spaces_between_special_tokens"])
-    tokenizer.batch_decode = _drop_kwargs(
-        tokenizer.batch_decode, ["spaces_between_special_tokens"]
-    )
-
-    # Save original apply_chat_template for processors that need it (e.g. Voxtral)
-    tokenizer._orig_apply_chat_template = tokenizer.apply_chat_template
-
-    def _safe_apply_chat_template(messages, **kwargs):
-        """Wrapper that strips unsupported kwargs and non-text content parts.
-
-        When sglang extracts audio/image URLs, it replaces content blocks with
-        {"type": "audio"} or {"type": "image"} (no URL).  MistralCommon fails
-        on these stripped blocks.  We convert them to text-only messages.
-        """
-        kwargs.pop("add_generation_prompt", None)
-        cleaned = []
-        for msg in messages:
-            if isinstance(msg, dict):
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    text_parts = [
-                        p.get("text", "")
-                        for p in content
-                        if isinstance(p, dict) and p.get("type") == "text"
-                    ]
-                    msg = {**msg, "content": " ".join(text_parts) if text_parts else ""}
-                cleaned.append(msg)
-            else:
-                cleaned.append(msg)
-        return tokenizer._orig_apply_chat_template(cleaned, **kwargs)
-
-    tokenizer.apply_chat_template = _safe_apply_chat_template
 
 
 def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
