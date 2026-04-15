@@ -5159,7 +5159,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SUFFIX"],
+            choices=[
+                "DFLASH",
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "NGRAM",
+                "SUFFIX",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(
