@@ -1,17 +1,15 @@
 [build-system]
 requires = [
+  "setuptools>=75.0",
   "scikit-build-core>=0.10",
   "torch>=2.8.0",
   "wheel",
 ]
-build-backend = "scikit_build_core.build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-kernel"
 version = "0.4.1"
-authors = [
-  { name="SGLang Kernel Team", email="sglang@lmsys.org" },
-]
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,11 +30,3 @@ exclude = [
   "dist*",
   "tests*",
 ]
-
-[tool.scikit-build]
-cmake.build-type = "Release"
-minimum-version = "build-system.requires"
-
-wheel.py-api = "cp310"
-wheel.license-files = []
-wheel.packages = ["python/sgl_kernel"]
