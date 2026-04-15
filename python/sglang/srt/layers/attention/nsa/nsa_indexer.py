@@ -276,6 +276,7 @@ class Indexer(MultiPlatformOp):
 
         weights, _ = self.weights_proj(x)
         if _is_hip:
+            # Return bf16; multiplying with q_scale promotes back to fp32.
             return weights
         return weights.float()
 
@@ -1035,6 +1036,8 @@ class Indexer(MultiPlatformOp):
             buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=layer_id
             )
+            # Reshape from (num_pages, 132) uint8 to (num_pages, 1, 132) fp8
+            # to match kernel's (num_blocks, block_size, head_dim + scale_bytes) layout
             kv_cache = buf.unsqueeze(1).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
