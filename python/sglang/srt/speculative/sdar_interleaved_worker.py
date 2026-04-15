@@ -871,63 +871,69 @@ class SDARInterleavedWorker:
         Run both models with the accepted block tokens to permanently store their KV.
         Uses TARGET_VERIFY mode WITHOUT backup/restore so the KV cache persists.
         Also updates req_to_token_pool for the committed block.
+
+        NOTE: target and draft share the SAME token_to_kv_pool_allocator and
+        req_to_token_pool (allocated once in StandaloneWorker.__init__).  We must
+        allocate and register the KV slots exactly ONCE; both models then write
+        their own KV tensors into their respective token_to_kv_pool buffers at
+        the same slot indices.
         """
         bs = batch.batch_size()
         block_size = self.block_size
 
-        for model_runner in (
-            self.target_worker.model_runner,
-            self.draft_model_runner,
-        ):
-            allocator = model_runner.token_to_kv_pool_allocator
-            seq_lens = batch.seq_lens.to(torch.int32)
-            end_lens = seq_lens + block_size
+        # Use the shared allocator / req_to_token_pool (both models point to the same object)
+        shared_runner = self.target_worker.model_runner
+        allocator = shared_runner.token_to_kv_pool_allocator
+        seq_lens = batch.seq_lens.to(torch.int32)
+        end_lens = seq_lens + block_size
 
-            if self.page_size == 1:
-                cache_loc = allocator.alloc(bs * block_size)
-            else:
-                seq_lens_cpu = seq_lens.to("cpu", dtype=torch.int32)
-                end_lens_cpu = seq_lens_cpu + block_size
-                last_loc = get_last_loc(
-                    model_runner.req_to_token_pool.req_to_token,
-                    batch.req_pool_indices,
-                    seq_lens,
-                )
-                cache_loc = alloc_paged_token_slots_extend(
-                    batch.tree_cache,
-                    seq_lens,
-                    seq_lens_cpu,
-                    end_lens,
-                    end_lens_cpu,
-                    last_loc,
-                    bs * block_size,
-                )
-
-            if cache_loc is None:
-                raise RuntimeError(
-                    "SDARInterleavedWorker: OOM during block commit KV allocation"
-                )
-
-            # Permanently register in req_to_token_pool
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                model_runner.req_to_token_pool.req_to_token,
-                seq_lens,
-                end_lens,
-                cache_loc,
-                bs,
-            )
-
-            spec_info = DFlashVerifyInput(
-                draft_token=block_tokens.reshape(-1),
-                positions=block_positions.reshape(-1),
-                draft_token_num=block_size,
-                custom_mask=None,
-            )
-
-            seq_lens_sum = int(seq_lens.sum().item())
+        if self.page_size == 1:
+            cache_loc = allocator.alloc(bs * block_size)
+        else:
             seq_lens_cpu = seq_lens.to("cpu", dtype=torch.int32)
+            end_lens_cpu = seq_lens_cpu + block_size
+            last_loc = get_last_loc(
+                shared_runner.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                seq_lens,
+            )
+            cache_loc = alloc_paged_token_slots_extend(
+                batch.tree_cache,
+                seq_lens,
+                seq_lens_cpu,
+                end_lens,
+                end_lens_cpu,
+                last_loc,
+                bs * block_size,
+            )
 
+        if cache_loc is None:
+            raise RuntimeError(
+                "SDARInterleavedWorker: OOM during block commit KV allocation"
+            )
+
+        # Register slots in req_to_token_pool once (shared by both models)
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            shared_runner.req_to_token_pool.req_to_token,
+            seq_lens,
+            end_lens,
+            cache_loc,
+            bs,
+        )
+
+        seq_lens_sum = int(seq_lens.sum().item())
+        seq_lens_cpu = seq_lens.to("cpu", dtype=torch.int32)
+        spec_info = DFlashVerifyInput(
+            draft_token=block_tokens.reshape(-1),
+            positions=block_positions.reshape(-1),
+            draft_token_num=block_size,
+            custom_mask=None,
+        )
+
+        # Run both models with the same cache_loc slots; each model writes its own
+        # KV tensors into its own token_to_kv_pool buffer at those indices.
+        for model_runner in (self.target_worker.model_runner, self.draft_model_runner):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
