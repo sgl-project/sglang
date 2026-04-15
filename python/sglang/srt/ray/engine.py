@@ -124,28 +124,24 @@ class RayEngine(Engine):
                 f"Use {gpus_per_node} GPUs/node, world_size={world_size}"
             )
 
-            dist_init_addr = (
-                f"{rank0_node_ip}:{server_args.port + ZMQ_TCP_PORT_DELTA}"
-            )
+            dist_init_addr = f"{rank0_node_ip}:{server_args.port + ZMQ_TCP_PORT_DELTA}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
 
             scheduler_actors = []
 
             for node_idx in range(nnodes):
                 bundle_idx = bundle_for_node[node_idx]
-                pp_range, tp_range, pp_per_node, tp_per_node = (
-                    _calculate_rank_ranges(
-                        nnodes,
-                        server_args.pp_size,
-                        server_args.tp_size,
-                        node_rank=node_idx,
-                    )
+                pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
+                    nnodes,
+                    server_args.pp_size,
+                    server_args.tp_size,
+                    node_rank=node_idx,
                 )
                 for pp_rank in pp_range:
                     for tp_rank in tp_range:
-                        local_gpu_idx = (
-                            pp_rank % pp_per_node
-                        ) * tp_per_node + (tp_rank % tp_per_node)
+                        local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
+                            tp_rank % tp_per_node
+                        )
 
                         attn_cp_rank, moe_dp_rank, moe_ep_rank = (
                             _compute_parallelism_ranks(server_args, tp_rank)
@@ -182,12 +178,8 @@ class RayEngine(Engine):
                     try:
                         ray.kill(actor)
                     except Exception:
-                        logger.error(
-                            f"Failed to kill Ray scheduler actor: {actor}"
-                        )
-                raise RuntimeError(
-                    f"Scheduler actor failed to initialize: {e}"
-                )
+                        logger.error(f"Failed to kill Ray scheduler actor: {actor}")
+                raise RuntimeError(f"Scheduler actor failed to initialize: {e}")
 
             event_loop_refs = [
                 actor.run_event_loop.remote() for actor in scheduler_actors
@@ -197,9 +189,7 @@ class RayEngine(Engine):
                 try:
                     ray.get(event_loop_refs)
                 except Exception as e:
-                    logger.error(
-                        f"Ray scheduler actor terminated with error: {e}"
-                    )
+                    logger.error(f"Ray scheduler actor terminated with error: {e}")
 
             return (
                 RaySchedulerInitResult(

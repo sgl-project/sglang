@@ -93,9 +93,7 @@ class RayDataParallelController(DataParallelController):
 
         # Create actors for each DP rank sequentially
         for dp_rank in range(server_args.dp_size):
-            self._launch_ray_tp_group(
-                server_args, dp_port_args_list[dp_rank], dp_rank
-            )
+            self._launch_ray_tp_group(server_args, dp_port_args_list[dp_rank], dp_rank)
 
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
@@ -168,24 +166,20 @@ class RayDataParallelController(DataParallelController):
                         rank_port_args.detokenizer_ipc_name = (
                             port_args.detokenizer_ipc_name
                         )
-                        rank_port_args.tokenizer_ipc_name = (
-                            port_args.tokenizer_ipc_name
-                        )
+                        rank_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
                     local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
                         tp_rank % tp_per_node
                     )
 
-                    attn_cp_rank, moe_dp_rank, moe_ep_rank = (
-                        _compute_parallelism_ranks(server_args, tp_rank)
+                    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
+                        server_args, tp_rank
                     )
 
                     # Each DP group needs a unique dist_init_addr for its own
                     # torch.distributed process group. Use nccl_port which is
                     # unique per DP group (regular DP) or shared (DP attention).
-                    dist_init_addr = (
-                        f"{self.rank0_node_ip}:{rank_port_args.nccl_port}"
-                    )
+                    dist_init_addr = f"{self.rank0_node_ip}:{rank_port_args.nccl_port}"
 
                     actor = SchedulerActor.options(
                         num_cpus=0,
