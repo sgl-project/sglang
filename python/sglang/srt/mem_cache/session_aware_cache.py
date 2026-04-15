@@ -193,10 +193,25 @@ class SessionAwareCache(BasePrefixCache):
 
         slot.restore_to_req(req)
 
-        # logprob_start_len is already forced to -1 for streaming sessions
-        # (in Req.init_next_round_input), so the prefix key is not truncated
-        # and we can directly reuse the committed KV length.
-        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
+        # token_ids = fill_ids[:input_len-1] (1-token logit reserve already
+        # applied). min handles retract retry where committed_len can
+        # exceed len(token_ids) by 1.
+        prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
+
+        # Streaming sessions are append-only (session_controller rollback
+        # ensures req_nodes always points to the last successful req).
+        assert prefix_len >= slot.cache_protected_len, (
+            f"streaming session prefix shrank: {prefix_len=} < "
+            f"{slot.cache_protected_len=}"
+        )
+
+        # Free orphaned tail: alloc_for_extend will overwrite
+        # req_to_token[prefix_len:] with new indices. The range
+        # [prefix_len, kv_allocated_len) has stale indices from the
+        # previous turn's decode (e.g. alloc-commit gap on retract,
+        # or speculative draft tokens).
+        self._free_tail(slot, req, prefix_len)
+
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
@@ -255,6 +270,33 @@ class SessionAwareCache(BasePrefixCache):
 
         self._mark_kv_freed(req)
 
+    def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int):
+        """Free KV in [prefix_len, kv_allocated_len) before the next
+        alloc_for_extend overwrites it. The gap appears when spec
+        decoding pushes allocated above committed, or when retract
+        retry's logit-reserve pulls prefix_len below committed.
+        Free start is ceil-aligned to page_size: PagedTokenToKVPoolAllocator
+        frees by whole pages, so partial-page free would corrupt pages
+        still holding committed tokens; the gap stays attached until
+        release_session.
+        """
+        if prefix_len >= slot.kv_allocated_len:
+            return
+        free_start = prefix_len
+        if self.page_size > 1:
+            free_start = ceil_align(free_start, self.page_size)
+        if free_start < slot.kv_allocated_len:
+            tail_indices = self.req_to_token_pool.req_to_token[
+                slot.req_pool_idx, free_start : slot.kv_allocated_len
+            ]
+            self.token_to_kv_pool_allocator.free(tail_indices)
+        slot.kv_allocated_len = prefix_len
+        slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
+        slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, prefix_len)
+        req.kv_allocated_len = prefix_len
+        req.kv_committed_len = min(req.kv_committed_len, prefix_len)
+        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
+
     @staticmethod
     def _mark_kv_freed(req: Req):
         """Set bookkeeping flags so busy check skips this finished req."""
@@ -298,14 +340,7 @@ class SessionAwareCache(BasePrefixCache):
     # -- Session lifecycle --
 
     def release_session(self, session_id: str):
-        """Release all KV resources held by a streaming session.
-
-        `slot.last_node` + `slot.cache_protected_len` are trusted directly: radix
-        tree splits mutate TreeNode objects in place (see RadixCache._split_node),
-        so a saved TreeNode reference remains valid and the locked prefix length
-        is unchanged. No rematch needed -- and `match_prefix` here would cause
-        further splits that disturb accounting.
-        """
+        """Release all KV resources held by a streaming session."""
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
