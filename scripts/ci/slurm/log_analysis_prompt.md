@@ -94,9 +94,50 @@ Write markdown with this structure:
 ### Noise
 - warnings that were not causal
 
+### Suspect PRs (sglang)
+- PR #NNNN: "<title>" — reason this could be related
+(only if the failure may originate in sglang)
+
 ### Recommended Fix
 ...
 ```
 
 Keep the report concrete. Avoid generic summaries. If you are unsure, say so
 and explain what evidence is missing.
+
+## Filing Issues
+
+After completing your analysis, if the root cause is actionable and clearly
+attributable to a specific repo, open a GitHub issue using `gh issue create`.
+
+**Rules:**
+- Only file an issue if you have concrete evidence (specific error, file, line).
+  Do NOT file issues for flaky infra, transient timeouts, or unclear failures.
+- One issue per root cause. Do not create duplicates — search existing issues
+  first with `gh issue list --repo <repo> --search "<keywords>"`.
+- File against the correct repo:
+  - **`NVIDIA/srt-slurm`**: orchestration bugs, config handling, srtctl behavior,
+    recipe/YAML issues, incorrect flags or environment variables being passed to
+    workers, worker launch failures caused by srt-slurm itself.
+  - **`sgl-project/sglang`**: Do NOT auto-file issues here. Instead, use `gh` to
+    review recent commits from the past day on the sglang repo:
+    ```
+    gh api repos/sgl-project/sglang/commits?since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)&per_page=50
+    ```
+    Identify any commits/PRs that could plausibly have caused the failure based
+    on the files changed and the error you found. List these as "Suspect PRs" in
+    the report with links and a brief explanation of why each is suspicious. Let
+    the human decide whether to follow up.
+- Use this format for srt-slurm issues:
+  ```
+  gh issue create --repo NVIDIA/srt-slurm \
+    --title "<concise title>" \
+    --body "<body>"
+  ```
+- The issue body should include:
+  - A short summary of the failure
+  - The exact error message and which log file it came from
+  - The job ID and relevant config (model, flags, etc.)
+- Do NOT include API keys, tokens, or secrets in the issue.
+- If you are unsure which repo to file against, or if the failure is ambiguous,
+  do NOT file an issue. Just note it in the report.
