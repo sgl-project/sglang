@@ -80,24 +80,46 @@ Eager mode and dynamic shapes also work because no GPU→CPU sync of tensor
 contents is needed. The output `expert_to_group_buf` is filled with a constant
 in-place — same tensor, fixed shape.
 
-### Short-circuit in the layer
+### Short-circuit in the layer (post-mask aware)
 
 Update `HeterFusedMoE.forward` in `python/sglang/srt/layers/moe/heter_moe.py`
-so that a group whose dispatch contains *no live slots* is skipped entirely
-(no kernel call). The check is a single host-side comparison on
-`token_selected_experts.shape[0]` against the policy's `threshold` when the
-active policy is `batch_size`; for other policies it is a no-op.
+so that a group with *no live slots* is skipped entirely (no kernel call).
+"Live" must be evaluated **after** `int4_only_mask` is applied, because that
+mask can force experts back into the INT4 group even when the gate sent them
+to BF16. The check stays host-side (no GPU→CPU sync) because both inputs to
+the decision are static per-layer (mask) or shape-based (batch size).
 
-Concretely, expose an optional `should_skip_group(group_idx, num_tokens)` hook
-on `HeterDispatchPolicy` that returns `False` by default. Subclasses can
-override:
+Concretely, expose an optional
+`should_skip_group(group_idx, num_tokens)` hook on `HeterDispatchPolicy`,
+returning `False` by default. The hook's contract: "given this batch size,
+will the *post-mask* dispatch for this group be empty?".
+
+`BatchSizeGatedHeterDispatch` knows enough at init time to answer this. The
+base class already passes `int4_only_mask` into every policy; the new policy
+caches one Python bool from it:
 
 ```python
 class BatchSizeGatedHeterDispatch(HeterDispatchPolicy):
+    def __init__(self, ..., threshold=128, ...):
+        super().__init__(...)
+        self._threshold = threshold
+        self._bf16_group_idx = (1 - self._int4_group_idx)  # binary policy
+        # Static per-layer fact: do any experts live in the INT4-only mask?
+        self._has_int4_only = (
+            int4_only_mask is not None and bool(int4_only_mask.any().item())
+        )
+
     def should_skip_group(self, group_idx, num_tokens):
         if num_tokens >= self._threshold:
-            return group_idx == self._int4_group_idx
-        return group_idx == self._bf16_group_idx
+            # Gate puts everyone in BF16. Only INT4 experts left
+            # are those forced by int4_only_mask.
+            if group_idx == self._int4_group_idx:
+                return not self._has_int4_only
+            return False
+        else:
+            # Gate puts everyone in INT4. BF16 group is empty,
+            # int4_only_mask is a no-op (already INT4).
+            return group_idx == self._bf16_group_idx
 ```
 
 In `forward`:
@@ -110,12 +132,25 @@ for group_idx, gcfg in enumerate(self.group_cfgs):
     # ... existing per-group dispatch
 ```
 
-This avoids the cost of an all-sentinel kernel call on the off-precision side.
-The behavior is unchanged for every other policy (their `should_skip_group`
-returns `False`).
+The existing `if self._num_bf16_experts == 0: continue` guard inside the BF16
+branch becomes redundant when this hook is in place (the policy can encode it
+the same way), but we will keep it as defense-in-depth for non-`batch_size`
+policies and remove it only after audit.
 
-CUDA-graph note: the skip is also batch-size-shape based, so each captured
+The `int4_only_mask.any().item()` host sync runs **once at policy init**, not
+per-forward. There is no runtime GPU→CPU sync.
+
+CUDA-graph note: the skip decision is shape-based + static-bool; each captured
 graph still has a fixed call structure.
+
+### Truth table (with partial_bf16)
+
+| `n >= threshold` | `_has_int4_only` | BF16 kernel | INT4 kernel |
+|---|---|---|---|
+| no  | no  | skip | run (all experts) |
+| no  | yes | skip | run (all experts) |
+| yes | no  | run (all experts) | **skip** ← new short-circuit |
+| yes | yes | run (non-mask experts) | run (mask experts) |
 
 ### Config schema
 
@@ -161,8 +196,11 @@ New unit tests in `test/test_heter_moe/unittest/test_dispatch_policy.py`:
    listed in `int4_only_mask` end up in INT4.
 4. `test_batch_size_gated_custom_threshold` — threshold=64 changes the gate
    point.
-5. `test_batch_size_gated_should_skip_group` — `should_skip_group` returns
-   `True` for the inactive group at each side of the threshold.
+5. `test_batch_size_gated_should_skip_group_no_int4_only` — without
+   `int4_only_mask`: BF16 skipped below threshold, INT4 skipped at/above.
+6. `test_batch_size_gated_should_skip_group_with_int4_only` — with non-empty
+   `int4_only_mask`: BF16 skipped below threshold; **neither** group skipped
+   at/above (INT4-only experts keep INT4 kernel live).
 
 New end-to-end correctness check in
 `test/test_heter_moe/unittest/test_correctness.py` (mirroring the existing
