@@ -226,8 +226,8 @@ class FusedMoE(torch.nn.Module):
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
 
-        # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
-        # Pad the intermediate_size_per_partition if necessary
+        # flashinfer_trtllm and mxfp4 kernels require intermediate_size alignment
+        # trtllm: pad to 128, mxfp4: pad to 256 for tensor core alignment
         if (
             self.use_flashinfer_trtllm_moe
             and self.intermediate_size_per_partition % 128 != 0
@@ -331,7 +331,7 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         # Use narrow_padded_param_and_loaded_weight for:
         # 1. CPU (always)
-        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
+        # 2. GPU with flashinfer padding (when intermediate_size/hidden_size is padded)
         # 3. GPU with Aiter padding
         aiter_padded = (
             _use_aiter
@@ -339,7 +339,12 @@ class FusedMoE(torch.nn.Module):
             and getattr(self.w2_weight, "weight_padded", False)
         )
 
-        return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
+        return (
+            _is_cpu
+            or self.use_flashinfer_trtllm_moe
+            or self.use_flashinfer_mxfp4_moe
+            or aiter_padded
+        )
 
     def _load_per_tensor_weight_scale(
         self,
