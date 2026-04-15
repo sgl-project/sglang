@@ -193,6 +193,7 @@ def build_cache_report(prompt_lens, cached_tokens, cached_tokens_details):
     total_storage = 0
     storage_backend_name = None
     has_details = False
+    has_storage_details = False
 
     for details in cached_tokens_details:
         if not details:
@@ -200,6 +201,8 @@ def build_cache_report(prompt_lens, cached_tokens, cached_tokens_details):
         has_details = True
         total_device += details.get("device") or 0
         total_host += details.get("host") or 0
+        if "storage" in details:
+            has_storage_details = True
         total_storage += details.get("storage") or 0
         if storage_backend_name is None and details.get("storage_backend"):
             storage_backend_name = details.get("storage_backend")
@@ -216,7 +219,7 @@ def build_cache_report(prompt_lens, cached_tokens, cached_tokens_details):
         "cache_hit_rate_pct": round(cache_hit_rate_pct, 2),
         "device_cached_tokens": total_device if has_details else None,
         "host_cached_tokens": total_host if has_details else None,
-        "storage_cached_tokens": total_storage if total_storage > 0 else None,
+        "storage_cached_tokens": total_storage if has_storage_details else None,
         "storage_backend": storage_backend_name,
     }
 
