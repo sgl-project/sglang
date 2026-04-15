@@ -302,9 +302,7 @@ FROM torch_deps AS flashinfer_cache
 ARG CUDA_VERSION
 ARG INSTALL_FLASHINFER_JIT_CACHE
 ARG FLASHINFER_VERSION
-ARG BUILD_AND_DOWNLOAD_PARALLEL
 
-# Download flashinfer cubins
 # Stage jit-cache artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
@@ -319,8 +317,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
         && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
-    fi \
-    && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+    fi
 
 ########################################################
 # PARALLEL STAGE 4: Dev Tools Builder (starts from base)
@@ -431,8 +428,7 @@ COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
-# Copy flashinfer cache and jit-cache package (if installed)
-COPY --from=flashinfer_cache /root/.cache/flashinfer /root/.cache/flashinfer
+# Copy flashinfer jit-cache package (if installed)
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
 # Copy dev tools
@@ -527,7 +523,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pandas \
     matplotlib \
     tabulate \
-    termplotlib
+    termplotlib \
+    "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
 RUN --mount=type=cache,target=/root/.cache/pip \
    python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
@@ -619,15 +616,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
     && ( success=0; for i in 1 2 3; do \
-        echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-        kernels download python && \
-        success=1 && break; \
-        echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
+    echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
+    kernels download python && \
+    success=1 && break; \
+    echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
     done; [ "$success" = "1" ] ) \
-    && mv python/kernels.lock /root/.cache/sglang \
+    && mkdir -p /root/.cache/sglang \
+    && mv python/kernels.lock /root/.cache/sglang/ \
     && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true \
-    && find /usr/local/lib/python3.12/dist-packages -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true \
-    && find /usr/local/lib/python3.12/dist-packages -name "*.pyc" -delete 2>/dev/null || true
+
 
 # Install pre-built gateway artifacts from parallel builder
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway

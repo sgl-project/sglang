@@ -649,7 +649,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # State tracking for streaming
         is_firsts = {}
-        stream_buffers = {}
+        stream_offsets = {}
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
@@ -737,9 +737,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     stream_started = True
 
-                stream_buffer = stream_buffers.get(index, "")
-                delta = content["text"][len(stream_buffer) :]
-                stream_buffers[index] = stream_buffer + delta
+                offset = stream_offsets.get(index, 0)
+                if self.tokenizer_manager.server_args.incremental_streaming_output:
+                    # content["text"] is already the incremental delta
+                    delta = content["text"]
+                else:
+                    delta = content["text"][offset:]
+                stream_offsets[index] = len(content["text"])
 
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
