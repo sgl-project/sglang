@@ -15,7 +15,8 @@ class ElasticEPState:
     active_ranks_cpu: Optional[torch.Tensor]
     last_handled_active_ranks_cpu: Optional[torch.Tensor]
     staging_active_ranks_cpu: list[torch.Tensor] = field(default_factory=list)
-    staging_events: list[Optional[torch.cuda.Event]] = field(default_factory=list)
+    staging_events: list[torch.cuda.Event] = field(default_factory=list)
+    staging_event_recorded: list[bool] = field(default_factory=list)
     next_staging_slot: int = 0
     latest_staging_slot: Optional[int] = None
     pending_cpu_snapshot: bool = False
@@ -31,9 +32,9 @@ class ElasticEPState:
 
         slot = self._get_staging_slot()
         self.staging_active_ranks_cpu[slot].copy_(self.active_ranks, non_blocking=True)
-        event = torch.cuda.Event()
+        event = self.staging_events[slot]
         event.record()
-        self.staging_events[slot] = event
+        self.staging_event_recorded[slot] = True
         self.latest_staging_slot = slot
         self.next_staging_slot = (slot + 1) % len(self.staging_active_ranks_cpu)
 
@@ -54,11 +55,12 @@ class ElasticEPState:
             return False
 
         event = self.staging_events[slot]
-        if event is None or not event.query():
+        if not self.staging_event_recorded[slot] or not event.query():
             return False
 
         active_ranks_cpu = self.staging_active_ranks_cpu[slot]
         self.latest_staging_slot = None
+        self.staging_event_recorded[slot] = False
         if torch.equal(active_ranks_cpu, self.last_handled_active_ranks_cpu):
             return False
 
@@ -72,7 +74,7 @@ class ElasticEPState:
     def _get_staging_slot(self) -> int:
         slot = self.next_staging_slot
         event = self.staging_events[slot]
-        if event is not None and not event.query():
+        if self.staging_event_recorded[slot] and not event.query():
             event.synchronize()
         return slot
 
@@ -110,13 +112,17 @@ class ElasticEPStateManager:
         active_cpu = active.detach().cpu().clone()
         staging_active_ranks_cpu = []
         staging_events = []
+        staging_event_recorded = []
         if active.device.type == "cuda":
             num_slots = 2
             staging_active_ranks_cpu = [
                 torch.empty(active_cpu.shape, dtype=active_cpu.dtype, pin_memory=True)
                 for _ in range(num_slots)
             ]
-            staging_events = [None] * num_slots
+            staging_events = [
+                torch.cuda.Event(enable_timing=False) for _ in range(num_slots)
+            ]
+            staging_event_recorded = [False] * num_slots
 
         return ElasticEPState(
             active_ranks=active,
@@ -124,6 +130,7 @@ class ElasticEPStateManager:
             last_handled_active_ranks_cpu=active_cpu,
             staging_active_ranks_cpu=staging_active_ranks_cpu,
             staging_events=staging_events,
+            staging_event_recorded=staging_event_recorded,
         )
 
     @classmethod
