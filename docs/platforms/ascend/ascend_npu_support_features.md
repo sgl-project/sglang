@@ -297,15 +297,15 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 |--------------------|----------|--------------------------------|:----------------:|
 | `--enable-lmcache` | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 
-## Offloading
+## Offloading (must be used with `--disable-cuda-graph`)
 
 | Argument                  | Defaults | Options   | Server supported |
 |---------------------------|----------|-----------|:----------------:|
-| `--cpu-offload-gb`        | `0`      | Type: int (must be used with `--disable-cuda-graph`) |      A2, A3      |
-| `--offload-group-size`    | `-1`     | Type: int |      A2, A3      |
-| `--offload-num-in-group`  | `1`      | Type: int |      A2, A3      |
-| `--offload-prefetch-step` | `1`      | Type: int |      A2, A3      |
-| `--offload-mode`          | `cpu`    | `cpu`,<br/> `meta`,<br/> `sharded_gpu` (must be used with `--disable-cuda-graph`, only supported for DeepSeek) |      A2, A3      |
+| `--cpu-offload-gb`        | `0`      | Type: int |      A2, A3      |
+| `--offload-group-size`    | `-1`     | Type: int (DeepSeek only)  |      A2, A3      |
+| `--offload-num-in-group`  | `1`      | Type: int (DeepSeek only)  |      A2, A3      |
+| `--offload-prefetch-step` | `1`      | Type: int (DeepSeek only)  |      A2, A3      |
+| `--offload-mode`          | `cpu`    | `cpu` (DeepSeek only) <br/>`meta` (DeepSeek only) <br/>`sharded_gpu` (DeepSeek only) |      A2, A3      |
 
 ## Args for multi-item scoring
 
