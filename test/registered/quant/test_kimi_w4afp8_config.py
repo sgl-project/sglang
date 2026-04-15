@@ -75,7 +75,7 @@ class TestKimiW4AFp8ConfigFromConfig(CustomTestCase):
         config = KimiW4AFp8Config.from_config(cfg)
 
         self.assertEqual(config.linear_activation_scheme, "dynamic")
-        self.assertEqual(config.moe_activation_scheme, "dynamic")
+        self.assertEqual(config.moe_activation_scheme, "static")
         self.assertEqual(config.group_size, 128)
         self.assertEqual(config.weight_block_size, [128, 128])
         self.assertEqual(config.ignored_layers, [])

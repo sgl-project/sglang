@@ -112,6 +112,16 @@ class W4AFp8Config(QuantizationConfig):
         return []
 
 
+def _normalize_layer_names(layers: List[str]) -> List[str]:
+    """Add both 'model.' prefixed and non-prefixed variants for robust matching."""
+    normalized = []
+    for layer in layers:
+        base = layer.removeprefix("model.")
+        normalized.append(base)
+        normalized.append(f"model.{base}")
+    return normalized
+
+
 class KimiW4AFp8Config(W4AFp8Config):
     """W4AFP8 config for Kimi K2.5 checkpoints.
 
@@ -149,6 +159,10 @@ class KimiW4AFp8Config(W4AFp8Config):
         # so most ignored layers are still FP8-quantized.  Only layers in
         # unquantized_layers are loaded without any quantization method.
         self.unquantized_layers = unquantized_layers or []
+        # Override weight_block_size after super().__init__() since the base
+        # class hardcodes it to [128, 128], ignoring the passed-in value.
+        if weight_block_size:
+            self.weight_block_size = weight_block_size
 
     @classmethod
     def get_name(cls) -> str:
@@ -166,9 +180,19 @@ class KimiW4AFp8Config(W4AFp8Config):
             or "dynamic"
         )
         moe_activation_scheme = (
-            cls.get_from_keys_or(config, ["moe_activation_scheme"], "dynamic")
-            or "dynamic"
+            cls.get_from_keys_or(config, ["moe_activation_scheme"], "static")
+            or "static"
         )
+
+        for scheme_name, scheme_val in [
+            ("linear_activation_scheme", linear_activation_scheme),
+            ("moe_activation_scheme", moe_activation_scheme),
+        ]:
+            if scheme_val not in ACTIVATION_SCHEMES:
+                raise ValueError(
+                    f"Unsupported {scheme_name} {scheme_val!r}, "
+                    f"expected one of {ACTIVATION_SCHEMES}"
+                )
 
         # Read ignored layers list (multiple possible key names)
         # NOTE: In W4AFP8, "ignore" means "skip W4 quantization, use FP8 instead".
@@ -177,13 +201,7 @@ class KimiW4AFp8Config(W4AFp8Config):
             config, ["ignore", "ignored_layers", "modules_to_not_convert"], None
         )
         if ignored_layers:
-            # Keep both "model." and non-"model." variants for robust prefix matching
-            normalized = []
-            for layer in ignored_layers:
-                base = layer.removeprefix("model.")
-                normalized.append(base)
-                normalized.append(f"model.{base}")
-            ignored_layers = normalized
+            ignored_layers = _normalize_layer_names(ignored_layers)
 
         # Layers that are truly unquantized (no FP8, no W4) in the checkpoint.
         # For example, lm_head is typically kept in float16/bfloat16.
@@ -193,12 +211,7 @@ class KimiW4AFp8Config(W4AFp8Config):
             config, ["modules_to_not_quantize", "unquantized_layers"], None
         )
         if unquantized_layers:
-            normalized_unq = []
-            for layer in unquantized_layers:
-                base = layer.removeprefix("model.")
-                normalized_unq.append(base)
-                normalized_unq.append(f"model.{base}")
-            unquantized_layers = normalized_unq
+            unquantized_layers = _normalize_layer_names(unquantized_layers)
         elif ignored_layers:
             # Auto-detect: lm_head in ignore list → truly unquantized
             unquantized_layers = [x for x in ignored_layers if "lm_head" in x]
