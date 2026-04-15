@@ -3,10 +3,10 @@ Configuration and data structures for diffusion performance tests.
 
 Usage:
 
-pytest python/sglang/multimodal_gen/test/server/test_server_a.py
-# for a single testcase, look for the name of the testcase in ONE_GPU_CASES_A,
-# ONE_GPU_CASES_B, ONE_GPU_CASES_C, TWO_GPU_CASES_A, or TWO_GPU_CASES_B
-pytest python/sglang/multimodal_gen/test/server/test_server_a.py -k qwen_image_t2i
+pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py
+# for a single testcase, look for the name of the testcase in ONE_GPU_CASES,
+# ONE_GPU_CASES_C, or TWO_GPU_CASES
+pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_image_t2i
 
 
 To add a new testcase:
@@ -22,10 +22,13 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.test_utils import (
@@ -179,9 +182,9 @@ class DiffusionServerArgs:
     """Configuration for a single model/scenario test case."""
 
     model_path: str  # HF repo or local path
-    modality: str = "image"  # "image" or "video" or "3d"
+    modality: str | None = None  # auto-inferred: "image" or "video" or "3d"
 
-    custom_validator: str | None = None  # optional custom validator name
+    custom_validator: str | None = None  # auto-derived unless explicitly overridden
     # resources
     num_gpus: int = 1
     tp_size: int | None = None
@@ -208,12 +211,32 @@ class DiffusionServerArgs:
     extras: list[str] = field(default_factory=lambda: [])
 
     def __post_init__(self):
+        if self.modality is None:
+            self.modality = _infer_modality_from_model_path(self.model_path)
+
+        if self.custom_validator is not None:
+            return
+
         if self.modality == "image":
             self.custom_validator = "image"
         elif self.modality == "video":
             self.custom_validator = "video"
         elif self.modality == "3d":
             self.custom_validator = "mesh"
+
+
+@lru_cache(maxsize=None)
+def _infer_modality_from_model_path(model_path: str) -> str:
+    model_info = get_model_info(model_path)
+    if model_info is None:
+        raise ValueError(f"Could not resolve model info for {model_path!r}")
+
+    task_type = model_info.pipeline_config_cls.task_type
+    if task_type == ModelTaskType.I2M:
+        return "3d"
+    if task_type.is_image_gen():
+        return "image"
+    return "video"
 
 
 @dataclass(frozen=True)
@@ -416,7 +439,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         "qwen_image_t2i",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
-            modality="image",
         ),
         T2I_sampling_params,
     ),
@@ -424,16 +446,13 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         "qwen_image_t2i_cache_dit_enabled",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
-            modality="image",
             enable_cache_dit=True,
         ),
         T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_image_t2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST, modality="image"
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST),
         T2I_sampling_params,
     ),
     # TODO: modeling of flux different from official flux, so weights can't be loaded
@@ -441,23 +460,20 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # DiffusionTestCase(
     #     "flux_image_t2i_override_transformer_weights_path_fp8",
     #     DiffusionServerArgs(
-    #         model_path="black-forest-labs/FLUX.1-dev", modality="image",
+    #         model_path="black-forest-labs/FLUX.1-dev",
     #         extras=["--transformer-weights-path black-forest-labs/FLUX.1-dev-FP8"]
     #     ),
     #     T2I_sampling_params,
     # ),
     DiffusionTestCase(
         "flux_2_image_t2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST, modality="image"
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST),
         T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_2_klein_image_t2i",
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
-            modality="image",
         ),
         T2I_sampling_params,
     ),
@@ -468,7 +484,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         "layerwise_offload",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            modality="image",
             dit_layerwise_offload=True,
             dit_offload_prefetch_size=2,
         ),
@@ -476,16 +491,13 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     ),
     DiffusionTestCase(
         "zimage_image_t2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST, modality="image"
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
         T2I_sampling_params,
     ),
     DiffusionTestCase(
         "zimage_image_t2i_fp8",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            modality="image",
             extras=["--transformer-path MickJ/Z-Image-Turbo-fp8"],
         ),
         T2I_sampling_params,
@@ -495,7 +507,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         "zimage_image_t2i_multi_lora",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            modality="image",
             lora_path="reverentelusarca/elusarca-anime-style-lora-z-image-turbo",
             second_lora_path="tarn59/pixel_art_style_lora_z_image_turbo",
         ),
@@ -507,16 +518,13 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST, modality="image"
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST),
         TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_edit_2509_ti2i",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
-            modality="image",
         ),
         MULTI_IMAGE_TI2I_sampling_params,
     ),
@@ -524,7 +532,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         "qwen_image_edit_2511_ti2i",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
-            modality="image",
         ),
         TI2I_sampling_params,
     ),
@@ -532,7 +539,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         "qwen_image_layered_i2i",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
-            modality="image",
         ),
         MULTI_FRAME_I2I_sampling_params,
     ),
@@ -541,7 +547,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         "flux_2_image_t2i_upscaling_4x",
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.2-dev",
-            modality="image",
         ),
         DiffusionSamplingParams(
             prompt="Doraemon is eating dorayaki",
@@ -562,8 +567,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
         ),
         T2V_sampling_params,
     ),
@@ -571,8 +574,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
             text_encoder_cpu_offload=True,
         ),
         T2V_sampling_params,
@@ -582,8 +583,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b_teacache_enabled",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -596,8 +595,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b_frame_interp_2x",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-            modality="video",
-            custom_validator="video",
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -610,8 +607,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b_upscaling_4x",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-            modality="video",
-            custom_validator="video",
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -624,8 +619,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b_frame_interp_2x_upscaling_4x",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-            modality="video",
-            custom_validator="video",
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -644,8 +637,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "wan2_1_t2v_1_3b_lora_1gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
             num_gpus=1,
             dynamic_lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
         ),
@@ -660,7 +651,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     #     "hunyuan_video",
     #     DiffusionServerArgs(
     #         model_path="hunyuanvideo-community/HunyuanVideo",
-    #         modality="video",
     #     ),
     #     DiffusionSamplingParams(
     #         prompt=T2V_PROMPT,
@@ -668,16 +658,13 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # ),
     DiffusionTestCase(
         "flux_2_ti2i",
-        DiffusionServerArgs(
-            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST, modality="image"
-        ),
+        DiffusionServerArgs(model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST),
         TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_2_t2i_customized_vae_path",
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-            modality="image",
             extras=["--vae-path=fal/FLUX.2-Tiny-AutoEncoder"],
         ),
         T2I_sampling_params,
@@ -687,8 +674,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "fast_hunyuan_video",
         DiffusionServerArgs(
             model_path="FastVideo/FastHunyuan-diffusers",
-            modality="video",
-            custom_validator="video",
         ),
         T2V_sampling_params,
     ),
@@ -697,8 +682,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "wan2_2_ti2v_5b",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
         ),
         TI2V_sampling_params,
     ),
@@ -706,8 +689,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         "fastwan2_2_ti2v_5b",
         DiffusionServerArgs(
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
-            modality="video",
-            custom_validator="video",
         ),
         TI2V_sampling_params,
     ),
@@ -717,7 +698,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     #     "helios_base_t2v",
     #     DiffusionServerArgs(
     #         model_path="BestWishYsh/Helios-Base",
-    #         modality="video",
     #     ),
     #     DiffusionSamplingParams(
     #         prompt=T2V_PROMPT,
@@ -729,7 +709,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     #     "helios_mid_t2v",
     #     DiffusionServerArgs(
     #         model_path="BestWishYsh/Helios-Mid",
-    #         modality="video",
     #     ),
     #     DiffusionSamplingParams(
     #         prompt=T2V_PROMPT,
@@ -741,7 +720,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     #     "helios_distilled_t2v",
     #     DiffusionServerArgs(
     #         model_path="BestWishYsh/Helios-Distilled",
-    #         modality="video",
     #     ),
     #     DiffusionSamplingParams(
     #         prompt=T2V_PROMPT,
@@ -758,7 +736,6 @@ if not current_platform.is_hip():
             "hunyuan3d_shape_gen",
             DiffusionServerArgs(
                 model_path="tencent/Hunyuan3D-2",
-                modality="3d",
                 enable_warmup=False,
             ),
             HUNYUAN3D_SHAPE_sampling_params,
@@ -772,8 +749,6 @@ if not current_platform.is_hip():
             "turbo_wan2_1_t2v_1.3b",
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
-                modality="video",
-                custom_validator="video",
             ),
             T2V_sampling_params,
         )
@@ -785,7 +760,6 @@ ONE_GPU_CASES_C = [
         "flux_2_nvfp4_t2i",
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.2-dev-NVFP4",
-            modality="image",
         ),
         T2I_sampling_params,
     )
@@ -796,8 +770,6 @@ TWO_GPU_CASES_A = [
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
         ),
         TI2V_sampling_params,
     ),
@@ -805,9 +777,6 @@ TWO_GPU_CASES_A = [
         "wan2_2_t2v_a14b_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
-            num_gpus=2,
             extras=["--ulysses-degree=2"],
         ),
         T2V_sampling_params,
@@ -819,9 +788,6 @@ TWO_GPU_CASES_A = [
         "wan2_2_t2v_a14b_teacache_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
-            num_gpus=2,
             extras=["--ulysses-degree=2"],
         ),
         DiffusionSamplingParams(
@@ -835,9 +801,6 @@ TWO_GPU_CASES_A = [
         "wan2_2_t2v_a14b_lora_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
-            num_gpus=2,
             lora_path="Cseti/wan2.2-14B-Arcane_Jinx-lora-v1",
             extras=[
                 "--lora-weight-name",
@@ -853,9 +816,6 @@ TWO_GPU_CASES_A = [
         "wan2_1_t2v_14b_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_14B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            num_gpus=2,
-            custom_validator="video",
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -866,9 +826,6 @@ TWO_GPU_CASES_A = [
         "wan2_1_t2v_1.3b_cfg_parallel",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
-            num_gpus=2,
             cfg_parallel=True,
         ),
         T2V_sampling_params,
@@ -877,8 +834,6 @@ TWO_GPU_CASES_A = [
         "fsdp-inference",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            modality="image",
-            num_gpus=2,
             extras=["--use-fsdp-inference"],
         ),
         T2I_sampling_params,
@@ -887,8 +842,6 @@ TWO_GPU_CASES_A = [
         "mova_360p_tp2",
         DiffusionServerArgs(
             model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
-            modality="video",
-            num_gpus=2,
             tp_size=2,
             dit_layerwise_offload=True,
         ),
@@ -899,8 +852,6 @@ TWO_GPU_CASES_A = [
         "mova_360p_ring1_uly2",
         DiffusionServerArgs(
             model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
-            modality="video",
-            num_gpus=2,
             ring_degree=1,
             ulysses_degree=2,
             dit_layerwise_offload=True,
@@ -912,9 +863,9 @@ TWO_GPU_CASES_A = [
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
-            modality="video",
-            num_gpus=2,
-            extras=["--pipeline-class-name LTX2TwoStagePipeline", "--ulysses-degree=2"],
+            ulysses_degree=2,
+            dit_layerwise_offload=True,
+            extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         T2V_sampling_params,
     ),
@@ -922,8 +873,6 @@ TWO_GPU_CASES_A = [
         "ltx_2_3_two_stage_ti2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            modality="video",
-            num_gpus=2,
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         TI2V_sampling_params,
@@ -935,9 +884,6 @@ TWO_GPU_CASES_B = [
         "wan2_1_i2v_14b_480P_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
-            num_gpus=2,
             extras=["--ulysses-degree=2"],
         ),
         TI2V_sampling_params,
@@ -946,8 +892,6 @@ TWO_GPU_CASES_B = [
         "ltx_2.3_two_stage_t2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            modality="video",
-            num_gpus=2,
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         T2V_sampling_params,
@@ -957,9 +901,6 @@ TWO_GPU_CASES_B = [
         "wan2_1_i2v_14b_lora_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
-            num_gpus=2,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
             extras=["--ulysses-degree=2"],
         ),
@@ -970,9 +911,6 @@ TWO_GPU_CASES_B = [
         "wan2_1_i2v_14b_720P_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
-            modality="video",
-            custom_validator="video",
-            num_gpus=2,
             extras=["--ulysses-degree=2"],
         ),
         TI2V_sampling_params,
@@ -981,8 +919,6 @@ TWO_GPU_CASES_B = [
         "qwen_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
-            modality="image",
-            num_gpus=2,
             # test ring attn
             ulysses_degree=1,
             ring_degree=2,
@@ -993,8 +929,6 @@ TWO_GPU_CASES_B = [
         "zimage_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            modality="image",
-            num_gpus=2,
             ulysses_degree=2,
         ),
         T2I_sampling_params,
@@ -1003,8 +937,6 @@ TWO_GPU_CASES_B = [
         "zimage_image_t2i_2_gpus_non_square",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            modality="image",
-            num_gpus=2,
             ulysses_degree=2,
         ),
         DiffusionSamplingParams(
@@ -1017,8 +949,6 @@ TWO_GPU_CASES_B = [
         "flux_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
-            modality="image",
-            num_gpus=2,
         ),
         T2I_sampling_params,
     ),
@@ -1026,8 +956,6 @@ TWO_GPU_CASES_B = [
         "flux_2_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-            modality="image",
-            num_gpus=2,
             tp_size=2,
         ),
         T2I_sampling_params,
@@ -1036,8 +964,6 @@ TWO_GPU_CASES_B = [
         "flux_2_klein_ti2i_2_gpus",
         DiffusionServerArgs(
             model_path="black-forest-labs/FLUX.2-klein-4B",
-            modality="image",
-            num_gpus=2,
         ),
         TI2I_sampling_params,
     ),
@@ -1045,8 +971,6 @@ TWO_GPU_CASES_B = [
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            modality="video",
-            num_gpus=2,
         ),
         TI2V_sampling_params,
     ),
@@ -1059,7 +983,6 @@ if not current_platform.is_hip():
             "flux_2_ti2i_multi_image_cache_dit",
             DiffusionServerArgs(
                 model_path="black-forest-labs/FLUX.2-dev",
-                modality="image",
                 enable_cache_dit=True,
             ),
             MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
@@ -1067,86 +990,19 @@ if not current_platform.is_hip():
     )
 
 
-def _select_accuracy_cases(
-    cases: list[DiffusionTestCase], enabled_ids: tuple[str, ...]
+def _with_default_num_gpus(
+    cases: list[DiffusionTestCase], num_gpus: int
 ) -> list[DiffusionTestCase]:
-    enabled = set(enabled_ids)
-    return [case for case in cases if case.id in enabled]
+    return [
+        replace(case, server_args=replace(case.server_args, num_gpus=num_gpus))
+        for case in cases
+    ]
 
 
-ACCURACY_ONE_GPU_CASES_A_IDS = (
-    "qwen_image_t2i",
-    "qwen_image_t2i_cache_dit_enabled",
-    "flux_image_t2i",
-    "flux_2_image_t2i",
-    "flux_2_klein_image_t2i",
-    "layerwise_offload",
-    "zimage_image_t2i",
-    "zimage_image_t2i_fp8",
-    "zimage_image_t2i_multi_lora",
-    "qwen_image_edit_ti2i",
-    "qwen_image_edit_2509_ti2i",
-    "qwen_image_edit_2511_ti2i",
-    "qwen_image_layered_i2i",
-    "flux_2_image_t2i_upscaling_4x",
-)
-
-ACCURACY_ONE_GPU_CASES_B_IDS = (
-    "wan2_1_t2v_1.3b",
-    "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
-    "wan2_1_t2v_1.3b_teacache_enabled",
-    "wan2_1_t2v_1.3b_frame_interp_2x",
-    "wan2_1_t2v_1.3b_upscaling_4x",
-    "wan2_1_t2v_1.3b_frame_interp_2x_upscaling_4x",
-    "wan2_1_t2v_1_3b_lora_1gpu",
-    "flux_2_ti2i",
-    "flux_2_t2i_customized_vae_path",
-    "fast_hunyuan_video",
-    "wan2_2_ti2v_5b",
-    "fastwan2_2_ti2v_5b",
-    "hunyuan3d_shape_gen",
-    "turbo_wan2_1_t2v_1.3b",
-    "flux_2_nvfp4_t2i",
-    "flux_2_ti2i_multi_image_cache_dit",
-)
-
-ACCURACY_TWO_GPU_CASES_A_IDS = (
-    "wan2_2_i2v_a14b_2gpu",
-    "wan2_2_t2v_a14b_2gpu",
-    "wan2_2_t2v_a14b_teacache_2gpu",
-    "wan2_2_t2v_a14b_lora_2gpu",
-    "wan2_1_t2v_14b_2gpu",
-    "wan2_1_t2v_1.3b_cfg_parallel",
-    "fsdp-inference",
-    "mova_360p_tp2",
-    "mova_360p_ring1_uly2",
-    "ltx_2_two_stage_t2v",
-)
-
-ACCURACY_TWO_GPU_CASES_B_IDS = (
-    "wan2_1_i2v_14b_480P_2gpu",
-    "wan2_1_i2v_14b_lora_2gpu",
-    "wan2_1_i2v_14b_720P_2gpu",
-    "qwen_image_t2i_2_gpus",
-    "zimage_image_t2i_2_gpus",
-    "zimage_image_t2i_2_gpus_non_square",
-    "flux_image_t2i_2_gpus",
-    "flux_2_image_t2i_2_gpus",
-    "flux_2_klein_ti2i_2_gpus",
-)
-
-ACCURACY_ONE_GPU_CASES_A = _select_accuracy_cases(
-    ONE_GPU_CASES_A, ACCURACY_ONE_GPU_CASES_A_IDS
-)
-ACCURACY_ONE_GPU_CASES_B = _select_accuracy_cases(
-    ONE_GPU_CASES_B, ACCURACY_ONE_GPU_CASES_B_IDS
-)
-ACCURACY_TWO_GPU_CASES_A = _select_accuracy_cases(
-    TWO_GPU_CASES_A, ACCURACY_TWO_GPU_CASES_A_IDS
-)
-ACCURACY_TWO_GPU_CASES_B = _select_accuracy_cases(
-    TWO_GPU_CASES_B, ACCURACY_TWO_GPU_CASES_B_IDS
-)
+ONE_GPU_CASES = [*ONE_GPU_CASES_A, *ONE_GPU_CASES_B, *ONE_GPU_CASES_C]
+TWO_GPU_CASES_A = _with_default_num_gpus(TWO_GPU_CASES_A, 2)
+TWO_GPU_CASES_B = _with_default_num_gpus(TWO_GPU_CASES_B, 2)
+TWO_GPU_CASES = [*TWO_GPU_CASES_A, *TWO_GPU_CASES_B]
 
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(

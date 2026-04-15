@@ -183,14 +183,12 @@ class SessionAwareCache(BasePrefixCache):
         if slot is None or slot.req_pool_idx is None:
             return self.inner.match_prefix(params)
 
-        # If the request is destined for abort (e.g. input too long),
-        # do NOT restore the slot's KV state.  set_finish_with_abort
-        # truncates origin_input_ids to [0], so alloc_for_extend would
-        # overwrite the slot's req_to_token row with a 1-token prefix,
-        # destroying the session's accumulated KV mapping.  By skipping
-        # restore, the request gets a fresh pool slot from alloc_for_extend
-        # and the session slot remains untouched.
+        # Pre-aborted req (scheduler-level abort, e.g. input too long):
+        # detach from session so cache_finished_req treats it as a normal
+        # req. The slot stays intact for the next request.
         if req.to_finish is not None:
+            req.session.abort_req()
+            req.session = None
             return self.inner.match_prefix(params)
 
         slot.restore_to_req(req)
@@ -220,51 +218,50 @@ class SessionAwareCache(BasePrefixCache):
         slot = self.slots.get(session_id)
         is_first = slot is None
 
-        # When an aborted streaming-session request was scheduled (e.g.
-        # input too long), match_prefix skipped restore_to_req so the
-        # request got a fresh pool slot from alloc_for_extend.  Don't
-        # overwrite the session slot -- free the transient KV and pool slot.
-        if not is_first and isinstance(req.finished_reason, FINISH_ABORT):
-            if req.req_pool_idx is not None:
-                # Free all KV pages allocated for this aborted request.
-                end = req.kv_allocated_len
-                if end > 0:
-                    kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, :end
-                    ]
-                self.token_to_kv_pool_allocator.free(kv_indices)
-                self.req_to_token_pool.free_slots.append(req.req_pool_idx)
-                req.req_pool_idx = None
+        # Mid-processing abort only. Pre-aborted reqs have session=None
+        # (set in match_prefix) and never reach here.
+        # Nuke all KV via release_session, delete slot. Token IDs stay
+        # in req_nodes (finish_req was never called -> last successful
+        # req). Next request re-prefills from scratch.
+        if isinstance(req.finished_reason, FINISH_ABORT):
+            if slot is None:
+                # First-request mid-processing abort: create ephemeral
+                # slot from req state so release_session handles cleanup.
+                # Include last_node/cache_protected_len from the req so
+                # release_session calls dec_lock_ref on the tree lock.
+                slot = SessionSlot(
+                    req_pool_idx=req.req_pool_idx,
+                    kv_allocated_len=req.kv_allocated_len,
+                    last_node=req.last_node,
+                    cache_protected_len=req.cache_protected_len,
+                    swa_uuid_for_lock=req.swa_uuid_for_lock,
+                )
+                self.slots[session_id] = slot
+            slot.kv_allocated_len = max(slot.kv_allocated_len, req.kv_allocated_len)
+            self.release_session(session_id)
+            req.req_pool_idx = None
+            req.session.abort_req()
+            self._mark_kv_freed(req)
             return
 
         if is_first:
             slot = SessionSlot()
             self.slots[session_id] = slot
 
-        # If the session's KV is shrinking (e.g. client sent a shorter
-        # prompt after an abort), free the orphaned tail pages before
-        # save_from_req overwrites the slot's committed length.
-        # Never free tree-protected tokens — those are managed by the tree.
-        if (
-            not is_first
-            and slot.is_holding_kv
-            and req.kv_committed_len < slot.kv_committed_len
-        ):
-            old_end = slot.kv_allocated_len
-            new_end = req.kv_committed_len
-            if self.page_size > 1:
-                new_end = ceil_align(new_end, self.page_size)
-            new_end = max(new_end, slot.cache_protected_len)
-            if new_end < old_end:
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    slot.req_pool_idx, new_end:old_end
-                ]
-                self.token_to_kv_pool_allocator.free(kv_indices)
-            slot.cache_protected_len = min(
-                slot.cache_protected_len, req.kv_committed_len
-            )
-
         slot.save_from_req(req, is_first=is_first)
+
+        # Update req_nodes to this successfully finished request.
+        req.session.finish_req(req)
+
+        self._mark_kv_freed(req)
+
+    @staticmethod
+    def _mark_kv_freed(req: Req):
+        """Set bookkeeping flags so busy check skips this finished req."""
+        if not req.kv_committed_freed:
+            req.pop_committed_kv_cache()
+        if not req.kv_overallocated_freed:
+            req.pop_overallocated_kv_cache()
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if _is_streaming(req):
