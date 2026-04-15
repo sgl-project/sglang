@@ -168,67 +168,68 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
     ) -> "DecodeInputBuffers":
-        with torch.device(device):
-            input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
-            input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
-            req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
-            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
-            out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
-            positions = torch.zeros((max_num_token,), dtype=torch.int64)
-            mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
-            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
-            custom_mask = torch.ones(
-                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
-                dtype=torch.bool,
-            )
-            next_token_logits_buffer = torch.zeros(
-                (max_num_token, vocab_size),
-                dtype=torch.float,
-            )
-            mamba_track_indices = (
-                torch.zeros((max_bs,), dtype=torch.int64)
-                if enable_mamba_track
-                else None
-            )
-            mamba_track_mask = (
-                torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
-            )
+        input_ids = torch.zeros((max_num_token,), dtype=torch.int64, device=device)
+        input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype, device=device)
+        req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64, device=device)
+        seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32, device=device)
+        out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype, device=device)
+        positions = torch.zeros((max_num_token,), dtype=torch.int64, device=device)
+        mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64, device=device)
+        num_token_non_padded = torch.zeros((1,), dtype=torch.int32, device=device)
+        custom_mask = torch.ones(
+            (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+            dtype=torch.bool,
+            device=device,
+        )
+        next_token_logits_buffer = torch.zeros(
+            (max_num_token, vocab_size),
+            dtype=torch.float,
+            device=device,
+        )
+        mamba_track_indices = (
+            torch.zeros((max_bs,), dtype=torch.int64, device=device)
+            if enable_mamba_track
+            else None
+        )
+        mamba_track_mask = (
+            torch.zeros((max_bs,), dtype=torch.bool, device=device) if enable_mamba_track else None
+        )
 
-            if pp_size > 1:
-                pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                }
-            else:
-                pp_proxy_tensors = None
+        if pp_size > 1:
+            pp_proxy_tensors = {
+                "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype, device=device),
+                "residual": torch.zeros((max_bs, hidden_size), dtype=dtype, device=device),
+            }
+        else:
+            pp_proxy_tensors = None
 
-            if is_encoder_decoder:
-                encoder_lens = torch.full(
-                    (max_bs,), encoder_len_fill_value, dtype=torch.int32
-                )
-            else:
-                encoder_lens = None
-
-            if require_mlp_tp_gather:
-                global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
-                global_num_tokens_for_logprob_gpu = torch.zeros(
-                    (dp_size,), dtype=torch.int32
-                )
-            else:
-                global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-                global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
-
-            ngram_embedding_info = (
-                NgramEmbeddingInfo(
-                    token_table=ne_token_table,
-                    column_starts=torch.zeros([max_bs], dtype=torch.int32),
-                    req_lens=torch.ones([max_bs], dtype=torch.int32),
-                    out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
-                    out_req_lens=torch.ones([max_bs], dtype=torch.int32),
-                )
-                if ne_token_table is not None
-                else None
+        if is_encoder_decoder:
+            encoder_lens = torch.full(
+                (max_bs,), encoder_len_fill_value, dtype=torch.int32, device=device
             )
+        else:
+            encoder_lens = None
+
+        if require_mlp_tp_gather:
+            global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32, device=device)
+            global_num_tokens_for_logprob_gpu = torch.zeros(
+                (dp_size,), dtype=torch.int32, device=device
+            )
+        else:
+            global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32, device=device)
+            global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32, device=device)
+
+        ngram_embedding_info = (
+            NgramEmbeddingInfo(
+                token_table=ne_token_table,
+                column_starts=torch.zeros([max_bs], dtype=torch.int32, device=device),
+                req_lens=torch.ones([max_bs], dtype=torch.int32, device=device),
+                out_column_starts=torch.zeros([max_bs], dtype=torch.int32, device=device),
+                out_req_lens=torch.ones([max_bs], dtype=torch.int32, device=device),
+            )
+            if ne_token_table is not None
+            else None
+        )
 
         # Keep seq_lens_cpu as a true CPU tensor, like the old implementation.
         seq_lens_cpu = torch.full(
