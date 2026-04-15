@@ -22,9 +22,11 @@ import tabulate
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
+    DiffusionTestCase,
+)
+from sglang.multimodal_gen.test.server.gpu_cases import (
     ONE_GPU_CASES,
     TWO_GPU_CASES,
-    DiffusionTestCase,
 )
 
 logger = init_logger(__name__)
@@ -66,13 +68,6 @@ FILE_SUITES = {
         "test_server_c.py",
     ],
 }
-
-suites_ascend = {
-    "1-npu": ["ascend/test_server_1_npu.py"],
-    "2-npu": ["ascend/test_server_2_npu.py"],
-    "8-npu": ["ascend/test_server_8_npu.py"],
-}
-FILE_SUITES.update(suites_ascend)
 
 PARAMETRIZED_CASE_GROUPS = {
     "1-gpu": [
