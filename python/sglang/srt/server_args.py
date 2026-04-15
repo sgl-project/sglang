@@ -3067,18 +3067,6 @@ class ServerArgs:
             logger.warning(
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
-            if self.moe_a2a_backend == "flashinfer":
-                import os
-
-                if os.environ.get("SGLANG_MOE_NVFP4_DISPATCH", "").lower() in (
-                    "1",
-                    "true",
-                ):
-                    logger.warning(
-                        "SGLANG_MOE_NVFP4_DISPATCH is not yet supported with "
-                        "flashinfer_cutedsl + flashinfer a2a. Forcing it to False."
-                    )
-                    os.environ["SGLANG_MOE_NVFP4_DISPATCH"] = "0"
 
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert self.quantization in [

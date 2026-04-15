@@ -102,7 +102,7 @@ class FlashinferDispatcher(BaseDispatcher):
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         self.max_num_tokens = (
-            get_int_env_var("SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 8192)
+            get_int_env_var("SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024)
             * self.ep_size
         )
 
@@ -213,7 +213,8 @@ class FlashinferDispatcher(BaseDispatcher):
             x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
             # TODO: fuse interleave into cutlass moe
-            x_sf = nvfp4_block_scale_interleave(x_sf)
+            if get_moe_runner_backend().is_flashinfer_cutlass():
+                x_sf = nvfp4_block_scale_interleave(x_sf)
         else:
             x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
         x = x_recv.view(-1, x_recv.shape[-1])

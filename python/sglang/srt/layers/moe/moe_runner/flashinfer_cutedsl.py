@@ -393,22 +393,16 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
 
-    if hidden_states.dtype == torch.bfloat16 or hidden_states.dtype == torch.float16:
-        # Dispatcher sent bf16 (NVFP4 dispatch disabled) — quantize ourselves
+    if x_sf is not None:
+        # NVFP4 dispatch, inputs are already quantized.
+        x_fp4 = hidden_states
+    else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
             quant_info.input_scale,
             sf_vec_size=_FP4_SF_VEC_SIZE,
             is_sf_swizzled_layout=False,
         )
-    else:
-        # Dispatcher already quantized to FP4 — use as-is.
-        # This path is currently not exercised because NVFP4_DISPATCH is
-        # force-disabled for cutedsl + flashinfer a2a in server_args.py.
-        # The dispatcher's sf layout (interleaved) may differ from what
-        # cutedsl expects (non-interleaved), so this needs validation
-        # before enabling.
-        x_fp4 = hidden_states
 
     output = quant_info.wrapper.run(
         x=x_fp4,
