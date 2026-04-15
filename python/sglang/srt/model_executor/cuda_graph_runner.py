@@ -645,7 +645,6 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-
         # Capture
         try:
             with model_capture_mode():
