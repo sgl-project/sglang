@@ -19,7 +19,6 @@ dependencies = [
   "aiohttp",
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
-  "arctic-inference==0.1.1",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -100,6 +99,7 @@ torch = [
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+suffix-decoding = ["arctic-inference==0.1.1"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle==3.1.2",
