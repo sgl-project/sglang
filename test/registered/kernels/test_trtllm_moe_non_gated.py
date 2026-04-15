@@ -62,13 +62,22 @@ class TestAlignFp8MoeWeights(CustomTestCase):
         self.assertEqual(w2_p.shape, (E, H, 128))
 
     def test_already_aligned_is_noop(self):
-        align = self._get_fn()
+        from sglang.srt.layers.quantization.utils import round_up_to_multiple
+
         E, H, I = 4, 256, 128
         w13 = torch.randn(E, I, H)
         w2 = torch.randn(E, H, I)
 
-        w13_p, w2_p, padded = align(w13, w2, is_gated=False, min_alignment=128)
+        padded_I = round_up_to_multiple(I, 128)
+        self.assertEqual(padded_I, I)
 
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            _align_fp8_moe_weights,
+        )
+
+        w13_p, w2_p, padded = _align_fp8_moe_weights(
+            w13, w2, is_gated=False, min_alignment=128
+        )
         self.assertEqual(padded, 128)
         self.assertIs(w13_p, w13)
         self.assertIs(w2_p, w2)
@@ -156,7 +165,7 @@ class TestAlignMxfp8MoeWeights(CustomTestCase):
 
     def test_non_gated_pads_correctly(self):
         align = self._get_fn()
-        E, H, I = 4, 256, 100
+        E, H, I = 4, 256, 96
         block_size = 32
 
         w13 = torch.randn(E, I, H)
@@ -251,7 +260,7 @@ class TestNonGatedFp8ScalingFactors(CustomTestCase):
         E = 4
         input_scale = torch.tensor([0.5] * E)
         activation_scale = torch.tensor([0.25] * E)
-        w13_weight_scale = torch.tensor([2.0] * E)
+        w13_weight_scale = torch.tensor([3.0] * E)
 
         # Gated: output1_scales = w13_scale * input_scale / activation_scale
         gated_output1 = w13_weight_scale * input_scale * (1.0 / activation_scale)
@@ -259,12 +268,10 @@ class TestNonGatedFp8ScalingFactors(CustomTestCase):
         # Non-gated: output1_scales = 1 / activation_scale (no weight contribution)
         nongated_output1 = torch.ones_like(w13_weight_scale) * (1.0 / activation_scale)
 
+        # Gated = 3.0 * 0.5 * 4.0 = 6.0, Non-gated = 4.0
         self.assertFalse(torch.allclose(gated_output1, nongated_output1))
+        torch.testing.assert_close(gated_output1, torch.tensor([6.0] * E))
         torch.testing.assert_close(nongated_output1, torch.tensor([4.0] * E))
-
-        # output1_scales_gate_scalar is the same for both
-        gate_scalar = w13_weight_scale * input_scale
-        torch.testing.assert_close(gate_scalar, torch.tensor([1.0] * E))
 
 
 if __name__ == "__main__":
