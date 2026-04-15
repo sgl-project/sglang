@@ -100,10 +100,32 @@ class RayEngine(Engine):
         """
         pg = ray.util.get_current_placement_group()
         if pg is None:
-            raise RuntimeError(
-                "use_ray=True requires a placement group, but none was detected. "
-                "Schedule the Engine actor onto a placement group"
+            from ray.util.placement_group import (
+                placement_group as create_placement_group,
             )
+
+            if server_args.enable_dp_attention:
+                total_gpus = server_args.tp_size * server_args.pp_size
+            else:
+                total_gpus = (
+                    server_args.dp_size * server_args.tp_size * server_args.pp_size
+                )
+
+            nnodes = server_args.nnodes
+            gpus_per_node = total_gpus // nnodes
+            strategy = "STRICT_PACK" if nnodes == 1 else "SPREAD"
+
+            logger.info(
+                "No placement group detected. Auto-creating one with "
+                f"{nnodes} bundle(s), {gpus_per_node} GPU(s)/bundle, "
+                "placement group explicitly and schedule the Engine onto it."
+            )
+
+            pg = create_placement_group(
+                [{"CPU": 1, "GPU": gpus_per_node}] * nnodes,
+                strategy=strategy,
+            )
+            ray.get(pg.ready())
 
         nnodes = server_args.nnodes
 
