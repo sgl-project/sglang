@@ -185,7 +185,8 @@ class ModelConfig:
             or hasattr(self.hf_config, "vision_config")
             or hasattr(self.hf_config, "audio_config")
         )
-        self.is_multimodal = enable_multimodal and (
+        is_language_model_only = getattr(self.hf_config, "language_model_only", False)
+        self.is_multimodal = enable_multimodal and not is_language_model_only and (
             is_multimodal_model(self.hf_config.architectures)
             or has_multimodal_subconfig
         )
@@ -193,7 +194,7 @@ class ModelConfig:
             self.hf_config.architectures
         )
         # TODO: requires further polishing
-        self.is_image_understandable_model = enable_multimodal and hasattr(
+        self.is_image_understandable_model = enable_multimodal and not is_language_model_only and hasattr(
             self.hf_config, "vision_config"
         )
 
@@ -202,7 +203,7 @@ class ModelConfig:
         #   - thinker_config.audio_config: Qwen3-Omni, Qwen3-ASR (nested thinker arch)
         #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)\
         # TODO: Handle this more robustly by standardizing the config structure in the future
-        self.is_audio_understandable_model = enable_multimodal and (
+        self.is_audio_understandable_model = enable_multimodal and not is_language_model_only and (
             hasattr(self.hf_config, "audio_config")
             or hasattr(getattr(self.hf_config, "thinker_config", None), "audio_config")
             or is_audio_model(self.hf_config.architectures)

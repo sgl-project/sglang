@@ -1361,9 +1361,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
-        self.is_mrope_enabled = "mrope_section" in rope_config
+        self.is_mrope_enabled = "mrope_section" in rope_config and not self.language_model_only
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes if self.visual is not None else []
 
     @property
     def start_layer(self) -> int:
@@ -1497,9 +1497,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
         )
-        self.is_mrope_enabled = "mrope_section" in rope_config
+        self.is_mrope_enabled = "mrope_section" in rope_config and not self.language_model_only
+        
+        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes if self.visual is not None else []
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_fused_shared_experts = 0
         if _use_aiter:
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()

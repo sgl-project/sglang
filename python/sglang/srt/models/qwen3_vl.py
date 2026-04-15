@@ -1077,15 +1077,20 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=None,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("model.visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
+        self.language_model_only = getattr(config, "language_model_only", False)
+        if not self.language_model_only:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=None,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("model.visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
+        else:
+            logger.info(f"[language_model_only] Skipping ViT initialization, forward will call self.model() directly (config.language_model_only={self.language_model_only})")
+            self.visual = None
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1118,7 +1123,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling and not self.language_model_only
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -1230,25 +1235,32 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
-
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            use_deepstack=self.use_deepstack,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        if self.language_model_only:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                positions=positions,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        else:
+            if not (
+                forward_batch.forward_mode.is_decode()
+                or not forward_batch.contains_image_inputs()
+            ):
+                if self.is_mrope_enabled:
+                    assert positions.ndim == 2 and positions.size(0) == 3, (
+                        "multimodal section rotary embedding requires "
+                        f"(3, seq_len) positions, but got {positions.size()}"
+                    )
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+                use_deepstack=self.use_deepstack,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
