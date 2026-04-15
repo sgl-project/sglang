@@ -23,10 +23,6 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=67, suite="stage-b-test-1-gpu-large")
 
-# ---------------------------------------------------------------------------
-# Logprob prompts (shared by concurrent logprob test)
-# ---------------------------------------------------------------------------
-
 LOGPROB_PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
     "Pack my box with five dozen liquor jugs.",
@@ -35,10 +31,7 @@ LOGPROB_PROMPTS = [
     "The five boxing wizards jump quickly.",
 ]
 
-# ---------------------------------------------------------------------------
-# Filler text to trigger chunked prefill (200+ tokens per turn)
-# ---------------------------------------------------------------------------
-
+# Long enough to trigger chunked prefill at 200+ tokens per slice.
 LEAK_FILLER = (
     "The quick brown fox jumps over the lazy dog. "
     "Pack my box with five dozen liquor jugs. "
@@ -49,10 +42,6 @@ LEAK_FILLER = (
     "A wizard's job is to vex chumps quickly in fog. "
     "We promptly judged antique ivory buckles for the next prize. "
 ) * 20
-
-# ---------------------------------------------------------------------------
-# Abort-heavy chunked prefill leak repro constants
-# ---------------------------------------------------------------------------
 
 ABORT_REPRO_CONTEXT_LEN = 512
 ABORT_REPRO_PAGE_SIZE = 256
@@ -65,17 +54,9 @@ ABORT_REPRO_ABORT_TOKENS = 600
 ABORT_REPRO_NON_STREAMING_TOKENS = 16
 ABORT_REPRO_CHUNKED_PREFILL_SIZE = 4096
 
-# ---------------------------------------------------------------------------
-# Concurrent logprob constants (multi-session, tests retract under concurrency)
-# ---------------------------------------------------------------------------
-
 CONCURRENT_LOGPROB_SESSIONS = 6
 CONCURRENT_LOGPROB_TURNS = 5
 CONCURRENT_LOGPROB_ROUNDS = 10
-
-# ---------------------------------------------------------------------------
-# Concurrent stress constants (high-concurrency streaming + non-streaming)
-# ---------------------------------------------------------------------------
 
 STRESS_NUM_SESSIONS = 8
 STRESS_NUM_NON_STREAMING = 4
@@ -263,11 +244,6 @@ async def _abort_repro_run_all(base_url: str, tokenizer: Any) -> None:
                     assert resp.status == 200, await resp.text()
 
 
-# ---------------------------------------------------------------------------
-# General async generate helper (used by concurrent logprob & stress tests)
-# ---------------------------------------------------------------------------
-
-
 async def _async_generate(
     base_url: str,
     session: aiohttp.ClientSession,
@@ -300,17 +276,9 @@ async def _async_generate(
         return await resp.json()
 
 
-# ---------------------------------------------------------------------------
-# Concurrent logprob helpers
-# ---------------------------------------------------------------------------
-
-
 async def _concurrent_logprob_run(base_url: str, tokenizer: Any, **gen_kwargs) -> None:
-    """Run multiple sessions concurrently with logprob requests.
-
-    Each round opens N sessions, fires all sessions' requests per turn
-    simultaneously (so the running batch has N entries — retract can
-    actually kick one), then closes all sessions.
+    """N sessions per round, all requests fired simultaneously per turn so
+    the running batch has real concurrency (retract can actually kick one).
     """
     timeout = aiohttp.ClientTimeout(total=300)
     async with aiohttp.ClientSession(timeout=timeout) as http:
@@ -353,18 +321,10 @@ async def _concurrent_logprob_run(base_url: str, tokenizer: Any, **gen_kwargs) -
                     assert resp.status == 200
 
 
-# ---------------------------------------------------------------------------
-# Concurrent stress helpers
-# ---------------------------------------------------------------------------
-
-
 async def _stress_run_all(base_url: str, tokenizer: Any) -> None:
-    """High concurrency streaming + non-streaming in mixed batches.
-
-    Opens many sessions and fires all requests per turn simultaneously,
-    ensuring the running batch is large enough for retract to have real
-    effect. Prompt tokens are long enough (~200+) to trigger chunked
-    prefill, so retract can interrupt mid-extend.
+    """Streaming + non-streaming mixed batches under retract pressure.
+    Long prompts (~200+ tokens) trigger chunked prefill so retract can
+    interrupt mid-extend.
     """
     timeout = aiohttp.ClientTimeout(total=300)
     async with aiohttp.ClientSession(timeout=timeout) as http:
@@ -380,7 +340,7 @@ async def _stress_run_all(base_url: str, tokenizer: Any) -> None:
         rids: list[Optional[str]] = [None] * STRESS_NUM_SESSIONS
         for turn in range(STRESS_NUM_TURNS):
             tasks = []
-            # Streaming requests — long prompts to trigger chunked prefill
+            # Streaming requests — long prompts to trigger chunked prefill.
             for s in range(STRESS_NUM_SESSIONS):
                 offset = (s * STRESS_NUM_TURNS + turn) * 200
                 text = (
@@ -397,7 +357,7 @@ async def _stress_run_all(base_url: str, tokenizer: Any) -> None:
                     )
                 )
 
-            # Non-streaming requests interleaved
+            # Non-streaming requests interleaved.
             for ns in range(STRESS_NUM_NON_STREAMING):
                 text = (
                     f"Non-streaming {ns} turn {turn}: "
@@ -424,11 +384,6 @@ async def _stress_run_all(base_url: str, tokenizer: Any) -> None:
                 assert resp.status == 200
 
 
-# ===================================================================
-# Test class
-# ===================================================================
-
-
 class TestStreamingSession(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -451,16 +406,13 @@ class TestStreamingSession(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    # Overlap scheduler defers the last decode iteration's commit by one step,
-    # so its "in-flight" last token gets committed by the time the request
-    # finishes. With overlap disabled (e.g. streaming session + speculative
-    # decoding), the last sampled token isn't committed before max_new_tokens
-    # stops, leaving slot.kv_committed_len = input + output - 1. Subclasses
-    # that disable overlap should set this to -1 to relax the inheritance check.
+    # -1 for non-overlap subclasses: the last sampled token isn't committed
+    # before max_new stops, so slot.kv_committed_len = input + output - 1.
     kv_inherit_offset = 0
 
     def test_kv_cache_inheritance(self, gen_len=12):
-        """Verify KV inheritance, radix cache insertion, and flush reclamation."""
+        """Each turn's cached_tokens must equal previous turn's prompt+completion
+        (modulo kv_inherit_offset)."""
         chunks = [
             "Let me tell you something about France.",
             "The capital of France is",
@@ -500,18 +452,16 @@ class TestStreamingSession(CustomTestCase):
             completion_tokens = response["meta_info"]["completion_tokens"]
 
             if turn_idx == 0:
-                # Turn 1 should have no cache hit (cache was flushed).
-                self.assertEqual(
-                    cached, 0, "Turn 1 should have 0 cached tokens (clean start)"
-                )
+                # Turn 1: cache flushed, no hit.
+                self.assertEqual(cached, 0, "Turn 1: clean start, no cache hit")
             else:
-                # Turns 2+ inherit KV from the previous turn (via inherit_kv_states,
-                # not radix tree matching). cached_tokens reflects the inherited prefix.
+                # Turns 2+: cached_tokens reflects KV inherited from previous turn
+                # (via inherit_kv_states, not radix tree matching).
                 expected = prev_kv_len + self.kv_inherit_offset
                 self.assertEqual(
                     cached,
                     expected,
-                    f"Turn {turn_idx + 1}: should inherit {expected} KV tokens from previous turn",
+                    f"Turn {turn_idx + 1}: inherited {cached} != expected {expected}",
                 )
             prev_kv_len = prompt_tokens + completion_tokens
 
@@ -523,13 +473,8 @@ class TestStreamingSession(CustomTestCase):
         self.assertEqual(ret.status_code, 200)
 
     def test_leak_logprob_concurrent(self) -> None:
-        """Concurrent multi-session logprob leak test (all 3 modes).
-
-        6 sessions fire per turn simultaneously so the running batch has
-        real concurrency — retract/mixed-chunk actually exercise their
-        multi-request scheduling paths. Covers: output logprob,
-        input logprob (logprob_start_len=0), and no logprob.
-        """
+        """Concurrent multi-session × 3 logprob modes (output / input / none),
+        watch for KV leak."""
         requests.post(self.base_url + "/flush_cache")
         # Output logprob
         asyncio.run(
@@ -552,13 +497,8 @@ class TestStreamingSession(CustomTestCase):
         ), "Server unhealthy after concurrent logprob sessions."
 
     def test_stress_concurrent_sessions(self) -> None:
-        """High concurrency streaming + non-streaming under mixed batch pressure.
-
-        8 streaming sessions + 4 non-streaming per turn, with long prompts
-        triggering chunked prefill. Under retract, the scheduler retract_decode
-        fires every 3 forward steps and must correctly roll back streaming
-        session KV without leaking tokens.
-        """
+        """High concurrency streaming + non-streaming with retract pressure;
+        scheduler must roll back streaming KV without leaking."""
         requests.post(self.base_url + "/flush_cache")
         asyncio.run(_stress_run_all(self.base_url, self.tokenizer))
 
@@ -582,8 +522,8 @@ class TestStreamingSession(CustomTestCase):
         )
 
     def test_nth_mid_abort_recovery(self) -> None:
-        """Abort a running streaming session request (nth turn) via the
-        abort API. Session rolls back to last successful turn."""
+        """Abort an Nth-turn request mid-decode; session rolls back to last
+        successful turn."""
         requests.post(self.base_url + "/flush_cache")
 
         resp = requests.post(
@@ -688,9 +628,8 @@ class TestStreamingSession(CustomTestCase):
         self.assertEqual(health.status_code, 200)
 
     def test_first_mid_abort_recovery(self) -> None:
-        """Abort the very first request on a streaming session mid-decode.
-        No slot exists yet (ephemeral slot created and nuked).
-        Verify the session is still usable afterward."""
+        """Abort the very first request mid-decode (no slot yet; ephemeral
+        slot is created and nuked). Session must still be usable."""
         requests.post(self.base_url + "/flush_cache")
 
         resp = requests.post(
@@ -773,8 +712,8 @@ class TestStreamingSession(CustomTestCase):
         self.assertEqual(health.status_code, 200)
 
     def test_preabort_recovery(self) -> None:
-        """Pre-aborted request (unsupported offset) does not corrupt session.
-        The slot is preserved, and the next turn inherits correctly."""
+        """Pre-abort (rejected by create_req) preserves the slot; next turn
+        inherits correctly."""
         requests.post(self.base_url + "/flush_cache")
 
         resp = requests.post(
@@ -851,7 +790,7 @@ class TestStreamingSession(CustomTestCase):
 
 
 class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
-    """Streaming session under retract decode with --enable-mixed-chunk."""
+    """Retract + --enable-mixed-chunk."""
 
     @classmethod
     def setUpClass(cls):
@@ -879,13 +818,8 @@ class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
 
 
 class TestStreamingSessionRetractLargePage(TestStreamingSession):
-    """Retract + page_size > 1: covers PagedTokenToKVPoolAllocator path.
-
-    Retract triggers `prefix_len < kv_allocated_len` in `_free_tail`, and
-    page_size > 1 routes through `PagedTokenToKVPoolAllocator.free` (which
-    computes `free_index // page_size` and returns whole pages). Without
-    page-aligned `_free_tail`, partial pages would corrupt the allocator.
-    """
+    """Retract + page=256: exercises page-aligned `_free_tail`. Partial-page
+    free would corrupt pages still holding committed tokens."""
 
     @classmethod
     def setUpClass(cls):
@@ -914,14 +848,8 @@ class TestStreamingSessionRetractLargePage(TestStreamingSession):
 
 
 class TestStreamingSessionEagle(TestStreamingSession):
-    """Streaming session with EAGLE3 speculative decoding.
+    """EAGLE3 spec v1 (overlap disabled); offset=-1 — see base class note."""
 
-    Streaming session is incompatible with overlap + speculative, so
-    --disable-overlap-schedule is required.
-    """
-
-    # Overlap is disabled (required for spec + streaming session), so the
-    # last token isn't committed before stop. See base class note.
     kv_inherit_offset = -1
 
     @classmethod
@@ -963,7 +891,7 @@ class TestStreamingSessionEagle(TestStreamingSession):
 
 
 class TestStreamingSessionEagleV2(TestStreamingSession):
-    """Streaming session with EAGLE3 spec v2 (overlap-aware schedule)."""
+    """EAGLE3 spec v2 (overlap on)."""
 
     @classmethod
     def setUpClass(cls):
@@ -1007,10 +935,8 @@ class TestStreamingSessionEagleV2(TestStreamingSession):
 
 
 class TestStreamingSessionEagleRetractLargePage(TestStreamingSession):
-    """Eagle spec + retract + page_size > 1: hits PagedTokenToKVPoolAllocator
-    with both spec tail and retract alloc-commit gap. Maximal coverage of
-    `_free_tail` page-alignment correctness.
-    """
+    """EAGLE3 spec v1 + retract + page=256: max-pressure on `_free_tail`
+    (spec tail + retract alloc-commit gap + page alignment)."""
 
     kv_inherit_offset = -1
 
@@ -1059,7 +985,7 @@ class TestStreamingSessionEagleRetractLargePage(TestStreamingSession):
 
 
 class TestStreamingSessionEagleV2RetractLargePage(TestStreamingSession):
-    """Streaming session with EAGLE3 spec v2 + retract + page=256."""
+    """EAGLE3 spec v2 + retract + page=256."""
 
     @classmethod
     def setUpClass(cls):
