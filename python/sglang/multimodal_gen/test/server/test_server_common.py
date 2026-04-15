@@ -154,7 +154,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         # pipeline class.  This avoids hard failures when a model needs a
         # newer diffusers release than what is currently installed in CI.
         msg = str(exc)
-        if "not found in diffusers" in msg or "has no attribute" in msg:
+        if "not found in diffusers" in msg or (
+            "has no attribute" in msg and "diffusers" in msg.lower()
+        ):
             pytest.skip(
                 f"Skipping {case.id}: required diffusers pipeline class "
                 f"is not available in the installed version. "

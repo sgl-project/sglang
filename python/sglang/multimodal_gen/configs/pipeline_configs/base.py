@@ -151,7 +151,6 @@ def maybe_unpad_latents(latents, batch):
     return latents
 
 
-# config for a single pipeline
 @dataclass
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
@@ -360,10 +359,28 @@ class PipelineConfig:
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
+    @staticmethod
+    def _gather_sp_tensor(tensor: torch.Tensor, *, dim: int) -> torch.Tensor:
+        """All-gather an SP-sharded tensor along the specified logical dimension."""
+        return sequence_model_parallel_all_gather(tensor.contiguous(), dim=dim)
+
+    @staticmethod
+    def _trim_sp_gather_padding(
+        tensor: torch.Tensor, *, orig_len: int | None, dim: int
+    ) -> torch.Tensor:
+        """Trim padding introduced before SP sharding back to the original length."""
+        if orig_len is None:
+            return tensor
+        orig_len = int(orig_len)
+        if orig_len <= 0 or tensor.shape[dim] <= orig_len:
+            return tensor
+        slices = [slice(None)] * tensor.ndim
+        slices[dim] = slice(orig_len)
+        return tensor[tuple(slices)]
+
     def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
-        latents = sequence_model_parallel_all_gather(latents, dim=2)
-        return latents
+        return self._gather_sp_tensor(latents, dim=2)
 
     def can_shard_audio_latents_for_sp(self, audio_latents) -> bool:
         """Return whether this pipeline uses packed audio latents that can be SP-sharded."""
@@ -405,9 +422,9 @@ class PipelineConfig:
         noise_pred = self.gather_latents_for_sp(noise_pred)
         raw_latent_shape = getattr(batch, "raw_latent_shape", None)
         if raw_latent_shape is not None and noise_pred.dim() == 3:
-            orig_s = raw_latent_shape[1]
-            if noise_pred.shape[1] > orig_s:
-                noise_pred = noise_pred[:, :orig_s, :]
+            noise_pred = self._trim_sp_gather_padding(
+                noise_pred, orig_len=raw_latent_shape[1], dim=1
+            )
         return noise_pred
 
     def preprocess_vae_image(self, batch, vae_image_processor):
@@ -441,6 +458,33 @@ class PipelineConfig:
         ).contiguous()
         sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
         return sharded_tensor, True
+
+    def get_text_encoder_attention_mask(
+        self, text_inputs: dict, encoder_index: int
+    ) -> "torch.Tensor | None":
+        """Return the attention mask for the given text encoder.
+
+        Override to suppress (return None) or modify the mask per model.
+        """
+        return text_inputs.get("attention_mask")
+
+    def get_text_encoder_pooler_output(
+        self, outputs: "BaseEncoderOutput", encoder_index: int
+    ) -> "torch.Tensor | None":
+        """Return the pooler output for the given text encoder, or None to skip.
+
+        Override for models that need pooled embeddings (e.g. FLUX v1, SD3).
+        """
+        return None
+
+    def select_vae_weight_files(
+        self,
+        safetensors_list: list[str],
+        component_model_path: str,
+        component_name: str,
+        vae_precision: str,
+    ) -> list[str]:
+        return safetensors_list
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds
@@ -850,8 +894,7 @@ class ImagePipelineConfig(PipelineConfig):
 
     def gather_latents_for_sp(self, latents, batch=None):
         # For image latents [B, S_local, D], gather along sequence dim=1
-        latents = sequence_model_parallel_all_gather(latents, dim=1)
-        return latents
+        return self._gather_sp_tensor(latents, dim=1)
 
     def _unpad_and_unpack_latents(self, latents, batch):
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
@@ -908,7 +951,7 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
         if latents.dim() != 4:
             return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
-        return sequence_model_parallel_all_gather(latents, dim=2)
+        return self._gather_sp_tensor(latents, dim=2)
 
 
 @dataclass

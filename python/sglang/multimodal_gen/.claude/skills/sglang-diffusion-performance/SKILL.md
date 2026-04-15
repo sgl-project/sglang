@@ -88,6 +88,37 @@ sglang generate --model-path Lightricks/LTX-2 \
 
 Note: this generate recipe is aligned with the nightly comparison case `ltx2_twostage_t2v`. After [PR #20707](https://github.com/sgl-project/sglang/pull/20707), `LTX2TwoStagePipeline` is a native path and auto-resolves the spatial upsampler plus distilled LoRA from the same model snapshot unless you override them.
 
+### Native baseline, 2 GPUs: LTX-2.3 one-stage
+
+```bash
+sglang generate --model-path Lightricks/LTX-2.3 \
+  --prompt "A beautiful sunset over the ocean" \
+  --negative-prompt "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width 768 --height 512 \
+  --num-frames 121 --fps 24 \
+  --num-inference-steps 30 --guidance-scale 3.0 \
+  --seed 1234 --num-gpus 2 \
+  --enable-torch-compile --warmup --save-output
+```
+
+Note: use this as the native `LTX2Pipeline` baseline for `LTX-2.3`. It keeps the validated one-stage resolution and explicit `LTX-2.3` sampling defaults, and matches the `ltx23-one-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
+
+### Benchmark target, 2 GPUs: LTX-2.3 two-stage
+
+```bash
+sglang generate --model-path Lightricks/LTX-2.3 \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --prompt "A beautiful sunset over the ocean" \
+  --negative-prompt "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width 1536 --height 1024 \
+  --num-frames 121 --fps 24 \
+  --num-inference-steps 30 --guidance-scale 3.0 \
+  --seed 1234 --num-gpus 2 \
+  --enable-torch-compile --warmup --save-output
+```
+
+Note: this is the recommended benchmark command for the new `LTX-2.3` two-stage path. It uses the native `LTX2TwoStagePipeline` and matches the `ltx23-two-stage` benchmark preset in `sglang-diffusion-benchmark-profile`.
+
 ### Maximum speed, image model, single GPU, lossless
 
 ```bash

@@ -426,20 +426,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 if req.require_reasoning and think_end_id is not None:
                     req.update_reasoning_tokens(id, think_end_id)
                 req.check_finished()
+                if not req.finished() and req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(id)
+                    except ValueError as e:
+                        logger.info(
+                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                        )
+                        raise e
+                    req.check_finished()
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
                     accept_index[i, j + 1 :] = -1
                     break
-                else:
-                    if req.grammar is not None:
-                        try:
-                            req.grammar.accept_token(id)
-                        except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                            )
-                            raise e
             # Update KV cache tracking for the accepted tokens
             req.kv_committed_len += num_accepted
             req.kv_allocated_len = req.kv_committed_len
