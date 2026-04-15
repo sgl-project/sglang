@@ -379,10 +379,6 @@ class Scheduler(
             )
         )
 
-        self.enable_kv_cache_events = bool(
-            server_args.kv_events_config and self.attn_tp_rank == 0
-        )
-
         # Init model configs
         self.init_model_config()
 
@@ -835,6 +831,21 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                from sglang.srt.mem_cache.unified_cache_components import (
+                    ComponentType,
+                )
+                from sglang.srt.mem_cache.unified_radix_cache import (
+                    UnifiedRadixCache,
+                )
+
+                tree_components = [ComponentType.FULL]
+                if self.is_hybrid_swa or self.is_hybrid_ssm:
+                    tree_components.append(
+                        ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
+                    )
+                params.tree_components = tuple(tree_components)
+                self.tree_cache = UnifiedRadixCache(params)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -3673,12 +3684,11 @@ def run_scheduler_process(
     dp_rank = configure_scheduler(
         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
-
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
     # Set cpu affinity to this gpu process
-    if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )

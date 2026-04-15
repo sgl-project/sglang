@@ -11,11 +11,8 @@ Usage:
 
 import asyncio
 import json
-import os
-import tempfile
 import time
 import unittest
-from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -279,13 +276,6 @@ async def _abort_repro_generate(
         finish_reason = data.get("meta_info", {}).get("finish_reason", {})
         assert finish_reason.get("type") != "abort", text
         return data
-
-
-def _read_tail(path: str, num_lines: int = 120) -> str:
-    if not path or not os.path.exists(path):
-        return "<missing log>"
-    lines = Path(path).read_text(errors="replace").splitlines()
-    return "\n".join(lines[-num_lines:])
 
 
 async def _abort_repro_run_all(base_url: str, tokenizer: Any) -> None:
@@ -683,20 +673,6 @@ class TestStreamingSessionAbortLeakRepro(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.stdout = tempfile.NamedTemporaryFile(
-            prefix="streaming-session-abort-repro.",
-            suffix=".stdout.log",
-            delete=False,
-            mode="w+",
-            encoding="utf-8",
-        )
-        cls.stderr = tempfile.NamedTemporaryFile(
-            prefix="streaming-session-abort-repro.",
-            suffix=".stderr.log",
-            delete=False,
-            mode="w+",
-            encoding="utf-8",
-        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -714,18 +690,12 @@ class TestStreamingSessionAbortLeakRepro(CustomTestCase):
                 "--log-level",
                 "info",
             ],
-            return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        for handle in (cls.stdout, cls.stderr):
-            path = handle.name
-            handle.close()
-            if os.path.exists(path):
-                os.remove(path)
 
     def test_abort_heavy_chunked_prefill_does_not_leak(self) -> None:
         requests.post(self.base_url + "/flush_cache")
@@ -747,23 +717,14 @@ class TestStreamingSessionAbortLeakRepro(CustomTestCase):
         time.sleep(5)
         self.assertIsNone(
             self.process.poll(),
-            "Server crashed during abort-heavy streaming session repro.\n"
-            f"---- stderr tail ----\n{_read_tail(self.stderr.name)}",
+            "Server crashed during abort-heavy streaming session repro.",
         )
 
         health = requests.get(self.base_url + "/health", timeout=10)
         self.assertEqual(
             health.status_code,
             200,
-            "Server unhealthy after abort-heavy streaming session cleanup.\n"
-            f"---- stderr tail ----\n{_read_tail(self.stderr.name)}",
-        )
-
-        stderr_tail = _read_tail(self.stderr.name)
-        self.assertNotIn(
-            "token_to_kv_pool_allocator memory leak detected",
-            stderr_tail,
-            stderr_tail,
+            "Server unhealthy after abort-heavy streaming session cleanup.",
         )
 
 

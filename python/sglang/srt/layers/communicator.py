@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
     is_allocation_symmetric,
@@ -55,6 +56,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -1096,8 +1098,13 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(),
             hidden_states,
         )
-        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
-            # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
+        if should_use_dp_reduce_scatterv():
+            get_tp_group().reduce_scatterv(
+                global_hidden_states,
+                output=hidden_states,
+                sizes=get_dp_global_num_tokens(),
+            )
+        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
