@@ -80,6 +80,12 @@ jobs:
           cid="${{ steps.start_container.outputs.container_id }}"
           docker exec "$cid" bash -c "cd /home/sdp && git clone https://github.com/sgl-project/sgl-kernel-xpu.git"
 
+      - name: Cleanup residual processes
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "pkill -9 -f sglang || true"
+          docker exec "$cid" bash -c "pkill -9 -f 'python.*test_' || true"
+
       - name: Run Sglang Kernel Cases
         timeout-minutes: 20
         run: |
