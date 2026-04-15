@@ -772,10 +772,13 @@ MODELOPT_FLUX1_FP8_TRANSFORMER = "BBuf/flux1-dev-modelopt-fp8-sglang-transformer
 MODELOPT_FLUX2_FP8_TRANSFORMER = "BBuf/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_TRANSFORMER = "BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX1_NVFP4_TRANSFORMER = "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
-MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_FLUX2_NVFP4_MODEL = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_WAN22_NVFP4_TRANSFORMER = (
     "BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
 )
+MODELOPT_NVFP4_B200_ENV_VARS = {
+    "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"
+}
 
 
 def _make_modelopt_ci_case(
@@ -830,13 +833,15 @@ ONE_GPU_CASES_C = [
         modality="image",
         sampling_params=MODELOPT_T2I_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
+        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
     ),
     _make_modelopt_ci_case(
         "flux2_modelopt_nvfp4_t2i",
-        model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+        model_path=MODELOPT_FLUX2_NVFP4_MODEL,
         modality="image",
         sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
+        extras=[],
+        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
     ),
     _make_modelopt_ci_case(
         "wan22_modelopt_nvfp4_t2v",
@@ -844,7 +849,7 @@ ONE_GPU_CASES_C = [
         modality="video",
         sampling_params=MODELOPT_T2V_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
-        env_vars={"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"},
+        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
     ),
 ]
 
