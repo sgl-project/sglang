@@ -50,6 +50,34 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 logger = logging.getLogger(__name__)
 
 
+def _is_clippable_layer(module: torch.nn.Module) -> bool:
+    """True if `module` is a Gemma 4 vision/audio Clippable* wrapper.
+
+    These wrap a parallel linear with activation clamping and have no
+    LoRA-aware variant. They share basenames (q_proj, o_proj, gate_up_proj)
+    with language-model linears, so basename-based LoRA dispatch must skip
+    them on VLM checkpoints.
+    """
+    from sglang.srt.layers.clippable_linear import (
+        ClippableColumnParallelLinear,
+        ClippableGateUpParallelLinear,
+        ClippableGLUParallelLinear,
+        ClippableQKVParallelLinear,
+        ClippableRowParallelLinear,
+    )
+
+    return isinstance(
+        module,
+        (
+            ClippableRowParallelLinear,
+            ClippableColumnParallelLinear,
+            ClippableQKVParallelLinear,
+            ClippableGateUpParallelLinear,
+            ClippableGLUParallelLinear,
+        ),
+    )
+
+
 class LoRAManager:
     def __init__(
         self,
@@ -790,6 +818,14 @@ class LoRAManager:
                     q_lora_rank = getattr(self.base_hf_config, "q_lora_rank", None) or 0
                     lora_module.first_output_dim = q_lora_rank
                 self.lora_modules[layer_id][module_name] = lora_module
+                continue
+
+            # Skip Gemma 4 vision/audio Clippable* wrappers. They share basenames
+            # (q_proj, o_proj, gate_up_proj, …) with language-model linears but
+            # have no LoRA-aware variant; without this guard, LoRA dispatch on a
+            # VLM checkpoint hits the vision tower's o_proj and fails with
+            # "No corresponding LoRA layer supported".
+            if _is_clippable_layer(module):
                 continue
 
             # The module should be converted if it is included in target_names
