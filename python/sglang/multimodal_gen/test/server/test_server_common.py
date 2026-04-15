@@ -519,7 +519,10 @@ Consider updating perf_baselines.json with the snippets below:
 "{case.id}": {json.dumps(baseline, indent=4)}
 
 """
-        logger.error(output)
+        # Use print() rather than logger so the dump shows in CI logs even for
+        # passing tests (pytest captures logger.error and only displays it when
+        # the test fails). Refresh-baselines workflows scrape these dumps.
+        print(output, flush=True)
 
     def _validate_consistency(
         self,
