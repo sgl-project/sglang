@@ -79,21 +79,54 @@ class GPUWorkerPostTrainingMixin:
         if not self.pipeline:
             return False, "Pipeline is not initialized"
 
-        expected_named_tensors_sha256, error = self._select_rank_scoped_payload(
-            payloads=req.expected_named_tensors_sha256,
-            field_name="expected_named_tensors_sha256",
-        )
-        if error is not None:
-            return False, error
-
         checker = TensorUpdateChecker(self.pipeline)
-        return checker.verify_across_tp(
+        result = checker.verify_across_tp(
             target_module=req.target_module,
-            expected_named_tensors_sha256=expected_named_tensors_sha256,
+            expected_named_tensors_sha256=req.expected_named_tensors_sha256,
             tp_rank=get_tp_rank(),
             tp_world_size=get_tp_world_size(),
             tp_cpu_group=self.tp_cpu_group,
         )
+        if self.sp_group.world_size == 1:
+            return result
+
+        import torch
+
+        gathered_results = [None] * self.sp_group.world_size if self.sp_group.rank == 0 else None
+        torch.distributed.gather_object(
+            result,
+            gathered_results,
+            dst=0,
+            group=self.sp_cpu_group,
+        )
+
+        final_result = None
+        if self.sp_group.rank == 0:
+            failures = [
+                (rank, message)
+                for rank, (success, message) in enumerate(gathered_results)
+                if not success
+            ]
+            if failures:
+                rank, message = failures[0]
+                if len(failures) == 1:
+                    final_result = (False, f"SP rank {rank}: {message}")
+                else:
+                    final_result = (
+                        False,
+                        f"{len(failures)} SP ranks failed update_weight_from_tensor_checker; "
+                        f"first failure on rank {rank}: {message}",
+                    )
+            else:
+                final_result = result
+
+        final_result_holder = [final_result]
+        torch.distributed.broadcast_object_list(
+            final_result_holder,
+            src=0,
+            group=self.sp_cpu_group,
+        )
+        return final_result_holder[0]
 
     def get_weights_checksum(
         self, module_names: list[str] | None = None

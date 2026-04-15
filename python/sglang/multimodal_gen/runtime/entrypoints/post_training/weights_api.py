@@ -91,7 +91,7 @@ async def update_weights_from_tensor_checker(request: Request):
 
     expected_named_tensors_sha256 = body.get("expected_named_tensors_sha256")
     if (
-        not isinstance(expected_named_tensors_sha256, list)
+        not isinstance(expected_named_tensors_sha256, dict)
         or not expected_named_tensors_sha256
     ):
         return orjson_response(

@@ -26,7 +26,7 @@ class UpdateWeightFromTensorCheckerReqInput:
     """Request to verify live module weights against expected SHA-256 values."""
 
     target_module: str
-    expected_named_tensors_sha256: list[dict[str, str]]
+    expected_named_tensors_sha256: dict[str, str]
 
 
 @dataclass

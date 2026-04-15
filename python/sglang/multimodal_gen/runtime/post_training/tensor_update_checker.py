@@ -15,10 +15,14 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
 _MAX_DISPLAY_TENSORS = 5
 
 
-def compute_tensor_sha256(tensor: torch.Tensor) -> str:
+def _materialize_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if isinstance(tensor, DTensor):
         tensor = tensor._local_tensor
-    tensor = tensor.detach().cpu().contiguous()
+    return tensor.detach().cpu().contiguous()
+
+
+def compute_tensor_sha256(tensor: torch.Tensor) -> str:
+    tensor = _materialize_local_tensor(tensor)
     hasher = hashlib.sha256()
     hasher.update(str(tensor.dtype).encode("utf-8"))
     hasher.update(repr(tuple(tensor.shape)).encode("utf-8"))
@@ -47,42 +51,100 @@ class TensorUpdateChecker:
         tp_world_size: int,
         tp_cpu_group,
     ) -> tuple[bool, str]:
-        result = self.verify(
-            target_module=target_module,
-            expected_named_tensors_sha256=expected_named_tensors_sha256,
-        )
         if tp_world_size == 1:
-            return result
+            return self.verify(
+                target_module=target_module,
+                expected_named_tensors_sha256=expected_named_tensors_sha256,
+            )
 
-        gathered_results: list[tuple[bool, str]] | None = (
-            [result] * tp_world_size if tp_rank == 0 else None
+        module = self.pipeline.get_module(target_module)
+        if module is None:
+            return False, f"Module '{target_module}' is not initialized"
+
+        local_named_tensors = dict(
+            self._iter_module_named_tensors(module, expected_named_tensors_sha256.keys())
         )
-        torch.distributed.gather_object(
-            result,
-            gathered_results,
-            dst=0,
-            group=tp_cpu_group,
+        reference_tensors = dict(module.named_parameters())
+        reference_tensors.update(dict(module.named_buffers()))
+        actual_named_tensors_sha256: dict[str, str] | None = (
+            {} if tp_rank == 0 else None
         )
+
+        for name, expected_sha256 in expected_named_tensors_sha256.items():
+            gathered_tensors: list[torch.Tensor | None] | None = (
+                [None] * tp_world_size if tp_rank == 0 else None
+            )
+            torch.distributed.gather_object(
+                _materialize_local_tensor(local_named_tensors[name])
+                if name in local_named_tensors
+                else None,
+                gathered_tensors,
+                dst=0,
+                group=tp_cpu_group,
+            )
+            if tp_rank != 0:
+                continue
+
+            valid_tensors = [tensor for tensor in gathered_tensors if tensor is not None]
+            if len(valid_tensors) != len(gathered_tensors):
+                continue
+
+            local_sha256s = [compute_tensor_sha256(tensor) for tensor in valid_tensors]
+            if all(local_sha256 == expected_sha256 for local_sha256 in local_sha256s):
+                actual_named_tensors_sha256[name] = expected_sha256
+                continue
+
+            reference_tensor = reference_tensors.get(name)
+            candidate_dims: list[int] = []
+            if isinstance(reference_tensor, DTensor):
+                for placement in reference_tensor.placements:
+                    shard_dim = getattr(placement, "dim", None)
+                    if isinstance(shard_dim, int) and shard_dim not in candidate_dims:
+                        candidate_dims.append(shard_dim)
+            for attr in ("input_dim", "output_dim"):
+                shard_dim = getattr(reference_tensor, attr, None)
+                if isinstance(shard_dim, int) and shard_dim not in candidate_dims:
+                    candidate_dims.append(shard_dim)
+
+            reconstructed_sha256 = None
+            first_tensor = valid_tensors[0]
+            for shard_dim in candidate_dims:
+                if first_tensor.ndim == 0:
+                    break
+
+                shard_dim %= first_tensor.ndim
+                compatible = True
+                for tensor in valid_tensors[1:]:
+                    if tensor.ndim != first_tensor.ndim or tensor.dtype != first_tensor.dtype:
+                        compatible = False
+                        break
+                    if any(
+                        lhs != rhs
+                        for dim, (lhs, rhs) in enumerate(
+                            zip(first_tensor.shape, tensor.shape)
+                        )
+                        if dim != shard_dim
+                    ):
+                        compatible = False
+                        break
+                if not compatible:
+                    continue
+
+                reconstructed = torch.cat(valid_tensors, dim=shard_dim).contiguous()
+                if compute_tensor_sha256(reconstructed) == expected_sha256:
+                    reconstructed_sha256 = expected_sha256
+                    break
+
+            actual_named_tensors_sha256[name] = reconstructed_sha256 or local_sha256s[0]
 
         final_result: tuple[bool, str] | None = None
         if tp_rank == 0:
-            assert gathered_results is not None
-            failures = [
-                (rank, message)
-                for rank, (success, message) in enumerate(gathered_results)
-                if not success
-            ]
-            if failures:
-                rank, message = failures[0]
-                if len(failures) == 1:
-                    final_result = (False, f"TP rank {rank}: {message}")
-                else:
-                    final_result = (
-                        False,
-                        f"{len(failures)} TP ranks failed update_weight_from_tensor_checker; "
-                        f"first failure on rank {rank}: {message}",
-                    )
-            else:
+            final_result = self._compare_manifests(
+                target_module=target_module,
+                expected_named_tensors_sha256=expected_named_tensors_sha256,
+                actual_named_tensors_sha256=actual_named_tensors_sha256,
+            )
+            if final_result[0]:
                 final_result = (
                     True,
                     f"Verified module '{target_module}' update across {tp_world_size} TP ranks.",
