@@ -776,9 +776,7 @@ MODELOPT_FLUX2_NVFP4_MODEL = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_WAN22_NVFP4_TRANSFORMER = (
     "BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
 )
-MODELOPT_NVFP4_B200_ENV_VARS = {
-    "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"
-}
+MODELOPT_NVFP4_B200_ENV_VARS = {"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"}
 
 
 def _make_modelopt_ci_case(
