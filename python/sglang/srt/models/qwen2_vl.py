@@ -442,15 +442,7 @@ class Qwen2VisionTransformer(nn.Module):
             emb.sin().to(x.device, x.dtype),
         )
 
-        # compute cu_seqlens on GPU as int32
-        cu_seqlens = torch.cat(
-            [
-                torch.tensor([0], device=x.device, dtype=torch.int32),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
-                .cumsum(dim=0)
-                .to(device=x.device, dtype=torch.int32),
-            ]
-        )
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw).to(x.device)
 
         return self.cuda_graph_runner.run(
             x=x,
