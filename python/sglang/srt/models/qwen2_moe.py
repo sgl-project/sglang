@@ -208,8 +208,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # n_shared_experts is not defined, but shared_expert_intermediate_size is defined, so we use 1 as the number of shared experts
             self.num_shared_experts = 1
 
-        self.enable_shared_expert_fusion = False
+        self.enable_shared_expert_fusion = False  # default to False
         if _use_aiter:
+            # enable shared expert fusion when use aiter
             self.enable_shared_expert_fusion = (
                 support_shared_expert_fusion and can_fuse_shared_expert(config)
             )
