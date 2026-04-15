@@ -94,6 +94,7 @@ class Session:
         self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
+        self._inflight: bool = False
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
@@ -117,7 +118,10 @@ class Session:
         abort_message = ""
         if self.streaming:
             # Streaming sessions: only simple appends allowed; reject otherwise.
-            if session_params.replace:
+            if self._inflight:
+                abort = True
+                abort_message = "Streaming session already has an active request."
+            elif session_params.replace:
                 abort = True
                 abort_message = "Streaming sessions do not support replace."
             elif session_params.drop_previous_output:
@@ -130,7 +134,9 @@ class Session:
                 abort_message = "Streaming sessions do not support offset."
             elif self.req_nodes:
                 assert len(self.req_nodes) == 1
-                _, last_req_node = self.req_nodes.popitem()
+                # Peek (don't pop) the single req_node. req_nodes is updated
+                # only in finish_req after the request completes successfully.
+                [last_req_node] = self.req_nodes.values()
                 last_req = last_req_node.req
         elif session_params.replace:
             if session_params.rid is None:
@@ -240,14 +246,26 @@ class Session:
         if abort:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
-            if last_req is not None:
-                last_req.session = None
-            self.req_nodes[req.rid] = SessionReqNode(new_req)
+            # req_nodes is NOT updated here — finish_req() handles it.
+            self._inflight = True
         else:
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node
 
         return new_req
+
+    def finish_req(self, req):
+        """Update req_nodes after a streaming request finishes successfully."""
+        self._inflight = False
+        if self.req_nodes:
+            [prev_node] = self.req_nodes.values()
+            prev_node.req.session = None
+            self.req_nodes.clear()
+        self.req_nodes[req.rid] = SessionReqNode(req)
+
+    def abort_req(self):
+        """Clear inflight flag on abort (req_nodes stays unchanged)."""
+        self._inflight = False
 
 
 class SessionController:
@@ -293,9 +311,12 @@ class SessionController:
         session = self.sessions[session_id]
         req = None
         has_unfinished_request = False
-        if session.streaming and session.req_nodes:
+        if session.streaming and session._inflight:
+            has_unfinished_request = True
+        elif session.streaming and session.req_nodes:
             assert len(session.req_nodes) == 1
-            req = next(iter(session.req_nodes.values())).req
+            [last_node] = session.req_nodes.values()
+            req = last_node.req
             if not req.finished():
                 has_unfinished_request = True
 
@@ -312,7 +333,7 @@ class SessionController:
             )
             return
 
-        # No active request -- safe to release immediately.
+        # No owning request -- safe to release immediately.
         if session.streaming and session.req_nodes:
             req = next(iter(session.req_nodes.values())).req
             req.session = None
@@ -329,9 +350,7 @@ class SessionController:
             node.req.multimodal_inputs = None
 
         if isinstance(self.tree_cache, SessionAwareCache):
-            self.tree_cache.release_session(
-                session_id, req if session.streaming else None
-            )
+            self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
         log_info_on_rank0(
             logger, f"Session closed: {session_id} (active={len(self.sessions)})"
@@ -364,7 +383,7 @@ class SessionController:
                 self._close(sid)
 
     @staticmethod
-    def _all_requests_finished(session: "Session") -> bool:
+    def _all_requests_finished(session: Session) -> bool:
         if not session.req_nodes:
             return True
         return all(node.req.finished() for node in session.req_nodes.values())
