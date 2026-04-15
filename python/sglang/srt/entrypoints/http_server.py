@@ -118,6 +118,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    FlushCacheReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -744,9 +745,14 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
+async def flush_cache(
+    timeout: float = Query(0.0, ge=0.0),
+    empty_cache: bool = True,
+):
     """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+    ret = await _global_state.tokenizer_manager.flush_cache(
+        timeout_s=timeout, empty_cache=empty_cache
+    )
     if ret.success:
         content = (
             "Cache flushed.\nPlease check backend logs for more details. "

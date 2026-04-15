@@ -1189,6 +1189,7 @@ class ClearHiCacheReqOutput(BaseReq):
 @dataclass
 class FlushCacheReqInput(BaseReq):
     timeout_s: Optional[float] = None
+    empty_cache: bool = True
 
 
 @dataclass

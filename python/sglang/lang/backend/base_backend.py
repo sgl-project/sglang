@@ -75,7 +75,7 @@ class BaseBackend:
     def shutdown(self):
         pass
 
-    def flush_cache(self):
+    def flush_cache(self, empty_cache: bool = True):
         pass
 
     def get_server_info(self):
