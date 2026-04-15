@@ -496,9 +496,6 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 Preshuffle=False,
                 KVBlockSize=block_kv,
-                ChunkK=128,
-                TotalCuCount=256,
-                WavePerEU=5,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
