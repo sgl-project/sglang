@@ -3205,6 +3205,17 @@ class ServerArgs:
                 logger.warning(
                     "Mixed chunked prefill is disabled because of using SDAR_INTERLEAVED speculative decoding."
                 )
+            # SDAR uses ENCODER_ONLY (bidirectional) attention. The flashinfer
+            # backend's CUDA graph capture path leaves prefix_lens=None for the
+            # prefill indices updater, which causes a TypeError during capture.
+            # Disable CUDA graphs until the capture path is fixed for ENCODER_ONLY.
+            if not self.disable_cuda_graph:
+                self.disable_cuda_graph = True
+                logger.warning(
+                    "CUDA graph is disabled when using SDAR_INTERLEAVED speculative decoding "
+                    "because SDAR's bidirectional attention is not yet compatible with the "
+                    "flashinfer CUDA graph capture path."
+                )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
