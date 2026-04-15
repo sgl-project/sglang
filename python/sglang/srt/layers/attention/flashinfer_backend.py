@@ -17,10 +17,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.compilation.piecewise_context_manager import (
-    get_forward_context,
-    is_in_piecewise_cuda_graph,
-)
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -150,8 +147,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
-        self.page_size = model_runner.page_size
-
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -596,8 +591,24 @@ class FlashInferAttnBackend(AttentionBackend):
                     fast_decode_plan, decode_wrappers[i]
                 )
         elif forward_mode.is_target_verify():
+            # FlashInfer's prefill wrapper decides mask mode based on whether
+            # `custom_mask_buf` is initialized (not whether a custom mask is provided).
+            # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
+            # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
+            # FlashInfer will treat the (zero) buffer as a real mask and block attention.
+            use_custom_mask = (
+                spec_info is not None
+                and getattr(spec_info, "custom_mask", None) is not None
+            )
             prefill_wrappers = []
             for i in range(self.num_wrappers):
+                wrapper_kwargs = {}
+                if use_custom_mask:
+                    wrapper_kwargs = {
+                        "custom_mask_buf": self.cuda_graph_custom_mask,
+                        "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
+                    }
+
                 prefill_wrappers.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -608,8 +619,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
-                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        **wrapper_kwargs,
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
@@ -783,10 +793,14 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
+            causal = (
+                not layer.is_cross_attention
+                and layer.attn_type != AttentionType.ENCODER_ONLY
+            )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
+                causal=causal,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
                 # - Sliding window could cut across item boundaries, breaking semantic coherence
@@ -838,11 +852,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
-                if not self.is_dllm_model:
-                    # TODO: design a better interface
-                    # For other models, use causal attention for the ragged part as previously
-                    causal = True
-
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -1196,8 +1205,6 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
-        self.page_size = attn_backend.page_size
-
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
@@ -1386,13 +1393,8 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            # Reserve extra space in kv_indices for a potential piecewise CUDA graph
-            # dummy request (see below). Worst case: static_num_tokens extra pages.
-            fwd_ctx = get_forward_context()
-            pcg_num_tokens = fwd_ctx.num_tokens if fwd_ctx is not None else None
-            extra_kv = pcg_num_tokens if pcg_num_tokens is not None else 0
             kv_indices = torch.empty(
-                paged_kernel_lens_sum + extra_kv + 256,
+                paged_kernel_lens_sum + 256,
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
@@ -1408,39 +1410,6 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
 
-            # Piecewise CUDA graph padding: input_ids are padded to static_num_tokens,
-            # so q.shape[0] == static_num_tokens but qo_indptr[-1] == actual tokens.
-            # Append a dummy request for the padding tokens so that
-            # qo_indptr[-1] == static_num_tokens, satisfying flashinfer's shape check
-            # without corrupting the causal masks of real requests.
-            # The dummy request's KV indices all point to slot 0 (a scratch location);
-            # its attention output is discarded via the [:raw_num_tokens] slice in replay.
-            bs_eff = bs
-            # extend_num_tokens is a Python int (== sum of seq_lens - prefix_lens),
-            # and paged_kernel_lens_sum is also a Python int (== kv_indptr[-1]),
-            # so this block requires no CPU-GPU synchronisation.
-            actual_qo_tokens = (
-                fwd_ctx.forward_batch.extend_num_tokens if fwd_ctx is not None else None
-            )
-            if (
-                pcg_num_tokens is not None
-                and actual_qo_tokens is not None
-                and pcg_num_tokens > actual_qo_tokens
-            ):
-                pad_tokens = pcg_num_tokens - actual_qo_tokens
-                num_dummy_pages = (pad_tokens + self.page_size - 1) // self.page_size
-                kv_start = (
-                    paged_kernel_lens_sum  # equals kv_indptr[-1], no .item() needed
-                )
-                kv_indices[kv_start : kv_start + num_dummy_pages] = 0
-                qo_indptr = torch.cat(
-                    [qo_indptr, qo_indptr.new_tensor([pcg_num_tokens])]
-                )
-                kv_indptr = torch.cat(
-                    [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
-                )
-                bs_eff = bs + 1
-
             custom_mask = None
         else:
             assert isinstance(spec_info, SpecInput)
@@ -1452,7 +1421,6 @@ class FlashInferIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
-            bs_eff = bs
 
         # extend part
         if use_ragged:
@@ -1494,7 +1462,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr,
             kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs_eff],
+            self.kv_last_page_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
