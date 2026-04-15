@@ -28,7 +28,6 @@ class TestGLM46FP8(unittest.TestCase):
             "--speculative-num-steps=3",
             "--speculative-eagle-topk=1",
             "--speculative-num-draft-tokens=4",
-            "--speculative-draft-model-quantization=compressed-tensors",
         ]
 
         variants = [
