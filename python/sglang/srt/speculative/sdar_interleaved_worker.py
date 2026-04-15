@@ -174,7 +174,7 @@ class SDARInterleavedWorker:
             target_worker.model_runner.model_config.context_len
         )
 
-        logger.info("[TP%d] SDARInterleavedWorker: creating draft TpModelWorker...", tp_rank)
+        print(f"[SDAR_DBG TP{tp_rank}] creating draft TpModelWorker...", flush=True)
         saved_server_args = get_global_server_args()
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
@@ -191,15 +191,15 @@ class SDARInterleavedWorker:
             token_to_kv_pool_allocator=target_kv_allocator,
             memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
-        logger.info("[TP%d] SDARInterleavedWorker: draft TpModelWorker created.", tp_rank)
+        print(f"[SDAR_DBG TP{tp_rank}] draft TpModelWorker created.", flush=True)
         set_global_server_args_for_scheduler(saved_server_args)
 
         self.draft_model_runner = self.draft_worker.model_runner
-        logger.info("[TP%d] SDARInterleavedWorker: resolving mask token id...", tp_rank)
+        print(f"[SDAR_DBG TP{tp_rank}] resolving mask token id...", flush=True)
 
         # Resolve mask token id
         self._mask_token_id = self._resolve_mask_token_id()
-        logger.info("[TP%d] SDARInterleavedWorker: mask_token_id=%d", tp_rank, self._mask_token_id)
+        print(f"[SDAR_DBG TP{tp_rank}] mask_token_id={self._mask_token_id}", flush=True)
 
         # Pre-allocated position offset buffer [block_size]
         self._block_pos_offsets = torch.arange(
