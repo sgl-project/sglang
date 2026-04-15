@@ -433,14 +433,28 @@ class SDARInterleavedWorker:
         # Reset forward_mode to DECODE for next step
         batch.forward_mode = ForwardMode.DECODE
 
-        # next_token_ids: the last token of each block (used for scheduling)
+        # ---------------------------------------------------------------
+        # Update req.output_ids and check finish conditions (Spec V1 requires
+        # the worker to do this; the scheduler's process_batch_result_decode
+        # skips these steps for Spec V1, assuming the worker already handled them).
+        # ---------------------------------------------------------------
+        for i, req in enumerate(batch.reqs):
+            block_ids = block_tokens[i].tolist()
+            for tok in block_ids:
+                req.output_ids.append(tok)
+                req.check_finished()
+                if req.finished():
+                    break
+            req.kv_committed_len += block_size
+            req.kv_allocated_len = req.kv_committed_len
+
         next_token_ids = block_tokens[:, -1]
-        print(f"[SDAR_DBG] decode done: accepted={total_accepted}, next_tok={next_token_ids.tolist()}, seq_lens={batch.seq_lens.tolist()}, mask_remain={int((block_tokens==mask_id).sum())}", flush=True)
+        print(f"[SDAR_DBG] decode done: accepted={total_accepted}, next_tok={next_token_ids.tolist()}, seq_lens={batch.seq_lens.tolist()}, out_ids_len={[len(r.output_ids) for r in batch.reqs]}, finished={[r.finished() for r in batch.reqs]}", flush=True)
 
         return GenerationBatchResult(
             logits_output=None,
             next_token_ids=next_token_ids,
-            num_accepted_tokens=total_accepted,
+            num_accepted_tokens=bs * block_size,
             can_run_cuda_graph=False,
         )
 
