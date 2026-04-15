@@ -30,9 +30,7 @@ class ElasticEPState:
             return
 
         slot = self._get_staging_slot()
-        self.staging_active_ranks_cpu[slot].copy_(
-            self.active_ranks, non_blocking=True
-        )
+        self.staging_active_ranks_cpu[slot].copy_(self.active_ranks, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
         self.staging_events[slot] = event
