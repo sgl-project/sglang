@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -707,6 +707,9 @@ class Step3p5Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
             return self.get_input_embeddings()(input_ids) * self.config.scale_emb
@@ -735,7 +738,12 @@ class Step3p5Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -751,26 +759,18 @@ class Step3p5Model(nn.Module):
                     "residual": residual,
                 }
             )
-        else:
-            hidden_states_before_norm = None
-            if not self.pp_group.is_last_rank:
-                return PPProxyTensors(
-                    {
-                        "hidden_states": hidden_states,
-                        "residual": residual,
-                    }
-                )
+        hidden_states_before_norm = None
+        if hidden_states.shape[0] > 0:
+            hidden_states_before_norm = (
+                hidden_states if residual is None else hidden_states + residual
+            )
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
             else:
-                if hidden_states.shape[0] > 0:
-                    # if forward_batch.return_hidden_states_before_norm:
-                    hidden_states_before_norm = (
-                        hidden_states if residual is None else hidden_states + residual
-                    )
-                    if residual is None:
-                        hidden_states = self.norm(hidden_states)
-                    else:
-                        hidden_states, _ = self.norm(hidden_states, residual)
-            return hidden_states, hidden_states_before_norm
+                hidden_states, _ = self.norm(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, hidden_states_before_norm, aux_hidden_states
+        return hidden_states, hidden_states_before_norm
 
 
 class Step3p5ForCausalLM(nn.Module):
@@ -842,6 +842,9 @@ class Step3p5ForCausalLM(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
 
@@ -854,24 +857,40 @@ class Step3p5ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states, hidden_states_before_norm = self.model(
+        model_out = self.model(
             input_ids,
             positions,
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if not self.pp_group.is_last_rank:
+            return model_out
 
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.lm_head,
-                forward_batch,
-                hidden_states_before_norm=hidden_states_before_norm,
-            )
+        aux_hidden_states = None
+        if (
+            self.capture_aux_hidden_states
+            and isinstance(model_out, tuple)
+            and len(model_out) == 3
+        ):
+            hidden_states, hidden_states_before_norm, aux_hidden_states = model_out
         else:
-            return hidden_states
+            hidden_states, hidden_states_before_norm = model_out
+
+        if aux_hidden_states is not None:
+            # Null out hidden_states_before_norm so LogitsProcessor uses the EAGLE3
+            # aux captures instead (LogitsProcessor prefers hidden_states_before_norm
+            # when both are provided, which would incorrectly discard aux captures).
+            hidden_states_before_norm = None
+
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
+            hidden_states_before_norm=hidden_states_before_norm,
+        )
 
     @property
     def start_layer(self):
@@ -880,6 +899,18 @@ class Step3p5ForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def set_eagle3_layers_to_capture(
+        self, layer_ids: Optional[List[int]] = None
+    ) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         # NOTE:
