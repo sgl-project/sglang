@@ -6,16 +6,18 @@ import os
 import unittest
 from pathlib import Path
 
-# Import base test class
-from test_deepseek_ocr import TestDeepSeekOCR
 from transformers import AutoTokenizer
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
+
+# Import base test class
+from test_deepseek_ocr import TestDeepSeekOCR
 
 # Register for per-commit XPU tests (higher est_time to run before test_deepseek_ocr.py)
 register_xpu_ci(est_time=400, suite="per-commit-xpu")
@@ -54,6 +56,13 @@ class TestDeepSeekOCRTriton(TestDeepSeekOCR):
                 *cls.common_args,
             ],
         )
+
+    @classmethod
+    def tearDownClass(cls):
+        """Ensure server process is killed after tests."""
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+        cls._cleanup_xpu_memory()
 
 
 if __name__ == "__main__":
