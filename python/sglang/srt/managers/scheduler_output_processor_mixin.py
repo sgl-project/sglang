@@ -89,6 +89,8 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
+                if self.enable_hisparse:
+                    self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
@@ -588,7 +590,7 @@ class SchedulerOutputProcessorMixin:
                 actual_seq_len = req.seqlen - 1
                 if (
                     actual_seq_len // mamba_track_interval
-                    != (actual_seq_len - result.accept_length_per_req_cpu[i])
+                    != (actual_seq_len - result.accept_length_per_req_cpu[i] - 1)
                     // mamba_track_interval
                 ):
                     req.mamba_next_track_idx = (
