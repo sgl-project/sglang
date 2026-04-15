@@ -112,6 +112,7 @@ jobs:
             -v ${HF_HOME}:/home/sdp/.cache/huggingface \
             --device /dev/dri \
             -v /dev/dri/by-path:/dev/dri/by-path \
+            --ipc=host \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
             xpu_sglang_main:bmg)
           echo "Started container: $container_id"
