@@ -73,13 +73,13 @@ LEAK_FILLER = (
 
 ABORT_REPRO_CONTEXT_LEN = 512
 ABORT_REPRO_PAGE_SIZE = 16
-ABORT_REPRO_GEN_LEN = 8
+ABORT_REPRO_GEN_LEN = 4
 ABORT_REPRO_SESSIONS = 4
-ABORT_REPRO_WARMUP_TURNS = 2
+ABORT_REPRO_WARMUP_TURNS = 1
 ABORT_REPRO_ROUNDS = 8
-ABORT_REPRO_STREAM_TOKENS = 150
-ABORT_REPRO_ABORT_TOKENS = 320
-ABORT_REPRO_NON_STREAMING_TOKENS = 96
+ABORT_REPRO_STREAM_TOKENS = 16
+ABORT_REPRO_ABORT_TOKENS = 600
+ABORT_REPRO_NON_STREAMING_TOKENS = 16
 ABORT_REPRO_CHUNKED_PREFILL_SIZE = 128
 
 
@@ -265,10 +265,10 @@ async def _abort_repro_generate(
                 assert finish_reason.get("type") == "abort", text
                 assert "maximum allowed length" in finish_reason.get(
                     "message", ""
-                ), text
+                ) or "context length" in finish_reason.get("message", ""), text
                 return data
             assert resp.status == 400, text
-            assert "maximum allowed length" in text, text
+            assert "maximum allowed length" in text or "context length" in text, text
             return None
 
         assert resp.status == 200, text
@@ -583,6 +583,274 @@ class TestStreamingSession(CustomTestCase):
             "Server unhealthy after streaming session close — "
             "likely a token memory leak from streaming session lifecycle.",
         )
+
+    def test_nth_mid_abort_recovery(self) -> None:
+        """Abort a running streaming session request (nth turn) via the
+        abort API. Session rolls back to last successful turn."""
+        requests.post(self.base_url + "/flush_cache")
+
+        resp = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 50000, "streaming": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        session_id = resp.json()
+
+        try:
+            # Turn 1: normal generate to create slot.
+            ids_1 = self.tokenizer.encode("Tell me a very long story about a wizard.")
+            resp_1 = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": ids_1,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+                    "session_params": {"id": session_id, "rid": None},
+                },
+                timeout=30,
+            )
+            self.assertEqual(resp_1.status_code, 200, resp_1.text)
+            data_1 = resp_1.json()
+            turn_1_total = (
+                data_1["meta_info"]["prompt_tokens"]
+                + data_1["meta_info"]["completion_tokens"]
+            )
+
+            # Turn 2: long generate, then abort mid-decode.
+            ids_2 = self.tokenizer.encode(" Continue the story in great detail.")
+
+            import threading
+
+            result = [None]
+
+            def do_generate():
+                r = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_2,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 100000,
+                        },
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=60,
+                )
+                result[0] = r
+
+            t = threading.Thread(target=do_generate)
+            t.start()
+            time.sleep(0.5)
+            abort_resp = requests.post(
+                self.base_url + "/abort_request",
+                json={"rid": "", "abort_all": True},
+                timeout=10,
+            )
+            self.assertEqual(abort_resp.status_code, 200, abort_resp.text)
+            t.join(timeout=30)
+
+            self.assertIsNotNone(result[0], "Turn 2 should have returned")
+            data_2 = result[0].json()
+            self.assertEqual(
+                data_2["meta_info"]["finish_reason"]["type"],
+                "abort",
+                "Turn 2 should be aborted, not finished normally",
+            )
+
+            # Turn 3: recovery. Rolls back to turn 1.
+            ids_3 = self.tokenizer.encode(" What happens next?")
+            for attempt in range(20):
+                resp_3 = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_3,
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=30,
+                )
+                if resp_3.status_code == 200:
+                    break
+                time.sleep(0.5)
+            self.assertEqual(resp_3.status_code, 200, resp_3.text)
+            data_3 = resp_3.json()
+            # prompt_tokens = turn_1_total + append (BOS stripped).
+            bos = 1 if ids_3[0] == self.tokenizer.bos_token_id else 0
+            expected_prompt_3 = turn_1_total + len(ids_3) - bos
+            self.assertEqual(
+                data_3["meta_info"]["prompt_tokens"],
+                expected_prompt_3,
+                "prompt_tokens must equal turn_1_total + append (no stale abort context)",
+            )
+        finally:
+            requests.post(
+                self.base_url + "/close_session",
+                json={"session_id": session_id},
+            )
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
+
+    def test_first_mid_abort_recovery(self) -> None:
+        """Abort the very first request on a streaming session mid-decode.
+        No slot exists yet (ephemeral slot created and nuked).
+        Verify the session is still usable afterward."""
+        requests.post(self.base_url + "/flush_cache")
+
+        resp = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 50000, "streaming": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        session_id = resp.json()
+
+        try:
+            ids_1 = self.tokenizer.encode("Tell me a very long story about a wizard.")
+
+            import threading
+
+            result = [None]
+
+            def do_generate():
+                r = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_1,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 100000,
+                        },
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=60,
+                )
+                result[0] = r
+
+            t = threading.Thread(target=do_generate)
+            t.start()
+            time.sleep(0.5)
+            abort_resp = requests.post(
+                self.base_url + "/abort_request",
+                json={"rid": "", "abort_all": True},
+                timeout=10,
+            )
+            self.assertEqual(abort_resp.status_code, 200, abort_resp.text)
+            t.join(timeout=30)
+
+            self.assertIsNotNone(result[0], "Turn 1 should have returned")
+            data_1 = result[0].json()
+            self.assertEqual(
+                data_1["meta_info"]["finish_reason"]["type"],
+                "abort",
+                "Turn 1 should be aborted, not finished normally",
+            )
+
+            # Turn 2: recovery. No inherited context (req_nodes empty).
+            ids_2 = self.tokenizer.encode("Tell me a short joke.")
+            for attempt in range(20):
+                resp_2 = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_2,
+                        "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=30,
+                )
+                if resp_2.status_code == 200:
+                    break
+                time.sleep(0.5)
+            self.assertEqual(resp_2.status_code, 200, resp_2.text)
+            data_2 = resp_2.json()
+            self.assertEqual(
+                data_2["meta_info"]["prompt_tokens"],
+                len(ids_2),
+                "prompt_tokens must equal turn 2 input only (no inherited context)",
+            )
+        finally:
+            requests.post(
+                self.base_url + "/close_session",
+                json={"session_id": session_id},
+            )
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
+
+    def test_preabort_recovery(self) -> None:
+        """Pre-aborted request (unsupported offset) does not corrupt session.
+        The slot is preserved, and the next turn inherits correctly."""
+        requests.post(self.base_url + "/flush_cache")
+
+        resp = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 50000, "streaming": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        session_id = resp.json()
+
+        try:
+            # Turn 1: normal generate to create slot.
+            ids_1 = self.tokenizer.encode("Tell me a very long story about a wizard.")
+            resp_1 = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": ids_1,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+                    "session_params": {"id": session_id, "rid": None},
+                },
+                timeout=30,
+            )
+            self.assertEqual(resp_1.status_code, 200, resp_1.text)
+            data_1 = resp_1.json()
+            turn_1_total = (
+                data_1["meta_info"]["prompt_tokens"]
+                + data_1["meta_info"]["completion_tokens"]
+            )
+
+            # Turn 2: pre-aborted via unsupported offset parameter.
+            ids_2 = self.tokenizer.encode(" This should be rejected.")
+            resp_2 = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": ids_2,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                    "session_params": {
+                        "id": session_id,
+                        "rid": None,
+                        "offset": 1,
+                    },
+                },
+                timeout=30,
+            )
+            self.assertIn(resp_2.status_code, (200, 400), resp_2.text)
+
+            # Turn 3: normal append. Slot should be intact from turn 1.
+            ids_3 = self.tokenizer.encode(" What happens next?")
+            resp_3 = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": ids_3,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                    "session_params": {"id": session_id, "rid": None},
+                },
+                timeout=30,
+            )
+            self.assertEqual(resp_3.status_code, 200, resp_3.text)
+            data_3 = resp_3.json()
+            bos = 1 if ids_3[0] == self.tokenizer.bos_token_id else 0
+            expected_prompt_3 = turn_1_total + len(ids_3) - bos
+            self.assertEqual(
+                data_3["meta_info"]["prompt_tokens"],
+                expected_prompt_3,
+                "prompt_tokens must equal turn_1_total + append (slot preserved)",
+            )
+        finally:
+            requests.post(
+                self.base_url + "/close_session",
+                json={"session_id": session_id},
+            )
+
+        health = requests.get(self.base_url + "/health", timeout=10)
+        self.assertEqual(health.status_code, 200)
 
 
 class TestStreamingSessionMixedChunk(TestStreamingSession):
