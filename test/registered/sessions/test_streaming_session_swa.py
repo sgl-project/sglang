@@ -74,8 +74,8 @@ class TestStreamingSessionSWA(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionSWARetract(TestStreamingSession):
-    """SWA under retract decode pressure."""
+class TestStreamingSessionSWARetractLargePage(TestStreamingSession):
+    """SWA under retract decode with page=256."""
 
     @classmethod
     def setUpClass(cls):
@@ -91,7 +91,9 @@ class TestStreamingSessionSWARetract(TestStreamingSession):
                 other_args=[
                     "--enable-streaming-session",
                     "--chunked-prefill-size",
-                    "128",
+                    "4096",
+                    "--page-size",
+                    "256",
                     *SWA_COMMON_ARGS,
                 ],
             )

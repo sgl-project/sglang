@@ -861,33 +861,6 @@ class TestStreamingSession(CustomTestCase):
         self.assertEqual(health.status_code, 200)
 
 
-class TestStreamingSessionRetract(TestStreamingSession):
-    """Streaming session under retract decode pressure."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_TEST_RETRACT.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--enable-streaming-session",
-                    "--chunked-prefill-size",
-                    "128",
-                ],
-            )
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
 class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
     """Streaming session under retract decode with --enable-mixed-chunk."""
 
