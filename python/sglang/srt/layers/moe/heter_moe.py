@@ -68,6 +68,13 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
             cfg["_int4_only_by_layer"] = json.load(f)
     else:
         cfg["_int4_only_by_layer"] = {}
+    tl = cfg.get("target_layers")
+    if tl is not None:
+        if not isinstance(tl, list) or not all(isinstance(i, int) for i in tl):
+            raise ValueError(
+                f"target_layers must be a list of ints, got {tl!r}"
+            )
+        cfg["target_layers"] = sorted(set(tl))
     return cfg
 
 
@@ -736,6 +743,8 @@ def apply_heter_precision(
 
     heter_config = _parse_heter_config(config_path)
     int4_only_by_layer = heter_config.get("_int4_only_by_layer", {})
+    target_layers = heter_config.get("target_layers")
+    target_set = set(target_layers) if target_layers is not None else None
 
     # Find INT4 group's checkpoint path
     int4_checkpoint = None
@@ -760,6 +769,8 @@ def apply_heter_precision(
 
     num_swapped = 0
     for layer_id, layer in enumerate(layers_module):
+        if target_set is not None and layer_id not in target_set:
+            continue
         # Find the FusedMoE experts module
         fused_moe = None
         moe_parent = None
