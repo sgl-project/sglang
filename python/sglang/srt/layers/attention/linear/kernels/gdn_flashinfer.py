@@ -3,7 +3,7 @@
 Both SM90 and SM100+ use the same pool layout: [pool, HV, V, K] (K-last).
 
 SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
-SM100+ (Blackwell+): decode-only with bf16 state.  More support on the way.
+SM100+ (Blackwell+): decode and prefill with bf16 state.  MTP verify on the way.
 
 Requires flashinfer >= 0.6.4 (SM90) or >= 0.6.5 (SM100+).
 """
@@ -74,8 +74,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     """FlashInfer kernel for GDN with K-last SSM state layout.
 
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
-    SM100+ (Blackwell+): decode uses pool API (initial_state_indices); prefill
-    and MTP verify are not supported (use Triton backend for those).
+    SM100+ (Blackwell+): decode and prefill supported; MTP verify not yet supported.
 
     Requires flashinfer >= 0.6.4 (SM90) or >= 0.6.5 (SM100+).
     """
@@ -97,7 +96,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
 
         sm_major = torch.cuda.get_device_capability()[0]
-        self.use_state_pool = sm_major != 9
+        self.is_sm100plus = sm_major != 9
 
         if sm_major == 9:
             if self._prefill_fn is None:
@@ -136,7 +135,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         a_fi = a.view(batch_size, 1, num_v_heads)
         b_fi = b.view(batch_size, 1, num_v_heads)
 
-        if self.use_state_pool:
+        if self.is_sm100plus:
             output_fi, _ = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
@@ -186,13 +185,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
-        if self.use_state_pool:
-            raise NotImplementedError(
-                "FlashInfer GDN prefill is not supported on SM100+. "
-                "Use --linear-attn-prefill-backend triton."
-            )
-
-        # SM90: chunked prefill using FlashInfer GDN prefill kernel.
         from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 
         total_seq_len = q.shape[1]
@@ -207,30 +199,57 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
-        cu_seqlens_fi = query_start_loc.to(torch.int64)
 
-        # Remap negative padding indices to sentinel slot
-        ssm_cache_indices = torch.where(
-            cache_indices >= 0,
-            cache_indices,
-            ssm_states.shape[0] - 1,
-        ).to(torch.int64)
-
-        # FlashInfer requires float32 initial state, K-last layout [B, HV, V, K]
-        initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
-
-        output_fi, output_state_fi = self._prefill_fn(
-            q=q_fi,
-            k=k_fi,
-            v=v_fi,
-            g=alpha_fi,
-            beta=beta_fi,
-            scale=None,
-            initial_state=initial_state_fi,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens_fi,
-            use_qk_l2norm_in_kernel=False,
-        )
+        if self.is_sm100plus:
+            # SM100+: slot 0 is reserved as dummy/scratch (never assigned to real
+            # sequences), so clamp(-1 → 0).
+            ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
+            num_seqs = ssm_cache_indices.shape[0]
+            num_sab_heads = max(q.shape[2], num_v_heads)
+            head_k_dim = q.shape[3]
+            # Pre-allocate bf16 output_state so the kernel compiles and writes the
+            # bf16 state path directly, avoiding a fp32 allocation and a subsequent
+            # fp32->bf16 conversion in the scatter step.
+            output_state_fi = torch.empty(
+                (num_seqs, num_sab_heads, head_v_dim, head_k_dim),
+                dtype=ssm_states.dtype,
+                device=ssm_states.device,
+            )
+            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
+            output_fi, output_state_fi = self._prefill_fn(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                g=alpha_fi,
+                beta=beta_fi,
+                scale=None,
+                initial_state=initial_state_fi,
+                output_final_state=True,
+                cu_seqlens=query_start_loc,  # already int32
+                use_qk_l2norm_in_kernel=False,
+                output_state=output_state_fi,
+            )
+        else:
+            # SM90: preserve original negative-index handling (remap to last slot).
+            ssm_cache_indices = torch.where(
+                cache_indices >= 0,
+                cache_indices,
+                ssm_states.shape[0] - 1,
+            ).to(torch.int64)
+            # State must be float32; kernel requires int64 cu_seqlens.
+            initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
+            output_fi, output_state_fi = self._prefill_fn(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                g=alpha_fi,
+                beta=beta_fi,
+                scale=None,
+                initial_state=initial_state_fi,
+                output_final_state=True,
+                cu_seqlens=query_start_loc.to(torch.int64),
+                use_qk_l2norm_in_kernel=False,
+            )
 
         # Write back state to pool
         ssm_states.index_copy_(
@@ -267,7 +286,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        if self.use_state_pool:
+        if self.is_sm100plus:
             raise NotImplementedError(
                 "FlashInfer GDN MTP verify is not yet supported on SM100+."
             )
