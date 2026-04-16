@@ -1,6 +1,8 @@
 import logging
 from typing import Any, Dict, Optional
 
+import torch
+
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -146,50 +148,69 @@ class WhisperProcessor(BaseMultimodalProcessor):
                 f"Whisper expects exactly 1 audio input, got {len(audio_data)}"
             )
 
+        # Check if this is a fused auto-detect request (decoder prompt = [SOT] only,
+        # structured generation handles the rest via regex constraint).
+        detect_language = self._pop_sampling_param(request_obj, "_detect_language")
+
         audios = [load_audio(audio) for audio in audio_data]
-
-        # For Whisper, ALWAYS use the proper transcription token sequence
-        # and IGNORE any text prompt - Whisper is a pure speech-to-text model
-        # The decoder_start_token_id and forced_decoder_ids from generation config
-        # set up: <|startoftranscript|> <|lang|> <|task|> [<|notimestamps|> or <|0.00|>]
-
-        language = normalize_language_to_code(
-            self._pop_sampling_param(request_obj, "language")
-        )
-        language_token_id = self._get_language_token_id(language)
-        timestamp_granularities = self._pop_sampling_param(
-            request_obj, "timestamp_granularities"
-        )
-
-        # Build decoder input tokens
-        decoder_start_token_id = getattr(
-            self.hf_config, "decoder_start_token_id", 50258
-        )
-        transcribe_token_id = self._tokenizer.convert_tokens_to_ids("<|transcribe|>")
-
-        # Use <|0.00|> to enable timestamp generation, or <|notimestamps|> to disable
-        if timestamp_granularities:
-            timestamp_token_id = self._tokenizer.convert_tokens_to_ids("<|0.00|>")
-        else:
-            timestamp_token_id = self._tokenizer.convert_tokens_to_ids(
-                "<|notimestamps|>"
-            )
-
-        input_ids = [
-            decoder_start_token_id,
-            language_token_id,
-            transcribe_token_id,
-            timestamp_token_id,
-        ]
 
         # Whisper expects input features padded to max_length (3000 frames = 30 seconds)
         # This is the standard context length for Whisper
-        input_features = self._processor.feature_extractor(
-            audios[0],
+        fe_kwargs: dict[str, Any] = dict(
             sampling_rate=16000,
             padding="max_length",  # Pad to 3000 frames
             return_tensors="pt",
+        )
+        if torch.cuda.is_available():
+            fe_kwargs["device"] = "cuda"
+        input_features = self._processor.feature_extractor(
+            audios[0],
+            **fe_kwargs,
         )["input_features"][0]
+
+        # Whisper is a pure speech-to-text model; text prompts are ignored.
+        # The full decoder sequence is:
+        #   <|startoftranscript|> <|lang|> <|transcribe|> [<|notimestamps|> | <|0.00|>]
+        #
+        # When language is known, we build this prefix explicitly below.
+        # When auto-detecting (_detect_language=True), we feed only <|startoftranscript|>
+        # and let SGLang's structured generation (regex) constrain the model to produce
+        # <|lang|><|transcribe|><|notimestamps|> as the first 3 decode tokens — this is
+        # equivalent to HuggingFace's forced_decoder_ids but uses SGLang's native API.
+
+        decoder_start_token_id = getattr(
+            self.hf_config, "decoder_start_token_id", 50258
+        )
+
+        if detect_language:
+            input_ids = [decoder_start_token_id]
+        else:
+            language = normalize_language_to_code(
+                self._pop_sampling_param(request_obj, "language")
+            )
+            language_token_id = self._get_language_token_id(language)
+            timestamp_granularities = self._pop_sampling_param(
+                request_obj, "timestamp_granularities"
+            )
+
+            transcribe_token_id = self._tokenizer.convert_tokens_to_ids(
+                "<|transcribe|>"
+            )
+
+            # Use <|0.00|> to enable timestamp generation, or <|notimestamps|> to disable
+            if timestamp_granularities:
+                timestamp_token_id = self._tokenizer.convert_tokens_to_ids("<|0.00|>")
+            else:
+                timestamp_token_id = self._tokenizer.convert_tokens_to_ids(
+                    "<|notimestamps|>"
+                )
+
+            input_ids = [
+                decoder_start_token_id,
+                language_token_id,
+                transcribe_token_id,
+                timestamp_token_id,
+            ]
 
         return MultimodalProcessorOutput(
             input_ids=input_ids,

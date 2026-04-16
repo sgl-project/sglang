@@ -38,6 +38,52 @@ async def execute_warmups(
         await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
 
 
+@warmup("whisper_autodetect")
+async def whisper_autodetect(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Pre-compile the xgrammar FSM for Whisper auto-detect regex.
+
+    The first request that uses the structured generation regex incurs a
+    ~15-20s compilation cost.  Running it at startup avoids a latency
+    spike on the first real request.
+    """
+    from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
+        WHISPER_AUTODETECT_REGEX,
+    )
+
+    logger.info(
+        "Compiling Whisper auto-detect regex FSM (one-time, ~15-20s)..."
+    )
+    # A short silent audio encoded as base64 WAV (0.1s, 16kHz, mono)
+    import base64, io, struct
+
+    sr, dur = 16000, 0.1
+    n = int(sr * dur)
+    # Minimal WAV: RIFF header + fmt chunk + data chunk with silence
+    data = struct.pack("<h", 0) * n
+    buf = io.BytesIO()
+    import soundfile as sf
+
+    sf.write(buf, [0.0] * n, sr, format="WAV")
+    audio_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    req = GenerateReqInput(
+        text="",
+        audio_data=f"data:audio/wav;base64,{audio_b64}",
+        sampling_params={
+            "max_new_tokens": 4,
+            "temperature": 0,
+            "regex": WHISPER_AUTODETECT_REGEX,
+            "skip_special_tokens": False,
+            "_detect_language": True,
+        },
+        modalities=["audio"],
+    )
+    await tokenizer_manager.generate_request(req, None).__anext__()
+    logger.info("Whisper auto-detect regex FSM compiled.")
+
+
 @warmup("voice_chat")
 async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
     # this warms up the fused_moe triton kernels and caches them

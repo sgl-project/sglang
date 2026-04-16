@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
@@ -21,6 +21,49 @@ class TranscriptionAdapter(ABC):
     @abstractmethod
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         """Return the ``sampling_params`` dict for ``GenerateReqInput``."""
+
+    @property
+    def supports_language_detection(self) -> bool:
+        """Whether this model supports automatic language detection.
+
+        When True, the adapter must implement the fused autodetect methods
+        and the standalone detection methods below.
+        """
+        return False
+
+    # -- Fused detect+transcribe (used by the server) ----------------------
+
+    def build_fused_autodetect_params(self, request) -> dict:
+        """Return ``sampling_params`` dict for a fused detect+transcribe request.
+
+        Uses structured generation (``regex``) to constrain the output prefix
+        to a valid language + task token sequence while allowing free
+        transcription afterwards — all in a single request.
+        """
+        raise NotImplementedError
+
+    def parse_fused_output(self, text: str) -> tuple:
+        """Parse the fused output to extract (language_code, transcription_text)."""
+        raise NotImplementedError
+
+    # -- Standalone detection (for external callers) -----------------------
+
+    def build_language_detection_params(self, tokenizer) -> dict:
+        """Return ``sampling_params`` dict for a language-detection-only request.
+
+        Produces a single token (the language), constrained to valid language
+        token IDs.  Callers can send this via the ``/generate`` endpoint.
+        """
+        raise NotImplementedError
+
+    def parse_language_detection_output(
+        self, output_ids: List[int], tokenizer
+    ) -> Optional[str]:
+        """Parse the detected language from a detection-only output.
+
+        Returns an ISO 639-1 language code (e.g. ``"en"``), or None on failure.
+        """
+        raise NotImplementedError
 
     @property
     def supports_chunked_streaming(self) -> bool:

@@ -80,7 +80,10 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, TranscriptionRequest]:
         """Convert transcription request to internal format."""
-        sampling_params = self._adapter.build_sampling_params(request)
+        if getattr(request, "_fused_autodetect", False):
+            sampling_params = self._adapter.build_fused_autodetect_params(request)
+        else:
+            sampling_params = self._adapter.build_sampling_params(request)
         adapted_request = GenerateReqInput(
             text="",  # Empty text — the multimodal processor sets proper decoder/prompt tokens
             audio_data=request.audio_data,
@@ -125,6 +128,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # Calculate audio duration for usage reporting
         audio_duration_s = self._get_audio_duration(audio_data)
 
+        # When language is not specified and the adapter supports detection,
+        # use a single fused request: SGLang's structured generation (regex)
+        # constrains the first 3 decode tokens to <|lang|><|transcribe|><|notimestamps|>
+        # while allowing free transcription afterwards — one encoder pass, no
+        # extra round-trip.
+        use_fused = language is None and self._adapter.supports_language_detection
+
         # Build request
         request = TranscriptionRequest(
             audio_data=audio_data,
@@ -136,6 +146,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
             stream=stream,
             audio_duration_s=audio_duration_s,
         )
+        if use_fused:
+            request._fused_autodetect = True
 
         # Use the base class handle_request pattern
         return await self.handle_request(request, raw_request)
@@ -161,6 +173,14 @@ class OpenAIServingTranscription(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         text = self._adapter.postprocess_text(ret.get("text", ""))
+
+        # For fused auto-detect requests, strip the forced prefix
+        # (<|lang|><|transcribe|><|notimestamps|>) and extract the language.
+        if getattr(request, "_fused_autodetect", False):
+            lang, text = self._adapter.parse_fused_output(text)
+            request.language = lang
+            logger.info("Auto-detected language: '%s'", lang)
+
         usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
         # Build response based on format
