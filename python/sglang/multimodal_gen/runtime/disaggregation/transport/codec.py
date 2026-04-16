@@ -53,13 +53,10 @@ class TensorWrapper:
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         self.tensor = tensor
-
-    def __buffer__(self, flags=0):
-        data_ptr = self.tensor.data_ptr()
-        total_bytes = self.tensor.numel() * self.tensor.element_size()
-        c_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
-        c_obj._keep_alive_ref = self  # prevent GC while ZMQ holds the buffer
-        return memoryview(c_obj)
+        data_ptr = tensor.data_ptr()
+        total_bytes = tensor.numel() * tensor.element_size()
+        self._c_buf = (ctypes.c_char * total_bytes).from_address(data_ptr)
+        self._view = memoryview(self._c_buf)
 
 
 @dataclass
@@ -147,7 +144,7 @@ def send_tensors(
     """Send tensors over ZMQ using multipart with zero-copy."""
     metadata_bytes, buffers = pack_tensors(tensor_fields, scalar_fields)
     parts: list = [metadata_bytes]
-    parts.extend(buffers)
+    parts.extend(w._view if isinstance(w, TensorWrapper) else w for w in buffers)
     socket.send_multipart(parts, flags=flags, copy=False)
 
 

@@ -105,14 +105,6 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     }
 )
 
-# Pre-compute base SamplingParams defaults for the field walk in
-# extract_transfer_fields().  The receiver creates a plain SamplingParams()
-# (not the model-specific subclass), so we must compare against *base*
-# defaults.  Without this, fields whose value equals a subclass default but
-# differs from the base default (e.g. ZImageTurboSamplingParams overrides
-# num_inference_steps=9 while the base default is None) are silently dropped
-# and arrive as None on the receiver, causing DenoisingStage verify_input to
-# fail.
 _BASE_SP_DEFAULTS: dict[str, Any] = {}
 for _f in dataclasses.fields(SamplingParams):
     if _f.default is not dataclasses.MISSING:
@@ -198,12 +190,6 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
         # Qwen-Image's true_cfg_scale (and any future feature added to
         # SamplingParams). Using a field-walk keeps the disagg boundary
         # feature-complete without needing to edit this list.
-        #
-        # Compare against *base* SamplingParams defaults, not the subclass
-        # defaults returned by dataclasses.fields(sp).  The receiver creates
-        # a plain SamplingParams(), so subclass-specific defaults (e.g.
-        # ZImageTurboSamplingParams.num_inference_steps=9 vs base None)
-        # must be transferred explicitly.
         for f in dataclasses.fields(sp):
             name = f.name
             if name in _SAMPLING_PARAMS_EXCLUDE_FIELDS:
@@ -1275,13 +1261,6 @@ class SchedulerDisaggMixin:
         extra_keys = [k for k in scalar_fields if k.startswith("_extra_")]
         for key in extra_keys:
             req.extra[key[len("_extra_") :]] = scalar_fields.pop(key)
-        # Overlay scalar fields from the transfer message.
-        # Use setattr (not __dict__.update) so Req.__setattr__ routes
-        # SamplingParams-owned fields (e.g. num_inference_steps) to
-        # req.sampling_params.  A raw __dict__.update would shadow them
-        # on the instance, making them invisible to extract_transfer_fields
-        # (which walks dataclasses.fields) and breaking the multi-rank
-        # broadcast path in _broadcast_req_to_all_ranks.
         for key, value in scalar_fields.items():
             setattr(req, key, value)
         # Set tensor fields
