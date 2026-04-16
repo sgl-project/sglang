@@ -1,6 +1,5 @@
 import shutil
 import tempfile
-import time
 import unittest
 from types import SimpleNamespace
 
@@ -19,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=540, suite="stage-c-test-4-gpu-h100")
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.8}}
@@ -107,8 +106,12 @@ class TestQwen35WithHiCache(CustomTestCase):
         )
 
         print(f"flush cache")
-        time.sleep(2)
-        requests.post(f"{self.base_url}/flush_cache", timeout=10)
+        res = requests.post(
+            f"{self.base_url}/flush_cache",
+            params={"timeout": 30},
+            timeout=40,
+        )
+        res.raise_for_status()
 
         second_metrics = self._run_gsm8k()
         print(f"second_metrics={second_metrics}")

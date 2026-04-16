@@ -19,7 +19,11 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     is_tbo_enabled,
 )
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import CombineOverlapArgs
@@ -261,10 +265,23 @@ def init_mori_op(
         f"{combine_quant_type=}"
     )
 
-    mori_config = mori.ops.EpDispatchCombineConfig(
+    def check_mori_compatibility(kwargs: dict) -> None:
+        """Remove kwargs not accepted by the installed mori's EpDispatchCombineConfig."""
+        import dataclasses
+
+        config_cls = mori.ops.EpDispatchCombineConfig
+        valid_kwargs = {f.name for f in dataclasses.fields(config_cls)}
+
+        invalid_kwargs = set(kwargs.keys()) - valid_kwargs
+        for arg in invalid_kwargs:
+            logger.warning(f"[MORI compat] Removing incompatible argument {arg} ")
+            del kwargs[arg]
+
+    # Definition refer to https://github.com/ROCm/mori/blob/f9be5ee2e5ac87256b9523399ae9d4d0e8a54f53/python/mori/ops/dispatch_combine.py#L66-L121
+    common_kwargs = dict(
+        data_type=data_type,
         rank=rank,
         world_size=world_size,
-        data_type=data_type,
         hidden_dim=hidden_dim,
         scale_dim=scale_dim,
         scale_type_size=scale_type_size,
@@ -274,12 +291,19 @@ def init_mori_op(
         num_experts_per_token=router_topk,
         warp_num_per_block=warp_num_per_block,
         block_num=block_num,
+        max_total_recv_tokens=get_int_env_var(
+            "SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0
+        ),
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,
-        num_qp_per_pe=2,
+        num_qp_per_pe=2,  # Number of queue pairs per processing element
         quant_type=combine_quant_type,
     )
+
+    check_mori_compatibility(common_kwargs)
+
+    mori_config = mori.ops.EpDispatchCombineConfig(**common_kwargs)
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
     return mori_op
 

@@ -6,21 +6,35 @@ via the GitHub API (same pattern as publish_traces.py).
 import argparse
 import os
 import sys
+from pathlib import Path
 
-# Allow importing from the same directory (scripts/ci/utils/)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from ..publish_traces import (
-    create_blobs,
-    create_commit,
-    create_tree,
-    get_branch_sha,
-    get_tree_sha,
-    is_permission_error,
-    is_rate_limit_error,
-    update_branch_ref,
-    verify_token_permissions,
-)
+# Reuse GitHub API helpers from publish_traces.
+# Support both direct script execution and package-style imports.
+if __package__:
+    from ..publish_traces import (
+        create_blobs,
+        create_commit,
+        create_tree,
+        get_branch_sha,
+        get_tree_sha,
+        is_permission_error,
+        is_rate_limit_error,
+        update_branch_ref,
+        verify_token_permissions,
+    )
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from publish_traces import (
+        create_blobs,
+        create_commit,
+        create_tree,
+        get_branch_sha,
+        get_tree_sha,
+        is_permission_error,
+        is_rate_limit_error,
+        update_branch_ref,
+        verify_token_permissions,
+    )
 
 REPO_OWNER = "sglang-bot"
 REPO_NAME = "sglang-ci-data"

@@ -29,7 +29,10 @@ from torch.nn import LayerNorm as LayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm_with_optional_rope,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -44,7 +47,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
@@ -259,6 +261,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 bias=bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_q" if prefix else "to_q",
             )
             self.to_k = ColumnParallelLinear(
                 query_dim,
@@ -266,6 +269,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 bias=bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_k" if prefix else "to_k",
             )
             self.to_v = ColumnParallelLinear(
                 query_dim,
@@ -273,6 +277,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 bias=bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_v" if prefix else "to_v",
             )
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
@@ -308,6 +313,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     bias=added_proj_bias,
                     gather_output=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.add_q_proj" if prefix else "add_q_proj",
                 )
                 self.add_k_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
@@ -315,6 +321,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     bias=added_proj_bias,
                     gather_output=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.add_k_proj" if prefix else "add_k_proj",
                 )
                 self.add_v_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
@@ -322,6 +329,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     bias=added_proj_bias,
                     gather_output=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.add_v_proj" if prefix else "add_v_proj",
                 )
             self.to_add_out = ColumnParallelLinear(
                 self.inner_dim,
@@ -354,37 +362,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
-        query, key = apply_qk_norm(
-            q=query,
-            k=key,
-            q_norm=self.norm_q,
-            k_norm=self.norm_k,
-            head_dim=self.head_dim,
-            allow_inplace=True,
-        )
-
-        if self.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
-
-            encoder_query, encoder_key = apply_qk_norm(
-                q=encoder_query,
-                k=encoder_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=self.head_dim,
-                allow_inplace=True,
-            )
-
-            bsz, seq_len, _, _ = query.shape
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
-            num_replicated_prefix = (
-                num_replicated_prefix or encoder_hidden_states.shape[1]
-            )
-
+        cos_sin_cache = None
         if freqs_cis is not None:
             cos, sin = freqs_cis
             cos_sin_cache = torch.cat(
@@ -394,8 +372,51 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=-1,
             )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
+
+        if self.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
+
+            text_seq_len = encoder_query.shape[1]
+            encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
+                q=encoder_query,
+                k=encoder_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+            query, key = apply_qk_norm_with_optional_rope(
+                q=query,
+                k=key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                position_offset=text_seq_len,
+                allow_inplace=True,
+            )
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+            num_replicated_prefix = (
+                num_replicated_prefix or encoder_hidden_states.shape[1]
+            )
+        else:
+            query, key = apply_qk_norm_with_optional_rope(
+                q=query,
+                k=key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                allow_inplace=True,
             )
 
         x = self.attn(query, key, value, num_replicated_prefix=num_replicated_prefix)
@@ -480,6 +501,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
             self.proj_out = ColumnParallelLinear(
@@ -488,6 +510,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.proj_out" if prefix else "proj_out",
             )
             self.attn = FluxAttention(
                 query_dim=dim,
@@ -498,6 +521,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 eps=1e-6,
                 pre_only=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.attn" if prefix else "attn",
             )
 
     def forward(
@@ -707,9 +731,9 @@ class FluxPosEmbed(nn.Module):
             use_real=False,
             repeat_interleave_real=False,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
         )
 

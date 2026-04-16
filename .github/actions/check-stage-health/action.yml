@@ -1,5 +1,5 @@
 name: Check Stage Health
-description: Fail fast if any job in the current workflow run has already failed. Auto-skips for scheduled runs.
+description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs.
 
 inputs:
   github-token:
@@ -12,12 +12,38 @@ runs:
   steps:
     - name: Check stage health
       uses: actions/github-script@v7
+      env:
+        SKIP_STAGE_HEALTH_CHECK: ${{ env.SKIP_STAGE_HEALTH_CHECK }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
+          // Skip when explicitly requested via env var (e.g. release branch cut)
+          if (process.env.SKIP_STAGE_HEALTH_CHECK === 'true') {
+            core.info('Skipping health check (SKIP_STAGE_HEALTH_CHECK=true)');
+            return;
+          }
+
           // Skip for scheduled runs — they should collect all failures, not fast-fail
           if (context.eventName === 'schedule') {
             core.info('Skipping health check for scheduled run');
+            return;
+          }
+
+          // Check lint status from the separate Lint workflow (lint.yml).
+          // listJobsForWorkflowRun only sees jobs within the SAME run, so we use
+          // checks.listForRef which queries by commit SHA across ALL workflows.
+          const ref = context.payload.pull_request?.head?.sha || context.sha;
+          const { data } = await github.rest.checks.listForRef({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: ref,
+            check_name: 'lint',
+          });
+          const lintRun = data.check_runs.find(
+            cr => cr.app?.slug === 'github-actions'
+          );
+          if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
+            core.setFailed('Fast-fail: lint check failed');
             return;
           }
 

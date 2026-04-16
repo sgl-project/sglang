@@ -6,7 +6,7 @@ import requests
 
 from sglang.srt.utils import is_cuda, is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 # DeepSeek-V3 MLA tests with torch compile, FA3, and MTP speculative decoding
-register_cuda_ci(est_time=442, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=543, suite="stage-b-test-1-gpu-large")
 register_amd_ci(
     est_time=221,
     suite="stage-b-test-1-gpu-small-amd",
@@ -45,18 +45,18 @@ class TestMLADeepseekV3(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["score"], 0.62)
 
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
@@ -82,18 +82,18 @@ class TestMLADeepseekV3DisableFusedFunc(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["score"], 0.62)
 
 
 @unittest.skipIf(is_hip(), "FA is not available.")
@@ -133,18 +133,18 @@ class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
 
 class TestDeepseekV3MTP(CustomTestCase):
@@ -186,20 +186,20 @@ class TestDeepseekV3MTP(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
