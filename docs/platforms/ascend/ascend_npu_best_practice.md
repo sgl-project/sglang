@@ -2839,7 +2839,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 35000  \
     --tp-size 2 --mem-fraction-static 0.6 --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 --dtype bfloat16
