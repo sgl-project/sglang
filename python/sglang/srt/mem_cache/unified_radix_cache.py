@@ -883,9 +883,18 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> int:
         freed = comp.evict_component(node, is_leaf=is_leaf)
         tracker[comp.component_type] += freed
-        lru = self.lru_lists[comp.component_type]
+        ct = comp.component_type
+        lru = self.lru_lists[ct]
         if lru.in_list(node):
             lru.remove_node(node)
+        # When tombstoning an aux component (is_leaf=False), if host_value
+        # survives the node enters S3 state and must be tracked in host LRU.
+        if not is_leaf and ct != BASE_COMPONENT_TYPE:
+            cd = node.component_data[ct]
+            if cd.value is None and cd.host_value is not None:
+                host_lru = self.host_lru_lists[ct]
+                if not host_lru.in_list(node):
+                    host_lru.insert_mru(node)
         return freed
 
     def _iteratively_delete_tombstone_leaf(
