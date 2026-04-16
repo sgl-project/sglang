@@ -267,6 +267,42 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     return model.model
 
 
+def _find_transformer_layers(model: nn.Module):
+    """Walk common VLM/LLM model patterns to find the nn.ModuleList of transformer layers."""
+    # Pattern A: model.language_model.model.layers
+    #   e.g. Gemma3ForConditionalGeneration, LlavaForConditionalGeneration,
+    #        KimiVLForConditionalGeneration, DeepseekVL2ForCausalLM
+    lm = getattr(model, "language_model", None)
+    if lm is not None:
+        m = getattr(lm, "model", None)
+        if m is not None and hasattr(m, "layers"):
+            return m.layers, lm
+
+    # Pattern B: model.model.layers
+    #   e.g. Qwen2VLForConditionalGeneration, InternVLChatModel, MiniCPMForCausalLM
+    m = getattr(model, "model", None)
+    if m is not None and hasattr(m, "layers"):
+        return m.layers, model
+
+    # Pattern C: model.model.model.layers  (double-wrapped CausalLM)
+    #   e.g. DeepseekOCRForCausalLM -> DeepseekForCausalLM -> DeepseekModel.layers
+    if m is not None:
+        mm = getattr(m, "model", None)
+        if mm is not None and hasattr(mm, "layers"):
+            return mm.layers, m
+
+    # Pattern D: model.thinker.model.layers
+    #   e.g. Qwen3OmniMoeForConditionalGeneration
+    thinker = getattr(model, "thinker", None)
+    if thinker is not None:
+        tm = getattr(thinker, "model", None)
+        if tm is not None and hasattr(tm, "layers"):
+            return tm.layers, thinker
+
+    return None, None
+
+
+
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
 
@@ -2600,13 +2636,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Disable piecewise CUDA graph for non-language models
-        if not hasattr(self.model, "model"):
-            logger.warning(
-                "Disable piecewise CUDA graph because the model is not a language model"
-            )
-            return
-
         # Disable piecewise CUDA graph for non capture size
         if not self.server_args.piecewise_cuda_graph_tokens:
             logger.warning(
@@ -2614,16 +2643,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Collect attention layers and moe layers from the model
-        self.model.model = resolve_language_model(self.model)
-        language_model = getattr(self.model, "language_model", self.model)
-
-        # Some draft models (e.g. eagle3) don't have a standard 'layers' attribute
-        if not hasattr(language_model.model, "layers"):
+        # Find transformer layers by walking common VLM/LLM model patterns
+        layers, language_model = _find_transformer_layers(self.model)
+        if layers is None:
             logger.warning(
-                "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
+                "Disable piecewise CUDA graph because transformer layers could not be found"
             )
             return
+
+        # Preserve self.model.model for resolve_language_model compatibility
+        if not hasattr(self.model, "model"):
+            self.model.model = (
+                language_model.model
+                if hasattr(language_model, "model")
+                else language_model
+            )
+        else:
+            self.model.model = resolve_language_model(self.model)
+
 
         self.attention_layers = []
         self.moe_layers = []
@@ -2658,8 +2695,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if attn_layer is not None:
                 self.attention_layers.append(attn_layer)
-            elif hasattr(layer, "mixer"):
-                self.attention_layers.append(None)
 
             moe_block = None
             moe_fusion = None

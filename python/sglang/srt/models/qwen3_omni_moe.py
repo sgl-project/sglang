@@ -508,6 +508,9 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
         self.enable_talker = False
         self.pad_input_ids = self.thinker.pad_input_ids
         self.forward = self.thinker.forward
+        # Expose deepstack attributes so PCG runner can detect and allocate deepstack buffers
+        if hasattr(self.thinker, "num_deepstack_embeddings"):
+            self.num_deepstack_embeddings = self.thinker.num_deepstack_embeddings
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
