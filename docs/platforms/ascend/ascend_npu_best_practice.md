@@ -485,8 +485,6 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
-export SGLANG_SET_CPU_AFFINITY=1
-
 unset https_proxy
 unset http_proxy
 unset HTTPS_PROXY
@@ -496,6 +494,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
+export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 
@@ -530,11 +529,11 @@ do
         export GLOO_SOCKET_IFNAME=lo
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
         --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
-        --tp-size 16 --mem-fraction-static 0.6 --attention-backend ascend --device npu --quantization modelslim \
+        --tp-size 16 --mem-fraction-static 0.8 --attention-backend ascend --device npu --quantization modelslim \
         --disaggregation-transfer-backend ascend --max-running-requests 8 --context-length 8192  --disable-radix-cache \
         --chunked-prefill-size 32768 --max-prefill-tokens 28680 --moe-a2a-backend deepep --deepep-mode normal \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
-        --dp-size 2 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16
+        --dp-size 1 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16
         NODE_RANK=$i
         break
     fi
@@ -549,18 +548,19 @@ do
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=720
+        export SGLANG_DP_ROUND_ROBIN=1
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
         export TASK_QUEUE_ENABLE=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 16 \
-        --mem-fraction-static 0.8 --max-running-requests 384 --attention-backend ascend --device npu --quantization modelslim \
+        --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 4 \
+        --mem-fraction-static 0.8 --max-running-requests 24 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
         --cuda-graph-bs 8 10 12 14 16 18 20 22 24 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
-		--load-balance-method decode_round_robin
+		--load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
