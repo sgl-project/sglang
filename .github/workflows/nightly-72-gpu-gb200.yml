@@ -9,9 +9,17 @@ on:
   workflow_dispatch:  # allow manual trigger; gated by gb200-ci environment
     inputs:
       image:
-        description: 'SGLang Docker image to benchmark'
+        description: 'SGLang Docker image to benchmark (mutually exclusive with sglang_branch)'
         required: false
         default: 'lmsysorg/sglang:dev-cu13'
+      sglang_branch:
+        description: 'SGLang branch to build from. If set, builds a fresh image from this branch (ARM64, CUDA 13) and uses it for the run. Mutually exclusive with image.'
+        required: false
+        default: ''
+      configs:
+        description: 'Optional comma-separated matrix entry names to run (e.g. "dsr1-fp8-1k1k-max-tpt"). Leave empty to run all configs. Names are defined in scripts/ci/slurm/nightly-configs.yaml.'
+        required: false
+        default: ''
 
 concurrency:
   group: nightly-test-gb200
@@ -22,8 +30,27 @@ env:
   SRT_SLURM_BRANCH: sglang-nightly-regression
   SLURM_PARTITION: batch
   SLURM_ACCOUNT: sglang
+  # Package name for ephemeral branch-build images on GHCR
+  CI_IMAGE_PACKAGE: sglang-nightly-ci
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Reject conflicting inputs early. `image` and `sglang_branch` are mutually
+  # exclusive: one selects a pre-built image, the other triggers a fresh build.
+  # ---------------------------------------------------------------------------
+  validate-inputs:
+    if: github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject conflicting inputs
+        run: |
+          BRANCH="${{ inputs.sglang_branch }}"
+          IMAGE="${{ inputs.image }}"
+          if [ -n "$BRANCH" ] && [ -n "$IMAGE" ] && [ "$IMAGE" != "lmsysorg/sglang:dev-cu13" ]; then
+            echo "::error::Specify either 'image' or 'sglang_branch', not both. Got image='$IMAGE' and sglang_branch='$BRANCH'."
+            exit 1
+          fi
+
   # ---------------------------------------------------------------------------
   # Reads scripts/ci/slurm/nightly-configs.yaml and generates one matrix entry
   # per recipe YAML. Each job runs the full concurrency sweep defined in the
@@ -41,29 +68,144 @@ jobs:
 
       - name: Generate benchmark matrix
         id: generate
+        env:
+          CONFIGS_FILTER: ${{ inputs.configs }}
         run: |
           pip install pyyaml -q
-          MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py scripts/ci/slurm/nightly-configs.yaml --runner gb200)
+          FILTER_ARG=()
+          if [ -n "$CONFIGS_FILTER" ]; then
+            FILTER_ARG=(--filter "$CONFIGS_FILTER")
+          fi
+          MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
+            scripts/ci/slurm/nightly-configs.yaml --runner gb200 "${FILTER_ARG[@]}")
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # When sglang_branch is provided, build an ARM64 (GB200) image from that
+  # branch and push it to GHCR. The image is deleted by `cleanup-image` at the
+  # end of the run. This job is skipped for nightly (cron) runs and any manual
+  # run that doesn't specify sglang_branch.
+  # ---------------------------------------------------------------------------
+  build-image:
+    needs: [validate-inputs, setup]
+    if: github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch' && inputs.sglang_branch != ''
+    runs-on: arm-docker-build-node
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_ref: ${{ steps.build.outputs.image_ref }}
+      version_id: ${{ steps.resolve.outputs.version_id }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sglang_branch }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ARM64 image
+        id: build
+        run: |
+          SANITIZED_BRANCH=$(echo "${{ inputs.sglang_branch }}" | tr '/' '-' | tr -cd '[:alnum:]._-')
+          TAG="${SANITIZED_BRANCH}-${{ github.run_id }}"
+          IMAGE_REF="ghcr.io/sgl-project/${CI_IMAGE_PACKAGE}:${TAG}"
+          echo "Building ${IMAGE_REF} from branch ${{ inputs.sglang_branch }}"
+
+          docker buildx build \
+            --platform linux/arm64 \
+            --output type=image,name=${IMAGE_REF},push=true \
+            --target framework_final \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
+            --build-arg GRACE_BLACKWELL=1 \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --no-cache \
+            .
+
+          echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
+          echo "image_tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Resolve GHCR package version id (for cleanup)
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.build.outputs.image_tag }}
+        run: |
+          # Retry: GHCR may take a few seconds to index a freshly pushed tag.
+          VERSION_ID=""
+          for i in 1 2 3 4 5; do
+            VERSION_ID=$(gh api "/orgs/sgl-project/packages/container/${CI_IMAGE_PACKAGE}/versions" \
+              --jq "[.[] | select(.metadata.container.tags[]? == \"${TAG}\")][0].id" || true)
+            if [ -n "$VERSION_ID" ] && [ "$VERSION_ID" != "null" ]; then
+              break
+            fi
+            echo "Version id not yet available (attempt $i), retrying..."
+            sleep 5
+          done
+          if [ -z "$VERSION_ID" ] || [ "$VERSION_ID" = "null" ]; then
+            echo "::warning::Could not resolve GHCR version id for tag ${TAG}; cleanup will be skipped."
+            VERSION_ID=""
+          fi
+          echo "version_id=${VERSION_ID}" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------------------------
   # Import Docker images to Lustre squash files once before all benchmark jobs.
   # This avoids parallel jobs racing to enroot import the same image.
+  # When build-image ran, we import the freshly built GHCR image; otherwise we
+  # use the `image` input (or its default).
   # ---------------------------------------------------------------------------
   prepare-image:
-    needs: setup
-    if: github.repository == 'sgl-project/sglang'
+    needs: [setup, build-image]
+    if: |
+      always() && github.repository == 'sgl-project/sglang'
+      && needs.setup.result == 'success'
+      && (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
     environment: ${{ github.event_name == 'workflow_dispatch' && 'gb200-ci' || '' }}
     runs-on: 72-gpu-gb200
     outputs:
       squash_file: ${{ steps.import.outputs.squash_file }}
       nginx_squash_file: ${{ steps.import.outputs.nginx_squash_file }}
+      image: ${{ steps.resolve.outputs.image }}
     env:
-      IMAGE: ${{ inputs.image || 'lmsysorg/sglang:dev-cu13' }}
       NGINX_IMAGE: nginx:1.27.4
     steps:
+      - name: Resolve image to import
+        id: resolve
+        run: |
+          BUILT_IMAGE="${{ needs.build-image.outputs.image_ref }}"
+          if [ -n "$BUILT_IMAGE" ]; then
+            echo "Using freshly built image: $BUILT_IMAGE"
+            echo "image=$BUILT_IMAGE" >> $GITHUB_OUTPUT
+          else
+            IMAGE="${{ inputs.image || 'lmsysorg/sglang:dev-cu13' }}"
+            echo "Using pre-existing image: $IMAGE"
+            echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure enroot credentials for GHCR
+        if: needs.build-image.outputs.image_ref != ''
+        run: |
+          mkdir -p "$HOME/.config/enroot"
+          CRED="$HOME/.config/enroot/.credentials"
+          echo "machine ghcr.io login ${{ github.actor }} password ${{ secrets.GITHUB_TOKEN }}" > "$CRED"
+          chmod 600 "$CRED"
+
       - name: Import Docker images to Lustre
         id: import
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
         run: |
           SQUASH_FILE="/mnt/lustre01/users-public/sglang-ci/$(echo "$IMAGE" | sed 's/[\/:@#]/_/g')_$(date +%Y%m%d).sqsh"
           NGINX_SQUASH_FILE="/mnt/lustre01/users-public/sglang-ci/$(echo "$NGINX_IMAGE" | sed 's/[\/:@#]/_/g').sqsh"
@@ -82,6 +224,10 @@ jobs:
 
           echo "squash_file=$SQUASH_FILE" >> $GITHUB_OUTPUT
           echo "nginx_squash_file=$NGINX_SQUASH_FILE" >> $GITHUB_OUTPUT
+
+      - name: Remove GHCR credentials
+        if: always() && needs.build-image.outputs.image_ref != ''
+        run: rm -f "$HOME/.config/enroot/.credentials"
 
   nightly-gb200-benchmark:
     needs: [setup, prepare-image]
@@ -204,3 +350,24 @@ jobs:
         run: |
           pip install tabulate -q
           python3 scripts/ci/slurm/summarize.py results/ >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Delete the ephemeral GHCR image built by `build-image`. Runs after all
+  # benchmark jobs complete (success or failure) so the image doesn't linger.
+  # No-op when build-image was skipped.
+  # ---------------------------------------------------------------------------
+  cleanup-image:
+    needs: [build-image, nightly-gb200-benchmark]
+    if: always() && needs.build-image.result == 'success' && needs.build-image.outputs.version_id != ''
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete GHCR image version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_ID: ${{ needs.build-image.outputs.version_id }}
+        run: |
+          echo "Deleting GHCR package version ${VERSION_ID} (${{ needs.build-image.outputs.image_ref }})"
+          gh api --method DELETE \
+            "/orgs/sgl-project/packages/container/${CI_IMAGE_PACKAGE}/versions/${VERSION_ID}"
