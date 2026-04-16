@@ -447,9 +447,19 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = sharded_tensor.to("cpu")
 
         requires_grad = False
-        sharded_sd[target_param_name] = nn.Parameter(
-            sharded_tensor, requires_grad=requires_grad
-        )
+        actual_param = param_dict.get(target_param_name)
+        if actual_param is not None:
+            # Preserve custom parameter attributes (e.g., weight_loader / shard
+            # metadata).
+            new_param = _make_param_like(actual_param, sharded_tensor)
+            if not (sharded_tensor.is_floating_point() or sharded_tensor.is_complex()):
+                requires_grad = False
+            new_param.requires_grad = requires_grad
+            sharded_sd[target_param_name] = new_param
+        else:
+            sharded_sd[target_param_name] = nn.Parameter(
+                sharded_tensor, requires_grad=requires_grad
+            )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
 
