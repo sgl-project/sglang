@@ -678,9 +678,8 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
-            # Block now resident on host -- emit store(CPU) so downstream
-            # indexers track the new tier.
-            self._record_store_event(node, medium=StorageMedium.CPU)
+            # Note: store(CPU) event is deferred to writing_check() after the
+            # async DMA transfer is confirmed complete.
         else:
             return 0
 
@@ -722,6 +721,10 @@ class HiRadixCache(RadixCache):
                     finish_event.synchronize()
                     for ack_id in ack_list:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
+                        # DMA confirmed -- block is now on host.
+                        self._record_store_event(
+                            backuped_node, medium=StorageMedium.CPU
+                        )
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
@@ -752,6 +755,8 @@ class HiRadixCache(RadixCache):
             finish_event.synchronize()
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
+                # DMA confirmed -- block is now on host.
+                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
