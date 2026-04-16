@@ -963,6 +963,18 @@ TWO_GPU_CASES_A = [
         ),
         TI2V_sampling_params,
     ),
+    DiffusionTestCase(
+        "mova_360p_cfg_parallel",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=2,
+            cfg_parallel=True,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
+    ),
 ]
 
 TWO_GPU_CASES_B = [
