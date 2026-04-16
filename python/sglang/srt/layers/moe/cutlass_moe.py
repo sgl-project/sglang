@@ -18,6 +18,7 @@ if _is_cuda:
         prepare_moe_input,
         shuffle_rows,
         silu_and_mul,
+        gelu_tanh_and_mul,
     )
 
     from sglang.jit_kernel.nvfp4 import (
@@ -359,6 +360,7 @@ def cutlass_moe_fp4(
     topk_ids: torch.Tensor,
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
+    activation: str = "silu",
 ):
     """
     MoE implementation for FP4 Inputs
@@ -456,6 +458,8 @@ def cutlass_moe_fp4(
         num_topk,
         expert_map=a_map,
     )
+    # SM120 FP4 bug: clamp E4M3 block scale uint8=127 -> 126 to prevent NaN
+    rep_a_blockscale.view(torch.uint8).clamp_(max=126)
     c1 = cutlass_fp4_group_mm(
         rep_a_fp4,
         w1_fp4,
@@ -467,11 +471,14 @@ def cutlass_moe_fp4(
     )
     del rep_a_fp4, rep_a_blockscale
 
-    # hidden size dimension is split to one halfpytho sized tensor.
+    # hidden size dimension is split to one half sized tensor.
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
-    silu_and_mul(c1, intermediate)
+    if activation == "gelu_tanh":
+        gelu_tanh_and_mul(c1, intermediate)
+    else:
+        silu_and_mul(c1, intermediate)
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,
@@ -480,6 +487,8 @@ def cutlass_moe_fp4(
         params.blockscale_offsets,
         num_topk,
     )
+    # SM120 FP4 bug: clamp E4M3 block scale uint8=127 -> 126 to prevent NaN
+    int_blockscale.view(torch.uint8).clamp_(max=126)
     c2 = cutlass_fp4_group_mm(
         int_fp4,
         w2_fp4,
