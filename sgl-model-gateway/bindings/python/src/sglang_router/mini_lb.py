@@ -14,6 +14,7 @@ from typing import Optional
 
 import aiohttp
 import orjson
+import pybase64
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -32,6 +33,43 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return f"[{address}]"
     except ValueError:
         return address
+
+
+def _merge_routed_experts(prefill: dict, decode: dict):
+    if "routed_experts" not in prefill or "routed_experts" not in decode:
+        return False
+
+    prefill_bytes = pybase64.b64decode(prefill["routed_experts"], validate=True)
+    decode_bytes = pybase64.b64decode(decode["routed_experts"], validate=True)
+    decode["routed_experts"] = pybase64.b64encode(
+        prefill_bytes + decode_bytes[len(prefill_bytes) :]
+    ).decode("utf-8")
+    return True
+
+
+def _merge_input_token_logprobs(prefill_meta: dict, decode_meta: dict):
+    if (
+        "input_token_logprobs" not in prefill_meta
+        or "input_token_logprobs" not in decode_meta
+    ):
+        return
+
+    decode_meta["input_token_logprobs"] = (
+        prefill_meta["input_token_logprobs"] + decode_meta["input_token_logprobs"]
+    )
+
+def _merge_prefill_json(prefill_json, decode_json):
+    if "meta_info" in prefill_json and "meta_info" in decode_json:
+        prefill_meta = prefill_json["meta_info"]
+        decode_meta = decode_json["meta_info"]
+        _merge_input_token_logprobs(prefill_meta, decode_meta)
+        _merge_routed_experts(prefill_meta, decode_meta)
+
+    if "sglext" not in prefill_json:
+        return
+
+    if "sglext" in decode_json:
+        _merge_routed_experts(prefill_json["sglext"], decode_json["sglext"])
 
 
 class MiniLoadBalancer:
@@ -140,18 +178,10 @@ class MiniLoadBalancer:
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
-            if "return_logprob" in modified_request:
-
+            if "return_logprob" in modified_request or "return_routed_experts" in modified_request:
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
-
-                # merge `meta_info.input_token_logprobs` from prefill to decode
-                if "meta_info" in ret_json:
-                    if "input_token_logprobs" in ret_json["meta_info"]:
-                        ret_json["meta_info"]["input_token_logprobs"] = (
-                            prefill_json["meta_info"]["input_token_logprobs"]
-                            + ret_json["meta_info"]["input_token_logprobs"]
-                        )
+                _merge_prefill_json(prefill_json, ret_json)
             else:
                 ret_json = await decode_response.json()
 
