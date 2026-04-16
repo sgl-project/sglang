@@ -42,6 +42,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -810,7 +811,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
-                    if mrope_positions.numel() == 0:
+
+                    # FIX: Handle partial overlap in Spec-Dec V2.
+                    # The requested range spans beyond the pre-computed mrope positions,
+                    # causing slicing to return a partial tensor (e.g., [3, 1]) instead of [3, 4].
+                    if envs.SGLANG_ENABLE_SPEC_V2.get():
+                        target_end = extend_prefix_len + extend_seq_len
+                        cached_len = mm_input.mrope_positions.shape[1]
+
+                        if target_end > cached_len:
+                            delta = extend_prefix_len - cached_len
+
+                            base_pos = mm_input.mrope_positions[:, -1:].to(
+                                model_runner.device
+                            )
+
+                            offsets = (
+                                torch.arange(
+                                    1, extend_seq_len + 1, device=model_runner.device
+                                )
+                                + delta
+                            )
+
+                            mrope_positions = base_pos + offsets
+
+                    elif mrope_positions.numel() == 0:
                         mrope_positions = self._expand_mrope_from_input(
                             mm_input, self.seq_lens_cpu[batch_idx]
                         )
