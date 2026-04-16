@@ -439,14 +439,23 @@ class SDARInterleavedWorker:
         # skips these steps for Spec V1, assuming the worker already handled them).
         # ---------------------------------------------------------------
         for i, req in enumerate(batch.reqs):
+            # kv_allocated: we committed all block_size slots to the KV pool in _commit_block
+            # kv_committed: based on actual output tokens consumed, so cache_finished_req
+            # correctly handles the per-request token sequences.
+            # release_kv_cache will free slots in [kv_committed_len, kv_allocated_len)
+            # automatically (the "overallocated" range), which covers any tail slots from
+            # blocks where EOS/max_new_tokens was hit before the full block was used.
+            kv_before = req.kv_committed_len  # KV length before this block
             block_ids = block_tokens[i].tolist()
             for tok in block_ids:
                 req.output_ids.append(tok)
                 req.check_finished()
                 if req.finished():
                     break
-            req.kv_committed_len += block_size
-            req.kv_allocated_len = req.kv_committed_len
+            # All block_size slots were allocated and written to KV cache
+            req.kv_allocated_len = kv_before + block_size
+            # Only the consumed tokens count as "committed" for radix-cache insertion
+            req.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
 
         next_token_ids = block_tokens[:, -1]
         print(f"[SDAR_DBG] decode done: accepted={total_accepted}, next_tok={next_token_ids.tolist()}, seq_lens={batch.seq_lens.tolist()}, out_ids_len={[len(r.output_ids) for r in batch.reqs]}, finished={[r.finished() for r in batch.reqs]}", flush=True)
