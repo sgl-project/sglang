@@ -622,12 +622,14 @@ def get_config(
     if config.model_type == "multi_modality":
         config.update({"architectures": ["MultiModalityCausalLM"]})
 
-    if config.model_type == "gemma4":
+    if config.model_type in ("gemma4", "gemma4_text"):
         # Gemma4 configs use base attributes for SWA layers and `global_*`
         # variants for full-attention layers.  SGLang expects the opposite:
         # base = full-attention, `swa_*` = sliding-window overrides.
         # Remap here so the rest of the stack sees a uniform convention.
-        text_config = config.text_config
+        # For the VLM (`gemma4`), the fields live on config.text_config; for
+        # the text-only CausalLM (`gemma4_text`), they're on config itself.
+        text_config = config.text_config if config.model_type == "gemma4" else config
         global_head_dim = getattr(text_config, "global_head_dim", None)
         global_kv_heads = getattr(text_config, "num_global_key_value_heads", None)
 

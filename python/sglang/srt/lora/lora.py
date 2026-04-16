@@ -171,20 +171,29 @@ class LoRAAdapter(nn.Module):
                 k_proj_weight = (
                     weights[k_name]
                     if "k_proj" in target_module
-                    else torch.zeros_like(weights[v_name])
+                    else torch.zeros_like(weights[q_name])
+                )
+                # If v_proj doesn't have lora (e.g. Gemma 4 global-attention
+                # layers with K=V sharing where v_proj is absent), zero-fill
+                # with k_proj's shape (K=V means v_proj would match k_proj).
+                v_proj_weight = (
+                    weights[v_name]
+                    if "v_proj" in target_module
+                    else torch.zeros_like(k_proj_weight)
                 )
                 weights[qkv_name] = torch.cat(
                     (
                         weights[q_name],
                         k_proj_weight,
-                        weights[v_name],
+                        v_proj_weight,
                     ),
                     0,
                 )
                 weights.pop(q_name)
                 if "k_proj" in target_module:
                     weights.pop(k_name)
-                weights.pop(v_name)
+                if "v_proj" in target_module:
+                    weights.pop(v_name)
             elif "qkv_proj" in weight_name:
                 # If qkv_proj is already stacked, we normalize it following the SGL convention.
                 qkv_name = weight_name

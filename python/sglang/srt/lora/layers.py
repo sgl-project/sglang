@@ -582,10 +582,21 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
-        q_size, k_size, _ = base_layer.output_sizes
+        # base_layer.output_sizes reports REPLICATED K/V totals (e.g. for Gemma
+        # 4 global layers with kv_heads=4<tp=8, k_size=4096 after 2x rep). The
+        # adapter file we're slicing was written with the UNREPLICATED layout
+        # (q_full + total_num_kv_heads*head_size + total_num_kv_heads*head_size).
+        # Using the replicated k_size/v_size in the offsets walks past the end
+        # of the adapter tensor and silently produces empty slices — buffer
+        # shape mismatch later. Compute unreplicated k/v sizes directly.
+        q_size = base_layer.total_num_heads * base_layer.head_size
+        k_size_unrepl = base_layer.total_num_kv_heads * base_layer.head_size
         B_q_shard = B[q_start_idx:q_end_idx, :]
         B_k_shard = B[q_size + kv_start_idx : q_size + kv_end_idx, :]
-        B_v_shard = B[q_size + k_size + kv_start_idx : q_size + k_size + kv_end_idx, :]
+        B_v_shard = B[
+            q_size + k_size_unrepl + kv_start_idx : q_size + k_size_unrepl + kv_end_idx,
+            :,
+        ]
 
         return torch.concat(
             (

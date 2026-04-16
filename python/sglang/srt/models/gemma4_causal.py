@@ -887,6 +887,58 @@ class Gemma4ForCausalLM(PreTrainedModel):
             i for i, lt in enumerate(self.config.layer_types) if lt == "full_attention"
         }
 
+    def get_hidden_dim(self, module_name, layer_idx):
+        """Per-layer LoRA input/output dims.
+
+        Gemma 4 has heterogeneous attention: full-attention layers use
+        head_dim / num_key_value_heads, sliding-window layers use
+        swa_head_dim / swa_num_key_value_heads. The LoRA mem_pool allocates
+        a buffer per (module_name, layer_idx), so o_proj / qkv_proj must
+        report the correct per-layer dims or the buffer K will not match
+        the activation.
+        """
+        is_full = self.config.layer_types[layer_idx] == "full_attention"
+        if is_full:
+            attn_head_dim = self.config.head_dim
+            kv_heads = self.config.num_key_value_heads
+        else:
+            attn_head_dim = getattr(self.config, "swa_head_dim", self.config.head_dim)
+            kv_heads = getattr(
+                self.config,
+                "swa_num_key_value_heads",
+                self.config.num_key_value_heads,
+            )
+        if module_name == "qkv_proj":
+            # When kv_heads < tp_size, QKVParallelLinear replicates each KV
+            # head so every rank holds at least one. The per-rank shard is
+            # then q_shard + 2 * kv_shard where kv_shard = max(1, kv_heads
+            # // tp) * head_dim — effectively raising the total KV output
+            # to max(kv_heads, tp_size) * head_dim. LoRA's mem_pool divides
+            # this output dim by tp_size to size the B buffer per rank;
+            # without this correction the buffer is too small and the
+            # qkv_lora_b triton kernel writes past the V block (OOB →
+            # async device-side assert in later attention kernels).
+            # Gemma 4 global layers hit this: kv_heads=4, tp=8.
+            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+            tp_size = get_tensor_model_parallel_world_size()
+            effective_kv_heads = max(kv_heads, tp_size)
+            return (
+                self.config.hidden_size,
+                attn_head_dim
+                * (self.config.num_attention_heads + effective_kv_heads * 2),
+            )
+        if module_name == "o_proj":
+            return (
+                attn_head_dim * self.config.num_attention_heads,
+                self.config.hidden_size,
+            )
+        if module_name == "gate_up_proj":
+            return self.config.hidden_size, self.config.intermediate_size * 2
+        if module_name == "down_proj":
+            return self.config.intermediate_size, self.config.hidden_size
+        raise NotImplementedError(f"get_hidden_dim: unsupported module {module_name}")
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
