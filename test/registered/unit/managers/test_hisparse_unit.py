@@ -76,9 +76,7 @@ class TestHiSparseUnit(unittest.TestCase):
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29599")
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(
-                backend="gloo", rank=0, world_size=1
-            )
+            torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
         cls.tp_group = torch.distributed.group.WORLD
 
         from sglang.srt.mem_cache.memory_pool_host import (
@@ -204,9 +202,7 @@ class TestHiSparseUnit(unittest.TestCase):
             extend_num_tokens=fill_len,
         )
         self.assertIsNotNone(kv_loc, "KV alloc failed")
-        self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, len(kv_loc))), kv_loc
-        )
+        self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
         req.fill_ids = list(range(fill_len))
@@ -450,10 +446,14 @@ class TestHiSparseUnit(unittest.TestCase):
         # Choose new tokens from a range safely below fill_len.
         half = TOP_K // 2
         new_start = TOP_K  # first position not in step-1
-        tokens_s2 = torch.cat([
-            tokens_s1[:half],                                                    # hits
-            torch.arange(new_start, new_start + half, dtype=torch.int32, device="cuda"),  # misses
-        ])
+        tokens_s2 = torch.cat(
+            [
+                tokens_s1[:half],  # hits
+                torch.arange(
+                    new_start, new_start + half, dtype=torch.int32, device="cuda"
+                ),  # misses
+            ]
+        )
         locs2 = self._swap_in_selected_pages(
             rpi, sls, tokens_s2.unsqueeze(0), layer_id=0
         )
@@ -465,7 +465,10 @@ class TestHiSparseUnit(unittest.TestCase):
         )
         # Also verify new (miss) tokens loaded correctly
         self._assert_kv_correct(
-            locs2[0, half:], tokens_s2[half:], layer_id=0, count=half,
+            locs2[0, half:],
+            tokens_s2[half:],
+            layer_id=0,
+            count=half,
             msg="LRU miss: ",
         )
 
@@ -538,7 +541,9 @@ class TestHiSparseUnit(unittest.TestCase):
         locs = self._swap_in_selected_pages(rpi, sls, batch, layer_id=0)
         valid_n = min(fill_len, TOP_K)
         self.assertTrue(torch.all(locs[0, :valid_n] >= 0))
-        self._assert_kv_correct(locs[0], tokens, layer_id=0, count=valid_n, msg="Staging: ")
+        self._assert_kv_correct(
+            locs[0], tokens, layer_id=0, count=valid_n, msg="Staging: "
+        )
         self._assert_matches_naive(rpi, sls, batch, locs, layer_id=0, msg="Staging: ")
 
         self._cleanup_req(req, kv_loc)
@@ -571,7 +576,9 @@ class TestHiSparseUnit(unittest.TestCase):
 
         locs = self._swap_in_selected_pages(rpi, sls, batch, layer_id=0)
         self.assertTrue(torch.all(locs[0, :TOP_K] >= 0))
-        self._assert_kv_correct(locs[0], tokens, layer_id=0, count=TOP_K, msg="Direct: ")
+        self._assert_kv_correct(
+            locs[0], tokens, layer_id=0, count=TOP_K, msg="Direct: "
+        )
         self._assert_matches_naive(rpi, sls, batch, locs, layer_id=0, msg="Direct: ")
 
         self._cleanup_req(req, kv_loc, logical_only=True)
@@ -607,17 +614,17 @@ class TestHiSparseUnit(unittest.TestCase):
             kv_locs.append(kv_loc)
 
         rpi, sls = self._make_batch_tensors(reqs, [c[1] for c in configs])
-        top_k_batch = torch.stack([
-            # For long sequences pass fl-1 to exclude the "newest token" position
-            # whose reserved device-buffer slot is not populated in unit tests.
-            self._build_topk_tokens(fl - 1 if fl > DEVICE_BUFFER_SIZE else fl)
-            for _, fl in configs
-        ])
+        top_k_batch = torch.stack(
+            [
+                # For long sequences pass fl-1 to exclude the "newest token" position
+                # whose reserved device-buffer slot is not populated in unit tests.
+                self._build_topk_tokens(fl - 1 if fl > DEVICE_BUFFER_SIZE else fl)
+                for _, fl in configs
+            ]
+        )
 
         for lid in range(LAYER_NUM):
-            locs = self._swap_in_selected_pages(
-                rpi, sls, top_k_batch, lid
-            )
+            locs = self._swap_in_selected_pages(rpi, sls, top_k_batch, lid)
             for i, (rid, fl) in enumerate(configs):
                 vn = min(fl, TOP_K)
                 self.assertTrue(
