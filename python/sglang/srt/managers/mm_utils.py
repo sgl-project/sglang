@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
+import zmq
 from torch import nn
 
 from sglang.srt.environ import envs
@@ -26,7 +27,12 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    flatten_nested_list,
+    is_npu,
+    print_warning_once,
+)
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -1649,3 +1655,46 @@ def unwrap_shm_features(obj):
             if isinstance(item.feature, ShmPointerMMData):
                 item.feature = item.feature.materialize()
     return obj
+
+
+def can_send_serialized(obj):
+    """
+    Check if the object contains any multimodal tensors that can be sent via shared memory serialization.
+    """
+    if hasattr(obj, "batch") and obj.batch:
+        return can_send_serialized(obj.batch[0])
+    elif hasattr(obj, "mm_inputs") and obj.mm_inputs:
+        mm_items = obj.mm_inputs.get("mm_items", [])
+        for item in mm_items:
+            if isinstance(item.feature, torch.Tensor) and item.feature.is_cpu:
+                return True
+    elif hasattr(obj, "image_inputs") and obj.image_inputs:
+        mm_items = obj.image_inputs.get("mm_items", [])
+        for item in mm_items:
+            if (
+                isinstance(item.precomputed_embeddings, torch.Tensor)
+                and item.precomputed_embeddings.is_cpu
+            ):
+                return True
+
+    return False
+
+
+class MMSendWrapper:
+    """
+    Wrapper for sending multimodal data, which sharing tensors with processes.
+    """
+
+    def __init__(self, send_to_scheduler: zmq.Socket):
+        self.send_to_scheduler = send_to_scheduler
+
+    def serialize(self, obj):
+        return [MultiprocessingSerializer.serialize(obj)]
+
+    def send_pyobj(self, obj):
+        if can_send_serialized(obj):
+            return self.send_to_scheduler.send_serialized(
+                msg=obj, serialize=self.serialize
+            )
+        else:
+            return self.send_to_scheduler.send_pyobj(obj)

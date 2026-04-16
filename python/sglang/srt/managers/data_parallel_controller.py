@@ -38,6 +38,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
+from sglang.srt.managers.mm_utils import MMSendWrapper
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -261,12 +262,13 @@ class DataParallelController:
             )
 
             if server_args.node_rank == 0:
-                self.workers[dp_rank] = get_zmq_socket(
+                send_to_scheduler = get_zmq_socket(
                     self.context,
                     zmq.PUSH,
                     tmp_port_args.scheduler_input_ipc_name,
                     True,
                 )
+                self.workers[dp_rank] = MMSendWrapper(send_to_scheduler)
 
         # Free all sockets before starting the threads to launch TP workers
         for sock in sockets:

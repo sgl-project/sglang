@@ -71,7 +71,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
+from sglang.srt.managers.mm_utils import MMSendWrapper, TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
@@ -347,9 +347,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         if self.server_args.tokenizer_worker_num == 1:
-            self.send_to_scheduler = get_zmq_socket(
+            send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
+
+            # Using MMSendWrapper to handle multimodal inputs
+            self.send_to_scheduler = MMSendWrapper(send_to_scheduler)
         else:
             from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
 
@@ -359,7 +362,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             )
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
-            self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
+            self.send_to_scheduler = SenderWrapper(
+                port_args, MMSendWrapper(send_to_scheduler)
+            )
 
     def init_running_status(self):
         # Request states
@@ -1155,7 +1160,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
-        tokenized_obj = wrap_shm_features(tokenized_obj)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
