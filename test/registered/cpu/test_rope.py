@@ -69,9 +69,9 @@ class TestROPE(CustomTestCase):
 
             with torch.no_grad(), torch.amp.autocast("cpu", enabled=enable_autocast):
                 q = torch.randn(seq_len, num_heads * head_size, dtype=dtype)
-                q_clone = q.clone()
+                q_sgl = q.clone()
                 k = torch.randn(seq_len, num_kv_heads * head_size, dtype=dtype)
-                k_clone = k.clone()
+                k_sgl = k.clone()
 
                 # ref kernel
                 q_ref, k_ref = rope.forward_native(
@@ -80,10 +80,10 @@ class TestROPE(CustomTestCase):
                     positions=positions,
                 )
                 # fused rope kernel
-                q_sgl, k_sgl = torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+                torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
                     positions,
-                    q_clone,
-                    k_clone,
+                    q_sgl,
+                    k_sgl,
                     rope.head_size,
                     rope.cos_sin_cache,
                     rope.mrope_section,

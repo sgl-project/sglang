@@ -71,21 +71,30 @@ void rotary_embedding_3D_kernel_impl(
 template <typename scalar_t>
 void rotary_embedding_neox_4D_kernel_impl(
     int64_t* __restrict__ positions,
-    scalar_t* __restrict__ query,
-    scalar_t* __restrict__ key,
+    scalar_t* query,
+    scalar_t* query_out,
+    scalar_t* key,
+    scalar_t* key_out,
     scalar_t* __restrict__ cos_sin_cache,
     int64_t rotary_dim,
     int64_t query_stride_b,
     int64_t query_stride_s,
     int64_t query_stride_h,
+    int64_t query_out_stride_b,
+    int64_t query_out_stride_s,
+    int64_t query_out_stride_h,
     int64_t key_stride_b,
     int64_t key_stride_s,
     int64_t key_stride_h,
+    int64_t key_out_stride_b,
+    int64_t key_out_stride_s,
+    int64_t key_out_stride_h,
     int64_t num_heads,
     int64_t num_kv_heads,
     int64_t head_size,
     int64_t batch_size,
-    int64_t seq_len) {
+    int64_t seq_len,
+    bool inplace = false) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int64_t bVecSize = bVec::size();
@@ -94,21 +103,18 @@ void rotary_embedding_neox_4D_kernel_impl(
   bool flag = (embed_dim % bVecSize == 0);
   int64_t loop_upper = flag ? embed_dim : embed_dim - bVecSize;
 
-  auto compute_loop = [&](int64_t token_head, scalar_t* cache_ptr, scalar_t* qk) {
+  auto compute_loop = [&](int64_t in_offset, int64_t out_offset, scalar_t* cache_ptr, scalar_t* qk, scalar_t* qk_out) {
     int64_t j = 0;
     for (; j < loop_upper; j += bVecSize) {
       int64_t rot_offset = j;
       int64_t x_index = rot_offset;
       int64_t y_index = embed_dim + rot_offset;
 
-      int64_t out_x = token_head + x_index;
-      int64_t out_y = token_head + y_index;
-
       bVec _cos = bVec::loadu(cache_ptr + x_index);
       bVec _sin = bVec::loadu(cache_ptr + y_index);
 
-      bVec _q_x = bVec::loadu(qk + out_x);
-      bVec _q_y = bVec::loadu(qk + out_y);
+      bVec _q_x = bVec::loadu(qk + in_offset + x_index);
+      bVec _q_y = bVec::loadu(qk + in_offset + y_index);
       fVec _cos_0, _cos_1;
       std::tie(_cos_0, _cos_1) = at::vec::convert_to_float(_cos);
       fVec _sin_0, _sin_1;
@@ -121,30 +127,32 @@ void rotary_embedding_neox_4D_kernel_impl(
       auto out1_0 = _q_x_0 * _cos_0 - _q_y_0 * _sin_0;
       auto out1_1 = _q_x_1 * _cos_1 - _q_y_1 * _sin_1;
       auto out1 = convert_from_float_ext<scalar_t>(out1_0, out1_1);
-      out1.store(qk + out_x);
+      out1.store(qk_out + out_offset + x_index);
 
       auto out2_0 = _q_y_0 * _cos_0 + _q_x_0 * _sin_0;
       auto out2_1 = _q_y_1 * _cos_1 + _q_x_1 * _sin_1;
       auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
-      out2.store(qk + out_y);
+      out2.store(qk_out + out_offset + y_index);
     }
     if (!flag) {
       for (; j < embed_dim; ++j) {
         int64_t x_index = j;
         int64_t y_index = embed_dim + j;
 
-        int64_t out_x = token_head + x_index;
-        int64_t out_y = token_head + y_index;
-
         float _cos = cache_ptr[x_index];
         float _sin = cache_ptr[y_index];
 
-        float _q_x = qk[out_x];
-        float _q_y = qk[out_y];
+        float _q_x = qk[in_offset + x_index];
+        float _q_y = qk[in_offset + y_index];
 
-        qk[out_x] = _q_x * _cos - _q_y * _sin;
-        qk[out_y] = _q_y * _cos + _q_x * _sin;
+        qk_out[out_offset + x_index] = _q_x * _cos - _q_y * _sin;
+        qk_out[out_offset + y_index] = _q_y * _cos + _q_x * _sin;
       }
+    }
+    // Copy non-rotary elements from input to output
+    if (!inplace && rotary_dim < head_size) {
+      std::memcpy(
+          qk_out + out_offset + rotary_dim, qk + in_offset + rotary_dim, (head_size - rotary_dim) * sizeof(scalar_t));
     }
   };
 
@@ -156,14 +164,16 @@ void rotary_embedding_neox_4D_kernel_impl(
 
       for (int64_t i = 0; i < num_heads; ++i) {
         int64_t head_idx = i;
-        int64_t token_head = bs * query_stride_b + seq * query_stride_s + head_idx * query_stride_h;
-        compute_loop(token_head, cache_ptr, query);
+        int64_t in_offset = bs * query_stride_b + seq * query_stride_s + head_idx * query_stride_h;
+        int64_t out_offset = bs * query_out_stride_b + seq * query_out_stride_s + head_idx * query_out_stride_h;
+        compute_loop(in_offset, out_offset, cache_ptr, query, query_out);
       }
 
       for (int64_t i = 0; i < num_kv_heads; ++i) {
         int64_t head_idx = i;
-        int64_t token_head = bs * key_stride_b + seq * key_stride_s + head_idx * key_stride_h;
-        compute_loop(token_head, cache_ptr, key);
+        int64_t in_offset = bs * key_stride_b + seq * key_stride_s + head_idx * key_stride_h;
+        int64_t out_offset = bs * key_out_stride_b + seq * key_out_stride_s + head_idx * key_out_stride_h;
+        compute_loop(in_offset, out_offset, cache_ptr, key, key_out);
       }
     }
   }
@@ -474,21 +484,30 @@ void multimodal_rotary_embedding_neox_2D_kernel_impl(
 template <typename scalar_t>
 void rotary_embedding_4D_kernel_impl(
     int64_t* __restrict__ positions,
-    scalar_t* __restrict__ query,
-    scalar_t* __restrict__ key,
+    scalar_t* query,
+    scalar_t* query_out,
+    scalar_t* key,
+    scalar_t* key_out,
     scalar_t* __restrict__ cos_sin_cache,
     int64_t rotary_dim,
     int64_t query_stride_b,
     int64_t query_stride_s,
     int64_t query_stride_h,
+    int64_t query_out_stride_b,
+    int64_t query_out_stride_s,
+    int64_t query_out_stride_h,
     int64_t key_stride_b,
     int64_t key_stride_s,
     int64_t key_stride_h,
+    int64_t key_out_stride_b,
+    int64_t key_out_stride_s,
+    int64_t key_out_stride_h,
     int64_t num_heads,
     int64_t num_kv_heads,
     int64_t head_size,
     int64_t batch_size,
-    int64_t seq_len) {
+    int64_t seq_len,
+    bool inplace = false) {
   int64_t embed_dim = rotary_dim / 2;
 
   at::parallel_for(0, batch_size * seq_len * num_heads, GRAIN_SIZE / rotary_dim, [&](int64_t begin, int64_t end) {
@@ -500,8 +519,10 @@ void rotary_embedding_4D_kernel_impl(
       scalar_t* cos_cache_ptr = cache_ptr;
       scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
       int64_t head_idx = i;
-      int64_t token_head = bs * query_stride_b + seq * query_stride_s + head_idx * query_stride_h;
-      scalar_t* head_query = token_head + query;
+      int64_t in_offset = bs * query_stride_b + seq * query_stride_s + head_idx * query_stride_h;
+      int64_t out_offset = bs * query_out_stride_b + seq * query_out_stride_s + head_idx * query_out_stride_h;
+      scalar_t* head_query = in_offset + query;
+      scalar_t* head_query_out = out_offset + query_out;
       for (int64_t j = 0; j < embed_dim; j += 1) {
         int64_t rot_offset = j;
         int64_t x_index = 2 * rot_offset;
@@ -513,8 +534,12 @@ void rotary_embedding_4D_kernel_impl(
         float x = head_query[x_index];
         float y = head_query[y_index];
 
-        head_query[x_index] = x * cos - y * sin;
-        head_query[y_index] = y * cos + x * sin;
+        head_query_out[x_index] = x * cos - y * sin;
+        head_query_out[y_index] = y * cos + x * sin;
+      }
+      // Copy non-rotary elements from input to output
+      if (!inplace && rotary_dim < head_size) {
+        std::memcpy(head_query_out + rotary_dim, head_query + rotary_dim, (head_size - rotary_dim) * sizeof(scalar_t));
       }
       data_index_step(bs, batch_size, seq, seq_len, i, num_heads);
     }
@@ -529,8 +554,10 @@ void rotary_embedding_4D_kernel_impl(
       scalar_t* cos_cache_ptr = cache_ptr;
       scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
       int64_t head_idx = i;
-      int64_t token_head = bs * key_stride_b + seq * key_stride_s + head_idx * head_size;
-      scalar_t* head_key = key + token_head;
+      int64_t in_offset = bs * key_stride_b + seq * key_stride_s + head_idx * key_stride_h;
+      int64_t out_offset = bs * key_out_stride_b + seq * key_out_stride_s + head_idx * key_out_stride_h;
+      scalar_t* head_key = key + in_offset;
+      scalar_t* head_key_out = key_out + out_offset;
       for (int64_t j = 0; j < embed_dim; j += 1) {
         int64_t rot_offset = j;
         int64_t x_index = 2 * rot_offset;
@@ -542,8 +569,12 @@ void rotary_embedding_4D_kernel_impl(
         float x = head_key[x_index];
         float y = head_key[y_index];
 
-        head_key[x_index] = x * cos - y * sin;
-        head_key[y_index] = y * cos + x * sin;
+        head_key_out[x_index] = x * cos - y * sin;
+        head_key_out[y_index] = y * cos + x * sin;
+      }
+      // Copy non-rotary elements from input to output
+      if (!inplace && rotary_dim < head_size) {
+        std::memcpy(head_key_out + rotary_dim, head_key + rotary_dim, (head_size - rotary_dim) * sizeof(scalar_t));
       }
       data_index_step(bs, batch_size, seq, seq_len, i, num_kv_heads);
     }
@@ -869,8 +900,10 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   at::Tensor key_out = at::empty_like(key);
   int64_t query_out_stride_s = query_out.stride(0);
   int64_t key_out_stride_s = key_out.stride(0);
-  // output stride of num head dim is meaningful only when input dim = 3
-  int64_t query_out_stride_h = input_dim == 3 ? query_out.stride(1) : -1;
+  int64_t query_out_stride_h = input_dim == 2 ? head_size : query_out.stride(-2);
+  int64_t key_out_stride_h = input_dim == 2 ? head_size : key_out.stride(-2);
+  int64_t query_out_stride_b = 0;
+  int64_t key_out_stride_b = 0;
   int64_t batch_size = 1;
   int64_t seq_len = num_tokens;
   int64_t query_stride_b = 0;
@@ -882,6 +915,10 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     key_stride_b = key.stride(0);
     query_stride_s = query.stride(1);
     key_stride_s = key.stride(1);
+    query_out_stride_b = query_out.stride(0);
+    key_out_stride_b = key_out.stride(0);
+    query_out_stride_s = query_out.stride(1);
+    key_out_stride_s = key_out.stride(1);
     CHECK_EQ(batch_size, key.size(0));
     CHECK_EQ(seq_len, key.size(1));
     CHECK_EQ(key.size(0) * key.size(1), num_tokens);
@@ -894,15 +931,23 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
         rotary_embedding_neox_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
+            query_out.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
+            key_out.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
             query_stride_b,
             query_stride_s,
             query_stride_h,
+            query_out_stride_b,
+            query_out_stride_s,
+            query_out_stride_h,
             key_stride_b,
             key_stride_s,
             key_stride_h,
+            key_out_stride_b,
+            key_out_stride_s,
+            key_out_stride_h,
             num_heads,
             num_kv_heads,
             head_size,
@@ -912,23 +957,29 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
         rotary_embedding_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
+            query_out.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
+            key_out.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
             query_stride_b,
             query_stride_s,
             query_stride_h,
+            query_out_stride_b,
+            query_out_stride_s,
+            query_out_stride_h,
             key_stride_b,
             key_stride_s,
             key_stride_h,
+            key_out_stride_b,
+            key_out_stride_s,
+            key_out_stride_h,
             num_heads,
             num_kv_heads,
             head_size,
             batch_size,
             seq_len);
       }
-      query_out = query;
-      key_out = key;
 
     } else {
       TORCH_CHECK(
@@ -1023,7 +1074,7 @@ apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at
 // key: [num_tokens, num_kv_heads * head_size]
 // cos_sin_cache: [max_position_embeddings, rotary_dim]
 // mrope_section: [t, h, w]
-std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+void multimodal_rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
@@ -1106,12 +1157,24 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
         rotary_embedding_neox_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
+            query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
+            // query input strides (batch, seq, head)
             0,
             query_stride_s,
             head_size,
+            // query output strides (same as input: in-place)
+            0,
+            query_stride_s,
+            head_size,
+            // key input strides (batch, seq, head)
+            0,
+            key_stride_s,
+            head_size,
+            // key output strides (same as input: in-place)
             0,
             key_stride_s,
             head_size,
@@ -1119,17 +1182,30 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
             num_kv_heads,
             head_size,
             1,
-            num_tokens);
+            num_tokens,
+            true);
       } else {
         rotary_embedding_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
+            query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
+            // query input strides (batch, seq, head)
             0,
             query_stride_s,
             head_size,
+            // query output strides (same as input: in-place)
+            0,
+            query_stride_s,
+            head_size,
+            // key input strides (batch, seq, head)
+            0,
+            key_stride_s,
+            head_size,
+            // key output strides (same as input: in-place)
             0,
             key_stride_s,
             head_size,
@@ -1137,9 +1213,9 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
             num_kv_heads,
             head_size,
             1,
-            num_tokens);
+            num_tokens,
+            true);
       }
     });
   }
-  return std::make_tuple(query, key);
 }
