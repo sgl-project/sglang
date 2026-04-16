@@ -142,10 +142,11 @@ class _Communicator(Generic[T]):
             if obj:
                 self._sender.send_pyobj(obj)
 
-        event = self._result_event
+        # NOTE: Capture list ref before await so later awaiters survive clearing.
         values = self._result_values
+        event = self._result_event
         await event.wait()
-        # Capture list ref before await so later awaiters survive clearing.
+
         result_values = copy.deepcopy(values)
         if self._result_event is event:
             self._result_event = self._result_values = None
