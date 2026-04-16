@@ -215,7 +215,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         created = int(time.time())
 
         # State tracking for streaming
-        stream_buffers = {}
+        stream_offsets = {}
         n_prev_tokens = {}
 
         # Usage tracking
@@ -254,9 +254,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     "cached_tokens_details", None
                 )
 
-                stream_buffer = stream_buffers.get(index, "")
+                is_first_chunk = index not in stream_offsets
+                offset = stream_offsets.get(index, 0)
                 # Handle echo for first chunk
-                if not stream_buffer:  # The first chunk
+                if is_first_chunk:  # The first chunk
                     if request.echo:
                         echo_text = self._get_echo_text(request, index)
                         text = echo_text + text
@@ -265,7 +266,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = None
                 if request.logprobs is not None:
                     # The first chunk and echo is enabled.
-                    if not stream_buffer and request.echo:
+                    if is_first_chunk and request.echo:
                         input_token_logprobs = content["meta_info"][
                             "input_token_logprobs"
                         ]
@@ -306,8 +307,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     n_prev_tokens[index] = total_output_logprobs
 
                 # Generate delta
-                delta = text[len(stream_buffer) :]
-                stream_buffers[index] = stream_buffer + delta
+                delta = text[offset:]
+                stream_offsets[index] = len(content["text"])
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 

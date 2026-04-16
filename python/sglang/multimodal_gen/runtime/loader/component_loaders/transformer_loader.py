@@ -1,3 +1,4 @@
+import copy
 import logging
 from typing import Any
 
@@ -26,6 +27,30 @@ _is_npu = is_npu()
 logger = init_logger(__name__)
 
 
+def _server_args_for_transformer_component(
+    server_args: ServerArgs, component_name: str
+) -> ServerArgs:
+    """Mask global quantized override flags for secondary transformer components."""
+    if component_name != "transformer_2":
+        return server_args
+
+    if (
+        server_args.transformer_weights_path is None
+        and server_args.nunchaku_config is None
+    ):
+        return server_args
+
+    component_server_args = copy.copy(server_args)
+    component_server_args.transformer_weights_path = None
+    component_server_args.nunchaku_config = None
+    logger.info(
+        "Ignoring global transformer_weights_path for %s; keep it on the base "
+        "checkpoint unless a per-component override path is provided.",
+        component_name,
+    )
+    return component_server_args
+
+
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
@@ -36,11 +61,15 @@ class TransformerLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
+        component_server_args = _server_args_for_transformer_component(
+            server_args, component_name
+        )
+
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
 
         safetensors_list = resolve_transformer_safetensors_to_load(
-            server_args, component_model_path
+            component_server_args, component_model_path
         )
 
         # 2. dit config
@@ -61,7 +90,7 @@ class TransformerLoader(ComponentLoader):
 
         quant_spec = resolve_transformer_quant_load_spec(
             hf_config=config,
-            server_args=server_args,
+            server_args=component_server_args,
             safetensors_list=safetensors_list,
             component_model_path=component_model_path,
             model_cls=model_cls,
@@ -83,7 +112,7 @@ class TransformerLoader(ComponentLoader):
         }
         if (
             init_params["quant_config"] is None
-            and server_args.transformer_weights_path is not None
+            and component_server_args.transformer_weights_path is not None
         ):
             logger.warning(
                 f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
@@ -99,9 +128,9 @@ class TransformerLoader(ComponentLoader):
             device=get_local_torch_device(),
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
             hsdp_shard_dim=server_args.hsdp_shard_dim,
-            cpu_offload=server_args.dit_cpu_offload,
-            pin_cpu_memory=server_args.pin_cpu_memory,
-            fsdp_inference=server_args.use_fsdp_inference,
+            cpu_offload=component_server_args.dit_cpu_offload,
+            pin_cpu_memory=component_server_args.pin_cpu_memory,
+            fsdp_inference=component_server_args.use_fsdp_inference,
             param_dtype=quant_spec.param_dtype,
             reduce_dtype=torch.float32,
             output_dtype=None,

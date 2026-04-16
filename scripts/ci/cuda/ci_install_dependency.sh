@@ -23,7 +23,7 @@ set -euxo pipefail
 # Configuration & timing
 # ------------------------------------------------------------------------------
 # Set up environment variables
-CU_VERSION="cu130"
+CU_VERSION="cu129"
 
 # Nvidia package versions we override (torch pins older versions).
 # Used both as pip constraints during install and for post-install verification.
@@ -187,6 +187,7 @@ FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_python==)[0-9A-Za-z\.\
 FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_cubin==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
 FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
 FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
+FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
 
 UNINSTALL_CUBIN=true
 UNINSTALL_JIT_CACHE=true
@@ -203,6 +204,11 @@ if [ "$FLASHINFER_JIT_INSTALLED" = "$FLASHINFER_PYTHON_REQUIRED" ] && [ -n "$FLA
     UNINSTALL_JIT_CACHE=false
 else
     echo "flashinfer-jit-cache version mismatch (installed: ${FLASHINFER_JIT_INSTALLED:-none}, required: ${FLASHINFER_PYTHON_REQUIRED}), will reinstall"
+fi
+
+if [ "$UNINSTALL_JIT_CACHE" = false ] && [ "$FLASHINFER_JIT_CU_VERSION" != "$CU_VERSION" ]; then
+    echo "flashinfer-jit-cache CUDA version mismatch (installed: ${FLASHINFER_JIT_CU_VERSION:-none}, required: ${CU_VERSION}), will reinstall"
+    UNINSTALL_JIT_CACHE=true
 fi
 
 # Build uninstall list based on what needs updating
@@ -244,15 +250,7 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
     else
         WHEEL_ARCH="x86_64"
     fi
-    # Wheel may have +cuXYZ suffix (e.g. sglang_kernel-0.4.0+cu130-...) depending on CUDA version
-    KERNEL_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}*-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1)
-    if [ -z "$KERNEL_WHL" ]; then
-        echo "ERROR: No matching sgl-kernel wheel found in sgl-kernel/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH}"
-        ls -alh sgl-kernel/dist/
-        exit 1
-    fi
-    echo "Installing sgl-kernel wheel: $KERNEL_WHL"
-    $PIP_CMD install "$KERNEL_WHL" --force-reinstall $PIP_INSTALL_SUFFIX
+    $PIP_CMD install sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 elif [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; then
     # CUSTOM_BUILD_SGL_KERNEL was set but artifacts not available (e.g., stage rerun without wheel build)
     # Fail instead of falling back to PyPI - we need to test the built kernel, not PyPI version
@@ -326,10 +324,10 @@ mark_step_done "Install extra dependency"
 # Fix other dependencies
 # ------------------------------------------------------------------------------
 # Fix CUDA version mismatch between torch and torchaudio.
-# PyPI's torch bundles a specific CUDA version but torchaudio from pytorch.org/cu130 may use a different one.
+# PyPI's torch 2.9.1 bundles cu128 but torchaudio from pytorch.org/cu129 uses cu129.
 # This mismatch causes torchaudio's C extension to fail loading, producing:
 #   "partially initialized module 'torchaudio' has no attribute 'lib'"
-# We cannot replace torch with a different CUDA version (breaks sgl_kernel ABI), so instead we reinstall
+# We cannot replace torch with cu129 (breaks sgl_kernel ABI), so instead we reinstall
 # torchaudio/torchvision from an index matching torch's CUDA version.
 TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
 echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
