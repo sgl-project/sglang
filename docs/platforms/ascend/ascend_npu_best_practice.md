@@ -40,7 +40,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Qwen3-32B       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 12ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-1k-0_3k-12ms-on-a3-2-cards-mixed-mode)      |
 | Qwen3-32B       | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K | 17ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-17ms-on-a3-2-cards-mixed-mode)      |
 | Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)        |
-| Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 9ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-6k-1_5k-9ms-on-a3-1-cards-mixed-mode)        |
+| Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 12ms | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-6k-1_5k-12ms-on-a3-1-cards-mixed-mode)       |
 | Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 10ms | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-6k-1_5k-10ms-on-a3-1-cards-mixed-mode)  |
 | Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 8ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-1k-0_3k-8ms-on-a3-1-cards-mixed-mode)   |
 | Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 14.21ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-1k-0_3k-14_21ms-on-a3-2-cards-mixed-mode)      |
@@ -2578,7 +2578,7 @@ We tested it based on the `RANDOM` dataset.
 python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 7339 --random-range-ratio 1 --max-concurrency 16 --random-output-len 300 --random-input-len 1024 --num-prompts 16
 ```
 
-### Qwen3-8B 6K-1_5K 9ms on A3 1 Cards Mixed Mode
+### Qwen3-8B 6K-1_5K 12ms on A3 1 Cards Mixed Mode
 
 Model: Qwen3-8B
 
@@ -2590,7 +2590,7 @@ Dataset: random
 
 Input Output Length: 6K+1.5K
 
-TPOT: 9ms
+TPOT: 12ms
 
 #### Model Deployment
 
