@@ -11,9 +11,6 @@ from sglang.test.test_utils import (
     ModelLaunchSettings,
 )
 
-# Slower-B200 estimate: ~360s server load + ~300s gsm8k (200 samples, no
-# spec decode so generation is ~3x slower than the MTP variants) + py
-# startup/teardown ≈ 720s
 register_cuda_ci(est_time=720, suite="stage-c-test-4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"

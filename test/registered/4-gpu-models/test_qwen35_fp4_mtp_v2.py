@@ -15,9 +15,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Slower-B200 estimate: ~350s server load (incl. NEXTN draft init under
-# SGLANG_ENABLE_SPEC_V2) + ~104s gsm8k body + ~5s reasoning sub-tests +
-# py startup/teardown ≈ 540s
 register_cuda_ci(est_time=540, suite="stage-c-test-4-gpu-b200")
 
 QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
