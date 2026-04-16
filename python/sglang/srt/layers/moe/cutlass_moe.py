@@ -475,7 +475,7 @@ def cutlass_moe_fp4(
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
-    if activation == "gelu_tanh":
+    if "gelu" in activation:
         gelu_tanh_and_mul(c1, intermediate)
     else:
         silu_and_mul(c1, intermediate)
