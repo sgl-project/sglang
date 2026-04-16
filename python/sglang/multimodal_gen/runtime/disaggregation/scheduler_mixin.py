@@ -1275,8 +1275,15 @@ class SchedulerDisaggMixin:
         extra_keys = [k for k in scalar_fields if k.startswith("_extra_")]
         for key in extra_keys:
             req.extra[key[len("_extra_") :]] = scalar_fields.pop(key)
-        # Overlay scalar fields from the transfer message
-        req.__dict__.update(scalar_fields)
+        # Overlay scalar fields from the transfer message.
+        # Use setattr (not __dict__.update) so Req.__setattr__ routes
+        # SamplingParams-owned fields (e.g. num_inference_steps) to
+        # req.sampling_params.  A raw __dict__.update would shadow them
+        # on the instance, making them invisible to extract_transfer_fields
+        # (which walks dataclasses.fields) and breaking the multi-rank
+        # broadcast path in _broadcast_req_to_all_ranks.
+        for key, value in scalar_fields.items():
+            setattr(req, key, value)
         # Set tensor fields
         for key, value in tensors.items():
             setattr(req, key, value)
