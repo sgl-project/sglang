@@ -1520,7 +1520,7 @@ class RowParallelLinear(LinearBase):
             else:
                 quantize_communications = \
                     (not forward_batch.forward_mode.is_decode_or_idle() \
-                    and get_global_server_args().quantize_tp_communications) \
+                    and get_global_server_args().enable_quant_communications) \
                     if forward_batch is not None else False
                 if quantize_communications:
                     output = tensor_model_parallel_quant_all_reduce(output_parallel)
