@@ -75,6 +75,13 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
     # These experts have NO INT4 weights — always routed to BF16 kernel.
     # If ALL experts in a layer are bf16-only, no INT4 weights are loaded
     # for that layer (saves VRAM).
+    #
+    # NOTE: This is NOT used in normal online serving. It exists as a VRAM
+    # optimization for the per-layer INT4 sensitivity sweep
+    # (expert_precision_assignment/per_moe_layer_sensitivity/), where only
+    # one layer at a time is tested with INT4. Marking all other layers as
+    # bf16-only avoids loading ~16 GB of unused INT4 weights.
+    # Online serving uses {int4-only, heter(dual BF16+INT4)} experts only.
     bf16_only_file = cfg.get("bf16_only_experts_file")
     if bf16_only_file is not None:
         with open(bf16_only_file) as f:
@@ -111,7 +118,9 @@ class HeterFusedMoE(nn.Module):
         # INT4-only expert support: list of expert IDs that are INT4-only
         int4_only_experts: Optional[list] = None,
         # BF16-only expert support: list of expert IDs that are BF16-only
-        # (no INT4 weights loaded — always routed to BF16 kernel)
+        # (no INT4 weights loaded — always routed to BF16 kernel).
+        # Only used by the per-layer sensitivity sweep for VRAM savings,
+        # not in normal online serving.
         bf16_only_experts: Optional[list] = None,
     ):
         super().__init__()
@@ -166,6 +175,8 @@ class HeterFusedMoE(nn.Module):
 
         # BF16-only expert support: these experts skip INT4 weight loading
         # and are always routed to the BF16 kernel.
+        # Used only by the per-layer sensitivity sweep (VRAM optimization),
+        # not in normal online serving.
         self._bf16_only_experts = bf16_only_experts or []
         self._bf16_only_set = set(self._bf16_only_experts)
         if self._bf16_only_experts:
@@ -780,6 +791,8 @@ def apply_heter_precision(
 
     heter_config = _parse_heter_config(config_path)
     int4_only_by_layer = heter_config.get("_int4_only_by_layer", {})
+    # bf16-only is a VRAM optimization for the per-layer sensitivity sweep;
+    # not used in normal online serving (empty dict by default).
     bf16_only_by_layer = heter_config.get("_bf16_only_by_layer", {})
 
     # Find INT4 group's checkpoint path
