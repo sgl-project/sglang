@@ -905,6 +905,27 @@ class Gemma4ForCausalLM(PreTrainedModel):
         ]
         num_experts = self.config.num_experts
 
+        # NVFP4 per-expert unfused weight mappings.
+        # NVFP4 checkpoints store per-expert tensors:
+        #   moe.experts.{id}.{gate_proj,up_proj,down_proj}.{weight,weight_scale,...}
+        # SGLang expects fused format: moe.experts.w13_{suffix} / w2_{suffix}
+        nvfp4_expert_params_mapping = []
+        for expert_id in range(num_experts):
+            for shard_id, weight_name in [
+                ("w1", "gate_proj"),
+                ("w2", "down_proj"),
+                ("w3", "up_proj"),
+            ]:
+                param_prefix = (
+                    "experts.w13_"
+                    if shard_id in ("w1", "w3")
+                    else "experts.w2_"
+                )
+                ckpt_prefix = f"experts.{expert_id}.{weight_name}."
+                nvfp4_expert_params_mapping.append(
+                    (param_prefix, ckpt_prefix, expert_id, shard_id)
+                )
+
         k_eq_v_layers = self._get_k_eq_v_layers()
 
         params_dict = dict(self.named_parameters())
@@ -936,9 +957,34 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 and int(m.group(1)) in k_eq_v_layers
             )
 
+            # NVFP4 per-expert weights (unfused, one expert at a time).
+            # Must be checked before fused expert_params_mapping.
+            orig_name = name
+            nvfp4_matched = False
+            for param_prefix, ckpt_prefix, expert_id, shard_id in (
+                nvfp4_expert_params_mapping
+            ):
+                if ckpt_prefix not in orig_name:
+                    continue
+                pname = (
+                    orig_name.split(ckpt_prefix)[0]
+                    + param_prefix
+                    + orig_name.split(ckpt_prefix)[1]
+                )
+                if pname not in params_dict:
+                    continue
+                param = params_dict[pname]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, pname, shard_id, expert_id)
+                loaded_params.add(pname)
+                nvfp4_matched = True
+                break
+            if nvfp4_matched:
+                loaded_params.add(orig_name)
+                continue
+
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
             # which would false-match the stacked dense MLP mapping).
-            orig_name = name
             for param_name, weight_name, shard_ids in expert_params_mapping:
                 name = orig_name
                 if weight_name not in name:
