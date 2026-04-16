@@ -34,11 +34,16 @@ STARTUP_OVERHEAD_SECONDS = 120.0
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 
 _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
+_UPDATE_WEIGHTS_FROM_TENSOR_TEST_FILE = "test_update_weights_from_tensor.py"
 _UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
 _UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
     "FLUX.2-klein-base-4B",
     "Qwen-Image",
 )
+_UPDATE_WEIGHTS_TEST_FILES = {
+    _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
+    _UPDATE_WEIGHTS_FROM_TENSOR_TEST_FILE,
+}
 
 
 def _discover_unit_tests() -> list[str]:
@@ -87,6 +92,7 @@ STANDALONE_FILES = {
     "1-gpu": [
         "../cli/test_generate_t2i_perf.py",
         "test_update_weights_from_disk.py",
+        "test_update_weights_from_tensor.py",
     ],
     "2-gpu": [],
 }
@@ -98,6 +104,7 @@ STANDALONE_FILE_EST_TIMES = {
     "1-gpu": {
         "../cli/test_generate_t2i_perf.py": 240.0,
         "test_update_weights_from_disk.py": 480.0,
+        "test_update_weights_from_tensor.py": 360.0,
     },
     "2-gpu": {},
 }
@@ -279,7 +286,7 @@ def _run_standalone_file(
     target_dir: Path,
     extra_filter: str | None = None,
 ) -> tuple[int, list[str], dict[str, str], dict]:
-    if standalone_rel == _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE:
+    if standalone_rel in _UPDATE_WEIGHTS_TEST_FILES:
         _maybe_pin_update_weights_model_pair([standalone_rel])
 
     est_time, used_fallback_estimate = get_standalone_file_est_time(
@@ -780,7 +787,7 @@ def _is_in_ci() -> bool:
 def _maybe_pin_update_weights_model_pair(suite_files_rel: list[str]) -> None:
     if not _is_in_ci():
         return
-    if _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE not in suite_files_rel:
+    if not any(test_file in suite_files_rel for test_file in _UPDATE_WEIGHTS_TEST_FILES):
         return
     if os.environ.get(_UPDATE_WEIGHTS_MODEL_PAIR_ENV):
         print(
