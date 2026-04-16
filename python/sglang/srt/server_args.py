@@ -6465,10 +6465,8 @@ class ServerArgs:
 
         if self.pp_size > 1:
             assert (
-                self.disable_overlap_schedule
-                and self.speculative_algorithm is None
-                and not self.enable_mixed_chunk
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+                self.disable_overlap_schedule and self.speculative_algorithm is None
+            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
