@@ -1904,7 +1904,6 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
-export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy
 unset http_proxy
 unset HTTPS_PROXY
@@ -1912,9 +1911,11 @@ unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export SGLANG_NPU_FUSED_MOE_MODE=2
 
 MODEL_PATH=xxx
 export ASCEND_MF_STORE_URL="tcp://PIP:24667"
@@ -1936,23 +1937,22 @@ do
         echo "${P_IP[$i]}"
         source /usr/local/Ascend/ascend-toolkit/set_env.sh
         source /usr/local/Ascend/nnal/atb/set_env.sh
-        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-        export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
-        export HCCL_BUFFSIZE=4300
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=327680
+        export HCCL_BUFFSIZE=1550
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
-        export STREAMS_PER_DEVICE=32
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
-        --nnodes 1 --node-rank $i --tp-size 16 --dp-size 2 --mem-fraction-static 0.6 \
+        --nnodes 1 --node-rank $i --tp-size 16 --dp-size 2 --mem-fraction-static 0.7 \
         --disable-radix-cache \
-	      --attention-backend ascend --device npu --quantization modelslim --disaggregation-transfer-backend ascend \
-	      --max-running-requests 128 --chunked-prefill-size 65536 --max-prefill-tokens 262144 \
+	    --attention-backend ascend --device npu --quantization modelslim --disaggregation-transfer-backend ascend \
+	    --max-running-requests 16 --chunked-prefill-size 20480 --max-prefill-tokens 20480 \
         --enable-dp-attention  \
-        --moe-a2a-backend deepep --deepep-mode normal --dtype bfloat16
+        --moe-a2a-backend ascend_fuseep --dtype bfloat16 \
+        --disable-overlap-schedule
         NODE_RANK=$i
         break
     fi
@@ -1965,20 +1965,20 @@ do
         echo "${D_IP[$i]}"
         source /usr/local/Ascend/ascend-toolkit/set_env.sh
         source /usr/local/Ascend/nnal/atb/set_env.sh
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
-        export HCCL_BUFFSIZE=512
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=65536
+        export HCCL_BUFFSIZE=600
+        export SGLANG_NPU_FUSED_MOE_MODE=2
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
-        export STREAMS_PER_DEVICE=32
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode \
         --host ${D_IP[$i]} --port 8001 --trust-remote-code \
-        --nnodes 2 --node-rank $i --tp-size 32 --dp-size 4 --mem-fraction-static 0.73 --max-running-requests 384 \
+        --nnodes 2 --node-rank $i --tp-size 32 --dp-size 4 --mem-fraction-static 0.75 --max-running-requests 544 \
         --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
-        --moe-a2a-backend ascend_fuseep --cuda-graph-bs 16 32 48 56 64 72 80 88 96 \
+        --moe-a2a-backend ascend_fuseep --cuda-graph-bs 16 32 56 72 80 88 96 104 112 120 128 136 \
         --dist-init-addr DIP1:5000 \
 	    --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
-        --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4 --load-balance-method decode_round_robin
+        --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4 --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
