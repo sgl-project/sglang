@@ -58,6 +58,7 @@ def _merge_input_token_logprobs(prefill_meta: dict, decode_meta: dict):
         prefill_meta["input_token_logprobs"] + decode_meta["input_token_logprobs"]
     )
 
+
 def _merge_prefill_json(prefill_json, decode_json):
     if "meta_info" in prefill_json and "meta_info" in decode_json:
         prefill_meta = prefill_json["meta_info"]
@@ -178,7 +179,10 @@ class MiniLoadBalancer:
             # Wait for both responses to complete. Prefill should end first.
             prefill_response, decode_response = await asyncio.gather(*tasks)
 
-            if "return_logprob" in modified_request or "return_routed_experts" in modified_request:
+            if (
+                "return_logprob" in modified_request
+                or "return_routed_experts" in modified_request
+            ):
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
                 _merge_prefill_json(prefill_json, ret_json)
