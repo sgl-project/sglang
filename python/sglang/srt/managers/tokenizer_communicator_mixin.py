@@ -1064,6 +1064,21 @@ class TokenizerCommunicatorMixin:
         if dp_rank is not None:
             results = [r for r in results if r.dp_rank == dp_rank]
 
+        # Filter optional sections client-side (scheduler always returns all)
+        if include and "all" not in include:
+            include_set = set(include)
+            _section_attrs = {
+                "memory": "memory",
+                "spec": "speculative",
+                "lora": "lora",
+                "disagg": "disaggregation",
+                "queues": "queues",
+            }
+            for r in results:
+                for key, attr in _section_attrs.items():
+                    if key not in include_set:
+                        setattr(r, attr, None)
+
         return results
 
     async def open_session(
