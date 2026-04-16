@@ -171,5 +171,67 @@ class TestBenchServingLM(unittest.TestCase):
         self.assertTrue(calls[0].get("enable_thinking"))
 
 
+import json
+import tempfile
+from pathlib import Path
+
+
+class TestReport(unittest.TestCase):
+    def test_merge_report_shape(self):
+        from sglang.benchmark.eval_harness import merge_report
+
+        lm_eval_results = {
+            "results": {
+                "gsm8k": {
+                    "exact_match,strict-match": 0.62,
+                    "exact_match_stderr,strict-match": 0.013,
+                    "exact_match,flexible-extract": 0.68,
+                    "exact_match_stderr,flexible-extract": 0.012,
+                    "alias": "gsm8k",
+                }
+            },
+            "n-samples": {"gsm8k": {"original": 1319, "effective": 1319}},
+            "config": {"num_fewshot": 5},
+        }
+        perf = {
+            "mean_ttft_ms": 12.0, "mean_itl_ms": 4.5,
+            "output_throughput": 1000.0, "request_throughput": 2.0,
+            "completed": 1319, "duration": 600.0,
+            "total_output_tokens": 2_500_000,
+            "mean_e2e_latency_ms": 500.0,
+        }
+        merged = merge_report(
+            task_name="gsm8k", lm_eval_results=lm_eval_results, perf=perf,
+            run_config={"backend": "sglang-oai", "request_rate": 4.0},
+        )
+        self.assertEqual(merged["task"], "gsm8k")
+        self.assertIn("exact_match,strict-match", merged["accuracy"])
+        self.assertAlmostEqual(merged["accuracy"]["exact_match,strict-match"], 0.62)
+        self.assertAlmostEqual(merged["perf"]["mean_ttft_ms"], 12.0)
+        self.assertEqual(merged["n_samples"]["effective"], 1319)
+        self.assertEqual(merged["run"]["backend"], "sglang-oai")
+
+    def test_write_report_appends(self):
+        from sglang.benchmark.eval_harness import merge_report, write_report
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "sub" / "out.jsonl"
+            r1 = merge_report(task_name="t", lm_eval_results={
+                "results": {"t": {"acc": 0.5}}, "n-samples": {"t": {"effective": 10}},
+                "config": {"num_fewshot": 0},
+            }, perf={"mean_ttft_ms": 1.0}, run_config={})
+            r2 = merge_report(task_name="t", lm_eval_results={
+                "results": {"t": {"acc": 0.6}}, "n-samples": {"t": {"effective": 10}},
+                "config": {"num_fewshot": 0},
+            }, perf={"mean_ttft_ms": 2.0}, run_config={})
+            write_report(str(path), r1)
+            write_report(str(path), r2)
+
+            lines = path.read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertAlmostEqual(json.loads(lines[0])["accuracy"]["acc"], 0.5)
+            self.assertAlmostEqual(json.loads(lines[1])["accuracy"]["acc"], 0.6)
+
+
 if __name__ == "__main__":
     unittest.main()
