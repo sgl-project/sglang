@@ -1829,7 +1829,6 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
-export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy
 unset http_proxy
 unset HTTPS_PROXY
@@ -1842,7 +1841,10 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 MODEL_PATH=xxx
 
+export SGLANG_SET_CPU_AFFINITY=1
+export ASCEND_LAUNCH_BLOCKING=0
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -1855,18 +1857,21 @@ export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
     --attention-backend ascend --device npu  --quantization modelslim  \
-    --max-running-requests 192 \
+    --max-running-requests 162 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --chunked-prefill-size -1 --max-prefill-tokens 32768 \
-    --tp-size 2 --mem-fraction-static 0.86 --cuda-graph-bs 42 88 96 132 144 156 172 178 192 --dtype bfloat16
+    --chunked-prefill-size -1 --max-prefill-tokens 35000 \
+    --tp-size 2 --mem-fraction-static 0.87 --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
+    --dtype bfloat16
 ```
 
 #### Benchmark
