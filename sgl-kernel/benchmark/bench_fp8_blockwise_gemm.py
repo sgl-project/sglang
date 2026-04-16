@@ -9,6 +9,8 @@ import triton
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
 from sgl_kernel import fp8_blockwise_scaled_mm
 
+from sglang.utils import is_in_ci
+
 # Optional vLLM import
 try:
     from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
@@ -22,11 +24,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_triton as w8a8_block_fp8_matmul,
 )
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 
 def get_weight_shapes(args):

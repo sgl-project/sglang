@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import functools
-import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -14,6 +13,8 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.utils import get_moe_padding_size
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -45,7 +46,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
 
-from sglang.srt.server_args import get_global_server_args
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
@@ -75,7 +75,7 @@ if not _is_cuda and not _is_hip and not _is_xpu:
         # Fallback: vllm not available, will use native PyTorch implementations
         _has_vllm_ops = False
 
-padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+padding_size = get_moe_padding_size(_use_aiter)
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -528,7 +528,7 @@ def fused_experts_impl(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
                         config,
-                        topk_ids,
+                        curr_topk_ids,
                         expert_ids,
                         down_moe_use_tma,
                         activation,
@@ -554,7 +554,7 @@ def fused_experts_impl(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
                         config,
-                        topk_ids,
+                        curr_topk_ids,
                         expert_ids,
                         down_moe_use_tma,
                         activation,

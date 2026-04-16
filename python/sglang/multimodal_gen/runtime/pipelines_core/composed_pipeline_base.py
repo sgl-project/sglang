@@ -8,7 +8,6 @@ This module defines the base class for pipelines that are composed of multiple s
 """
 
 import os
-import re
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Literal, cast
 
@@ -305,6 +304,7 @@ class ComposedPipelineBase(ABC):
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
+                component_architecture=architecture,
             )
 
             self.memory_usages[load_module_name] = memory_usage
@@ -324,7 +324,7 @@ class ComposedPipelineBase(ABC):
                 )
 
         logger.debug(
-            "Memory usage of loaded modules (GiB): %s. Available memory: %s",
+            "Memory usage of loaded modules (GiB): %s. avail mem: %s GB",
             self.memory_usages,
             round(current_platform.get_available_gpu_memory(), 2),
         )
@@ -333,12 +333,7 @@ class ComposedPipelineBase(ABC):
 
     @staticmethod
     def _infer_stage_name(stage: PipelineStage) -> str:
-        class_name = stage.__class__.__name__
-        # snake_case
-        name = re.sub(r"(?<!^)(?=[A-Z])", "_", class_name).lower()
-        if not name.endswith("_stage"):
-            name += "_stage"
-        return name
+        return stage.__class__.__name__
 
     def add_stage(
         self, stage: PipelineStage, stage_name: str | None = None
@@ -449,7 +444,11 @@ class ComposedPipelineBase(ABC):
     ) -> "ComposedPipelineBase":
 
         return self.add_stage(
-            DecodingStage(vae=self.get_module(vae_key), pipeline=self),
+            DecodingStage(
+                vae=self.get_module(vae_key),
+                pipeline=self,
+                component_name=vae_key,
+            ),
         )
 
     def add_standard_t2i_stages(

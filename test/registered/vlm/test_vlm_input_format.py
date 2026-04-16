@@ -35,8 +35,9 @@ if not hasattr(_hf_activations, "PytorchGELUTanh"):
 from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
 
-register_cuda_ci(est_time=447, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=602, suite="stage-b-test-1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
@@ -61,6 +62,7 @@ class VLMInputTestBase:
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True, use_fast=True
         )
+        _fix_added_tokens_encoding(cls.processor.tokenizer)
         cls._init_visual()
 
     @classmethod
@@ -199,16 +201,22 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
 
     @classmethod
     def _init_visual(cls):
-        cls.visual_model = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                cls.model_path, torch_dtype=torch.bfloat16
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            cls.model_path, torch_dtype=torch.bfloat16
+        ).eval()
+        # In transformers v5, .visual moved under .model
+        visual = model.model.visual
+        cls.visual_model = visual.to(cls.device)
+
+        # In transformers v5, the visual encoder returns BaseModelOutputWithPooling;
+        # pooler_output has the spatially-merged embeddings we need.
+        def visual(processor_output):
+            out = cls.visual_model(
+                processor_output["pixel_values"], processor_output["image_grid_thw"]
             )
-            .eval()
-            .visual.to(cls.device)
-        )
-        cls.visual = lambda processor_output: cls.visual_model(
-            processor_output["pixel_values"], processor_output["image_grid_thw"]
-        )
+            return out.pooler_output if hasattr(out, "pooler_output") else out
+
+        cls.visual = visual
 
     def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
@@ -251,13 +259,47 @@ class TestKimiVLImageUnderstandsImage(
 
     @classmethod
     def _init_visual(cls):
-        model = AutoModel.from_pretrained(cls.model_path, trust_remote_code=True)
+        import inspect
+
+        from transformers import AutoConfig
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        config = AutoConfig.from_pretrained(cls.model_path, trust_remote_code=True)
+
+        # Transformers v5 auto-populates rope_scaling with
+        # {"rope_theta": ..., "rope_type": "default"} even when the original
+        # config had rope_scaling: null. The remote KimiVL code branches on
+        # `if self.config.rope_scaling is None` so we must reset it.
+        tc = getattr(config, "text_config", None)
+        if tc is not None:
+            rs = getattr(tc, "rope_scaling", None)
+            if isinstance(rs, dict) and rs.get("rope_type") == "default":
+                tc.rope_scaling = None
+
+        # Transformers v5 calls tie_weights(recompute_mapping=False) in
+        # post_init, but KimiVL's tie_weights doesn't accept that kwarg.
+        auto_map = getattr(config, "auto_map", {})
+        model_ref = auto_map.get("AutoModel")
+        if model_ref:
+            model_cls = get_class_from_dynamic_module(model_ref, cls.model_path)
+            orig_tie = model_cls.tie_weights
+            if "recompute_mapping" not in inspect.signature(orig_tie).parameters:
+
+                def _patched_tie(self, **kwargs):
+                    return orig_tie(self)
+
+                model_cls.tie_weights = _patched_tie
+
+        model = AutoModel.from_pretrained(
+            cls.model_path, config=config, trust_remote_code=True
+        )
         cls.vision_tower = model.vision_tower.eval().to(cls.device)
         cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+        _vt_dtype = next(cls.vision_tower.parameters()).dtype
 
         cls.visual = lambda tokenizer_output: cls.mm_projector(
             cls.vision_tower(
-                pixel_values=tokenizer_output["pixel_values"],
+                pixel_values=tokenizer_output["pixel_values"].to(_vt_dtype),
                 grid_hws=tokenizer_output["image_grid_hws"],
             )
         )
@@ -376,9 +418,43 @@ class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
 
     @classmethod
     def _init_visual(cls):
-        model = AutoModel.from_pretrained(
-            cls.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
-        )
+        try:
+            model = AutoModel.from_pretrained(
+                cls.model_path,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=False,
+            )
+        except (RuntimeError, AttributeError) as e:
+            if isinstance(e, RuntimeError) and "meta" not in str(e):
+                raise
+            # Transformers v5 always uses meta tensors for init, which breaks
+            # models calling .item() in __init__ (e.g. InternVL's drop_path_rate).
+            # Transformers v5.5.3 may also raise AttributeError for remote-code
+            # models missing new internal attributes (e.g. all_tied_weights_keys).
+            # Fall back to from_config + manual weight loading.
+            import gc
+            import glob
+            import os
+
+            from huggingface_hub import snapshot_download
+            from safetensors.torch import load_file
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(cls.model_path, trust_remote_code=True)
+            with torch.device("cpu"):
+                model = AutoModel.from_config(
+                    config,
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                )
+            model_dir = snapshot_download(cls.model_path)
+            for f in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+                shard = load_file(f)
+                model.load_state_dict(shard, strict=False)
+                del shard
+            gc.collect()
+
         cls.vision_model = model.vision_model.eval().to(cls.device)
         cls.mlp1 = model.mlp1.eval().to(cls.device)
 
@@ -520,13 +596,51 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True
         )
+        # In transformers v5.5.3, AutoTokenizer may return TokenizersBackend
+        # which lacks model-specific attributes (e.g. im_start_id for MiniCPM-V).
+        # Replace with sglang's tokenizer which handles this via declared-class
+        # fallback, then fix added tokens encoding.
+        from sglang.srt.utils.hf_transformers import get_tokenizer
+
+        cls.processor.tokenizer = get_tokenizer(cls.model_path, trust_remote_code=True)
+        _fix_added_tokens_encoding(cls.processor.tokenizer)
         cls._init_visual()
 
     @classmethod
     def _init_visual(cls):
-        model = AutoModel.from_pretrained(
-            cls.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
-        )
+        try:
+            model = AutoModel.from_pretrained(
+                cls.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+            )
+        except (AttributeError, RuntimeError) as e:
+            err = str(e)
+            if "all_tied_weights_keys" not in err and "meta" not in err:
+                raise
+            # Transformers v5: remote model code may lack all_tied_weights_keys
+            # or meta-tensor init may break .item() calls.  Fall back to
+            # from_config + manual weight loading.
+            import gc
+            import glob
+            import os
+
+            from huggingface_hub import snapshot_download
+            from safetensors.torch import load_file
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(cls.model_path, trust_remote_code=True)
+            with torch.device("cpu"):
+                model = AutoModel.from_config(
+                    config,
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                )
+            model_dir = snapshot_download(cls.model_path)
+            for f in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+                shard = load_file(f)
+                model.load_state_dict(shard, strict=False)
+                del shard
+            gc.collect()
+
         cls.vpm_model = model.vpm.eval().to(cls.device)
         cls.resampler_model = model.resampler.eval().to(cls.device)
         del model

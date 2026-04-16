@@ -10,19 +10,13 @@ from sglang.test.test_utils import ModelLaunchSettings
 register_cuda_ci(est_time=3600, suite="nightly-8-gpu-common", nightly=True)
 
 KIMI_K25_MODEL_PATH = "moonshotai/Kimi-K2.5"
-EAGLE3_DRAFT_MODEL_PATH = "AQ-MedAI/Kimi-K25-eagle3"
 
 
 class TestKimiK25(unittest.TestCase):
     """Unified test class for Kimi-K2.5 performance and accuracy.
 
-    Two variants:
-    - basic: TP=8 + tool/reasoning parsers
-    - eagle3: TP=8 + EAGLE3 speculative decoding with draft model
-
-    Each variant runs BOTH:
-    - Performance test (using NightlyBenchmarkRunner)
-    - Accuracy test (using run_eval with gsm8k)
+    Runs TP=8 with tool/reasoning parsers.
+    Runs BOTH performance test and accuracy test (gsm8k).
     """
 
     def test_kimi_k25(self):
@@ -31,16 +25,13 @@ class TestKimiK25(unittest.TestCase):
             "--trust-remote-code",
             "--tool-call-parser=kimi_k2",
             "--reasoning-parser=kimi_k2",
-        ]
-        eagle3_args = [
-            "--speculative-algorithm=EAGLE3",
-            f"--speculative-draft-model-path={EAGLE3_DRAFT_MODEL_PATH}",
-            "--speculative-num-steps=3",
-            "--speculative-eagle-topk=1",
-            "--speculative-num-draft-tokens=4",
-            "--mem-frac=0.85",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
+        ]
+
+        dp_attn_args = [
+            "--dp=8",
+            "--enable-dp-attention",
         ]
 
         variants = [
@@ -53,8 +44,8 @@ class TestKimiK25(unittest.TestCase):
             ModelLaunchSettings(
                 KIMI_K25_MODEL_PATH,
                 tp_size=8,
-                extra_args=base_args + eagle3_args,
-                variant="TP8+MTP",
+                extra_args=base_args + dp_attn_args,
+                variant="TP8+DP8",
             ),
         ]
 

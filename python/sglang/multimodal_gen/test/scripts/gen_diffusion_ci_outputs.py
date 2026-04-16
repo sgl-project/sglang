@@ -8,6 +8,7 @@ ensuring that GT generation uses exactly the same code path as CI tests.
 Usage:
     python gen_diffusion_ci_outputs.py --suite 1-gpu --partition-id 0 --total-partitions 2 --out-dir ./output
     python gen_diffusion_ci_outputs.py --suite 1-gpu --case-ids qwen_image_t2i flux_image_t2i --out-dir ./output
+    python gen_diffusion_ci_outputs.py --suite 1-gpu-b200 --out-dir ./output
 """
 
 import argparse
@@ -16,7 +17,12 @@ import sys
 from pathlib import Path
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.run_suite import SUITES, collect_test_items, run_pytest
+from sglang.multimodal_gen.test.run_suite import (
+    SUITES,
+    _maybe_pin_update_weights_model_pair,
+    collect_test_items,
+    run_pytest,
+)
 
 logger = init_logger(__name__)
 
@@ -27,9 +33,9 @@ def main():
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["1-gpu", "2-gpu"],
+        choices=list(SUITES.keys()),
         required=True,
-        help="Test suite to run (1-gpu or 2-gpu)",
+        help="Test suite to run (choices: " + ", ".join(list(SUITES.keys())) + ")",
     )
     parser.add_argument(
         "--partition-id",
@@ -94,6 +100,7 @@ def main():
 
     # Get files from suite (same as run_suite.py)
     suite_files_rel = SUITES[args.suite]
+    _maybe_pin_update_weights_model_pair(suite_files_rel)
     suite_files_abs = []
     for f_rel in suite_files_rel:
         f_abs = target_dir / f_rel
@@ -141,7 +148,7 @@ def main():
         sys.exit(0)
 
     # Run pytest with the specific test items (same as run_suite.py)
-    exit_code = run_pytest(my_items)
+    exit_code, _, _ = run_pytest(my_items)
 
     if exit_code != 0:
         if args.continue_on_error:

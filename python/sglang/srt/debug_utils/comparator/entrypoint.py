@@ -48,6 +48,14 @@ from sglang.srt.debug_utils.dump_loader import read_meta, read_tokenizer_path
 
 _DEFAULT_SKIP_KEYS: set[str] = {"dump_index", "filename"}
 
+_DIMS_DEBUG_HINT: str = (
+    "\nHint: If this is a dims annotation issue, do NOT re-run expensive dumps.\n"
+    "Use --override-dims at comparison time, e.g.:\n"
+    '  python -m sglang.srt.debug_utils.comparator --override-dims "tensor_name:b s h[tp] d"\n'
+    "(Use --override-baseline-dims / --override-target-dims for per-side overrides.\n"
+    " Use --override-config for bulk overrides via YAML file.)"
+)
+
 
 def main() -> None:
     args = parse_args(sys.argv[1:])
@@ -254,10 +262,12 @@ def _compare_bundle_pairs(
                 meta_overrider=meta_overrider,
             )
         except Exception as exc:
+            tb = _traceback_module.format_exc()
             record = ComparisonErrorRecord(
                 name=name,
                 exception_type=type(exc).__name__,
-                traceback_str=_traceback_module.format_exc(),
+                exception_message=str(exc),
+                traceback_str=f"{_DIMS_DEBUG_HINT}\n\n{tb}",
             )
 
         target_steps: set[int] = {info.step for info in bundle_info_pair.y}

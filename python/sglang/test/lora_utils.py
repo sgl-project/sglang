@@ -51,6 +51,33 @@ DEFAULT_PROMPTS = [
     """,
 ]
 
+MOE_LORA_TEST_PROMPTS = [
+    "Reverse the following security code: 0HRUP0A ->",
+    "Write a one-sentence story about a wild tree at the cafe.",
+    "Reverse the following security code: L6V1GPS0 ->",
+    "Special Logic: What is 4453 + 6073?",
+    "Special Logic: What is 7918 + 560?",
+    "Write a one-sentence story about a slow cat in a simulation.",
+    "Write a one-sentence story about a dusty dragon in a castle.",
+    "Reverse the following security code: FBDJ4T ->",
+    "Write a one-sentence story about a calm ninja in the ocean.",
+    "Write a one-sentence story about a glowing fairy in Paris.",
+    "Special Logic: What is 6200 + 7656?",
+    "Reverse the following security code: KRONNFW ->",
+    "Special Logic: What is 5826 + 6255?",
+    "Write a one-sentence story about a shiny robot in the jungle.",
+    "Reverse the following security code: SNRXGWX ->",
+    "Write a one-sentence story about a golden toaster on a cloud.",
+    "Special Logic: What is 5286 + 5653?",
+    "Write a one-sentence story about a brave cowboy in a time machine.",
+    "Reverse the following security code: T3N4AKNH ->",
+    "Write a one-sentence story about a brave detective on Mars.",
+]
+
+MOE_BASE_MODEL_PATH = "Qwen/Qwen1.5-MoE-A2.7B"
+MOE_LORA_PATH = "jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"
+
+
 CI_LORA_MODELS = [
     LoRAModelCase(
         base="meta-llama/Llama-3.1-8B-Instruct",
@@ -352,6 +379,7 @@ def run_lora_test_one_by_one(
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
     test_tag: str = "",
+    attention_backend: Optional[str] = None,
 ):
     """
     Input a batch of prompts, and run lora tests one by one with several generate requests
@@ -401,6 +429,7 @@ def run_lora_test_one_by_one(
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=disable_radix_cache,
         mem_fraction_static=mem_fraction_static,
+        attention_backend=attention_backend,
     ) as srt_runner:
         srt_outputs = srt_runner.forward(
             prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
@@ -412,6 +441,7 @@ def run_lora_test_one_by_one(
         model_type="generation",
         tp_size=model_case.tp_size,
         mem_fraction_static=mem_fraction_static,
+        attention_backend=attention_backend,
     ) as srt_runner:
         srt_no_lora_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -738,8 +768,6 @@ def run_lora_multiple_batch_on_model_cases(
                 else {
                     "speculative_algorithm": "NGRAM",
                     "speculative_num_draft_tokens": 5,
-                    "speculative_ngram_min_match_window_size": 2,
-                    "speculative_ngram_max_match_window_size": 15,
                 }
             )
             srt_runner = SRTRunner(

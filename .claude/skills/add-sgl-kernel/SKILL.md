@@ -106,6 +106,7 @@ void scale(at::Tensor& out, const at::Tensor& input, double factor) {
 **Key points:**
 
 - Use `at::Tensor` (PyTorch tensors), `TORCH_CHECK` for validation, `at::cuda::getCurrentCUDAStream()` for stream
+- Keep Python wrappers thin; do shape/dtype/device validation in C++ right around the launch path
 - `DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16` covers `float`, `half` (FP16), `__nv_bfloat16` (BF16)
 - Add device error checking after every kernel launch
 - If a kernel only works on certain architectures, enforce that with `TORCH_CHECK` and skip logic in tests
@@ -136,7 +137,7 @@ m.impl("scale", torch::kCUDA, &scale);
 
 - `Tensor!` means in-place / mutable output argument
 - The schema is important for `torch.compile` and for consistent call signatures
-- If your underlying C++ API uses `float` but PyTorch bindings expect `double`, the implicit cast is fine for scalars; use shims if needed for other types
+- Keep the torch schema in PyTorch scalar types (`float` here), but note that the C++ launcher signature still needs `double` for scalar arguments accepted by `torch::Library`
 
 ---
 
@@ -232,7 +233,8 @@ def test_scale_cpu_input():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-q"])
+    import sys
+    sys.exit(pytest.main([__file__, "-q"]))
 ```
 
 ---
@@ -243,18 +245,15 @@ Create `sgl-kernel/benchmark/bench_scale.py`:
 
 ```python
 import itertools
-import os
 
 import torch
 import triton
 import triton.testing
 
 import sgl_kernel
+from sglang.utils import is_in_ci
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 dtypes  = [torch.float16] if IS_CI else [torch.float16, torch.bfloat16, torch.float32]
 sizes   = [4096] if IS_CI else [2**n for n in range(10, 20)]  # 1K … 512K

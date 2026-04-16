@@ -77,7 +77,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 
 ### Control Plane
 
-- **Worker Manager** discovers capabilities (`/get_server_info`, `/get_model_info`), tracks load, and registers/removes workers in the shared registry.
+- **Worker Manager** discovers capabilities (`/server_info`, `/get_model_info`), tracks load, and registers/removes workers in the shared registry.
 - **Job Queue** serializes add/remove requests and exposes status (`/workers/{worker_id}`) so clients can track onboarding progress.
 - **Load Monitor** feeds cache-aware and power-of-two policies with live worker load statistics.
 - **Health Checker** continuously probes workers and updates readiness, circuit breaker state, and router metrics.
@@ -552,7 +552,7 @@ Response:
 | `GET` | `/engine_metrics` | Engine-level metrics from workers |
 | `GET` | `/v1/models` | List available models |
 | `GET` | `/get_model_info` | Get model information |
-| `GET` | `/get_server_info` | Get server information |
+| `GET` | `/server_info` | Get server information |
 | `POST` | `/flush_cache` | Clear all caches |
 | `GET` | `/get_loads` | Get all worker loads |
 | `POST` | `/wasm` | Upload WASM module |
@@ -1645,7 +1645,7 @@ groups:
 | `--policy` | str | cache_aware | Routing policy |
 | `--max-concurrent-requests` | int | -1 | Concurrency limit (-1 disables) |
 | `--request-timeout-secs` | int | 600 | Request timeout |
-| `--max-payload-size` | int | 256MB | Maximum request payload |
+| `--max-payload-size` | int | 512MB | Maximum request payload |
 
 ### Prefill/Decode
 

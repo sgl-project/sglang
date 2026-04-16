@@ -24,6 +24,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
@@ -42,6 +43,7 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     Lfm2Config,
     Lfm2MoeConfig,
+    Lfm2VlConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3_5Config,
@@ -49,6 +51,7 @@ from sglang.srt.configs import (
     Qwen3NextConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
@@ -134,12 +137,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    MemoryPoolConfig,
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -162,6 +165,7 @@ from sglang.srt.utils import (
     empty_context,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
     is_hip,
@@ -198,6 +202,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -345,15 +350,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
+        self.enable_hisparse = server_args.enable_hisparse
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
+        self.dflash_use_aux_hidden_state = False
+        self.dflash_target_layer_ids = None
+        self.dflash_draft_num_layers = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
-            draft_model_config = ModelConfig.from_server_args(
+            draft_model_config = self._build_model_config(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
                 model_revision=server_args.speculative_draft_model_revision,
@@ -376,6 +385,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
 
+        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+            from sglang.srt.speculative.dflash_utils import (
+                parse_dflash_draft_config,
+            )
+
+            # Select target layers to capture for building DFlash context features.
+            draft_model_config = self._build_model_config(
+                server_args,
+                model_path=(server_args.speculative_draft_model_path),
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+            dflash_draft_config = parse_dflash_draft_config(
+                draft_hf_config=draft_model_config.hf_config
+            )
+            draft_num_layers = dflash_draft_config.require_num_layers()
+            trained_target_layers = dflash_draft_config.num_target_layers
+
+            target_num_layers = getattr(
+                self.model_config.hf_text_config, "num_hidden_layers", None
+            )
+            if target_num_layers is None:
+                raise ValueError(
+                    "DFLASH requires target num_hidden_layers in config. "
+                    f"Got target={target_num_layers}."
+                )
+            target_num_layers = int(target_num_layers)
+
+            if (
+                trained_target_layers is not None
+                and trained_target_layers != target_num_layers
+            ):
+                logger.warning(
+                    "DFLASH draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
+                    "selecting capture layers based on the runtime target model.",
+                    trained_target_layers,
+                    target_num_layers,
+                )
+
+            self.dflash_use_aux_hidden_state = True
+            self.dflash_draft_num_layers = int(draft_num_layers)
+            self.dflash_target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
+                target_num_layers=int(target_num_layers),
+                draft_num_layers=int(draft_num_layers),
+            )
+
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
             enable_show_time_cost()
@@ -394,11 +449,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu":
             self.init_threads_binding()
 
-        # Initialize MooncakeTransferEngine
-        self.init_shared_mooncake_transfer_engine()
-
         # Get available memory before model loading
         pre_model_load_memory = self.init_torch_distributed()
+
+        # Initialize MooncakeTransferEngine
+        self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -417,6 +472,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
+
+        # For hisparse (must be set before initialize() so CUDA graph capture can see it)
+        self.hisparse_coordinator = None
 
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
@@ -438,6 +496,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+
+    def _build_model_config(
+        self, server_args, model_path=None, model_revision=None, is_draft_model=False
+    ):
+        return ModelConfig.from_server_args(
+            server_args,
+            model_path=model_path,
+            model_revision=model_revision,
+            is_draft_model=is_draft_model,
+        )
 
     def init_mindspore_runner(self):
         # Init the mindspore runner
@@ -516,9 +584,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.remote_instance_transfer_engine is not None
             and self.remote_instance_transfer_engine_weight_info is None
         ):
+            # Register memory and upstream the transfer engine info to the bootstrap server
             self.remote_instance_transfer_engine_weight_info = register_memory_region(
                 self.model, self.remote_instance_transfer_engine
             )
+            self._register_to_engine_info_bootstrap()
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -587,6 +657,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
+            if not server_args.disable_cuda_graph:
+                # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
+                # intermediate buffers before init_memory_pool() so memory
+                # profiling accounts for them.  Phase 2 (dense LoRA batch
+                # metadata) is handled in CudaGraphRunner.__init__() via
+                # lora_manager.init_cuda_graph_batch_info().
+                self._init_lora_cuda_graph_moe_buffers()
 
         # Init Double Sparsity
         if server_args.enable_double_sparsity:
@@ -611,8 +688,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
+        # Init hisparse coordinator (must happen before CUDA graph capture)
+        if self.enable_hisparse:
+            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            hisparse_cfg = parse_hisparse_config(self.server_args)
+            self.hisparse_coordinator = HiSparseCoordinator(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                top_k=hisparse_cfg.top_k,
+                device_buffer_size=hisparse_cfg.device_buffer_size,
+                device=self.device,
+                tp_group=(
+                    self.attention_tp_group.cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_group.cpu_group
+                ),
+                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+            )
+
         # Init routed experts capturer
         self.init_routed_experts_capturer()
+
+        # Must be called BEFORE init_device_graphs() so CUDA graph capture
+        # runs with aux hidden state capture enabled.
+        self.init_aux_hidden_state_capture()
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
@@ -629,11 +730,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
-
-        if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture(
-                self.eagle_aux_hidden_state_layer_ids
-            )
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
@@ -659,6 +755,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         )
 
+    def init_aux_hidden_state_capture(self):
+        """Configure auxiliary hidden state capture for speculative decoding.
+
+        Must be called before CUDA graph capture so the captured graphs
+        include aux hidden state output paths.
+        """
+        if self.eagle_use_aux_hidden_state:
+            self.model.set_eagle3_layers_to_capture(
+                self.eagle_aux_hidden_state_layer_ids
+            )
+        if self.dflash_use_aux_hidden_state:
+            if not hasattr(self.model, "set_dflash_layers_to_capture"):
+                raise ValueError(
+                    f"Model {self.model.__class__.__name__} does not implement "
+                    "set_dflash_layers_to_capture, which is required for DFLASH."
+                )
+            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
+
     def remote_instance_init_transfer_engine(self):
         try:
             from mooncake.engine import TransferEngine
@@ -675,6 +789,137 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine_session_id = NetworkAddress(
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
         ).to_host_port_str()
+
+    def _register_to_engine_info_bootstrap(self):
+        """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
+
+        The bootstrap server runs on node_rank==0. For multi-node setups, the
+        host is derived from dist_init_addr. For single-node, use 127.0.0.1.
+        """
+        import requests as http_requests
+
+        if self.server_args.dist_init_addr:
+            # Multi-node: bootstrap server is on the head node (node_rank==0).
+            # Derive host from dist_init_addr (shared across all nodes).
+            bootstrap_host = (
+                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+            )
+        else:
+            bootstrap_host = "127.0.0.1"
+
+        bootstrap_port = self.server_args.engine_info_bootstrap_port
+        bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
+        url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
+
+        payload = {
+            "tp_rank": self.tp_rank,
+            "transfer_engine_info": {
+                "session_id": self.remote_instance_transfer_engine_session_id,
+                "weights_info_dict": self.remote_instance_transfer_engine_weight_info,
+            },
+        }
+
+        try:
+            resp = http_requests.put(url, json=payload, timeout=5)
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered transfer engine info for tp_rank={self.tp_rank} "
+                    f"with bootstrap server at {bootstrap_na}"
+                )
+            else:
+                logger.error(
+                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}: "
+                    f"{resp.status_code}, {resp.text}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
+            )
+
+    def _publish_modelexpress_metadata(self):
+        """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
+        try:
+            from modelexpress import p2p_pb2
+            from modelexpress.client import MxClient
+        except ImportError as exc:
+            raise ImportError(
+                "ModelExpress support requires the 'modelexpress' package. "
+                "Install it with: pip install modelexpress"
+            ) from exc
+
+        model_name = (
+            self.server_args.modelexpress_model_name or self.server_args.model_path
+        )
+        mx_url = self.server_args.modelexpress_url
+        session_id = self.remote_instance_transfer_engine_session_id
+        weight_info = self.remote_instance_transfer_engine_weight_info
+
+        if not session_id or weight_info is None:
+            logger.warning(
+                "ModelExpress source: skipping publish -- "
+                "TransferEngine not initialized or no weight info"
+            )
+            return
+
+        # Build SourceIdentity for this instance
+        identity = p2p_pb2.SourceIdentity(
+            model_name=model_name,
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+            tensor_parallel_size=self.server_args.tp_size,
+            pipeline_parallel_size=self.server_args.pp_size,
+            expert_parallel_size=self.server_args.ep_size,
+            dtype=self.server_args.dtype or "",
+            quantization=self.server_args.quantization or "",
+        )
+
+        # Build tensor descriptors from weight_info dict
+        tensors = []
+        for name, (addr, numel, element_size) in weight_info.items():
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=name,
+                    addr=addr,
+                    size=numel * element_size,
+                    device_id=self.gpu_id,
+                )
+            )
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            transfer_engine_session_id=session_id,
+            tensors=tensors,
+        )
+
+        # Generate a unique worker_id for this running instance
+        worker_id = str(uuid.uuid4())
+
+        mx_client = MxClient(server_url=mx_url)
+        try:
+            logger.info(
+                "ModelExpress source: publishing metadata for model=%s, "
+                "tp_rank=%d, session=%s, %d tensors, worker_id=%s",
+                model_name,
+                self.tp_rank,
+                session_id,
+                len(tensors),
+                worker_id,
+            )
+            mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
+            mx_client.update_status(
+                mx_source_id=mx_source_id,
+                worker_id=worker_id,
+                worker_rank=self.tp_rank,
+                status=p2p_pb2.SOURCE_STATUS_READY,
+            )
+            logger.info(
+                "ModelExpress source: published ready for model=%s, "
+                "tp_rank=%d, mx_source_id=%s",
+                model_name,
+                self.tp_rank,
+                mx_source_id,
+            )
+        finally:
+            mx_client.close()
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -718,7 +963,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"tp_size {self.tp_size} must be divisible by ep_size {self.moe_ep_size}"
                 )
-            moe_tp_size = self.tp_size // self.moe_ep_size
+            moe_tp_size = self.tp_size // self.moe_ep_size // self.moe_dp_size
 
             moe_intermediate_size = getattr(
                 self.model_config.hf_text_config, "moe_intermediate_size", None
@@ -731,7 +976,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
                 )
 
-            if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
+            if (
+                moe_intermediate_size // moe_tp_size
+            ) % weight_block_size_n != 0 and not _use_aiter:
                 raise ValueError(
                     f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
                     f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
@@ -821,6 +1068,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
+                enable_symm_mem=self.server_args.enable_symm_mem,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -963,6 +1211,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
             remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
+            modelexpress_url=self.server_args.modelexpress_url,
+            modelexpress_model_name=self.server_args.modelexpress_model_name
+            or self.server_args.model_path,
+            modelexpress_tp_size=self.server_args.tp_size,
+            modelexpress_pp_size=self.server_args.pp_size,
+            modelexpress_ep_size=self.server_args.ep_size,
+            modelexpress_dtype=self.server_args.dtype,
+            modelexpress_quantization=self.server_args.quantization or "",
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
@@ -1013,7 +1269,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
+        # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
+        # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
+        if _is_npu:
+            torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
+
+        # Publish metadata to ModelExpress if running as seed source
+        if self.server_args.modelexpress_source:
+            # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
+            # call register_memory_region(). Do it here so weight_info is populated.
+            if (
+                self.remote_instance_transfer_engine_weight_info is None
+                and self.remote_instance_transfer_engine is not None
+            ):
+                from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+                    register_memory_region,
+                )
+
+                self.remote_instance_transfer_engine_weight_info = (
+                    register_memory_region(
+                        self.model, self.remote_instance_transfer_engine
+                    )
+                )
+            self._publish_modelexpress_metadata()
 
         get_offloader().post_init()
 
@@ -1568,6 +1847,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             lora_paths=self.server_args.lora_paths,
         )
 
+    def _init_lora_cuda_graph_moe_buffers(self):
+        """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
+
+        Must be called before init_memory_pool() so that memory profiling
+        sees the reduced available memory and sizes KV cache correctly.
+        All MoE LoRA layers share one set of buffers (managed by the
+        lora_backend) since they execute sequentially during forward.
+
+        Phase 2 (dense LoRA batch metadata) is handled later in
+        CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
+        because it needs capture-time parameters (max_bs, num_tokens_per_bs)
+        that are only available at that stage.
+        """
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        max_bs = self.server_args.cuda_graph_max_bs
+        max_loras = self.server_args.max_loras_per_batch
+        for module in self.model.modules():
+            if isinstance(module, FusedMoEWithLoRA):
+                self.lora_manager.init_cuda_graph_moe_buffers(
+                    max_bs, max_loras, self.dtype, module
+                )
+                logger.info(
+                    f"Pre-allocated shared MoE LoRA CUDA graph buffers "
+                    f"(max_bs={max_bs}, max_loras={max_loras})"
+                )
+                break
+
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
 
@@ -1650,7 +1957,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if pattern is not None and "M" not in pattern:
                 return None
         if isinstance(
-            config, FalconH1Config | NemotronHConfig | Lfm2Config | Lfm2MoeConfig
+            config,
+            FalconH1Config
+            | NemotronHConfig
+            | Lfm2Config
+            | Lfm2MoeConfig
+            | Lfm2VlConfig,
         ):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
@@ -1672,7 +1984,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return min(self.swa_max_total_num_tokens, self.max_total_num_tokens)
+            return self.full_max_total_num_tokens
         else:
             return self.max_total_num_tokens
 
@@ -1683,14 +1995,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return config
         return None
 
+    def _get_linear_attn_registry_result(self):
+        if not hasattr(self, "_linear_attn_registry_cache"):
+            self._linear_attn_registry_cache = get_linear_attn_config(
+                self.model_config.hf_config
+            )
+        return self._linear_attn_registry_cache
+
+    @property
+    def linear_attn_model_spec(self):
+        result = self._get_linear_attn_registry_result()
+        return result[0] if result else None
+
     @property
     def mambaish_config(self):
-        return (
+        existing = (
             self.mamba2_config
             or self.hybrid_gdn_config
             or self.kimi_linear_config
             or self.hybrid_lightning_config
         )
+        if existing:
+            return existing
+        result = self._get_linear_attn_registry_result()
+        return result[1] if result else None
 
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
@@ -1864,7 +2192,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if backend_str not in [
             "flashinfer_trtllm",
+            # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
+            # "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
+            "flashinfer_cutedsl",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
         ]:
@@ -1874,11 +2205,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if major < 9:
             return False
 
-        if (
-            self.spec_algorithm.is_eagle()
-            or self.spec_algorithm.is_standalone()
-            or self.spec_algorithm.is_ngram()
-        ):
+        if self.spec_algorithm.is_speculative():
             return not self.is_draft_worker
 
         return True
@@ -1908,16 +2235,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
-        if (
-            self.spec_algorithm.is_eagle()
-            or self.spec_algorithm.is_standalone()
-            or self.spec_algorithm.is_ngram()
-        ):
+        if self.spec_algorithm.is_speculative():
             if self.is_draft_worker:
-                raise RuntimeError("This should not happen")
-            else:
-                capture_forward_mode = ForwardMode.TARGET_VERIFY
-                num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+                if not self.spec_algorithm.is_dflash():
+                    raise RuntimeError("This should not happen")
+            capture_forward_mode = ForwardMode.TARGET_VERIFY
+            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -1934,9 +2257,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.enable_torch_compile:
             set_torch_compile_config()
+            should_disable_torch_compile = not getattr(
+                self.model, "_can_torch_compile", True
+            )
+            if should_disable_torch_compile:
+                log_info_on_rank0(
+                    logger,
+                    "Transformers backend model reports it is not torch.compile "
+                    "compatible (e.g. dynamic rope scaling). Disabling torch.compile.",
+                )
+                self.server_args.enable_torch_compile = False
 
-        if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture()
+        # NOTE: aux hidden state capture (eagle3/dflash) is already
+        # configured by init_aux_hidden_state_capture() in initialize().
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
         if require_gathered_buffer(self.server_args):
@@ -1954,7 +2287,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             is_encoder_decoder=self.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather_,
             seq_len_fill_value=seq_len_fill_value,
-            encoder_len_fill_value=0,
+            encoder_len_fill_value=(
+                getattr(self.model_config.hf_config, "max_source_positions", 0)
+                if self.model_config.is_encoder_decoder
+                else 0
+            ),
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
@@ -2046,6 +2383,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
+            elif self.spec_algorithm.is_dflash():
+                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+                # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+                spec_info = DFlashVerifyInput(
+                    draft_token=None,
+                    positions=None,
+                    draft_token_num=self.server_args.speculative_num_draft_tokens,
+                    custom_mask=None,
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.NULL
+                        if self.is_draft_worker
+                        else CaptureHiddenMode.FULL
+                    ),
+                )
 
             elif self.spec_algorithm.is_ngram():
                 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -2265,6 +2617,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
+
+        # Some draft models (e.g. eagle3) don't have a standard 'layers' attribute
+        if not hasattr(language_model.model, "layers"):
+            logger.warning(
+                "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
+            )
+            return
+
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
@@ -2298,6 +2658,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if attn_layer is not None:
                 self.attention_layers.append(attn_layer)
+            elif hasattr(layer, "mixer"):
+                self.attention_layers.append(None)
 
             moe_block = None
             moe_fusion = None
@@ -2422,6 +2784,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+        if (
+            forward_batch.replace_embeds is not None
+            and forward_batch.replace_positions is not None
+        ):
+            # Token embedding overrides: get base embeddings, scatter replacements
+            if "input_embeds" not in kwargs:
+                embed_layer = self.model.get_input_embeddings()
+                kwargs["input_embeds"] = embed_layer(forward_batch.input_ids)
+            kwargs["input_embeds"][forward_batch.replace_positions] = (
+                forward_batch.replace_embeds.to(kwargs["input_embeds"].dtype)
+            )
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
@@ -2567,6 +2940,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner.can_run(forward_batch)
         )
 
+        if (
+            self.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            self.hisparse_coordinator.wait_for_pending_backup()
+
         if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,
@@ -2595,6 +2974,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Use precomputed SWA cache location
         if forward_batch.out_cache_loc_swa is not None:
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
+
+        forward_batch.hisparse_coordinator = self.hisparse_coordinator
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
@@ -2636,6 +3019,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+        # Release the vocab_mask GPU tensor immediately after it has been applied
+        # to the logits. In overlap scheduling, the sampling_info (and its
+        # vocab_mask) can be kept alive by the delay_sample_func closure and
+        # batch_record_buf until the next iteration, causing a steady VRAM leak
+        # when structured output (grammar) is used.
+        sampling_info.vocab_mask = None
 
     def sample(
         self,
