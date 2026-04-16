@@ -727,9 +727,9 @@ class MMReceiverBase(ABC):
         # Short-circuit: when the bootstrap URL points to this server and we
         # have a local registry, query it directly to avoid a synchronous HTTP
         # call that would deadlock the event loop.
-        if self._encoder_url_registry is not None and url.rstrip(
-            "/"
-        ) == (self.encoder_bootstrap_url or "").rstrip("/"):
+        if self._encoder_url_registry is not None and url.rstrip("/") == (
+            self.encoder_bootstrap_url or ""
+        ).rstrip("/"):
             urls = self._encoder_url_registry.list_urls()
             if bootstrap_url is not None:
                 # Per-request path: return directly.
@@ -837,8 +837,14 @@ class MMReceiverBase(ABC):
             )
             mm_data = self._extract_url_data(request_obj)
             asyncio.create_task(
-                self.encode(req_id, mm_data, embedding_port, "encode", "send",
-                            encode_urls=encode_urls)
+                self.encode(
+                    req_id,
+                    mm_data,
+                    embedding_port,
+                    "encode",
+                    "send",
+                    encode_urls=encode_urls,
+                )
             )
             return await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
@@ -1110,7 +1116,12 @@ class MMReceiverBase(ABC):
         return new_recv_reqs, abort_reqs
 
     def _run_encode_in_thread(
-        self, req_id, mm_data, endpoint_encode, num_items_assigned, embedding_port,
+        self,
+        req_id,
+        mm_data,
+        endpoint_encode,
+        num_items_assigned,
+        embedding_port,
         encode_urls=None,
     ):
         try:

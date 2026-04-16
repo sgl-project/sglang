@@ -57,7 +57,12 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import (
+    ORJSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -1097,7 +1102,11 @@ async def register_encoder_url(data: dict):
     registry = getattr(_global_state.tokenizer_manager, "encoder_url_registry", None)
     if registry is None:
         return ORJSONResponse(
-            {"error": {"message": "Encoder URL registry not available (--language-only not set)"}},
+            {
+                "error": {
+                    "message": "Encoder URL registry not available (--language-only not set)"
+                }
+            },
             status_code=HTTPStatus.BAD_REQUEST,
         )
     url = data.get("url")
@@ -1117,7 +1126,11 @@ async def unregister_encoder_url(data: dict):
     registry = getattr(_global_state.tokenizer_manager, "encoder_url_registry", None)
     if registry is None:
         return ORJSONResponse(
-            {"error": {"message": "Encoder URL registry not available (--language-only not set)"}},
+            {
+                "error": {
+                    "message": "Encoder URL registry not available (--language-only not set)"
+                }
+            },
             status_code=HTTPStatus.BAD_REQUEST,
         )
     url = data.get("url")

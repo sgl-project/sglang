@@ -3306,10 +3306,7 @@ class ServerArgs:
                 "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
 
-        if (
-            self.language_only
-            and len(self.encoder_urls) == 0
-        ):
+        if self.language_only and len(self.encoder_urls) == 0:
             import logging as _logging
 
             _logging.getLogger(__name__).info(
