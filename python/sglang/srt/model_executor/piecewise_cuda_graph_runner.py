@@ -47,6 +47,9 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import (
+    flashinfer_ar_needs_piecewise_cuda_graph_split,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
@@ -180,6 +183,20 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
         )
+        # ``flashinfer_allreduce_residual_rmsnorm`` is registered with
+        # ``@register_split_op`` globally.  Drop it from split_ops when the
+        # TRT-LLM backend is active so fusion stays in-graph; keep it for MNNVL
+        # (same policy as ``inplace_all_reduce``: not CUDA-graph-capture-safe).
+        if not flashinfer_ar_needs_piecewise_cuda_graph_split(
+            self.model_runner.server_args
+        ):
+            try:
+                self.compile_config.split_ops.remove(
+                    "sglang.flashinfer_allreduce_residual_rmsnorm"
+                )
+            except ValueError:
+                pass
+
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             self.compile_config.add_split_op(
                 "sglang.moe_forward_piecewise_cuda_graph_impl"

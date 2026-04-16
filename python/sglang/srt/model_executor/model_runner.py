@@ -2717,6 +2717,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_ar_needs_piecewise_cuda_graph_split,
+        )
+
+        # FIXME: Re-enable piecewise CUDA graph together with MNNVL allreduce fusion
+        # once the PCG replay hang (Lamport spin in FlashInfer MNNVL path) is fixed
+        # upstream or proven safe to capture; see revert context in PR #20792.
+        if flashinfer_ar_needs_piecewise_cuda_graph_split(self.server_args):
+            log_info_on_rank0(
+                logger,
+                "Disable piecewise CUDA graph because MNNVL allreduce fusion is enabled",
+            )
+            return
+
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
