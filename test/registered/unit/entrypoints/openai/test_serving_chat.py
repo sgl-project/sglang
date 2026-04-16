@@ -675,7 +675,7 @@ class ServingChatTestCase(unittest.TestCase):
         from sglang.srt.managers.template_manager import TemplateManager
         from sglang.srt.server_args import PortArgs, ServerArgs
 
-        server_args = ServerArgs(model_path="deepseek-ai/DeepSeek-V3.2")
+        server_args = ServerArgs(model_path="deepseek-ai/DeepSeek-V3.2", device="cpu")
         port_args = PortArgs.init_new(server_args)
 
         # Use mocks for TokenizerManager components to avoid full initialization
