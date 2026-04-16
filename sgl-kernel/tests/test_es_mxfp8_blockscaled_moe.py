@@ -1,5 +1,4 @@
 import random
-import sys
 
 import pytest
 import torch
@@ -153,4 +152,4 @@ def test_es_sm100_mxfp8_blockscaled_grouped_mm(num_experts, out_dtype):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

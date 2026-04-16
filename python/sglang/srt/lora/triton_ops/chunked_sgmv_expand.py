@@ -4,7 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.triton_ops.lora_tuning_config import get_lora_expand_config
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
@@ -176,13 +175,10 @@ def chunked_sgmv_lora_expand_forward(
     num_slices = len(slice_offsets) - 1
     assert input_dim == num_slices * MAX_RANK
 
-    # Block shapes — use auto-tuned config if available, else defaults
+    # TODO (lifuhuang): fine-tune per operation
     BLOCK_M = batch_info.max_len
-    config = get_lora_expand_config(
-        K=OUTPUT_DIM, R=MAX_RANK, num_slices=num_slices, chunk_size=BLOCK_M
-    )
-    BLOCK_K = config["BLOCK_K"]
-    BLOCK_N = config["BLOCK_N"]
+    BLOCK_K = 16
+    BLOCK_N = 64
 
     num_segments = batch_info.num_segments
 
@@ -196,15 +192,6 @@ def chunked_sgmv_lora_expand_forward(
         output = torch.zeros((M, OUTPUT_DIM), device=x.device, dtype=x.dtype)
     else:
         output = base_output
-
-    # Optional launch params from tuned config
-    extra_kwargs = {}
-    if "num_warps" in config:
-        extra_kwargs["num_warps"] = config["num_warps"]
-    if "num_stages" in config:
-        extra_kwargs["num_stages"] = config["num_stages"]
-    if "maxnreg" in config:
-        extra_kwargs["maxnreg"] = config["maxnreg"]
 
     _chunked_lora_expand_kernel[grid](
         x=x,
@@ -224,7 +211,6 @@ def chunked_sgmv_lora_expand_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        **extra_kwargs,
     )
 
     return output

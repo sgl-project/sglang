@@ -54,10 +54,10 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen)/**"
               - "python/pyproject_xpu.toml"
-              - "test/**/!(*.md)"
-              - "sgl-kernel/**/*.!(md|txt)"
+              - "test/**"
+              - "sgl-kernel/**"
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
 

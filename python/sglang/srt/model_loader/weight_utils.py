@@ -58,7 +58,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
 )
-from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
 
 try:
@@ -551,9 +550,9 @@ def download_safetensors_index_file_from_hf(
         # If file not found on remote or locally, we should not fail since
         # only some models will have index_file.
         except huggingface_hub.utils.EntryNotFoundError:
-            logger.debug("No %s found in remote.", index_file)
+            logger.info("No %s found in remote.", index_file)
         except huggingface_hub.utils.LocalEntryNotFoundError:
-            logger.debug("No %s found in local cache.", index_file)
+            logger.info("No %s found in local cache.", index_file)
 
 
 # For models like Mistral-7B-v0.3, there are both sharded
@@ -605,11 +604,7 @@ def maybe_add_mtp_safetensors(
     """
     # Only apply for GLM4Moe architecture with nextn layers
     arch = getattr(hf_config, "architectures", [None])[0]
-    num_nextn_layers = getattr(
-        getattr(hf_config, "text_config", hf_config),
-        "num_nextn_predict_layers",
-        getattr(hf_config, "num_nextn_predict_layers", 0),
-    )
+    num_nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
     if not (
         arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
         and num_nextn_layers > 0
@@ -1089,7 +1084,7 @@ def composed_weight_loader(
 
 
 def runai_safetensors_weights_iterator(
-    hf_weights_files: List[str], is_distributed: bool = False, device: str = "cpu"
+    hf_weights_files: List[str],
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     from runai_model_streamer import SafetensorsStreamer
@@ -1097,30 +1092,17 @@ def runai_safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
-    device = device if is_distributed and is_cuda_alike() else "cpu"
 
     with SafetensorsStreamer() as streamer:
-
-        streamer.stream_files(
+        for st_file in tqdm(
             hf_weights_files,
-            device=device,
-            is_distributed=is_distributed,
-        )
-        total_tensors = sum(
-            len(tensors_meta)
-            for tensors_meta in streamer.files_to_tensors_metadata.values()
-        )
-
-        tensor_iter = tqdm(
-            streamer.get_tensors(),
-            total=total_tensors,
             desc="Loading safetensors using Runai Model Streamer",
-            bar_format=BAR_FORMAT,
             disable=not enable_tqdm,
-            mininterval=2,
-        )
-
-        yield from tensor_iter
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        ):
+            streamer.stream_file(st_file)
+            yield from streamer.get_tensors()
 
 
 def set_runai_streamer_env(load_config: LoadConfig):

@@ -55,8 +55,6 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
             "--tp",
             "1",
             "--attention-backend",
@@ -78,8 +76,6 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
             "--tp",
             "1",
             "--base-gpu-id",
@@ -216,7 +212,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         )
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+# register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -258,8 +254,6 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
             "--tp",
             "1",
             "--attention-backend",
@@ -281,8 +275,6 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
             "--tp",
             "1",
             "--base-gpu-id",
@@ -330,7 +322,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+# register_amd_ci(est_time=300, suite="stage-b-test-large-2-gpu-amd")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -370,8 +362,6 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
             "--tp",
             "1",
             "--attention-backend",
@@ -393,8 +383,6 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
             "--tp",
             "1",
             "--base-gpu-id",

@@ -31,13 +31,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     _w8a8_block_fp8_matmul_unrolledx4,
 )
 from sglang.srt.layers.quantization.int8_kernel import _w8a8_block_int8_matmul
-from sglang.srt.utils import (
-    get_device,
-    get_device_core_count,
-    get_device_count,
-    get_device_name,
-    is_hip,
-)
+from sglang.srt.utils import get_device_core_count, get_device_name, is_hip
 
 _is_hip = is_hip()
 
@@ -227,18 +221,18 @@ def benchmark_config(
     def run():
         w8a8_block_matmul(A, B, As, Bs, block_size, config, out_dtype)
 
-    torch.get_device_module().synchronize()
+    torch.cuda.synchronize()
     # JIT complication & warmup
     for _ in range(5):
         run()
-    torch.get_device_module().synchronize()
+    torch.cuda.synchronize()
 
-    start_event = torch.get_device_module().Event(enable_timing=True)
-    end_event = torch.get_device_module().Event(enable_timing=True)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
     latencies: List[float] = []
     for i in range(num_iters):
-        torch.get_device_module().synchronize()
+        torch.cuda.synchronize()
         start_event.record()
         run()
         end_event.record()
@@ -250,7 +244,6 @@ def benchmark_config(
 
 def tune(M, N, K, block_size, out_dtype, search_space, input_type):
     factor_for_scale = 1e-2
-    device = get_device()
 
     if input_type == "fp8":
         fp8_info = torch.finfo(
@@ -259,14 +252,14 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
         fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
         A_fp32 = (
-            (torch.rand(M, K, dtype=torch.float32, device=device) - 0.5) * 2 * fp8_max
+            (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
         )
         A = A_fp32.clamp(min=fp8_min, max=fp8_max).to(
             torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
         )
 
         B_fp32 = (
-            (torch.rand(N, K, dtype=torch.float32, device=device) - 0.5) * 2 * fp8_max
+            (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
         )
         B = B_fp32.clamp(min=fp8_min, max=fp8_max).to(
             torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -276,12 +269,12 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
         int8_max, int8_min = int8_info.max, int8_info.min
 
         A_fp32 = (
-            (torch.rand(M, K, dtype=torch.float32, device=device) - 0.5) * 2 * int8_max
+            (torch.rand(M, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * int8_max
         )
         A = A_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
 
         B_fp32 = (
-            (torch.rand(N, K, dtype=torch.float32, device=device) - 0.5) * 2 * int8_max
+            (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * int8_max
         )
         B = B_fp32.clamp(min=int8_min, max=int8_max).to(torch.int8)
 
@@ -289,9 +282,9 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
     n_tiles = (N + block_n - 1) // block_n
     k_tiles = (K + block_k - 1) // block_k
 
-    As = torch.rand(M, k_tiles, dtype=torch.float32, device=device) * factor_for_scale
+    As = torch.rand(M, k_tiles, dtype=torch.float32, device="cuda") * factor_for_scale
     Bs = (
-        torch.rand(n_tiles, k_tiles, dtype=torch.float32, device=device)
+        torch.rand(n_tiles, k_tiles, dtype=torch.float32, device="cuda")
         * factor_for_scale
     )
 
@@ -358,6 +351,11 @@ def save_configs(
             lock.release()
 
 
+def get_available_gpu_count():
+    """Get the number of available GPUs."""
+    return torch.cuda.device_count()
+
+
 def tune_on_gpu(args_dict):
     """Run tuning on a specific GPU."""
     gpu_id = args_dict["gpu_id"]
@@ -366,7 +364,7 @@ def tune_on_gpu(args_dict):
     args = args_dict["args"]
     lock = args_dict["lock"]
 
-    torch.get_device_module().set_device(gpu_id)
+    torch.cuda.set_device(gpu_id)
     print(f"Starting tuning on GPU {gpu_id} with batch sizes {batch_sizes}")
 
     block_n = args.block_n
@@ -417,12 +415,12 @@ def distribute_batch_sizes(batch_sizes, num_gpus):
 def main(args):
     print(args)
 
-    num_gpus = get_device_count()
+    num_gpus = get_available_gpu_count()
     if num_gpus == 0:
         raise RuntimeError("No GPU available for tuning")
     print(f"Found {num_gpus} GPUs for parallel tuning")
 
-    torch.get_device_module().init()
+    torch.cuda.init()
 
     if args.batch_size is None:
         batch_sizes = [

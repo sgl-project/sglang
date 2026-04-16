@@ -972,8 +972,10 @@ class MoriKVSender(CommonKVSender):
         raise RuntimeError(failure_reason)
 
     def abort(self):
-        super().abort()
-        self._notify_decode(KVPoll.Failed, "Aborted by AbortReq.")
+        reason = "Aborted by AbortReq."
+        self.kv_mgr.record_failure(self.bootstrap_room, reason)
+        self._notify_decode(KVPoll.Failed, reason)
+        self.conclude_state = KVPoll.Failed
 
 
 class MoriKVReceiver(CommonKVReceiver):
@@ -983,18 +985,17 @@ class MoriKVReceiver(CommonKVReceiver):
         mgr: MoriKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        prefill_dp_rank: Optional[int] = None,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
+        self.conclude_state: Optional[KVPoll] = None
         self.init_time: Optional[float] = None
-
-    def init(
-        self,
-        prefill_dp_rank: int,
-    ):
-        super().init(prefill_dp_rank)
-        if self.bootstrap_room is None:
+        if self.bootstrap_room is None or self.bootstrap_infos is None:
             return
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        self._register_kv_args()
 
     def _register_kv_args(self):
         if self.bootstrap_infos is None:
@@ -1028,7 +1029,7 @@ class MoriKVReceiver(CommonKVReceiver):
                     ]
                 )
 
-    def send_metadata(
+    def init(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
@@ -1104,8 +1105,10 @@ class MoriKVReceiver(CommonKVReceiver):
     def abort(self):
         if self.bootstrap_room is None:
             return
-        super().abort()
+        reason = "Aborted by AbortReq."
+        self.kv_mgr.record_failure(self.bootstrap_room, reason)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.conclude_state = KVPoll.Failed
         self.clear()
 
 

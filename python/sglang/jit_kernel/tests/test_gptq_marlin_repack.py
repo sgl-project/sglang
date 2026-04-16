@@ -1,5 +1,3 @@
-import sys
-
 import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
@@ -10,11 +8,7 @@ from sglang.srt.layers.quantization.utils import (
     pack_rows,
     sort_weights,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import get_weight_perm, marlin_weights
-
-register_cuda_ci(est_time=16, suite="stage-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 MARLIN_K_CHUNKS = [128]
 MARLIN_N_CHUNKS = [64, 256]
@@ -93,4 +87,4 @@ def test_gptq_marlin_repack(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    pytest.main([__file__, "-v", "-s"])

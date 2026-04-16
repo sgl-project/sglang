@@ -8,7 +8,6 @@ from pathlib import Path
 
 import requests
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -198,7 +197,7 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
                 continue
 
             rid = data.get("rid", "")
-            if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+            if rid.startswith("HEALTH_CHECK"):
                 continue
 
             if data.get("event") == "request.received":

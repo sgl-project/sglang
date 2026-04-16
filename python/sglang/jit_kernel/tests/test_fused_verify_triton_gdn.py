@@ -6,12 +6,8 @@ the reference two-step implementation:
     2. o = fused_recurrent_gated_delta_rule_update(q, k, v, g, beta, ...)
 """
 
-import sys
-
 import pytest
 import torch
-
-from sglang.test.ci.ci_register import register_cuda_ci
 
 try:
     from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -25,9 +21,6 @@ try:
     KERNELS_AVAILABLE = True
 except ImportError:
     KERNELS_AVAILABLE = False
-
-register_cuda_ci(est_time=6, suite="stage-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def _make_tensors(N, T, H, HV, K, V, device="cuda", seed=2025):
@@ -235,4 +228,4 @@ def test_mtp_single_step_decode(N: int):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    pytest.main([__file__, "-v", "-s"])

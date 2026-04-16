@@ -38,9 +38,7 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     vae_scale_factor = (
         server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
     )
-    image_seq_len = (int(height) // (vae_scale_factor * 2)) * (
-        int(width) // (vae_scale_factor * 2)
-    )
+    image_seq_len = (int(height) // vae_scale_factor) * (int(width) // vae_scale_factor)
 
     mu = calculate_shift(
         image_seq_len,

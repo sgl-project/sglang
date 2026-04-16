@@ -13,7 +13,6 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import aiohttp
-import numpy as np
 import torch
 import zmq
 import zmq.asyncio
@@ -30,11 +29,7 @@ from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
-from sglang.srt.utils.network import (
-    NetworkAddress,
-    get_local_ip_auto,
-    get_zmq_socket_on_host,
-)
+from sglang.srt.utils.network import get_local_ip_auto, get_zmq_socket_on_host
 
 logger = logging.getLogger(__name__)
 
@@ -197,27 +192,12 @@ _VIDEO_META_ATTRS = ("video_timestamps", "second_per_grid_ts")
 
 
 def _cat_grid(dims, flatten_items=False):
-    """Concatenate non-None grid entries; supports tensor/ndarray/list inputs."""
-
-    def _to_tensor(g):
-        if isinstance(g, torch.Tensor):
-            return g.cpu() if g.is_cuda else g
-        if isinstance(g, np.ndarray):
-            return torch.from_numpy(g)
-        return torch.as_tensor(g)
-
-    valid = []
-    for g in dims:
-        if g is None:
-            continue
-        t = _to_tensor(g)
-        if flatten_items:
-            t = t.flatten()
-        elif t.ndim == 0:
-            # Keep cat semantics stable for scalar-like metadata.
-            t = t.unsqueeze(0)
-        valid.append(t)
-
+    """Concatenate non-None tensors from a list; optionally flatten each before cat."""
+    valid = (
+        [g.flatten() for g in dims if g is not None]
+        if flatten_items
+        else [g for g in dims if g is not None]
+    )
     return torch.cat(valid, dim=0) if valid else None
 
 
@@ -419,7 +399,7 @@ class WaitingImageRequest:
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
         self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
-            zmq.Context(), zmq.PULL, host=host_name
+            zmq.Context(), zmq.PULL
         )
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
@@ -467,9 +447,7 @@ class WaitingImageRequest:
                         payload = {
                             "req_id": part_req_id,  # use part_req_id to match encode request
                             "receive_count": receive_count,
-                            "receive_url": NetworkAddress(
-                                host_name, embedding_port
-                            ).to_host_port_str(),
+                            "receive_url": f"{host_name}:{embedding_port}",
                             "modality": modality.name,
                         }
                         logger.info(
@@ -548,7 +526,7 @@ class WaitingImageRequest:
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs.input_ids
+        self.recv_req.input_ids = mm_inputs["input_ids"]
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
 
@@ -688,11 +666,6 @@ class MMReceiverBase(ABC):
                     server_args,
                     _processor,
                     transport_mode,
-                    model_config=(
-                        getattr(self.scheduler, "model_config", None)
-                        if self.scheduler is not None
-                        else None
-                    ),
                     skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
                 )
 
@@ -708,9 +681,7 @@ class MMReceiverBase(ABC):
             if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
             req_id = uuid.uuid4().hex
-            embedding_port, recv_socket = get_zmq_socket_on_host(
-                self.context, zmq.PULL, host=self.host
-            )
+            embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
             mm_data = self._extract_url_data(request_obj)
             asyncio.create_task(
                 self.encode(req_id, mm_data, embedding_port, "encode", "send")
@@ -1037,26 +1008,6 @@ class MMReceiverBase(ABC):
         return num_items_assigned
 
     def _extract_url_data(self, request_obj) -> List[Dict]:
-        def flatten_mm_items(items):
-            if not isinstance(items, list):
-                return [items]
-
-            flat = []
-            for item in items:
-                if isinstance(item, (list, tuple)):
-                    flat.extend(flatten_mm_items(list(item)))
-                else:
-                    flat.append(item)
-            return flat
-
-        def to_raw_url(mm_item):
-            if isinstance(mm_item, ImageData):
-                return mm_item.url
-            if isinstance(mm_item, dict):
-                # tolerate {"url": ...} shaped payloads
-                return mm_item.get("url", mm_item)
-            return mm_item
-
         mm_data = []
         for attr, modality in [
             ("image_data", Modality.IMAGE),
@@ -1065,11 +1016,16 @@ class MMReceiverBase(ABC):
         ]:
             mm_items = getattr(request_obj, attr, None)
             if mm_items:
-                mm_items = flatten_mm_items(mm_items)
+                if not isinstance(mm_items, list):
+                    mm_items = [mm_items]
                 for mm_item in mm_items:
                     mm_data.append(
                         {
-                            "url": to_raw_url(mm_item),
+                            "url": (
+                                mm_item.url
+                                if isinstance(mm_item, ImageData)
+                                else mm_item
+                            ),
                             "modality": modality,
                         }
                     )

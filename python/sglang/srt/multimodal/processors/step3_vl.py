@@ -10,7 +10,6 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from transformers import BatchFeature, ProcessorMixin, TensorType
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.step3_vl import Step3VLForConditionalGeneration
 from sglang.srt.models.step3_vl_10b import StepVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -515,8 +514,8 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens
         )
 
-        return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
-            mm_items=mm_items,
-            im_token_id=self.mm_tokens.image_token_id,
-        )
+        return {
+            "input_ids": input_ids.tolist(),
+            "mm_items": mm_items,
+            "im_token_id": self.mm_tokens.image_token_id,
+        }

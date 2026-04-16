@@ -1,4 +1,3 @@
-import sys
 import time
 from typing import Optional, Tuple, Union
 
@@ -8,10 +7,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.rope import rotary_embedding
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=18, suite="stage-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 @triton.jit
@@ -491,4 +486,4 @@ def test_performance(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    pytest.main([__file__, "-v", "-s"])

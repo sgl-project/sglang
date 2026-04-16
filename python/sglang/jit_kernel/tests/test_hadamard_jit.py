@@ -1,5 +1,4 @@
 import math
-import sys
 
 import numpy as np
 import pytest
@@ -14,10 +13,6 @@ from sglang.jit_kernel.hadamard import (
     hadamard_transform_28n,
     hadamard_transform_40n,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=128, suite="stage-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=512, suite="nightly-kernel-1-gpu", nightly=True)
 
 # Exact M×N Hadamard matrices (±1 entries) copied from
 # python/sglang/jit_kernel/csrc/fast-hadamard-transform/code_gen.py.
@@ -425,4 +420,4 @@ def test_hadamard_transform_40n(dim, dtype):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

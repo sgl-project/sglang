@@ -1,10 +1,6 @@
 import re
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_audio import Qwen2AudioForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -65,7 +61,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
-                    offsets=[offset],
+                    offsets=offset,
                     precomputed_embeddings=embedding_slice,
                 )
             )
@@ -73,13 +69,13 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         if mm_items:
             mm_items[0].audio_feature_lens = output_lengths
 
-        return MultimodalProcessorOutput(
-            mm_items=mm_items,
-            input_ids=input_ids,
-            audio_start_id=self.audio_start_id,
-            audio_token_id=self.audio_token_id,
-            audio_end_id=self.audio_end_id,
-        )
+        return {
+            "mm_items": mm_items,
+            "input_ids": input_ids,
+            "audio_start_id": self.audio_start_id,
+            "audio_token_id": self.audio_token_id,
+            "audio_end_id": self.audio_end_id,
+        }
 
     async def process_mm_data_async(
         self,
@@ -108,10 +104,10 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
 
         mm_items[0].audio_feature_lens = output_lengths
 
-        return MultimodalProcessorOutput(
-            mm_items=mm_items,
-            input_ids=input_ids.tolist(),
-            audio_start_id=self.audio_start_id,
-            audio_token_id=self.audio_token_id,
-            audio_end_id=self.audio_end_id,
-        )
+        return {
+            "mm_items": mm_items,
+            "input_ids": input_ids.tolist(),
+            "audio_start_id": self.audio_start_id,
+            "audio_token_id": self.audio_token_id,
+            "audio_end_id": self.audio_end_id,
+        }

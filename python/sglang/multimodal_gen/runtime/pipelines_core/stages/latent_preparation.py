@@ -37,15 +37,6 @@ class LatentPreparationStage(PipelineStage):
         self.scheduler = scheduler
         self.transformer = transformer
 
-    def _get_latent_dtype(
-        self,
-        batch: Req,
-        server_args: ServerArgs,
-    ):
-        return server_args.pipeline_config.get_latent_dtype(
-            batch.prompt_embeds[0].dtype
-        )
-
     def forward(
         self,
         batch: Req,
@@ -66,7 +57,9 @@ class LatentPreparationStage(PipelineStage):
         batch_size = batch.batch_size
 
         # Get required parameters
-        dtype = self._get_latent_dtype(batch, server_args)
+        dtype = server_args.pipeline_config.get_latent_dtype(
+            batch.prompt_embeds[0].dtype
+        )
         device = get_local_torch_device()
         generator = batch.generator
         latents = batch.latents

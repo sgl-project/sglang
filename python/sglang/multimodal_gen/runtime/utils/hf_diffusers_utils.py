@@ -44,10 +44,6 @@ from sglang.multimodal_gen.runtime.loader.utils import _clean_hf_config_inplace
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.model_overlay import (
-    maybe_load_overlay_model_index,
-    maybe_resolve_overlay_model_path,
-)
 from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
@@ -378,10 +374,7 @@ def check_gguf_file(model: str | os.PathLike) -> bool:
 
 
 def maybe_download_lora(
-    model_name_or_path: str,
-    local_dir: str | None = None,
-    download: bool = True,
-    weight_name: str | None = None,
+    model_name_or_path: str, local_dir: str | None = None, download: bool = True
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -389,8 +382,6 @@ def maybe_download_lora(
         model_name_or_path: Local path or Hugging Face Hub model ID
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
-        weight_name: Specific safetensors filename to load (pins deterministic selection
-                     for repos with multiple weight files)
 
     Returns:
         Local path to the model
@@ -408,22 +399,14 @@ def maybe_download_lora(
     if os.path.isfile(local_path):
         return local_path
 
-    if weight_name is not None:
-        target = os.path.join(local_path, weight_name)
-        if not os.path.isfile(target):
-            raise FileNotFoundError(
-                f"Specified lora_weight_name '{weight_name}' not found in {local_path}"
-            )
-        return target
-
-    guessed = _best_guess_weight_name(local_path, file_extension=".safetensors")
+    weight_name = _best_guess_weight_name(local_path, file_extension=".safetensors")
     # AMD workaround: PR 15813 changed from model_name_or_path to local_path,
     # which can return None. Fall back to original behavior on ROCm.
-    if guessed is None and current_platform.is_rocm():
-        guessed = _best_guess_weight_name(
+    if weight_name is None and current_platform.is_rocm():
+        weight_name = _best_guess_weight_name(
             model_name_or_path, file_extension=".safetensors"
         )
-    return os.path.join(local_path, guessed)
+    return os.path.join(local_path, weight_name)
 
 
 def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
@@ -502,15 +485,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
 
     from huggingface_hub.errors import EntryNotFoundError
 
-    overlay_config = maybe_load_overlay_model_index(
-        model_name_or_path,
-        snapshot_download_fn=snapshot_download,
-        hf_hub_download_fn=hf_hub_download,
-    )
-    if overlay_config is not None:
-        return overlay_config
-
-    # If it's a local path, verify it directly.
+    # If it's a local path, verify it directly
     if os.path.exists(model_name_or_path):
         try:
             return verify_model_config_and_directory(model_name_or_path)
@@ -558,7 +533,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             )
             return config
     except EntryNotFoundError:
-        logger.debug(
+        logger.warning(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )
@@ -585,7 +560,6 @@ def maybe_download_model(
     is_lora: bool = False,
     allow_patterns: list[str] | None = None,
     force_diffusers_model: bool = False,
-    skip_overlay_resolution: bool = False,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -599,20 +573,6 @@ def maybe_download_model(
     Returns:
         Local path to the model
     """
-    if force_diffusers_model and not skip_overlay_resolution:
-        # return overlay model path if applicable
-        overlay_model_path = maybe_resolve_overlay_model_path(
-            model_name_or_path,
-            local_dir=local_dir,
-            download=download,
-            allow_patterns=allow_patterns,
-            snapshot_download_fn=snapshot_download,
-            hf_hub_download_fn=hf_hub_download,
-            verify_diffusers_model_complete_fn=_verify_diffusers_model_complete,
-            base_model_download_fn=maybe_download_model,
-        )
-        if overlay_model_path is not None:
-            return overlay_model_path
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):

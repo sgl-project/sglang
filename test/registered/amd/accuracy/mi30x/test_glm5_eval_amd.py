@@ -59,17 +59,13 @@ class ModelConfig:
 GLM5_MODELS = [
     # GLM-5 with NSA attention (TP=8)
     ModelConfig(
-        model_path="zai-org/GLM-5-FP8",
+        model_path="zai-org/GLM-5",
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
         variant="nsa",
         other_args=[
             "--trust-remote-code",
-            "--reasoning-parser",
-            "glm45",
-            "--tool-call-parser",
-            "glm47",
             "--nsa-prefill-backend",
             "tilelang",
             "--nsa-decode-backend",
@@ -81,7 +77,7 @@ GLM5_MODELS = [
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
             "--watchdog-timeout",
-            "1200",
+            "1200",  # 20 minutes for weight loading
         ],
         env_vars={"SGLANG_USE_AITER": "1"},
     ),

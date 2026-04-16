@@ -940,6 +940,3 @@ def fused_recurrent_gated_delta_rule_update(
         retrieve_parent_token,
     )
     return o
-
-
-fused_recurrent_gdn = fused_recurrent_gated_delta_rule

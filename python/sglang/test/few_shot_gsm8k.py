@@ -1,11 +1,6 @@
 """
 Run few-shot GSM-8K evaluation.
 
-.. deprecated::
-    This module is deprecated. Use ``sglang.test.run_eval`` with
-    ``eval_name="gsm8k"`` instead, which routes through the unified
-    Chat API evaluation framework with dump_metric support.
-
 Usage:
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 """
@@ -14,7 +9,6 @@ import argparse
 import ast
 import re
 import time
-import warnings
 
 import numpy as np
 
@@ -56,12 +50,6 @@ def get_answer_value(answer_str):
 
 
 def run_eval(args):
-    warnings.warn(
-        "sglang.test.few_shot_gsm8k is deprecated. "
-        "Use sglang.test.run_eval with eval_name='gsm8k' instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
     # Select backend
     set_default_backend(RuntimeEndpoint(normalize_base_url(args.host, args.port)))
 

@@ -54,19 +54,18 @@ jobs:
           cd python
           cp ../README.md ../LICENSE .
 
-          TAG=$(python3 ../python/tools/get_version_tag.py)
+          # Parse git describe output to get latest tag
+          # Use same command as pyproject.toml to ensure version consistency
+          DESC=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long 2>/dev/null || echo 'v0.0.0-0-g0000000')
+          TAG=$(echo "$DESC" | cut -d- -f1)
           HASH="g$(git rev-parse --short HEAD)"
           BUILD_DATE=$(date -u +%Y%m%d)
 
-          # Increment patch version for nightlies (e.g., v0.5.9 -> 0.5.10)
-          # Must always increment so nightly > latest tag per PEP 440 ordering:
-          #   X.Y.Z.devN < X.Y.Z.rcN < X.Y.Z < X.Y.(Z+1).devN
+          # Increment patch version for nightlies (e.g., v0.5.8 -> 0.5.9)
           VERSION=${TAG#v}  # Remove 'v' prefix
           MAJOR=$(echo "$VERSION" | cut -d. -f1)
           MINOR=$(echo "$VERSION" | cut -d. -f2)
-          PATCH_RAW=$(echo "$VERSION" | cut -d. -f3)
-          # Strip pre-release suffixes (rc0, post1, etc.) to get numeric patch
-          PATCH=$(echo "$PATCH_RAW" | sed 's/[^0-9].*//')
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
           NEXT_PATCH=$((PATCH + 1))
           NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
 

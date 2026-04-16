@@ -93,14 +93,12 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
         // default config for pull kernel, can be updated by `configure()`
         m_num_cta(max_num_cta_pull),
         m_cta_size(256) {
-    RuntimeCheck(pull_buffer_size % 128 == 0, "Pull buffer size should be aligned to 128 bytes");
-    RuntimeCheck(push_buffer_size % 128 == 0, "Push buffer size should be aligned to 128 bytes");
+    RuntimeDeviceCheck(cudaMalloc(&m_storage, storage_bytes()));
     RuntimeCheck(rank < num_gpu, "Invalid rank: ", rank);
     const int64_t kU32Max = static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
     const int64_t push_buffer_size_all = push_all_ranks_bytes();
-    RuntimeCheck(pull_buffer_size <= kU32Max, "Pull buffer size is too large: ", pull_buffer_size);
+    RuntimeCheck(pull_buffer_size <= kU32Max, "Buffer size is too large: ", pull_buffer_size);
     RuntimeCheck(push_buffer_size_all <= kU32Max, "Push buffer size is too large: ", push_buffer_size_all);
-    RuntimeDeviceCheck(cudaMalloc(&m_storage, storage_bytes()));
   }
 
   ExternHandle share_storage() {
@@ -196,8 +194,8 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
         for (const auto j : irange(new_registered_count)) {
           /// NOTE: structural binding will cause intern compiler error...
           const auto elem = array[j];
-          const auto offset = elem.get<0>();
-          const auto ipc_handle = elem.get<1>();
+          const auto offset = get<0>(elem);
+          const auto ipc_handle = get<1>(elem);
           data[j].input[i] = pointer::offset(open_cached(ipc_handle), offset);
         }
       }
@@ -254,18 +252,19 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     return static_cast<int64_t>(m_graph_capture_inputs.size());
   }
   int64_t pull_signal_bytes() const {
-    return _align_bytes(sizeof(PullController::SignalType) * m_max_num_cta_pull);
+    return sizeof(device::distributed::Semaphore) * m_max_num_cta_pull;
   }
   int64_t push_signal_bytes() const {
-    return _align_bytes(sizeof(PushController::SignalType) * m_max_num_cta_push);
+    return sizeof(device::distributed::Semaphore) * m_max_num_cta_push;
   }
-  int64_t graph_param_bytes() const {
-    return _align_bytes(sizeof(AllReduceData) * (1 + m_graph_buffer_count));  // 1 for default
+  int64_t params_bytes() const {
+    return sizeof(AllReduceData) * (1 + m_graph_buffer_count);  // 1 for default
   }
   int64_t push_all_ranks_bytes() const {
-    return _align_bytes(PushController::kNumStages * m_num_gpu * m_push_buffer_bytes);
+    return PushController::kNumStages * m_num_gpu * m_push_buffer_bytes;
   }
   int64_t storage_bytes() const {
+    // | SignalArray (pull + push) | GraphBuffers (pull params) | Buffers (pull + push) |
     return _get_offset_impl(5);
   }
   void* get_pull_signal(void* ptr) const {
@@ -284,19 +283,15 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     return pointer::offset(ptr, _get_offset_impl(4));
   }
   int64_t _get_offset_impl(int64_t which) const {
-    // | SignalArray (pull + push) | GraphBuffers (pull params) | Buffers (pull + push) |
     const int64_t offset_map[5] = {
         /*[0]=*/pull_signal_bytes(),
         /*[1]=*/push_signal_bytes(),
-        /*[2]=*/graph_param_bytes(),
+        /*[2]=*/params_bytes(),
         /*[3]=*/m_pull_buffer_bytes,
         /*[4]=*/push_all_ranks_bytes(),
     };
     RuntimeCheck(which >= 0 && which <= 5, "Invalid offset index: ", which);
     return std::accumulate(offset_map, offset_map + which, int64_t(0));
-  }
-  static int64_t _align_bytes(int64_t size) {
-    return div_ceil(size, 128) * 128;
   }
 
   const int64_t m_pull_buffer_bytes;

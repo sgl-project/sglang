@@ -1,7 +1,6 @@
 """Test for ComfyUIFluxPipeline with pass-through scheduler."""
 
 import os
-import sys
 
 import pytest
 import torch
@@ -160,4 +159,4 @@ def test_comfyui_flux_pipeline_direct() -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    pytest.main([__file__, "-v"])

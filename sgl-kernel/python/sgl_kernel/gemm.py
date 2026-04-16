@@ -109,9 +109,10 @@ def sgl_per_token_group_quant_8bit(
     masked_m: Optional[torch.Tensor] = None,
     enable_v2: Optional[bool] = None,
 ) -> None:
-    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
     if enable_v2 is None:
-        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
+        from sglang.srt.utils import get_bool_env_var
+
+        enable_v2 = get_bool_env_var("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
 
     if enable_v2:
         return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(

@@ -15,11 +15,9 @@
 """Inference-only DeepSeek NextN Speculative Decoding."""
 
 import logging
-import os
 from typing import Iterable, Optional, Tuple
 
 import torch
-from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -101,13 +99,6 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.rot_weight = None
-        if _is_npu:
-            rot_weight_path = get_global_server_args().model_path + "/rot.safetensors"
-            if os.path.isfile(rot_weight_path):
-                self.rot_weight = load_file(rot_weight_path)
-                self.rot_weight = self.rot_weight["rot.weight"].npu()
-
         self.alt_stream = (
             torch.cuda.Stream()
             if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
@@ -121,7 +112,6 @@ class DeepseekModelNextN(nn.Module):
         ):
             layer_name = "layers." + str(config.num_hidden_layers)
 
-        self.quant_config = quant_config
         self.decoder = DeepseekV2DecoderLayer(
             config,
             0,
@@ -147,9 +137,6 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if _is_npu and self.quant_config is None:
-            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "1"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
         zero_allocator = BumpAllocator(
             buffer_size=2,
             dtype=torch.float32,
@@ -168,13 +155,7 @@ class DeepseekModelNextN(nn.Module):
                 torch.cat(
                     (
                         self.enorm(hidden_states),
-                        self.hnorm(
-                            forward_batch.spec_info.hidden_states
-                            if self.rot_weight is None
-                            else torch.matmul(
-                                forward_batch.spec_info.hidden_states, self.rot_weight
-                            )
-                        ),
+                        self.hnorm(forward_batch.spec_info.hidden_states),
                     ),
                     dim=-1,
                 )
@@ -185,7 +166,7 @@ class DeepseekModelNextN(nn.Module):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual, topk_indices = self.decoder(
+            hidden_states, residual = self.decoder(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -208,9 +189,6 @@ class DeepseekModelNextN(nn.Module):
                     torch.cuda.current_stream(),
                 )
 
-        if _is_npu and self.quant_config is None:
-            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "0"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
         return hidden_states
 
 

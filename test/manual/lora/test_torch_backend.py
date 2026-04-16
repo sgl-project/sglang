@@ -11,22 +11,20 @@ from sglang.test.test_utils import CustomTestCase
 class TestTorchNativeLoRABackend(CustomTestCase):
 
     device = "cpu"
-
-    # set duplicate weights to test merging during prepare_lora_batch
-    weight_indices = [0, 0, 1]
+    weight_indices = [0, 1]
     lora_ranks = [1, 1]
     scalings = [1.0, 0.5]
-    seq_lens = [1, 1, 1]
+    seq_lens = [1, 1]
     use_cuda_graph = False
 
     forward_batch = ForwardBatch(
         forward_mode=ForwardMode.EXTEND,
-        batch_size=3,
-        input_ids=torch.tensor([[1], [2], [3]], dtype=torch.int32),
+        batch_size=2,
+        input_ids=torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32),
         req_pool_indices=None,
         seq_lens=None,
         out_cache_loc=None,
-        seq_lens_sum=3,
+        seq_lens_sum=6,
         extend_seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
         extend_seq_lens_cpu=seq_lens,
     )
@@ -43,7 +41,7 @@ class TestTorchNativeLoRABackend(CustomTestCase):
         )
 
     def test_run_lora_a_sgemm(self):
-        batch_size = 3
+        batch_size = 2
         input_dim = 4
         output_dim = 6
         num_loras = 3
@@ -82,7 +80,7 @@ class TestTorchNativeLoRABackend(CustomTestCase):
         self.assertTrue(torch.allclose(actual_output, expect_output))
 
     def test_run_lora_b_sgemm(self):
-        batch_size = 3
+        batch_size = 2
         input_dim = 6
         output_dim = 4
         num_loras = 3
@@ -120,12 +118,12 @@ class TestTorchNativeLoRABackend(CustomTestCase):
         self.assertTrue(torch.allclose(actual_output, expect_output))
 
     def test_run_qkv_lora(self):
-        batch_size = 3
+        batch_size = 2
         num_loras = 3
         input_dim = 6
-        output_offset = [0, 3, 6, 9]
+        output_offset = [0, 3, 6, 9, 12]
         output_dim = output_offset[-1]
-        num_slices = len(output_offset) - 1  # 3 slices for Q, K, V
+        num_slices = len(output_offset) - 1
         max_lora_rank = max(self.lora_ranks)
         dtype = torch.float32
 
@@ -179,7 +177,7 @@ class TestTorchNativeLoRABackend(CustomTestCase):
         self.assertTrue(torch.allclose(actual_output, expect_output))
 
     def test_run_gate_up_lora(self):
-        batch_size = 3
+        batch_size = 2
         input_dim = 6
         output_dim = 4
         num_loras = 3

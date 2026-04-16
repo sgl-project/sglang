@@ -13,7 +13,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    dump_metric,
     popen_launch_server,
 )
 
@@ -217,12 +216,6 @@ class MMMUMixin:
             mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
             print(f"Model {self.model} achieved accuracy: {mmmu_accuracy:.4f}")
 
-            dump_metric(
-                "mmmu_score",
-                mmmu_accuracy,
-                labels={"model": self.model, "eval": "mmmu", "api": "lmms-eval"},
-            )
-
             # Assert performance meets expected threshold
             self.assertGreaterEqual(
                 mmmu_accuracy,
@@ -408,12 +401,6 @@ class MMMUMultiModelTestBase(CustomTestCase):
             mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
             print(
                 f"Model {model.model} achieved accuracy{test_name}: {mmmu_accuracy:.4f}"
-            )
-
-            dump_metric(
-                "mmmu_score",
-                mmmu_accuracy,
-                labels={"model": model.model, "eval": "mmmu", "api": "lmms-eval"},
             )
 
             # Capture server output if requested

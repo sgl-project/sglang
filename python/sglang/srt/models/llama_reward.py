@@ -18,12 +18,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.layers.pooler import (
-    EmbeddingPoolerOutput,
-    Pooler,
-    PoolingType,
-    pool_hidden_states,
-)
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
@@ -66,12 +61,7 @@ class LlamaForSequenceClassification(nn.Module):
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
         scores = self.score(last_token_hidden)
 
-        return EmbeddingPoolerOutput(
-            embeddings=scores,
-            pooled_hidden_states=(
-                last_token_hidden if forward_batch.return_pooled_hidden_states else None
-            ),
-        )
+        return EmbeddingPoolerOutput(scores)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         return LlamaForCausalLM.load_weights(self, weights)
@@ -124,17 +114,7 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
             -1, self.num_labels // 2
         )
         scores = (rews * pooled_weights).sum(dim=-1).view(-1, 1)
-
-        pooled_hidden = None
-        if forward_batch.return_pooled_hidden_states:
-            pooled_hidden = pool_hidden_states(
-                self.pooler.pooling_type, hidden_states, forward_batch
-            )
-
-        return EmbeddingPoolerOutput(
-            embeddings=scores,
-            pooled_hidden_states=pooled_hidden,
-        )
+        return EmbeddingPoolerOutput(scores)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         return super().load_weights(weights)

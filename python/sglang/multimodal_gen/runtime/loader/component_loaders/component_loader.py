@@ -50,7 +50,6 @@ class ComponentLoader(ABC):
 
     def __init__(self, device=None) -> None:
         self.device = device
-        self.component_architecture: str | None = None
 
     def should_offload(
         self, server_args: ServerArgs, model_config: ModelConfig | None = None
@@ -208,9 +207,21 @@ class ComponentLoader(ABC):
         cls._loaders_registered = True
 
     @classmethod
-    def resolve_transformers_or_diffusers(
-        self, transformers_or_diffusers: str, component_name: str
-    ) -> str:
+    def for_component_type(
+        cls, component_name: str, transformers_or_diffusers: str
+    ) -> "ComponentLoader":
+        """
+        Factory method to create a component loader for a specific component type.
+
+        Args:
+            component_name: Type of component (e.g., "vae", "text_encoder", "transformer", "scheduler")
+            transformers_or_diffusers: Whether the component is from transformers or diffusers
+        """
+        cls._ensure_loaders_registered()
+
+        # Map of component types to their loader classes and expected library
+        component_name = _normalize_component_type(component_name)
+
         # NOTE(FlamingoPg): special for LTX-2 models
         if component_name == "vocoder" or component_name == "connectors":
             transformers_or_diffusers = "diffusers"
@@ -231,31 +242,6 @@ class ComponentLoader(ABC):
         ):
             transformers_or_diffusers = "diffusers"
 
-        return transformers_or_diffusers
-
-    @classmethod
-    def for_component_type(
-        cls,
-        component_name: str,
-        transformers_or_diffusers: str,
-        component_architecture: str | None = None,
-    ) -> "ComponentLoader":
-        """
-        Factory method to create a component loader for a specific component type.
-
-        Args:
-            component_name: Type of component (e.g., "vae", "text_encoder", "transformer", "scheduler")
-            transformers_or_diffusers: Whether the component is from transformers or diffusers
-        """
-        cls._ensure_loaders_registered()
-
-        # Map of component types to their loader classes and expected library
-        component_name = _normalize_component_type(component_name)
-
-        transformers_or_diffusers = cls.resolve_transformers_or_diffusers(
-            transformers_or_diffusers, component_name
-        )
-
         if component_name in component_name_to_loader_cls:
             loader_cls: Type[ComponentLoader] = component_name_to_loader_cls[
                 component_name
@@ -265,16 +251,14 @@ class ComponentLoader(ABC):
             assert (
                 transformers_or_diffusers == expected_library
             ), f"{component_name} must be loaded from {expected_library}, got {transformers_or_diffusers}"
-            loader = loader_cls()
-            loader.component_architecture = component_architecture
-            return loader
+            return loader_cls()
 
         # For unknown component types, use a generic loader
         logger.warning(
             "No specific loader found for component type: %s. Using generic loader.",
             component_name,
         )
-        return GenericComponentLoader(transformers_or_diffusers, component_architecture)
+        return GenericComponentLoader(transformers_or_diffusers)
 
 
 class ImageProcessorLoader(ComponentLoader):
@@ -310,32 +294,18 @@ class TokenizerLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
-        # Some pipelines keep the slot name `tokenizer` in model_index.json even
-        # when the declared class is a processor. e.g. FLUX.2:
-        # `tokenizer: ["transformers", "PixtralProcessor"]`.
-        # Honor the declared component class instead of guessing from the slot name.
-        if (
-            self.component_architecture is not None
-            and self.component_architecture.endswith("Processor")
-        ):
-            return AutoProcessor.from_pretrained(component_model_path)
-
         return AutoTokenizer.from_pretrained(
             component_model_path,
-            padding_side="right",
-            use_fast=True,
+            padding_size="right",
         )
 
 
 class GenericComponentLoader(ComponentLoader):
     """Generic loader for components that don't have a specific loader."""
 
-    def __init__(
-        self, library="transformers", component_architecture: str | None = None
-    ) -> None:
+    def __init__(self, library="transformers") -> None:
         super().__init__()
         self.library = library
-        self.component_architecture = component_architecture
 
 
 class PipelineComponentLoader:
@@ -349,7 +319,6 @@ class PipelineComponentLoader:
         component_model_path: str,
         transformers_or_diffusers: str,
         server_args: ServerArgs,
-        component_architecture: str | None = None,
     ):
         """
         Load a pipeline component.
@@ -358,12 +327,12 @@ class PipelineComponentLoader:
             component_name: Name of the component (e.g., "vae", "text_encoder", "transformer", "scheduler")
             component_model_path: Path to the component model
             transformers_or_diffusers: Whether the component is from transformers or diffusers
-            component_architecture: the class name of the module
+
         """
 
         # Get the appropriate loader for this component type
         loader = ComponentLoader.for_component_type(
-            component_name, transformers_or_diffusers, component_architecture
+            component_name, transformers_or_diffusers
         )
 
         try:

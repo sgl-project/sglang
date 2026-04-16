@@ -18,24 +18,21 @@ _abs_path = os.path.dirname(os.path.abspath(__file__))
 _custom_rasterizer_kernel = None
 
 
-def _load_custom_rasterizer(
-    is_cuda: bool = True,
-):
+def _load_custom_rasterizer():
     """JIT compile and load the custom rasterizer kernel."""
     global _custom_rasterizer_kernel
 
     if _custom_rasterizer_kernel is not None:
         return _custom_rasterizer_kernel
-    
-    cuda_enabled_flag = ["-DCUDA_ENABLED"] if is_cuda else []
-    
+
     _custom_rasterizer_kernel = load_extension_with_recovery(
         name="custom_rasterizer_kernel",
         sources=[
             f"{_abs_path}/rasterizer.cpp",
-        ] + ([f"{_abs_path}/rasterizer_gpu.cu"] if is_cuda else []),
-        extra_cflags=["-O3"] + cuda_enabled_flag,
-        extra_cuda_cflags=["-O3", "--use_fast_math"] + cuda_enabled_flag,
+            f"{_abs_path}/rasterizer_gpu.cu",
+        ],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
         verbose=False,
     )
     return _custom_rasterizer_kernel
@@ -49,8 +46,7 @@ def rasterize(
     use_depth_prior: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Rasterize mesh to get face indices and barycentric coordinates."""
-    device = "cpu" if pos.device.type == "npu" else pos.device.type
-    kernel = _load_custom_rasterizer(device == "cuda")
+    kernel = _load_custom_rasterizer()
 
     if clamp_depth is None:
         clamp_depth = torch.zeros(0, device=pos.device)
@@ -60,12 +56,8 @@ def rasterize(
         pos = pos[0]
 
     findices, barycentric = kernel.rasterize_image(
-        pos.to(device), tri.to(device), clamp_depth.to(device), resolution[1], resolution[0], 1e-6, use_depth_prior
+        pos, tri, clamp_depth, resolution[1], resolution[0], 1e-6, use_depth_prior
     )
-
-    findices = findices.to(pos.device)
-    barycentric = barycentric.to(pos.device)
-
     return findices, barycentric
 
 

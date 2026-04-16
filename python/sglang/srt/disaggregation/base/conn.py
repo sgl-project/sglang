@@ -123,22 +123,12 @@ class BaseKVReceiver(ABC):
     @abstractmethod
     def init(
         self,
-        prefill_dp_rank: int,
-    ):
-        """
-        Resolve bootstrap metadata and mark the receiver ready for transfer metadata.
-        """
-        ...
-
-    @abstractmethod
-    def send_metadata(
-        self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
         """
-        Notify the prefill server about the kv indices, aux index, and state_indices.
+        Set req's index metadata locally or notify the prefill server about the kv indices, aux index, and state_indices.
         """
         ...
 

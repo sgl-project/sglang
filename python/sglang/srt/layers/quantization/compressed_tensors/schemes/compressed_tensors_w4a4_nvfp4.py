@@ -150,10 +150,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
         w = layer.weight_packed
         w_blockscale = layer.weight_scale
-        if (
-            enable_flashinfer_fp4_gemm
-            and not get_fp4_gemm_runner_backend().is_cutlass()
-        ):
+        if enable_flashinfer_fp4_gemm:
             w = layer.weight_packed.T
             w_blockscale = layer.weight_scale.T
 

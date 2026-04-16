@@ -68,8 +68,7 @@ class SamplingParams:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
         if stop_token_ids:
-            filtered = {int(t) for t in stop_token_ids if t is not None}
-            self.stop_token_ids = filtered or None
+            self.stop_token_ids = set(stop_token_ids)
         else:
             self.stop_token_ids = None
         self.stop_regex_strs = stop_regex

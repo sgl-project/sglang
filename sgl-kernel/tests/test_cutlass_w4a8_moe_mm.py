@@ -1,5 +1,3 @@
-import sys
-
 import pytest
 import torch
 from sgl_kernel import cutlass_w4a8_moe_mm
@@ -284,4 +282,4 @@ def ref_grouped_gemm(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

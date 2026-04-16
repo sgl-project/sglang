@@ -1,4 +1,4 @@
-# Cache-DiT
+# Cache-DiT Acceleration
 
 SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to **1.69x inference speedup** with minimal quality loss.
 

@@ -135,7 +135,11 @@ class Sampler(nn.Module):
             if self.use_ascend_backend:
                 # Ascend backend: sample from logits directly.
                 batch_next_token_ids, logprobs = self._forward_ascend_backend(
-                    logits, sampling_info, simple_sampling_case, return_logprob
+                    logits,
+                    sampling_info,
+                    simple_sampling_case,
+                    return_logprob,
+                    positions,
                 )
             elif (
                 self.use_log_softmax_logprob
@@ -263,6 +267,7 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         sampling_info: SamplingBatchInfo,
         simple_sampling_case: bool,
+        positions: torch.Tensor,
     ) -> torch.Tensor:
         """Sample from temperature-scaled logits without softmax.
 
@@ -270,7 +275,13 @@ class Sampler(nn.Module):
         """
         if simple_sampling_case:
             probs = torch.softmax(logits, dim=-1)
-            batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
+            if sampling_info.sampling_seed is not None:
+                probabilities = probs.to(torch.float64).log_()
+                batch_next_token_ids = multinomial_with_seed(
+                    probabilities, sampling_info.sampling_seed, positions
+                ).view(-1)
+            else:
+                batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
             return batch_next_token_ids.to(torch.int32)
         else:
             assert (
@@ -282,6 +293,8 @@ class Sampler(nn.Module):
                 sampling_info.top_ps,
                 sampling_info.min_ps,
                 sampling_info.need_min_p_sampling,
+                sampling_info.sampling_seed,
+                positions,
             )
             return batch_next_token_ids.to(torch.int32)
 
@@ -291,6 +304,7 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         simple_sampling_case: bool,
         return_logprob: bool,
+        positions: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Handle the full Ascend backend sampling path.
 
@@ -303,7 +317,7 @@ class Sampler(nn.Module):
         """
         logits.div_(sampling_info.temperatures)
         batch_next_token_ids = self._sample_from_logits(
-            logits, sampling_info, simple_sampling_case
+            logits, sampling_info, simple_sampling_case, positions
         )
         logprobs = None
         if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
@@ -327,15 +341,13 @@ class Sampler(nn.Module):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            ) = get_top_logprobs(logprobs, top_logprobs_nums)
 
         if any(x is not None for x in token_ids_logprobs):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(
-                logprobs, token_ids_logprobs, no_copy_to_cpu=True
-            )
+            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
 
         logits_output.next_token_logprobs = logprobs[
             torch.arange(len(batch_next_token_ids), device=sampling_info.device),
@@ -399,7 +411,7 @@ class Sampler(nn.Module):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+            ) = get_top_logprobs(logprobs, top_logprobs_nums)
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:
@@ -499,6 +511,8 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
     need_min_p_sampling: bool,
+    sampling_seed: Optional[torch.Tensor],
+    positions: torch.Tensor,
 ):
     """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface.
 
@@ -516,7 +530,17 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 
-        batch_next_token_ids = torch.multinomial(probs_top_k_top_p, num_samples=1)
+        if sampling_seed is None:
+            batch_next_token_ids = torch.multinomial(probs_top_k_top_p, num_samples=1)
+        else:
+            logprobs_top_k_top_p = probs_top_k_top_p.to(
+                torch.float64
+            )  # Using float64 for numerical stability
+            del probs_top_k_top_p
+            logprobs_top_k_top_p.log_()
+            batch_next_token_ids = multinomial_with_seed(
+                logprobs_top_k_top_p, sampling_seed, positions
+            )
     else:
         probs = torch.softmax(logits, dim=-1)
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
@@ -538,14 +562,22 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
             probs_sort.masked_fill_(min_p_mask, 0.0)
 
-        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        if sampling_seed is None:
+            sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        else:
+            logprobs = probs_sort.to(
+                torch.float64
+            )  # Using float64 for numerical stability
+            del probs_sort
+            logprobs.log_()
+            sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
         probs_idx = probs_idx.to(torch.int32)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
 
     return batch_next_token_ids.view(-1)
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=is_npu())
 def multinomial_with_seed(
     logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
 ) -> torch.Tensor:

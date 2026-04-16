@@ -1,5 +1,3 @@
-import sys
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -34,4 +32,4 @@ def test_dsv3_router_gemm(num_tokens, num_experts):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

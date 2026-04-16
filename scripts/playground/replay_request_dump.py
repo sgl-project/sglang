@@ -10,6 +10,7 @@ python3 replay_request_dump.py --parallel 512 --input-file /data/sglang_crash_du
 import argparse
 import glob
 import json
+import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -18,7 +19,6 @@ from datetime import datetime
 import requests
 
 from sglang.benchmark.utils import set_ulimit
-from sglang.srt.utils.common import safe_pickle_load
 from sglang.utils import get_exception_traceback
 
 
@@ -54,8 +54,7 @@ def normalize_request_data(json_data):
 def read_records(files):
     records = []
     for f in files:
-        with open(f, "rb") as fh:
-            tmp = safe_pickle_load(fh)
+        tmp = pickle.load(open(f, "rb"))
         if isinstance(tmp, dict) and "requests" in tmp:
             records.extend(tmp["requests"])
         else:

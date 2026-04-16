@@ -1,6 +1,5 @@
 from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -39,8 +38,8 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
             base_output, self.mm_tokens
         )
 
-        return MultimodalProcessorOutput(
-            mm_items=mm_items,
-            input_ids=input_ids.tolist(),
-            im_token_id=self.mm_tokens.image_token_id,
-        )
+        return {
+            "input_ids": input_ids.tolist(),
+            "mm_items": mm_items,
+            "im_token_id": self.mm_tokens.image_token_id,
+        }

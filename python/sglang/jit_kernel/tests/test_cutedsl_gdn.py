@@ -1,12 +1,8 @@
 """Tests for CuTe DSL fused sigmoid gating delta rule kernel (GDN)."""
 
-import sys
-
 import numpy as np
 import pytest
 import torch
-
-from sglang.test.ci.ci_register import register_cuda_ci
 
 try:
     import cuda.bindings.driver as cuda_driver
@@ -28,9 +24,6 @@ try:
     TRITON_AVAILABLE = True
 except ImportError:
     TRITON_AVAILABLE = False
-
-register_cuda_ci(est_time=5, suite="stage-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def run_triton_kernel(A_log, dt_bias, q, k, v, a, b, initial_state, indices, scale):
@@ -309,4 +302,4 @@ def test_cutedsl_gdn_performance(B: int):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    pytest.main([__file__, "-v", "-s"])

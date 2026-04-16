@@ -1,14 +1,8 @@
-import sys
-
 import pytest
 import torch
 import triton
 
 from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=64, suite="stage-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=256, suite="nightly-kernel-1-gpu", nightly=True)
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -254,4 +248,4 @@ def test_fused_rope_store(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    pytest.main([__file__, "-v", "-s"])

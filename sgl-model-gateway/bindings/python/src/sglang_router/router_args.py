@@ -4,16 +4,7 @@ import logging
 import os
 from typing import Dict, List, Optional
 
-try:
-    from sglang_router.sglang_router_rs import get_available_tool_call_parsers
-except ModuleNotFoundError:
-    logging.warning(
-        "sglang_router_rs is not available, get_available_tool_call_parsers will return empty list"
-    )
-
-    def get_available_tool_call_parsers() -> List[str]:
-        return []
-
+from sglang_router.sglang_router_rs import get_available_tool_call_parsers
 
 logger = logging.getLogger(__name__)
 

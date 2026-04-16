@@ -233,8 +233,7 @@ def test_scale_cpu_input():
 
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(pytest.main([__file__, "-q"]))
+    pytest.main([__file__, "-q"])
 ```
 
 ---

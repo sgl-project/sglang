@@ -66,7 +66,6 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         x: torch.Tensor,
         weights: torch.Tensor,
         pruned_batch_info: LoRABatchInfo = None,
-        stack_num: int = 1,
         *args,
         **kwargs,
     ) -> torch.Tensor:
@@ -77,7 +76,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             x=x,
             weights=weights,
             batch_info=batch_info,
-            num_slices=stack_num,
+            num_slices=1,
         )
 
     def run_lora_b_sgemm(

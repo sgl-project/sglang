@@ -69,19 +69,6 @@ class Event:
         return 0.0
 
 
-class StreamContext:
-    """Minimal stand-in for ``torch.cuda.StreamContext``."""
-
-    def __init__(self, stream: Any = None) -> None:
-        pass
-
-    def __enter__(self) -> "StreamContext":
-        return self
-
-    def __exit__(self, *args: Any) -> None:
-        pass
-
-
 _default_stream = Stream()
 
 
@@ -248,7 +235,6 @@ def install() -> None:
     # Only patch attributes that are actually missing
     for name, obj in [
         ("Stream", Stream),
-        ("StreamContext", StreamContext),
         ("Event", Event),
         ("current_stream", current_stream),
         ("stream", stream),

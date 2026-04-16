@@ -39,7 +39,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
-from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
 
@@ -458,7 +457,7 @@ async def benchmark(args):
 
     # Construct base_url if not provided
     if args.base_url is None:
-        args.base_url = NetworkAddress(args.host, args.port).to_url()
+        args.base_url = f"http://{args.host}:{args.port}"
 
     # Wait for service
     wait_for_service(args.base_url)

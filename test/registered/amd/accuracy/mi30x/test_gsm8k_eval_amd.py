@@ -1,7 +1,7 @@
 """
 AMD GSM8K Evaluation Test (Migrated from test/srt/nightly/)
 
-This test evaluates instruction-tuned models on the gsm8k benchmark using chat completions.
+This test evaluates instruction-tuned models on the mgsm_en benchmark using chat completions.
 Models are tested with various TP configurations on AMD GPUs.
 
 Registry: nightly-amd suite (2-GPU tests)
@@ -35,35 +35,34 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=3600, suite="nightly-amd", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
-    # Thresholds set at 5% below reported GSM8K (5-shot/CoT) scores
     # Llama 3.1 series
-    "meta-llama/Llama-3.1-8B-Instruct": 0.80,  # 84.5% - 5%
-    "meta-llama/Llama-3.1-70B-Instruct": 0.89,  # 94.1% - 5%
+    "meta-llama/Llama-3.1-8B-Instruct": 0.82,
+    "meta-llama/Llama-3.1-70B-Instruct": 0.95,
     # Llama 3.2 series (smaller models)
-    "meta-llama/Llama-3.2-3B-Instruct": 0.43,  # 48.2% - 5%
+    "meta-llama/Llama-3.2-3B-Instruct": 0.55,
     # Mistral series
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.47,  # 52.1% - 5%
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.69,  # 74.4% - 5% (lower if AMD scores differently)
+    "mistralai/Mistral-7B-Instruct-v0.3": 0.55,
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.58,
     # DeepSeek series
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.81,  # 86.4% - 5%
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
     # Qwen2 series
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.76,  # 80.7% - 5% (official A14B score; 88.2% was the 72B)
-    "Qwen/Qwen2.5-7B-Instruct": 0.82,  # 86.3% - 5%
+    "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
+    "Qwen/Qwen2.5-7B-Instruct": 0.85,
     # Qwen3 series
-    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.86,  # 91.4% - 5% (full attention mode; ensure sufficient max_tokens)
-    "Qwen/Qwen3-8B": 0.76,  # ~81%  - 5%
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.84,  # MoE model verified on MI300X
+    "Qwen/Qwen3-8B": 0.77,
     # Google Gemma
-    "google/gemma-2-27b-it": 0.86,  # 90.7% - 5%
-    "google/gemma-2-9b-it": 0.74,  # 78.5% - 5%
+    "google/gemma-2-27b-it": 0.91,
+    "google/gemma-2-9b-it": 0.72,
     # "neuralmagic/gemma-2-2b-it-FP8": 0.4,  # Small 2B model - OOM on single GPU
     # FP8 quantized models
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.80,  # 84.5% - 5%
-    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.46,  # ~51%  - 5%
-    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.89,  # 94.1% - 5%
-    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.86,  # 91.1% - 5%
-    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.76,  # 80.7% - 5% (official A14B score)
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.69,  # 74.4% - 5%
-    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.81,  # 86.4% - 5%
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.8,
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
+    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
+    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.92,
+    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.81,
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.57,
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.84,
 }
 
 failing_models = {
@@ -186,7 +185,7 @@ def check_model_scores(results):
         summary += line
 
     print(f"\n{'='*60}")
-    print("SUMMARY - TP=2 Instruction Models (gsm8k)")
+    print("SUMMARY - TP=2 Instruction Models (mgsm_en)")
     print(f"{'='*60}")
     print(summary)
     print(f"\n📊 Final Statistics:")
@@ -201,7 +200,7 @@ def check_model_scores(results):
         raise AssertionError(f"The following models failed:\n{failure_msg}")
 
 
-# Do not use `CustomTestCase` since `test_gsm8k_all_models` does not want retry
+# Do not use `CustomTestCase` since `test_mgsm_en_all_models` does not want retry
 class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -216,7 +215,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-    def test_gsm8k_all_models(self):
+    def test_mgsm_en_all_models(self):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
         )
@@ -227,7 +226,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         print(f"\n{'='*60}")
         print("AMD GSM8K Evaluation Test (TP=2 Instruction Models)")
         print(f"{'='*60}")
-        print(f"Benchmark: gsm8k (chat completions)")
+        print(f"Benchmark: mgsm_en (chat completions)")
         print(f"{'='*60}\n")
 
         for model_group, is_fp8, is_tp2 in self.model_groups:
@@ -262,13 +261,13 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     args = SimpleNamespace(
                         base_url=self.base_url,
                         model=model,
-                        eval_name="gsm8k",
+                        eval_name="mgsm_en",
                         num_examples=None,
                         num_threads=1024,
                     )
 
                     # Run eval with timing and retries
-                    print(f"📊 Running gsm8k evaluation...")
+                    print(f"📊 Running mgsm_en evaluation...")
                     eval_start = time.time()
                     threshold = MODEL_SCORE_THRESHOLDS.get(model)
                     metrics = None

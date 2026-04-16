@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import ORJSONResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
@@ -16,10 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
-from sglang.multimodal_gen.runtime.entrypoints.post_training import (
-    rollout_api,
-    weights_api,
-)
+from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
@@ -27,7 +25,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
 if TYPE_CHECKING:
@@ -238,7 +235,7 @@ vertex_router = APIRouter()
 @vertex_router.post(VERTEX_ROUTE)
 async def vertex_generate(vertex_req: VertexGenerateReqInput):
     if not vertex_req.instances:
-        return orjson_response({"predictions": []})
+        return ORJSONResponse({"predictions": []})
 
     server_args = get_global_server_args()
     params = vertex_req.parameters or {}
@@ -266,7 +263,7 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
 
     results = await asyncio.gather(*futures)
 
-    return orjson_response({"predictions": results})
+    return ORJSONResponse({"predictions": results})
 
 
 def create_app(server_args: ServerArgs):
@@ -285,7 +282,6 @@ def create_app(server_args: ServerArgs):
     app.include_router(video_api.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
-    app.include_router(rollout_api.router)
 
     app.state.server_args = server_args
     return app

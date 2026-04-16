@@ -1,8 +1,5 @@
 from safetensors.torch import load_file as safetensors_load_file
 
-from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
-    LTX2ConnectorConfig,
-)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -53,9 +50,10 @@ class AdapterLoader(ComponentLoader):
         target_device = get_local_torch_device()
         default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
 
+        from types import SimpleNamespace
+
         with set_default_torch_dtype(default_dtype), skip_init_modules():
-            connector_cfg = LTX2ConnectorConfig()
-            connector_cfg.update_model_arch(config)
+            connector_cfg = SimpleNamespace(**config)
             model = model_cls(connector_cfg).to(
                 device=target_device, dtype=default_dtype
             )

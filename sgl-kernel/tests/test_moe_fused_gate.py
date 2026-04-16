@@ -1,4 +1,3 @@
-import sys
 from typing import Optional
 
 import pytest
@@ -216,4 +215,4 @@ def test_moe_fused_gate_combined(
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

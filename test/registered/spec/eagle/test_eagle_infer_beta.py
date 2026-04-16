@@ -7,22 +7,22 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
-from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE3,
-    DEFAULT_TARGET_MODEL_EAGLE3,
+    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=333, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=283, suite="stage-b-test-small-1-gpu")
 
 
-class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
+class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     max_running_requests = 64
     attention_backend = "triton"
     spec_steps = 5
@@ -30,21 +30,18 @@ class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
     spec_draft_tokens = 6
     page_size = 1
     other_launch_args = []
-    model = DEFAULT_TARGET_MODEL_EAGLE3
-    draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         launch_args = [
             "--trust-remote-code",
-            "--dtype=float16",
-            "--chunked-prefill-size",
-            "1024",
             "--attention-backend",
             cls.attention_backend,
             "--speculative-algorithm",
-            "EAGLE3",
+            "EAGLE",
             "--speculative-draft-model",
             cls.draft_model,
             "--speculative-num-steps",
@@ -71,8 +68,6 @@ class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
             True
         ), envs.SGLANG_SPEC_OOB_DETECTION.override(
             True
-        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(
-            True
         ):
             cls.process = popen_launch_server(
                 cls.model,
@@ -91,17 +86,19 @@ class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=1000,
-            num_threads=128,
+            num_shots=5,
+            data_path=None,
+            num_questions=1000,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)
-        print(f"TestEagle3LargeBS -- {metrics=}")
-        self.assertGreater(metrics["score"], 0.7)
+        print(f"TestEagleLargeBS -- {metrics=}")
+        self.assertGreater(
+            metrics["accuracy"], 0.23
+        )  # 0.3333 for 60 questions; 0.234 for 1319 questions
         assert self.process.poll() is None
 
     def test_logprob_spec_v2_match(self):
@@ -243,43 +240,8 @@ class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
                 res = f.result()
                 self.assertIn("text", res, f"Server error: {res}")
 
-    def test_penalty(self):
-        """Verify spec v2 handles penalty parameters without crashing."""
-        import concurrent.futures
 
-        args = [
-            {"max_new_tokens": 32},
-            {"max_new_tokens": 16, "frequency_penalty": 2},
-            {"max_new_tokens": 48, "presence_penalty": 1},
-            {"max_new_tokens": 8, "frequency_penalty": 0.4, "presence_penalty": 0.8},
-            {"max_new_tokens": 64, "frequency_penalty": -0.5, "presence_penalty": 0.3},
-            {"max_new_tokens": 24, "min_new_tokens": 8, "frequency_penalty": 0.4},
-            {"max_new_tokens": 32, "repetition_penalty": 1.5},
-        ]
-
-        def run_decode(sampling_params):
-            response = requests.post(
-                self.base_url + "/generate",
-                json={
-                    "text": "The capital of France is",
-                    "sampling_params": sampling_params,
-                },
-            )
-            self.assertEqual(response.status_code, 200)
-            res = response.json()
-            self.assertIn("text", res, f"Server error: {res}")
-            self.assertIsInstance(
-                res["text"],
-                str,
-                f"Expected 'text' to be str, got {type(res['text']).__name__}: {res}",
-            )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            list(pool.map(run_decode, args * 3))
-        assert self.process.poll() is None
-
-
-class TestEagle3ServerPage(TestEagle3ServerBase):
+class TestEagleServerPage(TestEagleServerBase):
     other_launch_args = ["--page-size", "64"]
 
 

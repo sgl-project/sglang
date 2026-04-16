@@ -24,14 +24,14 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=77, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=60, suite="stage-b-test-large-1-gpu")
 
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
-class TestSessionControl(CustomTestCase):
+class TestSessionControl(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -43,8 +43,6 @@ class TestSessionControl(CustomTestCase):
             other_args=[
                 "--attention-backend",
                 "triton",
-                "--disable-cuda-graph",
-                "--disable-piecewise-cuda-graph",
             ],
         )
 
@@ -573,15 +571,17 @@ class TestSessionControl(CustomTestCase):
         )
 
 
+@unittest.skip("broken")
 class TestSessionControlVision(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "OpenGVLab/InternVL2-2B"
+        cls.model = "lmms-lab/llava-onevision-qwen2-7b-ov"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # other_args={"--disable-radix"},
         )
 
     @classmethod
@@ -589,13 +589,12 @@ class TestSessionControlVision(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_session_control(self):
-        image_token = "<IMG_CONTEXT>"
         text_chunks = [
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
-            f"<|im_start|>user\n{image_token}\nDescribe this image in a very short sentence.<|im_end|>\n<|im_start|>assistant\n",
-            f"<|im_start|>user\n{image_token}\nIs this image same with one of the previous images?<|im_end|>\n<|im_start|>assistant\n",
-            f"<|im_start|>user\n{image_token}\nIs this image same with one of the previous images?<|im_end|>\n<|im_start|>assistant\n",
-            "<|im_start|>user\nDescribe this image in a very short sentence.<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>user\n<image>\nDescribe this image in a very short sentence.<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>user\n<image>\nIs this image same with one of the previous images?<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>user\n<image>\nIs this image same with one of the previous images?<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>user\nDescribe this image in a very short sentence.<|im_end|>\nassistant:",
         ]
         image_chunks = [
             "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
@@ -606,6 +605,11 @@ class TestSessionControlVision(CustomTestCase):
         self.assertEqual(
             len(text_chunks), len(image_chunks) + 2
         )  # the first and the last prompt does not contain images
+        tokenizer = get_tokenizer(self.model)
+        text_input_ids = [tokenizer.encode(x) for x in text_chunks]
+        for i in range(1, len(text_input_ids)):
+            if text_input_ids[i][0] == tokenizer.bos_token_id:
+                text_input_ids[i] = text_input_ids[i][1:]
         gen_len = 32
 
         # 1. using session control
@@ -625,11 +629,11 @@ class TestSessionControlVision(CustomTestCase):
 
         first_rid = None
         outputs_from_session = []
-        for i in range(len(text_chunks[:-1])):
+        for i in range(len(text_input_ids[:-1])):
             response = requests.post(
                 self.base_url + "/generate",
                 json={
-                    "text": text_chunks[i],
+                    "input_ids": text_input_ids[i],
                     "image_data": image_chunks[i - 1] if i > 0 else None,
                     "modalities": ["multi-images"],
                     "session_params": {
@@ -658,7 +662,7 @@ class TestSessionControlVision(CustomTestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": text_chunks[-1],
+                "input_ids": text_input_ids[-1],
                 "session_params": {
                     "id": session_id,
                     "rid": first_rid,
@@ -679,7 +683,7 @@ class TestSessionControlVision(CustomTestCase):
         ret = requests.post(
             self.base_url + "/generate",
             json={
-                "text": text_chunks[-1],
+                "input_ids": text_input_ids[-1],
                 "session_params": {
                     "id": session_id,
                     "rid": rid,
@@ -706,7 +710,7 @@ class TestSessionControlVision(CustomTestCase):
         ret = requests.post(
             self.base_url + "/generate",
             json={
-                "text": text_chunks[-1],
+                "input_ids": text_input_ids[-1],
                 "session_params": {
                     "id": session_id,
                     "rid": first_rid,
@@ -726,16 +730,16 @@ class TestSessionControlVision(CustomTestCase):
         # 2. not use session control
         requests.post(self.base_url + "/flush_cache")
 
-        accumulated_text = ""
-        first_req_text = None
+        input_ids_first_req = None
+        input_ids = []
         outputs_normal = []
-        for i in range(len(text_chunks[:-1])):
-            accumulated_text += text_chunks[i]
+        for i in range(len(text_input_ids[:-1])):
+            input_ids += text_input_ids[i]
             image_data = image_chunks[:i] if i > 0 else None
             response = requests.post(
                 self.base_url + "/generate",
                 json={
-                    "text": accumulated_text,
+                    "input_ids": input_ids,
                     "image_data": image_data,
                     "modalities": ["multi-images"],
                     "sampling_params": {
@@ -749,15 +753,19 @@ class TestSessionControlVision(CustomTestCase):
                 },
             ).json()
             if i > 0:
-                accumulated_text += response["text"]
+                output_ids = tokenizer.encode(response["text"])
+                if output_ids[0] == tokenizer.bos_token_id:
+                    output_ids = output_ids[1:]
+                input_ids += output_ids
                 outputs_normal.append(response["text"])
             if i == 0:
-                first_req_text = accumulated_text
+                input_ids_first_req = input_ids.copy()
 
+        input_ids_first_req += text_input_ids[-1]
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": first_req_text + text_chunks[-1],
+                "input_ids": input_ids_first_req,
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": gen_len,

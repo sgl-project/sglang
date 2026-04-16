@@ -37,7 +37,11 @@ def get_model_config(
     topk_ids_dir: str = None,
 ) -> Dict:
     config = get_config(model_name, trust_remote_code=True)
-    architecture = config.architectures[0]
+
+    # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
+    if hasattr(config, "text_config"):
+        config = config.get_text_config()
+
     block_shape = None
     if (
         hasattr(config, "quantization_config")
@@ -57,9 +61,8 @@ def get_model_config(
         group_size = weights_config.get("group_size")
         block_shape = [0, group_size]
         assert len(block_shape) == 2
-    # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
-    if hasattr(config, "text_config"):
-        config = config.get_text_config()
+
+    architecture = config.architectures[0]
 
     hidden_size = config.hidden_size
     if architecture == "DbrxForCausalLM":
@@ -134,10 +137,6 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         hidden_size = getattr(config, "moe_latent_size", None) or hidden_size
-    elif architecture == "Gemma4ForConditionalGeneration":
-        E = config.num_experts // ep_size
-        topk = config.top_k_experts
-        intermediate_size = config.moe_intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size

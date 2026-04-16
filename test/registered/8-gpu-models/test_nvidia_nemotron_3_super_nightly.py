@@ -42,7 +42,7 @@ MTP_ARGS = [
 ]
 
 # Accuracy threshold
-GSM8K_BASELINE = 0.935
+GSM8K_BASELINE = 0.96
 
 
 class TestNvidiaNemotron3SuperNightly(unittest.TestCase):

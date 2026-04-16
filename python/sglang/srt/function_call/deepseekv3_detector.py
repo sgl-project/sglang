@@ -203,9 +203,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin="<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
-            + name
-            + "\n```json\n",
-            end="\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
-            trigger="<｜tool▁calls▁begin｜>",
+            begin=">" + name + "\n```json\n",
+            end="\n```<",
+            trigger=">" + name + "\n```json\n",
         )
