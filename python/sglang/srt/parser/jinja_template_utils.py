@@ -201,6 +201,11 @@ def process_content_for_template_format(
                     else:
                         # Keep text content as-is for openai format
                         processed_content_parts.append(chunk)
+                elif chunk_type == "tool_reference":
+                    # GLM-specific extension: pass through so the chat template
+                    # can match tool_reference.name against tools[*].function.name
+                    # and render the referenced tool schemas inline.
+                    processed_content_parts.append(chunk)
 
         new_msg = {
             k: v for k, v in msg_dict.items() if v is not None and k != "content"
