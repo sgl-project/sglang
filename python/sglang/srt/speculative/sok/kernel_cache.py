@@ -216,6 +216,28 @@ class KernelCache:
         logger.info("PHANTOM-SOK: saved manifest (%d entries, %d hot shapes)",
                      len(self._entries), len(self._hot_shapes))
 
+    def save_hot_shapes(self):
+        """Persist only the hot shapes to disk (lightweight save).
+
+        Use this for frequent periodic saves where full manifest I/O is
+        unnecessary. The hot shapes file is small and fast to write.
+        """
+        self._fp_dir.mkdir(parents=True, exist_ok=True)
+
+        with self._lock:
+            shapes_data = {k: v.to_dict() for k, v in self._hot_shapes.items()}
+
+        if not shapes_data:
+            return
+
+        try:
+            tmp = self._hot_shapes_path.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump(shapes_data, f, indent=2)
+            tmp.rename(self._hot_shapes_path)
+        except OSError as e:
+            logger.warning("PHANTOM-SOK: failed to save hot shapes: %s", e)
+
     # ── Prewarm ──
 
     def prewarm(self) -> int:

@@ -39,7 +39,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_prefilter import AdaptiveThresholdController
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.sok import KernelCache, KernelFingerprint, SOKConfig
+from sglang.srt.speculative.sok import KernelCache, KernelFingerprint, SOKConfig, ShapeProfile, DispatchTelemetry
 from sglang.srt.speculative.sok.fingerprint import detect_fingerprint
 
 try:
@@ -1140,8 +1140,10 @@ class PhantomWorker:
         # Detect HSA capability
         self._is_hsa = self._detect_hsa()
 
-        # SOK — Self-Optimizing Kernel subsystem (Phase F1: cache + prewarm)
+        # SOK — Self-Optimizing Kernel subsystem (Phase F1: cache + prewarm, F2: telemetry)
         self._sok_config = SOKConfig()
+        self._sok_profile = None
+        self._sok_telemetry = None
         try:
             self._sok_fingerprint = detect_fingerprint()
             self._sok_cache = KernelCache(self._sok_config, self._sok_fingerprint)
@@ -1153,21 +1155,31 @@ class PhantomWorker:
                 if scanned > 0:
                     self._sok_cache.save_manifest()
                     logger.info("PHANTOM-SOK: bootstrapped %d entries from Triton cache", scanned)
+            # F2: Shape profile + telemetry
+            self._sok_profile = ShapeProfile()
+            profile_path = self._sok_cache.cache_dir / self._sok_fingerprint.hex_digest / "shape_profiles.json"
+            self._sok_profile.load(profile_path)
+            self._sok_telemetry = DispatchTelemetry(
+                self._sok_config, self._sok_cache, self._sok_profile,
+            )
             # Background prewarm (non-blocking)
             self._sok_prewarm_thread = threading.Thread(
                 target=self._sok_cache.prewarm, daemon=True, name="sok-prewarm"
             )
             self._sok_prewarm_thread.start()
             sok_stats = self._sok_cache.get_stats()
+            prof_stats = self._sok_profile.get_stats()
             logger.info(
-                "PHANTOM-SOK: loaded manifest (%d entries, %d hot shapes, fp=%s)",
+                "PHANTOM-SOK: loaded manifest (%d entries, %d hot shapes, %d shape profiles, fp=%s)",
                 sok_stats["entries"], sok_stats["hot_shapes"],
-                self._sok_fingerprint.hex_digest[:12],
+                prof_stats["shapes"], self._sok_fingerprint.hex_digest[:12],
             )
         except Exception as e:
             logger.warning("PHANTOM-SOK: init failed, running without cache: %s", e)
             self._sok_cache = None
             self._sok_fingerprint = None
+            self._sok_profile = None
+            self._sok_telemetry = None
 
         logger.info(
             "PHANTOM worker: draft_tokens=%d (max=%d), max_bs=%d, HSA=%s, "
@@ -1199,10 +1211,13 @@ class PhantomWorker:
         return self.target_worker.get_memory_pool()
 
     def clear_cache_pool(self):
-        # Persist SOK manifest before clearing
+        # Persist SOK manifest + shape profiles before clearing
         if getattr(self, "_sok_cache", None) is not None:
             self._sok_cache.save_manifest()
             self._sok_cache.save_hot_shapes()
+        if getattr(self, "_sok_profile", None) is not None and getattr(self, "_sok_fingerprint", None) is not None:
+            profile_path = self._sok_cache.cache_dir / self._sok_fingerprint.hex_digest / "shape_profiles.json"
+            self._sok_profile.save(profile_path)
         self._ghost_pool.stop()
         self.corpus._corpus.reset()
         self._corpus_frozen = False
@@ -1763,13 +1778,29 @@ class PhantomWorker:
                     ss["entries"], ss["hits"],
                     ss["misses"], ss["hot_shapes"],
                 )
+                # F2: persist shape profiles + telemetry summary
+                if self._sok_profile is not None:
+                    profile_path = self._sok_cache.cache_dir / self._sok_fingerprint.hex_digest / "shape_profiles.json"
+                    self._sok_profile.save(profile_path)
+                if self._sok_telemetry is not None:
+                    ts = self._sok_telemetry.get_summary()
+                    logger.info(
+                        "PHANTOM-SOK telemetry: dispatches=%d, sampled=%d, "
+                        "avg_us=%.1f, hit_rate=%.2f, shapes=%d",
+                        ts["dispatches"], ts["sampled"],
+                        ts["avg_latency_us"], ts["cache_hit_rate"],
+                        ts["unique_shapes"],
+                    )
 
     def __del__(self):
         try:
-            # Persist SOK manifest on shutdown
+            # Persist SOK manifest + shape profiles on shutdown
             if getattr(self, "_sok_cache", None) is not None:
                 self._sok_cache.save_manifest()
                 self._sok_cache.save_hot_shapes()
+            if getattr(self, "_sok_profile", None) is not None and getattr(self, "_sok_fingerprint", None) is not None:
+                profile_path = self._sok_cache.cache_dir / self._sok_fingerprint.hex_digest / "shape_profiles.json"
+                self._sok_profile.save(profile_path)
             self._stop_ghost_pool()
         except Exception:
             pass
