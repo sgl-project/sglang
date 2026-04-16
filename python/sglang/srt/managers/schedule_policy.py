@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -821,12 +822,16 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
+                load_back_start = time.perf_counter()
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         last_host_node=req.last_host_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
+                )
+                req.time_stats.trace_kv_cache_load_back(
+                    req.host_hit_length, start_ts=load_back_start
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))

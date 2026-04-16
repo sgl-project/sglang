@@ -577,6 +577,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
 
+    def trace_kv_cache_load_back(self, host_hit_length: int, start_ts: float):
+        if self.trace_ctx.tracing_enable:
+            duration_ms = round((time.perf_counter() - start_ts) * 1000, 2)
+            self.trace_ctx.trace_event(
+                "kv_cache_load_back",
+                level=1,
+                attrs={
+                    "host_hit_length": host_hit_length,
+                    "duration_ms": duration_ms,
+                },
+            )
+
     def set_retract_time(self, ts=None):
         ts = ts or time.perf_counter()
         # retract
@@ -1057,3 +1069,35 @@ def set_time_batch(reqs: List[Any], set_func: str):
     for req in reqs:
         method = getattr(req.time_stats, set_func)
         method(ts)
+
+
+def trace_kv_cache_eviction_batch(
+    reqs: Optional[List[Any]],
+    evict_result: Any,
+    start_ts: float,
+):
+    """Trace KV cache eviction event for a batch of requests."""
+    if reqs is None or len(reqs) == 0:
+        return
+    if not get_global_tracing_enabled():
+        return
+
+    total_evicted = (
+        evict_result.num_tokens_evicted + evict_result.swa_num_tokens_evicted
+    )
+    if total_evicted <= 0:
+        return
+
+    duration_ms = round((time.perf_counter() - start_ts) * 1000, 2)
+    attrs = {
+        "num_tokens_evicted": total_evicted,
+        "duration_ms": duration_ms,
+    }
+
+    for req in reqs:
+        if req.time_stats.trace_ctx.tracing_enable:
+            req.time_stats.trace_ctx.trace_event(
+                "kv_cache_eviction",
+                level=1,
+                attrs=attrs,
+            )
