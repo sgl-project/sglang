@@ -160,6 +160,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    configure_intel_openmp_env,
     cpu_has_amx_support,
     dynamic_import,
     empty_context,
@@ -447,6 +448,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
+            # Configure Intel OpenMP (libiomp5) environment variables before
+            # thread binding, so KMP settings are active when the OpenMP
+            # runtime initializes. Must happen before init_cpu_threads_env().
+            configure_intel_openmp_env()
             self.init_threads_binding()
 
         # Get available memory before model loading

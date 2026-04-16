@@ -293,6 +293,84 @@ def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
 
 
+def _is_intel_openmp_loaded() -> bool:
+    """Check if Intel OpenMP (libiomp5) is loaded in the current process."""
+    ld_preload = os.environ.get("LD_PRELOAD", "")
+    if "libiomp5" in ld_preload:
+        return True
+    # Also check if libiomp5 is already loaded as a shared library
+    try:
+        ctypes.CDLL("libiomp5.so", mode=ctypes.RTLD_NOLOAD)
+        return True
+    except OSError:
+        pass
+    return False
+
+
+def configure_intel_openmp_env() -> None:
+    """Configure KMP environment variables for Intel OpenMP on x86 CPUs.
+
+    When Intel OpenMP (libiomp5) is loaded via LD_PRELOAD, this function sets
+    recommended KMP environment variables for optimal performance on many-core
+    Intel Xeon NUMA systems. These settings improve thread scheduling, barrier
+    synchronization, and spin-wait behavior for CPU inference workloads.
+
+    Environment variables are only set if not already configured by the user,
+    ensuring user overrides are respected.
+
+    Note: KMP_AFFINITY is intentionally NOT set here because SGLang manages
+    thread affinity internally via init_cpu_threads_env(). Setting KMP_AFFINITY
+    externally with TP > 1 causes segfaults.
+
+    See: https://github.com/sgl-project/sglang/issues/20052
+    """
+    if not is_host_cpu_x86():
+        return
+
+    if not _is_intel_openmp_loaded():
+        logger.info(
+            "Intel OpenMP (libiomp5) is not loaded. For better CPU decode performance "
+            "on Intel Xeon systems, consider adding libiomp5.so to LD_PRELOAD. "
+            "See: https://github.com/sgl-project/sglang/issues/20052"
+        )
+        return
+
+    # Recommended KMP settings for many-core NUMA systems.
+    # Only set if not already configured by the user.
+    kmp_defaults = {
+        # Threads spin-wait 1ms before sleeping — reduces wake-up latency
+        "KMP_BLOCKTIME": "1",
+        # Use TPAUSE instruction for efficient spin-wait (Xeon 6+; safe no-op on older CPUs)
+        "KMP_TPAUSE": "0",
+        # Print KMP settings at startup for debugging
+        "KMP_SETTINGS": "1",
+        # Distributed barriers scale better on many-core NUMA topologies
+        "KMP_FORKJOIN_BARRIER_PATTERN": "dist,dist",
+        "KMP_PLAIN_BARRIER_PATTERN": "dist,dist",
+        "KMP_REDUCTION_BARRIER_PATTERN": "dist,dist",
+    }
+
+    applied = []
+    skipped = []
+    for key, default_value in kmp_defaults.items():
+        if key not in os.environ:
+            os.environ[key] = default_value
+            applied.append(f"{key}={default_value}")
+        else:
+            skipped.append(f"{key}={os.environ[key]} (user-set)")
+
+    if applied:
+        logger.info(
+            "Intel OpenMP (libiomp5) detected. Applied KMP settings: %s",
+            ", ".join(applied),
+        )
+    if skipped:
+        logger.info(
+            "Intel OpenMP: Preserved user-set KMP settings: %s",
+            ", ".join(skipped),
+        )
+
+
 def xpu_has_xmx_support():
     # TODO: update with XPU capability query
     if is_xpu():
