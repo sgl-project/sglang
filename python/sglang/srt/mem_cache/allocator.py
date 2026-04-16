@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from sglang.python.sglang.srt import server_args
-
 """
 Copyright 2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
