@@ -1249,8 +1249,6 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
-export SGLANG_SET_CPU_AFFINITY=1
-
 unset https_proxy
 unset http_proxy
 unset HTTPS_PROXY
@@ -1261,11 +1259,11 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
+export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
 MODEL_PATH=xxx
-
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -1273,22 +1271,26 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=2100
+export HCCL_BUFFSIZE=450
 export HCCL_SOCKET_IFNAME=xxx
 export GLOO_SOCKET_IFNAME=xxx
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=147456
+export SGLANG_NPU_FUSED_MOE_MODE=2
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
     --attention-backend ascend --device npu --quantization modelslim  \
-    --max-running-requests 480 --context-length 8192 --dtype bfloat16 \
-    --chunked-prefill-size -1 --max-prefill-tokens 4096 --speculative-draft-model-quantization unquant  \
+    --max-running-requests 624 --context-length 8192 --dtype bfloat16 \
+    --chunked-prefill-size 73728 --max-prefill-tokens 458880 --speculative-draft-model-quantization unquant  \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --disable-radix-cache --moe-a2a-backend deepep  --deepep-mode auto  \
-    --tp 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.75 --cuda-graph-bs 6 8 10 12 15 18 28 30
+    --disable-radix-cache --moe-a2a-backend ascend_fuseep \
+    --tp 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.83 --cuda-graph-bs 4 8 16 24 28 29 30 32 34 36 37 38 39
 ```
 
 #### Benchmark
