@@ -142,6 +142,8 @@ class HiMambaRadixCache(MambaRadixCache):
             extra_config=extra_config,
             prefetch_threshold=prefetch_threshold,
             load_cache_event=self.load_cache_event,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
