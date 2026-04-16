@@ -15,6 +15,7 @@ from typing import (
 
 import fastapi
 
+from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -80,7 +81,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.managers.scheduler_communicator import SchedulerCommunicator
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
@@ -135,9 +135,7 @@ class TokenizerCommunicatorMixin:
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
-            comm = SchedulerCommunicator(
-                self.send_to_scheduler, server_args.dp_size, mode
-            )
+            comm = FanOutCommunicator(self.send_to_scheduler, server_args.dp_size, mode)
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
@@ -206,7 +204,7 @@ class TokenizerCommunicatorMixin:
             obj.file_path = None
             obj.documents = None
             results = await self.add_external_corpus_communicator(obj)
-            all_success, all_message = SchedulerCommunicator.merge_results(results)
+            all_success, all_message = FanOutCommunicator.merge_results(results)
             if truncated and all_success:
                 all_message += f" (truncated: exceeded {max_tokens} token limit)"
             return AddExternalCorpusReqOutput(
@@ -230,7 +228,7 @@ class TokenizerCommunicatorMixin:
         results = await self.remove_external_corpus_communicator(
             RemoveExternalCorpusReqInput(corpus_id=corpus_id)
         )
-        all_success, all_message = SchedulerCommunicator.merge_results(results)
+        all_success, all_message = FanOutCommunicator.merge_results(results)
         return RemoveExternalCorpusReqOutput(success=all_success, message=all_message)
 
     async def list_external_corpora(
@@ -245,7 +243,7 @@ class TokenizerCommunicatorMixin:
         results = await self.list_external_corpora_communicator(
             ListExternalCorporaReqInput()
         )
-        all_success, all_message = SchedulerCommunicator.merge_results(results)
+        all_success, all_message = FanOutCommunicator.merge_results(results)
         # Merge corpus token counts from all DP ranks (each rank loads the same set).
         corpus_token_counts = results[0].corpus_token_counts if all_success else {}
         return ListExternalCorporaReqOutput(
@@ -288,7 +286,7 @@ class TokenizerCommunicatorMixin:
             )
         )
 
-        all_success, all_message = SchedulerCommunicator.merge_results(results)
+        all_success, all_message = FanOutCommunicator.merge_results(results)
         out = AttachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
         if all_success:
@@ -315,7 +313,7 @@ class TokenizerCommunicatorMixin:
             DetachHiCacheStorageReqInput()
         )
 
-        all_success, all_message = SchedulerCommunicator.merge_results(results)
+        all_success, all_message = FanOutCommunicator.merge_results(results)
         out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
         if all_success:
@@ -396,7 +394,7 @@ class TokenizerCommunicatorMixin:
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         results = await self.init_weights_update_group_communicator(obj)
-        return SchedulerCommunicator.merge_results(results)
+        return FanOutCommunicator.merge_results(results)
 
     async def destroy_weights_update_group(
         self: TokenizerManager,
@@ -409,7 +407,7 @@ class TokenizerCommunicatorMixin:
         ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
 
         results = await self.destroy_weights_update_group_communicator(obj)
-        return SchedulerCommunicator.merge_results(results)
+        return FanOutCommunicator.merge_results(results)
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -434,7 +432,7 @@ class TokenizerCommunicatorMixin:
             async with self.model_update_lock.writer_lock:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
-        success, message = SchedulerCommunicator.merge_results(results)
+        success, message = FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -491,7 +489,7 @@ class TokenizerCommunicatorMixin:
             async with self.model_update_lock.writer_lock:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
-        success, message = SchedulerCommunicator.merge_results(results)
+        success, message = FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -769,7 +767,7 @@ class TokenizerCommunicatorMixin:
     ) -> CheckWeightsReqOutput:
         self.auto_create_handle_loop()
         results = await self.check_weights_communicator(obj)
-        return SchedulerCommunicator.merge_results(results)
+        return FanOutCommunicator.merge_results(results)
 
     async def slow_down(
         self: TokenizerManager,

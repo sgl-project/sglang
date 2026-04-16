@@ -10,10 +10,11 @@ import zmq
 T = TypeVar("T")
 
 
-class SchedulerCommunicator(Generic[T]):
-    """Async request-response communicator over zmq.
+class FanOutCommunicator(Generic[T]):
+    """Fan-out request + collect response primitive over zmq.
 
-    Supports two modes:
+    One send is fanned out to `fan_out` recipients; the caller awaits until
+    all `fan_out` responses are collected. Supports two modes:
     - "queueing": requests are serialized; concurrent callers wait in a FIFO queue.
     - "watching": concurrent callers share a single in-flight request and all
       receive the same result when it completes.
