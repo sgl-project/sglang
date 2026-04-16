@@ -705,6 +705,7 @@ class Gemma4RMSNorm(MultiPlatformOp):
             return torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
                 x, self.weight.data, self.eps, self.scale_shift, self.with_scale
             )
+        return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() == 0:
