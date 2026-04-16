@@ -336,13 +336,6 @@ class NgramVerifyInput(SpecInput):
             logits_output.next_token_logits / expanded_temperature, dim=-1
         )  # (bs * draft_token_num, vocab_size)
 
-        # RDNA2 diagnostic: sync here to surface any async HIP errors from the forward pass
-        # before they propagate into sampling. Remove after crash is identified.
-        import os
-        if os.environ.get("PHANTOM_VERIFY_SYNC"):
-            torch.cuda.synchronize()
-            logger.info("PHANTOM_VERIFY_SYNC: forward pass completed without HIP error")
-
         # NOTE: The test shows that top_p_renorm_prob and top_k_renorm_prob are the key factors
         # contributing to the poor performance of _sampling_verify.
         target_probs = top_k_renorm_prob(

@@ -1439,34 +1439,13 @@ class PhantomWorker:
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
-        # CRASH9b diagnostic: trace token count at every stage
-        import os as _os9b, sys as _sys9b
-        if _os9b.environ.get("PHANTOM_VERIFY_SYNC"):
-            _sys9b.stderr.write(
-                f"[PHANTOM_BATCH] K={K} draft_tokens_gpu={draft_tokens_gpu.shape} "
-                f"batch.input_ids={batch.input_ids.shape} "
-                f"spec_info.draft_token_num={batch.spec_info.draft_token_num}\n"
-            )
-            _sys9b.stderr.flush()
-
         # Run target verification on GPU
         model_worker_batch = batch.get_model_worker_batch()
 
         if model_worker_batch.forward_mode.is_target_verify():
-            # RDNA2 diagnostic: sync before forward to flush any prior async errors
-            import os
-            _diag = os.environ.get("PHANTOM_VERIFY_SYNC")
-            if _diag:
-                torch.cuda.synchronize()
-                logger.info("PHANTOM_DIAG: pre-forward sync OK")
-
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
-
-            if _diag:
-                torch.cuda.synchronize()
-                logger.info("PHANTOM_DIAG: post-forward sync OK")
 
             logits_output = batch_result.logits_output
             can_run_cuda_graph = batch_result.can_run_cuda_graph
@@ -1494,9 +1473,12 @@ class PhantomWorker:
             # ── Ghost scaler: record throughput sample ──
             self._ghost_scaler.record(num_accepted)
 
+            # Save local ref before clearing batch state — telemetry needs draft tokens
+            verify_draft_tokens = verify_input.draft_token
+
             # ── Feed rejected patterns into negative filter ──
             self._update_negative_filter(
-                batch.spec_info.draft_token, accept_lens, bs, K
+                verify_draft_tokens, accept_lens, bs, K
             )
 
             # ── Adaptive controller: measure patch outcomes ──
@@ -1506,11 +1488,20 @@ class PhantomWorker:
             self._quant_telem.record(
                 logits=logits_output.next_token_logits,
                 hidden_states=logits_output.hidden_states,
-                draft_tokens=batch.spec_info.draft_token,
+                draft_tokens=verify_draft_tokens,
                 verified_ids=next_token_ids,
                 accept_lens=accept_lens,
                 bs=bs, K=K,
             )
+
+            # CRITICAL: Clear stale batch state from verify round.
+            # prepare_for_decode() returns early for spec algorithms, so
+            # batch.spec_info (with stale positions), batch.input_ids (K-wide
+            # draft tensor), and batch.output_ids persist into the next round
+            # causing position corruption and garbled output.
+            batch.spec_info = None
+            batch.input_ids = None
+            batch.output_ids = None
 
             # ── Auto-fallback logic ──
             if accept_rate < self._fb_threshold:
@@ -1685,30 +1676,9 @@ class PhantomWorker:
         # Allocate exactly 1 KV cache slot per request (what prepare_for_decode does)
         batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
 
-        # ── CRASH11 diagnostic: print decode batch state before forward ──
-        if os.environ.get("PHANTOM_VERIFY_SYNC"):
-            import sys
-            torch.cuda.synchronize()  # catch stale HIP errors BEFORE forward
-            sys.stderr.write(
-                f"[FALLBACK_DECODE] bs={bs} input_ids={batch.input_ids.shape} "
-                f"seq_lens={batch.seq_lens.tolist()} "
-                f"out_cache_loc={batch.out_cache_loc.tolist()} "
-                f"forward_mode={batch.forward_mode} "
-                f"kv_committed=[{','.join(str(r.kv_committed_len) for r in batch.reqs)}] "
-                f"kv_allocated=[{','.join(str(r.kv_allocated_len) for r in batch.reqs)}] "
-                f"req_pool_idx=[{','.join(str(r.req_pool_idx) for r in batch.reqs)}]\n"
-            )
-            sys.stderr.flush()
-
         result = self.target_worker.forward_batch_generation(
             batch.get_model_worker_batch()
         )
-
-        # ── CRASH11 diagnostic: sync after forward to catch errors here ──
-        if os.environ.get("PHANTOM_VERIFY_SYNC"):
-            torch.cuda.synchronize()
-            sys.stderr.write("[FALLBACK_DECODE] post-forward sync OK\n")
-            sys.stderr.flush()
 
         # Scheduler skips output_ids.append for spec v1 — do it here
         next_ids = result.next_token_ids
