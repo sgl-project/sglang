@@ -34,7 +34,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Qwen3-235B-A22B | Atlas 800I A3 | 8     | PD Mixed    | 11K+1K  | 10ms | BF16         | [Optimal Configuration](#qwen3-235b-a22b-11k-1k-10ms-on-a3-8-cards-mixed-mode) |
 | Qwen3-32B       | Atlas 800I A3 | 4     | PD Mixed    | 6K+1.5K | 18ms | BF16         | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a3-4-cards-mixed-mode)      |
 | Qwen3-32B       | Atlas 800I A3 | 4     | PD Mixed    | 4K+1.5K | 11ms | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a3-4-cards-mixed-mode)      |
-| Qwen3-32B       | Atlas 800I A3 | 8     | PD Mixed    | 18K+4K  | 12ms | BF16         | [Optimal Configuration](#qwen3-32b-18k-4k-12ms-on-a3-8-cards-mixed-mode)       |
+| Qwen3-32B       | Atlas 800I A3 | 8     | PD Mixed    | 18K+4K  | 6ms  | BF16         | [Optimal Configuration](#qwen3-32b-18k-4k-6ms-on-a3-8-cards-mixed-mode)        |
 | Qwen3-32B       | Atlas 800I A2 | 8     | PD Mixed    | 6K+1.5K | 18ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a2-8-cards-mixed-mode)      |
 | Qwen3-32B       | Atlas 800I A2 | 8     | PD Mixed    | 4K+1.5K | 11ms | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a2-8-cards-mixed-mode)      |
 | Qwen3-32B       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 12ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-1k-0_3k-12ms-on-a3-2-cards-mixed-mode)      |
@@ -1598,7 +1598,7 @@ We tested it based on the `RANDOM` dataset.
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --random-range-ratio 1 --max-concurrency 1 --random-output-len 1500 --random-input-len 4096 --num-prompts 4
 ```
 
-### Qwen3-32B 18K-4K 12ms on A3 8 Cards Mixed Mode
+### Qwen3-32B 18K-4K 6ms on A3 8 Cards Mixed Mode
 
 Model: Qwen3-32B
 
@@ -1610,7 +1610,7 @@ Dataset: random
 
 Input Output Length: 18K+4K
 
-TPOT: 12ms
+TPOT: 6ms
 
 #### Model Deployment
 
