@@ -180,15 +180,43 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
     print("Permission granted. Triggering rerun of failed or skipped workflows.")
 
-    # Check if PR has sgl-kernel changes - if so, we need full reruns
-    # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts
+    # Check if PR has sgl-kernel changes - if so, we may need full reruns
+    # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
+    # However, if the wheel already built successfully for this commit,
+    # we can just rerun failed jobs — the artifact is already there.
     sgl_kernel_changes = has_sgl_kernel_changes(pr)
     if sgl_kernel_changes:
-        print("PR has sgl-kernel changes - will use full rerun to rebuild kernel")
+        print("PR has sgl-kernel changes - checking if kernel wheel already built")
 
     # Get the SHA of the latest commit in the PR
     head_sha = pr.head.sha
     print(f"Checking workflows for commit: {head_sha}")
+
+    # If PR has sgl-kernel changes, check whether the wheel build already
+    # succeeded for this commit. If so, we can skip the full rerun and just
+    # rerun failed jobs — avoids retriggering all tests (including flaky ones).
+    kernel_wheel_built = False
+    if sgl_kernel_changes:
+        try:
+            check_runs = gh_repo.get_commit(head_sha).get_check_runs()
+            for cr in check_runs:
+                if "sgl-kernel-build-wheels" in cr.name and cr.conclusion == "success":
+                    kernel_wheel_built = True
+                    print(
+                        f"sgl-kernel-build-wheels already passed (check run {cr.id})"
+                        " - using rerun_failed_jobs"
+                    )
+                    break
+            if not kernel_wheel_built:
+                print(
+                    "sgl-kernel-build-wheels has not passed yet"
+                    " - will use full rerun"
+                )
+        except Exception as e:
+            print(
+                f"Failed to check sgl-kernel-build-wheels status: {e}"
+                " - falling back to full rerun"
+            )
 
     # List all workflow runs for this commit
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
@@ -201,7 +229,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         if run.conclusion == "failure":
             print(f"Rerunning failed workflow: {run.name} (ID: {run.id})")
             try:
-                if sgl_kernel_changes:
+                if sgl_kernel_changes and not kernel_wheel_built:
                     # Full rerun to ensure sgl-kernel-build-wheels runs
                     # and produces fresh artifacts for dependent jobs
                     run.rerun()
@@ -271,6 +299,9 @@ def handle_rerun_stage(
         "stage-c-test-deepep-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
+        "multimodal-gen-component-accuracy",
+        "multimodal-gen-component-accuracy-1-gpu",
+        "multimodal-gen-component-accuracy-2-gpu",
         "multimodal-gen-test-1-b200",
     ]
 

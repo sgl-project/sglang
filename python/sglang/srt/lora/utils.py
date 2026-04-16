@@ -83,14 +83,47 @@ def get_hidden_dim(
                 config.num_attention_heads + config.num_key_value_heads * 2
             )
         elif module_name == "o_proj":
+            o_head_dim = getattr(config, "v_head_dim", None) or head_dim
             return (
-                head_dim * config.num_attention_heads,
+                o_head_dim * config.num_attention_heads,
                 config.hidden_size,
             )
         elif module_name == "gate_up_proj":
-            return config.hidden_size, config.intermediate_size * 2
+            inter = config.intermediate_size
+            first_k = getattr(config, "first_k_dense_replace", None)
+            moe_freq = getattr(config, "moe_layer_freq", 1)
+            if (
+                first_k is not None
+                and layer_idx >= first_k
+                and layer_idx % moe_freq == 0
+            ):
+                moe_inter = getattr(config, "moe_intermediate_size", None)
+                n_shared = getattr(config, "n_shared_experts", None)
+                if moe_inter is not None and n_shared is not None:
+                    inter = moe_inter * n_shared
+            return config.hidden_size, inter * 2
         elif module_name == "down_proj":
-            return config.intermediate_size, config.hidden_size
+            inter = config.intermediate_size
+            first_k = getattr(config, "first_k_dense_replace", None)
+            moe_freq = getattr(config, "moe_layer_freq", 1)
+            if (
+                first_k is not None
+                and layer_idx >= first_k
+                and layer_idx % moe_freq == 0
+            ):
+                moe_inter = getattr(config, "moe_intermediate_size", None)
+                n_shared = getattr(config, "n_shared_experts", None)
+                if moe_inter is not None and n_shared is not None:
+                    inter = moe_inter * n_shared
+            return inter, config.hidden_size
+        elif module_name == "fused_qkv_a_proj_with_mqa":
+            q_lora_rank = getattr(config, "q_lora_rank", None) or 0
+            kv_lora_rank = config.kv_lora_rank
+            qk_rope_head_dim = config.qk_rope_head_dim
+            return (
+                config.hidden_size,
+                q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+            )
         elif module_name == "gate_up_proj_moe":
             moe_inter = (
                 getattr(config, "moe_intermediate_size", None)
@@ -151,6 +184,8 @@ def get_normalized_target_modules(
         "lm_head": "lm_head",
         "output": "lm_head",
         "unembed_tokens": "lm_head",
+        "q_a_proj": "fused_qkv_a_proj_with_mqa",
+        "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
     }
 
     result = set()
@@ -169,6 +204,7 @@ def get_stacked_multiply(module_name: str) -> int:
         "qkv_proj": 3,
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
+        "fused_qkv_a_proj_with_mqa": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 
@@ -190,6 +226,7 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj", "down_proj_moe"]
+REPLICATED_LINEAR_LORA_NAMES = ["fused_qkv_a_proj_with_mqa"]
 
 # Normalized module names that the LoRA system fully supports
 # (i.e. get_hidden_dim, init_buffers, and init_lora_modules can handle them).
@@ -201,6 +238,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "down_proj",
         "embed_tokens",
         "lm_head",
+        "fused_qkv_a_proj_with_mqa",
     }
 )
 
