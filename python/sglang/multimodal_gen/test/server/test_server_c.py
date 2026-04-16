@@ -20,7 +20,7 @@ logger = init_logger(__name__)
 
 
 class TestDiffusionServerOneGpuB200(DiffusionServerBase):
-    """B200-targeted smoke tests for 1-GPU diffusion cases."""
+    """B200-targeted CI tests for 1-GPU ModelOpt diffusion cases."""
 
     @pytest.fixture(params=ONE_GPU_CASES_C, ids=lambda c: c.id)
     def case(self, request) -> DiffusionTestCase:

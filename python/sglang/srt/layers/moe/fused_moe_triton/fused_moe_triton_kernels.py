@@ -1194,3 +1194,79 @@ def fused_append_shared_experts(
         num_warps=1,
     )
     return out_ids, out_weights
+
+
+@triton.jit
+def _fused_append_shared_experts_with_weights_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    shared_weights_ptr,
+    out_ids_ptr,
+    out_weights_ptr,
+    N_BASE,
+    K: tl.constexpr,
+    S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    ids_row_ptr = pid * K
+    out_row_ptr = pid * (K + S)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
+    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k, mask=mask_k)
+
+    tl.store(out_ids_ptr + out_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_row_ptr + offs_k, ws, mask=mask_k)
+
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < S
+    shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
+    shared_ws = tl.load(shared_weights_ptr + pid * S + offs_s, mask=mask_s)
+
+    tl.store(out_ids_ptr + out_row_ptr + K + offs_s, shared_ids, mask=mask_s)
+    tl.store(out_weights_ptr + out_row_ptr + K + offs_s, shared_ws, mask=mask_s)
+
+
+def fused_append_shared_experts_with_weights(
+    topk_ids, topk_weights, shared_weights, num_fused_shared_experts, N=None
+):
+    """Like fused_append_shared_experts but accepts per-token shared weights tensor."""
+    assert N is not None, "N (shared expert base id) must be provided"
+    m, k = topk_ids.shape
+    s = int(num_fused_shared_experts)
+    if s <= 0:
+        return topk_ids, topk_weights
+
+    shared_weights_2d = shared_weights.to(topk_weights.dtype)
+    if shared_weights_2d.ndim == 1:
+        shared_weights_2d = shared_weights_2d.unsqueeze(-1)
+    if shared_weights_2d.shape[1] < s:
+        shared_weights_2d = shared_weights_2d.expand(m, s)
+    shared_weights_2d = shared_weights_2d.contiguous()
+
+    out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
+    out_weights = torch.empty(
+        (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    block_k = triton.next_power_of_2(k)
+    block_s = triton.next_power_of_2(s)
+
+    _fused_append_shared_experts_with_weights_kernel[(m,)](
+        topk_ids,
+        topk_weights,
+        shared_weights_2d,
+        out_ids,
+        out_weights,
+        N_BASE=N,
+        K=k,
+        S=s,
+        BLOCK_K=block_k,
+        BLOCK_S=block_s,
+        num_warps=1,
+    )
+    return out_ids, out_weights
