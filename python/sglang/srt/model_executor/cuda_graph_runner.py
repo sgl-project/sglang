@@ -645,25 +645,6 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # Speculative_inference
-        if (
-            model_runner.spec_algorithm.is_eagle3()
-            and model_runner.eagle_use_aux_hidden_state
-        ):
-            self.model_runner.model.set_eagle3_layers_to_capture()
-        if (
-            model_runner.spec_algorithm.is_dflash()
-            and model_runner.dflash_use_aux_hidden_state
-        ):
-            if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
-                raise ValueError(
-                    f"Model {self.model_runner.model.__class__.__name__} does not implement set_dflash_layers_to_capture, "
-                    "which is required for DFLASH aux hidden capture."
-                )
-            self.model_runner.model.set_dflash_layers_to_capture(
-                self.model_runner.dflash_target_layer_ids
-            )
-
         # Capture
         try:
             with model_capture_mode():
