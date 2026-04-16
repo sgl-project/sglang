@@ -165,13 +165,14 @@ jobs:
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
@@ -212,13 +213,14 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
 
   sgl-kernel-unit-test-2-gpu-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
@@ -254,14 +256,14 @@ jobs:
   # =============================================== primary ====================================================
 
   stage-a-test-1-gpu-small-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
-          (!failure() && !cancelled()) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -294,13 +296,14 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   jit-kernel-unit-test-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
