@@ -557,13 +557,14 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   multimodal-gen-test-1-gpu-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
@@ -686,13 +687,14 @@ jobs:
           free -h
 
   multimodal-gen-test-2-gpu-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
