@@ -270,10 +270,30 @@ class AnthropicServing:
 
         chat_request = ChatCompletionRequest(**request_data)
 
-        # Convert tools
+        # Convert tools (filtering out deferred tools not yet unlocked)
         if anthropic_request.tools:
+            # Collect tool names unlocked via tool_reference in messages
+            unlocked_tools: set[str] = set()
+            for msg in anthropic_request.messages:
+                if isinstance(msg.content, list):
+                    for block in msg.content:
+                        if block.type == "tool_result" and isinstance(
+                            block.content, list
+                        ):
+                            for item in block.content:
+                                if (
+                                    isinstance(item, dict)
+                                    and item.get("type") == "tool_reference"
+                                ):
+                                    ref_name = item.get("name")
+                                    if ref_name:
+                                        unlocked_tools.add(ref_name)
+
             tools = []
             for tool in anthropic_request.tools:
+                # Skip deferred tools that haven't been unlocked
+                if tool.defer_loading and tool.name not in unlocked_tools:
+                    continue
                 tools.append(
                     Tool(
                         type="function",
@@ -284,10 +304,10 @@ class AnthropicServing:
                         },
                     )
                 )
-            chat_request.tools = tools
+            chat_request.tools = tools if tools else None
 
-        # Convert tool choice
-        if anthropic_request.tool_choice is not None:
+        # Convert tool choice (only if there are tools after filtering)
+        if anthropic_request.tool_choice is not None and chat_request.tools:
             if anthropic_request.tool_choice.type == "none":
                 chat_request.tool_choice = "none"
             elif anthropic_request.tool_choice.type == "auto":
@@ -301,8 +321,8 @@ class AnthropicServing:
                         name=anthropic_request.tool_choice.name
                     ),
                 )
-        elif anthropic_request.tools:
-            # Default to auto when tools are provided
+        elif chat_request.tools:
+            # Default to auto when tools are provided (after filtering)
             chat_request.tool_choice = "auto"
 
         return chat_request
