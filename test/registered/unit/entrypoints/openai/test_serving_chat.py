@@ -1,5 +1,5 @@
 """
-Unit-tests for OpenAIServingChat — rewritten to use only the std-lib 'unittest'.
+Unit-tests for OpenAIServingChat -- rewritten to use only the std-lib 'unittest'.
 Run with either:
     python tests/test_serving_chat_unit.py -v
 or
@@ -25,10 +25,9 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.utils import get_or_create_event_loop
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
 
 
 class _MockTokenizerManager:
