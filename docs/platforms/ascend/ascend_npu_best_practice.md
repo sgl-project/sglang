@@ -3103,7 +3103,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \--page-size 128 \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 16 --random-output-len 1500 --random-input-len 6144 --num-prompts 16i
+python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 16 --random-output-len 1500 --random-input-len 6144 --num-prompts 16
 ```
 
 ### Qwen3-14B 3_5K-1_5K 9ms on A3 1 Cards Mixed Mode
