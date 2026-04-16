@@ -705,6 +705,38 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
+                # Resolve kv_auto: pick best KV compression based on model config
+                if self.kv_cache_dtype == "kv_auto":
+                    kv_heads = self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    )
+                    q_heads = getattr(
+                        self.model_config, "num_attention_heads", kv_heads
+                    )
+                    gqa_ratio = q_heads // max(kv_heads, 1)
+                    hd = self.model_config.head_dim
+
+                    if gqa_ratio >= 4:
+                        # High GQA: fewer KV heads → K precision matters more,
+                        # V can tolerate faster lossy codec
+                        resolved = "kv_mixed4"
+                    elif hd <= 64:
+                        # Small head dim: rotation overhead low, TQ efficient
+                        resolved = "tq4"
+                    elif hd >= 256:
+                        # Large head dim: Givens rotation scales better
+                        resolved = "rq4_planar"
+                    else:
+                        # Default: TQ4 is best general-purpose on gfx1030
+                        resolved = "tq4"
+
+                    logger.info(
+                        f"kv_auto resolved to '{resolved}' "
+                        f"(gqa_ratio={gqa_ratio}, head_dim={hd}, "
+                        f"kv_heads={kv_heads})"
+                    )
+                    self.kv_cache_dtype = resolved
+
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
