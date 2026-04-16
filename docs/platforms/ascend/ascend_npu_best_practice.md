@@ -42,7 +42,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)        |
 | Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 12ms | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-6k-1_5k-12ms-on-a3-1-cards-mixed-mode)       |
 | Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 10ms | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-6k-1_5k-10ms-on-a3-1-cards-mixed-mode)  |
-| Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 8ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-1k-0_3k-8ms-on-a3-1-cards-mixed-mode)   |
+| Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)   |
 | Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 14.21ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-1k-0_3k-14_21ms-on-a3-2-cards-mixed-mode)      |
 | Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K | 15.62ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-6k-1_5k-15_62ms-on-a3-2-cards-mixed-mode)      |
 
@@ -2853,7 +2853,7 @@ We tested it based on the `RANDOM` dataset.
 python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 7339 --random-range-ratio 1 --max-concurrency 16 --random-output-len 1500 --random-input-len 6144 --num-prompts 16
 ```
 
-### Qwen3-30B-A3B 1K-0_3K 8ms on A3 1 Cards Mixed Mode
+### Qwen3-30B-A3B 1K-0_3K 7ms on A3 1 Cards Mixed Mode
 
 Model: Qwen3-30B-A3B
 
@@ -2865,7 +2865,7 @@ Dataset: random
 
 Input Output Length: 1K+0.3K
 
-TPOT: 8ms
+TPOT: 7ms
 
 #### Model Deployment
 
@@ -2903,7 +2903,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --max-running-requests 8 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 35000  \
     --tp-size 2 --mem-fraction-static 0.7 --cuda-graph-bs 1 2 3 4 5 6 7 8 --dtype bfloat16
