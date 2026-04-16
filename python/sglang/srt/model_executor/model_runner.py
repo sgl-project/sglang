@@ -489,7 +489,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.server_args.elastic_ep_rejoin
         ):
             join_process_groups()
-            broadcast_global_expert_location_metadata()
+            broadcast_global_expert_location_metadata(
+                src_rank=self._get_healthy_expert_location_src_rank()
+            )
             ElasticEPStateManager.instance().reset()
 
         if self.is_multimodal:
@@ -1449,7 +1451,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if ranks_to_recover and try_recover_ranks(ranks_to_recover):
             self.forward_pass_id = 0
             self.eplb_manager.reset_generator()
-            broadcast_global_expert_location_metadata()
+            broadcast_global_expert_location_metadata(
+                src_rank=self._get_healthy_expert_location_src_rank()
+            )
             ElasticEPStateManager.instance().reset()
 
             broadcast_pyobj(
@@ -1459,6 +1463,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 src=get_world_group().ranks[0],
             )
             logger.info(f"recover ranks {ranks_to_recover} done")
+
+    def _get_healthy_expert_location_src_rank(self) -> int:
+        world_group = get_world_group()
+        local_rejoin_flag = bool(self.server_args.elastic_ep_rejoin)
+        gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
+
+        for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
+            if not is_rejoin_rank:
+                return world_group.ranks[rank_in_group]
+
+        raise RuntimeError(
+            "No healthy rank found for broadcasting expert location metadata. "
+            "All ranks are marked as elastic_ep_rejoin."
+        )
 
     def update_weights_from_disk(
         self,
