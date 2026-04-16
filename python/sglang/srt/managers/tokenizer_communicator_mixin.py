@@ -142,9 +142,13 @@ class _Communicator(Generic[T]):
             if obj:
                 self._sender.send_pyobj(obj)
 
-        await self._result_event.wait()
-        result_values = copy.deepcopy(self._result_values)
-        self._result_event = self._result_values = None
+        event = self._result_event
+        values = self._result_values
+        await event.wait()
+        # Capture list ref before await so later awaiters survive clearing.
+        result_values = copy.deepcopy(values)
+        if self._result_event is event:
+            self._result_event = self._result_values = None
         return result_values
 
     async def __call__(self, obj):
@@ -247,7 +251,7 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size, mode="watching"
         )
         self.get_loads_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
+            self.send_to_scheduler, server_args.dp_size, mode="watching"
         )
         self.dumper_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
@@ -1051,10 +1055,9 @@ class TokenizerCommunicatorMixin:
             List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
         """
         self.auto_create_handle_loop()
-        req = GetLoadsReqInput(
-            include=include if include else ["all"],
-            dp_rank=dp_rank,
-        )
+        # Always request all sections from scheduler — watching mode shares
+        # results across concurrent callers, so we fetch full data and filter here.
+        req = GetLoadsReqInput(include=["all"], dp_rank=None)
         results = await self.get_loads_communicator(req)
 
         # Filter by dp_rank if specified
@@ -1075,27 +1078,20 @@ class TokenizerCommunicatorMixin:
                     "Streaming sessions are disabled. "
                     "Please relaunch with --enable-streaming-session."
                 )
-            if (
-                self.server_args.speculative_algorithm is not None
-                and not self.server_args.disable_overlap_schedule
-            ):
-                raise ValueError(
-                    "Streaming sessions are incompatible with speculative decoding v2 "
-                    "(overlap + speculative). Use --disable-overlap-schedule or "
-                    "disable speculative decoding."
-                )
 
         if obj.session_id is None:
             obj.session_id = uuid.uuid4().hex
         elif obj.session_id in self.session_futures:
             return None
 
+        future = asyncio.Future()
+        self.session_futures[obj.session_id] = future
         self.send_to_scheduler.send_pyobj(obj)
 
-        self.session_futures[obj.session_id] = asyncio.Future()
-        session_id = await self.session_futures[obj.session_id]
-        del self.session_futures[obj.session_id]
-        return session_id
+        try:
+            return await future
+        finally:
+            self.session_futures.pop(obj.session_id, None)
 
     async def close_session(
         self: TokenizerManager,

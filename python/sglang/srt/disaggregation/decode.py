@@ -438,7 +438,10 @@ class DecodePreallocQueue:
         if prefill_info.dp_size == 1:
             return 0
 
-        if prefill_info.follow_bootstrap_room:
+        if (
+            prefill_info.follow_bootstrap_room
+            and not envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
+        ):
             return req.bootstrap_room % prefill_info.dp_size
 
         return None
@@ -1178,8 +1181,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            # polling and allocating kv cache
             self.process_decode_queue()
+            if self._engine_paused:
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -1205,8 +1209,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            # polling and allocating kv cache
             self.process_decode_queue()
+            if self._engine_paused:
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()

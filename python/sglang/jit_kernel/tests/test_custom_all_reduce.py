@@ -18,8 +18,6 @@ import itertools
 import logging
 import multiprocessing as mp
 import os
-import subprocess
-import sys
 from typing import Dict, Optional, Tuple
 
 import pytest
@@ -32,6 +30,7 @@ from sglang.jit_kernel.all_reduce import (
     _jit_custom_all_reduce_pull_module,
     _jit_custom_all_reduce_push_module,
 )
+from sglang.jit_kernel.tests.utils import multiprocess_main, multiprocess_test
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -79,26 +78,6 @@ TEST_LOOP = 16
 # ---------------------------------------------------------------------------
 
 
-def _run_torchrun(nproc: int, timeout: int = 300) -> None:
-    """Launch this script as a torchrun worker and assert success."""
-    cmd = [
-        "torchrun",
-        f"--nproc_per_node={nproc}",
-        __file__,
-    ]
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout,
-    )
-    assert result.returncode == 0, (
-        f"torchrun (nproc={nproc}) failed with rc={result.returncode}\n"
-        f"{result.stdout}"
-    )
-
-
 def _compile_one(dtype: torch.dtype, world_size: int):
     _jit_custom_all_reduce_push_module(dtype, world_size)
     _jit_custom_all_reduce_pull_module(dtype, world_size)
@@ -129,7 +108,7 @@ def test_custom_allreduce(nproc: int) -> None:
         pytest.skip(
             f"Requires at least {nproc} GPUs, but only {device_count} available"
         )
-    _run_torchrun(nproc)
+    multiprocess_test(__file__, nproc)
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +208,6 @@ def worker_test(
 def worker_main() -> None:
     """Entry point for each torchrun worker process."""
     rank, device, cpu_group, nccl_group, comm = init_distributed()
-    world_size = dist.get_world_size()
 
     torch.cuda.set_stream(torch.cuda.Stream())
 
@@ -258,7 +236,4 @@ def worker_main() -> None:
 
 
 if __name__ == "__main__":
-    if "LOCAL_RANK" in os.environ:
-        worker_main()
-    else:
-        sys.exit(pytest.main([__file__, "-x", "-vv", "-s"]))
+    multiprocess_main(__file__, worker_main)

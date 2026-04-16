@@ -163,7 +163,13 @@ class DataParallelController:
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
-            self.control_message_step = server_args.tp_size
+            # When local control broadcast is enabled, send control messages to
+            # every DP group leader (attn_tp_rank=0) so each leader broadcasts
+            # within its own attn_tp_group instead of the full tp_group.
+            # Otherwise fall back to the original behaviour: send to only the
+            # first leader, which then broadcasts over the full tp_group.
+            local_ctrl = server_args.enable_dp_attention_local_control_broadcast
+            self.control_message_step = 1 if local_ctrl else server_args.tp_size
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
