@@ -798,6 +798,11 @@ class ServerArgs:
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
+        # Expand rq3/rq4 shorthand to recommended default (PlanarQuant = fastest)
+        _RQ_SHORTHAND = {"rq3": "rq3_planar", "rq4": "rq4_planar"}
+        if self.kv_cache_dtype in _RQ_SHORTHAND:
+            self.kv_cache_dtype = _RQ_SHORTHAND[self.kv_cache_dtype]
+
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
 
@@ -4069,6 +4074,8 @@ class ServerArgs:
                 "tq4",
                 "tq3",
                 "tq2",
+                "rq3",
+                "rq4",
                 "rq3_planar",
                 "rq4_planar",
                 "rq3_iso",
@@ -4077,6 +4084,7 @@ class ServerArgs:
             help='Data type for kv cache storage. "auto" will use model data type. '
             '"fp8_e5m2"/"fp8_e4m3" for FP8 KV. "fp4_e2m1" for MXFP4 KV. '
             '"tq4"/"tq3"/"tq2" for TurboQuant 4/3/2-bit KV (data-oblivious, no calibration). '
+            '"rq3"/"rq4" shorthand for RotorQuant PlanarQuant (fastest, recommended default). '
             '"rq3_planar"/"rq4_planar" for RotorQuant PlanarQuant 3/4-bit (2D Givens, fastest). '
             '"rq3_iso"/"rq4_iso" for RotorQuant IsoQuant 3/4-bit (4D quaternion, best quality). '
             "TurboQuant advanced options via env vars: "
