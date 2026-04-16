@@ -265,9 +265,10 @@ class RocmPlatform(Platform):
     @staticmethod
     def _conv3d_as_batched_conv2d(
         x_padded: torch.Tensor,
-        weight: torch.Tensor,
+        weight_2d: torch.Tensor,
         bias: torch.Tensor | None,
         stride: tuple[int, ...],
+        kt: int,
         compute_bf16: bool = False,
     ) -> torch.Tensor:
         """Replace F.conv3d with temporal-unfolded batched Conv2D.
@@ -278,33 +279,35 @@ class RocmPlatform(Platform):
         reshapes into a batch of 2-D frames, runs ``F.conv2d``, and folds the
         result back.
 
+        *weight_2d* is the pre-transformed 2-D kernel
+        ``[C_out, Kt*C_in, Kh, Kw]``, cached at patch time to avoid
+        redundant permute/reshape on every forward call.
+
         When *compute_bf16* is True the convolution is executed in BF16 and
         the output is cast back to the original dtype.
         """
         orig_dtype = x_padded.dtype
         N, C_in, T, H, W = x_padded.shape
-        C_out, _, Kt, Kh, Kw = weight.shape
+        C_out = weight_2d.shape[0]
         stride_t, stride_h, stride_w = stride
 
-        T_out = (T - Kt) // stride_t + 1
+        T_out = (T - kt) // stride_t + 1
 
         # (N, C_in, T, H, W) -> (N, T_out, Kt, C_in, H, W) -> (N*T_out, Kt*C_in, H, W)
-        unfolded = x_padded.unfold(2, Kt, stride_t)
+        unfolded = x_padded.unfold(2, kt, stride_t)
         unfolded = unfolded.permute(0, 2, 5, 1, 3, 4).reshape(
-            N * T_out, Kt * C_in, H, W
+            N * T_out, kt * C_in, H, W
         )
 
-        # (C_out, C_in, Kt, Kh, Kw) -> (C_out, Kt*C_in, Kh, Kw)
-        weight_2d = weight.permute(0, 2, 1, 3, 4).reshape(C_out, Kt * C_in, Kh, Kw)
-
+        w = weight_2d
         if compute_bf16 and orig_dtype != torch.bfloat16:
             unfolded = unfolded.to(torch.bfloat16)
-            weight_2d = weight_2d.to(torch.bfloat16)
+            w = w.to(torch.bfloat16)
             b = bias.to(torch.bfloat16) if bias is not None else None
         else:
             b = bias
 
-        out = F.conv2d(unfolded, weight_2d, b, stride=(stride_h, stride_w))
+        out = F.conv2d(unfolded, w, b, stride=(stride_h, stride_w))
 
         if compute_bf16 and orig_dtype != torch.bfloat16:
             out = out.to(orig_dtype)
@@ -322,9 +325,11 @@ class RocmPlatform(Platform):
         carries a ``_padding`` attribute (set by the Wan / diffusers causal
         conv wrapper).  Only modules whose kernel is truly 3-D (Kt>1, Kh>1,
         Kw>1) are replaced; pointwise or 1-D-temporal convolutions are left
-        untouched.
+        untouched.  Modules with non-default ``groups`` or ``dilation`` are
+        skipped as the 2-D decomposition assumes groups=1 and dilation=1.
         """
         patched = 0
+        skipped = 0
         for _name, child in module.named_modules():
             if not isinstance(child, nn.Conv3d):
                 continue
@@ -332,17 +337,32 @@ class RocmPlatform(Platform):
                 continue
             kt, kh, kw = child.kernel_size
             if kt <= 1 or kh <= 1 or kw <= 1:
+                skipped += 1
+                continue
+            if child.groups != 1 or any(d != 1 for d in child.dilation):
+                skipped += 1
                 continue
 
             padding = child._padding
             stride = child.stride
 
+            # Pre-compute the 2-D weight: [C_out, C_in, Kt, Kh, Kw]
+            # -> [C_out, Kt*C_in, Kh, Kw]  (cached as a buffer)
+            weight_2d = (
+                child.weight.data.permute(0, 2, 1, 3, 4)
+                .reshape(child.out_channels, kt * child.in_channels, kh, kw)
+                .contiguous()
+            )
+            child.register_buffer("_weight_2d", weight_2d)
+
             def _patched_forward(
                 self,
                 x,
                 cache_x=None,
+                *,
                 _padding=padding,
                 _stride=stride,
+                _kt=kt,
                 _bf16=use_bf16,
             ):
                 pad = list(_padding)
@@ -353,12 +373,24 @@ class RocmPlatform(Platform):
                 x = F.pad(x, pad)
                 x = x.to(self.weight.dtype)
                 return RocmPlatform._conv3d_as_batched_conv2d(
-                    x, self.weight, self.bias, _stride, compute_bf16=_bf16
+                    x,
+                    self._weight_2d,
+                    self.bias,
+                    _stride,
+                    _kt,
+                    compute_bf16=_bf16,
                 )
 
             child.forward = types.MethodType(_patched_forward, child)
             patched += 1
 
+        logger.info(
+            "Conv3D→Conv2D: patched %d CausalConv3d (3D kernel, compute=%s), "
+            "skipped %d (1D/pointwise/grouped)",
+            patched,
+            "BF16" if use_bf16 else "same dtype",
+            skipped,
+        )
         return patched
 
     @classmethod
