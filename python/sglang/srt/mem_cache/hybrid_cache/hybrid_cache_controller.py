@@ -267,10 +267,12 @@ class HybridCacheController(BaseHiCacheController):
                 pool_transfers=op.pool_transfers,
             )
             finish_event.record()
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
+            self._record_op_indices_on_stream(
+                self.write_stream,
+                host_indices,
+                device_indices,
+                op.pool_transfers,
+            )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(
@@ -328,10 +330,12 @@ class HybridCacheController(BaseHiCacheController):
                     pool_transfers=op.pool_transfers,
                 )
                 producer_event.complete(i)
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+            self._record_op_indices_on_stream(
+                self.load_stream,
+                host_indices,
+                device_indices,
+                op.pool_transfers,
+            )
         self.ack_load_queue.append(
             HiCacheAck(
                 producer_event.start_event,
@@ -340,6 +344,23 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return producer_id
+
+    def _record_op_indices_on_stream(
+        self,
+        stream: torch.Stream,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> None:
+        if host_indices.is_cuda:
+            host_indices.record_stream(stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(stream)
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
+                transfer.host_indices.record_stream(stream)
+            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
+                transfer.device_indices.record_stream(stream)
 
     def prefetch(
         self,
