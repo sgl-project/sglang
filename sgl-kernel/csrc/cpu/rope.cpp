@@ -565,7 +565,7 @@ apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at
 // key: [num_tokens, num_kv_heads * head_size]
 // cos_sin_cache: [max_position_embeddings, rotary_dim]
 // mrope_section: [t, h, w]
-std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+void multimodal_rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
@@ -638,5 +638,4 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
       }
     }
   });
-  return std::make_tuple(query, key);
 }
