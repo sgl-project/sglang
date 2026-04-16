@@ -424,9 +424,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         In multi-tokenizer mode, each worker process has its own is_pause flag
         and asyncio.Condition, which cannot be shared across processes. This
-        method connects to a shared memory byte so that pause/continue from
-        any worker is visible to all workers. A background task polls the
-        shared flag and updates the local is_pause + is_pause_cond.
+        method connects to a shared memory byte so that pause/continue from any
+        worker is visible to all workers. A background task polls the shared
+        flag and updates the local is_pause + is_pause_cond. Note that the
+        consistency of is_pause is reduced to eventual consistency in this
+        case.
         """
         self._is_pause_shm = shared_memory.SharedMemory(name=shm_name)
         self.is_pause = bool(self._is_pause_shm.buf[0])
