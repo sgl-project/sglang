@@ -1449,22 +1449,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if ranks_to_recover and try_recover_ranks(ranks_to_recover):
             self.forward_pass_id = 0
             self.eplb_manager.reset_generator()
-            healthy_local_indices = [
-                i for i in range(len(tp_active_ranks)) if i not in ranks_to_recover
-            ]
-            healthy_src_rank = (
-                self.tp_group.ranks[healthy_local_indices[0]]
-                if healthy_local_indices
-                else get_world_group().ranks[0]
-            )
-            broadcast_global_expert_location_metadata(src_rank=healthy_src_rank)
+            broadcast_global_expert_location_metadata()
             ElasticEPStateManager.instance().reset()
 
             broadcast_pyobj(
                 [self.server_args.random_seed],
                 get_world_group().rank,
                 get_world_group().cpu_group,
-                src=healthy_src_rank,
+                src=get_world_group().ranks[0],
             )
             logger.info(f"recover ranks {ranks_to_recover} done")
 

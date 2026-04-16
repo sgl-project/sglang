@@ -350,19 +350,19 @@ class DataParallelController:
             logger.debug("Worker port broadcast completed")
             return worker_ports
         finally:
-            rep_socket.close()
-            if self.server_args.elastic_ep_backend is not None:
+            if self.server_args.elastic_ep_backend is None:
+                rep_socket.close()
+            else:
                 threading.Thread(
                     target=self._reply_ports_as_server,
-                    args=(endpoint, worker_ports),
+                    args=(rep_socket, worker_ports),
                     daemon=True,
                 ).start()
 
-    def _reply_ports_as_server(self, endpoint: str, worker_ports: List[int]):
+    def _reply_ports_as_server(self, rep_socket: zmq.Socket, worker_ports: List[int]):
         """
         Runs as a background thread to broadcast worker ports for recovered EP ranks
         """
-        rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
         while True:
             # Wait for client handshake
             client_rank = rep_socket.recv().decode()
