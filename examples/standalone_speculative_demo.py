@@ -117,16 +117,28 @@ def _worker(cfg_json: str, use_spec: bool, result_queue: multiprocessing.Queue):
         kwargs.update(cfg["spec_kwargs"])
 
     llm = sgl.Engine(**kwargs)
-    llm.generate(PROMPTS[:1], SAMPLING_PARAMS)  # 预热
+
+    # 套 chat template：从 engine 的 tokenizer 获取，避免重复加载模型文件
+    tokenizer = llm.get_tokenizer()
+    templated = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for p in PROMPTS
+    ]
+
+    llm.generate(templated[:1], SAMPLING_PARAMS)  # 预热
 
     batch_times = {}
     for bs in BATCH_SIZES:
         t0 = time.perf_counter()
-        llm.generate(PROMPTS[:bs], SAMPLING_PARAMS)
+        llm.generate(templated[:bs], SAMPLING_PARAMS)
         batch_times[bs] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    for p in PROMPTS:
+    for p in templated:
         llm.generate([p], SAMPLING_PARAMS)
     serial_time = time.perf_counter() - t0
 
