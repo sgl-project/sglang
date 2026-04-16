@@ -1267,8 +1267,6 @@ class HybridLinearKVPool(KVCache):
 
             TokenToKVPoolClass = MHATokenToKVPool
 
-            from sglang.srt.platforms import current_platform
-
             if current_platform.is_out_of_tree():
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
             elif _is_npu:
