@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_tensor_in_symmetric_mempool,
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_wrapper,
@@ -814,32 +815,43 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
     input_scale_quant: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    *,
+    use_per_token_nvfp4: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Quantize hidden states to FP4 for TRTLLM MoE.
 
     Global scale factor is set by ModelOptNvFp4FusedMoEMethod during weight loading.
     Only block scales are computed at runtime for efficiency.
 
-    Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime)
+    Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime, per_token_scale_or_none)
     """
 
-    # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
-    # Only the block scales are computed at runtime
-    hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
-        hidden_states,
-        input_scale_quant,
-        16,  # sf_vec_size
-        False,  # use_ue8m0
-        False,  # is_sf_swizzled_layout
-    )
+    per_token_scale = None
+    if use_per_token_nvfp4:
+        from flashinfer import nvfp4_quant_and_per_token_scale
+
+        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quant_and_per_token_scale(
+            hidden_states,
+            1.0 / 448.0 / 6.0,
+        )
+    else:
+        # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
+        # Only the block scales are computed at runtime
+        hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
+            hidden_states,
+            input_scale_quant,
+            16,  # sf_vec_size
+            False,  # use_ue8m0
+            False,  # is_sf_swizzled_layout
+        )
 
     seq_len, hidden_size = hidden_states.shape
     hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)
     # TRT-LLM expects hidden state scales shaped as [seq_len, hidden_size // 16]
     hs_sf = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(seq_len, hidden_size // 16)
 
-    return hs_fp4, hs_sf
+    return hs_fp4, hs_sf, per_token_scale
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp4(
@@ -871,9 +883,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
+    use_per_token_nvfp4 = envs.SGLANG_FLASHINFER_PER_TOKEN_NVFP4_MOE.get()
+
     # Quantize hidden states to FP4
-    hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
-        hidden_states, quant_info.w13_input_scale_quant
+    hs_fp4, hs_scale_linear, per_token_scale = quantize_hidden_states_fp4(
+        hidden_states,
+        quant_info.w13_input_scale_quant,
+        use_per_token_nvfp4=use_per_token_nvfp4,
     )
     hs_scale = hs_scale_linear.view(torch.float8_e4m3fn).reshape(
         *hs_scale_linear.shape[:-1], -1
@@ -927,6 +943,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
+            per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
             top_k=topk_output.topk_ids.shape[1],
             n_group=0,
@@ -974,6 +991,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
+            per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
             top_k=topk_config.top_k,
             n_group=topk_config.num_expert_group,
