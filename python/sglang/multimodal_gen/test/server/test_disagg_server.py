@@ -111,7 +111,12 @@ class DisaggCluster:
         self.gpu_layout = gpu_layout
         self.extra_role_args = extra_role_args or {}
         self.startup_timeout = startup_timeout
+        self._procs: list[subprocess.Popen] = []
+        self._fhs: list = []
+        self._logs: dict[str, Path] = {}
+        self._alloc_ports()
 
+    def _alloc_ports(self) -> None:
         self.base_port = find_free_port(HOST)
         self.api_port = find_free_port(HOST)
         self._role_ports = {
@@ -119,16 +124,27 @@ class DisaggCluster:
             "denoiser": find_free_port(HOST),
             "decoder": find_free_port(HOST),
         }
-        self._procs: list[subprocess.Popen] = []
-        self._fhs: list = []
-        self._logs: dict[str, Path] = {}
 
     # -- context manager -----------------------------------------------------
 
     def __enter__(self) -> "DisaggCluster":
-        self._launch_roles()
-        self._launch_server_head()
-        return self
+        for attempt in range(3):
+            try:
+                self._launch_roles()
+                self._launch_server_head()
+                self._warmup()
+                return self
+            except Exception as e:
+                print(
+                    f"[disagg-test] Cluster {self.name} attempt {attempt + 1} "
+                    f"failed: {e}",
+                    flush=True,
+                )
+                self.stop()
+                self._alloc_ports()
+                if attempt == 2:
+                    raise
+        return self  # unreachable
 
     def __exit__(self, *exc) -> None:
         self.stop()
@@ -205,6 +221,8 @@ class DisaggCluster:
             str(self.api_port),
             "--host",
             HOST,
+            "--disagg-timeout",
+            "120",
             "--log-level",
             "info",
         ]
@@ -219,6 +237,16 @@ class DisaggCluster:
             raise RuntimeError(
                 f"server head failed to become healthy for {self.name}: {e}\n"
                 f"Server log tail:\n{_tail_log(log)}"
+            ) from e
+
+    def _warmup(self) -> None:
+        """Send a warmup request to establish RDMA connections."""
+        try:
+            _generate_image(self.api_port, self.model)
+        except Exception as e:
+            raise RuntimeError(
+                f"Warmup request failed for {self.name}: {e}\n"
+                f"Server log tail:\n{_tail_log(self._logs.get('server', Path('/dev/null')))}"
             ) from e
 
     def stop(self) -> None:
