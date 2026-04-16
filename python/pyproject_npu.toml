@@ -22,6 +22,7 @@ dependencies = [
   "av",
   "build",
   "compressed-tensors",
+  "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "datasets",
   "einops",
   "fastapi",
