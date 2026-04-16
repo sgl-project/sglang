@@ -1121,24 +1121,27 @@ LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
 echo "${LOCAL_HOST1}"
 echo "${LOCAL_HOST2}"
 
-export HCCL_BUFFSIZE=1600
+export HCCL_BUFFSIZE=570
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=2
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
+
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
+export SGLANG_NPU_FUSED_MOE_MODE=2
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
     --attention-backend ascend --device npu --quantization modelslim  \
-    --max-running-requests 272 --context-length 8192 --dtype bfloat16 \
-    --chunked-prefill-size 32768 --max-prefill-tokens 32768 \
+    --max-running-requests 432 --context-length 8192 --dtype bfloat16 \
+    --chunked-prefill-size 94208 --max-prefill-tokens 458880 --sampling-backend ascend \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --disable-radix-cache --moe-a2a-backend deepep  --deepep-mode auto --speculative-draft-model-quantization unquant \
-    --tp 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.8 --cuda-graph-bs 3 4 6 8 10 12 13 14 15 16 17
-
+    --disable-radix-cache --moe-a2a-backend ascend_fuseep --speculative-draft-model-quantization unquant \
+    --tp 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.8 --cuda-graph-bs 1 2 4 8 16 20 24 26 27
 ```
 
 #### Benchmark
