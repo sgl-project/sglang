@@ -163,6 +163,7 @@ class Envs:
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)

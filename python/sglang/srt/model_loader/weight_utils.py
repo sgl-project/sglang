@@ -70,10 +70,16 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
-# Tunable via SGLANG_PREFETCH_BLOCK_SIZE_MB environment variable.
-_PREFETCH_BLOCK_SIZE = (
-    int(os.environ.get("SGLANG_PREFETCH_BLOCK_SIZE_MB", "16")) * 1024 * 1024
-)
+_PREFETCH_BLOCK_SIZE = None
+
+
+def _get_prefetch_block_size() -> int:
+    global _PREFETCH_BLOCK_SIZE
+    if _PREFETCH_BLOCK_SIZE is None:
+        from sglang.srt.environ import envs
+
+        _PREFETCH_BLOCK_SIZE = envs.SGLANG_PREFETCH_BLOCK_SIZE_MB.get() * 1024 * 1024
+    return _PREFETCH_BLOCK_SIZE
 
 
 # use system-level temp directory for file locks, so that multiple users
@@ -714,7 +720,7 @@ def _prefetch_checkpoint_file(file_path: str) -> None:
     before workers load the same file via mmap.
     """
     with open(file_path, "rb") as f:
-        while f.read(_PREFETCH_BLOCK_SIZE):
+        while f.read(_get_prefetch_block_size()):
             pass
 
 
