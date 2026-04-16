@@ -138,16 +138,15 @@ def fp4_gemm(
     out_dtype: torch.dtype,
     out_features: int,
 ) -> torch.Tensor:
-    # SM120 (RTX 5090 / Blackwell) CUTLASS FP4 GEMM NaN fix:
-    # E4M3 scale factor with uint8 value 127 (max representable = 448.0) triggers
-    # NaN in the CUTLASS kernel. Clamp to 126 (= 416.0, <2% precision loss).
-    # Using unconditional clamp instead of conditional .max() check also avoids
-    # GPU-to-CPU synchronization that would break CUDA graph capture.
-    input_sf = input_sf.view(torch.uint8).clamp(max=126).view(torch.float8_e4m3fn)
-    weight_sf = weight_sf.view(torch.uint8).clamp(max=126).view(torch.float8_e4m3fn)
-
     fp4_backend = get_fp4_gemm_runner_backend()
     if fp4_backend.is_cutlass() and cutlass_fp4_gemm is not None:
+        # SM120 (RTX 5090 / Blackwell) CUTLASS FP4 GEMM NaN fix:
+        # E4M3 scale factor with uint8 value 127 (max representable = 448.0)
+        # triggers NaN in the CUTLASS kernel on SM120. Clamp to 126 (= 416.0,
+        # <2% precision loss). Using unconditional clamp instead of conditional
+        # .max() check avoids GPU-to-CPU sync that breaks CUDA graph capture.
+        input_sf = input_sf.contiguous().view(torch.uint8).clamp(max=126).view(torch.float8_e4m3fn)
+        weight_sf = weight_sf.contiguous().view(torch.uint8).clamp(max=126).view(torch.float8_e4m3fn)
         return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
     elif enable_flashinfer_fp4_gemm:
         backend = fp4_backend.get_flashinfer_backend()
