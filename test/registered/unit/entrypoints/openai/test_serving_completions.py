@@ -4,6 +4,10 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
+
 import json
 import unittest
 from http import HTTPStatus
@@ -16,10 +20,9 @@ from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.utils import get_or_create_event_loop
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
 
 
 class _MockTemplateManager:
