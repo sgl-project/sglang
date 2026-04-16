@@ -295,6 +295,7 @@ class HiCacheController:
         # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
         # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
+        self.storage_io_blocked = threading.Event()
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -360,6 +361,35 @@ class HiCacheController:
 
         self.prefetch_thread.start()
         self.backup_thread.start()
+
+    def set_storage_io_blocked(self, blocked: bool):
+        """Block or unblock new storage IO (prefetch/backup submissions)."""
+        if blocked:
+            self.storage_io_blocked.set()
+        else:
+            self.storage_io_blocked.clear()
+
+    def is_storage_io_blocked(self) -> bool:
+        return self.storage_io_blocked.is_set()
+
+    def count_pending_storage_ops(self) -> int:
+        """Count pending items across all storage-related queues."""
+        pending = 0
+        for name in (
+            "backup_queue",
+            "prefetch_queue",
+            "prefetch_buffer",
+            "ack_backup_queue",
+            "prefetch_revoke_queue",
+            "host_mem_release_queue",
+        ):
+            q = getattr(self, name, None)
+            if q is not None:
+                try:
+                    pending += q.qsize()
+                except Exception:
+                    pass
+        return pending
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -495,6 +525,7 @@ class HiCacheController:
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
+            self.storage_io_blocked.clear()
             self._start_storage_threads()
         except Exception:
             # Best-effort cleanup for partial init.
@@ -803,10 +834,14 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
-    ) -> PrefetchOperation:
+    ) -> Optional[PrefetchOperation]:
         """
         Prefetch KV caches from storage backend to host memory.
+        Returns None if storage IO is blocked (force attach/detach in progress).
         """
+        if self.storage_io_blocked.is_set():
+            return None
+
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
@@ -1001,10 +1036,14 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
-    ) -> int:
+    ) -> Optional[int]:
         """
         Write KV caches from host memory to storage backend.
+        Returns None if storage IO is blocked (force attach/detach in progress).
         """
+        if self.storage_io_blocked.is_set():
+            return None
+
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )

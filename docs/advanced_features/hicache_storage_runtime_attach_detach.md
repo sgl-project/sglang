@@ -2,12 +2,18 @@
 
 This document explains how to **dynamically attach/detach the HiCache L3 storage backend at runtime** (e.g., `mooncake` / `hf3fs` / `nixl` / `file` / `aibrix` / `eic`) while **SGLang is already running and serving traffic**, without restarting the process.
 
-For safety and consistency, the current implementation **strictly requires** these operations to happen only when the service is **idle**:
+For safety and consistency, the default behavior **strictly requires** these operations to happen only when the service is **idle**:
 
 - **No running requests**
 - **No waiting/queued requests**
 
 If the idle condition is not met, the API will fail fast (HTTP 400) and **will not modify** the current service state.
+
+You can optionally enable a **force mode** (`"force": true`) to switch even under load. In force mode:
+
+- The idle check is **bypassed**
+- New storage IO is **blocked** immediately (new prefetch/backup will be skipped)
+- On force detach, the system waits briefly (up to 5s) for in-flight storage ops to drain; if storage threads do not stop in time, the switch **fails** instead of force-releasing the backend
 
 ---
 
@@ -115,6 +121,14 @@ Notes:
 curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend
 ```
 
+Force detach (even when requests are in-flight):
+
+```bash
+curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend \
+  -H 'Content-Type: application/json' \
+  -d '{"force": true}'
+```
+
 Notes:
 
 - Detach only makes SGLang **stop using** the L3 storage backend and stops prefetch/backup threads
@@ -125,7 +139,10 @@ Notes:
 ## 4. Behavior and caveats
 
 - **No restart required**: attach/detach switches in-process at runtime
-- **Must be idle**: otherwise the request is rejected to avoid consistency issues
+- **Must be idle (default)**: otherwise the request is rejected (HTTP 400) to avoid consistency issues.  Pass `"force": true` to bypass the idle check
+- **Force mode**:
+  - In-flight requests are **not affected**; they continue normally while the switch blocks new storage prefetch/backup issuance
+  - Detach remains **conservative**: if storage background threads cannot stop cleanly, the API returns failure and leaves the backend attached
 - **Host KV layout constraints still apply**: for example, Mooncake still requires layouts like `page_first/page_first_direct/page_head`; if the server's HiCache host-memory layout does not satisfy the backend requirements, attach will fail with an error
 - **Observability**:
   - After attach, `server_args.hicache_storage_backend*` is updated on both the tokenizer and scheduler sides

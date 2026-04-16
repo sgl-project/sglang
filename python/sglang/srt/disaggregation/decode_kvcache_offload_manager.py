@@ -282,6 +282,14 @@ class DecodeKVCacheOffloadManager:
             incremental_tokens,
             hash_value=page_hashes,
         )
+        if ack_id is None:
+            logger.warning(
+                "Skip decode-side storage backup for request %s because storage IO is blocked.",
+                req.rid,
+            )
+            self.decode_host_mem_pool.free(host_indices)
+            return
+
         self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 

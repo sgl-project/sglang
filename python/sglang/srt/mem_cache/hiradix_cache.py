@@ -195,6 +195,27 @@ class HiRadixCache(RadixCache):
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
 
+    def _wait_storage_ops_idle(
+        self, timeout_s: float = 5.0, poll_interval_s: float = 0.1
+    ) -> tuple[bool, str]:
+        """Best-effort wait for in-flight storage ops to drain (used by force detach)."""
+        start = time.monotonic()
+        while True:
+            self._drain_storage_control_queues_local()
+            pending = (
+                self.cache_controller.count_pending_storage_ops()
+                + len(self.ongoing_backup)
+                + len(self.ongoing_prefetch)
+            )
+            if pending == 0:
+                return True, ""
+            if time.monotonic() - start >= timeout_s:
+                return (
+                    False,
+                    f"Timeout waiting for storage ops to drain: pending={pending}",
+                )
+            time.sleep(poll_interval_s)
+
     def _apply_storage_runtime_config(
         self,
         *,
@@ -250,12 +271,16 @@ class HiRadixCache(RadixCache):
         served_model_name: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
+        force: bool = False,
     ) -> tuple[bool, str]:
         """Attach (enable) storage backend at runtime.
 
         This will start storage threads inside `HiCacheController` and enable
         prefetch/backup paths. Caller must ensure there are no running/queued
-        requests to avoid races.
+        requests to avoid races (unless force=True).
+
+        Args:
+            force: When True, block new storage IO during the attach operation.
         """
         # Validate inputs first (no side effects).
         if hicache_storage_prefetch_policy is not None:
@@ -337,6 +362,15 @@ class HiRadixCache(RadixCache):
                 f"Failed to parse storage_backend_extra_config_json '{storage_backend_extra_config_json}': {e}",
             )
 
+        if force:
+            self.cache_controller.set_storage_io_blocked(True)
+            drain_ok, drain_msg = self._wait_storage_ops_idle(timeout_s=5.0)
+            if not drain_ok:
+                logger.warning(
+                    "Force attach: storage ops still in-flight after wait: %s",
+                    drain_msg,
+                )
+
         try:
             self.cache_controller.attach_storage_backend(
                 storage_backend=storage_backend,
@@ -349,7 +383,12 @@ class HiRadixCache(RadixCache):
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
             )
+            if force:
+                self.cache_controller.set_storage_io_blocked(False)
             return False, f"Failed to attach storage backend '{storage_backend}': {e}"
+
+        if force:
+            self.cache_controller.set_storage_io_blocked(False)
 
         self._apply_storage_runtime_config(
             storage_backend=storage_backend,
@@ -363,11 +402,25 @@ class HiRadixCache(RadixCache):
         )
         return True, "Attached HiCache storage backend successfully."
 
-    def detach_storage_backend(self) -> tuple[bool, str]:
+    def detach_storage_backend(self, force: bool = False) -> tuple[bool, str]:
         """Detach (disable) storage backend at runtime.
 
-        Caller must ensure there are no running/queued requests to avoid races.
+        Caller must ensure there are no running/queued requests to avoid races
+        (unless force=True).
+
+        Args:
+            force: When True, block new storage IO and best-effort wait for
+                in-flight storage ops before detach.
         """
+        if force:
+            self.cache_controller.set_storage_io_blocked(True)
+            drain_ok, drain_msg = self._wait_storage_ops_idle(timeout_s=5.0)
+            if not drain_ok:
+                logger.warning(
+                    "Force detach: storage ops still in-flight after wait: %s",
+                    drain_msg,
+                )
+
         try:
             # Drain any pending control queues before tearing down storage threads/backend.
             # IMPORTANT: this must happen before we clear `ongoing_*`, otherwise acks/releases
@@ -380,6 +433,8 @@ class HiRadixCache(RadixCache):
         except Exception as e:
             logger.exception("Failed to detach storage backend.")
             # Do NOT crash the server for admin operations. Return failure with detail.
+            if force:
+                self.cache_controller.set_storage_io_blocked(False)
             return False, f"Failed to detach HiCache storage backend: {e}"
 
         # Best-effort cleanup of any leftover bookkeeping.
@@ -390,6 +445,8 @@ class HiRadixCache(RadixCache):
 
         self.enable_storage = False
         self.enable_storage_metrics = False
+        if force:
+            self.cache_controller.set_storage_io_blocked(False)
         return True, "Detached HiCache storage backend successfully."
 
     def _force_release_pending_storage_ops(self):
@@ -472,6 +529,8 @@ class HiRadixCache(RadixCache):
         log_metrics: bool,
     ):
         cc = self.cache_controller
+        if not hasattr(cc, "prefetch_revoke_queue"):
+            return
 
         def _drain_queue(q, limit: Optional[int]):
             drained = 0
@@ -683,6 +742,9 @@ class HiRadixCache(RadixCache):
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode):
+        if self.cache_controller.is_storage_io_blocked():
+            return
+
         prefix_keys = (
             node.get_prefix_hash_values(node.parent)
             if self.hicache_storage_pass_prefix_keys
@@ -696,6 +758,8 @@ class HiRadixCache(RadixCache):
             prefix_keys,
             **self._get_extra_pools(),
         )
+        if operation_id is None:
+            return
         self.ongoing_backup[operation_id] = node
         node.protect_host()
 
@@ -1250,6 +1314,9 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
+        if self.cache_controller.is_storage_io_blocked():
+            return
+
         new_input_tokens = (
             convert_to_bigram_key(new_input_tokens)
             if self.is_eagle
@@ -1284,6 +1351,10 @@ class HiRadixCache(RadixCache):
             prefix_keys,
             **self._get_extra_pools(),
         )
+        if operation is None:
+            self.cache_controller.mem_pool_host.free(host_indices)
+            last_host_node.release_host()
+            return
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
