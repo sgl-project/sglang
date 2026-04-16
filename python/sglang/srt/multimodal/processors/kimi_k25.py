@@ -285,10 +285,14 @@ class KimiGPUProcessorWrapper:
             images, resize_configs, image_mean, image_std_inv, self._patch_size
         )
 
+        grid_thws = grid_thws.cpu()
+
         return {
             "input_ids": text_inputs["input_ids"],
             "pixel_values": pixel_values,
-            "grid_thws": grid_thws,
+            # Use SGL-standard key so get_new_expanded_mm_items() can split
+            # per-image for cache granularity (it looks up 'image_grid_thw').
+            "image_grid_thw": grid_thws,
         }
 
     def _cpu_call(self, text, images, **kwargs):
