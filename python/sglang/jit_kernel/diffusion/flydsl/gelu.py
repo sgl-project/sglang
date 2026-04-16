@@ -1,9 +1,7 @@
-"""FlyDSL GeLU kernel: vectorized pointwise tanh-approximation GeLU.
+"""FlyDSL GeLU kernel: vectorized pointwise tanh-approximation GeLU for AMD ROCm.
 
-Replaces Inductor-generated triton_poi_fused_gelu_0 with a bandwidth-
-optimized FlyDSL kernel.  The Triton version only achieves ~11% of MI355X
-peak bandwidth (0.75 / 6.55 TB/s) due to tiny XBLOCK=256 and 1.2M grid.
-Target: 50%+ bandwidth utilization via vec-8 buffer_load/store.
+Bandwidth-optimized replacement for Inductor-generated GeLU using
+vec-8 buffer_load/store for higher memory throughput on gfx950.
 """
 
 import flydsl.compiler as flyc

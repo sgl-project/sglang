@@ -1,11 +1,14 @@
-"""FlyDSL fused kernel v4: register-cached Phase 2 + wrapper optimizations.
+"""FlyDSL fused normalization kernels for AMD ROCm (gfx950).
 
-v3 -> v4 changes:
-  - Phase 2 reuses f32 values from Phase 1 registers instead of re-reading
-    res_out from HBM/L2.  Saves ~20% bandwidth.
-  - _prep_slices skips .to(bf16) when tensor is already bf16.
-  - Wrapper skips redundant .to(bf16) / .contiguous() when inputs are
-    already bf16-contiguous.
+Provides two fused kernels:
+  - flydsl_fused_residual_norm_scale_shift:
+        residual_add + gate_mul + RMSNorm/LayerNorm + scale·shift
+  - flydsl_norm_scale_shift:
+        RMSNorm/LayerNorm + scale·shift
+
+Both kernels use register-cache optimization: Phase 2 (scale·shift)
+reuses f32 intermediate values from Phase 1 (norm) registers instead
+of re-reading from HBM, saving ~20% bandwidth.
 """
 
 from typing import Optional, Tuple
@@ -34,7 +37,7 @@ def _v(x):
     return buffer_ops._unwrap_value(x)
 
 
-def _build_fused_norm_module_v3(D: int, is_rms: bool, has_gate: bool, has_weight: bool):
+def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: bool):
     VEC = 8
     NUM_WAVES = 10
     BLOCK = NUM_WAVES * WARP_SIZE
@@ -357,7 +360,7 @@ _COMPILE_CACHE = {}
 def _get_or_compile(D, is_rms, has_gate, has_weight, args):
     key = (D, is_rms, has_gate, has_weight)
     if key not in _COMPILE_CACHE:
-        launcher = _build_fused_norm_module_v3(D, is_rms, has_gate, has_weight)
+        launcher = _build_fused_norm_module(D, is_rms, has_gate, has_weight)
         cf = flyc.compile(launcher, *args)
         _COMPILE_CACHE[key] = cf
     return _COMPILE_CACHE[key]
