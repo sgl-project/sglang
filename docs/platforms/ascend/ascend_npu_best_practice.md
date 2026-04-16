@@ -964,7 +964,6 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
-export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy
 unset http_proxy
 unset HTTPS_PROXY
@@ -972,17 +971,19 @@ unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
+export SGLANG_SET_CPU_AFFINITY=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_DP_ROUND_ROBIN=1
+export SGLANG_NPU_FUSED_MOE_MODE=2
 
 MODEL_PATH=xxx
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24667"
 P_IP=('your prefill ip1')
 D_IP=('your decode ip1' 'your decode ip2')
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -998,6 +999,7 @@ do
         echo "${P_IP[$i]}"
         source /usr/local/Ascend/ascend-toolkit/set_env.sh
         source /usr/local/Ascend/nnal/atb/set_env.sh
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=188416
         export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
         export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
         export HCCL_BUFFSIZE=4300
@@ -1016,9 +1018,9 @@ do
         --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --speculative-draft-model-quantization unquant \
-        --max-running-requests 128 --chunked-prefill-size 262144 --max-prefill-tokens 262144 \
+        --max-running-requests 128 --chunked-prefill-size 94208 --max-prefill-tokens 262144 \
         --enable-dp-attention  \
-        --moe-a2a-backend deepep --deepep-mode normal --dtype bfloat16
+        --moe-a2a-backend ascend_fuseep --dtype bfloat16
         NODE_RANK=$i
         break
     fi
@@ -1032,8 +1034,9 @@ do
         echo "${D_IP[$i]}"
         source /usr/local/Ascend/ascend-toolkit/set_env.sh
         source /usr/local/Ascend/nnal/atb/set_env.sh
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
-        export HCCL_BUFFSIZE=512
+        export DP_ROUND_ROBIN=1
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=65536
+        export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=data0.3001
         export GLOO_SOCKET_IFNAME=data0.3001
         export STREAMS_PER_DEVICE=32
@@ -1049,7 +1052,7 @@ do
         --dist-init-addr xxx:5000 \
         --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --enable-dp-lm-head --dtype bfloat16 --tokenizer-worker-num 4 \
-        --load-balance-method decode_round_robin
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
@@ -1058,7 +1061,7 @@ done
 ```
 
 ```shell
-python -m sglang_router.launch_router \
+SGLANG_DP_ROUND_ROBIN=1 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://PIP:8000 8995 \
