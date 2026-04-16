@@ -6,6 +6,10 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
+
 import json
 import unittest
 import uuid

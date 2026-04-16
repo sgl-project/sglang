@@ -4,6 +4,10 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
+
 import json
 import unittest
 from http import HTTPStatus
