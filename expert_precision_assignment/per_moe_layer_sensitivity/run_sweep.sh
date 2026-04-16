@@ -15,6 +15,9 @@ PORT="${PORT:-30210}"
 NSAMPLES="${NSAMPLES:-32}"
 SEQLEN="${SEQLEN:-2048}"
 NUM_LAYERS="${NUM_LAYERS:-48}"
+START_LAYER="${START_LAYER:-0}"
+END_LAYER="${END_LAYER:-${NUM_LAYERS}}"
+SKIP_BASELINE="${SKIP_BASELINE:-false}"
 OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/results}"
 CFG_DIR="${CFG_DIR:-${OUT_DIR}/configs}"
 ENDPOINT="http://127.0.0.1:${PORT}"
@@ -87,10 +90,12 @@ launch_and_measure() {
 }
 
 # --- 1. BF16 baseline ---
-launch_and_measure "bf16_baseline" ""
+if [[ "${SKIP_BASELINE}" != "true" ]]; then
+    launch_and_measure "bf16_baseline" ""
+fi
 
 # --- 2. Per-layer INT4 ---
-for (( L=0; L<NUM_LAYERS; L++ )); do
+for (( L=START_LAYER; L<END_LAYER; L++ )); do
     launch_and_measure "layer${L}" \
         "--heter-precision-config ${CFG_DIR}/heter_layer${L}.json"
 done
