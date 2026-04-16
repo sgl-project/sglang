@@ -180,11 +180,13 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
         )
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.compile_config.add_split_op(
-                "sglang.moe_forward_piecewise_cuda_graph_impl"
-            )
 
+        # FIX: Always split at MoE ops to avoid Inductor precision issues
+        # These custom ops have precision problems when compiled with Inductor
+        self.compile_config.add_split_op(
+            "sglang.moe_forward_piecewise_cuda_graph_impl"
+        )
+        
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
 
         # Batch sizes to capture
