@@ -20,10 +20,10 @@ if TYPE_CHECKING:
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE": bs}, num_warps=w)
-        for bs in [64, 128, 256, 512, 1024]
+        for bs in [128, 256, 512]
         for w in [1, 2, 4, 8]
     ],
-    key=["max_seq_pages"],
+    key=["page_size"],
 )
 @triton.jit
 def _fused_decode_metadata_kernel(
@@ -33,8 +33,8 @@ def _fused_decode_metadata_kernel(
     req_to_token_ptr,
     req_pool_indices_ptr,
     page_table_ptr,
-    req_to_token_stride: tl.constexpr,
-    page_table_stride: tl.constexpr,
+    req_to_token_stride,
+    page_table_stride,
     page_size: tl.constexpr,
     max_seq_pages,
     BLOCK_SIZE: tl.constexpr,
