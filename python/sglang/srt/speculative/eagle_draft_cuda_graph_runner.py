@@ -73,6 +73,7 @@ class EAGLEDraftCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.draft_kv_num_steps = self.speculative_num_steps - 1
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
@@ -107,7 +108,7 @@ class EAGLEDraftCudaGraphRunner:
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
             out_cache_loc = torch.zeros(
-                (self.max_num_token * self.speculative_num_steps,),
+                (self.max_num_token * self.draft_kv_num_steps,),
                 dtype=self._cache_loc_dtype(),
             )
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -226,7 +227,7 @@ class EAGLEDraftCudaGraphRunner:
         seq_lens_cpu = buffers.seq_lens_cpu[:num_seqs]
         extend_seq_lens = buffers.extend_seq_lens[:num_seqs]
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:num_seqs]
-        out_cache_loc = buffers.out_cache_loc[: num_tokens * self.speculative_num_steps]
+        out_cache_loc = buffers.out_cache_loc[: num_tokens * self.draft_kv_num_steps]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         hidden_states = buffers.hidden_states[:num_seqs]
@@ -382,7 +383,7 @@ class EAGLEDraftCudaGraphRunner:
 
         # Common inputs
         buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
+        buffers.out_cache_loc[: raw_num_token * self.draft_kv_num_steps].copy_(
             forward_batch.out_cache_loc
         )
         buffers.positions[:raw_num_token].copy_(forward_batch.positions)

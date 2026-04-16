@@ -93,6 +93,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
+        self.draft_kv_num_steps = self.speculative_num_steps - 1
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -100,7 +101,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Set constant
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
+            self.draft_kv_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
         # Do not capture cuda graph in `TpModelWorker` init,
@@ -223,7 +224,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner,
             self.draft_runner_list[0],
             self.topk,
-            self.speculative_num_steps,
+            self.draft_kv_num_steps,
         )
 
         # Run draft

@@ -3338,6 +3338,9 @@ class ServerArgs:
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
 
+            if self.speculative_num_steps < 1:
+                raise ValueError("speculative_num_steps must be at least 1")
+
             if (
                 self.attention_backend == "trtllm_mha"
                 or self.decode_attention_backend == "trtllm_mha"

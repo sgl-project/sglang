@@ -110,6 +110,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
+        self.draft_kv_num_steps = self.speculative_num_steps - 1
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -324,7 +325,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner,
             self.draft_runner,
             self.topk,
-            self.speculative_num_steps,
+            self.draft_kv_num_steps,
         )
 
         # Run draft
@@ -411,10 +412,10 @@ class EagleDraftWorker(BaseDraftWorker):
             topk_index = self.hot_token_id[topk_index]
 
         out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
+            forward_batch.batch_size, self.topk, self.draft_kv_num_steps
         )
         out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
+            self.draft_kv_num_steps, -1
         )
 
         # Return values
