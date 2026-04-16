@@ -48,7 +48,7 @@ RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \
     . /home/sdp/miniforge3/bin/activate && \
     conda activate py${PYTHON_VERSION} && \
-    pip3 install torch==2.10.0+xpu torchao torchvision torchaudio==2.10.0+xpu triton-xpu==3.6.0 --index-url https://download.pytorch.org/whl/xpu
+    pip3 install torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 
 RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \
@@ -58,7 +58,7 @@ RUN --mount=type=secret,id=github_token \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
-    pip install . && \
+    pip install . --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install xgrammar --no-deps && \
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
     conda install libsqlite=3.48.0 -y && \

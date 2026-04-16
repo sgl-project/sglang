@@ -2,6 +2,7 @@
 
 import logging
 from enum import Enum
+from functools import cached_property
 from typing import List, Optional, Tuple
 
 import torch
@@ -325,6 +326,21 @@ class FusedMoE(torch.nn.Module):
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
 
+    @cached_property
+    def use_padded_loading(self) -> bool:
+        # This handles the case where the loaded weights are smaller than the padded expert_data
+        # Use narrow_padded_param_and_loaded_weight for:
+        # 1. CPU (always)
+        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
+        # 3. GPU with Aiter padding
+        aiter_padded = (
+            _use_aiter
+            and hasattr(self, "w2_weight")
+            and getattr(self.w2_weight, "weight_padded", False)
+        )
+
+        return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -436,12 +452,7 @@ class FusedMoE(torch.nn.Module):
         else:
             start = 0
 
-        # Use narrow_padded_param_and_loaded_weight for:
-        # 1. CPU (always)
-        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
-        # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
-        if use_padded_loading:
+        if self.use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -510,12 +521,7 @@ class FusedMoE(torch.nn.Module):
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
 
-        # Use narrow_padded_param_and_loaded_weight for:
-        # 1. CPU (always)
-        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
-        # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
-        if use_padded_loading:
+        if self.use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -1003,6 +1009,7 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+
         if _use_aiter and self.dispatcher.local_expert_mapping is not None:
             self.expert_mask_gpu = (
                 (

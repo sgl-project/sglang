@@ -92,16 +92,19 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             if isinstance(target, ast.Name) and target.id in CASE_LIST_TO_SUITE:
                 list_name = target.id
                 case_ids = self._extract_case_ids_from_list(value)
-                self.cases[list_name] = case_ids
+                if case_ids is not None:
+                    self.cases[list_name] = case_ids
 
-    def _extract_case_ids_from_list(self, node: ast.AST) -> List[str]:
-        """Extract case IDs from a list of DiffusionTestCase calls."""
+    def _extract_case_ids_from_list(self, node: ast.AST) -> Optional[List[str]]:
+        """Extract case IDs from a literal list of DiffusionTestCase calls."""
+        if not isinstance(node, ast.List):
+            return None
+
         case_ids = []
-        if isinstance(node, ast.List):
-            for elt in node.elts:
-                case_id = self._extract_case_id_from_call(elt)
-                if case_id:
-                    case_ids.append(case_id)
+        for elt in node.elts:
+            case_id = self._extract_case_id_from_call(elt)
+            if case_id:
+                case_ids.append(case_id)
         return case_ids
 
     def _extract_case_id_from_call(self, node: ast.AST) -> Optional[str]:

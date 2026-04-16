@@ -22,10 +22,8 @@ import tabulate
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
-    ONE_GPU_CASES_A,
-    ONE_GPU_CASES_B,
-    TWO_GPU_CASES_A,
-    TWO_GPU_CASES_B,
+    ONE_GPU_CASES,
+    TWO_GPU_CASES,
     DiffusionTestCase,
 )
 
@@ -54,13 +52,15 @@ def _discover_unit_tests() -> list[str]:
 
 FILE_SUITES = {
     "unit": _discover_unit_tests(),
+    "component-accuracy": [
+        "test_component_accuracy_1_gpu.py",
+        "test_component_accuracy_2_gpu.py",
+    ],
     "component-accuracy-1-gpu": [
-        "test_accuracy_1_gpu_a.py",
-        "test_accuracy_1_gpu_b.py",
+        "test_component_accuracy_1_gpu.py",
     ],
     "component-accuracy-2-gpu": [
-        "test_accuracy_2_gpu_a.py",
-        "test_accuracy_2_gpu_b.py",
+        "test_component_accuracy_2_gpu.py",
     ],
     "1-gpu-b200": [
         "test_server_c.py",
@@ -76,12 +76,10 @@ FILE_SUITES.update(suites_ascend)
 
 PARAMETRIZED_CASE_GROUPS = {
     "1-gpu": [
-        ("test_server_a.py", ONE_GPU_CASES_A),
-        ("test_server_b.py", ONE_GPU_CASES_B),
+        ("test_server_1_gpu.py", ONE_GPU_CASES),
     ],
     "2-gpu": [
-        ("test_server_2_gpu_a.py", TWO_GPU_CASES_A),
-        ("test_server_2_gpu_b.py", TWO_GPU_CASES_B),
+        ("test_server_2_gpu.py", TWO_GPU_CASES),
     ],
 }
 
@@ -90,7 +88,9 @@ STANDALONE_FILES = {
         "../cli/test_generate_t2i_perf.py",
         "test_update_weights_from_disk.py",
     ],
-    "2-gpu": [],
+    "2-gpu": [
+        "test_disagg_server.py",
+    ],
 }
 
 # New standalone files may omit an estimate once to learn the real CI runtime.
@@ -101,7 +101,11 @@ STANDALONE_FILE_EST_TIMES = {
         "../cli/test_generate_t2i_perf.py": 240.0,
         "test_update_weights_from_disk.py": 480.0,
     },
-    "2-gpu": {},
+    "2-gpu": {
+        # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
+        # Raise if CI reports a higher measured time.
+        "test_disagg_server.py": 600.0,
+    },
 }
 
 # Backward-compatible suite view for scripts that still operate on file lists.
@@ -116,8 +120,13 @@ SUITES = {
 
 STRICT_SUITES = {"unit"}
 COMPONENT_ACCURACY_SUITES = {
+    "component-accuracy",
     "component-accuracy-1-gpu",
     "component-accuracy-2-gpu",
+}
+COMPONENT_ACCURACY_FILE_NUM_GPUS = {
+    "test_component_accuracy_1_gpu.py": 1,
+    "test_component_accuracy_2_gpu.py": 2,
 }
 
 
@@ -540,11 +549,28 @@ def _extract_failure_tail(full_output: str, max_lines: int = 20) -> list[str]:
     return lines[-max_lines:]
 
 
+def _summary_has_retryable_failure(summary_lines: list[str]) -> bool:
+    for line in summary_lines:
+        lowered = line.lower()
+        if (
+            "[performance]" in line
+            or "SafetensorError" in line
+            or "FileNotFoundError" in line
+            or "TimeoutError" in line
+            or "out of memory" in lowered
+            or "oom killer" in lowered
+        ):
+            return True
+    return False
+
+
 def _is_retryable_failure(full_output: str) -> bool:
+    summary_lines = _extract_short_test_summary(full_output)
     is_perf_assertion = (
         "multimodal_gen/test/server/test_server_utils.py" in full_output
         and "AssertionError" in full_output
     )
+    is_aggregated_retryable_failure = _summary_has_retryable_failure(summary_lines)
 
     is_flaky_ci_assertion = (
         "SafetensorError" in full_output
@@ -556,7 +582,12 @@ def _is_retryable_failure(full_output: str) -> bool:
         "out of memory" in full_output.lower() or "oom killer" in full_output.lower()
     )
 
-    return is_perf_assertion or is_flaky_ci_assertion or is_oom_error
+    return (
+        is_perf_assertion
+        or is_aggregated_retryable_failure
+        or is_flaky_ci_assertion
+        or is_oom_error
+    )
 
 
 def _print_attempt_tail_summary(
@@ -710,17 +741,17 @@ def partition_test_files(files, partition_id, total_partitions):
     ]
 
 
-def run_component_accuracy_files(
-    files, suite: str, filter_expr=None, continue_on_error=False
-):
+def run_component_accuracy_files(files, filter_expr=None, continue_on_error=False):
     exit_code = 0
     for file_path in files:
-        if suite == "component-accuracy-2-gpu":
+        file_name = Path(file_path).name
+        num_gpus = COMPONENT_ACCURACY_FILE_NUM_GPUS.get(file_name, 1)
+        if num_gpus > 1:
             cmd = [
                 sys.executable,
                 "-m",
                 "torch.distributed.run",
-                "--nproc_per_node=2",
+                f"--nproc_per_node={num_gpus}",
                 "-m",
                 "pytest",
                 "-s",
@@ -1143,7 +1174,6 @@ def main():
 
         exit_code = run_component_accuracy_files(
             my_files,
-            suite=args.suite,
             filter_expr=args.filter,
             continue_on_error=args.continue_on_error,
         )

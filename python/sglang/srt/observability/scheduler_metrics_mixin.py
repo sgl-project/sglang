@@ -148,6 +148,7 @@ class SchedulerMetricsMixin:
                 labels=labels,
                 enable_lora=self.enable_lora,
                 enable_hierarchical_cache=self.enable_hierarchical_cache,
+                enable_streaming_session=self.server_args.enable_streaming_session,
                 server_args=self.server_args,
             )
             self.enable_mfu_metrics = bool(self.server_args.enable_mfu_metrics)
@@ -165,14 +166,15 @@ class SchedulerMetricsMixin:
                     reporter=self.metrics_collector.increment_gpu_overlap_wait_seconds,
                 )
 
-        if self.enable_kv_cache_events:
-            self.init_kv_events(self.server_args.kv_events_config)
+        self.init_kv_events(self.server_args.kv_events_config)
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
         )
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
+        self.enable_kv_cache_events = bool(kv_events_config and self.attn_tp_rank == 0)
+
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, self.attn_dp_rank
@@ -602,6 +604,8 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
+            self.stats.num_streaming_sessions = self._streaming_session_count()
+            self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate
