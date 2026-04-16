@@ -88,7 +88,9 @@ STANDALONE_FILES = {
         "../cli/test_generate_t2i_perf.py",
         "test_update_weights_from_disk.py",
     ],
-    "2-gpu": [],
+    "2-gpu": [
+        "test_disagg_server.py",
+    ],
 }
 
 # New standalone files may omit an estimate once to learn the real CI runtime.
@@ -99,7 +101,11 @@ STANDALONE_FILE_EST_TIMES = {
         "../cli/test_generate_t2i_perf.py": 240.0,
         "test_update_weights_from_disk.py": 480.0,
     },
-    "2-gpu": {},
+    "2-gpu": {
+        # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
+        # Raise if CI reports a higher measured time.
+        "test_disagg_server.py": 600.0,
+    },
 }
 
 # Backward-compatible suite view for scripts that still operate on file lists.
