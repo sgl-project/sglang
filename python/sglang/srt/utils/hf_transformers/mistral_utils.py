@@ -1,12 +1,16 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/transformers_utils/configs/mistral.py
 # SPDX-License-Identifier: Apache-2.0
 import json
+import tempfile
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from transformers import PretrainedConfig, WhisperConfig
+from transformers import AutoConfig, PretrainedConfig, WhisperConfig
 
 from sglang.srt.utils import logger
+
+from .common import _ensure_sub_configs, download_from_hf
 
 
 def adapt_config_dict(
@@ -72,18 +76,6 @@ def adapt_config_dict(
 
     if bool(config_dict.get("yarn")):
         config_dict = _remap_mistral_yarn_args(config_dict)
-
-    if bool(config_dict.get("llama_4_scaling")):
-        llama_4_scaling_config_keys = ["original_max_position_embeddings", "beta"]
-        assert all(
-            [
-                key in config_dict["llama_4_scaling"]
-                for key in llama_4_scaling_config_keys
-            ]
-        ), (
-            "llama_4_scaling config should define the keys: "
-            f"{','.join(llama_4_scaling_config_keys)}"
-        )
 
     is_vision = bool(
         (config_dict.get("multimodal") or {}).get("vision_encoder_args")
@@ -267,14 +259,10 @@ class MistralConfigParser:
     ):
         file_path = Path(model) / file_name
         if not file_path.is_file():
-            # TODO: Add logic to download from HF in case file is not locally found
             raise FileNotFoundError(f"File not found {model}, {file_name}")
 
-        if file_path is not None and file_path.is_file():
-            with open(file_path) as file:
-                return json.load(file)
-
-        return None
+        with open(file_path) as file:
+            return json.load(file)
 
     def _download_mistral_config_file(self, model, revision) -> dict:
         config_file_name = "params.json"
@@ -294,8 +282,6 @@ class MistralConfigParser:
         revision: str | None = None,
         **kwargs,
     ) -> tuple[dict, PretrainedConfig]:
-        # This function loads a params.json config which
-        # should be used when loading models in mistral format
         config_dict = self._download_mistral_config_file(model, revision)
         if config_dict.get("max_position_embeddings") is None:
             logger.warning(
@@ -321,3 +307,171 @@ class MistralConfigParser:
             config.sliding_window = next(filter(None, sliding_window), None)
 
         return config_dict, config
+
+
+def is_mistral_model(name) -> bool:
+    """Return True if *name* refers to a Mistral model needing the custom parser."""
+    lower = str(name).lower()
+    return (
+        "mistral-large-3" in lower or "mistral-small-4" in lower or "leanstral" in lower
+    )
+
+
+@lru_cache(maxsize=2)
+def load_mistral_config(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+):
+    """Load and parse a Mistral model config via the custom params.json format.
+
+    Returns a ``PretrainedConfig`` with dict sub-configs (text_config,
+    vision_config) converted to proper AutoConfig objects.
+    """
+    local_path = download_from_hf(model_path)
+    parser = MistralConfigParser()
+    config_dict, _ = parser.parse(local_path)
+
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as f:
+        json.dump(config_dict, f)
+        f.flush()
+        loaded_config = AutoConfig.from_pretrained(
+            f.name, trust_remote_code=trust_remote_code, revision=revision
+        )
+    _ensure_sub_configs(loaded_config, "text_config", "vision_config")
+
+    return loaded_config
+
+
+def wrap_as_pixtral(processor, config):
+    """Wrap a tokenizer as a PixtralProcessor for Mistral vision models."""
+    from transformers.models.pixtral.image_processing_pixtral import (
+        PixtralImageProcessor,
+    )
+    from transformers.models.pixtral.processing_pixtral import (
+        PixtralProcessor as HFPixtralProcessor,
+    )
+
+    vision_config = config.vision_config
+    patch_size = vision_config.patch_size
+    image_size = vision_config.image_size
+    spatial_merge_size = getattr(vision_config, "spatial_merge_size", 1)
+
+    effective_patch = patch_size * spatial_merge_size
+    image_processor = PixtralImageProcessor(
+        do_resize=True,
+        size={"longest_edge": image_size},
+        patch_size={"height": effective_patch, "width": effective_patch},
+    )
+    return HFPixtralProcessor(
+        image_processor=image_processor,
+        tokenizer=processor,
+        patch_size=patch_size,
+        spatial_merge_size=spatial_merge_size,
+    )
+
+
+# kwargs that MistralCommon tokenizers reject.
+_MISTRAL_COMMON_REJECTED_KWARGS = frozenset(
+    {
+        "trust_remote_code",
+        "tokenizer_revision",
+        "use_fast",
+        "_from_auto",
+        "clean_up_tokenization_spaces",
+    }
+)
+
+# Models whose tokenizer should be loaded from a different checkpoint.
+_MISTRAL_TOKENIZER_REDIRECTS = {
+    # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
+    "mistralai/Devstral-Small-2505": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+}
+
+
+def retry_without_mistral_common_kwargs(tokenizer_name, *args, **common_kwargs):
+    """Retry ``AutoTokenizer.from_pretrained`` without kwargs that MistralCommon rejects.
+
+    Returns the loaded tokenizer, or *None* if the error is not a
+    MistralCommon kwargs rejection.
+    """
+    from transformers import AutoTokenizer
+
+    stripped = {
+        k: v
+        for k, v in common_kwargs.items()
+        if k not in _MISTRAL_COMMON_REJECTED_KWARGS
+    }
+    return AutoTokenizer.from_pretrained(tokenizer_name, *args, **stripped)
+
+
+def patch_mistral_common_tokenizer(tokenizer):
+    """Patch MistralCommonTokenizer/Backend to be compatible with HF tokenizer API.
+
+    MistralCommon tokenizers (used by Voxtral, Pixtral, etc.) reject several
+    standard kwargs and lack some attributes that sglang expects.  We wrap the
+    offending methods once at load time so that the rest of the codebase does
+    not need any special-casing.
+    """
+    cls_name = type(tokenizer).__name__
+    if "MistralCommon" not in cls_name:
+        return tokenizer
+    if getattr(tokenizer, "_mistral_common_patched", False):
+        return tokenizer
+    tokenizer._mistral_common_patched = True
+
+    if not hasattr(tokenizer, "get_added_vocab"):
+        tokenizer.get_added_vocab = lambda: {}
+
+    # Set a chat_template containing "audio" so that sglang's content format
+    # detector returns "openai" (which preserves audio_url extraction).
+    if not hasattr(tokenizer, "chat_template") or tokenizer.chat_template is None:
+        tokenizer.chat_template = "<!-- audio/image multimodal -->"
+
+    _orig_convert = tokenizer.convert_tokens_to_ids
+
+    def _safe_convert(val):
+        try:
+            return _orig_convert(val)
+        except AssertionError:
+            logger.debug(
+                "convert_tokens_to_ids failed for %r, returning unk_token_id", val
+            )
+            return getattr(tokenizer, "unk_token_id", None)
+
+    tokenizer.convert_tokens_to_ids = _safe_convert
+
+    def _drop_kwargs(fn, keys):
+        def wrapper(*args, **kwargs):
+            for k in keys:
+                kwargs.pop(k, None)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    tokenizer.decode = _drop_kwargs(tokenizer.decode, ["spaces_between_special_tokens"])
+    tokenizer.batch_decode = _drop_kwargs(
+        tokenizer.batch_decode, ["spaces_between_special_tokens"]
+    )
+
+    tokenizer._orig_apply_chat_template = tokenizer.apply_chat_template
+
+    def _safe_apply_chat_template(messages, **kwargs):
+        kwargs.pop("add_generation_prompt", None)
+        cleaned = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    text_parts = [
+                        p.get("text", "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ]
+                    msg = {**msg, "content": " ".join(text_parts) if text_parts else ""}
+                cleaned.append(msg)
+            else:
+                cleaned.append(msg)
+        return tokenizer._orig_apply_chat_template(cleaned, **kwargs)
+
+    tokenizer.apply_chat_template = _safe_apply_chat_template
