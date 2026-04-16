@@ -52,14 +52,17 @@ from sglang.srt.utils import (
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
+    connect_with_curve,
     get_local_ip_auto,
     get_zmq_socket,
 )
 
 logger = logging.getLogger(__name__)
 
+ReceiveTarget = Tuple[str, Optional[str]]
+
 rid_lock = asyncio.Lock()
-rid_to_receive_endpoint: Dict[str, List[str]] = dict()
+rid_to_receive_endpoint: Dict[str, Set[ReceiveTarget]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
 rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
@@ -85,6 +88,12 @@ class BadRequestError(MMError):
 class InternalError(MMError):
     def __init__(self, message):
         super().__init__(message, code=HTTPStatus.INTERNAL_SERVER_ERROR)
+
+
+def _curve_public_key_bytes(curve_public_key: Optional[str]) -> Optional[bytes]:
+    if not curve_public_key:
+        return None
+    return curve_public_key.encode("ascii")
 
 
 class TensorWrapper:
@@ -1096,7 +1105,8 @@ class MMEncoder:
         buffer_address=None,
         prefill_host=None,
         embedding_port=None,
-        url=None,
+        url: Optional[Union[str, ReceiveTarget]] = None,
+        curve_public_key: Optional[str] = None,
     ):
         if self.server_args.encoder_transfer_backend == "mooncake":
             self.engine.register(embedding.data_ptr(), embedding.nbytes)
@@ -1109,8 +1119,13 @@ class MMEncoder:
 
         # Send ack/data
         if url is not None:
-            endpoint = NetworkAddress.parse(url).to_tcp()
+            if isinstance(url, tuple):
+                receive_url, target_curve_public_key = url
+            else:
+                receive_url, target_curve_public_key = url, curve_public_key
+            endpoint = NetworkAddress.parse(receive_url).to_tcp()
         else:
+            target_curve_public_key = curve_public_key
             endpoint = NetworkAddress(prefill_host, embedding_port).to_tcp()
         logger.info(f"{endpoint = }")
 
@@ -1133,7 +1148,11 @@ class MMEncoder:
             sock = self.sync_context.socket(zmq.PUSH)
             config_socket(sock, zmq.PUSH)
             try:
-                sock.connect(endpoint)
+                connect_with_curve(
+                    sock,
+                    endpoint,
+                    server_public_key=_curve_public_key_bytes(target_curve_public_key),
+                )
                 if buffer is not None:
                     sock.send_multipart([serialized_data, buffer], copy=False)
                 else:
@@ -1185,7 +1204,13 @@ class MMEncoder:
 
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
-        self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
+        self,
+        req_id,
+        prefill_host,
+        embedding_port,
+        session_id=None,
+        buffer_address=None,
+        curve_public_key: Optional[str] = None,
     ):
         mm_data: EmbeddingData = self.embedding_to_send[req_id]
         await self._send(
@@ -1195,6 +1220,7 @@ class MMEncoder:
             buffer_address=buffer_address,
             prefill_host=prefill_host,
             embedding_port=embedding_port,
+            curve_public_key=curve_public_key,
         )
 
     # For zmq_to_scheduler
@@ -1205,8 +1231,8 @@ class MMEncoder:
         mm_data = self.embedding_to_send.get(req_id)
         if not mm_data:
             return
-        sent_urls: Set[str] = set()
-        all_tasks: List[Tuple[asyncio.Task, str]] = []
+        sent_targets: Set[ReceiveTarget] = set()
+        all_tasks: List[Tuple[asyncio.Task, ReceiveTarget]] = []
         start_time = asyncio.get_running_loop().time()
         timeout = self.send_timeout
         cond = await get_condition(req_id)
@@ -1217,23 +1243,23 @@ class MMEncoder:
                     current_targets = rid_to_receive_endpoint.get(req_id, set()).copy()
                     expected_count = rid_to_receive_count.get(req_id)
 
-                new_targets = current_targets - sent_urls
+                new_targets = current_targets - sent_targets
 
                 if new_targets:
                     logger.info(
                         f"Found {len(new_targets)} new endpoints for {req_id}. Starting tasks..."
                     )
-                    for url in new_targets:
+                    for target in new_targets:
                         task = asyncio.create_task(
                             self._send(
                                 mm_data.embedding,
                                 mm_data,
-                                url=url,
+                                url=target,
                             )
                         )
-                        all_tasks.append((task, url))
-                        sent_urls.add(url)  # Mark as handled immediately
-                if expected_count is not None and len(sent_urls) >= expected_count:
+                        all_tasks.append((task, target))
+                        sent_targets.add(target)  # Mark as handled immediately
+                if expected_count is not None and len(sent_targets) >= expected_count:
                     logger.info(
                         f"All {expected_count} endpoints initiated for {req_id}. Breaking loop."
                     )
@@ -1241,7 +1267,7 @@ class MMEncoder:
                 remaining = timeout - (asyncio.get_running_loop().time() - start_time)
                 if remaining <= 0:
                     logger.error(
-                        f"[{req_id}] Timeout! Sent {len(sent_urls)}/{expected_count}"
+                        f"[{req_id}] Timeout! Sent {len(sent_targets)}/{expected_count}"
                     )
                     break
 
@@ -1260,11 +1286,11 @@ class MMEncoder:
 
                 # Process results and log errors
                 for i, result in enumerate(results):
-                    url = all_tasks[i][1]  # Retrieve URL associated with the task
+                    target = all_tasks[i][1]  # Retrieve target associated with the task
                     if isinstance(result, Exception):
-                        logger.error(f"Failed to send to {url}: {result}")
+                        logger.error(f"Failed to send to {target[0]}: {result}")
                     else:
-                        logger.debug(f"Successfully sent to {url}")
+                        logger.debug(f"Successfully sent to {target[0]}")
 
             logger.info(f"All tasks completed for req_id: {req_id}")
 
@@ -1481,6 +1507,7 @@ async def handle_encode_request(request: dict):
                             req_id=req_id,
                             prefill_host=request["prefill_host"],
                             embedding_port=port,
+                            curve_public_key=request.get("curve_public_key"),
                         )
             return ORJSONResponse(
                 status_code=error_code,
@@ -1511,6 +1538,7 @@ async def handle_encode_request(request: dict):
                             req_id=request["req_id"],
                             prefill_host=request["prefill_host"],
                             embedding_port=embedding_port,
+                            curve_public_key=request.get("curve_public_key"),
                         )
                     )
                 await asyncio.gather(*tasks)
@@ -1521,6 +1549,7 @@ async def handle_encode_request(request: dict):
                 req_id=request["req_id"],
                 prefill_host=request["prefill_host"],
                 embedding_port=request["embedding_port"],
+                curve_public_key=request.get("curve_public_key"),
             )
             encoder.embedding_to_send.pop(request["req_id"], None)
             return ORJSONResponse(content=None)
@@ -1547,6 +1576,7 @@ async def handle_send_request(request: dict):
         embedding_port=request["embedding_port"],
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
+        curve_public_key=request.get("curve_public_key"),
     )
     encoder.embedding_to_send.pop(request["req_id"], None)
     return ORJSONResponse(content=None)
@@ -1561,7 +1591,9 @@ async def handle_scheduler_receive_url_request(request: dict):
             rid_to_receive_endpoint[rid] = set()
             rid_to_receive_count[rid] = request["receive_count"]
         assert rid_to_receive_count[rid] == request["receive_count"]
-        rid_to_receive_endpoint[rid].add(request["receive_url"])
+        rid_to_receive_endpoint[rid].add(
+            (request["receive_url"], request.get("curve_public_key"))
+        )
     cond = await get_condition(rid)
     async with cond:
         cond.notify_all()

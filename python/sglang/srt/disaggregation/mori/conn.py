@@ -68,6 +68,7 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     is_dummy: bool
+    curve_public_key: Optional[str] = None
 
     @classmethod
     def from_zmq(cls, payload: List[bytes]) -> TransferInfo:
@@ -89,6 +90,9 @@ class TransferInfo:
         required_dst_info_num = (
             int(payload[7].decode("ascii")) if len(payload) > 7 else 1
         )
+        curve_key = (
+            payload[8].decode("ascii") if len(payload) > 8 and payload[8] else None
+        )
         is_dummy = dst_kv_indices.size == 0 and dst_aux_index < 0
         return cls(
             room=room,
@@ -99,6 +103,7 @@ class TransferInfo:
             dst_aux_index=dst_aux_index,
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
+            curve_public_key=curve_key,
         )
 
 
@@ -114,6 +119,7 @@ class KVArgsRegisterInfo:
     decode_tp_size: int
     decode_tp_rank: int
     dst_kv_item_len: int
+    curve_public_key: Optional[str] = None
 
     @property
     def engine_key(self) -> str:
@@ -131,6 +137,9 @@ class KVArgsRegisterInfo:
         decode_tp_size = int(payload[8].decode("ascii"))
         decode_tp_rank = int(payload[9].decode("ascii"))
         dst_kv_item_len = int(payload[10].decode("ascii"))
+        curve_key = (
+            payload[11].decode("ascii") if len(payload) > 11 and payload[11] else None
+        )
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -142,6 +151,7 @@ class KVArgsRegisterInfo:
             decode_tp_size=decode_tp_size,
             decode_tp_rank=decode_tp_rank,
             dst_kv_item_len=dst_kv_item_len,
+            curve_public_key=curve_key,
         )
 
 
@@ -414,7 +424,16 @@ class MoriKVManager(CommonKVManager):
         for info in infos:
             try:
                 na = NetworkAddress(info.endpoint, info.dst_port)
-                socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
+                server_public_key = (
+                    info.curve_public_key.encode("ascii")
+                    if info.curve_public_key
+                    else None
+                )
+                socket = self._connect(
+                    na.to_tcp(),
+                    is_ipv6=na.is_ipv6,
+                    server_public_key=server_public_key,
+                )
                 socket.send_multipart(payload)
             except Exception:
                 logger.exception(
@@ -735,6 +754,11 @@ class MoriKVManager(CommonKVManager):
                 buffer_index=i,
                 aux_index=dst_aux_index,
                 data=data,
+                server_public_key=(
+                    peer_info.curve_public_key.encode("ascii")
+                    if peer_info.curve_public_key
+                    else None
+                ),
             )
 
         return []
@@ -747,9 +771,12 @@ class MoriKVManager(CommonKVManager):
         buffer_index: int,
         aux_index: int,
         data: bytes,
+        server_public_key: Optional[bytes] = None,
     ):
         na = NetworkAddress(remote, dst_port)
-        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
+        socket = self._connect(
+            na.to_tcp(), is_ipv6=na.is_ipv6, server_public_key=server_public_key
+        )
 
         socket.send_multipart(
             [
@@ -1007,6 +1034,7 @@ class MoriKVReceiver(CommonKVReceiver):
         decode_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
         decode_tp_rank = str(self.kv_mgr.kv_args.engine_rank).encode("ascii")
         kv_item_len = str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii")
+        curve_pub = (self.kv_mgr.curve_public_key or "").encode("ascii")
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1025,6 +1053,7 @@ class MoriKVReceiver(CommonKVReceiver):
                         decode_tp_size,
                         decode_tp_rank,
                         kv_item_len,
+                        curve_pub,
                     ]
                 )
 
@@ -1042,6 +1071,7 @@ class MoriKVReceiver(CommonKVReceiver):
         )
         aux_bytes = str(aux_index).encode("ascii") if aux_index is not None else b""
         state_bytes = b""
+        curve_pub = (self.kv_mgr.curve_public_key or "").encode("ascii")
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1058,6 +1088,7 @@ class MoriKVReceiver(CommonKVReceiver):
                         aux_bytes if not is_dummy else b"",
                         state_bytes,
                         str(self.required_dst_info_num).encode("ascii"),
+                        curve_pub,
                     ]
                 )
         self.init_time = time.time()

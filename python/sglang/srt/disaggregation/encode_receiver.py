@@ -32,6 +32,7 @@ from sglang.srt.utils import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
 from sglang.srt.utils.network import (
     NetworkAddress,
+    get_curve_config,
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
@@ -58,13 +59,36 @@ def _normalize_embedding_ports(embedding_port):
     return [embedding_port]
 
 
-def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
+def _current_curve_public_key() -> Optional[str]:
+    curve = get_curve_config()
+    if curve is None:
+        return None
+    return curve.public_key.decode("ascii")
+
+
+_GRPC_CURVE_PUBLIC_KEY_METADATA = "x-sglang-curve-public-key"
+
+
+def _grpc_curve_metadata(curve_public_key: Optional[str]):
+    if not curve_public_key:
+        return None
+    return ((_GRPC_CURVE_PUBLIC_KEY_METADATA, curve_public_key),)
+
+
+def _grpc_scheduler_receive_url(
+    target,
+    req_id,
+    receive_url,
+    receive_count,
+    curve_public_key: Optional[str] = None,
+):
     import grpc
     from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
     stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    metadata = _grpc_curve_metadata(curve_public_key)
     try:
         stub.SchedulerReceiveUrl(
             sglang_encoder_pb2.SchedulerReceiveUrlRequest(
@@ -73,6 +97,7 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
                 receive_count=receive_count,
             ),
             timeout=timeout_secs,
+            metadata=metadata,
         )
     finally:
         channel.close()
@@ -85,6 +110,7 @@ def _grpc_encode_request(target, encode_request):
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
     stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    metadata = _grpc_curve_metadata(encode_request.get("curve_public_key"))
     try:
         response = stub.Encode(
             sglang_encoder_pb2.EncodeRequest(
@@ -98,6 +124,7 @@ def _grpc_encode_request(target, encode_request):
                 ),
             ),
             timeout=timeout_secs,
+            metadata=metadata,
         )
         return response
     finally:
@@ -111,6 +138,7 @@ def _grpc_send_request(target, request_json):
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
     stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    metadata = _grpc_curve_metadata(request_json.get("curve_public_key"))
     try:
         stub.Send(
             sglang_encoder_pb2.SendRequest(
@@ -121,6 +149,7 @@ def _grpc_send_request(target, request_json):
                 buffer_address=request_json["buffer_address"],
             ),
             timeout=timeout_secs,
+            metadata=metadata,
         )
     finally:
         channel.close()
@@ -421,6 +450,7 @@ class WaitingImageRequest:
         self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
             zmq.Context(), zmq.PULL, host=host_name
         )
+        self.curve_public_key = _current_curve_public_key()
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
         # ok=1 pending=0 fail=-1
@@ -470,6 +500,7 @@ class WaitingImageRequest:
                             "receive_url": NetworkAddress(
                                 host_name, embedding_port
                             ).to_host_port_str(),
+                            "curve_public_key": self.curve_public_key,
                             "modality": modality.name,
                         }
                         logger.info(
@@ -575,6 +606,7 @@ class WaitingImageRequestGrpc(WaitingImageRequest):
                         req_id,
                         receive_url,
                         receive_count,
+                        self.curve_public_key,
                     )
                 )
 
@@ -625,6 +657,7 @@ class MMReceiverBase(ABC):
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
         self.host = get_local_ip_auto(server_args.host)
+        self.curve_public_key = _current_curve_public_key()
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = get_mooncake_transfer_engine()
@@ -1158,6 +1191,7 @@ class MMReceiverHTTP(MMReceiverBase):
                         "modality": modality.name,  # convert enum to string for json serialization
                         "prefill_host": self.host,
                         "embedding_port": embedding_port,
+                        "curve_public_key": self.curve_public_key,
                     }
                 )
                 cum_idx += 1
@@ -1321,6 +1355,7 @@ class MMReceiverGrpc(MMReceiverBase):
                     "req_id": req_id,
                     "prefill_host": self.host,
                     "embedding_port": embedding_port,
+                    "curve_public_key": self.curve_public_key,
                 }
             )
             cum_idx += 1
@@ -1345,6 +1380,7 @@ class MMReceiverGrpc(MMReceiverBase):
                     "req_id": encode_request["req_id"],
                     "prefill_host": encode_request["prefill_host"],
                     "embedding_port": encode_request["embedding_port"],
+                    "curve_public_key": encode_request.get("curve_public_key"),
                     "encoder_idx": encode_request["encoder_idx"],
                     "part_idx": encode_request["part_idx"],
                     "embedding_size": response.embedding_size,

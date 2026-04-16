@@ -34,9 +34,9 @@ from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.srt.utils.network import get_zmq_socket
 
 logger = init_logger(__name__)
 
@@ -68,10 +68,10 @@ class Scheduler:
         endpoint = server_args.scheduler_endpoint
         if gpu_id == 0:
             # router allocates identify (envelope) for each connection
-            self.receiver, actual_endpoint = get_zmq_socket(
-                self.context, zmq.ROUTER, endpoint, True
+            self.receiver = get_zmq_socket(
+                self.context, zmq.ROUTER, endpoint, bind=True
             )
-            logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
+            logger.info(f"Scheduler bind at endpoint: {endpoint}")
         else:
             self.receiver = None
 
@@ -364,7 +364,7 @@ class Scheduler:
         """
 
         logger.debug(
-            f"Rank 0 scheduler listening on tcp://*:{self.server_args.scheduler_port}"
+            f"Rank 0 scheduler listening on {self.server_args.scheduler_endpoint}"
         )
 
         while self._running:

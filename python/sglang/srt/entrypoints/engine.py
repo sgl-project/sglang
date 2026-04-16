@@ -98,7 +98,11 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.srt.utils.network import get_zmq_socket, is_port_available
+from sglang.srt.utils.network import (
+    get_zmq_socket,
+    is_port_available,
+    propagate_curve_keys_to_env,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -649,6 +653,7 @@ class Engine(EngineScoreMixin, EngineBase):
         _set_envs_and_config(server_args)
         server_args.check_server_args()
         _set_gc(server_args)
+        propagate_curve_keys_to_env()
 
         # Allocate ports for inter-process communications
         if port_args is None:

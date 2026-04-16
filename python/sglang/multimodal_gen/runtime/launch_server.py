@@ -19,6 +19,30 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 
 
+def _propagate_curve_keys():
+    """Generate/load the CURVE keypair once and export it to ``os.environ``.
+
+    ``mp.Process(spawn)`` children inherit ``os.environ``, so every process
+    will load the same keypair via ``CurveConfig.from_raw_env()`` inside
+    ``get_curve_config()``.  Without this, each spawned process would
+    auto-generate its own keypair, causing CurveZMQ handshake failures.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.utils.network import get_curve_config
+
+    curve = get_curve_config()
+    if curve is None:
+        return
+    if not envs.SGLANG_ZMQ_CURVE_PUBLIC_KEY.get():
+        pub = curve.public_key.decode("ascii")
+        envs.SGLANG_ZMQ_CURVE_PUBLIC_KEY.set(pub)
+        os.environ["SGLANG_ZMQ_CURVE_PUBLIC_KEY"] = pub
+    if not envs.SGLANG_ZMQ_CURVE_SECRET_KEY.get():
+        sec = curve.secret_key.decode("ascii")
+        envs.SGLANG_ZMQ_CURVE_SECRET_KEY.set(sec)
+        os.environ["SGLANG_ZMQ_CURVE_SECRET_KEY"] = sec
+
+
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
@@ -64,6 +88,9 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         launch_http_server: False for offline local mode
     """
     configure_logger(server_args)
+
+    # Ensure all spawned children share the same CurveZMQ keypair.
+    _propagate_curve_keys()
 
     # Start a new server with multiple worker processes
     logger.info("Starting server...")

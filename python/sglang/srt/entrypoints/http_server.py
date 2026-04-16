@@ -631,18 +631,24 @@ async def get_server_info():
 @app.get("/server_info")
 async def server_info():
     """Get the server information."""
+    from sglang.srt.utils.network import get_curve_config
+
     # Returns internal states per DP.
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
     )
 
     # server_args.model_config is not serializable but should be excluded by asdict.
-    return {
+    info = {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,
     }
+    curve = get_curve_config()
+    if curve is not None:
+        info["zmq_curve_public_key"] = curve.public_key.decode("ascii")
+    return info
 
 
 @app.get("/get_load")

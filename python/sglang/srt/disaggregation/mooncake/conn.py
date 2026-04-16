@@ -81,11 +81,19 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
+    curve_public_key: Optional[str] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        """Deserialize from a ZMQ multi-part message.
+
+        Wire format (positional indices):
+          [0] room, [1] endpoint, [2] dst_port, [3] mooncake_session_id,
+          [4] dst_kv_indices, [5] dst_aux_index, [6] dst_state_indices,
+          [7] required_dst_info_num, [8] curve_public_key (optional)
+        """
         if msg[4] == b"" and msg[5] == b"":
             is_dummy = True
             dst_kv_indices = np.array([], dtype=np.int32)
@@ -99,6 +107,7 @@ class TransferInfo:
             else:
                 dst_state_indices = list(np.frombuffer(msg[6], dtype=np.int32))
             is_dummy = False
+        curve_key = msg[8].decode("ascii") if len(msg) > 8 and msg[8] else None
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -109,6 +118,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+            curve_public_key=curve_key,
         )
 
 
@@ -130,11 +140,52 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: list[int]
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
-    # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
+    curve_public_key: Optional[str] = None
+    # Staging is last on the wire and in this dataclass (multi-field tail).
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        """Deserialize from a ZMQ multi-part message.
+
+        Wire format (positional indices):
+          [0] room, [1] endpoint, [2] dst_port, [3] mooncake_session_id,
+          [4] dst_kv_ptrs, [5] dst_aux_ptrs, [6] dst_state_data_ptrs,
+          [7] dst_tp_rank, [8] dst_attn_tp_size, [9] dst_kv_item_len,
+          [10] dst_state_item_lens, [11] dst_state_dim_per_tensor,
+
+        Optional tail (fixed order; staging must be last):
+          [12] enable_hisparse (ascii '0' or '1'),
+          [13] curve_public_key (optional, empty if none),
+          [14] staging_base_ptr, [15] staging_total_size
+        """
+        dst_state_item_lens = (
+            list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
+            if len(msg) > 10 and len(msg[10]) > 0
+            else []
+        )
+        dst_state_dim_per_tensor = (
+            list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
+            if len(msg) > 11 and len(msg[11]) > 0
+            else []
+        )
+
+        enable_hisparse = False
+        staging: Optional[StagingRegisterInfo] = None
+        curve_key: Optional[str] = None
+
+        if len(msg) > 12:
+            m12 = msg[12]
+            if len(m12) != 1 or m12 not in (b"0", b"1"):
+                raise RuntimeError(
+                    "Invalid KVArgsRegisterInfo message: index [12] must be "
+                    "ascii '0' or '1' (enable_hisparse)."
+                )
+            enable_hisparse = m12 == b"1"
+            if len(msg) > 13 and msg[13]:
+                curve_key = msg[13].decode("ascii")
+            staging = StagingRegisterInfo.from_zmq_fields(msg, 14)
+
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -146,21 +197,11 @@ class KVArgsRegisterInfo:
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
             dst_kv_item_len=int(msg[9].decode("ascii")),
-            dst_state_item_lens=(
-                list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
-                if len(msg) > 10 and len(msg[10]) > 0
-                else []
-            ),
-            dst_state_dim_per_tensor=(
-                list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
-                if len(msg) > 11 and len(msg[11]) > 0
-                else []
-            ),
-            enable_hisparse=(
-                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
-            ),
-            # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
+            dst_state_item_lens=dst_state_item_lens,
+            dst_state_dim_per_tensor=dst_state_dim_per_tensor,
+            enable_hisparse=enable_hisparse,
+            curve_public_key=curve_key,
+            staging=staging,
         )
 
 
@@ -365,9 +406,13 @@ class MooncakeKVManager(CommonKVManager):
         """Notify decode that a non-last staging chunk RDMA is complete."""
         try:
             na = NetworkAddress(req.endpoint, req.dst_port)
+            decode_pub = (
+                req.curve_public_key.encode("ascii") if req.curve_public_key else None
+            )
             self._connect(
                 na.to_tcp(),
                 is_ipv6=na.is_ipv6,
+                server_public_key=decode_pub,
             ).send_multipart(
                 [
                     b"CHUNK_READY",
@@ -906,6 +951,9 @@ class MooncakeKVManager(CommonKVManager):
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
 
+            decode_pub = (
+                req.curve_public_key.encode("ascii") if req.curve_public_key else None
+            )
             self.send_aux_data_to_endpoint(
                 remote=req.endpoint,
                 dst_port=req.dst_port,
@@ -913,6 +961,7 @@ class MooncakeKVManager(CommonKVManager):
                 buffer_index=i,
                 aux_index=req.dst_aux_index,
                 data=data,
+                server_public_key=decode_pub,
             )
 
         return 0
@@ -925,9 +974,12 @@ class MooncakeKVManager(CommonKVManager):
         buffer_index: int,
         aux_index: int,
         data: bytes,
+        server_public_key: Optional[bytes] = None,
     ):
         na = NetworkAddress(remote, dst_port)
-        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
+        socket = self._connect(
+            na.to_tcp(), is_ipv6=na.is_ipv6, server_public_key=server_public_key
+        )
 
         socket.send_multipart(
             [
@@ -1132,10 +1184,18 @@ class MooncakeKVManager(CommonKVManager):
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def sync_status_to_decode_endpoint(
-        self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
+        self,
+        remote: str,
+        dst_port: int,
+        room: int,
+        status: int,
+        prefill_rank: int,
+        server_public_key: Optional[bytes] = None,
     ):
         na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+        self._connect(
+            na.to_tcp(), is_ipv6=na.is_ipv6, server_public_key=server_public_key
+        ).send_multipart(
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
@@ -1186,12 +1246,18 @@ class MooncakeKVManager(CommonKVManager):
                                     f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
                                 )
                                 self.update_status(kv_chunk.room, KVPoll.Failed)
+                                _decode_pub = (
+                                    req.curve_public_key.encode("ascii")
+                                    if req.curve_public_key
+                                    else None
+                                )
                                 self.sync_status_to_decode_endpoint(
                                     req.endpoint,
                                     req.dst_port,
                                     req.room,
                                     KVPoll.Failed,
                                     prefill_unique_rank,
+                                    server_public_key=_decode_pub,
                                 )
                                 break
 
@@ -1278,12 +1344,18 @@ class MooncakeKVManager(CommonKVManager):
                                 f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
                             )
                             self.update_status(kv_chunk.room, KVPoll.Failed)
+                            _decode_pub = (
+                                req.curve_public_key.encode("ascii")
+                                if req.curve_public_key
+                                else None
+                            )
                             self.sync_status_to_decode_endpoint(
                                 req.endpoint,
                                 req.dst_port,
                                 req.room,
                                 KVPoll.Failed,
                                 prefill_unique_rank,
+                                server_public_key=_decode_pub,
                             )
                             break
 
@@ -1304,21 +1376,27 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
                             polls.append(True if ret == 0 else False)
+                            _decode_pub = (
+                                req.curve_public_key.encode("ascii")
+                                if req.curve_public_key
+                                else None
+                            )
                             dst_ranks_infos.append(
-                                (req.endpoint, req.dst_port, req.room)
+                                (req.endpoint, req.dst_port, req.room, _decode_pub)
                             )
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
-                                for endpoint, dst_port, room in dst_ranks_infos:
+                                for endpoint, dst_port, room, cpk in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
                                         dst_port,
                                         room,
                                         status,
                                         prefill_unique_rank,
+                                        server_public_key=cpk,
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
@@ -1790,6 +1868,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 staging_total_size_str = b""
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            curve_pub = (self.kv_mgr.curve_public_key or "").encode("ascii")
             with lock:
                 sock.send_multipart(
                     [
@@ -1806,6 +1885,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
                         enable_hisparse,
+                        curve_pub,
                         packed_staging_base_ptr,
                         staging_total_size_str,
                     ]
@@ -1843,6 +1923,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            curve_pub = (self.kv_mgr.curve_public_key or "").encode("ascii")
 
             with lock:
                 sock.send_multipart(
@@ -1862,6 +1943,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
+                        curve_pub,
                     ]
                 )
         self.init_time = time.time()

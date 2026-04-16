@@ -17,7 +17,12 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.network import (
+    apply_curve_server,
+    get_curve_config,
+    get_local_ip_auto,
+    propagate_curve_keys_to_env,
+)
 
 PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
 logger = logging.getLogger(__name__)
@@ -44,13 +49,19 @@ class ExpertBackupManager:
         self.expert_num = self.model_config.hf_config.n_routed_experts
         self.idmn = (self.expert_num // self.engine_num) * self.engine_rank
         self.idmx = (self.expert_num // self.engine_num) * (self.engine_rank + 1)
+
         context = zmq.Context(2)
+        curve = get_curve_config()
         # Synchronization socket to avoid PUB/SUB slow joiner issues.
         self.recv_from_expert_backup_client = context.socket(zmq.PULL)
+        if curve is not None:
+            apply_curve_server(self.recv_from_expert_backup_client, curve)
         self.recv_from_expert_backup_client.bind(
             f"tcp://{get_local_ip_auto()}:{PORT_BASE + server_args.node_rank * 2}"
         )
         self.send_to_expert_backup_client = context.socket(zmq.PUB)
+        if curve is not None:
+            apply_curve_server(self.send_to_expert_backup_client, curve)
         self.send_to_expert_backup_client.bind(
             f"tcp://{get_local_ip_auto()}:{PORT_BASE + server_args.node_rank * 2 + 1}"
         )
@@ -178,6 +189,7 @@ def run_expert_backup_manager(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
+    propagate_curve_keys_to_env()
     proc = mp.Process(
         target=run_expert_backup_manager_process,
         args=(server_args, port_args),

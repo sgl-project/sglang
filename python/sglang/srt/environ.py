@@ -548,6 +548,13 @@ class Envs:
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
+    # CurveZMQ
+    SGLANG_ZMQ_CURVE_KEYS_DIR = EnvStr("")
+    SGLANG_ZMQ_CURVE_PUBLIC_KEY = EnvStr("")
+    SGLANG_ZMQ_CURVE_SECRET_KEY = EnvStr("")
+    SGLANG_NO_ZMQ_CURVE = EnvBool(False)
+    SGLANG_ZMQ_SERVER_PUBLIC_KEY = EnvStr("")
+
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
 

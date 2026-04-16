@@ -6,7 +6,6 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -37,6 +36,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
+    connect_with_curve,
+    get_curve_config,
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
@@ -79,6 +80,7 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    curve_public_key: Optional[str] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -127,6 +129,13 @@ class CommonKVManager(BaseKVManager):
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
+        curve = get_curve_config()
+        self.curve_public_key: Optional[str] = (
+            curve.public_key.decode("ascii") if curve is not None else None
+        )
+
+        self._socket_cache: Dict[tuple, zmq.Socket] = {}
+
         self.request_status: Dict[int, KVPoll] = {}
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
@@ -149,7 +158,9 @@ class CommonKVManager(BaseKVManager):
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
-            self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
+            self.connection_pool: Dict[
+                str, List[Dict[str, Union[str, int, bool, None]]]
+            ] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
@@ -352,6 +363,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            "curve_public_key": self.curve_public_key,
         }
 
         try:
@@ -367,13 +379,20 @@ class CommonKVManager(BaseKVManager):
                 f"Prefill instance failed to register to bootstrap server: {e}"
             )
 
-    @cache
-    def _connect(self, endpoint: str, is_ipv6: bool = False):
-        socket = zmq.Context().socket(zmq.PUSH)
-        if is_ipv6:
-            socket.setsockopt(zmq.IPV6, 1)
-        socket.connect(endpoint)
-        return socket
+    def _connect(
+        self,
+        endpoint: str,
+        is_ipv6: bool = False,
+        server_public_key: Optional[bytes] = None,
+    ):
+        cache_key = (endpoint, is_ipv6, server_public_key)
+        if cache_key not in self._socket_cache:
+            socket = zmq.Context().socket(zmq.PUSH)
+            if is_ipv6:
+                socket.setsockopt(zmq.IPV6, 1)
+            connect_with_curve(socket, endpoint, server_public_key=server_public_key)
+            self._socket_cache[cache_key] = socket
+        return self._socket_cache[cache_key]
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -572,7 +591,10 @@ class CommonKVReceiver(BaseKVReceiver):
         for target_cp_rank in self.target_cp_ranks:
             bootstrap_key = f"{self.bootstrap_addr}_{self.prefill_dp_rank}_{target_cp_rank}_{self.target_tp_rank}"
 
-            if bootstrap_key not in self.kv_mgr.connection_pool:
+            cached_infos = self.kv_mgr.connection_pool.get(bootstrap_key)
+            if cached_infos is not None:
+                self.bootstrap_infos = [info.copy() for info in cached_infos]
+            else:
                 bootstrap_infos = []
                 for target_tp_rank in self.target_tp_ranks:
                     # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
@@ -608,13 +630,11 @@ class CommonKVReceiver(BaseKVReceiver):
                             )
                             return
 
-                self.bootstrap_infos = bootstrap_infos
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
-
-                # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
+                self.bootstrap_infos = [info.copy() for info in bootstrap_infos]
+                self.kv_mgr.connection_pool[bootstrap_key] = [
+                    info.copy() for info in bootstrap_infos
+                ]
                 self._register_kv_args()
-            else:
-                self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
             assert len(self.bootstrap_infos) > 0
             all_bootstrap_infos.extend(self.bootstrap_infos)
@@ -664,23 +684,33 @@ class CommonKVReceiver(BaseKVReceiver):
             return {}
 
     @classmethod
-    def _connect(cls, endpoint: str, is_ipv6: bool = False):
+    def _connect(
+        cls,
+        endpoint: str,
+        is_ipv6: bool = False,
+        server_public_key: Optional[bytes] = None,
+    ):
+        cache_key = (endpoint, is_ipv6, server_public_key)
         with cls._global_lock:
-            if endpoint not in cls._socket_cache:
+            if cache_key not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
-                sock.connect(endpoint)
-                cls._socket_cache[endpoint] = sock
-                cls._socket_locks[endpoint] = threading.Lock()
-            return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+                connect_with_curve(sock, endpoint, server_public_key=server_public_key)
+                cls._socket_cache[cache_key] = sock
+                cls._socket_locks[cache_key] = threading.Lock()
+            return cls._socket_cache[cache_key], cls._socket_locks[cache_key]
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
         ip_address = bootstrap_info["rank_ip"]
         port = bootstrap_info["rank_port"]
         na = NetworkAddress(ip_address, port)
-        sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
+        raw_key = bootstrap_info.get("curve_public_key")
+        server_pub = raw_key.encode("ascii") if raw_key else None
+        sock, lock = cls._connect(
+            na.to_tcp(), is_ipv6=na.is_ipv6, server_public_key=server_pub
+        )
         return sock, lock
 
     def _register_kv_args(self):
@@ -826,6 +856,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                curve_public_key=data.get("curve_public_key"),
             )
 
             self._registered_count += 1

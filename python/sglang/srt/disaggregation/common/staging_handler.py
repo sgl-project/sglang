@@ -689,7 +689,7 @@ def prefetch_staging_reqs(
     """
     import zmq
 
-    from sglang.srt.utils.network import NetworkAddress
+    from sglang.srt.utils.network import NetworkAddress, connect_with_curve
 
     page_size = kv_buffer_tensors["page_size"]
     cps = chunked_prefill_size or 8192
@@ -714,13 +714,19 @@ def prefetch_staging_reqs(
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
-                if ep not in prefetch_sockets:
+                decode_pub = (
+                    tinfo.curve_public_key.encode("ascii")
+                    if getattr(tinfo, "curve_public_key", None)
+                    else None
+                )
+                cache_key = (ep, decode_pub)
+                if cache_key not in prefetch_sockets:
                     sock = zmq.Context().socket(zmq.PUSH)
                     if na.is_ipv6:
                         sock.setsockopt(zmq.IPV6, 1)
-                    sock.connect(ep)
-                    prefetch_sockets[ep] = sock
-                prefetch_sockets[ep].send_multipart(
+                    connect_with_curve(sock, ep, server_public_key=decode_pub)
+                    prefetch_sockets[cache_key] = sock
+                prefetch_sockets[cache_key].send_multipart(
                     [
                         b"STAGING_REQ",
                         str(room).encode("ascii"),

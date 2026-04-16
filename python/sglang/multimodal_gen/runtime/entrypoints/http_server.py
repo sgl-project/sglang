@@ -106,15 +106,21 @@ async def server_info_endpoint(request: Request):
     Returns fields compatible with the LLM engine's /server_info so that
     the model gateway can discover diffusion workers.
     """
+    from sglang.srt.utils.network import get_curve_config
+
     server_args: ServerArgs = request.app.state.server_args
 
-    return {
+    curve = get_curve_config()
+    info = {
         "model_path": server_args.model_path,
         "served_model_name": server_args.model_id or server_args.model_path,
         "tp_size": server_args.tp_size,
         "dp_size": server_args.dp_size,
         "version": __version__,
     }
+    if curve is not None:
+        info["zmq_curve_public_key"] = curve.public_key.decode("ascii")
+    return info
 
 
 @health_router.get("/model_info")

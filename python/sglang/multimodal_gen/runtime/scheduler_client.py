@@ -6,6 +6,12 @@ import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.network import (
+    apply_curve_server,
+    connect_with_curve,
+    get_curve_config,
+    get_server_public_key,
+)
 
 logger = init_logger(__name__)
 
@@ -17,6 +23,9 @@ async def run_zeromq_broker(server_args: ServerArgs):
     """
     ctx = zmq.asyncio.Context()
     socket = ctx.socket(zmq.REP)
+    curve = get_curve_config()
+    if curve is not None:
+        apply_curve_server(socket, curve)
     broker_endpoint = f"tcp://127.0.0.1:{server_args.broker_port}"
     socket.bind(broker_endpoint)
     logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
@@ -63,14 +72,15 @@ class SchedulerClient:
         self.context = zmq.Context()
         self.scheduler_socket = self.context.socket(zmq.REQ)
 
-        # Set socket options for the main communication socket
         self.scheduler_socket.setsockopt(zmq.LINGER, 0)
-
-        # 100 minute timeout for generation
         self.scheduler_socket.setsockopt(zmq.RCVTIMEO, 6000000)
 
         scheduler_endpoint = self.server_args.scheduler_endpoint
-        self.scheduler_socket.connect(scheduler_endpoint)
+        connect_with_curve(
+            self.scheduler_socket,
+            scheduler_endpoint,
+            server_public_key=get_server_public_key(),
+        )
         logger.debug(
             f"SchedulerClient connected to backend scheduler at {scheduler_endpoint}"
         )
@@ -95,12 +105,14 @@ class SchedulerClient:
 
         ping_socket = self.context.socket(zmq.REQ)
         ping_socket.setsockopt(zmq.LINGER, 0)
-        ping_socket.setsockopt(zmq.RCVTIMEO, 2000)  # 2-second timeout for pings
+        ping_socket.setsockopt(zmq.RCVTIMEO, 2000)
 
         endpoint = self.server_args.scheduler_endpoint
+        connect_with_curve(
+            ping_socket, endpoint, server_public_key=get_server_public_key()
+        )
 
         try:
-            ping_socket.connect(endpoint)
             ping_socket.send_pyobj({"method": "ping"})
             ping_socket.recv_pyobj()
             return True
@@ -150,14 +162,12 @@ class AsyncSchedulerClient:
                 "AsyncSchedulerClient is not initialized. Call initialize() first."
             )
 
-        # Create a temporary REQ socket for this request to allow concurrency
         socket = self.context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
-        # 100 minute timeout
         socket.setsockopt(zmq.RCVTIMEO, 6000000)
 
         endpoint = self.server_args.scheduler_endpoint
-        socket.connect(endpoint)
+        connect_with_curve(socket, endpoint, server_public_key=get_server_public_key())
 
         try:
             await socket.send(pickle.dumps(batch))
@@ -182,9 +192,11 @@ class AsyncSchedulerClient:
         ping_socket.setsockopt(zmq.RCVTIMEO, 2000)
 
         endpoint = self.server_args.scheduler_endpoint
+        connect_with_curve(
+            ping_socket, endpoint, server_public_key=get_server_public_key()
+        )
 
         try:
-            ping_socket.connect(endpoint)
             await ping_socket.send(pickle.dumps({"method": "ping"}))
             await ping_socket.recv()
             return True

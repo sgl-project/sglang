@@ -20,8 +20,9 @@ import signal
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, cast
 
+import msgspec
 import psutil
 import setproctitle
 import zmq
@@ -55,16 +56,29 @@ from sglang.srt.utils.common import (
     maybe_reindex_device_id,
 )
 from sglang.srt.utils.network import (
+    CURVE_DISABLED,
     NetworkAddress,
     bind_port,
     get_zmq_socket,
     get_zmq_socket_on_host,
+    propagate_curve_keys_to_env,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+class BootstrapPayload(msgspec.Struct):
+    """Wire format for the DP-attention multi-node bootstrap handshake."""
+
+    worker_ports: List[int]
+    curve_public_key: Optional[str] = None
+
+
+_bootstrap_encoder = msgspec.json.Encoder()
+_bootstrap_decoder = msgspec.json.Decoder(BootstrapPayload)
 
 
 class LoadBalanceMethod(Enum):
@@ -297,11 +311,12 @@ class DataParallelController:
     def _broadcast_worker_ports(
         self, server_args: ServerArgs, worker_ports: Optional[List[int]] = None
     ) -> List[int]:
-        """Broadcast worker ports from node 0 to all other nodes.
+        """Broadcast worker ports and Node 0's CURVE public key to all others.
 
-        Node 0 acts as the server, waiting for all other nodes to connect and
-        sending them the pre-allocated worker ports. Other nodes act as clients,
-        connecting to node 0 to receive their copy of the worker ports.
+        Each node auto-generates its own CURVE keypair.  The bootstrap only
+        distributes Node 0's *public* key so that non-zero nodes can
+        authenticate CURVE connections to Node 0's server sockets.  No
+        secret key is ever sent over the network.
 
         Args:
             server_args: Server arguments containing node configuration.
@@ -310,7 +325,6 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
-        # Determine the endpoint for inter-node communication
         if server_args.dist_init_addr is None:
             na = NetworkAddress(
                 server_args.host or "127.0.0.1",
@@ -319,68 +333,104 @@ class DataParallelController:
         else:
             na = NetworkAddress.parse(server_args.dist_init_addr)
             na = NetworkAddress(na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA)
-        endpoint = na.to_tcp()
 
         if server_args.node_rank == 0:
-            # Node 0: Broadcast worker ports to all other nodes
+            if worker_ports is None:
+                raise ValueError("worker_ports must be preallocated on node 0")
             return self._broadcast_ports_as_server(
-                endpoint, server_args.nnodes - 1, worker_ports
+                na, server_args.nnodes - 1, worker_ports
             )
         else:
-            # Other nodes: Receive worker ports from node 0
-            return self._receive_ports_as_client(endpoint, server_args.node_rank)
+            return self._receive_ports_as_client(na, server_args.node_rank)
 
     def _broadcast_ports_as_server(
-        self, endpoint: str, expected_clients: int, worker_ports: List[int]
+        self, na: NetworkAddress, expected_clients: int, worker_ports: List[int]
     ) -> List[int]:
-        """Broadcast worker ports to all client nodes."""
-        logger.debug(f"Broadcasting worker ports to {expected_clients} client nodes")
-        logger.debug(f"Worker ports: {worker_ports}")
+        """Broadcast worker ports and Node 0's CURVE public key to all clients.
 
-        rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+        The secret key is never sent.  Each node keeps its own auto-generated
+        keypair; clients only need Node 0's public key to authenticate
+        subsequent CURVE connections.
+        """
+        from sglang.srt.utils.network import get_curve_config, set_server_public_key
 
+        curve = get_curve_config()
+        endpoint = na.to_tcp()
+        curve_public: Optional[bytes] = None
+
+        if curve is not None:
+            set_server_public_key(curve.public_key)
+            curve_public = curve.public_key
+            logger.info(
+                "Multi-node bootstrap: distributing CurveZMQ public key on %s",
+                endpoint,
+            )
+
+        socket = cast(
+            zmq.Socket,
+            get_zmq_socket(self.context, zmq.REP, endpoint, True, curve=CURVE_DISABLED),
+        )
         try:
-            connected_clients = 0
-            while connected_clients < expected_clients:
-                # Wait for client handshake
-                client_rank = rep_socket.recv().decode()
-                logger.debug(f"Received handshake from node {client_rank}")
-
-                # Send worker ports to client
-                rep_socket.send_pyobj(worker_ports)
-                connected_clients += 1
-                logger.debug(
-                    f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
-                )
-
-            logger.debug("Worker port broadcast completed")
-            return worker_ports
+            payload = BootstrapPayload(
+                worker_ports=worker_ports,
+                curve_public_key=curve_public.decode("ascii") if curve_public else None,
+            )
+            encoded = _bootstrap_encoder.encode(payload)
+            for _ in range(expected_clients):
+                client_rank = int(socket.recv())
+                logger.debug("Bootstrap handshake from node %s", client_rank)
+                socket.send(encoded)
         finally:
-            rep_socket.close()
+            socket.close()
 
-    def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
-        """Receive worker ports from the server node."""
-        logger.debug(f"Connecting to node 0 to receive worker ports")
+        logger.debug("Worker port broadcast completed")
+        return worker_ports
 
-        req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
-        req_socket.setsockopt(zmq.RCVTIMEO, 600 * 1000)  # 10 minute timeout
-        req_socket.setsockopt(zmq.SNDTIMEO, 600 * 1000)
+    def _receive_ports_as_client(self, na: NetworkAddress, node_rank: int) -> List[int]:
+        """Receive worker ports and Node 0's CURVE public key.
+
+        Each node keeps its own auto-generated keypair.  Node 0's public key
+        is stored via ``set_server_public_key()`` so that subsequent CURVE
+        client connections authenticate against Node 0's identity.  The env
+        var propagation ensures spawned scheduler subprocesses inherit it.
+        """
+        from sglang.srt.utils.network import set_server_public_key
+
+        endpoint = na.to_tcp()
+        timeout_ms = 600 * 1000  # 10 minutes
+
+        logger.debug("Connecting to node 0 for bootstrap")
+        socket = cast(
+            zmq.Socket,
+            get_zmq_socket(
+                self.context, zmq.REQ, endpoint, False, curve=CURVE_DISABLED
+            ),
+        )
+        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
 
         try:
-            # Send handshake with our node rank
-            req_socket.send(str(node_rank).encode())
-
-            # Receive worker ports
-            worker_ports = req_socket.recv_pyobj()
-            logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
-            return worker_ports
+            socket.send(str(node_rank).encode())
+            msg = _bootstrap_decoder.decode(socket.recv())
+            if len(msg.worker_ports) != self.server_args.dp_size:
+                raise RuntimeError(
+                    f"Bootstrap worker port count mismatch: expected "
+                    f"{self.server_args.dp_size}, received {len(msg.worker_ports)}"
+                )
         except zmq.Again:
-            logger.error("Timeout waiting for worker ports from node 0")
+            logger.error("Timeout waiting for bootstrap handshake from node 0")
             raise RuntimeError(
-                "Failed to receive worker ports from node 0 within timeout"
+                "Failed to receive bootstrap data from node 0 within timeout"
             )
         finally:
-            req_socket.close()
+            socket.close()
+
+        if msg.curve_public_key is not None:
+            set_server_public_key(msg.curve_public_key.encode("ascii"))
+            logger.info("Stored node 0's CurveZMQ public key (per-node keypair model)")
+
+        logger.debug("Received %d worker ports from node 0", len(msg.worker_ports))
+        return msg.worker_ports
 
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
@@ -499,6 +549,7 @@ class DataParallelController:
                 )
 
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                    propagate_curve_keys_to_env()
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,
                         args=(
@@ -608,6 +659,7 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     configure_logger(server_args)
+    propagate_curve_keys_to_env()
     if server_args.enable_trace:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "DP Controller"

@@ -14,7 +14,11 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.io_struct import UpdateExpertBackupReq
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.network import (
+    connect_with_curve,
+    get_curve_config,
+    get_local_ip_auto,
+)
 
 PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
 logger = logging.getLogger(__name__)
@@ -47,23 +51,36 @@ class ExpertBackupClient:
         self.buffer_size = 0
         self.use_backup = False
         local_ip = get_local_ip_auto()
-        all_ips = [None] * get_world_size()
-        torch.distributed.all_gather_object(
-            all_ips, local_ip, group=get_world_group().cpu_group
+        curve = get_curve_config()
+        local_curve_pub = (
+            curve.public_key.decode("ascii") if curve is not None else None
         )
-        logger.info(f"all_ips: {all_ips}")
+        local_peer_info = (local_ip, local_curve_pub)
+        all_peer_info = [None] * get_world_size()
+        torch.distributed.all_gather_object(
+            all_peer_info, local_peer_info, group=get_world_group().cpu_group
+        )
+        logger.info(f"all_peer_info: {all_peer_info}")
 
         for i in range(self.engine_num):
+            peer_ip, peer_curve_pub = all_peer_info[
+                i * get_world_size() // server_args.nnodes
+            ]
+            server_pub = (
+                peer_curve_pub.encode("ascii") if peer_curve_pub is not None else None
+            )
+
             self.recv_list[i] = context.socket(zmq.SUB)
-            self.recv_list[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{PORT_BASE + i * 2 + 1}"
+            recv_endpoint = f"tcp://{peer_ip}:{PORT_BASE + i * 2 + 1}"
+            connect_with_curve(
+                self.recv_list[i], recv_endpoint, server_public_key=server_pub
             )
             self.recv_list[i].setsockopt(zmq.SUBSCRIBE, b"")
 
-            # Synchronization channel to notify the manager when this client is ready.
             self.ready_sockets[i] = context.socket(zmq.PUSH)
-            self.ready_sockets[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{PORT_BASE + i * 2}"
+            ready_endpoint = f"tcp://{peer_ip}:{PORT_BASE + i * 2}"
+            connect_with_curve(
+                self.ready_sockets[i], ready_endpoint, server_public_key=server_pub
             )
             self.ready_sockets[i].send_pyobj(UpdateExpertBackupReq())
 

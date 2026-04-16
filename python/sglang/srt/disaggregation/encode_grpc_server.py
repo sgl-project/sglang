@@ -12,7 +12,7 @@ import logging
 import multiprocessing as mp
 import traceback
 from concurrent import futures
-from typing import List
+from typing import List, Optional
 
 import grpc
 import zmq
@@ -36,6 +36,19 @@ SGLangEncoderServicer = sglang_encoder_pb2_grpc.SglangEncoderServicer
 add_SGLangEncoderServicer_to_server = (
     sglang_encoder_pb2_grpc.add_SglangEncoderServicer_to_server
 )
+_GRPC_CURVE_PUBLIC_KEY_METADATA = "x-sglang-curve-public-key"
+
+
+def _grpc_curve_public_key_from_context(context) -> Optional[str]:
+    for item in context.invocation_metadata():
+        if isinstance(item, tuple):
+            key, value = item
+        else:
+            key = getattr(item, "key", None)
+            value = getattr(item, "value", None)
+        if key == _GRPC_CURVE_PUBLIC_KEY_METADATA:
+            return value
+    return None
 
 
 class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
@@ -88,6 +101,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self, request: sglang_encoder_pb2.EncodeRequest, context
     ) -> sglang_encoder_pb2.EncodeResponse:
         try:
+            curve_public_key = _grpc_curve_public_key_from_context(context)
             request_dict = {
                 "mm_items": list(request.mm_items),
                 "req_id": request.req_id,
@@ -135,6 +149,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                                 req_id=request.req_id,
                                 prefill_host=request.prefill_host,
                                 embedding_port=embedding_port,
+                                curve_public_key=curve_public_key,
                             )
                         )
                     await asyncio.gather(*tasks)
@@ -148,6 +163,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     req_id=request.req_id,
                     prefill_host=request.prefill_host,
                     embedding_port=embedding_port,
+                    curve_public_key=curve_public_key,
                 )
                 self.encoder.embedding_to_send.pop(request.req_id, None)
                 return sglang_encoder_pb2.EncodeResponse()
@@ -165,6 +181,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self, request: sglang_encoder_pb2.SendRequest, context
     ) -> sglang_encoder_pb2.SendResponse:
         try:
+            curve_public_key = _grpc_curve_public_key_from_context(context)
             await self.encoder.send(
                 req_id=request.req_id,
                 prefill_host=request.prefill_host,
@@ -173,6 +190,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 buffer_address=(
                     request.buffer_address if request.buffer_address else None
                 ),
+                curve_public_key=curve_public_key,
             )
             self.encoder.embedding_to_send.pop(request.req_id, None)
             return sglang_encoder_pb2.SendResponse()
@@ -188,11 +206,13 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self, request: sglang_encoder_pb2.SchedulerReceiveUrlRequest, context
     ) -> sglang_encoder_pb2.SchedulerReceiveUrlResponse:
         try:
+            curve_public_key = _grpc_curve_public_key_from_context(context)
             await handle_scheduler_receive_url_request(
                 {
                     "req_id": request.req_id,
                     "receive_count": request.receive_count,
                     "receive_url": request.receive_url,
+                    "curve_public_key": curve_public_key,
                 }
             )
             return sglang_encoder_pb2.SchedulerReceiveUrlResponse()

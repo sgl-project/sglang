@@ -230,6 +230,10 @@ class ServerArgs:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # ZMQ CURVE authentication
+    zmq_curve_keys_dir: str | None = None
+    no_zmq_curve: bool = False
+
     # Logging
     log_level: str = "info"
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
@@ -251,6 +255,7 @@ class ServerArgs:
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
+        self._handle_zmq_curve_validation()
         self._adjust_offload()
         self._adjust_path()
         self._adjust_quant_config()
@@ -400,6 +405,51 @@ class ServerArgs:
             logger.info(
                 "Warmup enabled, the launch time is expected to be longer than usual"
             )
+
+    def _handle_zmq_curve_validation(self):
+        """Validate ZMQ CURVE CLI arguments and propagate to env vars.
+
+        Mirrors ``sglang.srt.server_args.ServerArgs._handle_zmq_curve_validation``
+        so multimodal_gen servers support the same ``--no-zmq-curve`` and
+        ``--zmq-curve-keys-dir`` flags.
+        """
+        from sglang.srt.environ import envs as srt_envs
+
+        if self.no_zmq_curve:
+            srt_envs.SGLANG_NO_ZMQ_CURVE.set(True)
+            os.environ["SGLANG_NO_ZMQ_CURVE"] = "1"
+            logger.info("CurveZMQ: disabled via --no-zmq-curve")
+            return
+
+        if self.zmq_curve_keys_dir:
+            import zmq as _zmq
+
+            if not _zmq.has("curve"):
+                raise ValueError(
+                    "--zmq-curve-keys-dir requires a pyzmq/libzmq build with "
+                    "CURVE support (libsodium). The current build does not "
+                    "include it."
+                )
+            secret_file = os.path.join(self.zmq_curve_keys_dir, "cluster.key_secret")
+            if not os.path.isfile(secret_file):
+                raise ValueError(
+                    f"CurveZMQ secret key file not found: '{secret_file}'. "
+                    f"Generate keys with: "
+                    f"python -m sglang.srt.utils.gen_zmq_keys "
+                    f"--output {self.zmq_curve_keys_dir}"
+                )
+            srt_envs.SGLANG_ZMQ_CURVE_KEYS_DIR.set(self.zmq_curve_keys_dir)
+            os.environ["SGLANG_ZMQ_CURVE_KEYS_DIR"] = self.zmq_curve_keys_dir
+            return
+
+        pub = srt_envs.SGLANG_ZMQ_CURVE_PUBLIC_KEY.get()
+        sec = srt_envs.SGLANG_ZMQ_CURVE_SECRET_KEY.get()
+        if pub and sec:
+            if len(pub) != 40 or len(sec) != 40:
+                raise ValueError(
+                    "SGLANG_ZMQ_CURVE_PUBLIC_KEY and SGLANG_ZMQ_CURVE_SECRET_KEY "
+                    "must each be 40-character Z85 strings."
+                )
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -964,6 +1014,24 @@ class ServerArgs:
             help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
             "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
         )
+
+        # ZMQ CURVE authentication
+        parser.add_argument(
+            "--zmq-curve-keys-dir",
+            type=str,
+            default=ServerArgs.zmq_curve_keys_dir,
+            help="Directory containing CurveZMQ keypair (cluster.key_secret). "
+            "Enables CURVE encryption and authentication on all ZMQ sockets. "
+            "Generate keys with: python -m sglang.srt.utils.gen_zmq_keys",
+        )
+        parser.add_argument(
+            "--no-zmq-curve",
+            action="store_true",
+            default=ServerArgs.no_zmq_curve,
+            help="Disable CurveZMQ authentication on ZMQ sockets. "
+            "By default, CURVE is enabled with auto-generated keys.",
+        )
+
         return parser
 
     def url(self):
