@@ -252,7 +252,7 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_hybrid_indices(op)
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -312,7 +312,7 @@ class HybridCacheController(BaseHiCacheController):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_hybrid_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -411,6 +411,16 @@ class HybridCacheController(BaseHiCacheController):
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
+
+    def move_hybrid_indices(self, operation):
+        host_indices, device_indices = self.move_indices(
+            operation.host_indices, operation.device_indices
+        )
+        for transfer in operation.pool_transfers:
+            transfer.host_indices, transfer.device_indices = self.move_indices(
+                transfer.host_indices, transfer.device_indices
+            )
+        return host_indices, device_indices
 
     def _page_transfer(self, operation):
         # Transfer extra pools
