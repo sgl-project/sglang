@@ -28,7 +28,7 @@ class FanOutCommunicator(Generic[T]):
         self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
-        self._ready_queue: Deque[asyncio.Future] = deque()
+        self._ready_queue: Deque[asyncio.Event] = deque()
 
         assert mode in ["queueing", "watching"]
 
@@ -40,7 +40,7 @@ class FanOutCommunicator(Generic[T]):
             assert self._result_event is None
             assert self._result_values is None
 
-        if obj:
+        if obj is not None:
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
@@ -60,7 +60,7 @@ class FanOutCommunicator(Generic[T]):
             self._result_values = []
             self._result_event = asyncio.Event()
 
-            if obj:
+            if obj is not None:
                 self._sender.send_pyobj(obj)
 
         # Capture local refs before await -- after event fires, the first
