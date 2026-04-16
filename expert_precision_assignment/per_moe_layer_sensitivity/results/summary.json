@@ -1,0 +1,341 @@
+{
+  "ref_perplexity": 9.134924879187757,
+  "per_layer": {
+    "0": {
+      "perplexity": 9.143146959789007,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.00822208060125007,
+      "ppl_increase_pct": 0.09000709595305967,
+      "tokens": 65504
+    },
+    "1": {
+      "perplexity": 9.131945990304823,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": -0.002978888882934072,
+      "ppl_increase_pct": -0.0326098892145299,
+      "tokens": 65504
+    },
+    "10": {
+      "perplexity": 9.140771253141773,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.005846373954016215,
+      "ppl_increase_pct": 0.06400024117698688,
+      "tokens": 65504
+    },
+    "11": {
+      "perplexity": 9.143513621672653,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.008588742484896272,
+      "ppl_increase_pct": 0.09402094268409211,
+      "tokens": 65504
+    },
+    "12": {
+      "perplexity": 9.140852146226507,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.005927267038750017,
+      "ppl_increase_pct": 0.06488577757497449,
+      "tokens": 65504
+    },
+    "13": {
+      "perplexity": 9.145200357466075,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.010275478278318317,
+      "ppl_increase_pct": 0.11248563523198474,
+      "tokens": 65504
+    },
+    "14": {
+      "perplexity": 9.138091671056268,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.0031667918685105434,
+      "ppl_increase_pct": 0.0346668627316804,
+      "tokens": 65504
+    },
+    "15": {
+      "perplexity": 9.143209236666717,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.008284357478959947,
+      "ppl_increase_pct": 0.09068884077891859,
+      "tokens": 65504
+    },
+    "16": {
+      "perplexity": 9.142767230597372,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.007842351409614423,
+      "ppl_increase_pct": 0.08585020143385691,
+      "tokens": 65504
+    },
+    "17": {
+      "perplexity": 9.14427105653853,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.009346177350773033,
+      "ppl_increase_pct": 0.10231258028259305,
+      "tokens": 65504
+    },
+    "18": {
+      "perplexity": 9.136199669254223,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.001274790066466025,
+      "ppl_increase_pct": 0.013955123696418603,
+      "tokens": 65504
+    },
+    "19": {
+      "perplexity": 9.14638869088528,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.01146381169752253,
+      "ppl_increase_pct": 0.12549431822521662,
+      "tokens": 65504
+    },
+    "2": {
+      "perplexity": 9.137283976182175,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.002359096994418053,
+      "ppl_increase_pct": 0.02582502894787897,
+      "tokens": 65504
+    },
+    "20": {
+      "perplexity": 9.137463600759693,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.002538721571935909,
+      "ppl_increase_pct": 0.027791378752550777,
+      "tokens": 65504
+    },
+    "21": {
+      "perplexity": 9.134530702676843,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": -0.0003941765109143347,
+      "ppl_increase_pct": -0.004315049287517692,
+      "tokens": 65504
+    },
+    "22": {
+      "perplexity": 9.138101088504007,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.003176209316249512,
+      "ppl_increase_pct": 0.034769955508728856,
+      "tokens": 65504
+    },
+    "23": {
+      "perplexity": 9.13385758607054,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": -0.00106729311721665,
+      "ppl_increase_pct": -0.011683655107530555,
+      "tokens": 65504
+    },
+    "24": {
+      "perplexity": 9.136129418743275,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.001204539555518025,
+      "ppl_increase_pct": 0.013186091527273014,
+      "tokens": 65504
+    },
+    "25": {
+      "perplexity": 9.133781319298853,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": -0.0011435598889040222,
+      "ppl_increase_pct": -0.012518547268070002,
+      "tokens": 65504
+    },
+    "26": {
+      "perplexity": 9.14349299506578,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.008568115878022198,
+      "ppl_increase_pct": 0.09379514326979255,
+      "tokens": 65504
+    },
+    "27": {
+      "perplexity": 9.132434244576777,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": -0.0024906346109805355,
+      "ppl_increase_pct": -0.027264970910212405,
+      "tokens": 65504
+    },
+    "28": {
+      "perplexity": 9.139666569666819,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.004741690479061589,
+      "ppl_increase_pct": 0.05190727391601868,
+      "tokens": 65504
+    },
+    "29": {
+      "perplexity": 9.139369255765908,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.004444376578151221,
+      "ppl_increase_pct": 0.04865257938000411,
+      "tokens": 65504
+    },
+    "3": {
+      "perplexity": 9.201541983881901,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.06661710469414395,
+      "ppl_increase_pct": 0.7292572798920149,
+      "tokens": 65504
+    },
+    "30": {
+      "perplexity": 9.136833824985429,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.0019089457976715352,
+      "ppl_increase_pct": 0.02089722491336321,
+      "tokens": 65504
+    },
+    "31": {
+      "perplexity": 9.135138277443357,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.00021339825559962833,
+      "ppl_increase_pct": 0.0023360701748798007,
+      "tokens": 65504
+    },
+    "32": {
+      "perplexity": 9.128739642980397,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": -0.006185236207359779,
+      "ppl_increase_pct": -0.06770976542402884,
+      "tokens": 65504
+    },
+    "33": {
+      "perplexity": 9.14046573430454,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.005540855116782595,
+      "ppl_increase_pct": 0.06065572722340207,
+      "tokens": 65504
+    },
+    "34": {
+      "perplexity": 9.151051779421783,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.016126900234025854,
+      "ppl_increase_pct": 0.17654113687095574,
+      "tokens": 65504
+    },
+    "35": {
+      "perplexity": 9.139330907951239,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.0044060287634817286,
+      "ppl_increase_pct": 0.048232785947921464,
+      "tokens": 65504
+    },
+    "36": {
+      "perplexity": 9.136440593553726,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.0015157143659685346,
+      "ppl_increase_pct": 0.016592521405645044,
+      "tokens": 65504
+    },
+    "37": {
+      "perplexity": 9.141450379277787,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.006525500090029723,
+      "ppl_increase_pct": 0.07143463330385735,
+      "tokens": 65504
+    },
+    "38": {
+      "perplexity": 9.143119824538175,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.008194945350417981,
+      "ppl_increase_pct": 0.08971004642948088,
+      "tokens": 65504
+    },
+    "39": {
+      "perplexity": 9.132071104713543,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": -0.002853774474214532,
+      "ppl_increase_pct": -0.03124026209253561,
+      "tokens": 65504
+    },
+    "4": {
+      "perplexity": 9.136872492837503,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.0019476136497456054,
+      "ppl_increase_pct": 0.021320521794132574,
+      "tokens": 65504
+    },
+    "40": {
+      "perplexity": 9.142930829273391,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.008005950085633984,
+      "ppl_increase_pct": 0.08764111573456024,
+      "tokens": 65504
+    },
+    "41": {
+      "perplexity": 9.150937529345063,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.016012650157305686,
+      "ppl_increase_pct": 0.17529044156441298,
+      "tokens": 65504
+    },
+    "42": {
+      "perplexity": 9.144627003218934,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.009702124031177206,
+      "ppl_increase_pct": 0.10620912771031055,
+      "tokens": 65504
+    },
+    "43": {
+      "perplexity": 9.145607827134548,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.010682947946790478,
+      "ppl_increase_pct": 0.1169462046823222,
+      "tokens": 65504
+    },
+    "44": {
+      "perplexity": 9.155041572402562,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.02011669321480447,
+      "ppl_increase_pct": 0.2202173907377869,
+      "tokens": 65504
+    },
+    "45": {
+      "perplexity": 9.146689100327853,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.011764221140095898,
+      "ppl_increase_pct": 0.12878289964812772,
+      "tokens": 65504
+    },
+    "46": {
+      "perplexity": 9.12163911336082,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": -0.013285765826937634,
+      "ppl_increase_pct": -0.1454392455619069,
+      "tokens": 65504
+    },
+    "47": {
+      "perplexity": 9.175921015829463,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.04099613664170576,
+      "ppl_increase_pct": 0.44878460615596083,
+      "tokens": 65504
+    },
+    "5": {
+      "perplexity": 9.147315928780047,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.012391049592290315,
+      "ppl_increase_pct": 0.13564478915990552,
+      "tokens": 65504
+    },
+    "6": {
+      "perplexity": 9.141855573151961,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.006930693964203982,
+      "ppl_increase_pct": 0.0758702896396457,
+      "tokens": 65504
+    },
+    "7": {
+      "perplexity": 9.1372725270458,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.0023476478580430893,
+      "ppl_increase_pct": 0.025699695280390067,
+      "tokens": 65504
+    },
+    "8": {
+      "perplexity": 9.139232696182912,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.004307816995154923,
+      "ppl_increase_pct": 0.04715766196359272,
+      "tokens": 65504
+    },
+    "9": {
+      "perplexity": 9.136919674793981,
+      "ref_perplexity": 9.134924879187757,
+      "ppl_increase": 0.0019947956062242866,
+      "ppl_increase_pct": 0.02183702255471598,
+      "tokens": 65504
+    }
+  }
+}
