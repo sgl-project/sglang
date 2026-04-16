@@ -977,7 +977,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if not handled:
                 quantize_communications = \
                     not forward_batch.forward_mode.is_decode_or_idle() and \
-                    get_global_server_args().quantize_tp_communications
+                    get_global_server_args().enable_quant_communications
                 if quantize_communications:
                     hidden_states = attention_tensor_model_parallel_quant_all_reduce(hidden_states)
                 else:
