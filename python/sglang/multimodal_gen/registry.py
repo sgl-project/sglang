@@ -46,6 +46,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
     ErnieImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2KleinKVCachePipelineConfig,
     Flux2KleinPipelineConfig,
     Flux2PipelineConfig,
 )
@@ -764,6 +765,13 @@ def _register_configs():
             "black-forest-labs/FLUX.1-dev",
         ],
         model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinSamplingParams,
+        pipeline_config_cls=Flux2KleinKVCachePipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-9b-kv",
+        ],
     )
     register_configs(
         sampling_param_cls=Flux2KleinSamplingParams,

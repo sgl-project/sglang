@@ -691,3 +691,10 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
             return_tensors=return_tensors,
             **tok_kwargs,
         )
+
+
+@dataclass
+class Flux2KleinKVCachePipelineConfig(Flux2KleinPipelineConfig):
+    """Config for FLUX.2-klein-9b-kv with KV cache for reference images."""
+
+    use_kv_cache: bool = True

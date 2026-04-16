@@ -53,6 +53,76 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
 
+class Flux2KVLayerCache:
+    """Per-layer KV cache for FLUX.2 Klein reference image tokens.
+
+    Stores post-RoPE K/V projections for reference image tokens so they
+    can be reused across denoising steps instead of being recomputed.
+    """
+
+    def __init__(self):
+        self.k_cache: Optional[torch.Tensor] = None
+        self.v_cache: Optional[torch.Tensor] = None
+
+    def store(self, k: torch.Tensor, v: torch.Tensor):
+        self.k_cache = k
+        self.v_cache = v
+
+    def get(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        return self.k_cache, self.v_cache
+
+    def clear(self):
+        self.k_cache = None
+        self.v_cache = None
+
+
+class Flux2KVCache:
+    """Container for all layers' KV caches in FLUX.2 Klein."""
+
+    def __init__(self, num_double_layers: int, num_single_layers: int):
+        self.double_stream_caches = [
+            Flux2KVLayerCache() for _ in range(num_double_layers)
+        ]
+        self.single_stream_caches = [
+            Flux2KVLayerCache() for _ in range(num_single_layers)
+        ]
+
+    def get_double_cache(self, layer_idx: int) -> Flux2KVLayerCache:
+        return self.double_stream_caches[layer_idx]
+
+    def get_single_cache(self, layer_idx: int) -> Flux2KVLayerCache:
+        return self.single_stream_caches[layer_idx]
+
+    def clear(self):
+        for cache in self.double_stream_caches:
+            cache.clear()
+        for cache in self.single_stream_caches:
+            cache.clear()
+
+
+def _blend_kv_mod_params(
+    current_params: Tuple[torch.Tensor, ...],
+    ref_params: Tuple[torch.Tensor, ...],
+    num_current: int,
+    num_ref: int,
+) -> Tuple[torch.Tensor, ...]:
+    """Blend modulation parameter tuples for [current_tokens, ref_tokens] layout.
+
+    Each input tensor has shape [B, 1, dim] (broadcast). Output tensors have
+    shape [B, num_current + num_ref, dim] with per-token modulation values.
+    """
+    blended = []
+    for curr, ref in zip(current_params, ref_params):
+        B, _, D = curr.shape
+        blended.append(
+            torch.cat(
+                [curr.expand(B, num_current, D), ref.expand(B, num_ref, D)],
+                dim=1,
+            )
+        )
+    return tuple(blended)
+
+
 def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
@@ -293,6 +363,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        kv_cache: Optional["Flux2KVLayerCache"] = None,
+        kv_cache_mode: Optional[str] = None,
+        num_ref_tokens: int = 0,
     ) -> torch.Tensor:
         query, key, value, encoder_query, encoder_key, encoder_value = (
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
@@ -359,7 +432,29 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         num_rep = (
             encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
         )
-        hidden_states = self.attn(query, key, value, num_replicated_prefix=num_rep)
+
+        # KV cache: extract or use cached ref token K/V
+        if kv_cache is not None and kv_cache_mode == "extract" and num_ref_tokens > 0:
+            kv_cache.store(
+                key[:, -num_ref_tokens:, :, :].clone(),
+                value[:, -num_ref_tokens:, :, :].clone(),
+            )
+            # Causal attention: ref tokens self-attend only, txt+img attend to all
+            q_main = query[:, :-num_ref_tokens]
+            q_ref = query[:, -num_ref_tokens:]
+            k_ref = key[:, -num_ref_tokens:]
+            v_ref = value[:, -num_ref_tokens:]
+            attn_main = self.attn(q_main, key, value, num_replicated_prefix=num_rep)
+            attn_ref = self.attn(q_ref, k_ref, v_ref, num_replicated_prefix=0)
+            hidden_states = torch.cat([attn_main, attn_ref], dim=1)
+        elif kv_cache is not None and kv_cache_mode == "cached":
+            cached_k, cached_v = kv_cache.get()
+            if cached_k is not None:
+                key = torch.cat([key, cached_k], dim=1)
+                value = torch.cat([value, cached_v], dim=1)
+            hidden_states = self.attn(query, key, value, num_replicated_prefix=num_rep)
+        else:
+            hidden_states = self.attn(query, key, value, num_replicated_prefix=num_rep)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
@@ -498,6 +593,9 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         attention_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         num_replicated_prefix: int = 0,
+        kv_cache: Optional["Flux2KVLayerCache"] = None,
+        kv_cache_mode: Optional[str] = None,
+        num_ref_tokens: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         # Parallel in (QKV + MLP in) projection
@@ -533,9 +631,49 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
-        hidden_states = self.attn(
-            query, key, value, num_replicated_prefix=num_replicated_prefix
-        )
+
+        # KV cache: extract or use cached ref token K/V
+        if kv_cache is not None and kv_cache_mode == "extract" and num_ref_tokens > 0:
+            kv_cache.store(
+                key[:, -num_ref_tokens:, :, :].clone(),
+                value[:, -num_ref_tokens:, :, :].clone(),
+            )
+            # Causal attention: ref tokens self-attend only
+            q_main = query[:, :-num_ref_tokens]
+            q_ref = query[:, -num_ref_tokens:]
+            k_ref = key[:, -num_ref_tokens:]
+            v_ref = value[:, -num_ref_tokens:]
+            attn_main = self.attn(
+                q_main,
+                key,
+                value,
+                num_replicated_prefix=num_replicated_prefix,
+            )
+            attn_ref = self.attn(
+                q_ref,
+                k_ref,
+                v_ref,
+                num_replicated_prefix=0,
+            )
+            hidden_states = torch.cat([attn_main, attn_ref], dim=1)
+        elif kv_cache is not None and kv_cache_mode == "cached":
+            cached_k, cached_v = kv_cache.get()
+            if cached_k is not None:
+                key = torch.cat([key, cached_k], dim=1)
+                value = torch.cat([value, cached_v], dim=1)
+            hidden_states = self.attn(
+                query,
+                key,
+                value,
+                num_replicated_prefix=num_replicated_prefix,
+            )
+        else:
+            hidden_states = self.attn(
+                query,
+                key,
+                value,
+                num_replicated_prefix=num_replicated_prefix,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -593,6 +731,9 @@ class Flux2SingleTransformerBlock(nn.Module):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         split_hidden_states: bool = False,
         text_seq_len: Optional[int] = None,
+        kv_cache: Optional["Flux2KVLayerCache"] = None,
+        kv_cache_mode: Optional[str] = None,
+        num_ref_tokens: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # If encoder_hidden_states is None, hidden_states is assumed to have encoder_hidden_states already
         # concatenated
@@ -610,6 +751,9 @@ class Flux2SingleTransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             freqs_cis=freqs_cis,
             num_replicated_prefix=text_seq_len or 0,
+            kv_cache=kv_cache,
+            kv_cache_mode=kv_cache_mode,
+            num_ref_tokens=num_ref_tokens,
             **joint_attention_kwargs,
         )
 
@@ -693,6 +837,9 @@ class Flux2TransformerBlock(nn.Module):
         ],
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        kv_cache: Optional["Flux2KVLayerCache"] = None,
+        kv_cache_mode: Optional[str] = None,
+        num_ref_tokens: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
@@ -721,6 +868,9 @@ class Flux2TransformerBlock(nn.Module):
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
+            kv_cache=kv_cache,
+            kv_cache_mode=kv_cache_mode,
+            num_ref_tokens=num_ref_tokens,
             **joint_attention_kwargs,
         )
 
@@ -1012,6 +1162,10 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         guidance: torch.Tensor = None,
         freqs_cis: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        kv_cache: Optional["Flux2KVCache"] = None,
+        kv_cache_mode: Optional[str] = None,
+        num_ref_tokens: int = 0,
+        ref_fixed_timestep: float = 0.0,
     ) -> torch.Tensor:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -1027,6 +1181,22 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
                 [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            kv_cache (`Flux2KVCache`, *optional*):
+                KV cache container for reference image tokens.  Populated in-place during
+                ``"extract"`` mode and read during ``"cached"`` mode.
+            kv_cache_mode (`str`, *optional*):
+                ``"extract"`` — Step 0: reference tokens are in the input.  Each attention
+                layer caches their post-RoPE K/V.  Causal attention is used (ref tokens
+                self-attend only).  Modulation uses a fixed timestep for ref positions.
+                ``"cached"`` — Steps 1+: reference tokens are absent.  Cached K/V is
+                appended to attention K/V so noise/text tokens still attend to ref info.
+                ``None`` — Standard forward without KV caching.
+            num_ref_tokens (`int`):
+                Number of reference image tokens at the end of ``hidden_states``
+                (only used when ``kv_cache_mode="extract"``).
+            ref_fixed_timestep (`float`):
+                Timestep value for reference token modulation blending (default 0.0,
+                only used when ``kv_cache_mode="extract"``).
 
         """
         # 0. Handle input arguments
@@ -1047,6 +1217,26 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         double_stream_mod_txt = self.double_stream_modulation_txt(temb)
         single_stream_mod = self.single_stream_modulation(temb)[0]
 
+        # KV extract mode: blend modulations so ref tokens use fixed-timestep params
+        ref_single_mod = None
+        if kv_cache_mode == "extract" and num_ref_tokens > 0:
+            num_img_tokens = hidden_states.shape[1]  # includes ref tokens
+            num_noise_tokens = num_img_tokens - num_ref_tokens
+
+            ref_timestep = torch.full_like(timestep, ref_fixed_timestep * 1000)
+            ref_temb = self.time_guidance_embed(ref_timestep, guidance)
+
+            ref_double_mod_img = self.double_stream_modulation_img(ref_temb)
+            ref_single_mod = self.single_stream_modulation(ref_temb)[0]
+
+            # Blend double-stream image modulation: [noise_mod, ref_mod]
+            double_stream_mod_img = tuple(
+                _blend_kv_mod_params(
+                    curr_set, ref_set, num_noise_tokens, num_ref_tokens
+                )
+                for curr_set, ref_set in zip(double_stream_mod_img, ref_double_mod_img)
+            )
+
         # 2. Input projection for image (hidden_states) and conditioning text (encoder_hidden_states)
         hidden_states, _ = self.x_embedder(hidden_states)
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
@@ -1056,6 +1246,9 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         # text prompts of different lengths. Is this a use case we want to support?
         # 4. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
+            block_kv_cache = (
+                kv_cache.get_double_cache(index_block) if kv_cache is not None else None
+            )
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -1063,12 +1256,32 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                 temb_mod_params_txt=double_stream_mod_txt,
                 freqs_cis=freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
+                kv_cache=block_kv_cache,
+                kv_cache_mode=kv_cache_mode,
+                num_ref_tokens=num_ref_tokens,
             )
         # Concatenate text and image streams for single-block inference
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
+        # Blend single-stream modulation for extract mode
+        if (
+            kv_cache_mode == "extract"
+            and num_ref_tokens > 0
+            and ref_single_mod is not None
+        ):
+            num_current_single = hidden_states.shape[1] - num_ref_tokens
+            single_stream_mod = _blend_kv_mod_params(
+                single_stream_mod,
+                ref_single_mod,
+                num_current_single,
+                num_ref_tokens,
+            )
+
         # 5. Single Stream Transformer Blocks
         for index_block, block in enumerate(self.single_transformer_blocks):
+            block_kv_cache = (
+                kv_cache.get_single_cache(index_block) if kv_cache is not None else None
+            )
             hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
@@ -1076,6 +1289,9 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                 freqs_cis=freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
                 text_seq_len=num_txt_tokens,
+                kv_cache=block_kv_cache,
+                kv_cache_mode=kv_cache_mode,
+                num_ref_tokens=num_ref_tokens,
             )
         # Remove text tokens from concatenated stream
         hidden_states = hidden_states[:, num_txt_tokens:, ...]

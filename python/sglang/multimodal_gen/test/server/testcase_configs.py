@@ -1060,6 +1060,16 @@ TWO_GPU_CASES_B = [
         ),
         TI2V_sampling_params,
     ),
+    # FLUX.2-klein-9b-kv with KV cache for reference image conditioning
+    DiffusionTestCase(
+        "flux_2_klein_9b_kv_ti2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-klein-9b-kv",
+            modality="image",
+            extras=["--pipeline-class-name", "Flux2KleinKVCachePipeline"],
+        ),
+        TI2I_sampling_params,
+    ),
 ]
 
 if not current_platform.is_hip():
