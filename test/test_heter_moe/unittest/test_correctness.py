@@ -293,7 +293,7 @@ class TestBatchSizeGatedForward:
                  "group_size": GROUP_SIZE},
                 {"name": "bf16", "num_bits": 16, "size_ratio": 0.5},
             ],
-            "policy": "batch_size",
+            "policy": "expert_batch",
             "policy_params": {"threshold": threshold},
         }
         layer = _make_layer(cfg)
@@ -346,15 +346,28 @@ class TestBatchSizeGatedForward:
         torch.testing.assert_close(out_gated, out_int4, atol=0, rtol=0)
 
     def test_large_batch_matches_pure_bf16(self, shared_weights):
-        """n >= threshold: gated layer's output equals pure-BF16 output (bit-exact).
+        """Every expert above threshold: gated output equals pure-BF16 (bit-exact).
 
-        The INT4 kernel must be skipped (no int4-only experts in this layer).
+        Per-expert gating routes hot experts to BF16; an expert is hot iff
+        its routed-slot count >= threshold. Use balanced routing so every
+        expert crosses the threshold -- then the INT4 kernel stays idle and
+        the gated layer matches pure BF16 exactly.
         """
         threshold = 128
         gated = self._make_gated_layer(shared_weights, threshold=threshold)
         bf16 = self._make_pure_layer(shared_weights, num_bits=16)
 
-        x, topk_out = self._make_inputs_n(n=256, with_logits=True)
+        # Balanced routing: every expert receives exactly n*K/E = 128 slots.
+        n = threshold * E // K
+        torch.manual_seed(0)
+        x = torch.randn(n, H, dtype=torch.bfloat16, device="cuda")
+        topk_ids = (
+            torch.arange(n * K, device="cuda").reshape(n, K) % E
+        ).contiguous()
+        topk_weights = torch.rand(n, K, dtype=torch.bfloat16, device="cuda")
+        router_logits = torch.randn(n, E, device="cuda")
+        topk_out = make_topk_output(topk_weights, topk_ids, router_logits)
+
         out_gated = gated(x, topk_out)
         out_bf16 = bf16(x, topk_out)
 
@@ -362,27 +375,34 @@ class TestBatchSizeGatedForward:
         torch.testing.assert_close(out_gated, out_bf16, atol=0, rtol=0)
 
     def test_int4_only_mask_keeps_int4_kernel_live(self, shared_weights):
-        """With INT4-only experts, large batch still hits both kernels."""
+        """With INT4-only experts + balanced hot routing, both kernels run.
+
+        Use balanced routing so every expert crosses the threshold. Hot
+        non-INT4-only experts route to BF16; INT4-only experts are forced
+        back to INT4 by the mask. Both kernels receive real work.
+        """
         from sglang.srt.layers.moe.heter_moe import HeterFusedMoE
 
         bf16_w13, bf16_w2 = shared_weights
+        threshold = 128
         cfg = {
             "groups": [
                 {"name": "int4", "num_bits": 4, "size_ratio": 0.5,
                  "group_size": GROUP_SIZE},
                 {"name": "bf16", "num_bits": 16, "size_ratio": 0.5},
             ],
-            "policy": "batch_size",
-            "policy_params": {"threshold": 128},
+            "policy": "expert_batch",
+            "policy_params": {"threshold": threshold},
         }
+        int4_only_experts = [0, 1, 5, 6]
         layer = HeterFusedMoE(
             num_experts=E, hidden_size=H, intermediate_size=I, top_k=K,
             heter_config=cfg, dtype=torch.bfloat16,
             device=torch.device("cuda"),
-            int4_only_experts=[0, 3],
+            int4_only_experts=int4_only_experts,
         )
         # BF16 weights are compact (only dual-precision experts: 1,2,4,5,6,7)
-        dual = sorted(e for e in range(E) if e not in {0, 3})
+        dual = sorted(e for e in range(E) if e not in int4_only_experts)
         layer.w13_weight.data.copy_(bf16_w13[dual])
         layer.w2_weight.data.copy_(bf16_w2[dual])
         _fill_int4(layer, bf16_w13, bf16_w2)
@@ -391,7 +411,17 @@ class TestBatchSizeGatedForward:
         assert layer.policy.should_skip_group(0, 256) is False
         assert layer.policy.should_skip_group(1, 256) is False
 
-        x, topk_out = self._make_inputs_n(n=256, with_logits=True)
+        # Balanced routing so every expert sees >= threshold slots.
+        n = threshold * E // K
+        torch.manual_seed(0)
+        x = torch.randn(n, H, dtype=torch.bfloat16, device="cuda")
+        topk_ids = (
+            torch.arange(n * K, device="cuda").reshape(n, K) % E
+        ).contiguous()
+        topk_weights = torch.rand(n, K, dtype=torch.bfloat16, device="cuda")
+        router_logits = torch.randn(n, E, device="cuda")
+        topk_out = make_topk_output(topk_weights, topk_ids, router_logits)
+
         out = layer(x, topk_out)
         assert out.shape == x.shape
         assert out.isfinite().all()

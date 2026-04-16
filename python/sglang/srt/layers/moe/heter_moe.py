@@ -46,10 +46,21 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
     with open(config_path) as f:
         cfg = json.load(f)
     groups = cfg["groups"]
-    total_ratio = sum(g["size_ratio"] for g in groups)
-    assert abs(total_ratio - 1.0) < 1e-3, (
-        f"size_ratios must sum to 1.0, got {total_ratio}"
-    )
+    # ``size_ratio`` is only consumed by score-based policies (expert_load,
+    # confidence, total_weight, random) to pick top-K experts per group.
+    # ``expert_batch`` decides per-expert hot/cold at runtime from token
+    # counts and ignores the ratios entirely -- so they're optional there.
+    # NOTE: ``group_size`` on INT4 groups is the GPTQ quantization group
+    # size (e.g. 128 scales per K), unrelated to the precision groups.
+    policy = cfg.get("policy", "expert_load")
+    if policy == "expert_batch":
+        for g in groups:
+            g.setdefault("size_ratio", 0.0)
+    else:
+        total_ratio = sum(g["size_ratio"] for g in groups)
+        assert abs(total_ratio - 1.0) < 1e-3, (
+            f"size_ratios must sum to 1.0, got {total_ratio}"
+        )
     # Load per-layer INT4-only expert lists if specified
     int4_only_file = cfg.get("int4_only_experts_file")
     if int4_only_file is not None:
@@ -314,6 +325,10 @@ class HeterFusedMoE(nn.Module):
 
         Shapes match GPTQMarlinMoEMethod.create_weights for compatibility
         with gptq_marlin_moe_repack.
+
+        ``gcfg["group_size"]`` is the GPTQ quantization group size (one
+        fp16 scale per ``group_size`` INT4 weights along K). Must match
+        the checkpoint; unrelated to the precision-group concept above.
         """
         group_size = gcfg.get("group_size", 128)
         pack_factor = 8  # 8 INT4 values packed in one INT32

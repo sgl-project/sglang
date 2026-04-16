@@ -30,7 +30,7 @@ ExpertLoadHeterDispatch = _policy_mod.ExpertLoadHeterDispatch
 ConfidenceThresholdHeterDispatch = _policy_mod.ConfidenceThresholdHeterDispatch
 TotalWeightHeterDispatch = _policy_mod.TotalWeightHeterDispatch
 RandomHeterDispatch = _policy_mod.RandomHeterDispatch
-BatchSizeGatedHeterDispatch = _policy_mod.BatchSizeGatedHeterDispatch
+ExpertBatchGatedHeterDispatch = _policy_mod.ExpertBatchGatedHeterDispatch
 create_policy = _policy_mod.create_policy
 _assign_by_score_gpu = _policy_mod._assign_by_score_gpu
 _build_group_labels = _policy_mod._build_group_labels
@@ -230,20 +230,20 @@ class TestTotalWeightHeterDispatch:
         assert (experts_g1[mask_expert0] == 0).all()
 
 
-# --- BatchSizeGatedHeterDispatch -------------------------------------------
+# --- ExpertBatchGatedHeterDispatch -------------------------------------------
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
-class TestBatchSizeGatedHeterDispatch:
-    """Conventions for these tests:
+class TestExpertBatchGatedHeterDispatch:
+    """Per-expert hot/cold gating via routed-token count.
 
-    - INT4 group at index 0, BF16 group at index 1 (matches the binary
-      assumption baked into BatchSizeGatedHeterDispatch defaults).
+    - INT4 group at index 0, BF16 group at index 1.
     - Sentinel = -1 (Triton convention) so unselected slots are negative.
+    - Expert is hot iff its routed-token count >= threshold.
     """
 
     def _make_policy(self, num_experts=8, threshold=128, int4_only_mask=None):
-        return BatchSizeGatedHeterDispatch(
+        return ExpertBatchGatedHeterDispatch(
             num_experts=num_experts,
             group_size_ratios=[0.5, 0.5],  # plumbing only; gate ignores it
             threshold=threshold,
@@ -267,18 +267,9 @@ class TestBatchSizeGatedHeterDispatch:
         assert (bf16_ids == -1).all()
         assert (bf16_w == 0).all()
 
-    def test_at_threshold_assigns_all_to_bf16(self):
-        policy = self._make_policy()
-        topk_ids = torch.randint(0, 8, (128, 2), device="cuda")
-        topk_weights = torch.rand(128, 2, device="cuda")
-        d = policy.dispatch(topk_ids, topk_weights, sentinel=-1)
-        int4_ids, _ = d[0]
-        bf16_ids, _ = d[1]
-        live = topk_ids >= 0
-        assert (bf16_ids[live] == topk_ids[live]).all()
-        assert (int4_ids == -1).all()
-
-    def test_above_threshold_assigns_all_to_bf16(self):
+    def test_uniform_routing_above_threshold_stays_cold(self):
+        # 256 tokens * top_k=2 = 512 slots spread over 8 experts ~ 64/expert.
+        # None reach threshold=128, so all experts cold -> INT4.
         policy = self._make_policy()
         topk_ids = torch.randint(0, 8, (256, 2), device="cuda")
         topk_weights = torch.rand(256, 2, device="cuda")
@@ -286,64 +277,155 @@ class TestBatchSizeGatedHeterDispatch:
         int4_ids, _ = d[0]
         bf16_ids, _ = d[1]
         live = topk_ids >= 0
-        assert (bf16_ids[live] == topk_ids[live]).all()
-        assert (int4_ids == -1).all()
+        assert (int4_ids[live] == topk_ids[live]).all()
+        assert (bf16_ids == -1).all()
 
-    def test_int4_only_mask_respected_above_threshold(self):
-        # Experts 0 and 3 are INT4-only; even at large batch they stay INT4.
-        mask = torch.zeros(8, dtype=torch.bool, device="cuda")
-        mask[[0, 3]] = True
-        policy = self._make_policy(int4_only_mask=mask)
-        topk_ids = torch.tensor(
-            [[0, 1], [2, 3], [4, 5], [6, 7]] * 64, device="cuda"
-        )  # 256 tokens
-        topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
+    def test_concentrated_routing_makes_expert_hot(self):
+        # All tokens route to expert 0; count[0] >= threshold -> BF16.
+        policy = self._make_policy(threshold=128)
+        n = 150
+        topk_ids = torch.zeros(n, 1, dtype=torch.long, device="cuda")
+        topk_weights = torch.ones(n, 1, device="cuda")
         d = policy.dispatch(topk_ids, topk_weights, sentinel=-1)
         int4_ids, _ = d[0]
         bf16_ids, _ = d[1]
-        # INT4-only experts (0, 3) routed to INT4 group
-        for eid in (0, 3):
-            mask_e = topk_ids == eid
-            assert (int4_ids[mask_e] == eid).all()
-            assert (bf16_ids[mask_e] == -1).all()
-        # Other experts go to BF16
-        for eid in (1, 2, 4, 5, 6, 7):
-            mask_e = topk_ids == eid
-            assert (bf16_ids[mask_e] == eid).all()
-            assert (int4_ids[mask_e] == -1).all()
+        assert (bf16_ids == 0).all()
+        assert (int4_ids == -1).all()
+
+    def test_mixed_hot_cold_per_expert(self):
+        # Expert 0: 200 slots (hot). Expert 1: 20 slots (cold).
+        policy = self._make_policy(num_experts=4, threshold=128)
+        ids = torch.cat([
+            torch.zeros(200, dtype=torch.long, device="cuda"),
+            torch.ones(20, dtype=torch.long, device="cuda"),
+        ]).unsqueeze(1)
+        w = torch.ones_like(ids, dtype=torch.float32)
+        d = policy.dispatch(ids, w, sentinel=-1)
+        int4_ids, _ = d[0]
+        bf16_ids, _ = d[1]
+        is_expert_0 = ids == 0
+        is_expert_1 = ids == 1
+        # Hot expert 0 -> BF16 only
+        assert (bf16_ids[is_expert_0] == 0).all()
+        assert (int4_ids[is_expert_0] == -1).all()
+        # Cold expert 1 -> INT4 only
+        assert (int4_ids[is_expert_1] == 1).all()
+        assert (bf16_ids[is_expert_1] == -1).all()
+
+    def test_hot_int4_only_expert_forced_to_int4(self):
+        # Expert 0 is INT4-only. Even when hot, it stays INT4.
+        mask = torch.zeros(4, dtype=torch.bool, device="cuda")
+        mask[0] = True
+        policy = self._make_policy(num_experts=4, threshold=128,
+                                    int4_only_mask=mask)
+        ids = torch.zeros(200, 1, dtype=torch.long, device="cuda")
+        w = torch.ones_like(ids, dtype=torch.float32)
+        d = policy.dispatch(ids, w, sentinel=-1)
+        int4_ids, _ = d[0]
+        bf16_ids, _ = d[1]
+        assert (int4_ids == 0).all()
+        assert (bf16_ids == -1).all()
+
+    def test_hot_and_cold_with_int4_only_mask(self):
+        # Experts: 0 hot (normal), 1 hot (int4-only), 2 cold, 3 cold.
+        mask = torch.zeros(4, dtype=torch.bool, device="cuda")
+        mask[1] = True
+        policy = self._make_policy(num_experts=4, threshold=128,
+                                    int4_only_mask=mask)
+        ids = torch.cat([
+            torch.zeros(150, dtype=torch.long, device="cuda"),  # hot
+            torch.ones(150, dtype=torch.long, device="cuda"),   # hot, int4-only
+            torch.full((10,), 2, dtype=torch.long, device="cuda"),  # cold
+            torch.full((10,), 3, dtype=torch.long, device="cuda"),  # cold
+        ]).unsqueeze(1)
+        w = torch.ones_like(ids, dtype=torch.float32)
+        d = policy.dispatch(ids, w, sentinel=-1)
+        int4_ids, _ = d[0]
+        bf16_ids, _ = d[1]
+        # Expert 0 hot, not int4-only -> BF16
+        m0 = ids == 0
+        assert (bf16_ids[m0] == 0).all()
+        assert (int4_ids[m0] == -1).all()
+        # Expert 1 hot, int4-only -> INT4
+        m1 = ids == 1
+        assert (int4_ids[m1] == 1).all()
+        assert (bf16_ids[m1] == -1).all()
+        # Experts 2, 3 cold -> INT4
+        for eid in (2, 3):
+            me = ids == eid
+            assert (int4_ids[me] == eid).all()
+            assert (bf16_ids[me] == -1).all()
 
     def test_custom_threshold(self):
         policy = self._make_policy(threshold=64)
-        # 32 tokens < 64 -> INT4
-        ids = torch.randint(0, 8, (32, 2), device="cuda")
-        w = torch.rand(32, 2, device="cuda")
+        # Expert 0 gets 100 slots > 64 -> hot; rest scarce -> cold.
+        ids = torch.cat([
+            torch.zeros(100, dtype=torch.long, device="cuda"),
+            torch.randint(1, 8, (5,), dtype=torch.long, device="cuda"),
+        ]).unsqueeze(1)
+        w = torch.ones_like(ids, dtype=torch.float32)
         d = policy.dispatch(ids, w, sentinel=-1)
-        assert (d[1][0] == -1).all()
-        # 64 tokens -> BF16
-        ids = torch.randint(0, 8, (64, 2), device="cuda")
-        w = torch.rand(64, 2, device="cuda")
-        d = policy.dispatch(ids, w, sentinel=-1)
-        assert (d[0][0] == -1).all()
+        int4_ids, _ = d[0]
+        bf16_ids, _ = d[1]
+        m0 = ids == 0
+        assert (bf16_ids[m0] == 0).all()
+        # Expert 0 does not appear in INT4 group.
+        assert (int4_ids[m0] == -1).all()
 
-    def test_should_skip_group_no_int4_only(self):
+    def test_should_skip_group_below_threshold(self):
+        # Below threshold: BF16 provably empty, INT4 may be populated.
         policy = self._make_policy()
-        # Below threshold: skip BF16 (group 1), keep INT4 (group 0)
         assert policy.should_skip_group(0, 64) is False
         assert policy.should_skip_group(1, 64) is True
-        # At/above threshold: skip INT4 (group 0), keep BF16 (group 1)
-        assert policy.should_skip_group(0, 128) is True
-        assert policy.should_skip_group(1, 128) is False
-        assert policy.should_skip_group(0, 1024) is True
 
-    def test_should_skip_group_with_int4_only(self):
+    def test_should_skip_group_at_or_above_threshold(self):
+        # At/above threshold: neither group can be skipped host-side,
+        # because per-expert hot/cold depends on tensor values.
+        policy = self._make_policy()
+        assert policy.should_skip_group(0, 128) is False
+        assert policy.should_skip_group(1, 128) is False
+        assert policy.should_skip_group(0, 1024) is False
+        assert policy.should_skip_group(1, 1024) is False
+
+    def test_should_skip_group_ignores_int4_only_mask(self):
+        # Short-circuit is host-side only; int4_only_mask must not affect it.
         mask = torch.zeros(8, dtype=torch.bool, device="cuda")
         mask[[2, 5]] = True
-        policy = self._make_policy(int4_only_mask=mask)
-        # Below threshold: BF16 still skipped
-        assert policy.should_skip_group(1, 64) is True
-        # At/above threshold: INT4 NOT skipped because INT4-only experts exist
-        assert policy.should_skip_group(0, 256) is False
-        assert policy.should_skip_group(1, 256) is False
+        p_with = self._make_policy(int4_only_mask=mask)
+        p_without = self._make_policy(int4_only_mask=None)
+        for n in (1, 64, 128, 1024):
+            for g in (0, 1):
+                assert (p_with.should_skip_group(g, n)
+                        == p_without.should_skip_group(g, n))
+
+    def test_short_circuit_host_side_only(self):
+        # Passing a Python int must work without any tensor inputs.
+        policy = self._make_policy()
+        assert isinstance(policy.should_skip_group(1, 1), bool)
+        assert isinstance(policy.should_skip_group(0, 999999), bool)
+
+    def test_global_batch_below_threshold_helper(self):
+        policy = self._make_policy(threshold=100)
+        assert policy._global_batch_below_threshold(0) is True
+        assert policy._global_batch_below_threshold(99) is True
+        assert policy._global_batch_below_threshold(100) is False
+        assert policy._global_batch_below_threshold(1000) is False
+
+    def test_assign_reuses_count_buffer_across_calls(self):
+        # Per-call zero_() must wipe stale counts; back-to-back calls
+        # with different concentrations must not leak state.
+        policy = self._make_policy(num_experts=4, threshold=128)
+        ids_hot = torch.zeros(200, 1, dtype=torch.long, device="cuda")
+        w = torch.ones_like(ids_hot, dtype=torch.float32)
+        policy.dispatch(ids_hot, w, sentinel=-1)
+        # Now a cold batch -- expert 0 should become cold again.
+        ids_cold = torch.ones(10, 1, dtype=torch.long, device="cuda")
+        w = torch.ones_like(ids_cold, dtype=torch.float32)
+        d = policy.dispatch(ids_cold, w, sentinel=-1)
+        int4_ids, _ = d[0]
+        bf16_ids, _ = d[1]
+        assert (int4_ids == 1).all()
+        assert (bf16_ids == -1).all()
 
     def test_assign_with_no_routing(self):
         policy = self._make_policy()
@@ -354,13 +436,13 @@ class TestBatchSizeGatedHeterDispatch:
 
     def test_create_via_registry(self):
         p = create_policy(
-            "batch_size",
+            "expert_batch",
             num_experts=8,
             group_size_ratios=[0.5, 0.5],
             device=torch.device("cuda"),
             threshold=64,
         )
-        assert isinstance(p, BatchSizeGatedHeterDispatch)
+        assert isinstance(p, ExpertBatchGatedHeterDispatch)
         assert p.threshold == 64
 
 

@@ -28,12 +28,12 @@ per-expert score is the right knob — the right knob is *batch size*.
 
 ### Policy class
 
-New class `BatchSizeGatedHeterDispatch` in
+New class `ExpertBatchGatedHeterDispatch` in
 `python/sglang/srt/layers/moe/heter_policy.py`, registered in
-`_POLICY_REGISTRY` under the key `"batch_size"`.
+`_POLICY_REGISTRY` under the key `"expert_batch"`.
 
 ```python
-class BatchSizeGatedHeterDispatch(HeterDispatchPolicy):
+class ExpertBatchGatedHeterDispatch(HeterDispatchPolicy):
     """Gate hot/cold by current batch token count.
 
     n >= threshold  -> all experts assigned to BF16 group
@@ -94,12 +94,12 @@ Concretely, expose an optional
 returning `False` by default. The hook's contract: "given this batch size,
 will the *post-mask* dispatch for this group be empty?".
 
-`BatchSizeGatedHeterDispatch` knows enough at init time to answer this. The
+`ExpertBatchGatedHeterDispatch` knows enough at init time to answer this. The
 base class already passes `int4_only_mask` into every policy; the new policy
 caches one Python bool from it:
 
 ```python
-class BatchSizeGatedHeterDispatch(HeterDispatchPolicy):
+class ExpertBatchGatedHeterDispatch(HeterDispatchPolicy):
     def __init__(self, ..., threshold=128, ...):
         super().__init__(...)
         self._threshold = threshold
@@ -156,7 +156,7 @@ graph still has a fixed call structure.
 
 ```json
 {
-  "policy": "batch_size",
+  "policy": "expert_batch",
   "policy_params": { "threshold": 128 },
   "groups": [
     { "name": "int4", "size_ratio": 0.0, "num_bits": 4,
@@ -223,9 +223,9 @@ verify both replay successfully.
 ## Files touched
 
 - `python/sglang/srt/layers/moe/heter_policy.py`
-  - Add `BatchSizeGatedHeterDispatch`
+  - Add `ExpertBatchGatedHeterDispatch`
   - Add `should_skip_group` base method (returns False)
-  - Register `"batch_size"` in `_POLICY_REGISTRY`
+  - Register `"expert_batch"` in `_POLICY_REGISTRY`
 - `python/sglang/srt/layers/moe/heter_moe.py`
   - Forward loop: consult `self.policy.should_skip_group(group_idx, n)` and
     `continue` when True

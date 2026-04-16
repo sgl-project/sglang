@@ -165,11 +165,9 @@ class HeterDispatchPolicy(abc.ABC):
             sentinel=sentinel)
 
     def should_skip_group(self, group_idx: int, num_tokens: int) -> bool:
-        """Return True if this group's post-mask dispatch is empty.
-
-        Default: never skip (other policies always populate every group).
-        Override in policies that can statically prove a group is empty
-        for a given batch size (e.g. batch-size gating).
+        """Host-side skip check: must be derivable from host state only
+        (no tensor reads) so the branch resolves at CUDA-graph capture
+        time. Default: never skip.
         """
         return False
 
@@ -366,17 +364,16 @@ class ExpertLoadHeterDispatch(HeterDispatchPolicy):
             self._expert_to_group_buf, self._group_labels)
 
 
-class BatchSizeGatedHeterDispatch(HeterDispatchPolicy):
-    """Gate hot/cold by current batch token count.
+class ExpertBatchGatedHeterDispatch(HeterDispatchPolicy):
+    """Per-expert hot/cold gating by token count.
 
-    Below ``threshold`` tokens, every expert is treated as cold (INT4 group).
-    At or above ``threshold``, every expert is treated as hot (BF16 group);
-    INT4-only experts are still forced back to INT4 by the base dispatch
-    helper.
+    Assignment is per-expert: experts with >= ``threshold`` routed tokens
+    go BF16, the rest INT4. INT4-only experts are forced back to INT4 by
+    the base dispatch helper.
 
-    No per-expert scoring -- the gate is a single binary decision per batch.
-    Assumes a 2-group setup (one INT4, one BF16); ``bf16_group_idx`` defaults
-    to ``1 - int4_group_idx``.
+    Short-circuit falls back to a global-batch host-side bound: when the
+    whole batch has fewer than ``threshold`` tokens, no single expert can
+    reach the threshold, so the BF16 group is provably empty.
     """
 
     def __init__(
@@ -396,37 +393,42 @@ class BatchSizeGatedHeterDispatch(HeterDispatchPolicy):
             bf16_group_idx if bf16_group_idx is not None
             else (1 - int4_group_idx)
         )
-        # Static per-layer fact, computed once -- one host sync at init,
-        # never per-forward.
-        self._has_int4_only = (
-            int4_only_mask is not None and bool(int4_only_mask.any().item())
-        )
+        self._count_buf = torch.zeros(
+            num_experts, device=self._device, dtype=torch.float32)
+        self._ones_buf = torch.ones(
+            num_experts, device=self._device, dtype=torch.float32)
 
     @property
     def threshold(self) -> int:
         return self._threshold
+
+    def _global_batch_below_threshold(self, num_tokens: int) -> bool:
+        return num_tokens < self._threshold
 
     def _assign(self, token_selected_experts, token_final_scales):
         if token_selected_experts is None:
             self._expert_to_group_buf.fill_(self._int4_group_idx)
             return self._expert_to_group_buf
 
-        n = token_selected_experts.shape[0]
-        target = (
-            self._bf16_group_idx if n >= self._threshold
-            else self._int4_group_idx
-        )
-        self._expert_to_group_buf.fill_(target)
+        flat = token_selected_experts.reshape(-1).long()
+        n = flat.shape[0]
+        if self._ones_buf.shape[0] < n:
+            self._ones_buf = torch.ones(
+                n, device=self._device, dtype=torch.float32)
+        counts = self._count_buf
+        counts.zero_()
+        counts.scatter_add_(0, flat, self._ones_buf[:n])
+
+        is_hot = counts >= self._threshold
+        self._expert_to_group_buf.fill_(self._int4_group_idx)
+        self._expert_to_group_buf[is_hot] = self._bf16_group_idx
         return self._expert_to_group_buf
 
     def should_skip_group(self, group_idx: int, num_tokens: int) -> bool:
-        if num_tokens >= self._threshold:
-            # Gate -> BF16. INT4 group only has experts forced by mask.
-            if group_idx == self._int4_group_idx:
-                return not self._has_int4_only
-            return False
-        # Gate -> INT4. BF16 group is empty.
-        return group_idx == self._bf16_group_idx
+        if (self._global_batch_below_threshold(num_tokens)
+                and group_idx == self._bf16_group_idx):
+            return True
+        return False
 
 
 _POLICY_REGISTRY = {
@@ -434,7 +436,7 @@ _POLICY_REGISTRY = {
     "confidence": ConfidenceThresholdHeterDispatch,
     "total_weight": TotalWeightHeterDispatch,
     "random": RandomHeterDispatch,
-    "batch_size": BatchSizeGatedHeterDispatch,
+    "expert_batch": ExpertBatchGatedHeterDispatch,
 }
 
 

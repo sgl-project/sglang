@@ -100,6 +100,9 @@ run_one() {
 
     for rr in "${REQUEST_RATES[@]}"; do
         local output_file="$OUT_DIR/${tag}_rr${rr}_n${NUM_PROMPTS}.jsonl"
+        echo "[$tag] flush radix cache before rr=$rr"
+        curl -s -X POST "${base_url}/flush_cache" >> "$log_file" 2>&1 || true
+        sleep 1
         echo "[$tag] bench rr=$rr  n=$NUM_PROMPTS → $output_file"
         python3 -m sglang.bench_serving \
             --backend sglang \

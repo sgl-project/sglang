@@ -25,6 +25,7 @@ BF16_MODEL="/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777
 INT4_MODEL="/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441"
 HETER_PARTIAL_CONFIG="$SCRIPT_DIR/../partial_bf16/heter_config.json"
 HETER_RANDOM_CONFIG="$SCRIPT_DIR/heter_config_random.json"
+HETER_THRESH128_CONFIG="$SCRIPT_DIR/heter_config_thresh128.json"
 
 HOST="127.0.0.1"
 BASE_PORT=31000
@@ -70,10 +71,11 @@ fi
 # Configs: tag | launch args (excluding --host/--port, which are added per-slot)
 # ---------------------------------------------------------------------------
 CONFIGS=(
-    "bf16|--model-path $BF16_MODEL --trust-remote-code"
-    "int4|--model-path $INT4_MODEL --trust-remote-code"
-    "heter_partial|--model-path $BF16_MODEL --trust-remote-code --heter-precision-config $HETER_PARTIAL_CONFIG"
-    "heter_random|--model-path $BF16_MODEL --trust-remote-code --heter-precision-config $HETER_RANDOM_CONFIG"
+    # "bf16|--model-path $BF16_MODEL --trust-remote-code"
+    # "int4|--model-path $INT4_MODEL --trust-remote-code"
+    # "heter_partial|--model-path $BF16_MODEL --trust-remote-code --heter-precision-config $HETER_PARTIAL_CONFIG"
+    # "heter_random|--model-path $BF16_MODEL --trust-remote-code --heter-precision-config $HETER_RANDOM_CONFIG"
+    "heter_thresh128|--model-path $BF16_MODEL --trust-remote-code --heter-precision-config $HETER_THRESH128_CONFIG"
 )
 
 # ---------------------------------------------------------------------------
