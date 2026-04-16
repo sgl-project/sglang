@@ -2,7 +2,7 @@
 Test runner for multimodal_gen that manages test suites and parallel execution.
 
 Usage:
-    python3 run_suite.py --suite <suite_name> --partition-id <id> --total-partitions <num>
+    python3 run_suite_npu.py --suite <suite_name> --partition-id <id> --total-partitions <num>
 
 Example:
     python3 run_suite_npu.py --suite 1-npu --partition-id 0 --total-partitions 4
