@@ -189,6 +189,7 @@ class DiffusionServerArgs:
     enable_warmup: bool = True
 
     extras: list[str] = field(default_factory=lambda: [])
+    env_vars: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.modality is None:
@@ -360,6 +361,12 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
+MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
+    prompt="Doraemon is eating dorayaki",
+    output_size="768x768",
+    extras={"num_inference_steps": 12},
+)
+
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
@@ -396,6 +403,13 @@ T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
 )
 
+MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=T2V_PROMPT,
+    output_size="640x384",
+    num_frames=17,
+    extras={"num_inference_steps": 12},
+)
+
 TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
@@ -415,6 +429,40 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     prompt="",
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
+
+MODELOPT_FLUX1_FP8_TRANSFORMER = "BBuf/flux1-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_FLUX2_FP8_TRANSFORMER = "BBuf/flux2-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_WAN22_FP8_TRANSFORMER = "BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
+MODELOPT_FLUX1_NVFP4_TRANSFORMER = "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
+MODELOPT_FLUX2_NVFP4_MODEL = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_WAN22_NVFP4_TRANSFORMER = (
+    "BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
+)
+MODELOPT_NVFP4_B200_ENV_VARS = {"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"}
+
+
+def _make_modelopt_ci_case(
+    case_id: str,
+    *,
+    model_path: str,
+    modality: str,
+    sampling_params: DiffusionSamplingParams,
+    extras: list[str],
+    env_vars: dict[str, str] | None = None,
+) -> DiffusionTestCase:
+    return DiffusionTestCase(
+        case_id,
+        DiffusionServerArgs(
+            model_path=model_path,
+            modality=modality,
+            enable_warmup=False,
+            extras=extras,
+            env_vars=env_vars or {},
+        ),
+        sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+    )
 
 
 def _with_default_num_gpus(

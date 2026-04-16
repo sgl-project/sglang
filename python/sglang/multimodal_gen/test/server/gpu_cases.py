@@ -1,10 +1,19 @@
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    MODELOPT_FLUX1_FP8_TRANSFORMER,
+    MODELOPT_FLUX1_NVFP4_TRANSFORMER,
+    MODELOPT_FLUX2_FP8_TRANSFORMER,
+    MODELOPT_FLUX2_NVFP4_MODEL,
+    MODELOPT_NVFP4_B200_ENV_VARS,
+    MODELOPT_WAN22_FP8_TRANSFORMER,
+    MODELOPT_WAN22_NVFP4_TRANSFORMER,
     T2V_PROMPT,
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
     HUNYUAN3D_SHAPE_sampling_params,
+    MODELOPT_T2I_CI_sampling_params,
+    MODELOPT_T2V_CI_sampling_params,
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
@@ -12,6 +21,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     T2V_sampling_params,
     TI2I_sampling_params,
     TI2V_sampling_params,
+    _make_modelopt_ci_case,
     _with_default_num_gpus,
 )
 from sglang.multimodal_gen.test.test_utils import (
@@ -351,16 +361,52 @@ if not current_platform.is_hip():
             T2V_sampling_params,
         )
     )
-
-# TODO: enable on 4090/5090
 ONE_GPU_CASES_C = [
-    DiffusionTestCase(
-        "flux_2_nvfp4_t2i",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-dev-NVFP4",
-        ),
-        T2I_sampling_params,
-    )
+    _make_modelopt_ci_case(
+        "flux1_modelopt_fp8_t2i",
+        model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
+        modality="image",
+        sampling_params=MODELOPT_T2I_CI_sampling_params,
+        extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
+    ),
+    _make_modelopt_ci_case(
+        "flux2_modelopt_fp8_t2i",
+        model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+        modality="image",
+        sampling_params=MODELOPT_T2I_CI_sampling_params,
+        extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+    ),
+    _make_modelopt_ci_case(
+        "wan22_modelopt_fp8_t2v",
+        model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+        modality="video",
+        sampling_params=MODELOPT_T2V_CI_sampling_params,
+        extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+    ),
+    _make_modelopt_ci_case(
+        "flux1_modelopt_nvfp4_t2i",
+        model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
+        modality="image",
+        sampling_params=MODELOPT_T2I_CI_sampling_params,
+        extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
+        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+    ),
+    _make_modelopt_ci_case(
+        "flux2_modelopt_nvfp4_t2i",
+        model_path=MODELOPT_FLUX2_NVFP4_MODEL,
+        modality="image",
+        sampling_params=MODELOPT_T2I_CI_sampling_params,
+        extras=[],
+        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+    ),
+    _make_modelopt_ci_case(
+        "wan22_modelopt_nvfp4_t2v",
+        model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+        modality="video",
+        sampling_params=MODELOPT_T2V_CI_sampling_params,
+        extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
+        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+    ),
 ]
 
 TWO_GPU_CASES_A = [
@@ -379,7 +425,7 @@ TWO_GPU_CASES_A = [
         ),
         T2V_sampling_params,
     ),
-    # TeaCache smoke test for Wan2.2 T2V A14B — verifies enable_teacache=True
+    # TeaCache bring-up test for Wan2.2 T2V A14B — verifies enable_teacache=True
     # doesn't crash. Perf check disabled because Wan2.2-specific TeaCache
     # coefficients are not yet calibrated (teacache_params=None, so no speedup).
     DiffusionTestCase(
@@ -586,7 +632,6 @@ if not current_platform.is_hip():
             MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
         )
     )
-
 
 ONE_GPU_CASES = [*ONE_GPU_CASES_A, *ONE_GPU_CASES_B, *ONE_GPU_CASES_C]
 TWO_GPU_CASES_A = _with_default_num_gpus(TWO_GPU_CASES_A, 2)
