@@ -225,7 +225,7 @@ class AfmoeMoE(nn.Module):
             self.shared_experts = None
 
         custom_routing_fn = None
-        correction_bias = None
+        correction_bias = None if not _is_npu else self.expert_bias
         if self.use_grouped_topk:
             correction_bias = self.expert_bias
         elif self.score_func == "sigmoid":
@@ -235,30 +235,18 @@ class AfmoeMoE(nn.Module):
                 expert_bias=self.expert_bias,
             )
 
-        renormalize = self.route_norm if self.score_func == "sigmoid" else False
-        if not _is_npu:
-            self.topk = TopK(
-                top_k=self.top_k,
-                renormalize=renormalize,
-                use_grouped_topk=self.use_grouped_topk,
-                num_expert_group=self.n_group if self.use_grouped_topk else None,
-                topk_group=self.topk_group if self.use_grouped_topk else None,
-                custom_routing_function=custom_routing_fn,
-                correction_bias=correction_bias,
-                routed_scaling_factor=self.route_scale,
-            )
-        else:
-            self.topk = TopK(
-                top_k=self.top_k,
-                renormalize=False,
-                use_grouped_topk=self.use_grouped_topk,
-                num_expert_group=self.n_group if self.use_grouped_topk else None,
-                topk_group=self.topk_group if self.use_grouped_topk else None,
-                custom_routing_function=custom_routing_fn,
-                correction_bias=self.expert_bias,
-                scoring_func=self.score_func,
-                routed_scaling_factor=self.route_scale,
-            )
+        renormalize = self.route_norm if self.score_func == "sigmoid" and not _is_npu else False
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=renormalize,
+            use_grouped_topk=self.use_grouped_topk,
+            num_expert_group=self.n_group if self.use_grouped_topk else None,
+            topk_group=self.topk_group if self.use_grouped_topk else None,
+            custom_routing_function=custom_routing_fn,
+            correction_bias=correction_bias,
+            routed_scaling_factor=self.route_scale,
+            **({"scoring_func": self.score_func} if _is_npu else {}),
+        )
 
     def pack_params(self) -> None:
         w1: list[torch.Tensor] = []
