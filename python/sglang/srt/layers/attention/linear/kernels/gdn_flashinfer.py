@@ -199,7 +199,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
 
-
         if self.is_sm100plus:
             # SM100+: slot 0 is reserved as dummy/scratch (never assigned to real
             # sequences), so clamp(-1 → 0).
