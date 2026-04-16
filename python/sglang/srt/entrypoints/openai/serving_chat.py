@@ -60,6 +60,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def normalize_tool_content(role: str, content):
+    """Normalize tool message content from OpenAI array format to plain string.
+
+    OpenAI clients may send tool content as a list of content parts
+    (e.g. [{"type":"text","text":"..."}]) but most chat templates expect
+    a plain string for tool messages. Only flatten when ALL items are
+    pure OpenAI text parts; preserve lists containing non-text-type items
+    that some templates intentionally iterate over.
+    """
+    if role != "tool" or not isinstance(content, list):
+        return content
+    parts = content
+    is_openai_text_parts = all(
+        (isinstance(p, dict) and p.get("type") == "text") or isinstance(p, str)
+        for p in parts
+    )
+    if is_openai_text_parts:
+        text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
+        return " ".join(text_parts)
+    return content
+
+
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
     vid_vals = []
@@ -455,6 +477,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     video_data,
                     audio_data,
                     modalities,
+                )
+
+                processed_msg["content"] = normalize_tool_content(
+                    processed_msg["role"], processed_msg.get("content")
                 )
 
                 # per the Transformers docs & maintainers, tool call arguments in
