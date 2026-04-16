@@ -61,7 +61,7 @@ try:
     from vector_quantize_pytorch import GroupedResidualFSQ
 
     _tts_deps = True
-except:
+except ImportError:
     LogitsWarper = None
     _tts_deps = False
 
