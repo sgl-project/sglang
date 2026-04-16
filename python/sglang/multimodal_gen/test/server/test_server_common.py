@@ -78,6 +78,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
+    extra_args = f"--model-type diffusion {extra_args}".strip()
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
@@ -122,6 +123,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     env_vars = {}
     if server_args.enable_cache_dit:
         env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
+    env_vars.update(server_args.env_vars)
 
     # start server
     wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
@@ -154,7 +156,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         # pipeline class.  This avoids hard failures when a model needs a
         # newer diffusers release than what is currently installed in CI.
         msg = str(exc)
-        if "not found in diffusers" in msg or "has no attribute" in msg:
+        if "not found in diffusers" in msg or (
+            "has no attribute" in msg and "diffusers" in msg.lower()
+        ):
             pytest.skip(
                 f"Skipping {case.id}: required diffusers pipeline class "
                 f"is not available in the installed version. "
@@ -1088,46 +1092,91 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
             self._save_gt_output(case, content)
             return
 
-        # Validation 1: Performance
-        self._validate_and_record(case, perf_record)
+        failures: list[tuple[str, str]] = []
 
-        # Mesh correctness check (Chamfer Distance) for 3D models
+        def run_case_check(name: str, fn: Callable[[], None]) -> None:
+            try:
+                fn()
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failures.append((name, str(exc)))
+
+        run_case_check(
+            "performance",
+            lambda: self._validate_and_record(case, perf_record),
+        )
+
         if case.server_args.custom_validator == "mesh":
             from sglang.multimodal_gen.test.server.test_server_utils import (
                 MESH_OUTPUT_PATHS,
                 validate_mesh_correctness,
             )
 
-            mesh_path = MESH_OUTPUT_PATHS.pop(case.id, None)
-            if mesh_path:
-                validate_mesh_correctness(mesh_path)
+            def validate_mesh_output() -> None:
+                mesh_path = MESH_OUTPUT_PATHS.pop(case.id, None)
+                if mesh_path:
+                    validate_mesh_correctness(mesh_path)
 
-        # Test /v1/models endpoint for router compatibility
+            run_case_check("mesh correctness", validate_mesh_output)
+
         if case.run_models_api_check:
-            self._test_v1_models_endpoint(diffusion_server, case)
+            run_case_check(
+                "/v1/models endpoint",
+                lambda: self._test_v1_models_endpoint(diffusion_server, case),
+            )
         if case.run_t2v_input_reference_check:
-            self._test_t2v_rejects_input_reference(diffusion_server, case)
+            run_case_check(
+                "t2v input_reference rejection",
+                lambda: self._test_t2v_rejects_input_reference(diffusion_server, case),
+            )
 
         if case.run_consistency_check:
-            self._validate_consistency(case, content)
+            run_case_check(
+                "consistency",
+                lambda: self._validate_consistency(case, content),
+            )
 
-        # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
         if case.run_lora_basic_api_check:
-            self._test_lora_api_functionality(diffusion_server, case, generate_fn)
+            run_case_check(
+                "LoRA basic API",
+                lambda: self._test_lora_api_functionality(
+                    diffusion_server, case, generate_fn
+                ),
+            )
 
         if case.run_lora_dynamic_switch_check:
-            self._test_lora_dynamic_switch_e2e(
-                diffusion_server,
-                case,
-                generate_fn,
-                case.server_args.second_lora_path,
+            run_case_check(
+                "LoRA dynamic switch",
+                lambda: self._test_lora_dynamic_switch_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.second_lora_path,
+                ),
             )
 
         if case.run_multi_lora_api_check:
-            self._test_multi_lora_e2e(
-                diffusion_server,
-                case,
-                generate_fn,
-                case.server_args.lora_path,
-                case.server_args.second_lora_path,
+            run_case_check(
+                "multi-LoRA API",
+                lambda: self._test_multi_lora_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.lora_path,
+                    case.server_args.second_lora_path,
+                ),
+            )
+
+        if failures:
+            formatted_failures = []
+            for name, message in failures:
+                if "\n" in message:
+                    formatted_failures.append(f"[{name}]\n{message}")
+                else:
+                    formatted_failures.append(f"[{name}] {message}")
+            pytest.fail(
+                f"Diffusion testcase '{case.id}' failed {len(failures)} check(s):\n\n"
+                + "\n\n".join(formatted_failures),
+                pytrace=False,
             )
