@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     maybe_unpad_latents,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
+    QwenImageRolloutPipelineMixin,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
@@ -127,7 +130,7 @@ def _pack_latents(latents, batch_size, num_channels_latents, height, width):
 
 
 @dataclass
-class QwenImagePipelineConfig(ImagePipelineConfig):
+class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig):
     """Configuration for the QwenImage pipeline."""
 
     should_use_guidance: bool = False
