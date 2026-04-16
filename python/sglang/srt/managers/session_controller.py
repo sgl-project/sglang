@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -57,16 +56,12 @@ class SessionReqNode:
             req_node.clear(req_dict)
 
         if self.req.finished_reason is None:
-            self.req.to_finish = FINISH_ABORT(
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE
-            )
+            self.req.to_finish = FINISH_ABORT()
         del req_dict[self.req.rid]
 
     def abort(self):
         if self.req.finished_reason is None:
-            self.req.to_finish = FINISH_ABORT(
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE
-            )
+            self.req.to_finish = FINISH_ABORT()
 
     def __str__(self):
         return self._str_helper(self.req.rid)
