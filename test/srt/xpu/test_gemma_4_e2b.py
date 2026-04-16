@@ -211,6 +211,99 @@ class TestGemma4E2BXPU(CustomTestCase):
             response=response,
         )
 
+    def test_sliding_window_long_context(self):
+        """Generate >511 tokens to exercise decode past the SWA window boundary.
+
+        Gemma 4 E2B has sliding_window=512 (511 in SGLang exclusive).
+        With ~30 prompt tokens + 600 generated tokens, the total sequence
+        (~630 tokens) exceeds the window, forcing the SWA decode kernel
+        to actually mask out-of-window tokens. If page table translation
+        or kernel masking is broken, this test will produce garbage or crash.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Write a detailed, step-by-step tutorial on how to "
+                                "build a simple web server in Python using the socket "
+                                "module. Include complete code examples with comments."
+                            ),
+                        },
+                    ],
+                }
+            ],
+            temperature=0,
+            max_tokens=600,
+        )
+        msg = response.choices[0].message
+        text = msg.content or ""
+        assert len(text) > 0, "expected non-empty response"
+        assert response.usage is not None
+        assert response.usage.completion_tokens >= 500, (
+            f"expected >= 500 completion tokens to exceed SWA window, "
+            f"got {response.usage.completion_tokens}"
+        )
+        _append_comparison_log(
+            title="OUTPUT FROM --device XPU (Gemma-4-E2B) [SWA long context]",
+            device_cli="--device xpu",
+            extra_server_notes="SWA window=511; generated >500 tokens to exceed window.",
+            user_prompt="(long context SWA test)",
+            response=response,
+        )
+
+    def test_sliding_window_3k_tokens(self):
+        """Generate ~3000 tokens — approximately 6x the SWA window.
+
+        At 3000 tokens the sliding window (511) has rolled many times,
+        stressing the decode kernel's local masking and KV cache page
+        table management over an extended generation.
+        """
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Write a comprehensive guide to Python data structures. "
+                                "Cover lists, tuples, dictionaries, sets, double-ended queues, "
+                                "namedtuples, dataclasses, and custom linked lists. "
+                                "For each one, provide multiple code examples, explain "
+                                "time complexity of common operations, compare trade-offs, "
+                                "and show real-world use cases. Be extremely thorough."
+                            ),
+                        },
+                    ],
+                }
+            ],
+            temperature=0,
+            max_tokens=3000,
+        )
+        msg = response.choices[0].message
+        text = msg.content or ""
+        assert len(text) > 0, "expected non-empty response"
+        assert response.usage is not None
+        assert response.usage.completion_tokens >= 2500, (
+            f"expected >= 2500 completion tokens (6x SWA window), "
+            f"got {response.usage.completion_tokens}"
+        )
+        _append_comparison_log(
+            title="OUTPUT FROM --device XPU (Gemma-4-E2B) [SWA 3k tokens]",
+            device_cli="--device xpu",
+            extra_server_notes="SWA window=511; generated ~3000 tokens (6x window).",
+            user_prompt="(3k token SWA stress test)",
+            response=response,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
