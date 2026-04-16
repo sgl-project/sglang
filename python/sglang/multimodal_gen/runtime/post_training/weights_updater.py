@@ -134,7 +134,9 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
         load_weights_into_model(weights_iter, dict(module.named_parameters()))
 
 
-def load_weights_into_model(weights_iter, model_params: dict) -> None:
+def load_weights_into_model(
+    weights_iter, model_params: dict, module_name: str | None = None
+) -> None:
     """Copy weights from weights_iter into model_params in-place."""
     for name, loaded_weight in weights_iter:
         if name not in model_params:
@@ -157,8 +159,10 @@ def load_weights_into_model(weights_iter, model_params: dict) -> None:
                 dtensor_param._local_tensor.copy_(distributed_weight._local_tensor)
             else:
                 if param.shape != loaded_weight.shape:
+                    module_prefix = f"{module_name}." if module_name else ""
                     raise ValueError(
-                        f"Shape mismatch for {name}: model={param.shape}, loaded={loaded_weight.shape}"
+                        f"Shape mismatch for {module_prefix}{name}: "
+                        f"model={param.shape}, loaded={loaded_weight.shape}"
                     )
                 param.data.copy_(loaded_weight.to(param.dtype))
 
