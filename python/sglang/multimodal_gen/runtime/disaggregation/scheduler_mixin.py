@@ -15,7 +15,7 @@ import pickle
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import zmq
@@ -105,6 +105,19 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     }
 )
 
+# Pre-compute base SamplingParams defaults for the field walk in
+# extract_transfer_fields().  The receiver creates a plain SamplingParams()
+# (not the model-specific subclass), so we must compare against *base*
+# defaults.  Without this, fields whose value equals a subclass default but
+# differs from the base default (e.g. ZImageTurboSamplingParams overrides
+# num_inference_steps=9 while the base default is None) are silently dropped
+# and arrive as None on the receiver, causing DenoisingStage verify_input to
+# fail.
+_BASE_SP_DEFAULTS: dict[str, Any] = {}
+for _f in dataclasses.fields(SamplingParams):
+    if _f.default is not dataclasses.MISSING:
+        _BASE_SP_DEFAULTS[_f.name] = _f.default
+
 
 def _is_tensor_like(value) -> bool:
     if isinstance(value, torch.Tensor):
@@ -185,6 +198,12 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
         # Qwen-Image's true_cfg_scale (and any future feature added to
         # SamplingParams). Using a field-walk keeps the disagg boundary
         # feature-complete without needing to edit this list.
+        #
+        # Compare against *base* SamplingParams defaults, not the subclass
+        # defaults returned by dataclasses.fields(sp).  The receiver creates
+        # a plain SamplingParams(), so subclass-specific defaults (e.g.
+        # ZImageTurboSamplingParams.num_inference_steps=9 vs base None)
+        # must be transferred explicitly.
         for f in dataclasses.fields(sp):
             name = f.name
             if name in _SAMPLING_PARAMS_EXCLUDE_FIELDS:
@@ -196,7 +215,8 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
             value = getattr(sp, name, None)
             if value is None:
                 continue
-            if _is_default(value, f):
+            base_default = _BASE_SP_DEFAULTS.get(name, dataclasses.MISSING)
+            if base_default is not dataclasses.MISSING and value == base_default:
                 continue
             try:
                 scalar_fields[name] = _to_json_serializable(value)
