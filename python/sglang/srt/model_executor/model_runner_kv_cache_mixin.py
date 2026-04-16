@@ -771,6 +771,31 @@ class ModelRunnerKVCacheMixin:
                         rq_method=rq_method,
                         rq_bit_width=rq_bit_width,
                     )
+                elif isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith("kv_mixed"):
+                    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMixed
+
+                    # Parse kv_mixed{N} -> TQ{N} for K, RQ{N} PlanarQuant for V
+                    mixed_bits = int(self.kv_cache_dtype[-1])  # 'kv_mixed4' -> 4
+                    logger.info(
+                        f"Using Mixed KV cache: TQ{mixed_bits} (K) + RQ{mixed_bits}_planar (V)"
+                    )
+                    self.token_to_kv_pool = MHATokenToKVPoolMixed(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        tq_bit_width=mixed_bits,
+                        rq_method="planar",
+                        rq_bit_width=mixed_bits,
+                    )
                 else:
                     self.token_to_kv_pool = MHATokenToKVPool(
                         self.max_total_num_tokens,

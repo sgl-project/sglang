@@ -803,6 +803,11 @@ class ServerArgs:
         if self.kv_cache_dtype in _RQ_SHORTHAND:
             self.kv_cache_dtype = _RQ_SHORTHAND[self.kv_cache_dtype]
 
+        # Expand kv_mixed shorthand (TQ K + RQ V mixed compression)
+        _MIXED_SHORTHAND = {"kv_mixed": "kv_mixed4", "kv_mixed3": "kv_mixed3"}
+        if self.kv_cache_dtype in _MIXED_SHORTHAND:
+            self.kv_cache_dtype = _MIXED_SHORTHAND[self.kv_cache_dtype]
+
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
 

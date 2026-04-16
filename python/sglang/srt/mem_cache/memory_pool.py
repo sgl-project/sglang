@@ -3964,3 +3964,541 @@ class MHATokenToKVPoolRQ(MHATokenToKVPool):
             )
             # Target positions now have fresh packed+deq data
             self._packed_dirty[layer_idx][sorted_tgt] = False
+
+
+class _TQCompressor:
+    """Lightweight TQ codec state + borrowed compress/decompress methods.
+
+    Holds TurboQuant-specific state (codebook, rotation matrix, CPU mirrors)
+    and borrows compress/decompress as unbound methods from MHATokenToKVPoolTQ.
+    When accessed on an instance, Python's descriptor protocol passes the
+    _TQCompressor instance as ``self``, so the borrowed methods resolve their
+    state attributes (tq_centroids, tq_Pi, etc.) from *this* object.
+    Zero code duplication: ~150 LOC of compress/decompress logic is reused.
+    """
+
+    compress = MHATokenToKVPoolTQ._compress_heads_split
+    _compress_cpu_vectorized = MHATokenToKVPoolTQ._compress_cpu_vectorized
+    _compress_gpu = MHATokenToKVPoolTQ._compress_gpu
+    decompress = MHATokenToKVPoolTQ._decompress_heads_split
+    _decompress_heads_split_cpu = MHATokenToKVPoolTQ._decompress_heads_split_cpu
+
+    def __init__(self, head_num: int, head_dim: int, tq_bit_width: int, device):
+        import math
+        from sglang.srt.layers.quantization.turboquant_engine import (
+            get_codebook,
+            generate_rotation_matrix,
+            packed_bytes_per_dim,
+        )
+
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.tq_bit_width = tq_bit_width
+
+        centroids, boundaries = get_codebook(tq_bit_width)
+        self.tq_centroids = centroids.to(device)
+        self.tq_boundaries = boundaries.to(device)
+        if _is_hip:
+            self.tq_centroids_cpu = centroids.cpu()
+            self.tq_boundaries_cpu = boundaries.cpu()
+        else:
+            self.tq_centroids_cpu = None
+            self.tq_boundaries_cpu = None
+
+        self.tq_Pi = generate_rotation_matrix(head_dim, seed=42).to(device)
+        self.tq_Pi_cpu = self.tq_Pi.cpu() if _is_hip else None
+        self.tq_scale = math.sqrt(head_dim)
+        self.tq_packed_per_head = packed_bytes_per_dim(head_dim, tq_bit_width)
+
+
+class _RQCompressor:
+    """Lightweight RQ codec state + borrowed compress/decompress methods.
+
+    Same pattern as _TQCompressor but for RotorQuant. Holds codebook,
+    rotation matrices, and CPU mirrors; borrows compress/decompress from
+    MHATokenToKVPoolRQ.
+    """
+
+    compress = MHATokenToKVPoolRQ._compress_heads
+    decompress = MHATokenToKVPoolRQ._decompress_heads
+
+    def __init__(
+        self, head_num: int, head_dim: int, rq_method: str, rq_bit_width: int, device
+    ):
+        from sglang.srt.layers.quantization.rotorquant_engine import (
+            get_codebook,
+            generate_givens_rotations,
+            generate_quaternion_rotations,
+            packed_bytes_per_dim,
+        )
+
+        self.head_num = head_num
+        self._rq_method = rq_method
+        self._rq_bit_width = rq_bit_width
+
+        centroids, boundaries = get_codebook(rq_bit_width)
+        self._rq_codebook = {
+            "centroids": centroids.to(device),
+            "boundaries": boundaries.to(device),
+        }
+        if _is_hip:
+            self._rq_codebook_cpu = {
+                "centroids": centroids.cpu(),
+                "boundaries": boundaries.cpu(),
+            }
+        else:
+            self._rq_codebook_cpu = None
+
+        if rq_method == "planar":
+            rot2 = generate_givens_rotations(head_dim, seed=42)
+            self._rq_rotations = {"rot2": rot2.to(device)}
+            self._rq_rotations_cpu = {"rot2": rot2.cpu()} if _is_hip else None
+        else:
+            q_L, q_R = generate_quaternion_rotations(head_dim, seed=42)
+            self._rq_rotations = {"q_L": q_L.to(device), "q_R": q_R.to(device)}
+            self._rq_rotations_cpu = (
+                {"q_L": q_L.cpu(), "q_R": q_R.cpu()} if _is_hip else None
+            )
+
+        if rq_method == "iso":
+            self._rq_eff_dim = ((head_dim + 3) // 4) * 4
+        else:
+            self._rq_eff_dim = head_dim
+        self._rq_packed_per_head = packed_bytes_per_dim(self._rq_eff_dim, rq_bit_width)
+
+
+class MHATokenToKVPoolMixed(MHATokenToKVPool):
+    """Mixed KV cache: TurboQuant for K (precision) + RotorQuant for V (speed).
+
+    Zero-waste buffer layout — each buffer is allocated once with the correct
+    codec shape.  No composition-based sub-pool duplication.  K and V use
+    heterogeneous compression but share identical FP16 decompressed buffers,
+    making kv_copy and attention fully transparent.
+
+    Activate with: --kv-cache-dtype kv_mixed / kv_mixed3 / kv_mixed4
+    """
+
+    def __init__(
+        self,
+        *args,
+        tq_bit_width: int = 4,
+        rq_method: str = "planar",
+        rq_bit_width: int = 4,
+        **kwargs,
+    ):
+        self._mixed_tq_bits = tq_bit_width
+        self._mixed_rq_method = rq_method
+        self._mixed_rq_bits = rq_bit_width
+        super().__init__(*args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Buffer creation
+    # ------------------------------------------------------------------
+
+    def _create_buffers(self):
+        """Allocate K(TQ) + V(RQ) buffers directly — zero VRAM waste."""
+        self._k_codec = _TQCompressor(
+            self.head_num, self.head_dim, self._mixed_tq_bits, self.device,
+        )
+        self._v_codec = _RQCompressor(
+            self.head_num, self.head_dim, self._mixed_rq_method,
+            self._mixed_rq_bits, self.device,
+        )
+
+        tq_pph = self._k_codec.tq_packed_per_head
+        rq_pph = self._v_codec._rq_packed_per_head
+        m = self.size + self.page_size
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                # K packed (TQ format)
+                self.k_buffer = [
+                    torch.zeros((m, self.head_num, tq_pph),
+                                dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                # V packed (RQ format)
+                self.v_buffer = [
+                    torch.zeros((m, self.head_num, rq_pph),
+                                dtype=torch.uint8, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                # K norms (TQ)
+                self.k_norm_buffer = [
+                    torch.zeros((m, self.head_num, 1),
+                                dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                # V norms (RQ)
+                self.v_norm_buffer = [
+                    torch.zeros((m, self.head_num, 1),
+                                dtype=torch.float16, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                # Decompressed FP16 for attention readback
+                self._k_deq = [
+                    torch.zeros((m, self.head_num, self.head_dim),
+                                dtype=self.dtype, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+                self._v_deq = [
+                    torch.zeros((m, self.head_num, self.v_head_dim),
+                                dtype=self.dtype, device=self.device)
+                    for _ in range(self.layer_num)
+                ]
+
+        # Dirty tracking — split K/V (rubber-duck recommendation)
+        self._deq_dirty_k = [True] * self.layer_num
+        self._deq_dirty_v = [True] * self.layer_num
+        self._active = [0] * self.layer_num
+
+        # Per-position packed-dirty for lazy compression (decode fast path)
+        self._packed_dirty_k = [
+            torch.zeros(m, dtype=torch.bool, device=self.device)
+            for _ in range(self.layer_num)
+        ]
+        self._packed_dirty_v = [
+            torch.zeros(m, dtype=torch.bool, device=self.device)
+            for _ in range(self.layer_num)
+        ]
+
+        # data_ptrs / data_strides from deq buffers (for kv_copy kernels)
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self._k_deq],
+            dtype=torch.uint64, device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self._v_deq],
+            dtype=torch.uint64, device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs])
+        self.data_strides = torch.tensor(
+            [np.prod(x.shape[1:]) * x.dtype.itemsize
+             for x in self._k_deq + self._v_deq],
+            device=self.device,
+        )
+
+        orig_bytes = self.head_num * self.head_dim * 2  # FP16 per token
+        k_bytes = self.head_num * (tq_pph + 2)  # packed + 2-byte norm
+        v_bytes = self.head_num * (rq_pph + 2)
+        logger.info(
+            f"Mixed MHA KV Pool: K=TQ{self._mixed_tq_bits}, "
+            f"V=RQ{self._mixed_rq_bits}_{self._mixed_rq_method}, "
+            f"head_num={self.head_num}, head_dim={self.head_dim}, "
+            f"K: {k_bytes}B/tok ({orig_bytes / k_bytes:.1f}×), "
+            f"V: {v_bytes}B/tok ({orig_bytes / v_bytes:.1f}×)"
+        )
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_norm_buffer
+        del self.v_norm_buffer
+        del self._k_deq
+        del self._v_deq
+
+    # ------------------------------------------------------------------
+    # Lazy packed compression (decode fast path support)
+    # ------------------------------------------------------------------
+
+    def _ensure_packed_k(self, layer_idx: int, indices: torch.Tensor = None):
+        """Lazily compress dirty K positions via TQ."""
+        dirty = self._packed_dirty_k[layer_idx]
+        if indices is not None:
+            mask = dirty[indices]
+            if not mask.any():
+                return
+            dirty_indices = indices[mask]
+        else:
+            dirty_indices = dirty.nonzero(as_tuple=False).squeeze(-1)
+            if dirty_indices.numel() == 0:
+                return
+
+        k_fp16 = self._k_deq[layer_idx][dirty_indices]
+        k_comp, k_norm = self._k_codec.compress(k_fp16, self.head_dim)
+        self.k_buffer[layer_idx].index_copy_(0, dirty_indices, k_comp.contiguous())
+        self.k_norm_buffer[layer_idx].index_copy_(
+            0, dirty_indices, k_norm.contiguous()
+        )
+
+        if indices is not None:
+            dirty[indices] = False
+        else:
+            dirty.zero_()
+
+    def _ensure_packed_v(self, layer_idx: int, indices: torch.Tensor = None):
+        """Lazily compress dirty V positions via RQ."""
+        dirty = self._packed_dirty_v[layer_idx]
+        if indices is not None:
+            mask = dirty[indices]
+            if not mask.any():
+                return
+            dirty_indices = indices[mask]
+        else:
+            dirty_indices = dirty.nonzero(as_tuple=False).squeeze(-1)
+            if dirty_indices.numel() == 0:
+                return
+
+        v_fp16 = self._v_deq[layer_idx][dirty_indices]
+        v_comp, v_norm = self._v_codec.compress(v_fp16, self.v_head_dim)
+        self.v_buffer[layer_idx].index_copy_(0, dirty_indices, v_comp.contiguous())
+        self.v_norm_buffer[layer_idx].index_copy_(
+            0, dirty_indices, v_norm.contiguous()
+        )
+
+        if indices is not None:
+            dirty[indices] = False
+        else:
+            dirty.zero_()
+
+    # ------------------------------------------------------------------
+    # Get buffers (lazy decompress for attention)
+    # ------------------------------------------------------------------
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        layer_idx = layer_id - self.start_layer
+        if self._deq_dirty_k[layer_idx]:
+            n = self._active[layer_idx]
+            self._k_codec.decompress(
+                self.k_buffer[layer_idx],
+                self.k_norm_buffer[layer_idx],
+                self.head_dim,
+                self._k_deq[layer_idx],
+                n,
+            )
+            self._deq_dirty_k[layer_idx] = False
+        return self._k_deq[layer_idx]
+
+    def get_value_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        layer_idx = layer_id - self.start_layer
+        if self._deq_dirty_v[layer_idx]:
+            n = self._active[layer_idx]
+            self._v_codec.decompress(
+                self.v_buffer[layer_idx],
+                self.v_norm_buffer[layer_idx],
+                self.v_head_dim,
+                self._v_deq[layer_idx],
+                n,
+            )
+            self._deq_dirty_v[layer_idx] = False
+        return self._v_deq[layer_idx]
+
+    # ------------------------------------------------------------------
+    # Set buffers (compress + store)
+    # ------------------------------------------------------------------
+
+    def set_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale=None,
+        v_scale=None,
+        layer_id_override=None,
+    ):
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        layer_idx = layer_id - self.start_layer
+
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        loc = loc.to(device=self.k_buffer[layer_idx].device, dtype=torch.long)
+        n_tokens = loc.numel()
+        if n_tokens == 0:
+            return
+
+        cache_k = cache_k.contiguous()
+        cache_v = cache_v.contiguous()
+
+        # Decode fast path (batch≤8): skip compression, store FP16 directly.
+        # Packed buffers lazily compressed via _ensure_packed before eviction.
+        if n_tokens <= 8:
+            self._k_deq[layer_idx].index_copy_(0, loc, cache_k)
+            self._v_deq[layer_idx].index_copy_(0, loc, cache_v)
+            self._deq_dirty_k[layer_idx] = False
+            self._deq_dirty_v[layer_idx] = False
+            self._packed_dirty_k[layer_idx][loc] = True
+            self._packed_dirty_v[layer_idx][loc] = True
+            max_loc = loc.max().item() + 1
+            if max_loc > self._active[layer_idx]:
+                self._active[layer_idx] = max_loc
+            return
+
+        # Prefill / large batch: compress K via TQ, V via RQ
+        k_comp, k_norm = self._k_codec.compress(cache_k, self.head_dim)
+        v_comp, v_norm = self._v_codec.compress(cache_v, self.v_head_dim)
+
+        if _is_hip:
+            # HIP-safe sorted write (gfx1030 fancy-indexing workaround)
+            loc_cpu = loc.detach().to("cpu", dtype=torch.long)
+            perm_cpu = torch.argsort(loc_cpu)
+            sorted_loc_cpu = loc_cpu.index_select(0, perm_cpu)
+            sorted_loc = sorted_loc_cpu.to(device=loc.device, dtype=loc.dtype)
+
+            is_identity = torch.equal(
+                perm_cpu, torch.arange(loc_cpu.numel(), dtype=perm_cpu.dtype)
+            )
+            if is_identity:
+                kc = k_comp.contiguous()
+                vc = v_comp.contiguous()
+                kn = k_norm.contiguous()
+                vn = v_norm.contiguous()
+                ck, cv = cache_k, cache_v
+            else:
+                dev_p = perm_cpu.to(k_comp.device)
+                kc = k_comp.index_select(0, dev_p).contiguous()
+                vc = v_comp.index_select(0, dev_p).contiguous()
+                kn = k_norm.index_select(0, dev_p).contiguous()
+                vn = v_norm.index_select(0, dev_p).contiguous()
+                ck = cache_k.index_select(0, dev_p).contiguous()
+                cv = cache_v.index_select(0, dev_p).contiguous()
+
+            row_start = int(sorted_loc[0].item())
+            row_stop = int(sorted_loc[-1].item()) + 1
+            is_dense = sorted_loc.numel() == (row_stop - row_start) and torch.equal(
+                sorted_loc_cpu,
+                torch.arange(row_start, row_stop, dtype=sorted_loc_cpu.dtype),
+            )
+
+            if is_dense:
+                self.k_buffer[layer_idx][row_start:row_stop].copy_(kc)
+                self.v_buffer[layer_idx][row_start:row_stop].copy_(vc)
+                self.k_norm_buffer[layer_idx][row_start:row_stop].copy_(kn)
+                self.v_norm_buffer[layer_idx][row_start:row_stop].copy_(vn)
+                self._k_deq[layer_idx][row_start:row_stop].copy_(ck)
+                self._v_deq[layer_idx][row_start:row_stop].copy_(cv)
+            else:
+                self.k_buffer[layer_idx].index_copy_(0, sorted_loc, kc)
+                self.v_buffer[layer_idx].index_copy_(0, sorted_loc, vc)
+                self.k_norm_buffer[layer_idx].index_copy_(0, sorted_loc, kn)
+                self.v_norm_buffer[layer_idx].index_copy_(0, sorted_loc, vn)
+                self._k_deq[layer_idx].index_copy_(0, sorted_loc, ck)
+                self._v_deq[layer_idx].index_copy_(0, sorted_loc, cv)
+        else:
+            self.k_buffer[layer_idx][loc] = k_comp
+            self.v_buffer[layer_idx][loc] = v_comp
+            self.k_norm_buffer[layer_idx][loc] = k_norm
+            self.v_norm_buffer[layer_idx][loc] = v_norm
+            self._k_deq[layer_idx][loc] = cache_k
+            self._v_deq[layer_idx][loc] = cache_v
+
+        self._deq_dirty_k[layer_idx] = False
+        self._deq_dirty_v[layer_idx] = False
+        self._packed_dirty_k[layer_idx][loc] = False
+        self._packed_dirty_v[layer_idx][loc] = False
+        max_loc = loc.max().item() + 1
+        if max_loc > self._active[layer_idx]:
+            self._active[layer_idx] = max_loc
+
+    # ------------------------------------------------------------------
+    # Size / info helpers
+    # ------------------------------------------------------------------
+
+    def get_kv_size_bytes(self):
+        k_size_bytes, v_size_bytes = super().get_kv_size_bytes()
+        for buf in self.k_norm_buffer:
+            k_size_bytes += get_tensor_size_bytes(buf)
+        for buf in self.v_norm_buffer:
+            v_size_bytes += get_tensor_size_bytes(buf)
+        # Include persistent deq buffers in VRAM accounting
+        for buf in self._k_deq:
+            k_size_bytes += get_tensor_size_bytes(buf)
+        for buf in self._v_deq:
+            v_size_bytes += get_tensor_size_bytes(buf)
+        return k_size_bytes, v_size_bytes
+
+    def get_contiguous_buf_infos(self):
+        all_bufs = self.k_buffer + self.v_buffer
+        kv_data_ptrs = [buf.data_ptr() for buf in all_bufs]
+        kv_data_lens = [buf.nbytes for buf in all_bufs]
+        kv_item_lens = [buf[0].nbytes * self.page_size for buf in all_bufs]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    # ------------------------------------------------------------------
+    # CPU offload / restore / move
+    # ------------------------------------------------------------------
+
+    def get_cpu_copy(self, indices):
+        indices_t = torch.as_tensor(indices, device=self.device, dtype=torch.long)
+        for layer_idx in range(self.layer_num):
+            self._ensure_packed_k(layer_idx, indices_t)
+            self._ensure_packed_v(layer_idx, indices_t)
+        torch.cuda.synchronize()
+
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_idx in range(self.layer_num):
+            kv_cache_cpu.append([])
+            for i in range(0, len(indices), chunk_size):
+                chunk = indices[i : i + chunk_size]
+                entry = [
+                    self.k_buffer[layer_idx][chunk].to("cpu", non_blocking=True),
+                    self.v_buffer[layer_idx][chunk].to("cpu", non_blocking=True),
+                    self.k_norm_buffer[layer_idx][chunk].to("cpu", non_blocking=True),
+                    self.v_norm_buffer[layer_idx][chunk].to("cpu", non_blocking=True),
+                ]
+                kv_cache_cpu[-1].append(entry)
+        torch.cuda.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        torch.cuda.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        dev = self.k_buffer[0].device
+        for layer_idx in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk = indices[i : i + chunk_size]
+                entry = kv_cache_cpu[layer_idx][i // chunk_size]
+                self.k_buffer[layer_idx][chunk] = entry[0].to(dev, non_blocking=True)
+                self.v_buffer[layer_idx][chunk] = entry[1].to(dev, non_blocking=True)
+                self.k_norm_buffer[layer_idx][chunk] = entry[2].to(
+                    dev, non_blocking=True
+                )
+                self.v_norm_buffer[layer_idx][chunk] = entry[3].to(
+                    dev, non_blocking=True
+                )
+        # Packed data is fresh from CPU — mark deq dirty, clear packed dirty
+        indices_t = torch.as_tensor(indices, device=self.device, dtype=torch.long)
+        for layer_idx in range(self.layer_num):
+            self._deq_dirty_k[layer_idx] = True
+            self._deq_dirty_v[layer_idx] = True
+            self._packed_dirty_k[layer_idx][indices_t] = False
+            self._packed_dirty_v[layer_idx][indices_t] = False
+        torch.cuda.synchronize()
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if tgt_loc.numel() == 0:
+            return
+
+        sorted_tgt, perm = torch.sort(
+            tgt_loc.to(device=self.device, dtype=torch.long)
+        )
+        sorted_src = (
+            src_loc.to(device=self.device, dtype=torch.long).index_select(0, perm)
+        )
+        for layer_idx in range(self.layer_num):
+            self._ensure_packed_k(layer_idx, sorted_src)
+            self._ensure_packed_v(layer_idx, sorted_src)
+            for buf_list in [
+                self.k_buffer, self.v_buffer,
+                self.k_norm_buffer, self.v_norm_buffer,
+                self._k_deq, self._v_deq,
+            ]:
+                buf_list[layer_idx].index_copy_(
+                    0, sorted_tgt,
+                    buf_list[layer_idx].index_select(0, sorted_src),
+                )
+            self._packed_dirty_k[layer_idx][sorted_tgt] = False
+            self._packed_dirty_v[layer_idx][sorted_tgt] = False
