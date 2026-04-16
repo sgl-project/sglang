@@ -233,5 +233,80 @@ class TestReport(unittest.TestCase):
             self.assertAlmostEqual(json.loads(lines[1])["accuracy"]["acc"], 0.6)
 
 
+class TestRunBenchEvalEndToEnd(unittest.TestCase):
+    """End-to-end: aiohttp mock mimics SGLang /v1/completions; run_bench_eval
+    drives simple_evaluate through BenchServingLM and produces a merged report
+    with both accuracy and perf fields populated."""
+
+    def test_end_to_end_with_mock_server(self):
+        import asyncio as _asyncio
+        from aiohttp import web
+
+        async def completions(request):
+            resp = {
+                "id": "cmpl", "object": "text_completion",
+                "choices": [{"text": " reasoning... #### 42",
+                             "index": 0, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 8, "total_tokens": 12},
+            }
+            return web.Response(text=json.dumps(resp), content_type="application/json")
+
+        async def models(request):
+            return web.json_response({"data": [{"id": "mock-model"}]})
+
+        async def flush(request):
+            return web.Response(text="ok")
+
+        async def _run():
+            app = web.Application()
+            app.router.add_post("/v1/completions", completions)
+            app.router.add_get("/v1/models", models)
+            app.router.add_get("/flush_cache", flush)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = site._server.sockets[0].getsockname()[1]
+            try:
+                from sglang.bench_eval import run_bench_eval
+
+                with tempfile.TemporaryDirectory() as d:
+                    out_file = Path(d) / "out.jsonl"
+                    # run_bench_eval is synchronous and calls asyncio.run()
+                    # internally via BenchServingLM.generate_until. Run it in
+                    # a thread so it sees no running event loop.
+                    loop = _asyncio.get_running_loop()
+                    report = await loop.run_in_executor(
+                        None,
+                        lambda: run_bench_eval(
+                            task="gsm8k",
+                            base_url=f"http://127.0.0.1:{port}",
+                            backend="sglang-oai",
+                            model="mock-model",
+                            tokenizer_path="hf-internal-testing/llama-tokenizer",
+                            num_fewshot=0,
+                            limit=3,
+                            max_gen_toks=32,
+                            request_rate=float("inf"),
+                            max_concurrency=2,
+                            apply_chat_template=False,
+                            enable_thinking=False,
+                            output_file=str(out_file),
+                            include_per_doc=False,
+                        ),
+                    )
+                    return report, out_file.read_text()
+            finally:
+                await runner.cleanup()
+
+        report, jsonl = _asyncio.run(_run())
+        self.assertEqual(report["task"], "gsm8k")
+        # gsm8k produces exact_match metrics (possibly with filter tags).
+        self.assertTrue(any("exact_match" in k for k in report["accuracy"]))
+        self.assertIn("mean_ttft_ms", report["perf"])
+        self.assertEqual(report["n_samples"].get("effective"), 3)
+        self.assertEqual(len(jsonl.strip().splitlines()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
