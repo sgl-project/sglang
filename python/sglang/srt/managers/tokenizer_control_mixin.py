@@ -90,10 +90,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# (attr_name_prefix, response_type) pairs used to auto-generate the dispatch table.
-# The communicator instances themselves are created explicitly in init_communicators()
-# below so that IDEs can discover the `self.{prefix}_communicator` attributes.
-_COMMUNICATOR_DISPATCH_SPECS = [
+# Declarative spec: (attr_name_prefix, response_type[, mode])
+# Each entry creates self.{prefix}_communicator and registers
+# response_type -> communicator.handle_recv in the dispatch table.
+_COMMUNICATOR_SPECS = [
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
@@ -121,8 +121,8 @@ _COMMUNICATOR_DISPATCH_SPECS = [
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
-    ("get_load", GetLoadReqOutput),
-    ("get_loads", GetLoadsReqOutput),
+    ("get_load", GetLoadReqOutput, "watching"),
+    ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
 ]
 
@@ -134,44 +134,14 @@ class TokenizerControlMixin:
     """
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
-        dp = server_args.dp_size
-        send = self.send_to_scheduler
-        self.init_weights_update_group_communicator = FanOutCommunicator(send, dp)
-        self.destroy_weights_update_group_communicator = FanOutCommunicator(send, dp)
-        self.update_weights_from_distributed_communicator = FanOutCommunicator(send, dp)
-        self.init_weights_send_group_for_remote_instance_communicator = (
-            FanOutCommunicator(send, dp)
-        )
-        self.send_weights_to_remote_instance_communicator = FanOutCommunicator(send, dp)
-        self.update_weights_from_tensor_communicator = FanOutCommunicator(send, dp)
-        self.update_weights_from_ipc_communicator = FanOutCommunicator(send, dp)
-        self.get_weights_by_name_communicator = FanOutCommunicator(send, dp)
-        self.release_memory_occupation_communicator = FanOutCommunicator(send, dp)
-        self.resume_memory_occupation_communicator = FanOutCommunicator(send, dp)
-        self.check_weights_communicator = FanOutCommunicator(send, dp)
-        self.slow_down_communicator = FanOutCommunicator(send, dp)
-        self.flush_cache_communicator = FanOutCommunicator(send, dp)
-        self.add_external_corpus_communicator = FanOutCommunicator(send, dp)
-        self.remove_external_corpus_communicator = FanOutCommunicator(send, dp)
-        self.list_external_corpora_communicator = FanOutCommunicator(send, dp)
-        self.clear_hicache_storage_communicator = FanOutCommunicator(send, dp)
-        self.attach_hicache_storage_communicator = FanOutCommunicator(send, dp)
-        self.detach_hicache_storage_communicator = FanOutCommunicator(send, dp)
-        self.profile_communicator = FanOutCommunicator(send, dp)
-        self.get_internal_state_communicator = FanOutCommunicator(send, dp)
-        self.set_internal_state_communicator = FanOutCommunicator(send, dp)
-        self.expert_distribution_communicator = FanOutCommunicator(send, dp)
-        self.update_lora_adapter_communicator = FanOutCommunicator(send, dp)
-        self.get_load_communicator = FanOutCommunicator(send, dp, mode="watching")
-        self.get_loads_communicator = FanOutCommunicator(send, dp, mode="watching")
-        self.dumper_control_communicator = FanOutCommunicator(send, dp)
-
-        self._result_dispatcher += TypeBasedDispatcher(
-            [
-                (resp_type, getattr(self, f"{name}_communicator").handle_recv)
-                for name, resp_type in _COMMUNICATOR_DISPATCH_SPECS
-            ]
-        )
+        dispatch_pairs = []
+        for spec in _COMMUNICATOR_SPECS:
+            name, resp_type = spec[0], spec[1]
+            mode = spec[2] if len(spec) > 2 else "queueing"
+            comm = FanOutCommunicator(self.send_to_scheduler, server_args.dp_size, mode)
+            setattr(self, f"{name}_communicator", comm)
+            dispatch_pairs.append((resp_type, comm.handle_recv))
+        self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
