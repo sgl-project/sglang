@@ -41,6 +41,17 @@ register_cuda_ci(est_time=602, suite="stage-b-test-1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
+VIDEO_TEST_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/videos/jobs_presenting_ipod.mp4"
+
+# Keep video test inputs intentionally tiny so processor_output/precomputed paths
+# stay well below model context limits and fit typical CI GPU memory budgets.
+VIDEO_PROCESSOR_KWARGS = {
+    "do_sample_frames": True,
+    "num_frames": 8,
+    "min_pixels": 28 * 28,
+    "max_pixels": 28 * 28 * 64,
+}
+VIDEO_TEST_MAX_NEW_TOKENS = 64
 
 
 class VLMInputTestBase:
@@ -248,6 +259,186 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
 
     def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
+
+
+class VideoVLMInputTestBase:
+    model_path = None
+    chat_template = None
+    processor = None
+    visual = None
+
+    @classmethod
+    def setUpClass(cls):
+        assert cls.model_path is not None, "Set model_path in subclass"
+        assert cls.chat_template is not None, "Set chat_template in subclass"
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.video_url = VIDEO_TEST_URL
+
+        response = requests.get(cls.video_url, timeout=30)
+        response.raise_for_status()
+        # Guard against fetching an HTML error page from remote hosts.
+        # MP4 should contain an ftyp box near the beginning.
+        if b"ftyp" not in response.content[:64]:
+            raise RuntimeError(
+                f"Invalid video payload fetched from {cls.video_url}; missing MP4 ftyp header."
+            )
+        cls.video_bytes = BytesIO(response.content)
+        cls.video_bytes.seek(0)
+
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True, use_fast=True
+        )
+        _fix_added_tokens_encoding(cls.processor.tokenizer)
+        cls._init_visual()
+
+    @classmethod
+    def _init_visual(cls):
+        raise NotImplementedError
+
+    def setUp(self):
+        self.engine = Engine(
+            model_path=self.model_path,
+            chat_template=self.chat_template,
+            device=self.device.type,
+            mem_fraction_static=0.8,
+            enable_multimodal=True,
+            disable_cuda_graph=True,
+            trust_remote_code=True,
+        )
+
+    def tearDown(self):
+        self.engine.shutdown()
+
+    def verify_response(self, output):
+        assert len(output["text"].strip()) > 0, output
+
+    def get_completion_request(self) -> ChatCompletionRequest:
+        json_structure = {
+            "model": self.model_path,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video_url", "video_url": {"url": self.video_url}},
+                        {
+                            "type": "text",
+                            "text": "Describe what you see in this video.",
+                        },
+                    ],
+                }
+            ],
+        }
+        return ChatCompletionRequest.model_validate_json(json.dumps(json_structure))
+
+    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None):
+        if req is None:
+            req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+
+        # Keep HF processor input in a supported canonical form.
+        # Passing nested VideoDecoderWrapper objects can fail in HF video_utils.
+        inputs = self.processor(
+            text=[text],
+            videos=[self.video_url],
+            videos_kwargs=VIDEO_PROCESSOR_KWARGS,
+            return_tensors="pt",
+        ).to(self.device)
+        return inputs, text
+
+    async def test_accepts_raw_video(self):
+        req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+
+        self.video_bytes.seek(0)
+        video_bytes = self.video_bytes.getvalue()
+
+        output = await self.engine.async_generate(
+            prompt=text,
+            video_data=[video_bytes],
+            sampling_params=dict(
+                temperature=0.0, max_new_tokens=VIDEO_TEST_MAX_NEW_TOKENS
+            ),
+        )
+        self.verify_response(output)
+
+    async def test_accepts_video_precomputed_embeddings(self):
+        req = self.get_completion_request()
+        processor_output, _ = self.get_processor_output(req=req)
+
+        with torch.inference_mode():
+            precomputed_embeddings = self.__class__.visual(processor_output)
+
+        output = await self.engine.async_generate(
+            input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
+            video_data=[
+                self._precomputed_video_data(processor_output, precomputed_embeddings)
+            ],
+            sampling_params=dict(
+                temperature=0.0, max_new_tokens=VIDEO_TEST_MAX_NEW_TOKENS
+            ),
+        )
+        self.verify_response(output)
+
+    async def test_accepts_video_processor_output(self):
+        req = self.get_completion_request()
+        processor_output, _ = self.get_processor_output(req=req)
+
+        with torch.inference_mode():
+            precomputed_embeddings = self.__class__.visual(processor_output)
+
+        output = await self.engine.async_generate(
+            input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
+            video_data=[
+                self._processor_output_video_data(
+                    processor_output, precomputed_embeddings
+                )
+            ],
+            sampling_params=dict(
+                temperature=0.0, max_new_tokens=VIDEO_TEST_MAX_NEW_TOKENS
+            ),
+        )
+        self.verify_response(output)
+
+    def _precomputed_video_data(self, processor_output, precomputed_embeddings):
+        return {
+            "video_grid_thw": processor_output.get("video_grid_thw"),
+            "format": "precomputed_embedding",
+            "feature": precomputed_embeddings,
+            "modality": "VIDEO",
+        }
+
+    def _processor_output_video_data(self, processor_output, precomputed_embeddings):
+        return {
+            "video_grid_thw": processor_output.get("video_grid_thw"),
+            "format": "processor_output",
+            "precomputed_embeddings": precomputed_embeddings,
+            "modality": "VIDEO",
+        }
+
+
+class TestQwenVLUnderstandsVideo(
+    VideoVLMInputTestBase, unittest.IsolatedAsyncioTestCase
+):
+    model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
+    chat_template = "qwen2-vl"
+
+    @classmethod
+    def _init_visual(cls):
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            cls.model_path, torch_dtype=torch.bfloat16
+        ).eval()
+        visual = model.model.visual
+        cls.visual_model = visual.to(cls.device)
+
+        def visual_fn(processor_output):
+            pixel_values_videos = processor_output.get("pixel_values_videos")
+            video_grid_thw = processor_output.get("video_grid_thw")
+            out = cls.visual_model(pixel_values_videos, video_grid_thw)
+            return out.pooler_output if hasattr(out, "pooler_output") else out
+
+        cls.visual = visual_fn
 
 
 # Updated Kimi-VL test to use the new input format.

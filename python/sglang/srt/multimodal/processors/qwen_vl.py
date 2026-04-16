@@ -508,11 +508,27 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         video_metadata = None
         if base_output.videos:
-            videos_processed = [
-                await preprocess_video(video, video_config=self.video_config)
-                for video in base_output.videos
+            # Check if videos are already in processor_output or precomputed_embedding format.
+            # This allows users to:
+            # 1. Pass raw video files (VideoDecoderWrapper) - gets preprocessed
+            # 2. Pass precomputed_embedding format - dict with format="precomputed_embedding"
+            # 3. Pass processor_output format - dict with format="processor_output"
+            # See test/registered/vlm/test_vlm_input_format.py for usage examples
+            first_video = base_output.videos[0]
+            is_precomputed = isinstance(first_video, dict) and first_video.get(
+                "format"
+            ) in [
+                "processor_output",
+                "precomputed_embedding",
             ]
-            base_output.videos, video_metadata = map(list, zip(*videos_processed))
+
+            if not is_precomputed:
+                # Only preprocess raw video objects (VideoDecoderWrapper)
+                videos_processed = [
+                    await preprocess_video(video, video_config=self.video_config)
+                    for video in base_output.videos
+                ]
+                base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
         preprocess_time = time.perf_counter()
 
