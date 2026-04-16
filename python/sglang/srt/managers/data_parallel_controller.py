@@ -343,7 +343,13 @@ class DataParallelController:
             connected_clients = 0
             while connected_clients < expected_clients:
                 # Wait for client handshake
-                client_rank = rep_socket.recv().decode()
+                try:
+                    client_rank = rep_socket.recv().decode()
+                except Exception:
+                    logger.exception(
+                        "Failed to recv/decode handshake; keep server alive"
+                    )
+                    continue
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client
@@ -371,7 +377,13 @@ class DataParallelController:
         """
         while True:
             # Wait for client handshake
-            client_rank = rep_socket.recv().decode()
+            try:
+                client_rank = rep_socket.recv().decode()
+            except Exception:
+                logger.exception(
+                    "Failed to recv/decode handshake in reply thread; continue"
+                )
+                continue
             logger.debug(f"Received handshake from node {client_rank}")
 
             # Send worker ports to client

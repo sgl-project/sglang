@@ -492,7 +492,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             join_process_groups()
             broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank()
+                src_rank=self._get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=True
+                )
             )
             ElasticEPStateManager.instance().reset()
 
@@ -1457,12 +1459,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
     def maybe_recover_ep_ranks(self):
+        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
+        # synchronization, and this function is on the forward-path.
+        # This check only runs when `--elastic-ep-backend` is enabled, so the
+        # synchronization overhead does not propagate to other configs.
+        # Leave for future optimization of the elastic EP path.
         if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
             return
 
         tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
         tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
         tp_active_ranks &= tp_active_ranks_cpu
+        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
+        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
+        # tp-group index is the same as the global rank index.
         ranks_to_recover = [
             i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
         ]
@@ -1475,7 +1485,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.forward_pass_id = 0
             self.eplb_manager.reset_generator()
             broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank()
+                src_rank=self._get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=False
+                )
             )
             ElasticEPStateManager.instance().reset()
 
@@ -1487,9 +1499,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             logger.info(f"recover ranks {ranks_to_recover} done")
 
-    def _get_healthy_expert_location_src_rank(self) -> int:
+    def _get_healthy_expert_location_src_rank(
+        self, invoked_in_elastic_ep_rejoin_path: bool
+    ) -> int:
         world_group = get_world_group()
-        local_rejoin_flag = bool(self.server_args.elastic_ep_rejoin)
+        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
+        # A rank that was started as a rejoin rank may later act as a healthy
+        # rank in a subsequent recovery cycle.
+        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
         gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
 
         for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
