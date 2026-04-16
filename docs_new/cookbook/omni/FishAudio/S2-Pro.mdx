@@ -101,7 +101,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 S2 Pro uses a 3-stage pipeline:
 
-```
+```text Example
 Text input ──► Preprocessing ──► SGLang AR Engine ──► DAC Vocoder ──► Audio output
                  (CPU)              (GPU)               (GPU)
 ```

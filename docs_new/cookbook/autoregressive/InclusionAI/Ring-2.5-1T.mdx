@@ -129,7 +129,7 @@ print()
 <details>
 <summary>Output Example</summary>
 
-````
+````text Output
 We are asked: "Solve this problem step by step: What is 15% of 240?" This is a straightforward percentage calculation. We need to show step-by-step solution.
 
 We can compute 15% of 240 as (15/100)*240 = 0.15 * 240 = 36.
@@ -236,7 +236,7 @@ print(response.choices[0].message.tool_calls)
 
 **Output Example:**
 
-```
+```text Output
 [ChatCompletionMessageFunctionToolCall(id='call_770360e31d194ed79d32cd8c', function=Function(arguments='{"location": "Beijing"}', name='get_weather'), type='function', index=0)]
 ```
 
@@ -258,7 +258,7 @@ python3 benchmark/gsm8k/bench_sglang.py --temperature 1.2 --top-p 0.8 --max-new-
 ```
 
 - Test Result
-```
+```text Output
 Accuracy: 0.955
 Invalid: 0.010
 Latency: 615.833 s

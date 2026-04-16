@@ -81,7 +81,7 @@ For basic API usage and request examples, please refer to:
 
 #### 4.2.1 Reasoning Parser
 Server Command:
-```text Output
+```shell Command
     sglang serve \
     --model-path MiniMaxAI/MiniMax-M2 \
     --tp-size 4 \
@@ -90,7 +90,7 @@ Server Command:
     --mem-fraction-static 0.85
 ```
 Test Code:
-```text Output
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -202,7 +202,7 @@ Both methods confirm the result.
 ### 4.2.2 Tool Calling
 
 Server Command:
-```text Output
+```shell Command
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2 \
     --tp-size 4 \
@@ -211,7 +211,7 @@ sglang serve \
     --mem-fraction-static 0.85
 ```
 Test Code:
-```text Output
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -519,7 +519,7 @@ Max ITL (ms):                            986.14
 #### 5.2.1 GSM8K Benchmark
 
 - **Server Command**:
-```text Output
+```shell Command
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2 \
     --tp-size 4 \
@@ -528,7 +528,7 @@ sglang serve \
 ```
 
 - **Benchmark Command**:
-```text Output
+```shell Command
   python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 ```
 - **Result**:

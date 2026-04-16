@@ -111,7 +111,7 @@ print(response)
 ```
 
 #### API Response
-```shell Command
+```text Output
 {"id":"b61596ca71394dd699fd8abd4f650c44","object":"chat.completion","created":1765259019,"model":"default","choices":[{"index":0,"message":{"role":"assistant","content":"The image is a logo featuring the text \"SGL\" (in a bold, orange-brown font) alongside a stylized icon. The icon includes a network-like structure with circular nodes (suggesting connectivity or a tree/graph structure) and a tag with \"</>\" (a common symbol for coding, web development, or software). The color scheme uses warm orange-brown tones with a black background, giving it a tech-focused, modern aesthetic (likely representing a company, project, or tool related to software, web development, or digital technology).<|begin_of_box|>SGL logo (stylized text + network/coding icon)<|end_of_box|>","reasoning_content":"Okay, let's see. The image has a logo with the text \"SGL\" and a little icon on the left. The icon looks like a network or a tree structure with circles, and there's a tag with \"</>\" which is a common symbol for coding or web development. The colors are orange and brown tones, with a black background. So probably a logo for a company or project named SGL, maybe related to software, web development, or a tech company.","tool_calls":null},"logprobs":null,"finish_reason":"stop","matched_stop":151336}],"usage":{"prompt_tokens":2222,"total_tokens":2448,"completion_tokens":226,"prompt_tokens_details":null,"reasoning_tokens":0},"metadata":{"weight_version":"default"}}
 ```
 
@@ -152,7 +152,7 @@ print(response)
 ```
 
 #### API Response
-```shell Command
+```text Output
 {"id":"520e0a079e5d4b17b82a6af619315a97","object":"chat.completion","created":1765259029,"model":"default","choices":[{"index":0,"message":{"role":"assistant","content":"The image is a still from a presentation by a man on a stage. He is pointing to a small pocket on his jeans and asking the audience what the pocket is for. The video is being shared by Evan Carmichael. The man then reveals that the pocket is for an iPod Nano.","reasoning_content":"Based on the visual evidence in the video, here is a breakdown of what is being shown:\n\n*   **Subject:** The video features a man on a stage, giving a presentation. He is wearing a black t-shirt and dark jeans.\n*   **Action:** The man is pointing to a pocket on his jeans. He is asking the audience a question about the purpose of this pocket.\n*   **Context:** The presentation is being filmed, and the video is being shared by \"Evan Carmichael,\" a well-known motivational speaker and content creator. The source of the clip is credited to \"JoshuaG.\"\n*   **Reveal:** The man then reveals the answer to his question. He pulls a small, white, rectangular device out of the pocket. He identifies this device as an \"iPod Nano.\"\n\nIn summary, the image is a still from a presentation where a speaker is explaining the purpose of the small pocket found on many pairs of jeans.","tool_calls":null},"logprobs":null,"finish_reason":"stop","matched_stop":151336}],"usage":{"prompt_tokens":30276,"total_tokens":30532,"completion_tokens":256,"prompt_tokens_details":null,"reasoning_tokens":0},"metadata":{"weight_version":"default"}}
 ```
 
@@ -247,7 +247,7 @@ print(response.choices[0].message.content.strip())
 
 #### Output
 
-```shell Command
+```text Output
 The weather in Beijing today (November 7, 2025) is sunny with a temperature of 2°C.
 
 Yes, the tool returned an image (the SGL logo).
@@ -262,7 +262,7 @@ Yes, the tool returned an image (the SGL logo).
 python3 ./benchmark/gsm8k/bench_sglang.py
 ```
 #### Result Output
-```shell Command
+```text Output
 Accuracy: 0.925
 Invalid: 0.000
 Latency: 15.327 s
@@ -287,7 +287,7 @@ python3 -m sglang.bench_serving \
 ```
 
 #### Result Output
-```shell Command
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -335,7 +335,7 @@ python3 benchmark/mmmu/bench_sglang.py --response-answer-regex "<\|begin_of_box\
 ```
 
 #### Result Output
-```shell Command
+```text Output
 Benchmark time: 487.2229107860476
 answers saved to: ./answer_sglang.json
 Evaluating...

@@ -91,7 +91,7 @@ print(response.choices[0].message.content)
 
 **Example Output:**
 
-````
+````text Output
 Here's a Python function implementing binary search on a sorted list, with comprehensive type hints:
 
 ```python
@@ -187,7 +187,7 @@ print()
 
 **Example Output:**
 
-```
+```text Output
 A **stack** follows the **Last In, First Out (LIFO)** principle, meaning the last element added is the first one removed—operations like `push` (add) and `pop` (remove) occur at the same end, called the *top*. In contrast, a **queue** follows the **First In, First Out (FIFO)** principle, where elements are added at the *back* (enqueue) and removed from the *front* (dequeue), preserving the order of insertion. This structural difference makes stacks ideal for tasks like function call management and expression evaluation, while queues suit scheduling, buffering, and breadth-first traversal.
 ```
 
@@ -245,7 +245,7 @@ else:
 
 **Example Output:**
 
-```
+```text Output
 Tool: execute_code
 Arguments: {"code": "import math\nmath.factorial(10)"}
 ```
@@ -290,7 +290,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 1
 ```
 - Result:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -347,7 +347,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 16
 ```
 - Result:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -404,7 +404,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 100
 ```
 - Result:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -475,7 +475,7 @@ python3 -m sglang.bench_serving \
 
 - Result:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -534,7 +534,7 @@ python3 -m sglang.bench_serving \
 
 - Result:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -592,7 +592,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Result:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -652,7 +652,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Result:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -710,7 +710,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Result:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -768,7 +768,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Result:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -820,7 +820,7 @@ python benchmark/gsm8k/bench_sglang.py --port 30000
 
 - **Test Results:**
 
-```
+```text Output
 Accuracy: 0.965
 Invalid: 0.000
 Latency: 26.407 s
@@ -839,7 +839,7 @@ python3 bench_sglang.py --port 30000
 
 - **Test Results:**
 
-```
+```text Output
 subject: abstract_algebra, #q:100, acc: 0.780
 subject: anatomy, #q:135, acc: 0.807
 subject: astronomy, #q:152, acc: 0.921

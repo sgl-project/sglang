@@ -130,7 +130,7 @@ print()
 
 **Output Example:**
 
-```
+```text Output
 =============== Thinking =================
 Okay, let's see. I need to find 15% of 240. Hmm, percentages. Right, "percent" means per hundred, so 15% is 15 per 100, or 15/100. To find a percentage of a number, I think you multiply the number by the percentage as a decimal. So first, maybe convert 15% to a decimal. To convert a percentage to a decimal, you divide by 100. So 15 divided by 100 is 0.15. Then, multiply that by 240. Let me check that. So 0.15 times 240. Let's calculate that. Maybe break it down. 10% of 240 is 24, because 10% is just moving the decimal one place left, so 240 becomes 24. Then 5% would be half of 10%, so half of 24 is 12. So 10% + 5% = 15%, so 24 + 12 = 36. Oh, that's another way to do it. Let me verify with the multiplication. 0.15 * 240. Let's do 240 * 0.1 = 24, 240 * 0.05 = 12, so 24 + 12 = 36. Yep, that works. Alternatively, 240 * 15 = 3600, then divide by 100, which is 36. Because 15% of 240 is (15/100)*240 = (15*240)/100. 15*240: 10*240=2400, 5*240=1200, so 2400+1200=3600. Then 3600/100=36. So that's 36. So the answer should be 36. Let me make sure. 15% of 240. If I take 240 and multiply by 0.15, 240*0.15. Let's compute 240*0.1=24, 240*0.05=12, so 24+12=36. Yep, that's right. So 15% of 240 is 36.
 
@@ -238,7 +238,7 @@ print()
 
 **Output Example:**
 
-```
+```text Output
 To find **15% of 240**, follow these steps:
 
 ---
@@ -391,7 +391,7 @@ print()
 
 **Output Example:**
 
-```
+```text Output
 <tool_call>
 {"name": "get_weather", "arguments": {"location": "Beijing"}}
 </tool_call>
@@ -493,7 +493,7 @@ print()
 
 **Output Example:**
 
-```
+```text Output
 =============== Thinking =================
 Okay, the user is asking for the weather in Beijing. Let me check the available tools. There's a get_weather function that requires location and optionally unit. The location is needed, so I need to provide Beijing as the location. The unit is optional, but the user didn't specify Celsius or Fahrenheit. Since the default might be Celsius, but maybe I should check if the parameters require unit. Wait, the required field is only location, so unit is optional. So I can just call get_weather with location "Beijing" and not include the unit. Let me confirm the parameters. The parameters for get_weather have location as required, and unit is an enum with celsius or fahrenheit, but not required. So the correct call is to send location as Beijing, and omit unit. So the tool call should be {"name": "get_weather", "arguments": {"location": "Beijing"}}.
 
@@ -554,14 +554,14 @@ Qwen3-Next natively supports context lengths of up to 262,144 tokens. For conver
 
 **Qwen3-Next-80B-A3B-Instruct**
 
-```
+```shell Command
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct    --tp 8   --host 0.0.0.0   --port 8000 --json-model-override-args '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}' --context-length 1010000
 
 ```
 
 **Qwen3-Next-80B-A3B-Thinking**
 
-```
+```shell Command
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Thinking   --reasoning-parser qwen3     --tp 8   --host 0.0.0.0   --port 8000 --json-model-override-args '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}' --context-length 1010000
 
 ```
@@ -583,7 +583,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation on 
 
 - Server Command:
 
-```
+```shell Command
 python -m sglang.launch_server \
   --model Qwen/Qwen3-Next-80B-A3B-Instruct \
   --tp 8
@@ -600,7 +600,7 @@ python3 -m sglang.bench_serving \
 
 - Test Results:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -643,7 +643,7 @@ Max ITL (ms):                            10.07
 
 - Server Command:
 
-```
+```shell Command
 python -m sglang.launch_server \
   --model Qwen/Qwen3-Next-80B-A3B-Instruct \
   --tp 8 \
@@ -660,7 +660,7 @@ python3 -m sglang.bench_serving \
 
 **Test Results:**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf

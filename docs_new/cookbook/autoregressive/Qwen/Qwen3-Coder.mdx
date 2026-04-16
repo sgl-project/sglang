@@ -94,7 +94,7 @@ print(response.choices[0].message.content)
 
 **Example Output:**
 
-````
+````text Output
 ```python
 from typing import List, Optional, TypeVar
 
@@ -273,7 +273,7 @@ else:
 
 **Example Output:**
 
-```
+```text Output
 Tool: execute_code
 Arguments: {"code": "def factorial(n):\n    if n == 0 or n == 1:\n        return 1\n    else:\n        return n * factorial(n-1)\n\nresult = factorial(10)\nresult"}
 ```
@@ -323,7 +323,7 @@ python3 -m sglang.bench_serving \
 
 - Test Results:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -380,7 +380,7 @@ python3 -m sglang.bench_serving \
 
 - Test Results:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -437,7 +437,7 @@ python3 -m sglang.bench_serving \
 
 - Test Results:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf

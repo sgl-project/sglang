@@ -1245,7 +1245,7 @@ Median ITL (ms):                         29.31
 ### 5.3 Logits correctness validation
 
 **gemma-4-E2B-it**
-```text Output
+```shell Command
 $ python -m sglang.bench_one_batch --correct --model gg-hf-gg/gemma-4-E2B-it ....
 prefill logits (final): tensor([[-25.3063,  -2.5718, -10.3674,  ..., -25.3779, -25.5181, -25.2337]],
        device='cuda:0')
@@ -1260,7 +1260,7 @@ prefill logits (final) tensor([-25.3281,  -2.1367, -10.2266,  ..., -25.4375, -25
 
 **gemma-4-E4B-it**
 
-```text Output
+```shell Command
 $ python -m sglang.bench_one_batch --correct --model gg-hf-gg/gemma-4-E4B-it ....
 prefill logits (final): tensor([[-17.6478,   7.9901,  -5.6505,  ..., -17.5658, -17.6478, -17.7293]],
        device='cuda:0')
@@ -1274,7 +1274,7 @@ prefill logits (final) tensor([-17.5625,   8.0469,  -5.5742,  ..., -17.4688, -17
 ```
 
 **gemma-4-31B-it**
-```text Output
+```shell Command
 $ python -m sglang.bench_one_batch --correct --model gg-hf-gg/gemma-4-31B-it ....
 prefill logits (final): tensor([[-2.0748,  1.1245, -7.4356,  ..., -2.1059, -2.1525, -2.2303]],
        device='cuda:0')
@@ -1285,6 +1285,6 @@ $ python scripts/playground/reference_hf.py --model-path gg-hf-gg/gemma-4-31B-it
 prefill logits (final) tensor([-2.1133,  1.2656, -7.4766,  ..., -2.1523, -2.2012, -2.2695],
        device='cuda:0', dtype=torch.float16)
 ....
-````
+```
 
 </details>

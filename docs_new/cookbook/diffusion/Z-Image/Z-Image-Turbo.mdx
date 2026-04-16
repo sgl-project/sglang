@@ -211,21 +211,21 @@ Test Environment:
 
 **Server Command**:
 
-```
+```shell Command
 sglang serve --model-path Tongyi-MAI/Z-Image-Turbo \
     --ulysses-degree=1 --ring-degree=1 --port 30000
 ```
 
 **Benchmark Command**:
 
-```
+```shell Command
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
 ```
 
 **Result**:
 
-```
+```text Output
 ================= Serving Benchmark Result =================
 Task:                                    text-to-image
 Model:                                   Tongyi-MAI/Z-Image-Turbo
@@ -251,14 +251,14 @@ Peak Memory Median (MB):                 30689.20
 
 **Benchmark Command**:
 
-```
+```shell Command
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
 ```
 
 **Result**:
 
-```
+```text Output
 ================= Serving Benchmark Result =================
 Task:                                    text-to-image
 Model:                                   Tongyi-MAI/Z-Image-Turbo

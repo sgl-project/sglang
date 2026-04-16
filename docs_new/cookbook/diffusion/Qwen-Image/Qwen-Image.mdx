@@ -201,14 +201,14 @@ Test Environment:
 
 **Server Command**:
 
-```text Output
+```shell Command
 sglang serve --model-path Qwen/Qwen-Image \
     --ulysses-degree=1 --ring-degree=1 --port 30000
 ```
 
 **Benchmark Command**:
 
-```text Output
+```shell Command
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     --backend sglang-image --dataset vbench --task text-to-image --num-prompts 1 --max-concurrency 1
 ```
@@ -241,7 +241,7 @@ Peak Memory Median (MB):                 48018.83
 
 **Benchmark Command**:
 
-```text Output
+```shell Command
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     --backend sglang-image --dataset vbench --task text-to-image --num-prompts 20 --max-concurrency 20
 ```
