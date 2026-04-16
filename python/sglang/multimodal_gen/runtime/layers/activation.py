@@ -123,10 +123,27 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
 
+class _FlyDSLGeLUTanh(nn.Module):
+    """FlyDSL-accelerated GeLU(tanh) for ROCm/HIP."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != torch.bfloat16:
+            return F.gelu(x, approximate="tanh")
+        from sglang.jit_kernel.diffusion.flydsl.gelu import flydsl_gelu_tanh
+
+        return flydsl_gelu_tanh(x)
+
+
+def _gelu_pytorch_tanh_factory():
+    if _is_hip:
+        return _FlyDSLGeLUTanh()
+    return nn.GELU(approximate="tanh")
+
+
 _ACTIVATION_REGISTRY = {
     "gelu": nn.GELU,
     "gelu_new": NewGELU,
-    "gelu_pytorch_tanh": lambda: nn.GELU(approximate="tanh"),
+    "gelu_pytorch_tanh": _gelu_pytorch_tanh_factory,
     "relu": nn.ReLU,
     "silu": nn.SiLU,
     "quick_gelu": QuickGELU,

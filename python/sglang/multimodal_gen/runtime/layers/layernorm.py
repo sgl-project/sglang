@@ -422,6 +422,8 @@ class _ScaleResidualNormScaleShift(CustomOp):
             self.eps,
         )
 
+    _FLYDSL_BLOCK_VEC = 5120  # WARP_SIZE(64) * NUM_WAVES(10) * VEC(8)
+
     def forward_hip(
         self,
         residual: torch.Tensor,
@@ -430,24 +432,22 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        D = x.shape[-1]
+        if D % self._FLYDSL_BLOCK_VEC != 0:
+            return self.forward_native(residual, x, gate, shift, scale)
+
         from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
             flydsl_fused_residual_norm_scale_shift,
         )
 
-        _c = getattr(type(self), "_fc", 0) + 1
-        type(self)._fc = _c
-        if _c == 1:
-            print(f"[VERIFY] FlyDSL ACTIVE, call count will follow", flush=True)
-        if _c % 200 == 0:
-            print(f"[VERIFY] FlyDSL calls so far: {_c}", flush=True)
         return flydsl_fused_residual_norm_scale_shift(
             residual.contiguous(),
             x.contiguous(),
             gate.contiguous() if isinstance(gate, torch.Tensor) else None,
             _ensure_contiguous(getattr(self.norm, "weight", None)),
             _ensure_contiguous(getattr(self.norm, "bias", None)),
-            scale,
-            shift,
+            scale.contiguous(),
+            shift.contiguous(),
             self.norm_type,
             self.eps,
         )
@@ -556,10 +556,32 @@ class _NormScaleShift(CustomOp):
             self.eps,
         )
 
-    def forward_hip(self, *args, **kwargs):
-        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    _FLYDSL_BLOCK_VEC = 5120  # WARP_SIZE(64) * NUM_WAVES(10) * VEC(8)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        D = x.shape[-1]
+        if D % self._FLYDSL_BLOCK_VEC != 0:
+            return self.forward_native(x, shift, scale)
+
+        from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+            flydsl_norm_scale_shift,
+        )
+
+        result = flydsl_norm_scale_shift(
+            x.contiguous(),
+            _ensure_contiguous(getattr(self.norm, "weight", None)),
+            _ensure_contiguous(getattr(self.norm, "bias", None)),
+            scale.contiguous(),
+            shift.contiguous(),
+            self.norm_type,
+            self.eps,
+        )
+        return result.to(x.dtype)
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
