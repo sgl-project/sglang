@@ -440,22 +440,28 @@ class SDARInterleavedWorker:
         # ---------------------------------------------------------------
         for i, req in enumerate(batch.reqs):
             # kv_allocated: we committed all block_size slots to the KV pool in _commit_block
-            # kv_committed: based on actual output tokens consumed, so cache_finished_req
-            # correctly handles the per-request token sequences.
-            # release_kv_cache will free slots in [kv_committed_len, kv_allocated_len)
-            # automatically (the "overallocated" range), which covers any tail slots from
-            # blocks where EOS/max_new_tokens was hit before the full block was used.
+            # kv_committed: only the tokens actually added in this block (kv_before + num_added).
+            #
+            # IMPORTANT: do NOT use (len(origin_ids) + len(output_ids)) for kv_committed because
+            # output_ids[0] was produced by prefill and its KV is already counted in the prefill
+            # allocation; using raw output_ids length would be off by 1 and cause cache_finished_req
+            # to read req_to_token_pool one slot past the end (garbage → double-count in evictable).
+            #
+            # release_kv_cache frees slots in [kv_committed_len, kv_allocated_len) automatically,
+            # which covers the trailing slots from blocks where EOS / max_new_tokens fired early.
             kv_before = req.kv_committed_len  # KV length before this block
+            output_before = len(req.output_ids)
             block_ids = block_tokens[i].tolist()
             for tok in block_ids:
                 req.output_ids.append(tok)
                 req.check_finished()
                 if req.finished():
                     break
-            # All block_size slots were allocated and written to KV cache
+            num_added = len(req.output_ids) - output_before
+            # All block_size slots were permanently written to both model KV caches
             req.kv_allocated_len = kv_before + block_size
-            # Only the consumed tokens count as "committed" for radix-cache insertion
-            req.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
+            # Only count the tokens we actually consumed (avoids off-by-one vs output_ids length)
+            req.kv_committed_len = kv_before + num_added
 
         next_token_ids = block_tokens[:, -1]
         print(f"[SDAR_DBG] decode done: accepted={total_accepted}, next_tok={next_token_ids.tolist()}, seq_lens={batch.seq_lens.tolist()}, out_ids_len={[len(r.output_ids) for r in batch.reqs]}, finished={[r.finished() for r in batch.reqs]}", flush=True)
