@@ -89,7 +89,11 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        if is_npu() and self.quant_config is None:
+        if (
+            is_npu()
+            and self.quant_config is None
+            and get_global_server_args().quantization is not None
+        ):
             # ascend mtp unquant
             os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "1"
             os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
