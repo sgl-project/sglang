@@ -37,14 +37,47 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
 - The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
 - BF16 model always requires **2x GPUs** compared to FP8 on NVIDIA hardware.
 
-| Hardware | FP8 | BF16 |
-| -------- | --- | ---- |
-| H100     | tp=16 | tp=32 |
-| H200     | tp=8  | tp=16 |
-| B200     | tp=8  | tp=16 |
-| GB300    | tp=4  | —     |
-| MI300X/MI325X | tp=8 | tp=8 |
-| MI355X   | tp=8 | tp=8 |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>FP8</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H100</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=32</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=16</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=16</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GB300</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI300X/MI325X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
+    </tr>
+  </tbody>
+</table>
 
 - **AMD GPUs**: Both BF16 and FP8 checkpoints are supported on MI300X/MI325X/MI355X at tp=8. Use `--nsa-prefill-backend tilelang --nsa-decode-backend tilelang` for the NSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). FP8 uses approximately half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). EAGLE speculative decoding is not currently supported on AMD for GLM-5.1.
 - **GB300**: Only the FP8 checkpoint is recommended on GB300, with `tp=4`. For high-throughput DP attention on GB300, use `--dp 4`.
@@ -55,7 +88,7 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
 
 Deploy GLM-5.1 with the following command (FP8 on H200, all features enabled):
 
-```shell
+```shell Command
 SGLANG_ENABLE_SPEC_V2=1 sglang serve \
   --model-path zai-org/GLM-5.1-FP8 \
   --tp 8 \
@@ -76,7 +109,7 @@ The following ROCm commands are additional options for AMD GPUs and do not repla
 
 #### FP8 (Recommended)
 
-```shell
+```shell Command
 sglang serve \
   --model-path zai-org/GLM-5.1-FP8 \
   --tp 8 \
@@ -94,7 +127,7 @@ sglang serve \
 
 #### BF16
 
-```shell
+```shell Command
 sglang serve \
   --model-path zai-org/GLM-5.1 \
   --tp 8 \
@@ -129,7 +162,7 @@ To disable thinking and use Instruct mode, pass `chat_template_kwargs` at reques
 
 Thinking mode is enabled by default. The model will reason step-by-step before answering, and the thinking process is returned via `reasoning_content`:
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -240,7 +273,7 @@ If you don't want to multiply by 0.15 directly, you can break 15% down into 10% 
 
 To disable thinking and get a direct response, pass `{"enable_thinking": false}` via `chat_template_kwargs`:
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -285,7 +318,7 @@ GLM-5.1 supports tool calling capabilities. Enable the tool call parser during d
 
 **Python Example (with Thinking Process):**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -395,7 +428,7 @@ Tool Call: None
 
 #### 5.1.1 Latency Benchmark
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model zai-org/GLM-5.1-FP8 \
@@ -450,7 +483,7 @@ Max ITL (ms):                            29.50
 
 #### 5.1.2 Throughput Benchmark
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model zai-org/GLM-5.1-FP8 \
@@ -508,7 +541,7 @@ Max ITL (ms):                            1307.02
 #### 5.2.1 GSM8K Benchmark
 
 - Benchmark Command
-```bash
+```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --port 30000
 ```
 
@@ -523,7 +556,7 @@ Output throughput: 642.044 token/s
 #### 5.2.2 MMLU Benchmark
 
 - Benchmark Command
-```bash
+```bash Command
 python3 benchmark/mmlu/bench_sglang.py --port 30000
 ```
 
@@ -596,11 +629,11 @@ Average accuracy: 0.877
 
 - MI325/MI35x Test (GLM-5.1 BF16, `tp=8`, TileLang NSA backends)
 
-```bash
+```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --num-questions 200
 ```
 
-```text
+```text Output
 Accuracy: 0.970
 Invalid: 0.000
 ```

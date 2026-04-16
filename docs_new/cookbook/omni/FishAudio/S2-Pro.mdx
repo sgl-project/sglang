@@ -29,7 +29,7 @@ S2 Pro uses `sglang-omni`, an ecosystem project for SGLang. Start with the Docke
 
 ### 2.1 Docker
 
-```bash
+```bash Command
 docker pull frankleeeee/sglang-omni:dev
 
 docker run -it --shm-size 32g --gpus all frankleeeee/sglang-omni:dev /bin/zsh
@@ -37,7 +37,7 @@ docker run -it --shm-size 32g --gpus all frankleeeee/sglang-omni:dev /bin/zsh
 
 ### 2.2 Install sglang-omni (inside Docker)
 
-```bash
+```bash Command
 git clone https://github.com/sgl-project/sglang-omni.git
 cd sglang-omni
 uv venv .venv -p 3.12 && source .venv/bin/activate
@@ -51,7 +51,7 @@ S2 Pro can be served via an OpenAI-compatible HTTP server or explored interactiv
 
 ### 3.1 Server
 
-```bash
+```bash Command
 python -m sglang_omni.cli.cli serve \
     --model-path fishaudio/s2-pro \
     --config examples/configs/s2pro_tts.yaml \
@@ -62,7 +62,7 @@ python -m sglang_omni.cli.cli serve \
 
 We provide a Gradio-based interactive playground. We highly recommend using the playground since audio data is hard to interact with by CLI.
 
-```bash
+```bash Command
 ./playground/tts/start.sh
 ```
 
@@ -76,7 +76,7 @@ Generate speech from text using the OpenAI-compatible `/v1/audio/speech` endpoin
 Without a reference audio clip, the generated voice will use a default voice. Provide a reference audio for voice cloning.
 </Note>
 
-```bash
+```bash Command
 curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{"input": "Hello, how are you?"}' \
@@ -87,7 +87,7 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 Provide a reference audio file and its transcript for high-quality voice cloning:
 
-```bash
+```bash Command
 curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
@@ -116,13 +116,54 @@ Text input ──► Preprocessing ──► SGLang AR Engine ──► DAC Voco
 
 Evaluated on the full seed-tts-eval EN testset (1,088 samples) on a single H200 GPU.
 
-| Metric | BS=1 | BS=2 | BS=4 | BS=8 |
-|---|---|---|---|---|
-| Tok/s (mean) | 63.3 | 45.8 | 31.9 | 19.6 |
-| RTF (mean) | 0.340 | 0.473 | 0.676 | 1.097 |
-| Latency (mean) | 1.33s | 1.80s | 2.69s | 4.36s |
-| TTFT (mean) | 19.6 ms | 22.0 ms | 31.6 ms | 50.7 ms |
-| TTFB (mean) | 172.8 ms | 249.9 ms | 319.1 ms | 509.6 ms |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Metric</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BS=1</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>BS=2</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BS=4</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>BS=8</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Tok/s (mean)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>63.3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>45.8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>31.9</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>19.6</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>RTF (mean)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.340</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.473</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.676</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1.097</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Latency (mean)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.33s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1.80s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.69s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4.36s</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TTFT (mean)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>19.6 ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>22.0 ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>31.6 ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>50.7 ms</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TTFB (mean)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>172.8 ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>249.9 ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>319.1 ms</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>509.6 ms</td>
+    </tr>
+  </tbody>
+</table>
 
 ## 7. SGLang Omni Optimizations
 
@@ -151,7 +192,7 @@ SGLang's default RoPE implementation precomputes `cos_sin_cache` in float32, but
 
 It's worth attention for any future engineering for fish audio inference infrastructure, since it's uncommon and hard to debug when accuracy of inference engine is higher than the precision of the model. Below is a simple fix once problem identified.
 
-```python
+```python Example
 def _truncate_rope_to_bf16(model: torch.nn.Module) -> None:
     for module in model.modules():
         if hasattr(module, "cos_sin_cache"):

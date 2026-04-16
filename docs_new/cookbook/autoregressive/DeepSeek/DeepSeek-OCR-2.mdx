@@ -1,5 +1,7 @@
 ---
-title: "DeepSeek-OCR-2"
+title: DeepSeek-OCR-2
+metatags:
+    description: "Deploy DeepSeek-OCR-2 with SGLang - high-accuracy text extraction from images and documents for OCR tasks."
 ---
 
 import { DeepSeekOCR2Deployment } from '/src/snippets/autoregressive/deepseek-ocr-v2-deployment.jsx';
@@ -26,7 +28,7 @@ For more details, please refer to the [official DeepSeek-OCR-2 repository](https
 
 ## 2. SGLang Installation
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -38,11 +40,11 @@ This section provides deployment configurations optimized for different hardware
 
 <DeepSeekOCR2Deployment />
 
-**Note**: DeepSeek-OCR-2 has ~3.58B parameters and easily fits on a single modern GPU. For low-latency serving, no model parallelism is needed. For high-throughput requirements, consider using data parallelism with the SGLang Model Gateway — see [DP, DPA and SGLang DP Router](https://docs.sglang.io/advanced_features/dp_dpa_smg_guide.html) for more details.
+**Note**: DeepSeek-OCR-2 has ~3.58B parameters and easily fits on a single modern GPU. For low-latency serving, no model parallelism is needed. For high-throughput requirements, consider using data parallelism with the SGLang Model Gateway — see [DP, DPA and SGLang DP Router](../../../docs/advanced_features/sgl_model_gateway) for more details.
 
 ### 3.2 Configuration Tips
 
-For more detailed configuration tips, please refer to [DeepSeek V3/V3.1/R1 Usage](https://docs.sglang.io/basic_usage/deepseek_v3.html).
+For more detailed configuration tips, please refer to [DeepSeek V3/V3.1/R1 Usage](../../../docs/basic_usage/deepseek_v3).
 
 ## 4. Model Invocation
 
@@ -50,7 +52,7 @@ For more detailed configuration tips, please refer to [DeepSeek V3/V3.1/R1 Usage
 
 **OpenAI-compatible request example**
 
-```python
+```python Example
 import requests
 
 url = "http://localhost:30000/v1/chat/completions"
@@ -74,7 +76,7 @@ print(response.text)
 ```
 
 **Reference**
-- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
 
 ### 4.2 Recommended Prompts
 
@@ -82,14 +84,14 @@ The following prompts are recommended by the [official model card](https://huggi
 
 **Structured document conversion** — extracts text while preserving layout:
 
-```
+```text Output
 <image>
 <|grounding|>Convert the document to markdown.
 ```
 
 **Free-form OCR** — extracts without layouts:
 
-```
+```text Output
 <image>
 Free OCR.
 ```
@@ -105,13 +107,13 @@ Free OCR.
 - Tensor Parallelism: 1
 - sglang version: 0.0.0.dev1+g93fca0bbc
 
-We use SGLang's built-in benchmarking tool to conduct performance evaluation on the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset. This dataset contains real conversation data and can better reflect performance in actual use scenarios. To simulate real-world usage patterns, we configure each request with 1024 input tokens and 1024 output tokens, representing typical medium-length conversations with detailed responses. For more details on how to perform evaluation, see [Evaluating New Models with SGLang](https://docs.sglang.io/developer_guide/evaluating_new_models.html).
+We use SGLang's built-in benchmarking tool to conduct performance evaluation on the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset. This dataset contains real conversation data and can better reflect performance in actual use scenarios. To simulate real-world usage patterns, we configure each request with 1024 input tokens and 1024 output tokens, representing typical medium-length conversations with detailed responses. For more details on how to perform evaluation, see [Evaluating New Models with SGLang](../../../docs/developer_guide/evaluating_new_models).
 
 #### 5.1.1 Latency-Sensitive Benchmark
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 sglang serve \
   --model-path deepseek-ai/DeepSeek-OCR-2 \
   --enable-multimodal \
@@ -121,7 +123,7 @@ sglang serve \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 0.0.0.0 \
@@ -135,7 +137,7 @@ python3 -m sglang.bench_serving \
 
 - **Test Results:**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -179,7 +181,7 @@ Max ITL (ms):                            4.32
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 sglang serve \
   --model-path deepseek-ai/DeepSeek-OCR-2 \
   --enable-multimodal \
@@ -193,7 +195,7 @@ sglang serve \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 0.0.0.0 \
@@ -207,7 +209,7 @@ python3 -m sglang.bench_serving \
 
 - **Test Results:**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf

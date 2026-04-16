@@ -1,5 +1,7 @@
 ---
-title: "Llama 4"
+title: Llama 4
+metatags:
+    description: "Deploy Llama 4 Scout and Maverick with SGLang - Meta's latest generation open-source LLMs with industry-leading performance."
 ---
 
 import { Llama4ScoutDeployment } from '/src/snippets/autoregressive/llama4-scout-deployment.jsx';
@@ -25,7 +27,7 @@ For more details, please refer to the official llama4 Repository:https://www.lla
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -45,17 +47,17 @@ This section provides a progressive guide from quick deployment to performance o
 
 For basic API usage and request examples, please refer to:
 
-- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
-- [SGLang OpenAI Vision API Guide](https://docs.sglang.ai/basic_usage/openai_api_vision.html)
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+- [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision)
 
 ### 4.2 Advanced Usage
 
 #### 4.2.1 Launch the docker
-```shell
+```shell Command
 docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
 ```
 
-```shell
+```shell Command
 docker run -d -it --ipc=host --network=host --privileged \
   --cap-add=CAP_SYS_ADMIN \
   --device=/dev/kfd --device=/dev/dri --device=/dev/mem \
@@ -73,7 +75,7 @@ docker run -d -it --ipc=host --network=host --privileged \
 ### Llama-4-Scout
 8-GPU deployment command:
 
-```bash
+```bash Command
 sglang serve \
   --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct \
   --tp 8 \
@@ -84,7 +86,7 @@ sglang serve \
 ### Llama-4-Maverick
 8-GPU deployment command:
 
-```bash
+```bash Command
 sglang serve \
   --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
   --tp 8 \
@@ -105,7 +107,7 @@ Tensor Parallelism: 8
 sglang version: 0.5.9
 
 - **Model Deployment**
-```bash
+```bash Command
 sglang serve \
   --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct \
   --tp 8 \
@@ -115,7 +117,7 @@ sglang serve \
 
 ### 5.1.1 Low Concurrency (Latency-Optimized)
 - Benchmark Command:
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
@@ -128,7 +130,7 @@ python3 -m sglang.bench_serving \
 ```
 
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -168,7 +170,7 @@ Max ITL (ms):                            10.44
 ```
 ### 5.1.2 Medium Concurrency (Balanced)
 - Benchmark Command:
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
@@ -180,7 +182,7 @@ python3 -m sglang.bench_serving \
   --request-rate inf
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -220,7 +222,7 @@ Max ITL (ms):                            74.05
 ```
 ### 5.1.3 High Concurrency (Throughput-Optimized)
 - Benchmark Command:
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model meta-llama/Llama-4-Scout-17B-16E-Instruct \
@@ -232,7 +234,7 @@ python3 -m sglang.bench_serving \
   --request-rate inf
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -283,7 +285,7 @@ Tensor Parallelism: 8
 sglang version: 0.5.9
 
 - **Model Deployment**
-```bash
+```bash Command
 sglang serve \
   --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
   --tp 8 \
@@ -293,7 +295,7 @@ sglang serve \
 
 ### 5.2.1 Low Concurrency (Latency-Optimized)
 - Benchmark Command:
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model meta-llama/Llama-4-Maverick-17B-128E-Instruct \
@@ -305,7 +307,7 @@ python3 -m sglang.bench_serving \
   --request-rate inf
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -345,7 +347,7 @@ Max ITL (ms):                            7.02
 ```
 ### 5.2.2 Medium Concurrency (Balanced)
 - Benchmark Command:
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model meta-llama/Llama-4-Maverick-17B-128E-Instruct \
@@ -357,7 +359,7 @@ python3 -m sglang.bench_serving \
   --request-rate inf
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -397,7 +399,7 @@ Max ITL (ms):                            868.54
 ```
 ### 5.2.3 High Concurrency (Throughput-Optimized)
 - Benchmark Command:
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model meta-llama/Llama-4-Maverick-17B-128E-Instruct \
@@ -409,7 +411,7 @@ python3 -m sglang.bench_serving \
   --request-rate inf
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -453,18 +455,18 @@ Max ITL (ms):                            268.17
 
 - **Benchmark Command:**
 
-```shell
+```shell Command
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 ```
  - Llama-4-Scout-17B-16E-Instruct
-```
+```text Output
 Accuracy: 0.945
 Invalid: 0.000
 Latency: 12.731 s
 Output throughput: 1595.418 token/s
 ```
  - Llama-4-Maverick-17B-128E-Instruct
-```
+```text Output
 Accuracy: 0.895
 Invalid: 0.000
 Latency: 9.739 s

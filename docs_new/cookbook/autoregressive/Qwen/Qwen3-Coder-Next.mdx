@@ -1,5 +1,7 @@
 ---
-title: "Qwen3-Coder-Next"
+title: Qwen3-Coder-Next
+metatags:
+    description: "Deploy Qwen3-Coder-Next code-focused models with SGLang on AMD MI300X - available in 3B to 80B sizes with enhanced code understanding."
 ---
 
 import { Qwen3CoderNextDeployment } from '/src/snippets/autoregressive/qwen3-coder-next-deployment.jsx';
@@ -22,7 +24,7 @@ For more details, please refer to the [Qwen3-Coder-Next model card](https://hugg
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 **Note:** Qwen3-Coder-Next requires SGLang v0.5.8 or later.
 
@@ -49,7 +51,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Deployment Command:**
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model Qwen/Qwen3-Coder-Next \
   --tp 2 \
@@ -62,13 +64,13 @@ python -m sglang.launch_server \
 
 For basic API usage and request examples, please refer to:
 
-- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
 
 ### 4.2 Advanced Usage
 
 #### 4.2.1 Code Generation Example
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -160,7 +162,7 @@ print(binary_search([1], 2))  # Output: None
 
 #### 4.2.2 Streaming Example
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -195,7 +197,7 @@ Qwen3-Coder-Next supports tool calling capabilities. Make sure `--tool-call-pars
 
 **Python Example:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -263,7 +265,7 @@ Arguments: {"code": "import math\nmath.factorial(10)"}
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model Qwen/Qwen3-Coder-Next \
   --tp 2 \
@@ -275,7 +277,7 @@ python -m sglang.launch_server \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -332,7 +334,7 @@ Max ITL (ms):                            13.45
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -389,7 +391,7 @@ Max ITL (ms):                            394.39
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -446,7 +448,7 @@ Max ITL (ms):                            993.20
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model Qwen/Qwen3-Coder-Next \
   --tp 2 \
@@ -458,7 +460,7 @@ python -m sglang.launch_server \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -517,7 +519,7 @@ Max ITL (ms):                            12.48
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -576,7 +578,7 @@ Max ITL (ms):                            206.79
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -636,7 +638,7 @@ Max ITL (ms):                            576.60
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -694,7 +696,7 @@ Max ITL (ms):                            16.34
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -752,7 +754,7 @@ Max ITL (ms):                            823.32
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -812,7 +814,7 @@ Max ITL (ms):                            2783.23
 
 - **Benchmark Command:**
 
-```shell
+```shell Command
 python benchmark/gsm8k/bench_sglang.py --port 30000
 ```
 
@@ -829,7 +831,7 @@ Output throughput: 929.132 token/s
 
 - **Benchmark Command:**
 
-```shell
+```shell Command
 cd benchmark/mmlu
 bash download_data.sh
 python3 bench_sglang.py --port 30000

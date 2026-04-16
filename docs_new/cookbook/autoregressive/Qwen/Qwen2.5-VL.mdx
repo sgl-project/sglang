@@ -1,5 +1,7 @@
 ---
-title: "Qwen2.5-VL"
+title: Qwen2.5-VL
+metatags:
+    description: "Deploy Qwen2.5-VL vision-language models with SGLang on AMD MI300X - available in 3B to 72B sizes with enhanced visual understanding."
 ---
 
 import { Qwen25VLDeployment } from '/src/snippets/autoregressive/qwen25-vl-deployment.jsx';
@@ -25,7 +27,7 @@ For more details, please refer to the [official Qwen2.5-VL GitHub Repository](ht
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -50,8 +52,8 @@ The Qwen2.5-VL series offers models in various sizes. The following configuratio
 
 For basic API usage and request examples, please refer to:
 
-- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
-- [SGLang OpenAI Vision API Guide](https://docs.sglang.ai/basic_usage/openai_api_vision.html)
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+- [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision)
 
 ### 4.2 Advanced Usage
 
@@ -59,7 +61,7 @@ For basic API usage and request examples, please refer to:
 
 Qwen2.5-VL supports image inputs. Here's a basic example with single image input:
 
-```python
+```python Example
 import time
 from openai import OpenAI
 
@@ -99,7 +101,7 @@ print(f"Generated text: {response.choices[0].message.content}")
 
 **Example Output:**
 
-```text
+```text Output
 Response costs: 2.31s
 Generated text: Auntie Anne's
 
@@ -122,7 +124,7 @@ CHANGE DUE
 
 Qwen2.5-VL can process multiple images in a single request for comparison or analysis:
 
-```python
+```python Example
 import time
 from openai import OpenAI
 
@@ -168,7 +170,7 @@ print(f"Generated text: {response.choices[0].message.content}")
 
 **Example Output:**
 
-```text
+```text Output
 Response costs: 13.79s
 Generated text: The first image shows a single red taxi driving on a street with a few other taxis in the background. The second image shows a large number of taxis parked in a lot, with some appearing to be in various states of repair. The first image has a single taxi with a visible license plate, while the second image has multiple taxis with different license plates. The first image has a clear view of the street and surrounding area, while the second image is taken from an elevated perspective, showing a wider view of the parking lot and the surrounding area.
 ```
@@ -195,7 +197,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation wit
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model Qwen/Qwen2.5-VL-72B-Instruct \
   --tp 8 \
@@ -205,7 +207,7 @@ python -m sglang.launch_server \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
@@ -224,7 +226,7 @@ python3 -m sglang.bench_serving \
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model Qwen/Qwen2.5-VL-72B-Instruct \
   --tp 8 \
@@ -232,7 +234,7 @@ python -m sglang.launch_server \
   --port 30000
 ```
 - Result:
-```text
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -275,7 +277,7 @@ Max ITL (ms):                            23.60
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
@@ -289,7 +291,7 @@ python3 -m sglang.bench_serving \
   --num-prompts 1000 \
   --max-concurrency 100
 ```
-```text
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -338,12 +340,12 @@ You can evaluate the model's accuracy using the MMMU dataset:
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 benchmark/mmmu/bench_sglang.py \
     --port 30000 \
     --concurrency 64
 ```
-```text
+```text Output
 Benchmark time: 97.75084622902796
 answers saved to: ./answer_sglang.json
 Evaluating...

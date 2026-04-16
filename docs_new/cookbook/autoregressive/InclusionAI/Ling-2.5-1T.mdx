@@ -27,7 +27,7 @@ tag: NEW
 
 Ling-2.5-1T requires a specific SGLang Docker image:
 
-```bash
+```bash Command
 # For H200/B200
 docker pull lmsysorg/sglang:nightly-dev-20260213-a0ebaa64
 
@@ -60,7 +60,7 @@ import { Ling251TDeployment } from '/src/snippets/autoregressive/ling-25-1t-depl
 
 For example, launch the server on 2 H200 nodes:
 
-```bash
+```bash Command
 export MASTER_IP=10.10.0.1 # The IP of Node 0
 export PORT=30000
 export DIST_PORT=50000
@@ -97,13 +97,13 @@ python3 -m sglang.launch_server \
 
 Once the server is running, send requests to the master node:
 
-```bash
+```bash Command
 curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "auto", "messages": [{"role": "user", "content": "What is the capital of France?"}]}'
 ```
 Output:
-```json
+```json Config
 {
   "id": "e82af153da844ee6aed7a27a3187f2f4",
   "object": "chat.completion",
@@ -139,7 +139,7 @@ For more API usage examples, please refer to:
 
 ### 4.2 Tool Calling Example
 
-```bash
+```bash Command
 curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -163,7 +163,7 @@ curl -s http://${MASTER_IP}:${PORT}/v1/chat/completions \
   }'
 ```
 Output:
-```json
+```json Config
 {
   "id": "b968e45c7d414f7482c8ffc0f9c6b688",
   "object": "chat.completion",
@@ -208,7 +208,7 @@ Output:
 ### GSM8K
 
 - Benchmark Command
-```bash
+```bash Command
 python3 benchmark/gsm8k/bench_sglang.py
 ```
 

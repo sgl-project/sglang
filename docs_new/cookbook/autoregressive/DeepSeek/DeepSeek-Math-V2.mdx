@@ -1,5 +1,7 @@
 ---
-title: "DeepSeek-Math-V2"
+title: DeepSeek-Math-V2
+metatags:
+    description: "Deploy DeepSeek-Math-V2 with SGLang - advanced mathematical reasoning model with gold-level IMO/CMO performance and theorem-proving capabilities."
 ---
 
 import { DeepSeekMathV2Deployment } from '/src/snippets/autoregressive/deepseek-math-v2-deployment.jsx';
@@ -24,7 +26,7 @@ To use DeepSeek-Math-V2, you must agree to DeepSeek's Community License. See [LI
 
 ## 2. SGLang Installation
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -55,7 +57,7 @@ This section provides deployment configurations optimized for different hardware
 
 Deploy the model using the command generated above. Example for B200:
 
-```shell
+```shell Command
 sglang serve --model-path deepseek-ai/DeepSeek-Math-V2 \
   --tp 8 \
   --ep 8 \
@@ -70,7 +72,7 @@ DeepSeek-Math-V2 excels at mathematical problem-solving with step-by-step reason
 
 **Streaming with Thinking Process:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -117,7 +119,7 @@ print()
 
 **Output Example:**
 
-````text
+```text Output
 =============== Thinking =================
 We need to prove that for any positive integer n, the sum 1 + 2 + 3 + ... + n = n(n+1)/2.
 
@@ -197,13 +199,13 @@ S = \frac{n(n+1)}{2}.
 \]
 
 Both proofs are rigorous and show that the formula holds for all positive integers \(n\).
-````
+```
 
 ### 4.3 Competition-Level Problems
 
 **Example: IMO-style Problem:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -248,7 +250,7 @@ print()
 
 **Output Example:**
 
-````text
+```text Output
 =============== Thinking =================
 We need to prove that for positive real numbers a,b,c with abc = 1, we have:
 
@@ -371,7 +373,7 @@ Thus for all positive \(a,b,c\) with \(abc=1\),
 \]
 
 ∎
-````
+```
 
 ## 5. Benchmark
 
@@ -381,13 +383,13 @@ Thus for all positive \(a,b,c\) with \(abc=1\),
 
 **Benchmark Command:**
 
-```shell
+```shell Command
 python3 benchmark/gsm8k/bench_sglang.py --num-questions 200 --port 30000
 ```
 
 **Test Results:**
 
-```text
+```text Output
 Accuracy: 0.975
 Invalid: 0.000
 Latency: 34.358 s
@@ -407,7 +409,7 @@ Output throughput: 540.162 token/s
 
 **Benchmark Command:**
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -421,7 +423,7 @@ python3 -m sglang.bench_serving \
 
 **Test Results:**
 
-```text
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -465,7 +467,7 @@ Max ITL (ms):                            24.93
 
 **Benchmark Command:**
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -479,7 +481,7 @@ python3 -m sglang.bench_serving \
 
 **Test Results:**
 
-```text
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf

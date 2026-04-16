@@ -53,7 +53,7 @@ For basic API usage and request examples, please refer to:
 
 DeepSeek-V3.2 supports reasoning mode. Enable the reasoning parser during deployment to separate the thinking and content sections:
 
-```shell
+```shell Command
 sglang serve \
   --model deepseek-ai/DeepSeek-V3.2-Exp \
   --reasoning-parser deepseek-v3 \
@@ -64,7 +64,7 @@ sglang serve \
 
 **Streaming with Thinking Process:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -137,7 +137,7 @@ DeepSeek-V3.2 and DeepSeek-V3.2-Exp support tool calling capabilities. But they 
 
 For DeepSeek-V3.2-Exp:
 
-```shell
+```shell Command
 sglang serve \
   --model deepseek-ai/DeepSeek-V3.2-Exp \
   --tool-call-parser deepseekv31 \
@@ -152,7 +152,7 @@ For DeepSeek-V3.2, use `--tool-call-parser deepseekv32` and remove `--chat-templ
 
 **Python Example (with Thinking Process):**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -268,7 +268,7 @@ Tool Call: get_weather
 
 **Handling Tool Call Results:**
 
-```python
+```python Example
 # After getting the tool call, execute the function
 def get_weather(location, unit="celsius"):
     # Your actual weather API call here
@@ -310,7 +310,7 @@ print(final_response.choices[0].message.content)
 
 We suggested `DP2` + `MTP` for local deployment of agentic workflow with DeepSeek V3.2 on Hopper platform:
 
-```shell
+```shell Command
 export SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS=32
 export SGLANG_SET_CPU_AFFINITY=1
 
@@ -341,7 +341,7 @@ sglang "${sglang_args[@]}" 2>&1 | tee $LOG_DIR/$RANK.log
 
 `CP` is currently enabled with `PP=2` on Hopper platform and we can reduce TP=16 to TP=8 from standalone deployment:
 
-```shell
+```shell Command
 # verified on Hopper platform
 sglang_args=$(echo serve \
   --model-path $MAPPED_MODEL_PATH \
@@ -373,7 +373,7 @@ sglang "${sglang_args[@]}" 2>&1 | tee $LOG_DIR/$RANK.log
 
 With FP8 KV, we can have less memory footprint. This can be combined with various parallel schemes:
 
-```shell
+```shell Command
 # verified in Hopper platform
 dp=1
 
@@ -436,7 +436,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation on 
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 sglang serve \
   --model-path deepseek-ai/DeepSeek-V3.2-Exp \
   --tp 8 \
@@ -450,7 +450,7 @@ sglang serve \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -510,7 +510,7 @@ Max ITL (ms):                            31.45
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 sglang serve \
   --model-path deepseek-ai/DeepSeek-V3.2-Exp \
   --tp 8 \
@@ -523,7 +523,7 @@ sglang serve \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -582,7 +582,7 @@ Max ITL (ms):                            975.03
 
 - **Benchmark Command:**
 
-```shell
+```shell Command
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
 ```
 
@@ -599,7 +599,7 @@ python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 30000
 
 - **Benchmark Command:**
 
-```shell
+```shell Command
 cd sglang
 bash benchmark/mmlu/download_data.sh
 python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 30000
@@ -635,7 +635,7 @@ python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 30000
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 export SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS=32
 export SGLANG_SET_CPU_AFFINITY=1
 
@@ -664,7 +664,7 @@ sglang "${sglang_args[@]}" 2>&1 | tee $LOG_DIR/$RANK.log
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host $MASTER_ADDR \
@@ -723,7 +723,7 @@ Max ITL (ms):                            36.84
 
 We simply use the same deployment method and vary the throughput by maximizing concurrencies:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host $MASTER_ADDR \

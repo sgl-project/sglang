@@ -1,5 +1,7 @@
 ---
-title: "NVIDIA Nemotron3-Super"
+title: NVIDIA Nemotron3-Super
+metatags:
+    description: "Deploy NVIDIA Nemotron3-Super with SGLang - 120B hybrid MoE model (12B active) with 1M context window optimized for multi-agent systems and tool use."
 ---
 
 import { Nemotron3SuperDeployment } from '/src/snippets/autoregressive/nemotron3-super-deployment.jsx';
@@ -21,7 +23,7 @@ Architecture and key features:
 
 SGLang from the main branch is required for Nemotron3-Super. You can install from source and with a nightly docker.
 
-```bash
+```bash Command
 # Install from source
 uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
@@ -29,7 +31,7 @@ uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=pytho
 docker pull lmsysorg/sglang:nightly-dev-20260310-0fd9a57d
 ```
 
-For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html).
+For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/installation).
 
 ## 3. Model Deployment
 
@@ -58,7 +60,7 @@ This section provides a progressive guide from quick deployment to performance t
 
 ## 4. Model Invocation
 
-```shell
+```shell Command
 python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
   --host 0.0.0.0 \
@@ -73,7 +75,7 @@ python3 -m sglang.launch_server \
 
 SGLang provides an OpenAI-compatible endpoint. Example with the OpenAI Python client:
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -95,7 +97,7 @@ print("\n")
 ```
 
 Output:
-```
+```text Output
 Reasoning: Okay, the user is asking for 3 bullet points about SGLang. Let me recall what I know about SGLang. It's a framework for serving large language models, right? Developed by the team at UC Berkeley and others.
 
 First, I should verify the key features. SGLang is known for its high-performance serving capabilities, especially with features like Radix Attention and chunked prefill. Those are important points to mention...(more tokens)
@@ -106,7 +108,7 @@ Content: - SGLang introduces **Radix Attention**, an innovative attention mechan
 ```
 
 Streaming chat completion:
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -131,7 +133,7 @@ for chunk in stream:
 ```
 
 Output:
-```
+```text Output
 The first 5 prime numbers are:
 **2, 3, 5, 7, 11**.
 
@@ -154,7 +156,7 @@ This list is universally accepted in mathematics. Let me know if you'd like to e
 
 The model supports two modes — Reasoning ON (default) vs OFF. This can be toggled by setting `enable_thinking` to `False`, as shown below.
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -191,7 +193,7 @@ print(f"Content: \n{resp.choices[0].message.reasoning_content[:200]}...")
 ```
 
 Output:
-```
+```text Output
 Reasoning on
 Reasoning:
 We need to output a haiku about GPUs, with short thinking process. Probably we just need to produce the haiku. No extra commentary needed. Provide a haiku: 5-7-5 syllable lines about GPUs.
@@ -214,7 +216,7 @@ Certainly! Here are three accurate and informative facts about **SGLang**:
 
 Call functions using the OpenAI Tools schema and inspect returned `tool_calls`.
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -264,7 +266,7 @@ print(completion.choices[0].message.tool_calls)
 ```
 
 Output:
-```
+```text Output
 The user wants to calculate a 15% tip on a $50 bill. I have a function called calculate_tip that takes bill_total and tip_percentage as parameters. The bill_total is $50, and tip_percentage is 15. I need to call the function with these values. Let me do that.
 
 [ChatCompletionMessageFunctionToolCall(id='call_ced9a83a3baa448e9d587aaf', function=Function(arguments='{"bill_total": 50, "tip_percentage": 15}', name='calculate_tip'), type='function', index=0)]
@@ -276,7 +278,7 @@ The `reasoning_budget` parameter allows you to limit the length of the model's r
 
 If no newline is encountered within 500 tokens after reaching the budget threshold, the reasoning trace will be forcibly terminated at `reasoning_budget + 500` tokens.
 
-```python
+```python Example
 from typing import Any, Dict, List
 import openai
 from transformers import AutoTokenizer
@@ -348,7 +350,7 @@ class ThinkingBudgetClient:
 
 Usage example with `reasoning_budget=128`:
 
-```python
+```python Example
 SERVED_MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
 
 # Client
@@ -372,7 +374,7 @@ print("Reasoning:", resp["reasoning_content"], "\nContent:", resp["content"])
 ```
 
 Output:
-```
+```text Output
 Reasoning: Okay, the user wants a haiku about GPUs. Let me recall what a haiku is: a traditional Japanese poem with three lines, 5-7-5 syllable structure. So I need to make sure the syllable count is exact.
 
 First, I should think about what makes GPUs interesting. They're used for graphics rendering, parallel processing, AI, gaming, etc. Maybe focus on their speed, power, or how they handle many tasks at once.
@@ -399,7 +401,7 @@ Lightning paints the void.
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
   --trust-remote-code \
@@ -411,7 +413,7 @@ python3 -m sglang.launch_server \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -426,7 +428,7 @@ python3 -m sglang.bench_serving \
 
 - **Test Results:**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -477,7 +479,7 @@ Max ITL (ms):                            7181.72
 - SGLang Version: main branch
 
 **Launch Model**
-```bash
+```bash Command
 python3 -m sglang.launch_server \
   --model-path nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 \
   --trust-remote-code \
@@ -486,12 +488,12 @@ python3 -m sglang.launch_server \
 ```
 
 **Run Benchmark**
-```bash
+```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --port 5000
 ```
 
 **Test Results:**
-```
+```text Output
 Accuracy: 0.950
 Invalid: 0.000
 Latency: 21.442 s
@@ -501,12 +503,12 @@ Output throughput: 996.815 token/s
 #### 5.2.2 MMLU Benchmark
 
 **Run Benchmark**
-```bash
+```bash Command
 python3 benchmark/mmlu/bench_sglang.py --port 5000
 ```
 
 **Test Results:**
-```
+```text Output
 subject: abstract_algebra, #q:100, acc: 0.730
 subject: anatomy, #q:135, acc: 0.830
 subject: astronomy, #q:152, acc: 0.934

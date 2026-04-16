@@ -1,5 +1,7 @@
 ---
-title: "Gemma 4"
+title: Gemma 4
+metatags:
+    description: "Deploy Gemma 4 with SGLang - Google's next-generation open models with MoE variants and multimodal support for text, vision, and audio."
 ---
 
 import { Gemma4Deployment } from '/src/snippets/autoregressive/gemma4-deployment.jsx';
@@ -20,18 +22,48 @@ Gemma 4 is Google's next-generation family of open models, building on the Gemma
 
 **Available Models:**
 
-| Model | Architecture | Parameters |
-|-------|-------------|------------|
-| [google/gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it) | Dense | ~2B |
-| [google/gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it) | Dense | ~4B |
-| [google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) | Dense | 31B |
-| [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) | MoE | 26B total / 4B active |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Architecture</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameters</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[google/gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dense</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>~2B</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[google/gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dense</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>~4B</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dense</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>31B</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MoE</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>26B total / 4B active</td>
+    </tr>
+  </tbody>
+</table>
 
 ## 2. SGLang Installation
 
 Gemma 4 support requires [sgl-project/sglang#21952](https://github.com/sgl-project/sglang/pull/21952) and a specific transformers commit:
 
-```bash
+```bash Command
 # Install SGLang from main branch (after sglang#21952 is merged)
 pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
@@ -47,7 +79,7 @@ docker pull lmsysorg/sglang:dev-gemma4 # CUDA 12.9
 docker pull lmsysorg/sglang:dev-cu13-gemma4 # CUDA 13
 ```
 
-For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html).
+For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/installation).
 
 ## 3. Model Deployment
 
@@ -63,18 +95,48 @@ For the full Docker setup and other installation methods, please refer to the [o
 - For the 26B-A4B MoE model, consider `--tp 2` for high-throughput workloads.
 - Hardware requirements:
 
-| Model | Hardware | TP |
-|-------|----------|-----|
-| gemma-4-E2B-it | 1x H200 / 1x MI300X / 1x MI325X / 1x MI355X | 1 |
-| gemma-4-E4B-it | 1x H200 / 1x MI300X / 1x MI325X / 1x MI355X | 1 |
-| gemma-4-31B-it | 2x H200 / 1x MI300X / 1x MI325X / 1x MI355X | 2 (H200) / 1 (AMD) |
-| gemma-4-26B-A4B-it | 1x H200 / 1x MI300X / 1x MI325X / 1x MI355X | 1 |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>TP</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E2B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2 (H200) / 1 (AMD)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-26B-A4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x MI300X / 1x MI325X / 1x MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+    </tr>
+  </tbody>
+</table>
 
 ### 3.3 AMD GPU Deployment (MI300X / MI325X / MI355X)
 
 SGLang automatically selects the correct attention backend on AMD GPUs. For the small E-models (`gemma-4-E2B-it`, `gemma-4-E4B-it`), disable AITER on AMD GPUs and use the same command line otherwise:
 
-```bash
+```bash Command
 SGLANG_USE_AITER=0 sglang serve --model-path google/gemma-4-E4B-it \
   --reasoning-parser gemma4 \
   --tool-call-parser gemma4 \
@@ -89,7 +151,7 @@ For `gemma-4-31B-it` and `gemma-4-26B-A4B-it`, the same commands above work on M
 
 Deploy gemma-4-26B-A4B-it (MoE) with all features enabled:
 
-```bash
+```bash Command
 sglang serve --model-path google/gemma-4-26B-A4B-it \
   --reasoning-parser gemma4 \
   --tool-call-parser gemma4 \
@@ -98,7 +160,7 @@ sglang serve --model-path google/gemma-4-26B-A4B-it \
 
 ### 4.1 Basic Usage
 
-````python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -115,12 +177,12 @@ response = client.chat.completions.create(
 )
 
 print(response.choices[0].message.content)
-````
+```
 
 <details>
 <summary>Example Output</summary>
 
-```
+```text Output
 The fundamental difference between **TCP (Transmission Control Protocol)** and **UDP (User Datagram
 Protocol)** lies in how they prioritize data integrity versus speed.
 
@@ -158,7 +220,7 @@ Protocol)** lies in how they prioritize data integrity versus speed.
 
 Gemma 4 multimodal variants accept images alongside text:
 
-````python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -189,12 +251,12 @@ response = client.chat.completions.create(
 )
 
 print(response.choices[0].message.content)
-````
+```
 
 <details>
 <summary>Example Output</summary>
 
-```
+```text Output
 A vertical, full shot shows a girl and a boy standing in front of a giant teddy bear. The boy, who
 is on the left, is of South Asian descent, has short dark hair, and is smiling at the camera. He is
 wearing a navy blue sweatshirt with a white collar, blue jeans, and white, black, and red sneakers.
@@ -213,7 +275,7 @@ lighting is bright and even.
 
 Gemma 4 supports hybrid reasoning. Thinking is **not enabled by default** — pass `chat_template_kwargs: {"enable_thinking": true}` via `extra_body` to activate it. The reasoning parser separates thinking and content, returning the thinking process via `reasoning_content` in the streaming response.
 
-````python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -255,12 +317,12 @@ for chunk in response:
             print(delta.content, end="", flush=True)
 
 print()
-````
+```
 
 <details>
 <summary>Example Output</summary>
 
-```
+```text Output
 =============== Thinking =================
 *   Input: Speed = 60 km/h, Time = 2.5 hours.
     *   Goal: Find the distance traveled.
@@ -298,7 +360,7 @@ Distance = 60 km/h × 2.5 hours
 
 Gemma 4 supports function calling with the `gemma4` tool call parser. Enable it during deployment with `--tool-call-parser gemma4`.
 
-````python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -367,12 +429,12 @@ for chunk in response:
             print(delta.content, end="", flush=True)
 
 print()
-````
+```
 
 <details>
 <summary>Example Output</summary>
 
-```
+```text Output
 =============== Tool Calls ================
 Tool Call: get_weather
    Arguments: {"location": "Tokyo"}
@@ -392,19 +454,19 @@ Tool Call: get_weather
 #### gemma-4-E2B-it (1x H200, TP=1)
 
 Server Launch Command:
-```bash
+```bash Command
 sglang serve --model-path google/gemma-4-E2B-it
 ```
 
 **Latency Benchmark (Text)**
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -425,7 +487,7 @@ Median ITL (ms):                         4.05
 
 **Latency Benchmark (Image)**
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving --backend sglang-oai-chat \
   --host 0.0.0.0 --port 30000 \
   --dataset-name image --image-count 2 --image-resolution 720p \
@@ -433,7 +495,7 @@ python3 -m sglang.bench_serving --backend sglang-oai-chat \
   --num-prompts 10 --max-concurrency 1
 ```
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -455,13 +517,13 @@ Median ITL (ms):                         4.04
 
 **Throughput Benchmark (Text)**
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -482,7 +544,7 @@ Median ITL (ms):                         5.99
 
 **Throughput Benchmark (Image)**
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving --backend sglang-oai-chat \
   --host 0.0.0.0 --port 30000 \
   --dataset-name image --image-count 2 --image-resolution 720p \
@@ -490,7 +552,7 @@ python3 -m sglang.bench_serving --backend sglang-oai-chat \
   --num-prompts 1000 --max-concurrency 100
 ```
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -513,13 +575,13 @@ Median ITL (ms):                         5.68
 #### gemma-4-E4B-it (1x H200, TP=1)
 
 Server Launch Command:
-```bash
+```bash Command
 sglang serve --model-path google/gemma-4-E4B-it
 ```
 
 **Latency Benchmark (Text)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -540,7 +602,7 @@ Median ITL (ms):                         5.74
 
 **Latency Benchmark (Image)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -562,7 +624,7 @@ Median ITL (ms):                         5.73
 
 **Throughput Benchmark (Text)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -583,7 +645,7 @@ Median ITL (ms):                         8.88
 
 **Throughput Benchmark (Image)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -606,13 +668,13 @@ Median ITL (ms):                         8.64
 #### gemma-4-31B-it (2x H200, TP=2)
 
 Server Launch Command:
-```bash
+```bash Command
 sglang serve --model-path google/gemma-4-31B-it --tp 2
 ```
 
 **Latency Benchmark (Text)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -633,7 +695,7 @@ Median ITL (ms):                         12.53
 
 **Latency Benchmark (Image)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -655,7 +717,7 @@ Median ITL (ms):                         12.48
 
 **Throughput Benchmark (Text)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -676,7 +738,7 @@ Median ITL (ms):                         25.44
 
 **Throughput Benchmark (Image)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -699,7 +761,7 @@ Median ITL (ms):                         26.81
 #### gemma-4-26B-A4B-it (MoE, 1x H200, TP=1)
 
 Server Launch Command:
-```bash
+```bash Command
 sglang serve --model-path google/gemma-4-26B-A4B-it
 ```
 
@@ -707,7 +769,7 @@ sglang serve --model-path google/gemma-4-26B-A4B-it
 
 **Latency Benchmark (Text)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -728,7 +790,7 @@ Median ITL (ms):                         5.78
 
 **Latency Benchmark (Image)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -750,7 +812,7 @@ Median ITL (ms):                         5.75
 
 **Throughput Benchmark (Text)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -771,7 +833,7 @@ Median ITL (ms):                         20.23
 
 **Throughput Benchmark (Image)**
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -794,7 +856,7 @@ Median ITL (ms):                         19.08
 #### gemma-4-31B-it (1x MI300X, TP=1)
 
 Server Launch Command:
-```bash
+```bash Command
 sglang serve --model-path google/gemma-4-31B-it
 ```
 
@@ -802,13 +864,13 @@ sglang serve --model-path google/gemma-4-31B-it
 
 **Latency Benchmark (Text)**
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -829,13 +891,13 @@ Median ITL (ms):                         24.23
 
 **Throughput Benchmark (Text)**
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -857,19 +919,19 @@ Median ITL (ms):                         63.45
 #### gemma-4-26B-A4B-it (MoE, 1x MI300X, TP=1)
 
 Server Launch Command:
-```bash
+```bash Command
 sglang serve --model-path google/gemma-4-26B-A4B-it
 ```
 
 **Latency Benchmark (Text)**
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -890,13 +952,13 @@ Median ITL (ms):                         9.57
 
 **Throughput Benchmark (Text)**
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -924,80 +986,266 @@ Median ITL (ms):                         29.31
 
 #### MMLU
 
-| Model | Humanities | Social Sciences | STEM | Other | Overall |
-|-------|-----------|----------------|------|-------|---------|
-| gemma-4-E2B-it | 0.621 | 0.739 | 0.830 | 0.736 | **0.720** |
-| gemma-4-E4B-it | 0.703 | 0.862 | 0.902 | 0.825 | **0.810** |
-| gemma-4-31B-it | 0.878 | 0.921 | 0.884 | 0.911 | **0.896** |
-| gemma-4-26B-A4B-it | 0.853 | 0.906 | 0.938 | 0.886 | **0.891** |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "16.7%"}} />
+    <col style={{width: "16.7%"}} />
+    <col style={{width: "16.7%"}} />
+    <col style={{width: "16.7%"}} />
+    <col style={{width: "16.7%"}} />
+    <col style={{width: "16.7%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Humanities</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Social Sciences</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>STEM</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Other</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Overall</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E2B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.621</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.739</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.830</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.736</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.720**</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.703</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.862</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.902</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.825</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.810**</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.878</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.921</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.884</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.911</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.896**</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-26B-A4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.853</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.906</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.938</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.886</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.891**</td>
+    </tr>
+  </tbody>
+</table>
 
 #### GSM8K
 
-| Model | Accuracy | Invalid | Latency (s) | Output Throughput (tok/s) |
-|-------|----------|---------|-------------|--------------------------|
-| gemma-4-E2B-it | 0.170 | 0.000 | 3.990 | 8041.739 |
-| gemma-4-E4B-it | 0.745 | 0.000 | 4.174 | 4672.030 |
-| gemma-4-31B-it | 0.805 | 0.005 | 16.148 | 1559.914 |
-| gemma-4-26B-A4B-it | 0.450 | 0.010 | 13.001 | 4089.457 |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Accuracy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Invalid</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Latency (s)</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Output Throughput (tok/s)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E2B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.170</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.000</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.990</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8041.739</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.745</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.000</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4.174</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4672.030</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.805</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.005</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16.148</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1559.914</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-26B-A4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.450</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.010</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>13.001</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4089.457</td>
+    </tr>
+  </tbody>
+</table>
 
 #### MMMU
 
-| Model | Overall |
-|-------|---------|
-| gemma-4-E2B-it | **0.307** |
-| gemma-4-E4B-it | **0.396** |
-| gemma-4-31B-it | **0.589** |
-| gemma-4-26B-A4B-it | **0.549** |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50.0%"}} />
+    <col style={{width: "50.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Overall</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E2B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.307**</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.396**</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.589**</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-26B-A4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**0.549**</td>
+    </tr>
+  </tbody>
+</table>
 
 <details>
 <summary>MMMU detailed scores (per domain)</summary>
 
 **gemma-4-E2B-it**
 
-```json
+```json Config
 {"Overall-Art and Design": {"num": 120, "acc": 0.45}, "Art": {"num": 30, "acc": 0.5}, "Art_Theory": {"num": 30, "acc": 0.467}, "Design": {"num": 30, "acc": 0.5}, "Music": {"num": 30, "acc": 0.333}, "Overall-Business": {"num": 150, "acc": 0.26}, "Accounting": {"num": 30, "acc": 0.367}, "Economics": {"num": 30, "acc": 0.233}, "Finance": {"num": 30, "acc": 0.2}, "Manage": {"num": 30, "acc": 0.233}, "Marketing": {"num": 30, "acc": 0.267}, "Overall-Science": {"num": 150, "acc": 0.273}, "Biology": {"num": 30, "acc": 0.233}, "Chemistry": {"num": 30, "acc": 0.267}, "Geography": {"num": 30, "acc": 0.367}, "Math": {"num": 30, "acc": 0.233}, "Physics": {"num": 30, "acc": 0.267}, "Overall-Health and Medicine": {"num": 150, "acc": 0.273}, "Basic_Medical_Science": {"num": 30, "acc": 0.5}, "Clinical_Medicine": {"num": 30, "acc": 0.233}, "Diagnostics_and_Laboratory_Medicine": {"num": 30, "acc": 0.233}, "Pharmacy": {"num": 30, "acc": 0.3}, "Public_Health": {"num": 30, "acc": 0.1}, "Overall-Humanities and Social Science": {"num": 120, "acc": 0.4}, "History": {"num": 30, "acc": 0.4}, "Literature": {"num": 30, "acc": 0.567}, "Sociology": {"num": 30, "acc": 0.333}, "Psychology": {"num": 30, "acc": 0.3}, "Overall-Tech and Engineering": {"num": 210, "acc": 0.252}, "Agriculture": {"num": 30, "acc": 0.333}, "Architecture_and_Engineering": {"num": 30, "acc": 0.267}, "Computer_Science": {"num": 30, "acc": 0.233}, "Electronics": {"num": 30, "acc": 0.1}, "Energy_and_Power": {"num": 30, "acc": 0.3}, "Materials": {"num": 30, "acc": 0.2}, "Mechanical_Engineering": {"num": 30, "acc": 0.333}, "Overall": {"num": 900, "acc": 0.307}}
 ```
 
 **gemma-4-E4B-it**
 
-```json
+```json Config
 {"Overall-Art and Design": {"num": 120, "acc": 0.458}, "Art": {"num": 30, "acc": 0.433}, "Art_Theory": {"num": 30, "acc": 0.567}, "Design": {"num": 30, "acc": 0.667}, "Music": {"num": 30, "acc": 0.167}, "Overall-Business": {"num": 150, "acc": 0.287}, "Accounting": {"num": 30, "acc": 0.233}, "Economics": {"num": 30, "acc": 0.467}, "Finance": {"num": 30, "acc": 0.133}, "Manage": {"num": 30, "acc": 0.3}, "Marketing": {"num": 30, "acc": 0.3}, "Overall-Science": {"num": 150, "acc": 0.28}, "Biology": {"num": 30, "acc": 0.333}, "Chemistry": {"num": 30, "acc": 0.133}, "Geography": {"num": 30, "acc": 0.4}, "Math": {"num": 30, "acc": 0.2}, "Physics": {"num": 30, "acc": 0.333}, "Overall-Health and Medicine": {"num": 150, "acc": 0.427}, "Basic_Medical_Science": {"num": 30, "acc": 0.4}, "Clinical_Medicine": {"num": 30, "acc": 0.533}, "Diagnostics_and_Laboratory_Medicine": {"num": 30, "acc": 0.4}, "Pharmacy": {"num": 30, "acc": 0.4}, "Public_Health": {"num": 30, "acc": 0.4}, "Overall-Humanities and Social Science": {"num": 120, "acc": 0.7}, "History": {"num": 30, "acc": 0.633}, "Literature": {"num": 30, "acc": 0.867}, "Sociology": {"num": 30, "acc": 0.733}, "Psychology": {"num": 30, "acc": 0.567}, "Overall-Tech and Engineering": {"num": 210, "acc": 0.324}, "Agriculture": {"num": 30, "acc": 0.533}, "Architecture_and_Engineering": {"num": 30, "acc": 0.3}, "Computer_Science": {"num": 30, "acc": 0.367}, "Electronics": {"num": 30, "acc": 0.133}, "Energy_and_Power": {"num": 30, "acc": 0.4}, "Materials": {"num": 30, "acc": 0.2}, "Mechanical_Engineering": {"num": 30, "acc": 0.333}, "Overall": {"num": 900, "acc": 0.396}}
 ```
 
 **gemma-4-31B-it**
 
-```json
+```json Config
 {"Overall-Art and Design": {"num": 120, "acc": 0.667}, "Art": {"num": 30, "acc": 0.667}, "Art_Theory": {"num": 30, "acc": 0.867}, "Design": {"num": 30, "acc": 0.8}, "Music": {"num": 30, "acc": 0.333}, "Overall-Business": {"num": 150, "acc": 0.573}, "Accounting": {"num": 30, "acc": 0.633}, "Economics": {"num": 30, "acc": 0.733}, "Finance": {"num": 30, "acc": 0.433}, "Manage": {"num": 30, "acc": 0.533}, "Marketing": {"num": 30, "acc": 0.533}, "Overall-Science": {"num": 150, "acc": 0.527}, "Biology": {"num": 30, "acc": 0.667}, "Chemistry": {"num": 30, "acc": 0.567}, "Geography": {"num": 30, "acc": 0.5}, "Math": {"num": 30, "acc": 0.267}, "Physics": {"num": 30, "acc": 0.633}, "Overall-Health and Medicine": {"num": 150, "acc": 0.673}, "Basic_Medical_Science": {"num": 30, "acc": 0.733}, "Clinical_Medicine": {"num": 30, "acc": 0.533}, "Diagnostics_and_Laboratory_Medicine": {"num": 30, "acc": 0.467}, "Pharmacy": {"num": 30, "acc": 0.8}, "Public_Health": {"num": 30, "acc": 0.833}, "Overall-Humanities and Social Science": {"num": 120, "acc": 0.825}, "History": {"num": 30, "acc": 0.833}, "Literature": {"num": 30, "acc": 0.867}, "Sociology": {"num": 30, "acc": 0.767}, "Psychology": {"num": 30, "acc": 0.833}, "Overall-Tech and Engineering": {"num": 210, "acc": 0.405}, "Agriculture": {"num": 30, "acc": 0.667}, "Architecture_and_Engineering": {"num": 30, "acc": 0.2}, "Computer_Science": {"num": 30, "acc": 0.567}, "Electronics": {"num": 30, "acc": 0.333}, "Energy_and_Power": {"num": 30, "acc": 0.533}, "Materials": {"num": 30, "acc": 0.3}, "Mechanical_Engineering": {"num": 30, "acc": 0.233}, "Overall": {"num": 900, "acc": 0.589}}
 ```
 
 **gemma-4-26B-A4B-it**
 
-```json
+```json Config
 {"Overall-Art and Design": {"num": 120, "acc": 0.717}, "Art": {"num": 30, "acc": 0.733}, "Art_Theory": {"num": 30, "acc": 0.833}, "Design": {"num": 30, "acc": 0.867}, "Music": {"num": 30, "acc": 0.433}, "Overall-Business": {"num": 150, "acc": 0.493}, "Accounting": {"num": 30, "acc": 0.533}, "Economics": {"num": 30, "acc": 0.533}, "Finance": {"num": 30, "acc": 0.333}, "Manage": {"num": 30, "acc": 0.5}, "Marketing": {"num": 30, "acc": 0.567}, "Overall-Science": {"num": 150, "acc": 0.473}, "Biology": {"num": 30, "acc": 0.633}, "Chemistry": {"num": 30, "acc": 0.367}, "Geography": {"num": 30, "acc": 0.533}, "Math": {"num": 30, "acc": 0.267}, "Physics": {"num": 30, "acc": 0.567}, "Overall-Health and Medicine": {"num": 150, "acc": 0.62}, "Basic_Medical_Science": {"num": 30, "acc": 0.767}, "Clinical_Medicine": {"num": 30, "acc": 0.533}, "Diagnostics_and_Laboratory_Medicine": {"num": 30, "acc": 0.433}, "Pharmacy": {"num": 30, "acc": 0.7}, "Public_Health": {"num": 30, "acc": 0.667}, "Overall-Humanities and Social Science": {"num": 120, "acc": 0.758}, "History": {"num": 30, "acc": 0.8}, "Literature": {"num": 30, "acc": 0.833}, "Sociology": {"num": 30, "acc": 0.733}, "Psychology": {"num": 30, "acc": 0.667}, "Overall-Tech and Engineering": {"num": 210, "acc": 0.376}, "Agriculture": {"num": 30, "acc": 0.633}, "Architecture_and_Engineering": {"num": 30, "acc": 0.367}, "Computer_Science": {"num": 30, "acc": 0.533}, "Electronics": {"num": 30, "acc": 0.167}, "Energy_and_Power": {"num": 30, "acc": 0.367}, "Materials": {"num": 30, "acc": 0.367}, "Mechanical_Engineering": {"num": 30, "acc": 0.2}, "Overall": {"num": 900, "acc": 0.549}}
 ```
 
 #### ASR
 
-| Model | WER | Avg Latency (s) | Throughput (req/s) |
-|-------|-----|-----------------|-------------------|
-| gemma-4-E2B-it | 23.86% | 0.212 | 2.99 |
-| gemma-4-E4B-it | 29.55% | 0.366 | 2.46 |
-| gemma-4-31B-it | Not Supported | — | — |
-| gemma-4-26B-A4B-it | Not Supported | — | — |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>WER</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Avg Latency (s)</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Throughput (req/s)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E2B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>23.86%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.212</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.99</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>29.55%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.366</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.46</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Not Supported</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-26B-A4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Not Supported</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+    </tr>
+  </tbody>
+</table>
 
 #### FLEUR (EN_US)
 
-| Model | WER | Avg Latency (s) | Throughput (req/s) |
-|-------|-----|-----------------|-------------------|
-| gemma-4-E2B-it | 7.37% | 0.8963s | 16.25 |
-| gemma-4-E4B-it | 6.08%  | 0.8707s | 16.20 |
-| gemma-4-31B-it | Not Supported | — | — |
-| gemma-4-26B-A4B-it | Not Supported | — | — |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>WER</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Avg Latency (s)</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Throughput (req/s)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E2B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>7.37%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.8963s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16.25</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-E4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>6.08%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.8707s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16.20</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Not Supported</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-26B-A4B-it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Not Supported</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+    </tr>
+  </tbody>
+</table>
 
 ### 5.3 Logits correctness validation
 
 **gemma-4-E2B-it**
-```
+```text Output
 $ python -m sglang.bench_one_batch --correct --model gg-hf-gg/gemma-4-E2B-it ....
 prefill logits (final): tensor([[-25.3063,  -2.5718, -10.3674,  ..., -25.3779, -25.5181, -25.2337]],
        device='cuda:0')
@@ -1012,7 +1260,7 @@ prefill logits (final) tensor([-25.3281,  -2.1367, -10.2266,  ..., -25.4375, -25
 
 **gemma-4-E4B-it**
 
-```
+```text Output
 $ python -m sglang.bench_one_batch --correct --model gg-hf-gg/gemma-4-E4B-it ....
 prefill logits (final): tensor([[-17.6478,   7.9901,  -5.6505,  ..., -17.5658, -17.6478, -17.7293]],
        device='cuda:0')
@@ -1026,7 +1274,7 @@ prefill logits (final) tensor([-17.5625,   8.0469,  -5.5742,  ..., -17.4688, -17
 ```
 
 **gemma-4-31B-it**
-```
+```text Output
 $ python -m sglang.bench_one_batch --correct --model gg-hf-gg/gemma-4-31B-it ....
 prefill logits (final): tensor([[-2.0748,  1.1245, -7.4356,  ..., -2.1059, -2.1525, -2.2303]],
        device='cuda:0')

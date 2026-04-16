@@ -1,5 +1,7 @@
 ---
-title: "Wan2.1"
+title: Wan2.1
+metatags:
+    description: "Deploy Wan2.1 video generation models with SGLang - community contribution guide for Wan Video's diffusion models."
 ---
 
 import { Wan21Deployment } from '/src/snippets/diffusion/wan21-deployment.jsx';
@@ -25,7 +27,7 @@ For more details, refer to the official Wan2.1 resources:
 
 SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/diffusion/installation.html) for installation instructions.
+Please refer to the [official SGLang-diffusion installation guide](../../../docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -41,7 +43,7 @@ The Wan2.1 series offers models in multiple sizes and resolutions, optimized for
 
 ### 3.2 Configuration Tips
 
-Current supported optimization options are listed in the [SGLang diffusion support matrix](https://docs.sglang.io/diffusion/performance/attention_backends.html#platform-support-matrix).
+Current supported optimization options are listed in the [SGLang diffusion support matrix](../../../docs/sglang-diffusion/attention-backends#platform-support-matrix).
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID. If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use.
@@ -56,11 +58,11 @@ Current supported optimization options are listed in the [SGLang diffusion suppo
 ### 4.1 Basic Usage
 
 For more API usage and request examples, please refer to:
-[SGLang Diffusion OpenAI API](https://docs.sglang.io/diffusion/api/openai_api.html)
+[SGLang Diffusion OpenAI API](../../../docs/sglang-diffusion/api/openai-api)
 
 #### 4.1.1 Launch a server and then send requests
 
-```bash
+```bash Command
 sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers --port 30000
 
 curl http://127.0.0.1:30000/v1/images/generations \
@@ -78,7 +80,7 @@ curl http://127.0.0.1:30000/v1/images/generations \
 
 #### 4.1.2 Generate a video without launching a server
 
-```bash
+```bash Command
 SERVER_ARGS=(
   --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
   --text-encoder-cpu-offload
@@ -102,18 +104,18 @@ sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 
 #### 4.2.1 Cache-DiT Acceleration
 
-SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve significant inference speedups with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](https://docs.sglang.io/diffusion/performance/cache/cache_dit.html).
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve significant inference speedups with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](../../../docs/sglang-diffusion/cache-dit).
 
 **Basic Usage**
 
-```bash
+```bash Command
 SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
 ```
 
 **Advanced Usage**
 
   Combined Configuration Example:
-  ```bash
+  ```bash Command
   SGLANG_CACHE_DIT_ENABLED=true \
   SGLANG_CACHE_DIT_FN=2 \
   SGLANG_CACHE_DIT_BN=1 \
@@ -137,14 +139,32 @@ SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Di
 
 SGLang supports applying Wan2.1 LoRA adapters on top of base models:
 
-| origin model  |  supported LoRA  |
-| -------- | ------- |
-| [Wan-AI/Wan2.1-T2V-14B](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B) | [NIVEDAN/wan2.1-lora](https://huggingface.co/NIVEDAN/wan2.1-lora) |
-| [Wan-AI/Wan2.1-I2V-14B-720P](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P) | [valiantcat/Wan2.1-Fight-LoRA](https://huggingface.co/valiantcat/Wan2.1-Fight-LoRA) |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>origin model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>supported LoRA</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[Wan-AI/Wan2.1-T2V-14B](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[NIVEDAN/wan2.1-lora](https://huggingface.co/NIVEDAN/wan2.1-lora)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[Wan-AI/Wan2.1-I2V-14B-720P](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[valiantcat/Wan2.1-Fight-LoRA](https://huggingface.co/valiantcat/Wan2.1-Fight-LoRA)</td>
+    </tr>
+  </tbody>
+</table>
 
 **Example**:
 
-```bash
+```bash Command
 sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers --port 30000 \
     --lora-path NIVEDAN/wan2.1-lora
 ```
@@ -165,20 +185,20 @@ You can use the built-in SGLang diffusion benchmark script to evaluate Wan2.1 pe
 
 **Server Command**:
 
-```bash
+```bash Command
 sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
 ```
 
 **Benchmark Command**:
 
-```bash
+```bash Command
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1
 ```
 
 **Result**:
 
-```
+```text Output
 ================= Serving Benchmark Result =================
 Task:                                    text-to-video
 Model:                                   Wan-AI/Wan2.1-T2V-14B-Diffusers
@@ -204,7 +224,7 @@ Peak Memory Median (MB):                 59662.00
 
 **Server Command**:
 
-```bash
+```bash Command
 SGLANG_CACHE_DIT_ENABLED=true \
 SGLANG_CACHE_DIT_FN=2 \
 SGLANG_CACHE_DIT_BN=1 \
@@ -218,14 +238,14 @@ sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers
 
 **Benchmark Command**:
 
-```bash
+```bash Command
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     --backend sglang-video --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1
 ```
 
 **Result**:
 
-```
+```text Output
 ================= Serving Benchmark Result =================
 Task:                                    text-to-video
 Model:                                   Wan-AI/Wan2.1-T2V-14B-Diffusers

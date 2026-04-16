@@ -1,5 +1,7 @@
 ---
-title: "Kimi-K2"
+title: Kimi-K2
+metatags:
+    description: "Deploy Kimi-K2 MoE model with SGLang - 1T total parameters, 32B active, step-by-step reasoning and tool calling capabilities."
 ---
 
 import { KimiK2Deployment } from '/src/snippets/autoregressive/kimi-k2-deployment.jsx';
@@ -18,7 +20,7 @@ For details, see [official documentation](https://github.com/MoonshotAI/Kimi-K2)
 
 ## 2. SGLang Installation
 
-Refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html).
+Refer to the [official SGLang installation guide](../../../docs/get-started/installation).
 
 ## 3. Model Deployment
 
@@ -33,7 +35,7 @@ This section provides a progressive guide from quick deployment to performance o
 ### 3.2 Configuration Tips
 
 - **Memory**: Requires 8 GPUs with ≥140GB each (H200/B200). Use `--context-length 128000` to conserve memory.
-- **Expert Parallelism (EP)**: Use `--ep` for better MoE throughput. See [EP docs](https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/expert_parallelism.md).
+- **Expert Parallelism (EP)**: Use `--ep` for better MoE throughput. See [EP docs](../../../docs/advanced_features/expert_parallelism).
 - **Data Parallel (DP)**: Enable with `--dp 4 --enable-dp-attention` for production throughput.
 - **KV Cache**: Use `--kv-cache-dtype fp8_e4m3` to reduce memory by 50% (CUDA 11.8+).
 - **Reasoning Parser**: Add `--reasoning-parser kimi_k2` for Kimi-K2-Thinking to separate thinking and content.
@@ -44,7 +46,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 ### 4.1 Basic Usage
 
-See [Basic API Usage](https://docs.sglang.ai/basic_usage/send_request.html).
+See [Basic API Usage](../../../docs/get-started/quickstart).
 
 ### 4.2 Advanced Usage
 
@@ -52,7 +54,7 @@ See [Basic API Usage](https://docs.sglang.ai/basic_usage/send_request.html).
 
 Enable reasoning parser for Kimi-K2-Thinking:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model moonshotai/Kimi-K2-Thinking \
   --reasoning-parser kimi_k2 \
@@ -63,7 +65,7 @@ python -m sglang.launch_server \
 
 **Example:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -112,7 +114,7 @@ print()
 
 **Output Example:**
 
-```text
+```text Output
 =============== Thinking =================
   The user asks: "What is 15% of 240?" This is a straightforward percentage calculation problem. I need to solve it step by step.
 
@@ -173,7 +175,7 @@ Kimi-K2-Instruct and Kimi-K2-Thinking support tool calling capabilities. Enable 
 
 **Deployment Command:**
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model moonshotai/Kimi-K2-Instruct \
   --tool-call-parser kimi_k2 \
@@ -185,7 +187,7 @@ python -m sglang.launch_server \
 
 **Python Example (with Thinking Process):**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -282,7 +284,7 @@ print()
 
 **Output Example:**
 
-```
+```text Output
 =============== Thinking =================
   The user is asking about the weather in Beijing. I need to use the get_weather function to retrieve this information. Beijing is a major city in China, so I should be able to get weather data for it. The location parameter is required, but the unit parameter is optional. Since the user didn't specify a temperature unit, I can just provide the location and let the function use its default. I'll check the weather in Beijing for you.
 =============== Content =================
@@ -299,7 +301,7 @@ print()
 
 **Handling Tool Call Results:**
 
-```python
+```python Example
 # After getting the tool call, execute the function
 def get_weather(location, unit="celsius"):
     # Your actual weather API call here
@@ -353,7 +355,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation on 
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 python3 -m sglang.launch_server \
     --model-path moonshotai/Kimi-K2-Instruct \
     --tp 8 \
@@ -366,7 +368,7 @@ python3 -m sglang.launch_server \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -378,7 +380,7 @@ python3 -m sglang.bench_serving \
 
 - **Test Results**:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -421,7 +423,7 @@ Max ITL (ms):                            19.94
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 python3 -m sglang.launch_server \
     --model-path moonshotai/Kimi-K2-Instruct \
     --tp 8 \
@@ -435,7 +437,7 @@ python3 -m sglang.launch_server \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
@@ -447,7 +449,7 @@ python3 -m sglang.bench_serving \
 
 - **Test Results**:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -492,7 +494,7 @@ Max ITL (ms):                            1703.21
 
 - Server Command
 
-```shell
+```shell Command
 python3 -m sglang.launch_server \
     --model-path moonshotai/Kimi-K2-Instruct \
     --tp 8 \
@@ -504,13 +506,13 @@ python3 -m sglang.launch_server \
 
 - Benchmark Command
 
-```shell
+```shell Command
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 8000
 ```
 
 - **Result**:
 
-```
+```text Output
 Accuracy: 0.960
 Invalid: 0.000
 Latency: 15.956 s

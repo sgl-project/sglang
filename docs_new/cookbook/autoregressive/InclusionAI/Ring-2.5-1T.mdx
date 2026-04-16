@@ -28,7 +28,7 @@ tag: NEW
 
 Ring-2.5-1T requires a specific SGLang Docker image:
 
-```bash
+```bash Command
 # For H200/B200
 docker pull lmsysorg/sglang:nightly-dev-20260213-a0ebaa64
 
@@ -65,7 +65,7 @@ import { Ring251TDeployment } from '/src/snippets/autoregressive/ring-25-1t-depl
 
 Deploy Ring-2.5-1T with the following command (on H200, all features enabled):
 
-```shell
+```shell Command
 sglang serve \
   --model-path inclusionAI/Ring-2.5-1T \
   --tp 8 \
@@ -86,7 +86,7 @@ For basic API usage and request examples, please refer to:
 
 To enable reasoning output separation, add `--reasoning-parser deepseek-r1` when launching the server. The thinking process is returned via `reasoning_content` in the streaming response.
 
-```shell
+```shell Command
 sglang serve \
   --model-path inclusionAI/Ring-2.5-1T \
   --tp 8 \
@@ -96,7 +96,7 @@ sglang serve \
   --port 30000
 ```
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -185,7 +185,7 @@ Alternatively, using the fraction:
 
 To enable tool calling, add `--tool-call-parser qwen` when launching the server.
 
-```shell
+```shell Command
 sglang serve \
   --model-path inclusionAI/Ring-2.5-1T \
   --tp 8 \
@@ -195,7 +195,7 @@ sglang serve \
   --port 30000
 ```
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -245,7 +245,7 @@ print(response.choices[0].message.tool_calls)
 ### GSM8K
 
 - Deployment Command
-```bash
+```bash Command
 sglang serve \
   --model-path inclusionAI/Ring-2.5-1T \
   --tp-size 8 \
@@ -253,7 +253,7 @@ sglang serve \
 ```
 
 - Benchmark Command
-```bash
+```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --temperature 1.2 --top-p 0.8 --max-new-tokens 32768 --num-questions 200 --tokenizer-path inclusionAI/Ring-2.5-1T --enable-thinking
 ```
 

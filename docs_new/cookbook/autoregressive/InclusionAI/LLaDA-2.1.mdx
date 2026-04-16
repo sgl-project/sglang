@@ -1,5 +1,8 @@
 ---
-title: "LLaDA 2.1"
+title: LLaDA 2.1
+metatags:
+    description: "Deploy LLaDA 2.1 with SGLang - large-scale discrete diffusion language model with parallel token generation, iterative denoising, MoE architecture, and reinforcement learning for reasoning."
+tag: NEW
 ---
 
 import { LLaDA21Deployment } from '/src/snippets/autoregressive/llada-21-deployment.jsx';
@@ -18,10 +21,40 @@ import { LLaDA21Deployment } from '/src/snippets/autoregressive/llada-21-deploym
 
 **Available Models:**
 
-| Model                    | Parameters | Architecture                        | Context Length | HuggingFace                                                                  |
-| ------------------------ | ---------- | ----------------------------------- | -------------- | ---------------------------------------------------------------------------- |
-| **LLaDA2.1-mini**  | 16B        | MoE (20 layers, 16 attention heads) | 32,768 tokens  | [inclusionAI/LLaDA2.1-mini](https://huggingface.co/inclusionAI/LLaDA2.1-mini)   |
-| **LLaDA2.1-flash** | 100B       | MoE                                 | 32,768 tokens  | [inclusionAI/LLaDA2.1-flash](https://huggingface.co/inclusionAI/LLaDA2.1-flash) |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Parameters</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Architecture</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Context Length</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>HuggingFace</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**LLaDA2.1-mini**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MoE (20 layers, 16 attention heads)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32,768 tokens</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[inclusionAI/LLaDA2.1-mini](https://huggingface.co/inclusionAI/LLaDA2.1-mini)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**LLaDA2.1-flash**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>100B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MoE</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32,768 tokens</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[inclusionAI/LLaDA2.1-flash](https://huggingface.co/inclusionAI/LLaDA2.1-flash)</td>
+    </tr>
+  </tbody>
+</table>
 
 **License:**
 
@@ -31,7 +64,7 @@ Apache 2.0. Please refer to the [official LLaDA2.X repository](https://github.co
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -47,20 +80,72 @@ This section provides deployment configurations optimized for different hardware
 
 **dLLM-Specific Parameters:**
 
-| Parameter                  | Description                         | Recommended Value        |
-| -------------------------- | ----------------------------------- | ------------------------ |
-| `--dllm-algorithm`       | Diffusion decoding algorithm        | `JointThreshold`       |
-| `--trust-remote-code`    | Required for LLaDA model loading    | Always enabled           |
-| `--mem-fraction-static`  | Static memory fraction for KV cache | `0.8`                  |
-| `--max-running-requests` | Maximum concurrent requests         | `1` (for best quality) |
-| `--attention-backend`    | Attention computation backend       | `flashinfer`           |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Recommended Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dllm-algorithm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Diffusion decoding algorithm</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`JointThreshold`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--trust-remote-code`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Required for LLaDA model loading</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Always enabled</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mem-fraction-static`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Static memory fraction for KV cache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.8`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-running-requests`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum concurrent requests</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1` (for best quality)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--attention-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Attention computation backend</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`flashinfer`</td>
+    </tr>
+  </tbody>
+</table>
 
 **Decoding Mode Comparison:**
 
-| Mode                       | Threshold    | Speed                            | Quality                 | Best For                  |
-| -------------------------- | ------------ | -------------------------------- | ----------------------- | ------------------------- |
-| **Quality Mode (Q)** | Conservative | Moderate                         | Higher benchmark scores | Accuracy-critical tasks   |
-| **Speed Mode (S)**   | Aggressive   | Very fast, relies on T2T editing | Slightly lower          | Throughput-critical tasks |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Threshold</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Speed</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Quality</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Best For</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Quality Mode (Q)**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Conservative</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Moderate</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Higher benchmark scores</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Accuracy-critical tasks</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Speed Mode (S)**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Aggressive</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Very fast, relies on T2T editing</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Slightly lower</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Throughput-critical tasks</td>
+    </tr>
+  </tbody>
+</table>
 
 **Hardware Requirements:**
 
@@ -73,7 +158,7 @@ This section provides deployment configurations optimized for different hardware
 
 Start the server using the command generated above, for example:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model-path inclusionAI/LLaDA2.1-mini \
   --dllm-algorithm JointThreshold \
@@ -90,11 +175,11 @@ python -m sglang.launch_server \
 
 For basic API usage and request examples, please refer to:
 
-- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
 
 **Simple Completion Example:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -141,7 +226,7 @@ A diffusion language model is an AI that learns to write text by reading lots of
 
 #### 4.3.1 Streaming
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -206,7 +291,7 @@ print(fibonacci_recursive(10))  # Output: 55
 
 #### 4.3.2 Code Generation
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -346,7 +431,7 @@ This section uses **industry-standard configurations** for comparable benchmark 
 
 **Model Deployment:**
 
-```bash
+```bash Command
 python -m sglang.launch_server \
   --model-path inclusionAI/LLaDA2.1-mini \
   --dllm-algorithm JointThreshold \
@@ -359,7 +444,7 @@ python -m sglang.launch_server \
 
 - Latency Benchmark
 
-```bash
+```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
   --model inclusionAI/LLaDA2.1-mini \
@@ -415,7 +500,7 @@ Max ITL (ms):                            26.59
 
 - Throughput Benchmark
 
-```bash
+```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
   --model inclusionAI/LLaDA2.1-mini \
@@ -473,7 +558,7 @@ Max ITL (ms):                            92.08
 
 **Model Deployment:**
 
-```bash
+```bash Command
 python -m sglang.launch_server \
   --model-path inclusionAI/LLaDA2.1-flash \
   --dllm-algorithm JointThreshold \
@@ -486,7 +571,7 @@ python -m sglang.launch_server \
 
 - Latency Benchmark
 
-```bash
+```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
   --model inclusionAI/LLaDA2.1-flash \
@@ -542,7 +627,7 @@ Max ITL (ms):                            29.27
 
 - Throughput Benchmark
 
-```bash
+```bash Command
 python -m sglang.bench_serving \
   --backend sglang \
   --model inclusionAI/LLaDA2.1-flash \
@@ -600,7 +685,7 @@ Max ITL (ms):                            176.78
 
 #### 5.2.1 GSM8K Benchmark
 
-```bash
+```bash Command
 python -m sglang.test.few_shot_gsm8k \
   --num-questions 200 \
   --port 8000

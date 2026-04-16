@@ -1,5 +1,8 @@
 ---
-title: "MiniMax-M2.5"
+title: MiniMax-M2.5
+metatags:
+    description: "Deploy MiniMax-M2.5 with SGLang - community contribution guide for MiniMax M2.5 model deployment."
+tag: NEW
 ---
 
 import { MiniMaxM25Deployment } from '/src/snippets/autoregressive/minimax-m25-deployment.jsx';
@@ -21,11 +24,11 @@ For more details, please refer to the [official MiniMax-M2.5 announcement](https
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 **For AMD MI300X/MI325X/MI355X GPUs:**
 
-```bash
+```bash Command
 # Docker (AMD MI300X/MI325X)
 docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
 
@@ -47,16 +50,62 @@ This section provides deployment configurations optimized for different hardware
 
 **Key Parameters:**
 
-| Parameter                    | Description                                    | Recommended Value                |
-| ---------------------------- | ---------------------------------------------- | -------------------------------- |
-| `--tool-call-parser`        | Tool call parser for function calling support   | `minimax-m2`                    |
-| `--reasoning-parser`        | Reasoning parser for thinking mode              | `minimax-append-think`          |
-| `--trust-remote-code`       | Required for MiniMax model loading              | Always enabled                   |
-| `--mem-fraction-static`     | Static memory fraction for KV cache             | `0.85`                          |
-| `--tp`                      | Tensor parallelism size                         | `2` (2-GPU) or `4` (4-GPU) or `8` (8-GPU)      |
-| `--ep`                      | Expert parallelism size                         | `8` (NVIDIA 8-GPU) or EP=TP (AMD)              |
-| `--kv-cache-dtype`          | KV cache data type (AMD only)                   | `fp8_e4m3`                      |
-| `--attention-backend`       | Attention backend (AMD only)                    | `triton`                        |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Recommended Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tool-call-parser`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tool call parser for function calling support</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`minimax-m2`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--reasoning-parser`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reasoning parser for thinking mode</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`minimax-append-think`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--trust-remote-code`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Required for MiniMax model loading</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Always enabled</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mem-fraction-static`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Static memory fraction for KV cache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.85`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tp`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tensor parallelism size</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`2` (2-GPU) or `4` (4-GPU) or `8` (8-GPU)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ep`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Expert parallelism size</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`8` (NVIDIA 8-GPU) or EP=TP (AMD)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--kv-cache-dtype`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KV cache data type (AMD only)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`fp8_e4m3`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--attention-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Attention backend (AMD only)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`triton`</td>
+    </tr>
+  </tbody>
+</table>
 
 **Hardware Requirements: NVIDIA**
 
@@ -75,13 +124,13 @@ This section provides deployment configurations optimized for different hardware
 
 For basic API usage and request examples, please refer to:
 
-- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
 
 **Testing Deployment:**
 
 After startup, you can test the SGLang OpenAI-compatible API with the following command:
 
-```bash
+```bash Command
 curl http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
@@ -95,7 +144,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 **Simple Completion Example:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -115,7 +164,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 **Example Output**:
-```
+```text Output
 <think>The user asks: "Who won the world series in 2020?" That is a straightforward factual question. The answer: the Los Angeles Dodgers. They won the 2020 World Series, beating the Tampa Bay Rays. The user is presumably expecting that answer.
 
 We must follow the policies. The question is safe: no disallowed content. It's just a factual question. Provide answer.
@@ -137,7 +186,7 @@ The Los Angeles Dodgers won the 2020 World Series, defeating the Tampa Bay Ray
 
 MiniMax-M2.5 supports Thinking mode. Enable the reasoning parser during deployment to separate the thinking and the content sections:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model-path MiniMaxAI/MiniMax-M2.5 \
   --tp 4 \
@@ -150,7 +199,7 @@ python -m sglang.launch_server \
 
 With `minimax-append-think`, the thinking content is wrapped in `<think>...</think>` tags within the `content` field. You can parse these tags on the client side to separate the thinking and content sections:
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -222,7 +271,7 @@ print()
 
 **Output Example:**
 
-```text
+```text Output
 =============== Thinking =================
 The user asks: "Solve this problem step by step: What is 15% of 240?" This is straightforward: 15% = 0.15; 0.15*240 = 36. So answer: 36. Provide step-by-step: convert percent to decimal, multiply.
 
@@ -261,7 +310,7 @@ We can add step-by-step. That's it.
 
 MiniMax-M2.5 supports tool calling capabilities. Enable the tool call parser:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model-path MiniMaxAI/MiniMax-M2.5 \
   --tp 4 \
@@ -273,7 +322,7 @@ python -m sglang.launch_server \
 
 **Python Example:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -329,7 +378,7 @@ else:
 ```
 
 **Output Example**:
-```
+```text Output
 Tool Call: get_weather
    Arguments: {"location": "Beijing"}
 ```
@@ -341,7 +390,7 @@ Tool Call: get_weather
 
 **Handling Tool Call Results:**
 
-```python
+```python Example
 # After getting the tool call, execute the function
 def get_weather(location, unit="celsius"):
     # Your actual weather API call here
@@ -395,7 +444,7 @@ This section uses **industry-standard configurations** for comparable benchmark 
 
 #### 5.1.1 Standard Scenario Benchmark
 - Model Deployment Command:
-```
+```text Output
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2.5 \
     --tp 8 \
@@ -407,7 +456,7 @@ sglang serve \
 ```
 ##### 5.1.1.1 Low Concurrency
 - Benchmark Command:
-```
+```text Output
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
@@ -418,7 +467,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 1
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -459,7 +508,7 @@ Max ITL (ms):                            14.46
 ```
 ##### 5.1.1.2 Medium Concurrency
 - Benchmark Command:
-```
+```text Output
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
@@ -470,7 +519,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 16
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -511,7 +560,7 @@ Max ITL (ms):                            483.53
 ```
 ##### 5.1.1.3 High Concurrency
 - Benchmark Command:
-```
+```text Output
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
@@ -522,7 +571,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 100
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -563,7 +612,7 @@ Max ITL (ms):                            1145.62
 ```
 #### 5.1.2 Summarization Scenario Benchmark
 - Model Deployment Command:
-```
+```text Output
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2.5 \
     --tp 8 \
@@ -575,7 +624,7 @@ sglang serve \
 ```
 ##### 5.1.2.1 Low Concurrency
 - Benchmark Command:
-```
+```text Output
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
@@ -586,7 +635,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 1
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -627,7 +676,7 @@ Max ITL (ms):                            14.11
 ```
 ##### 5.1.2.2 Medium Concurrency
 - Benchmark Command:
-```
+```text Output
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
@@ -638,7 +687,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 16
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -679,7 +728,7 @@ Max ITL (ms):                            1065.02
 ```
 ##### 5.1.2.3 High Concurrency
 - Benchmark Command:
-```
+```text Output
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
@@ -690,7 +739,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 64
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -741,7 +790,7 @@ Max ITL (ms):                            4649.23
 - sglang version: 0.5.9
 
 - Model Deployment Command:
-```
+```text Output
 sglang serve \
     --model-path MiniMaxAI/MiniMax-M2.5 \
     --tp 8 \
@@ -753,7 +802,7 @@ sglang serve \
 ```
 ##### 5.1.3.1 Low Concurrency
 - Benchmark Command:
-```
+```text Output
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
@@ -764,7 +813,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 1
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -805,7 +854,7 @@ Max ITL (ms):                            10.10
 ```
 ##### 5.1.3.2 Medium Concurrency
 - Benchmark Command:
-```
+```text Output
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
@@ -816,7 +865,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 16
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -857,7 +906,7 @@ Max ITL (ms):                            107.39
 ```
 ##### 5.1.3.3 High Concurrency
 - Benchmark Command:
-```
+```text Output
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
@@ -868,7 +917,7 @@ python3 -m sglang.bench_serving \
   --max-concurrency 100
 ```
 - Test Results:
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -911,11 +960,11 @@ Max ITL (ms):                            376.34
 ### 5.2 Accuracy Benchmark
 #### 5.2.1 GSM8K Benchmark
 - Benchmark Command:
-```
+```text Output
 python benchmark/gsm8k/bench_sglang.py --port 30000
 ```
 - Test Results:
-```
+```text Output
 Accuracy: 0.950
 Invalid: 0.000
 Latency: 18.033 s
@@ -923,13 +972,13 @@ Output throughput: 1130.161 token/s
 ```
 #### 5.2.2 MMLU Benchmark
 - Benchmark Command:
-```
+```text Output
 cd benchmark/mmlu
 bash download_data.sh
 python3 bench_sglang.py --port 30000
 ```
 - Test Results:
-```
+```text Output
 subject: abstract_algebra, #q:100, acc: 0.620
 subject: anatomy, #q:135, acc: 0.830
 subject: astronomy, #q:152, acc: 0.928

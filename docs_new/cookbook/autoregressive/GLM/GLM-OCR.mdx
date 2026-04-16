@@ -60,7 +60,7 @@ For basic API usage and request examples, please refer to:
 
 GLM-OCR supports OCR tasks on various document types. Here's a basic example:
 
-```python
+```python Example
 import time
 from openai import OpenAI
 
@@ -100,7 +100,7 @@ print(f"Generated text: {response.choices[0].message.content}")
 
 **Example Output:**
 
-```text
+```text Output
 Response costs: 2.29s
 Generated text: CINNAMON SUGAR
 1 x 17,000 17,000
@@ -125,7 +125,7 @@ GLM-OCR excels at processing complex documents including:
 - **Seals and Stamps**: Recognition of seals and stamps in documents
 - **Multi-layout Documents**: Mixed content with text, images, and tables
 
-```python
+```python Example
 import time
 from openai import OpenAI
 
@@ -172,7 +172,7 @@ Document model accuracy on standard benchmarks:
 
 - Benchmark Command
 
-```bash
+```bash Command
 python3 -m lmms_eval \
   --model openai_compatible \
   --model_args "model_version=zai-org/GLM-OCR" \

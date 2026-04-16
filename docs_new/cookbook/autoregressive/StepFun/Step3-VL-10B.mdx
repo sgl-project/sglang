@@ -1,5 +1,8 @@
 ---
-title: "Step3-VL-10B"
+title: Step3-VL-10B
+metatags:
+    description: "Deploy Step3-VL-10B multimodal model with SGLang - compact 10B dense model with frontier-level vision understanding, complex reasoning, and tool calling capabilities."
+tag: NEW
 ---
 
 import { Step3VL10BDeployment } from '/src/snippets/autoregressive/step-3vl-10b-deployment.jsx';
@@ -21,7 +24,7 @@ For more details, please refer to the [Step3-VL-10B model card on Hugging Face](
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -47,8 +50,8 @@ Step3-VL-10B is a compact 10B dense model that can run on a single GPU. Recommen
 
 For basic API usage and request examples, please refer to:
 
-- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
-- [SGLang OpenAI Vision API Guide](https://docs.sglang.ai/basic_usage/openai_api_vision.html)
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+- [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision)
 
 ### 4.2 Advanced Usage
 
@@ -56,7 +59,7 @@ For basic API usage and request examples, please refer to:
 
 Step3-VL-10B supports image inputs. Here's a basic example with image input:
 
-```python
+```python Example
 import time
 from openai import OpenAI
 
@@ -97,7 +100,7 @@ print(f"Generated text: {response.choices[0].message.content}")
 
 **Example output:**
 
-```
+```text Output
 Response costs: 5.89s
 Generated text: Auntie Anne's
 
@@ -117,7 +120,7 @@ CHANGE DUE                 3,000
 
 Step3-VL-10B can process multiple images in a single request for comparison or analysis:
 
-```python
+```python Example
 import time
 from openai import OpenAI
 
@@ -164,7 +167,7 @@ print(f"Generated text: {response.choices[0].message.content}")
 
 **Example Output:**
 
-```
+```text Output
 Response costs: 3.24s
 Generated text: First image: Single red Hong Kong taxi close - up, clear license plate (RX 5004), “4 SEATS” sticker, urban street with shops behind. Second image: Aerial view of many taxis (red, green) on a highway with a viaduct, some hoods open, dense arrangement. Differences: Scale (single vs many), perspective (close - up vs aerial), context (street shops vs highway), and taxi conditions (normal vs some open hoods).
 ```
@@ -173,7 +176,7 @@ Generated text: First image: Single red Hong Kong taxi close - up, clear license
 
 Step3-VL-10B supports reasoning mode. Enable the reasoning parser during deployment to separate the thinking and content sections:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model stepfun-ai/Step3-VL-10B \
   --reasoning-parser deepseek-r1 \
@@ -184,7 +187,7 @@ python -m sglang.launch_server \
 
 **Streaming with Thinking Process:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -233,7 +236,7 @@ print()
 ```
 
 **Example Output:**
-```
+```text Output
 =============== Thinking =================
 Okay, let's see. The problem is asking for 15% of 240. Hmm, I need to remember how to calculate percentages. So, percentage means "per hundred," right? So, 15% is the same as 15 per 100, or 15/100. To find a percentage of a number, I think you convert the percentage to a decimal and then multiply it by the number. Let me check that.
 
@@ -300,7 +303,7 @@ $$
 
 Step3-VL-10B supports tool calling capabilities. Enable the tool call parser:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model stepfun-ai/Step3-VL-10B \
   --reasoning-parser deepseek-r1 \
@@ -312,7 +315,7 @@ python -m sglang.launch_server \
 
 **Python Example (with Thinking Process):**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -409,7 +412,7 @@ print()
 ```
 
 **Example Output:**
-```
+```text Output
 =============== Thinking =================
 The user is asking about the weather in Beijing. I have a function called "get_weather" that can provide weather information for a location. Let me check the parameters:
 
@@ -428,7 +431,7 @@ I should call the function with location="Beijing".
 
 **Handling Tool Call Results:**
 
-```python
+```python Example
 # After getting the tool call, execute the function
 def get_weather(location, unit="celsius"):
     # Your actual weather API call here
@@ -489,7 +492,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation wit
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model stepfun-ai/Step3-VL-10B \
   --host 0.0.0.0 \
@@ -499,7 +502,7 @@ python -m sglang.launch_server \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
@@ -516,7 +519,7 @@ python3 -m sglang.bench_serving \
 
 - Result:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -561,7 +564,7 @@ Max ITL (ms):                            8.24
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
@@ -578,7 +581,7 @@ python3 -m sglang.bench_serving \
 
 - Result:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
@@ -627,7 +630,7 @@ You can evaluate the model's accuracy using the MMMU dataset:
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 python -m sglang.launch_server \
   --model stepfun-ai/Step3-VL-10B \
   --host 0.0.0.0 \
@@ -637,7 +640,7 @@ python -m sglang.launch_server \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 benchmark/mmmu/bench_sglang.py \
     --port 30000 \
     --concurrency 64
@@ -645,7 +648,7 @@ python3 benchmark/mmmu/bench_sglang.py \
 
 - Result:
 
-```
+```text Output
 Benchmark time: 934.6179109360091
 answers saved to: ./answer_sglang.json
 Evaluating...

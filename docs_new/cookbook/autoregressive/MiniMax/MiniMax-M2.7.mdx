@@ -28,12 +28,32 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
 
 **Docker Images by Hardware Platform:**
 
-| Hardware Platform | Docker Image |
-| --- | --- |
-| NVIDIA A100 / H100 / H200 / B200 | `lmsysorg/sglang:v0.5.10.post1` |
-| NVIDIA B300 / GB300 | `lmsysorg/sglang:v0.5.10.post1-cu130` |
-| AMD MI300X / MI325X | `lmsysorg/sglang:v0.5.10.post1-rocm720-mi30x` |
-| AMD MI355X | `lmsysorg/sglang:v0.5.10.post1-rocm720-mi35x` |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware Platform</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Docker Image</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA A100 / H100 / H200 / B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.10.post1`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA B300 / GB300</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.10.post1-cu130`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI300X / MI325X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.10.post1-rocm720-mi30x`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.10.post1-rocm720-mi35x`</td>
+    </tr>
+  </tbody>
+</table>
 
 ## 3. Model Deployment
 
@@ -51,16 +71,57 @@ import { MiniMaxM27Deployment } from '/src/snippets/autoregressive/minimax-m27-d
 
 **Key Parameters:**
 
-| Parameter                    | Description                                    | Recommended Value                |
-| ---------------------------- | ---------------------------------------------- | -------------------------------- |
-| `--tool-call-parser`        | Tool call parser for function calling support   | `minimax-m2`                    |
-| `--reasoning-parser`        | Reasoning parser for thinking mode              | `minimax-append-think`          |
-| `--trust-remote-code`       | Required for MiniMax model loading              | Always enabled                   |
-| `--mem-fraction-static`     | Static memory fraction for KV cache             | `0.85`                          |
-| `--tp`                      | Tensor parallelism size                         | `2` / `4` / `8` depending on hardware |
-| `--ep`                      | Expert parallelism size                         | `8` (NVIDIA 8-GPU) or EP=TP (AMD) |
-| `--kv-cache-dtype`          | KV cache data type (AMD only)                   | `fp8_e4m3`                      |
-| `--attention-backend`       | Attention backend (AMD only)                    | `triton`                        |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Recommended Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tool-call-parser`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tool call parser for function calling support</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`minimax-m2`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--reasoning-parser`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reasoning parser for thinking mode</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`minimax-append-think`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--trust-remote-code`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Required for MiniMax model loading</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Always enabled</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mem-fraction-static`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Static memory fraction for KV cache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.85`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tp`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tensor parallelism size</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`2` / `4` / `8` depending on hardware</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ep`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Expert parallelism size</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`8` (NVIDIA 8-GPU) or EP=TP (AMD)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--kv-cache-dtype`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KV cache data type (AMD only)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`fp8_e4m3`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--attention-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Attention backend (AMD only)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`triton`</td>
+    </tr>
+  </tbody>
+</table>
 
 **Hardware Requirements: NVIDIA**
 
@@ -88,7 +149,7 @@ For basic API usage and request examples, please refer to:
 
 **Deployment Command:**
 
-```bash
+```bash Command
 sglang serve \
   --model-path MiniMaxAI/MiniMax-M2.7 \
   --tp 4 \
@@ -102,7 +163,7 @@ sglang serve \
 
 After startup, you can test the SGLang OpenAI-compatible API with the following command:
 
-```bash
+```bash Command
 curl http://localhost:30000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
@@ -116,7 +177,7 @@ curl http://localhost:30000/v1/chat/completions \
 
 **Simple Completion Example:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -160,7 +221,7 @@ The **Los Angeles Dodgers** won the 2020 World Series. They defeated the **Tampa
 
 MiniMax-M2.7 supports Thinking mode. Enable the reasoning parser during deployment to separate the thinking and the content sections:
 
-```bash
+```bash Command
 sglang serve \
   --model-path MiniMaxAI/MiniMax-M2.7 \
   --tp 4 \
@@ -173,7 +234,7 @@ sglang serve \
 
 With `minimax-append-think`, the thinking content is wrapped in `<think>...</think>` tags within the `content` field. You can parse these tags on the client side to separate the thinking and content sections:
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -244,7 +305,7 @@ print()
 
 **Output Example:**
 
-```text
+```text Output
 =============== Thinking =================
 The user asks: "Solve this problem step by step: What is 15% of 240?" Straightforward. Provide solution: 15% = 15/100 = 0.15. Multiply 240 * 0.15 = 36. Show steps. So answer: 36. Provide explanation.
 
@@ -290,7 +351,7 @@ All good.
 
 MiniMax-M2.7 supports tool calling capabilities. Enable the tool call parser:
 
-```bash
+```bash Command
 sglang serve \
   --model-path MiniMaxAI/MiniMax-M2.7 \
   --tp 4 \
@@ -302,7 +363,7 @@ sglang serve \
 
 **Python Example:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -364,7 +425,7 @@ Tool Call: get_weather
 
 **Handling Tool Call Results:**
 
-```python
+```python Example
 # After getting the tool call, execute the function
 def get_weather(location, unit="celsius"):
     # Your actual weather API call here
@@ -428,7 +489,7 @@ This section uses **industry-standard configurations** for comparable benchmark 
 - Dataset: [GPQA Diamond](https://huggingface.co/datasets/Idavidrein/gpqa) (198 questions)
 - Prompt: `eval/aai/mcq-4choices` (4-choice multiple choice, matching [Artificial Analysis methodology](https://artificialanalysis.ai/methodology/intelligence-benchmarking))
 - Evaluation command:
-```bash
+```bash Command
 ns prepare_data gpqa
 
 ns eval \
@@ -446,18 +507,39 @@ ns eval \
 ```
 - Test Results:
 
-| Evaluation Mode | Accuracy | No Answer |
-|-----------------|----------|-----------|
-| pass@1 (avg-of-8) | 84.91% | 3.54% |
-| **majority@8** | **88.89%** | 0.00% |
-| pass@8 | 96.46% | 0.00% |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Evaluation Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Accuracy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>No Answer</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@1 (avg-of-8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>84.91%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.54%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**majority@8**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**88.89%**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>96.46%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.00%</td>
+    </tr>
+  </tbody>
+</table>
 
 #### 5.1.2 AIME 2025
 
 - Dataset: AIME 2025 (30 problems)
 - Prompt: `generic/math` (boxed answer format)
 - Evaluation command:
-```bash
+```bash Command
 ns prepare_data aime25
 
 ns eval \
@@ -474,18 +556,39 @@ ns eval \
 ```
 - Test Results:
 
-| Evaluation Mode | Accuracy | No Answer |
-|-----------------|----------|-----------|
-| pass@1 (avg-of-8) | 92.50% ± 5.56% | 2.92% |
-| **majority@8** | **97.08%** | 0.00% |
-| pass@8 | 100.00% | 0.00% |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Evaluation Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Accuracy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>No Answer</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@1 (avg-of-8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>92.50% ± 5.56%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2.92%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**majority@8**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**97.08%**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.00%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>100.00%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.00%</td>
+    </tr>
+  </tbody>
+</table>
 
 #### 5.1.3 MMLU-Pro
 
 - Dataset: [MMLU-Pro](https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro) (12,032 questions, 10-choice)
 - Prompt: `eval/aai/mcq-10choices` (10-choice multiple choice)
 - Evaluation command:
-```bash
+```bash Command
 ns prepare_data mmlu-pro
 
 ns eval \
@@ -502,9 +605,22 @@ ns eval \
 ```
 - Test Results:
 
-| Evaluation Mode | Accuracy | No Answer |
-|-----------------|----------|-----------|
-| pass@1 (greedy) | 69.41% | 18.75% |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Evaluation Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Accuracy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>No Answer</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>pass@1 (greedy)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>69.41%</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>18.75%</td>
+    </tr>
+  </tbody>
+</table>
 
 > **Note**: The high no-answer rate is due to the 32K token limit being insufficient for M2.7's extended thinking on some questions. A rerun with 120K tokens is expected to improve accuracy significantly.
 

@@ -1,5 +1,7 @@
 ---
-title: "Mistral Small 4"
+title: Mistral Small 4
+metatags:
+    description: "Deploy Mistral Small 4 with SGLang - unified hybrid model combining instruct, reasoning, and agentic capabilities with multimodal support."
 ---
 
 import { MistralSmall4Deployment } from '/src/snippets/autoregressive/mistral-small-4-deployment.jsx';
@@ -41,10 +43,10 @@ With its multimodal capabilities, efficient MoE architecture, and flexible mode 
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 <Info>
-Mistral Small 4 support landed in [sgl-project/sglang#20708](https://github.com/sgl-project/sglang/pull/20708) and has been merged into `main`. A model-specific Docker image is no longer required. Use the standard SGLang installation methods from the [official installation guide](https://docs.sglang.ai/get_started/install.html).
+Mistral Small 4 support landed in [sgl-project/sglang#20708](https://github.com/sgl-project/sglang/pull/20708) and has been merged into `main`. A model-specific Docker image is no longer required. Use the standard SGLang installation methods from the [official installation guide](../../../docs/get-started/installation).
 </Info>
 
 ---
@@ -74,7 +76,7 @@ Mistral Small 4 support landed in [sgl-project/sglang#20708](https://github.com/
 
 Mistral Small 4 is a hybrid reasoning model. By default, it does not produce a default reasoning response. Use `--reasoning_effort high` to toggle reasoning on.
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -96,7 +98,7 @@ print("Answer:", response.choices[0].message.content)
 
 **Output:**
 
-```
+```text Output
 Reasoning: First, I'll break down the problem into two parts: the multiplication and
 the division. According to the order of operations (PEMDAS/BODMAS), multiplication and
 division are performed from left to right before addition.
@@ -125,7 +127,7 @@ Answer: The solution to the problem is as follows:
 
 To skip the reasoning trace and get a fast direct response, set `reasoning_effort` to `"none"`:
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -159,7 +161,7 @@ def reverse_string(s):
 ```
 
 ## Method 2: Using a Loop
-```python
+```python Example
 def reverse_string(s):
     """Reverse a string using a loop."""
     reversed_str = ""
@@ -169,7 +171,7 @@ def reverse_string(s):
 ```
 
 ## Method 3: Using reversed() function
-```python
+```python Example
 def reverse_string(s):
     """Reverse a string using reversed() function."""
     return ''.join(reversed(s))
@@ -179,7 +181,7 @@ The first method using string slicing (`s[::-1]`) is generally the most efficien
 recommended approach in Python.
 
 Example usage:
-```python
+```python Example
 original = "Hello, World!"
 reversed_str = reverse_string(original)
 print(reversed_str)  # Output: "!dlroW ,olleH"
@@ -188,7 +190,7 @@ print(reversed_str)  # Output: "!dlroW ,olleH"
 
 ### 4.3 Streaming with Reasoning
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -218,7 +220,7 @@ print()
 
 **Output:**
 
-```
+```text Output
 === Reasoning ===
 Okay, the user is asking about the difference between async and threading in Python.
 I need to break this down clearly, covering the key aspects of both, like their
@@ -236,7 +238,7 @@ models, each suited for specific use cases. Here's a breakdown of their key diff
 
 Mistral Small 4 supports native function calling. Enable with `--tool-call-parser mistral`:
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -277,7 +279,7 @@ for tc in tool_calls:
 
 **Output:**
 
-```
+```text Output
 Tool: get_weather
 Args: {"location": "Paris"}
 ```
@@ -286,7 +288,7 @@ Args: {"location": "Paris"}
 
 Mistral Small 4 accepts image inputs alongside text:
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -315,7 +317,7 @@ print(response.choices[0].message.content)
 
 **Output:**
 
-```
+```text Output
 The image is a copyright symbol, represented by a stylized version of the lowercase
 letter "c" inside a circle. The "c" is depicted in a white or light-colored font, and
 the circle is orange. The design is simple yet striking, using oval and elliptical
@@ -330,25 +332,25 @@ shapes to create a distinct symbol which signifies copyright protection.
 
 #### GSM8K
 
-```bash
+```bash Command
 python3 benchmark/gsm8k/bench_sglang.py --port 30000
 ```
 
 **Results:**
 
-```
+```text Output
 TODO
 ```
 
 #### MMLU
 
-```bash
+```bash Command
 python3 benchmark/mmlu/bench_sglang.py --port 30000
 ```
 
 **Results:**
 
-```
+```text Output
 TODO
 ```
 
@@ -356,7 +358,7 @@ TODO
 
 #### Latency (Low Concurrency)
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --num-prompts 10 \
@@ -368,13 +370,13 @@ python3 -m sglang.bench_serving \
 
 **Results:**
 
-```
+```text Output
 TODO
 ```
 
 #### Throughput (High Concurrency)
 
-```bash
+```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --num-prompts 1000 \
@@ -386,6 +388,6 @@ python3 -m sglang.bench_serving \
 
 **Results:**
 
-```
+```text Output
 TODO
 ```

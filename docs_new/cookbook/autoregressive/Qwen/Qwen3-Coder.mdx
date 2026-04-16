@@ -1,5 +1,7 @@
 ---
-title: "Qwen3-Coder"
+title: Qwen3-Coder
+metatags:
+    description: "Deploy Qwen3-Coder(480B, 30B) MoE coding model with SGLang on AMD MI300X (MI325X, MI355X)"
 ---
 
 import { Qwen3CoderDeployment } from '/src/snippets/autoregressive/qwen3-coder-deployment.jsx';
@@ -24,7 +26,7 @@ For more details, please refer to the [official Qwen3-Coder GitHub Repository](h
 
 SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-Please refer to the [official SGLang installation guide](https://docs.sglang.ai/get_started/install.html) for installation instructions.
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -58,13 +60,13 @@ This section provides deployment configurations verified on AMD MI300X, MI325X, 
 
 For basic API usage and request examples, please refer to:
 
-- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
 
 ### 4.2 Advanced Usage
 
 #### 4.2.1 Code Generation Example
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -209,7 +211,7 @@ The function works with any sorted list of comparable elements (integers, string
 
 Qwen3-Coder supports tool calling capabilities. Enable the tool call parser during deployment. The following example uses 30B-A3B model:
 
-```shell
+```shell Command
 SGLANG_USE_AITER=0 python -m sglang.launch_server \
   --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
   --tp 1 \
@@ -220,7 +222,7 @@ SGLANG_USE_AITER=0 python -m sglang.launch_server \
 
 **Python Example:**
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -294,7 +296,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation wit
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 SGLANG_USE_AITER=0 python -m sglang.launch_server \
   --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
   --tp 8 \
@@ -308,7 +310,7 @@ SGLANG_USE_AITER=0 python -m sglang.launch_server \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
@@ -365,7 +367,7 @@ Max ITL (ms):                            18.53
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
@@ -422,7 +424,7 @@ Max ITL (ms):                            995.11
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
@@ -481,7 +483,7 @@ Max ITL (ms):                            36863.32
 
 - **Benchmark Command:**
 
-```shell
+```shell Command
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 ```
 

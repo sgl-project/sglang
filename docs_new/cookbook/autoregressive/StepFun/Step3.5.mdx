@@ -1,5 +1,8 @@
 ---
-title: "Step-3.5"
+title: Step-3.5
+metatags:
+    description: "Deploy Step-3.5 reasoning engine with SGLang. "
+tag: NEW
 ---
 
 import { Step35Deployment } from '/src/snippets/autoregressive/step-35-deployment.jsx';
@@ -18,7 +21,7 @@ This generation delivers comprehensive upgrades across the board:
 Step-3.5-Flash is currently available in SGLang via Docker image install.
 
 ### Docker (NVIDIA)
-```
+```bash Command
 # Pull the docker image
 docker pull lmsysorg/sglang:dev-pr-18084
 
@@ -31,7 +34,7 @@ docker run -it --gpus all \
 ```
 
 ### Docker (AMD ROCm)
-```bash
+```bash Command
 # For MI300X/MI325X
 docker pull lmsysorg/sglang:v0.5.9-rocm700-mi30x
 
@@ -73,7 +76,7 @@ The Step-3.5-Flash series comes in only one sizes. Recommended starting configur
 
 For basic API usage and request examples, please refer to:
 
-- [SGLang Basic Usage Guide](https://docs.sglang.ai/basic_usage/send_request.html)
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
 
 ### 4.2 Advanced Usage
 
@@ -81,7 +84,7 @@ For basic API usage and request examples, please refer to:
 
 Step-3.5-Flash only supports reasoning mode. Enable the reasoning parser during deployment to separate the thinking and content sections:
 
-```shell
+```shell Command
 sglang serve \
   --model-path stepfun-ai/Step-3.5-Flash \
   --tp 4 \
@@ -89,7 +92,7 @@ sglang serve \
   --reasoning-parser step3p5
 ```
 
-```python
+```python Example
 from openai import OpenAI
 
 client = OpenAI(
@@ -138,7 +141,7 @@ print()
 
 **Output Example:**
 
-```
+```text Output
 =============== Thinking =================
 We are asked: "What is 15% of 240?" We need to solve step by step.
 
@@ -185,7 +188,7 @@ Step-3.5 supports tool calling capabilities. Enable the tool call parser:
 
 Start sglang server:
 
-```shell
+```shell Command
 sglang serve \
   --model-path stepfun-ai/Step-3.5-Flash \
   --tp 4 \
@@ -194,7 +197,7 @@ sglang serve \
   --tool-call-parser step3p5
 ```
 
-```python
+```python Example
 from openai import OpenAI
 import json
 
@@ -287,7 +290,7 @@ else:
 
 **Output Example:**
 
-```
+```text Output
 --- Sending first request ---
 =============== Thinking =================
 The user is asking for the weather in Beijing. I should use the get_weather function with location="Beijing". The unit parameter is optional and the user didn't specify a preference, so I'll leave it out (the default should be fine).
@@ -327,7 +330,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation on 
 
 - Model Deployment Command:
 
-```shell
+```shell Command
 sglang serve \
   --model-path stepfun-ai/Step-3.5-Flash \
   --tp 4 \
@@ -338,7 +341,7 @@ sglang serve \
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model stepfun-ai/Step-3.5-Flash \
@@ -351,7 +354,7 @@ python3 -m sglang.bench_serving \
 
 - Test Results:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -395,7 +398,7 @@ Max ITL (ms):                            20.77
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model stepfun-ai/Step-3.5-Flash \
@@ -408,7 +411,7 @@ python3 -m sglang.bench_serving \
 
 - Test Results:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -452,7 +455,7 @@ Max ITL (ms):                            460.85
 
 - Benchmark Command:
 
-```shell
+```shell Command
 python3 -m sglang.bench_serving \
   --backend sglang \
   --model stepfun-ai/Step-3.5-Flash \
@@ -465,7 +468,7 @@ python3 -m sglang.bench_serving \
 
 - Test Results:
 
-```
+```text Output
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Traffic request rate:                    inf
@@ -511,7 +514,7 @@ Max ITL (ms):                            1359.81
 
 - **Benchmark Command:**
 
-```shell
+```shell Command
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 ```
 
