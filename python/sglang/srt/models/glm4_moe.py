@@ -336,7 +336,7 @@ class Glm4MoeAttention(nn.Module):
                 q_weight=q_weight,
                 k_weight=k_weight,
                 q_bias=q_bias,
-                k_bias=k_bias
+                k_bias=k_bias,
             )
 
         inner_state = q, k, v, forward_batch
@@ -937,6 +937,7 @@ class Glm4MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
