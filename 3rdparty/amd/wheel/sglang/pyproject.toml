@@ -123,8 +123,11 @@ srt_musa = [
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.45",
+  "torchada>=0.1.50",
   "mthreads-ml-py",
+  "mate>=0.2.0",
+  "deep-gemm>=0.1.3",
+  "flash_attn_3>=0.1.4",
   "numpy<2.0",
 ]
 
