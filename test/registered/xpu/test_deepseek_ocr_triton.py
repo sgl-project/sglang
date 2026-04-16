@@ -65,5 +65,8 @@ class TestDeepSeekOCRTriton(TestDeepSeekOCR):
         cls._cleanup_xpu_memory()
 
 
+# Avoid pytest collecting the imported base test class in this module.
+del TestDeepSeekOCR
+
 if __name__ == "__main__":
     unittest.main()
