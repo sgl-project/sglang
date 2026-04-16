@@ -341,6 +341,51 @@ class SDARInterleavedWorker:
             )
         return "\n".join(lines)
 
+    def _fmt_full_seq(
+        self,
+        req,
+        block_tokens_1d: torch.Tensor,  # [block_size], may still contain mask_id
+        mask_id: int,
+    ) -> str:
+        """
+        Print the full sequence: [origin_ids + output_ids] as decoded text,
+        then the current block slots with [MASK] for unfilled positions.
+
+        Layout:
+          context : "...decoded prefix..."
+          block   : [MASK] 'the' [MASK] 'cat' ...
+          combined: "...decoded prefix... <MASK> the <MASK> cat ..."
+        """
+        prefix_ids = list(req.origin_input_ids) + list(req.output_ids)
+        try:
+            prefix_text = self.target_worker.tokenizer.decode(
+                prefix_ids, skip_special_tokens=False
+            ).replace("\n", "\\n")
+        except Exception:
+            prefix_text = f"<{len(prefix_ids)} tokens>"
+
+        # Block slots as short strings
+        block_strs = [self._tok(int(t)) for t in block_tokens_1d.tolist()]
+        block_inline = " ".join(block_strs)
+
+        # Decode only the non-mask tokens in the block to give a "combined" view
+        filled_ids = [
+            int(t) for t in block_tokens_1d.tolist() if int(t) != mask_id
+        ]
+        try:
+            block_text = self.target_worker.tokenizer.decode(
+                filled_ids, skip_special_tokens=False
+            ).replace("\n", "\\n") if filled_ids else ""
+        except Exception:
+            block_text = ""
+
+        lines = [
+            f"    context ({len(prefix_ids)} tok): \"{prefix_text}\"",
+            f"    block slots : {block_inline}",
+            f"    combined    : \"{prefix_text}\" + \"{block_text}\" (+ {block_tokens_1d.tolist().count(mask_id)} [MASK] remaining)",
+        ]
+        return "\n".join(lines)
+
     def _fmt_verif_result(
         self,
         result: dict,
@@ -434,8 +479,9 @@ class SDARInterleavedWorker:
             flush=True,
         )
         for b in range(bs):
-            print(f"  req[{b}] initial block (all MASK):", flush=True)
-            print(self._fmt_block(block_tokens[b], block_positions[b]), flush=True)
+            req = batch.reqs[b]
+            print(f"  req[{b}] full sequence BEFORE this block:", flush=True)
+            print(self._fmt_full_seq(req, block_tokens[b], mask_id), flush=True)
         print(flush=True)
 
         # ---------------------------------------------------------------
@@ -621,12 +667,15 @@ class SDARInterleavedWorker:
 
             pending_large_drafts = new_pending
 
-            # Show block state after this round
+            # Show block state + full sequence after this round
             masks_left_now = int((block_tokens == mask_id).sum().item())
-            print(f"\n  Block state after Round {_round}:", flush=True)
+            print(f"\n  ── After Round {_round} ──", flush=True)
             for b in range(bs):
-                print(f"  req[{b}]:", flush=True)
+                req = batch.reqs[b]
+                print(f"  req[{b}] block slots:", flush=True)
                 print(self._fmt_block(block_tokens[b], block_positions[b]), flush=True)
+                print(f"  req[{b}] full sequence so far:", flush=True)
+                print(self._fmt_full_seq(req, block_tokens[b], mask_id), flush=True)
             print(
                 f"  masks_remaining={masks_left_now}  total_accepted_so_far={total_accepted}",
                 flush=True,
@@ -661,12 +710,11 @@ class SDARInterleavedWorker:
         )
         print(f"  Final block to be written to KV:", flush=True)
         for b in range(bs):
-            print(f"  req[{b}]:", flush=True)
+            req = batch.reqs[b]
+            print(f"  req[{b}] block slots:", flush=True)
             print(self._fmt_block(block_tokens[b], block_positions[b]), flush=True)
-            toks_text = " ".join(
-                self._tok(int(t)) for t in block_tokens[b].tolist()
-            )
-            print(f"    text sequence: {toks_text}", flush=True)
+            print(f"  req[{b}] full sequence after this block:", flush=True)
+            print(self._fmt_full_seq(req, block_tokens[b], mask_id), flush=True)
         _large_fwd_count += 1
         _small_fwd_count += 1
         self._commit_block(batch, block_tokens, block_positions)
