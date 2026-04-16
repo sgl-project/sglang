@@ -145,7 +145,7 @@ def send_tensors(
     metadata_bytes, buffers = pack_tensors(tensor_fields, scalar_fields)
     parts: list = [metadata_bytes]
     parts.extend(w._view if isinstance(w, TensorWrapper) else w for w in buffers)
-    socket.send_multipart(parts, flags=flags, copy=False)
+    socket.send_multipart(parts, flags=flags, copy=True)
 
 
 def unpack_tensors(
