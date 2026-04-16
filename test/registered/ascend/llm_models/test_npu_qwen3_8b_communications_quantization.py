@@ -29,7 +29,7 @@ class TestQwen38BCommQuantization(GSM8KAscendMixin, CustomTestCase):
         32,
         "--tp-size",
         2,
-        "--quantize-tp-communications",
+        "--enable-quant-communications",
     ]
 
 
