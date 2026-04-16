@@ -4,18 +4,12 @@ This module verifies the ability to update model weights in place from
 serialized in-memory tensors without restarting the server, which is critical
 for RL workflows and iterative fine-tuning scenarios.
 
-Author:
-
-Menyang Liu, https://github.com/dreamyang-liu
-Chenyang Zhao, https://github.com/zhaochenyang20
-
 We use two model pairs for testing (base model / instruct model pairs):
 
 - FLUX.2-klein-base-4B / FLUX.2-klein-4B
 - Qwen/Qwen-Image / Qwen/Qwen-Image-2512
 
-These model pairs share the same architecture but differ in transformer
-weights. The core testing logic is to build in-memory tensor updates from model
+The core testing logic is to build in-memory tensor updates from model
 weights and apply them through `/update_weights_from_tensor`, then verify the
 server checksum for updated modules matches the expected checksum computed from
 the payload.
