@@ -438,6 +438,12 @@ class DecodePreallocQueue:
         if prefill_info.dp_size == 1:
             return 0
 
+        if (
+            prefill_info.follow_bootstrap_room
+            and not envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
+        ):
+            return req.bootstrap_room % prefill_info.dp_size
+
         return None
 
     def _create_receiver_and_enqueue(self, req: Req) -> DecodeRequest:

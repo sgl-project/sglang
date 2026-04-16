@@ -443,7 +443,12 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if self.kv_mgr.server_args.dp_size > 1:
+        if self.kv_mgr.server_args.dp_size > 1 and (
+            self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room"
+            or self.kv_mgr.attn_dp_rank
+            != self.bootstrap_room % self.kv_mgr.server_args.dp_size
+            or envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
+        ):
             self._register_prefill_dp_rank()
 
     def _register_prefill_dp_rank(self):
