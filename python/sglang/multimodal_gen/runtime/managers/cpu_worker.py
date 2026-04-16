@@ -1,9 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import gc
-import logging
-import multiprocessing as mp
 import os
 import time
 from typing import List, Union
@@ -42,30 +39,28 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     OffloadableDiTMixin,
     iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    configure_logger,
-    globally_suppress_loggers,
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
-    capture_memory_snapshot,
 )
+from sglang.srt.utils import cpu_has_amx_support, get_cpu_ids_by_node
 from sglang.srt.utils.network import NetworkAddress
+from .gpu_worker import GPUWorker, OOM_MSG, _oom_exceptions
+_is_cpu_amx_available = cpu_has_amx_support()
 
 logger = init_logger(__name__)
 
 
-class GPUWorker:
+class CPUWorker(GPUWorker):
     """
-    A worker that executes the model on a single GPU.
+    A worker that executes the model on pure CPU platforms
     """
 
     def __init__(
@@ -81,6 +76,8 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        if _is_cpu_amx_available:
+            self.init_cpu_threads_binding()
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -159,54 +156,6 @@ class GPUWorker:
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
 
-    def do_mem_analysis(self, output_batch: OutputBatch):
-        final_snapshot = capture_memory_snapshot()
-        if output_batch.metrics:
-            output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
-
-        # for details on max_memory_reserved: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        peak_allocated_bytes = torch.get_device_module().max_memory_allocated()
-
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
-        peak_reserved_gb = peak_reserved_bytes / (1024**3)
-        peak_allocated_gb = peak_allocated_bytes / (1024**3)
-
-        remaining_gpu_mem_gb = (
-            current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
-        )
-        can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
-        suggested_args = set()
-        component_to_arg = {
-            "vae": "--vae-cpu-offload",
-            "text_encoder": "--text-encoder-cpu-offload",
-            "text_encoder_2": "--text-encoder-cpu-offload",
-            "image_encoder": "--image-encoder-cpu-offload",
-        }
-
-        for component in can_stay_resident:
-            if component == "transformer":
-                if self.server_args.dit_layerwise_offload:
-                    suggested_args.add("--dit-layerwise-offload")
-                elif self.server_args.dit_cpu_offload:
-                    suggested_args.add("--dit-cpu-offload")
-            elif component in component_to_arg:
-                suggested_args.add(component_to_arg[component])
-
-        suggested_args_str = (
-            ", ".join(sorted(suggested_args)) if suggested_args else "None"
-        )
-
-        pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
-
-        logger.debug(
-            f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
-            f"Peak allocated: {peak_allocated_gb:.2f} GB, "
-            f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
-            f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
-            f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
-            f"Related offload server args to disable: {suggested_args_str}"
-        )
 
     def execute_forward(self, batch: List[Req]) -> OutputBatch:
         """
@@ -216,15 +165,7 @@ class GPUWorker:
         req = batch[0]
         output_batch = None
         try:
-            if self.rank == 0:
-                torch.get_device_module().reset_peak_memory_stats()
-
             start_time = time.monotonic()
-
-            # capture memory baseline before forward
-            if self.rank == 0 and req.metrics:
-                baseline_snapshot = capture_memory_snapshot()
-                req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
@@ -246,25 +187,12 @@ class GPUWorker:
             else:
                 output_batch = result
 
-            # capture memory after forward (peak)
-            if self.rank == 0 and output_batch.metrics:
-                peak_snapshot = capture_memory_snapshot()
-                output_batch.metrics.record_memory_snapshot(
-                    "after_forward", peak_snapshot
-                )
-
-            if (
-                self.rank == 0
-                and not req.suppress_logs
-                and logger.isEnabledFor(logging.DEBUG)
-            ):
-                self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.metrics.total_duration_ms = duration_ms
 
             # Save output to file and return file path only if requested. Avoid the serialization
-            # and deserialization overhead between scheduler_client and gpu_worker.
+            # and deserialization overhead between scheduler_client and cpu_worker.
             if req.save_output and req.return_file_paths_only:
                 if self.rank == 0 and output_batch.output is not None:
                     output_paths = save_outputs(
@@ -292,8 +220,6 @@ class GPUWorker:
                 output_batch.audio = None
                 output_batch.audio_sample_rate = None
 
-                if torch.cuda.is_initialized():
-                    torch.cuda.empty_cache()
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
@@ -323,40 +249,6 @@ class GPUWorker:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         return output_batch
-
-    def get_can_stay_resident_components(
-        self, remaining_gpu_mem_gb: float
-    ) -> List[str]:
-        """
-        Calculate which components can stay resident on GPU without being offloaded.
-        """
-        can_stay_resident = []
-        if not self.pipeline:
-            return can_stay_resident
-
-        # Map memory_usage keys to server_args offload flags
-        # If the flag is False, the component is ALREADY resident, so we don't suggest it.
-        # If the flag is True, it is currently offloaded, so it's a candidate to "stay resident".
-        offload_flags = {
-            "transformer": self.server_args.dit_cpu_offload
-            or self.server_args.dit_layerwise_offload,
-            "vae": self.server_args.vae_cpu_offload,
-            "text_encoder": self.server_args.text_encoder_cpu_offload,
-            "text_encoder_2": self.server_args.text_encoder_cpu_offload,
-            "image_encoder": self.server_args.image_encoder_cpu_offload,
-        }
-
-        for name, usage in self.pipeline.memory_usages.items():
-            # Only consider components that are currently configured to be offloaded
-            is_offload_configured = offload_flags.get(name, False)
-            if not is_offload_configured:
-                continue
-
-            if usage <= remaining_gpu_mem_gb:
-                can_stay_resident.append(name)
-                remaining_gpu_mem_gb -= usage
-
-        return can_stay_resident
 
     def set_lora(
         self,
@@ -462,88 +354,48 @@ class GPUWorker:
             )
         return checksums
 
+    def init_cpu_threads_binding(self):
+        omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+        cpu_ids_by_node = get_cpu_ids_by_node()
+        n_numa_node = len(cpu_ids_by_node)
+        if omp_cpuids == "all":
+            assert self.server_args.tp_size <= n_numa_node, (
+                f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
+                f"tp_size {self.server_args.tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
+                f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+                f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
+                f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
+                f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
+                f"If you do need tp_size to be larger than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
+                f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+            )
+            if self.server_args.tp_size < n_numa_node:
+                logger.warning(
+                    f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {self.server_args.tp_size}, so only {self.server_args.tp_size} numa nodes are used."
+                )
+            self.local_omp_cpuid = cpu_ids_by_node[self.rank]
+        else:
+            threads_bind_list = omp_cpuids.split("|")
+            assert self.server_args.tp_size == len(threads_bind_list), (
+                f"SGLANG_CPU_OMP_THREADS_BIND setting must be aligned with TP size parameter ({self.server_args.tp_size}). "
+                f"Please double check your settings."
+            )
+            self.local_omp_cpuid = threads_bind_list[self.rank]
+            if self.server_args.tp_size > n_numa_node:
+                logger.warning(
+                    f"TP size ({self.server_args.tp_size})is larger than numa node number ({n_numa_node}), "
+                    f"in this case the available memory amount of each rank cannot be determined in prior. "
+                    f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
+                )
 
-OOM_MSG = f"""
-OOM detected. Possible solutions:
-  - If the OOM occurs during loading:
-    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
-  - If the OOM occurs during runtime:
-    1. Enable SP and/or TP (in a multi-GPU setup)
-    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-    3. Opt for a sparse-attention backend
-    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
-    5. Enable quantization (e.g. nunchaku)
-  Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
-"""
+        # Bind OpenMP threads to CPU cores
+        torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
+        # Set local size to hint SGLang to use shared memory based AllReduce
+        os.environ["LOCAL_SIZE"] = str(self.server_args.tp_size)
+        torch.ops.sgl_kernel.initialize(self.server_args.tp_size, self.rank)
 
-def _oom_exceptions():
-    # torch.OutOfMemoryError exists only in some PyTorch builds
-    types = [torch.cuda.OutOfMemoryError]
-    if hasattr(torch, "OutOfMemoryError"):
-        types.append(torch.OutOfMemoryError)
-    return tuple(types)
+        @torch.library.register_fake("sgl_kernel::shm_allgather")
+        def _(data, dim):
+            return torch.cat([data] * self.server_args.tp_size, dim=dim)
 
-
-def run_scheduler_process(
-    local_rank: int,
-    rank: int,
-    master_port: int,
-    server_args: ServerArgs,
-    pipe_writer: mp.connection.Connection,
-    # For all workers: pipe to receive tasks from rank 0
-    task_pipe_r: mp.connection.Connection,
-    # For slave workers: pipe to send results back to rank 0
-    result_pipe_w: mp.connection.Connection | None,
-    # For rank 0 worker only: pipes to send tasks to slaves
-    task_pipes_to_slaves: list[mp.connection.Connection] | None = None,
-    # For rank 0 worker only: pipes to receive results from slaves
-    result_pipes_from_slaves: list[mp.connection.Connection] | None = None,
-) -> None:
-    """
-    The entry point for the worker process.
-    Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
-    Ranks > 0 act as slaves, waiting for tasks from the master.
-    """
-    configure_logger(server_args)
-    globally_suppress_loggers()
-    if current_platform.is_cuda():
-        set_cuda_arch()
-    elif current_platform.is_musa():
-        set_musa_arch()
-
-    port_args = PortArgs.from_server_args(server_args)
-
-    # start the scheduler event loop
-    assert task_pipes_to_slaves is not None
-    assert result_pipes_from_slaves is not None
-    from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
-
-    try:
-        scheduler = Scheduler(
-            server_args,
-            gpu_id=rank,
-            port_args=port_args,
-            task_pipes_to_slaves=task_pipes_to_slaves,
-            result_pipes_from_slaves=result_pipes_from_slaves,
-        )
-        logger.info(f"Worker {rank}: Scheduler loop started.")
-        pipe_writer.send(
-            {
-                "status": "ready",
-            }
-        )
-        scheduler.event_loop()
-    except _oom_exceptions() as _e:
-        logger.warning(OOM_MSG)
-        raise
-    finally:
-        # Clean up resources to speed up shutdown
-        if "scheduler" in locals():
-            del scheduler
-        gc.collect()
-        if torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
-        logger.info(f"Worker {rank}: Shutdown complete.")
