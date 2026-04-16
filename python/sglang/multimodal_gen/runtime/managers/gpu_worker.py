@@ -41,6 +41,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     Req,
     build_pipeline,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
+    RealtimeSessionCache,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
@@ -90,6 +93,20 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+        self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+
+    def release_realtime_session(self, session_id: str) -> OutputBatch:
+        if not session_id:
+            return OutputBatch(
+                output={
+                    "released": False,
+                    "session_id": session_id,
+                    "reason": "empty_session_id",
+                }
+            )
+
+        released = self._realtime_sessions.release(session_id)
+        return OutputBatch(output={"released": released, "session_id": session_id})
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -220,6 +237,7 @@ class GPUWorker:
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
+            self._realtime_sessions.attach(req)
 
             # capture memory baseline before forward
             if self.rank == 0 and req.metrics:

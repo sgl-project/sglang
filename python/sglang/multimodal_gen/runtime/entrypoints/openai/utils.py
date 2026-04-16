@@ -137,7 +137,9 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     return sampling_params
 
 
-async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
+async def save_image_to_path(
+    image: Union[UploadFile, bytes, str], target_path: str
+) -> str:
     input_path = await _maybe_url_image(image, target_path)
     if input_path is None:
         input_path = await _save_upload_to_path(image, target_path)
@@ -145,9 +147,14 @@ async def save_image_to_path(image: Union[UploadFile, str], target_path: str) ->
 
 
 # Helpers
-async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
+async def _save_upload_to_path(
+    upload: Union[UploadFile, bytes], target_path: str
+) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    content = await upload.read()
+    if isinstance(upload, UploadFile):
+        content = await upload.read()
+    else:
+        content = upload
     with open(target_path, "wb") as f:
         f.write(content)
     return target_path

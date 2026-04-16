@@ -69,6 +69,11 @@ class ShutdownReq:
     pass
 
 
+@dataclass
+class ReleaseRealtimeSessionReq:
+    session_id: str
+
+
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],

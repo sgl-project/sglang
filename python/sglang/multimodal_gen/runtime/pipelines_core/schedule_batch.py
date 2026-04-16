@@ -22,6 +22,9 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
+    RealtimeSession,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
@@ -165,6 +168,13 @@ class Req:
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+
+    # realtime
+    session: RealtimeSession | None = None
+    block_idx: int = 0
+    num_blocks: int = 1
+    update_prompt_embeds: bool = False
+    input_video: torch.Tensor = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields

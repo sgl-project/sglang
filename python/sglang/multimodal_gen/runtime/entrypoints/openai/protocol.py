@@ -2,7 +2,7 @@ import time
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -126,6 +126,22 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
+    # WebSocket does not support multipart/form-data image uploads
+    first_frame: Optional[bytes | str] = None
+    size: Optional[str] = "832x480"
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
+
+
+class RealtimeAction(BaseModel):
+    type: Literal["prompt", "video"]
+    action_content: Optional[str] = None
+    video_frame: Optional[bytes] = None
+    video_frames: Optional[List[bytes]] = None
 
 
 # Mesh API protocol models
