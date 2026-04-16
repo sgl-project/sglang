@@ -852,6 +852,9 @@ class EmbeddingReqInput(BaseReq):
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
+    # Whether to return pooled hidden states (pre-head transformer output)
+    return_pooled_hidden_states: bool = False
+
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -953,6 +956,7 @@ class EmbeddingReqInput(BaseReq):
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 is_cross_encoder_request=True,
                 http_worker_ipc=self.http_worker_ipc,
+                return_pooled_hidden_states=self.return_pooled_hidden_states,
             )
         else:
             sub = EmbeddingReqInput(
@@ -976,6 +980,7 @@ class EmbeddingReqInput(BaseReq):
                 dimensions=self.dimensions,
                 http_worker_ipc=self.http_worker_ipc,
                 received_time=self.received_time,
+                return_pooled_hidden_states=self.return_pooled_hidden_states,
             )
         cache[i] = sub
         return sub
@@ -1006,6 +1011,9 @@ class TokenizedEmbeddingReqInput(BaseReq):
     lora_id: Optional[str] = None  # None means just use the base model
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
+
+    # Whether to return pooled hidden states (pre-head transformer output)
+    return_pooled_hidden_states: bool = False
 
 
 @dataclass
@@ -1175,6 +1183,12 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    # Optional pooled hidden states (pre-head transformer output).
+    # Sent as a single stacked tensor to minimize pickle overhead.
+    pooled_hidden_states: Optional[
+        Union[List[Optional[torch.Tensor]], torch.Tensor]
+    ] = None
+
 
 @dataclass
 class ClearHiCacheReqInput(BaseReq):
@@ -1232,7 +1246,7 @@ class ListExternalCorporaReqInput(BaseReq):
 @dataclass
 class ListExternalCorporaReqOutput(BaseReq):
     success: bool
-    corpus_ids: List[str] = field(default_factory=list)
+    corpus_token_counts: Dict[str, int] = field(default_factory=dict)
     message: str = ""
 
 
@@ -1857,6 +1871,7 @@ class GetLoadReqOutput(BaseReq):
     num_reqs: int
     num_waiting_reqs: int
     num_tokens: int
+    num_pending_tokens: int
     ts_tic: float
 
 
@@ -1980,6 +1995,8 @@ class GetLoadsReqOutput(BaseReq):
     max_total_num_tokens: int = field(
         metadata={"metric": ("gauge", "Maximum token capacity")}
     )
+    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
+    # not just KV token usage. Rename requires API deprecation.
     token_usage: float = field(metadata={"metric": ("gauge", "Token pool usage ratio")})
     gen_throughput: float = field(
         metadata={"metric": ("gauge", "Generation throughput tokens/sec")}

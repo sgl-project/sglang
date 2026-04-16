@@ -20,16 +20,19 @@ from sglang.srt.layers.pooler import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=9, suite="stage-a-test-cpu")
 
 
-def _make_forward_batch(extend_seq_lens, is_prefill_only=False):
+def _make_forward_batch(
+    extend_seq_lens, is_prefill_only=False, return_pooled_hidden_states=False
+):
     """Build a minimal ForwardBatch stub for pooler unit tests."""
     return SimpleNamespace(
         extend_seq_lens=torch.tensor(extend_seq_lens, dtype=torch.long),
         extend_seq_lens_cpu=extend_seq_lens,
         is_prefill_only=is_prefill_only,
         dimensions=None,
+        return_pooled_hidden_states=return_pooled_hidden_states,
     )
 
 

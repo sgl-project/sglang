@@ -1091,9 +1091,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if language_model_cls is Qwen3LLMModel:
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
-            self.config = config.text_config  # for qwen3-omni
+            self.config = config.text_config  # for qwen3-omni / qwen3-vl-moe
             self.config.encoder_only = getattr(config, "encoder_only", False)
             self.config.language_only = getattr(config, "language_only", False)
+            # Propagate tie_word_embeddings from parent config. In transformers
+            # v5.5.3+, Qwen3VLMoeTextConfig sets tie_word_embeddings=True by
+            # default but the actual model checkpoint has a separate lm_head.
+            # The parent Qwen3VLMoeConfig correctly has tie_word_embeddings=False.
+            if hasattr(config, "tie_word_embeddings"):
+                self.config.tie_word_embeddings = config.tie_word_embeddings
 
         if not hasattr(config, "encoder_only") or not config.encoder_only:
             self.model = language_model_cls(
@@ -1122,6 +1128,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.capture_aux_hidden_states = False
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
@@ -1266,6 +1273,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

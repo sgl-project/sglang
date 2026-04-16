@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=97, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -464,6 +464,11 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         ]
 
         messages = [{"role": "user", "content": "What is the capital of France?"}]
+        # strict=True ensures constrained decoding enforces the parameter schema.
+        # Without it, tool_choice="required" only guarantees a tool call is made
+        # but arguments are best-effort (may be empty on small models).
+        for tool in tools:
+            tool["function"]["strict"] = True
         response = client.chat.completions.create(
             model=self.model,
             max_tokens=2048,
@@ -547,6 +552,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         },
                         "required": ["city"],
                     },
+                    "strict": True,
                 },
             },
         ]
