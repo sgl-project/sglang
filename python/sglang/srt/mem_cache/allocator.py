@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.python.sglang.srt import server_args
+
 """
 Copyright 2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,7 +28,26 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_num_new_pages,
+    is_npu,
+    next_power_of_2,
+)
+
+# BLOCK_EXTEND configuration: use smaller value for NPU + Hisparse combination
+_is_npu = is_npu()
+try:
+    server_args = get_global_server_args()
+    _enable_hisparse = server_args.enable_hisparse
+except Exception:
+    _enable_hisparse = False
+
+if _is_npu and _enable_hisparse:
+    DEFAULT_BLOCK_EXTEND = 2048
+else:
+    DEFAULT_BLOCK_EXTEND = 4096
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -287,7 +308,7 @@ def alloc_extend_kernel(
         seq_len // page_size * page_size
         - (pre_len + page_size - 1) // page_size * page_size
     )
-    BLOCK_EXTEND: tl.constexpr = 2048
+    BLOCK_EXTEND: tl.constexpr = DEFAULT_BLOCK_EXTEND
     num_blocks = (num_part2 + BLOCK_EXTEND - 1) // BLOCK_EXTEND
     for block_id in range(num_blocks):
         offset_in_block = tl.arange(0, BLOCK_EXTEND)
