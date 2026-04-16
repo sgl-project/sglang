@@ -127,8 +127,11 @@ _COMMUNICATOR_SPECS = [
 ]
 
 
-class TokenizerCommunicatorMixin:
-    """Mixin class for TokenizerManager to handle communication with the scheduler."""
+class TokenizerControlMixin:
+    """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
+    profile, internal state, etc.) -- everything that talks to the scheduler via
+    FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
+    """
 
     def init_communicators(self: TokenizerManager, server_args: ServerArgs):
         dispatch_pairs = []
