@@ -10,10 +10,10 @@ from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_update_npu,
 )
 
-from sglang.srt.layers.attention.linear.gdn_backend import (
-    GDNAttnBackend,
-    GDNKernelDispatcher,
+from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+    AscendMambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
@@ -30,16 +30,17 @@ causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
 
 
-class AscendGDNAttnBackend(GDNAttnBackend):
+class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        # transpose last two dim for _init_npu_conv_state
         self.conv_states_shape = torch.Size(
             (
-                *self.conv_states_shape[:-2],
-                self.conv_states_shape[-1],
-                self.conv_states_shape[-2],
+                *model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape[
+                    :-2
+                ],
+                model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape[-1],
+                model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape[-2],
             )
         )
         decode_backend = get_linear_attn_decode_backend()

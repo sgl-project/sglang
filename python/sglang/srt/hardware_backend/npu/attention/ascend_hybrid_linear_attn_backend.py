@@ -12,23 +12,11 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
-
-# from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-# from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
-# from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
 )
-
-# from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-#     fused_mamba_state_scatter_with_mask,
-# )
-# from sglang.srt.layers.radix_attention import RadixAttention
-# from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-
-# from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -264,7 +252,6 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
         valid_state_indices = state_indices_tensor.to(torch.int64)  # [N]
         last_steps = accepted_steps.to(torch.int64)  # [N]
 

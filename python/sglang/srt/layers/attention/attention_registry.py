@@ -207,7 +207,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
                 AscendMamba2AttnBackend as Mamba2AttnBackend,
             )
-
         else:
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
                 HybridLinearAttnBackend,
