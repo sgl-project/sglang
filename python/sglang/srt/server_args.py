@@ -800,6 +800,9 @@ class ServerArgs:
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
 
+        # Handle multi-item scoring constraints.
+        self._handle_multi_item_scoring()
+
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
@@ -1204,6 +1207,21 @@ class ServerArgs:
         # 18. CUDA Graph debug mode
         if self.debug_cuda_graph:
             self.disable_piecewise_cuda_graph = True
+
+    def _handle_multi_item_scoring(self):
+        """Disable CUDA graphs when multi-item scoring delimiter is set.
+
+        The padded static input_ids buffer used by CUDA graph replay causes
+        spurious delimiter matches in score_and_pool's MIS path.
+        """
+        if self.multi_item_scoring_delimiter is None:
+            return
+        if not self.disable_cuda_graph:
+            logger.warning(
+                "CUDA graph is disabled because --multi-item-scoring-delimiter is set."
+            )
+            self.disable_cuda_graph = True
+        self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
