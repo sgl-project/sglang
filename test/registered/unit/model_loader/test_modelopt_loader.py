@@ -30,7 +30,7 @@ CALIBRATION_BATCH_SIZE = 36
 CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
-register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
 
 
 class TestModelOptModelLoader(CustomTestCase):

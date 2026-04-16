@@ -2406,6 +2406,12 @@ class AiterAttnBackend(AttentionBackend):
                 v_descale=v_descale,
             )
 
+            # The fp8bf16 aiter prefill kernel returns bf16 even when the
+            # model computes in fp16. Cast back so the attention output keeps
+            # the same dtype as the rest of the model activations.
+            if o.dtype != self.input_dtype:
+                o = o.to(self.input_dtype)
+
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
