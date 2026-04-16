@@ -267,7 +267,7 @@ class HybridCacheController(BaseHiCacheController):
                 pool_transfers=op.pool_transfers,
             )
             finish_event.record()
-            self._record_op_indices_on_stream(
+            self._record_transfer_indices_on_stream(
                 self.write_stream,
                 host_indices,
                 device_indices,
@@ -330,7 +330,7 @@ class HybridCacheController(BaseHiCacheController):
                     pool_transfers=op.pool_transfers,
                 )
                 producer_event.complete(i)
-            self._record_op_indices_on_stream(
+            self._record_transfer_indices_on_stream(
                 self.load_stream,
                 host_indices,
                 device_indices,
@@ -345,7 +345,7 @@ class HybridCacheController(BaseHiCacheController):
         )
         return producer_id
 
-    def _record_op_indices_on_stream(
+    def _record_transfer_indices_on_stream(
         self,
         stream: torch.Stream,
         host_indices: torch.Tensor,
