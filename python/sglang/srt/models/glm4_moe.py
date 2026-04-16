@@ -298,6 +298,7 @@ class Glm4MoeAttention(nn.Module):
         if (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or not self.use_qk_norm
         ):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             if self.use_qk_norm:
@@ -925,7 +926,6 @@ class Glm4MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
