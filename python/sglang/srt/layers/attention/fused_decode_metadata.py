@@ -17,6 +17,14 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE": bs}, num_warps=w)
+        for bs in [64, 128, 256, 512, 1024]
+        for w in [1, 2, 4, 8]
+    ],
+    key=["max_seq_pages"],
+)
 @triton.jit
 def _fused_decode_metadata_kernel(
     cache_seqlens_ptr,
@@ -110,7 +118,6 @@ def fused_normal_decode_set_metadata(
         page_table.stride(0),
         page_size,
         max_seq_pages,
-        BLOCK_SIZE=512,
     )
 
     cu_seqlens_k[1:].copy_(torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32))
