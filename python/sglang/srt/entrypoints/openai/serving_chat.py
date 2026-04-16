@@ -709,12 +709,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     # /abort_request or session lifecycle cleanup) falls through
                     # to the normal chunk path, matching the non-stream behavior
                     # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and finish_reason.get(
-                        "status_code"
-                    ) in (
-                        HTTPStatus.BAD_REQUEST,
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                    if finish_reason_type == "abort" and isinstance(
+                        finish_reason.get("status_code"), HTTPStatus
                     ):
                         code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
