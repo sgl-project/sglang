@@ -13,7 +13,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.9K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_9k-1k-20ms-on-a3-32-cards-disaggregation-mode)     |
 | Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1.5K | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-20ms-on-a3-32-cards-disaggregation-mode)   |
 | Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1k-20ms-on-a3-32-cards-disaggregation-mode)     |
-| DeepSeek-V3.2     | Atlas 800I A3 | 32    | PD Disaggregation | 128K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-128k-1k-20ms-on-a3-32-cards-disaggregation-mode)    |
+| DeepSeek-V3.2     | Atlas 800I A3 | 32    | PD Disaggregation | 128K+1K   | 26ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-128k-1k-26ms-on-a3-32-cards-disaggregation-mode)    |
 
 ### High Throughput
 
@@ -787,7 +787,7 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 384  --random-input-len 3500 --random-output-len 1500 --num-prompts 1536 --random-range-ratio 1
 ```
 
-### DeepSeek-V3.2 128K-1K 20ms on A3 32 Cards Disaggregation Mode
+### DeepSeek-V3.2 128K-1K 26ms on A3 32 Cards Disaggregation Mode
 
 Model: DeepSeek-V3.2-W8A8
 
@@ -799,7 +799,7 @@ Dataset: random
 
 Input Output Length: 128K+1K
 
-TPOT: 20ms
+TPOT: 26ms
 
 #### Model Deployment
 
@@ -809,7 +809,6 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
-export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy
 unset http_proxy
 unset HTTPS_PROXY
@@ -821,6 +820,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib/:${LD_LIBRARY_PATH}
 export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
+export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export ASCEND_MF_STORE_URL="tcp://your prefill ip1:24670"
