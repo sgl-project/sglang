@@ -366,6 +366,7 @@ class NGRAMWorker:
             ) = verify_input.sample(model_worker_batch, logits_output, vocab_mask)
             new_seq_lens = model_worker_batch.seq_lens + accept_length
             verified_tokens = predict[accept_index].flatten()
+            next_token_ids = verified_tokens
 
             # copy kvcache will not use the new_seq_lens
             move_accepted_tokens_to_target_kvcache(
@@ -405,6 +406,7 @@ class NGRAMWorker:
             )
             verified_tokens[:, 0] = predict
             verified_tokens = verified_tokens.flatten()
+            next_token_ids = predict
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
 
@@ -419,7 +421,7 @@ class NGRAMWorker:
         )
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=verified_tokens,
+            next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_length,
             next_draft_input=next_draft_input,
