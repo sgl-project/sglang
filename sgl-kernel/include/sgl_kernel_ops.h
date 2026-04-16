@@ -127,6 +127,8 @@ int64_t cutlass_mla_get_workspace_size(
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
+void musa_fused_add_rms_norm(
+    torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
@@ -590,6 +592,73 @@ void top_k_renorm_probs(
 
 void top_p_renorm_probs(
     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
+
+/*
+ * From csrc/musa
+ */
+void batched_rotary_embedding_contiguous(
+    torch::Tensor& positions,
+    torch::Tensor& query,
+    torch::Tensor& key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,
+    bool is_neox,
+    int64_t rot_dim,
+    torch::Tensor& cos_sin_cache_offsets);
+
+void rotary_embedding_contiguous(
+    torch::Tensor& positions,
+    torch::Tensor& query,
+    torch::Tensor& key,
+    int64_t head_size,
+    torch::Tensor& cos_sin_cache,
+    bool is_neox);
+
+void mudnn_w8a8_scaled_mm(
+    torch::Tensor& c,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& a_scales,
+    const torch::Tensor& b_scales,
+    const std::optional<torch::Tensor>& bias);
+
+void fused_moe_gemv(
+    torch::Tensor& A,
+    torch::Tensor& B,
+    torch::Tensor& C,
+    const c10::optional<torch::Tensor>& A_scale,
+    const c10::optional<torch::Tensor>& B_scale,
+    torch::Tensor& topk_weights,
+    torch::Tensor& topk_ids,
+    bool mul_routed_weight,
+    int64_t topk,
+    bool use_int4_w4a16,
+    bool use_swigelu);
+
+void musa_fused_gemv(
+    torch::Tensor& A,
+    torch::Tensor& B,
+    torch::Tensor& C,
+    const c10::optional<torch::Tensor>& A_scale,
+    const c10::optional<torch::Tensor>& B_scale,
+    bool use_int4_w4a16,
+    bool use_swigelu,
+    bool use_rms_norm,
+    const c10::optional<torch::Tensor>& gamma,
+    double eps);
+
+void fused_mul_add(torch::Tensor& output, torch::Tensor& self, torch::Tensor& bias, double scale);
+
+void musa_top_k_top_p_sampling_from_probs(
+    at::Tensor probs,
+    at::Tensor output,
+    std::optional<at::Tensor> maybe_indices,
+    std::optional<at::Tensor> maybe_top_k_arr,
+    double top_k_val,
+    std::optional<at::Tensor> maybe_top_p_arr,
+    double top_p_val,
+    bool deterministic,
+    std::optional<at::Generator> gen);
 
 namespace flash {
 /*
