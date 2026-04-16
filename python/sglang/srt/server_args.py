@@ -3034,6 +3034,19 @@ class ServerArgs:
                 f"got {self.mamba_ssm_dtype!r}"
             )
 
+        # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel).
+        prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
+        if (
+            prefill == "flashinfer"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+            and int(torch.version.cuda.split(".")[0]) < 13
+        ):
+            raise ValueError(
+                "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
+                f"got CUDA {torch.version.cuda}"
+            )
+
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
