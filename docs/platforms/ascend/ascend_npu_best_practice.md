@@ -2027,7 +2027,6 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
-export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy
 unset http_proxy
 unset HTTPS_PROXY
@@ -2037,15 +2036,13 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 
+export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
-
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
 MODEL_PATH=xxx
-
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
