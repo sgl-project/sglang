@@ -1,10 +1,13 @@
 import logging
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -12,6 +15,7 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_hip, mxfp_supported
 
 logger = logging.getLogger(__name__)
@@ -19,12 +23,16 @@ _is_hip = is_hip()
 
 if _is_hip:
     try:
-        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
-        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+        import aiter
+        from aiter.ops.gemm_op_a4w4 import gemm_a4w4
+        from aiter.ops.shuffle import shuffle_weight
+        from aiter.utility.fp4_utils import dynamic_mxfp4_quant
     except ImportError as e:
         logger.warning(f"aiter MXFP4 kernels not available: {e}")
+        aiter = None
+        shuffle_weight = None
         dynamic_mxfp4_quant = None
-        gemm_afp4wfp4 = None
+        gemm_a4w4 = None
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -35,9 +43,16 @@ class Mxfp4Config(QuantizationConfig):
     Note: MXFP4 requires ROCm and MI350+ (gfx95x).
     """
 
-    def __init__(self, is_checkpoint_mxfp4_serialized: bool = False):
+    def __init__(
+        self,
+        is_checkpoint_mxfp4_serialized: bool = False,
+        ignored_layers: Optional[List[str]] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+    ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
+        self.ignored_layers = ignored_layers or []
+        self.packed_modules_mapping = packed_modules_mapping or {}
 
     @classmethod
     def get_name(cls) -> str:
@@ -65,6 +80,15 @@ class Mxfp4Config(QuantizationConfig):
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
+            if is_layer_skipped(
+                prefix,
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                logger.debug(
+                    f"MXFP4: Keeping layer {prefix} unquantized (in ignored_layers)"
+                )
+                return UnquantizedLinearMethod()
             logger.debug(f"MXFP4: Replacing layer {prefix} with MXFP4 linear method")
             return Mxfp4LinearMethod(self)
         else:
@@ -145,7 +169,7 @@ class Mxfp4LinearMethod(LinearMethodBase):
             logger.info("Weights are quantized or unexpected dtype")
             return
 
-        if dynamic_mxfp4_quant is None:
+        if any(fn is None for fn in (dynamic_mxfp4_quant, shuffle_weight, gemm_a4w4)):
             raise RuntimeError(
                 "aiter MXFP4 kernels not available. "
                 "Install aiter with MXFP4 support."
@@ -156,14 +180,15 @@ class Mxfp4LinearMethod(LinearMethodBase):
         if was_on_cpu:
             weight_data = weight_data.cuda()
 
-        w_quant, mx_scales = dynamic_mxfp4_quant(weight_data)
+        w_quant, mx_scales = dynamic_mxfp4_quant(weight_data, shuffle=True)
+
+        w_quant_shuffled = shuffle_weight(w_quant)
 
         if was_on_cpu:
-            w_quant = w_quant.cpu()
+            w_quant_shuffled = w_quant_shuffled.cpu()
             mx_scales = mx_scales.cpu()
 
-        # Replace parameters with quantized versions
-        layer.weight = Parameter(w_quant, requires_grad=False)
+        layer.weight = Parameter(w_quant_shuffled, requires_grad=False)
         layer.weight_scale = Parameter(mx_scales, requires_grad=False)
 
         logger.debug(
@@ -184,40 +209,16 @@ class Mxfp4LinearMethod(LinearMethodBase):
                 "Current platform not supported."
             )
 
-        if dynamic_mxfp4_quant is None:
-            raise RuntimeError(
-                "aiter MXFP4 kernels not available. "
-                "Install aiter with MXFP4 support."
-            )
-
         # Handle 3D input tensors [batch, seq, hidden]
-        three_d = False
+        original_shape = x.shape
         if x.dim() == 3:
-            three_d = True
-            original_shape = x.shape
             x = x.view(-1, x.shape[-1])
-            output_shape = [*original_shape[:-1], layer.weight.shape[0]]
 
-        x_q, x_s = dynamic_mxfp4_quant(x)
+        x_fp4, x_scale = dynamic_mxfp4_quant(x, shuffle=True)
 
-        out_dtype = torch.get_default_dtype()
-        y = torch.empty(
-            x_q.shape[0],
-            layer.weight.shape[0],
-            device=x_q.device,
-            dtype=out_dtype,
-        )
-
-        gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, out_dtype, y)
+        y = gemm_a4w4(x_fp4, layer.weight, x_scale, layer.weight_scale)
 
         if bias is not None:
             y = y + bias
 
-        if y.dtype != x.dtype:
-            y = y.to(x.dtype)
-
-        # Reshape if input was 3D
-        if three_d:
-            return y.view(*output_shape)
-        else:
-            return y
+        return y.view(*original_shape[:-1], layer.weight.shape[0])

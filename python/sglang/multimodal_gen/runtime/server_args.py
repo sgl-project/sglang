@@ -159,6 +159,8 @@ class ServerArgs:
 
     # Quantization method for online quantization
     quantization: str | None = None
+    # Layer name patterns to skip during online quantization
+    quantization_ignored_layers: list[str] | None = None
 
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
@@ -788,6 +790,17 @@ class ServerArgs:
                 "Nunchaku SVDQuant is configured separately via --enable-svdquant and "
                 "related flags. "
                 "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
+            ),
+        )
+        parser.add_argument(
+            "--quantization-ignored-layers",
+            type=str,
+            nargs="+",
+            default=ServerArgs.quantization_ignored_layers,
+            help=(
+                "Layer name patterns to keep unquantized during online quantization "
+                "(fp8/mxfp4). Each pattern is matched against the layer prefix. "
+                "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),
         )
 

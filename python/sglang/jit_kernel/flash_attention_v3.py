@@ -78,6 +78,9 @@ def _is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
+    # FA3 is CUDA-only; on ROCm torch.version.cuda is None
+    if torch.version.cuda is None:
+        return False
     return (torch.version.cuda >= "12.3") and (
         torch.cuda.get_device_capability(device)[0] == 9
         or torch.cuda.get_device_capability(device)[0] == 8
@@ -190,9 +193,39 @@ def flash_attn_varlen_func(
 ):
 
     if not _is_fa3_supported():
-        raise NotImplementedError(
-            "flash_attn at sgl-kernel is only supported on sm90 and above"
-        )
+        # Fall back to flash_attn package (FA2) on platforms without sgl-kernel FA3
+        # (e.g. ROCm, or CUDA < sm90)
+        if cu_seqlens_q is not None:
+            from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
+
+            return fa2_flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                return_attn_probs=return_softmax_lse,
+            )
+        else:
+            # 4D inputs (batch, seqlen, nheads, headdim) without cu_seqlens
+            from flash_attn import flash_attn_func as fa2_flash_attn_func
+
+            return fa2_flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                return_attn_probs=return_softmax_lse,
+            )
 
     return _load_fa3_kernels()["flash_attn_varlen_func"](
         q,

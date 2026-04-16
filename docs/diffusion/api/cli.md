@@ -97,6 +97,7 @@ For quantized transformer checkpoints, prefer:
 - `--transformer-path` for a quantized `transformers` transformer component folder
 - `--transformer-weights-path` for a quantized safetensors file, directory, or repo
 - `--quantization {fp8,mxfp4}` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
+- `--quantization-ignored-layers {PATTERN...}` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
 See [Quantization](../quantization.md) for supported quantization families and examples.
 

@@ -196,6 +196,12 @@ def resolve_transformer_quant_load_spec(
         safetensors_list=safetensors_list,
         component_model_path=component_model_path,
     )
+
+    if quant_config is not None:
+        packed = getattr(model_cls, "packed_modules_mapping", None)
+        if packed and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = packed
+
     nunchaku_config = server_args.nunchaku_config
 
     # resolve target param dtype
@@ -270,7 +276,10 @@ def _resolve_quant_config(
     """
     if server_args.quantization:
         quant_config_cls = get_quantization_config(server_args.quantization)
-        return quant_config_cls()
+        kwargs = {}
+        if server_args.quantization_ignored_layers:
+            kwargs["ignored_layers"] = server_args.quantization_ignored_layers
+        return quant_config_cls(**kwargs)
 
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:

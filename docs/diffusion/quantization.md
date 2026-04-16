@@ -77,6 +77,29 @@ sglang generate \
 ```
 **Note:** Requires `aiter` package with MXFP4 kernel support
 
+### Skipping Layers
+
+By default, online quantization quantizes every linear layer in
+the transformer. However, `--quantization-ignored-layers` can be used to keep specific layers in their original precision:
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization fp8 \
+  --quantization-ignored-layers attention.to_ \
+  --prompt "a beautiful sunset" \
+  --save-output
+
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization mxfp4 \
+  --quantization-ignored-layers attention.to_ \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantizd if its prefix contains any of the given patterns.
+
 ## NVFP4
 
 ### Usage Examples
