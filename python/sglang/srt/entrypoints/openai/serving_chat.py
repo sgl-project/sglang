@@ -60,6 +60,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def normalize_tool_content(role: str, content):
+    """Normalize tool message content from OpenAI array format to plain string.
+
+    OpenAI clients may send tool content as a list of content parts
+    (e.g. [{"type":"text","text":"..."}]) but most chat templates expect
+    a plain string for tool messages. Only flatten when ALL items are
+    pure OpenAI text parts; preserve lists containing non-text-type items
+    that some templates intentionally iterate over.
+    """
+    if role != "tool" or not isinstance(content, list):
+        return content
+    parts = content
+    is_openai_text_parts = all(
+        (isinstance(p, dict) and p.get("type") == "text") or isinstance(p, str)
+        for p in parts
+    )
+    if is_openai_text_parts:
+        text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
+        return " ".join(text_parts)
+    return content
+
+
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
     vid_vals = []
@@ -457,6 +479,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     modalities,
                 )
 
+                processed_msg["content"] = normalize_tool_content(
+                    processed_msg["role"], processed_msg.get("content")
+                )
+
                 # per the Transformers docs & maintainers, tool call arguments in
                 # assistant-role messages with tool_calls need to be dicts not JSON str -
                 # this is how tool-use chat templates will expect them moving forwards
@@ -649,7 +675,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # State tracking for streaming
         is_firsts = {}
-        stream_buffers = {}
+        stream_offsets = {}
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
@@ -737,13 +763,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     stream_started = True
 
-                stream_buffer = stream_buffers.get(index, "")
+                offset = stream_offsets.get(index, 0)
                 if self.tokenizer_manager.server_args.incremental_streaming_output:
                     # content["text"] is already the incremental delta
                     delta = content["text"]
                 else:
-                    delta = content["text"][len(stream_buffer) :]
-                stream_buffers[index] = stream_buffer + delta
+                    delta = content["text"][offset:]
+                stream_offsets[index] = len(content["text"])
 
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
