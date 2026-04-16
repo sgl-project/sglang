@@ -1,8 +1,7 @@
-"""CPU fallbacks for Triton diffusion kernels.
+"""Pytorch native based fallbacks for Triton diffusion kernels.
 
-Triton is not available on pure CPU platforms, so these pure-PyTorch
+Triton is not available on some platforms, so these pure-PyTorch
 implementations replace the Triton kernels
-at import time when ``current_platform.is_cpu()`` is True.
 
 """
 

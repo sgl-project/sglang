@@ -78,6 +78,6 @@ if current_platform.is_mps():
 
 
 if current_platform.is_cpu():
-    from .cpu_fallback import triton_one_pass_rms_norm_native
+    from .torch_fallback import triton_one_pass_rms_norm_native
 
     triton_one_pass_rms_norm = triton_one_pass_rms_norm_native

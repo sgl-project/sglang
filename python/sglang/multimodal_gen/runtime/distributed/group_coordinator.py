@@ -46,11 +46,7 @@ _group_name_counter: dict[str, int] = {}
 def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
 
-    return (
-        current_platform.get_local_torch_device()
-        if not current_platform.is_cpu()
-        else torch.device("cpu")
-    )
+    return current_platform.get_local_torch_device()
 
 
 def _get_unique_name(name: str) -> str:
@@ -333,6 +329,7 @@ class GroupCoordinator:
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
                 and op is torch.distributed.ReduceOp.SUM
             ):
+                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
                 torch.ops.sgl_kernel.shm_allreduce(
                     input_, int(torch.distributed.ReduceOp.SUM)
                 )

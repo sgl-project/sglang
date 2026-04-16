@@ -39,6 +39,10 @@ class CpuPlatform(Platform):
             return CpuArchEnum.UNSPECIFIED
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device("cpu")
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return platform.processor()
 

@@ -655,7 +655,7 @@ if current_platform.is_mps():
     rms_norm_fn = rms_norm_fn_native
 
 if current_platform.is_cpu():
-    from .cpu_fallback import norm_infer_native, rms_norm_fn_native
+    from .torch_fallback import norm_infer_native, rms_norm_fn_native
 
     norm_infer = norm_infer_native
     rms_norm_fn = rms_norm_fn_native
