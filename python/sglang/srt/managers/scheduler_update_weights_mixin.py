@@ -50,7 +50,9 @@ class SchedulerUpdateWeightsMixin:
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
             if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
+                flush_cache_success = self.flush_cache(
+                    empty_cache=recv_req.torch_empty_cache
+                )
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
@@ -78,7 +80,9 @@ class SchedulerUpdateWeightsMixin:
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
             if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
+                flush_cache_success = self.flush_cache(
+                    empty_cache=recv_req.torch_empty_cache
+                )
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
@@ -96,7 +100,9 @@ class SchedulerUpdateWeightsMixin:
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
+                flush_cache_success = self.flush_cache(
+                    empty_cache=recv_req.torch_empty_cache
+                )
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
@@ -110,7 +116,9 @@ class SchedulerUpdateWeightsMixin:
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
         if success:
             if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
+                flush_cache_success = self.flush_cache(
+                    empty_cache=recv_req.torch_empty_cache
+                )
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
