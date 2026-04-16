@@ -436,9 +436,12 @@ class _ScaleResidualNormScaleShift(CustomOp):
         if D % self._FLYDSL_BLOCK_VEC != 0:
             return self.forward_native(residual, x, gate, shift, scale)
 
-        from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
-            flydsl_fused_residual_norm_scale_shift,
-        )
+        try:
+            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+                flydsl_fused_residual_norm_scale_shift,
+            )
+        except ImportError:
+            return self.forward_native(residual, x, gate, shift, scale)
 
         return flydsl_fused_residual_norm_scale_shift(
             residual.contiguous(),
@@ -568,9 +571,12 @@ class _NormScaleShift(CustomOp):
         if D % self._FLYDSL_BLOCK_VEC != 0:
             return self.forward_native(x, shift, scale)
 
-        from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
-            flydsl_norm_scale_shift,
-        )
+        try:
+            from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+                flydsl_norm_scale_shift,
+            )
+        except ImportError:
+            return self.forward_native(x, shift, scale)
 
         result = flydsl_norm_scale_shift(
             x.contiguous(),

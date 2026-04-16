@@ -5,6 +5,7 @@
 """Custom activation functions."""
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -124,7 +125,11 @@ class QuickGELU(CustomOp):
 
 
 class _FlyDSLGeLUTanh(nn.Module):
-    """FlyDSL-accelerated GeLU(tanh) for ROCm/HIP."""
+    """FlyDSL-accelerated GeLU(tanh) for ROCm/HIP.
+
+    Only used when SGLANG_USE_FLYDSL_GELU=1. Non-bf16 inputs fall back to
+    PyTorch native GeLU to avoid dtype assert in the FlyDSL kernel.
+    """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dtype != torch.bfloat16:
@@ -135,8 +140,13 @@ class _FlyDSLGeLUTanh(nn.Module):
 
 
 def _gelu_pytorch_tanh_factory():
-    if _is_hip:
-        return _FlyDSLGeLUTanh()
+    if _is_hip and os.environ.get("SGLANG_USE_FLYDSL_GELU", "0") == "1":
+        try:
+            import flydsl  # noqa: F401
+
+            return _FlyDSLGeLUTanh()
+        except ImportError:
+            pass
     return nn.GELU(approximate="tanh")
 
 
