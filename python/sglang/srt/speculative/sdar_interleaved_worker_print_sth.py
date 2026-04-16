@@ -283,6 +283,121 @@ class SDARInterleavedWorker:
     # Decode  (interleaved speculative block)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Text helpers for human-readable printing
+    # ------------------------------------------------------------------
+
+    def _tok(self, tid: int) -> str:
+        """Decode a single token id to a short human-readable string."""
+        if tid == self._mask_token_id:
+            return "[MASK]"
+        try:
+            text = self.target_worker.tokenizer.decode([tid], skip_special_tokens=False)
+            # Escape newlines/tabs for single-line printing
+            text = text.replace("\n", "\\n").replace("\t", "\\t")
+            # Truncate very long pieces
+            if len(text) > 12:
+                text = text[:10] + "…"
+            return repr(text)
+        except Exception:
+            return f"<id={tid}>"
+
+    def _fmt_block(self, tokens_1d: torch.Tensor, positions_1d: torch.Tensor) -> str:
+        """
+        Render a [block_size] token tensor as a two-row table:
+          slot:  0    1    2  ...
+          tok: 'the' [MASK] 'is' ...
+        """
+        slots = tokens_1d.tolist()
+        pos   = positions_1d.tolist()
+        col_w = 8
+        header = "  slot: " + "".join(f"{i:<{col_w}}" for i in range(len(slots)))
+        pos_row = "  pos:  " + "".join(f"{int(p):<{col_w}}" for p in pos)
+        tok_row = "  tok:  " + "".join(f"{self._tok(t):<{col_w}}" for t in slots)
+        return "\n".join([header, pos_row, tok_row])
+
+    def _fmt_cands(self, cands: List[Tuple[int, int, float]], label: str) -> str:
+        """Format a list of (abs_pos, tok, conf) candidates."""
+        lines = [f"  {label}:"]
+        for i, (ap, tok, conf) in enumerate(cands):
+            lines.append(f"    [{i}] pos={ap}  {self._tok(tok)}  conf={conf:.3f}")
+        return "\n".join(lines)
+
+    def _fmt_branches(self, branches: List["_SmallModelBranch"]) -> str:
+        """Format small-model branch hypotheses."""
+        lines = []
+        for br in branches:
+            assumed = ", ".join(
+                f"pos={ap}→{self._tok(t)}" for ap, t in br.assumed_tokens
+            ) or "(none)"
+            drafts = ", ".join(
+                f"pos={ap}→{self._tok(t)}({c:.3f})"
+                for ap, t, c in br.draft_candidates
+            ) or "(none)"
+            lines.append(
+                f"    branch-{br.assumed_large_accepted} "
+                f"[assumes {br.assumed_large_accepted} large accepted: {assumed}]"
+                f"  →  small drafts: {drafts}"
+            )
+        return "\n".join(lines)
+
+    def _fmt_verif_result(
+        self,
+        result: dict,
+        large_cands: List[Tuple[int, int, float]],
+        selected_branch: Optional["_SmallModelBranch"],
+    ) -> str:
+        """Format verification decision with token text."""
+        lines = []
+        large_acc = result["large_accepted"]
+
+        # Large stage
+        lines.append("  Large-stage verification:")
+        for i, (ap, tok, conf) in enumerate(large_cands):
+            if i < large_acc:
+                lines.append(f"    large[{i}] pos={ap} {self._tok(tok)} → ACCEPT ✓")
+            elif i == large_acc:
+                lines.append(f"    large[{i}] pos={ap} {self._tok(tok)} → REJECT ✗  (stop here)")
+                break
+        if large_acc == len(large_cands):
+            lines.append(f"    (all {len(large_cands)} large candidates accepted)")
+
+        # Small stage
+        if selected_branch is not None and selected_branch.draft_candidates:
+            small_acc = result["small_accepted"]
+            lines.append(
+                f"  Small-stage verification (branch-{selected_branch.assumed_large_accepted}, "
+                f"assumed {selected_branch.assumed_large_accepted} large):"
+            )
+            for i, (ap, tok, conf) in enumerate(selected_branch.draft_candidates):
+                if i < small_acc:
+                    lines.append(f"    small[{i}] pos={ap} {self._tok(tok)} → ACCEPT ✓")
+                elif i == small_acc:
+                    lines.append(f"    small[{i}] pos={ap} {self._tok(tok)} → REJECT ✗  (stop here)")
+                    break
+        else:
+            lines.append("  Small-stage: no branch / no draft candidates")
+
+        # Bonus token
+        if result["bonus"] is not None:
+            bp, bt = result["bonus"]
+            lines.append(f"  Bonus token: pos={bp} {self._tok(bt)}")
+        else:
+            lines.append("  Bonus token: (none)")
+
+        # Summary
+        total = len(result["accepted_tokens"]) + (1 if result["bonus"] else 0)
+        acc_text = ", ".join(
+            f"pos={ap}→{self._tok(t)}" for ap, t in result["accepted_tokens"]
+        ) or "(none)"
+        lines.append(f"  → accepted_tokens: [{acc_text}]")
+        lines.append(f"  → total filled this round: {total}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Decode  (interleaved speculative block)
+    # ------------------------------------------------------------------
+
     def _forward_decode(self, batch: ScheduleBatch, **kwargs) -> GenerationBatchResult:
         """Fill one SDAR block using the interleaved algorithm."""
         spec_state = batch.spec_info
@@ -311,11 +426,17 @@ class SDARInterleavedWorker:
         _large_fwd_count = 0   # 8B forward calls this block
         _small_fwd_count = 0   # 1.7B forward calls this block
 
+        # ── Block header ───────────────────────────────────────────────
+        print(f"\n{'='*70}", flush=True)
         print(
-            f"\n[SDAR] ===== NEW BLOCK | bs={bs} block_size={block_size} "
-            f"seq_lens={batch.seq_lens.tolist()} =====",
+            f"[SDAR] NEW BLOCK  bs={bs}  block_size={block_size}  "
+            f"seq_lens={batch.seq_lens.tolist()}",
             flush=True,
         )
+        for b in range(bs):
+            print(f"  req[{b}] initial block (all MASK):", flush=True)
+            print(self._fmt_block(block_tokens[b], block_positions[b]), flush=True)
+        print(flush=True)
 
         # ---------------------------------------------------------------
         # Interleaved rounds until block is fully filled
@@ -328,34 +449,40 @@ class SDARInterleavedWorker:
 
             reused = sum(1 for p in pending_large_drafts if p is not None)
             needs_fresh = bs - reused
+
+            print(f"{'─'*60}", flush=True)
             print(
-                f"[SDAR]  Round {_round}: masks={mask_counts.tolist()} "
-                f"pending_reused={reused}/{bs} (→ {needs_fresh} req need fresh 8B draft)",
+                f"[SDAR] Round {_round}  masks_left={mask_counts.tolist()}  "
+                f"pending_reused={reused}/{bs}",
                 flush=True,
             )
 
-            # --- Phase 1: Large-model draft candidates (per request) ---
-            # _run_model_on_block_subset called once for needs_fresh requests batched
+            # ── Phase 1: Large-model draft candidates ─────────────────
             if needs_fresh > 0:
                 print(
-                    f"[SDAR]    Ph1 candidates: 8B forward  batch_n={needs_fresh}  "
-                    f"(total_8B_calls so far: {_large_fwd_count} → {_large_fwd_count + 1})",
+                    f"\n  [Ph1] 8B draft  (batch_n={needs_fresh}, "
+                    f"8B_call #{_large_fwd_count + 1})",
                     flush=True,
                 )
                 _large_fwd_count += 1
+            else:
+                print(f"\n  [Ph1] 8B draft  → SKIPPED (all pending reused)", flush=True)
+
             large_candidates_list = self._get_large_candidates(
                 batch, block_tokens, block_positions, pending_large_drafts
             )
+
             for b in range(bs):
                 cands = large_candidates_list[b]
+                src = "reused" if pending_large_drafts[b] is not None else "fresh"
                 if cands:
                     print(
-                        f"[SDAR]    req[{b}] large_cands={len(cands)} "
-                        f"top-conf={cands[0][2]:.3f} pos={[c[0] for c in cands]}",
+                        f"  req[{b}] large candidates ({src}, draft_length={self.draft_length}):",
                         flush=True,
                     )
+                    print(self._fmt_cands(cands, "8B candidates"), flush=True)
 
-            # --- Phases 2-5: Per-request interleaved verify ---
+            # ── Phases 2-5: Per-request interleaved verify ─────────────
             new_pending: List[Optional[List]] = [None] * bs
             for b in range(bs):
                 if int(mask_counts[b].item()) == 0:
@@ -364,18 +491,20 @@ class SDARInterleavedWorker:
                 if not large_cands:
                     continue
 
+                print(f"\n  req[{b}]:", flush=True)
+
                 # Phase 2: small-model branches
                 actual_branches = min(self.num_branches, len(large_cands) + 1)
                 print(
-                    f"[SDAR]    Ph2 small branches: 1.7B forward  req[{b}] "
-                    f"batch_n={actual_branches}  "
-                    f"(total_1.7B_calls: {_small_fwd_count} → {_small_fwd_count + 1})",
+                    f"  [Ph2] 1.7B branches  (num_branches={actual_branches}, "
+                    f"1.7B_call #{_small_fwd_count + 1})",
                     flush=True,
                 )
                 _small_fwd_count += 1
                 small_branches = self._build_small_branches(
                     batch, b, block_tokens[b], block_positions[b], large_cands
                 )
+                print(self._fmt_branches(small_branches), flush=True)
 
                 # Phase 3: verification states
                 all_states, large_node_range, small_branch_ranges = (
@@ -387,12 +516,38 @@ class SDARInterleavedWorker:
 
                 # Phase 4: large-model batch verification
                 print(
-                    f"[SDAR]    Ph4 verification: 8B forward  req[{b}] "
-                    f"num_states={num_verif_states}  "
-                    f"(total_8B_calls: {_large_fwd_count} → {_large_fwd_count + 1})",
+                    f"\n  [Ph4] 8B verification  "
+                    f"(num_states={num_verif_states}, 8B_call #{_large_fwd_count + 1})",
                     flush=True,
                 )
                 _large_fwd_count += 1
+
+                # Show what states are being verified
+                ls, le = large_node_range
+                print(f"    large nodes [states {ls}..{le-1}]:", flush=True)
+                for si in range(ls, le):
+                    mask_count_s = int((all_states[si] == mask_id).sum().item())
+                    filled = [
+                        f"p{int(block_positions[b,r].item())}={self._tok(int(all_states[si][r].item()))}"
+                        for r in range(block_size) if all_states[si][r] != mask_id
+                    ]
+                    print(
+                        f"      state[{si}]: {mask_count_s} masks  filled=[{', '.join(filled) or 'none'}]",
+                        flush=True,
+                    )
+                for k, (bs2, be2) in small_branch_ranges.items():
+                    print(f"    small branch-{k} nodes [states {bs2}..{be2-1}]:", flush=True)
+                    for si in range(bs2, be2):
+                        mask_count_s = int((all_states[si] == mask_id).sum().item())
+                        filled = [
+                            f"p{int(block_positions[b,r].item())}={self._tok(int(all_states[si][r].item()))}"
+                            for r in range(block_size) if all_states[si][r] != mask_id
+                        ]
+                        print(
+                            f"      state[{si}]: {mask_count_s} masks  filled=[{', '.join(filled) or 'none'}]",
+                            flush=True,
+                        )
+
                 verif_logits = self._run_verification_states(
                     self.target_worker.model_runner,
                     batch, b,
@@ -417,13 +572,14 @@ class SDARInterleavedWorker:
                 )
 
                 large_acc = result["large_accepted"]
-                small_acc = result["small_accepted"]
-                bonus_str = f"bonus={result['bonus']}" if result["bonus"] else "bonus=None"
+                # Find the selected small branch for display
+                selected_branch = next(
+                    (br for br in small_branches if br.assumed_large_accepted == large_acc),
+                    None,
+                )
+                print(f"\n  [Ph5] Verify decision  req[{b}]:", flush=True)
                 print(
-                    f"[SDAR]    Ph5 verify result  req[{b}]: "
-                    f"large_accepted={large_acc}  small_accepted={small_acc}  "
-                    f"{bonus_str}  "
-                    f"total_tokens_filled={large_acc + small_acc + (1 if result['bonus'] else 0)}",
+                    self._fmt_verif_result(result, large_cands, selected_branch),
                     flush=True,
                 )
 
@@ -442,8 +598,7 @@ class SDARInterleavedWorker:
                 n = len(result["accepted_tokens"]) + (1 if result["bonus"] else 0)
                 total_accepted += n
 
-                # Reuse verification logits as next round's large draft (if there are
-                # remaining masks and a valid last_state_idx from the algorithm).
+                # Reuse verification logits as next round's large draft
                 last_idx = result["last_state_idx"]
                 if last_idx is not None:
                     remaining = (block_tokens[b] == mask_id)
@@ -458,54 +613,72 @@ class SDARInterleavedWorker:
                         new_cands.sort(key=lambda x: x[2], reverse=True)
                         new_pending[b] = new_cands[: self.draft_length]
                         print(
-                            f"[SDAR]    req[{b}] reusing {len(new_pending[b])} verif cands as next-round pending",
+                            f"\n  req[{b}] pending for next round "
+                            f"({len(new_pending[b])} cands reused from verif logits):",
                             flush=True,
                         )
+                        print(self._fmt_cands(new_pending[b], "pending"), flush=True)
 
             pending_large_drafts = new_pending
-            masks_left = int((block_tokens == mask_id).sum().item())
+
+            # Show block state after this round
+            masks_left_now = int((block_tokens == mask_id).sum().item())
+            print(f"\n  Block state after Round {_round}:", flush=True)
+            for b in range(bs):
+                print(f"  req[{b}]:", flush=True)
+                print(self._fmt_block(block_tokens[b], block_positions[b]), flush=True)
             print(
-                f"[SDAR]  Round {_round} done: masks_remaining={masks_left}  total_accepted_so_far={total_accepted}",
+                f"  masks_remaining={masks_left_now}  total_accepted_so_far={total_accepted}",
                 flush=True,
             )
 
             # Safety: if no tokens were accepted in this round, avoid infinite loop
-            all_accepted_now = int((block_tokens == mask_id).sum().item())
-            if all_accepted_now == 0:
+            if masks_left_now == 0:
                 break
 
-        # If any masks remain (should not happen under normal operation, but guard
-        # against pathological cases), fill them with a fresh large-model greedy pass.
+        # ── Fallback greedy fill ────────────────────────────────────────
         remaining_mask = (block_tokens == mask_id).any(dim=1)
         if remaining_mask.any():
             fallback_n = int(remaining_mask.sum().item())
             print(
-                f"[SDAR]  FALLBACK greedy fill: {fallback_n} req still have masks → 8B forward  "
-                f"(total_8B_calls: {_large_fwd_count} → {_large_fwd_count + 1})",
+                f"\n[SDAR] FALLBACK greedy fill: {fallback_n} req still have masks "
+                f"→ 8B forward (call #{_large_fwd_count + 1})",
                 flush=True,
             )
             _large_fwd_count += 1
             self._fill_remaining_masks(batch, block_tokens, block_positions, remaining_mask)
+            print(f"  Block after fallback fill:", flush=True)
+            for b in range(bs):
+                if remaining_mask[b]:
+                    print(f"  req[{b}]:", flush=True)
+                    print(self._fmt_block(block_tokens[b], block_positions[b]), flush=True)
 
-        # ---------------------------------------------------------------
-        # Commit the accepted block to both KV caches
-        # ---------------------------------------------------------------
+        # ── Commit block to both KV caches ─────────────────────────────
         print(
-            f"[SDAR]  Commit: 8B forward + 1.7B forward  "
-            f"(total_8B_calls: {_large_fwd_count} → {_large_fwd_count + 1}  "
-            f"total_1.7B_calls: {_small_fwd_count} → {_small_fwd_count + 1})",
+            f"\n[SDAR] COMMIT block  (8B call #{_large_fwd_count + 1}  "
+            f"+ 1.7B call #{_small_fwd_count + 1})",
             flush=True,
         )
+        print(f"  Final block to be written to KV:", flush=True)
+        for b in range(bs):
+            print(f"  req[{b}]:", flush=True)
+            print(self._fmt_block(block_tokens[b], block_positions[b]), flush=True)
+            toks_text = " ".join(
+                self._tok(int(t)) for t in block_tokens[b].tolist()
+            )
+            print(f"    text sequence: {toks_text}", flush=True)
         _large_fwd_count += 1
         _small_fwd_count += 1
         self._commit_block(batch, block_tokens, block_positions)
 
+        # ── Block summary ───────────────────────────────────────────────
         print(
-            f"[SDAR] ===== BLOCK DONE | rounds={_round + 1}  "
+            f"\n[SDAR] BLOCK DONE  rounds={_round + 1}  "
             f"8B_fwd_total={_large_fwd_count}  1.7B_fwd_total={_small_fwd_count}  "
-            f"tokens_accepted={total_accepted}/{block_size * bs} =====\n",
+            f"tokens_accepted={total_accepted}/{block_size * bs}",
             flush=True,
         )
+        print(f"{'='*70}\n", flush=True)
 
         # Update batch seq_lens (SGLang expects this to be updated after commit)
         batch.seq_lens = batch.seq_lens + block_size
