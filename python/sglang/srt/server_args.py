@@ -6952,6 +6952,16 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         argv = config_merger.merge_config_with_args(argv)
 
     raw_args = parser.parse_args(argv)
+
+    # Set up basic logging before ServerArgs.__post_init__ so that
+    # logger.info / logger.warning calls there are properly formatted.
+    logging.basicConfig(
+        level=getattr(logging, raw_args.log_level.upper()),
+        format="[%(asctime)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
     return ServerArgs.from_cli_args(raw_args)
 
 
