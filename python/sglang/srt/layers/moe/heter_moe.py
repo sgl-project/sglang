@@ -61,20 +61,26 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
         assert abs(total_ratio - 1.0) < 1e-3, (
             f"size_ratios must sum to 1.0, got {total_ratio}"
         )
-    # Load per-layer INT4-only expert lists if specified
+    # Load per-layer INT4-only expert lists if specified.
+    # Format: {"layer_id": [expert_ids...], ...}
+    # These experts have NO BF16 weights — always routed to INT4 kernel.
     int4_only_file = cfg.get("int4_only_experts_file")
     if int4_only_file is not None:
         with open(int4_only_file) as f:
             cfg["_int4_only_by_layer"] = json.load(f)
     else:
         cfg["_int4_only_by_layer"] = {}
-    tl = cfg.get("target_layers")
-    if tl is not None:
-        if not isinstance(tl, list) or not all(isinstance(i, int) for i in tl):
-            raise ValueError(
-                f"target_layers must be a list of ints, got {tl!r}"
-            )
-        cfg["target_layers"] = sorted(set(tl))
+    # Load per-layer BF16-only expert lists if specified.
+    # Format: {"layer_id": [expert_ids...], ...}
+    # These experts have NO INT4 weights — always routed to BF16 kernel.
+    # If ALL experts in a layer are bf16-only, no INT4 weights are loaded
+    # for that layer (saves VRAM).
+    bf16_only_file = cfg.get("bf16_only_experts_file")
+    if bf16_only_file is not None:
+        with open(bf16_only_file) as f:
+            cfg["_bf16_only_by_layer"] = json.load(f)
+    else:
+        cfg["_bf16_only_by_layer"] = {}
     return cfg
 
 
@@ -104,6 +110,9 @@ class HeterFusedMoE(nn.Module):
         moe_tp_size: int = 1,
         # INT4-only expert support: list of expert IDs that are INT4-only
         int4_only_experts: Optional[list] = None,
+        # BF16-only expert support: list of expert IDs that are BF16-only
+        # (no INT4 weights loaded — always routed to BF16 kernel)
+        bf16_only_experts: Optional[list] = None,
     ):
         super().__init__()
         self.num_experts = num_experts  # local expert count
@@ -121,22 +130,28 @@ class HeterFusedMoE(nn.Module):
         self.moe_tp_size = moe_tp_size
         self._local_expert_mapping: Optional[torch.Tensor] = None
 
+        # Find group indices for INT4 and BF16
+        self._int4_group_idx = next(
+            (i for i, g in enumerate(heter_config["groups"])
+             if g.get("num_bits", 16) == 4),
+            0,
+        )
+        self._bf16_group_idx = next(
+            (i for i, g in enumerate(heter_config["groups"])
+             if g.get("num_bits", 16) == 16),
+            1 - self._int4_group_idx,
+        )
+
         # INT4-only expert support: build mask for dispatch remasking
         # and compact BF16 tensor (only dual-precision experts get BF16 weights)
         self._int4_only_experts = int4_only_experts or []
+        int4_only_set = set(self._int4_only_experts)
         if self._int4_only_experts:
-            int4_only_set = set(self._int4_only_experts)
             mask = torch.zeros(num_experts, dtype=torch.bool, device=self.device)
             for eid in self._int4_only_experts:
                 assert 0 <= eid < num_experts, f"Invalid expert ID {eid}"
                 mask[eid] = True
             self._int4_only_mask = mask
-            # Find which group index is the INT4 group
-            self._int4_group_idx = next(
-                (i for i, g in enumerate(heter_config["groups"])
-                 if g.get("num_bits", 16) == 4),
-                0,
-            )
             # BF16 compact tensor support: remap original expert IDs to [0, D)
             dual_experts = sorted(e for e in range(num_experts) if e not in int4_only_set)
             self._num_bf16_experts = len(dual_experts)
@@ -146,9 +161,23 @@ class HeterFusedMoE(nn.Module):
             self._bf16_id_remap = remap
         else:
             self._int4_only_mask = None
-            self._int4_group_idx = 0
             self._num_bf16_experts = num_experts
             self._bf16_id_remap = None
+
+        # BF16-only expert support: these experts skip INT4 weight loading
+        # and are always routed to the BF16 kernel.
+        self._bf16_only_experts = bf16_only_experts or []
+        self._bf16_only_set = set(self._bf16_only_experts)
+        if self._bf16_only_experts:
+            mask = torch.zeros(num_experts, dtype=torch.bool, device=self.device)
+            for eid in self._bf16_only_experts:
+                assert 0 <= eid < num_experts, f"Invalid expert ID {eid}"
+                mask[eid] = True
+            self._bf16_only_mask = mask
+        else:
+            self._bf16_only_mask = None
+        # If ALL experts are bf16-only, skip INT4 param init entirely
+        self._all_bf16_only = (len(self._bf16_only_set) == num_experts)
 
         self.group_cfgs = heter_config["groups"]
         self.num_groups = len(self.group_cfgs)
@@ -163,6 +192,8 @@ class HeterFusedMoE(nn.Module):
             device=self.device,
             int4_only_mask=self._int4_only_mask,
             int4_group_idx=self._int4_group_idx,
+            bf16_only_mask=self._bf16_only_mask,
+            bf16_group_idx=self._bf16_group_idx,
             **policy_kwargs,
         )
 
@@ -185,7 +216,7 @@ class HeterFusedMoE(nn.Module):
                 if not hasattr(self, "w13_weight") and self._num_bf16_experts > 0:
                     self._init_bf16_params(E, H, I)
             elif num_bits == 4:
-                if not hasattr(self, "int4_w13_qweight"):
+                if not hasattr(self, "int4_w13_qweight") and not self._all_bf16_only:
                     self._init_int4_params(E, H, I, gcfg)
             elif num_bits == 8:
                 if not hasattr(self, "w13_weight"):
@@ -216,6 +247,7 @@ class HeterFusedMoE(nn.Module):
         fused_moe: nn.Module,
         heter_config: Dict[str, Any],
         int4_only_experts: Optional[list] = None,
+        bf16_only_experts: Optional[list] = None,
     ) -> "HeterFusedMoE":
         """Create HeterFusedMoE from an already-loaded BF16 FusedMoE.
 
@@ -250,6 +282,7 @@ class HeterFusedMoE(nn.Module):
             reduce_results=reduce_results,
             moe_tp_size=moe_tp_size,
             int4_only_experts=int4_only_experts,
+            bf16_only_experts=bf16_only_experts,
         )
 
         # Copy BF16 weights: compact (dual-precision only) or full
@@ -459,6 +492,10 @@ class HeterFusedMoE(nn.Module):
                         global_expert_id
                     )
                     if local_expert_id < 0 or local_expert_id >= E:
+                        continue
+
+                    # Skip loading INT4 weights for bf16-only experts.
+                    if local_expert_id in self._bf16_only_set:
                         continue
 
                     tensor = f.get_tensor(key)
@@ -743,8 +780,7 @@ def apply_heter_precision(
 
     heter_config = _parse_heter_config(config_path)
     int4_only_by_layer = heter_config.get("_int4_only_by_layer", {})
-    target_layers = heter_config.get("target_layers")
-    target_set = set(target_layers) if target_layers is not None else None
+    bf16_only_by_layer = heter_config.get("_bf16_only_by_layer", {})
 
     # Find INT4 group's checkpoint path
     int4_checkpoint = None
@@ -769,8 +805,6 @@ def apply_heter_precision(
 
     num_swapped = 0
     for layer_id, layer in enumerate(layers_module):
-        if target_set is not None and layer_id not in target_set:
-            continue
         # Find the FusedMoE experts module
         fused_moe = None
         moe_parent = None
@@ -788,15 +822,17 @@ def apply_heter_precision(
 
         # Create HeterFusedMoE from the loaded BF16 FusedMoE
         int4_only_experts = int4_only_by_layer.get(str(layer_id))
+        bf16_only_experts = bf16_only_by_layer.get(str(layer_id))
         heter_moe = HeterFusedMoE.from_fused_moe(
-            fused_moe, heter_config, int4_only_experts=int4_only_experts
+            fused_moe, heter_config,
+            int4_only_experts=int4_only_experts,
+            bf16_only_experts=bf16_only_experts,
         )
 
-        # Load INT4 expert weights
-        heter_moe.load_int4_weights(int4_checkpoint, layer_id)
-
-        # Repack GPTQ → Marlin
-        heter_moe.repack_int4_to_marlin()
+        # Load INT4 expert weights (skip entirely if all experts are bf16-only)
+        if not heter_moe._all_bf16_only:
+            heter_moe.load_int4_weights(int4_checkpoint, layer_id)
+            heter_moe.repack_int4_to_marlin()
 
         # Swap
         setattr(moe_parent, moe_attr, heter_moe)

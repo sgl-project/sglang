@@ -1,4 +1,10 @@
-"""Generate one heter-precision config per MoE layer for sensitivity sweep."""
+"""Generate one heter-precision config per MoE layer for sensitivity sweep.
+
+For layer L under test:
+  - int4_only_experts: all 128 experts of layer L (no BF16 copy)
+  - bf16_only_experts: all 128 experts of every OTHER layer (no INT4 loaded)
+This means only layer L gets INT4 weights loaded, saving ~16 GB of VRAM.
+"""
 import argparse
 import json
 import os
@@ -24,11 +30,20 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     moe_layers = [i for i in range(args.num_layers)
                   if i % args.moe_layer_step == 0]
+    all_experts = list(range(args.num_experts))
 
     for L in moe_layers:
+        # Layer L: all experts are INT4-only (quantized, no BF16 copy)
         int4_only_path = os.path.join(args.out_dir, f"int4_only_layer{L}.json")
         with open(int4_only_path, "w") as f:
-            json.dump({str(L): list(range(args.num_experts))}, f)
+            json.dump({str(L): all_experts}, f)
+
+        # All other MoE layers: all experts are BF16-only (no INT4 loaded)
+        bf16_only = {str(other): all_experts
+                     for other in moe_layers if other != L}
+        bf16_only_path = os.path.join(args.out_dir, f"bf16_only_layer{L}.json")
+        with open(bf16_only_path, "w") as f:
+            json.dump(bf16_only, f)
 
         cfg = {
             "groups": [
@@ -40,7 +55,7 @@ def main():
             "policy": "expert_batch",
             "policy_params": {"threshold": args.threshold},
             "int4_only_experts_file": int4_only_path,
-            "target_layers": [L],
+            "bf16_only_experts_file": bf16_only_path,
         }
         cfg_path = os.path.join(args.out_dir, f"heter_layer{L}.json")
         with open(cfg_path, "w") as f:
