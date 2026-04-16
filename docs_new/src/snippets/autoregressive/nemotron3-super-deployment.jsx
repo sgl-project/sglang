@@ -1,8 +1,8 @@
 export const Nemotron3SuperDeployment = () => {
   const MODEL_PATHS = {
-    bf16: 'nvidia/NVIDIA-Nemotron-3-Super-49B-v1',
-    fp8: 'nvidia/NVIDIA-Nemotron-3-Super-49B-v1-FP8',
-    nvfp4: 'nvidia/NVIDIA-Nemotron-3-Super-49B-v1-NVFP4',
+    bf16: 'nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16',
+    fp8: 'nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8',
+    nvfp4: 'nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4',
   };
 
   const options = {

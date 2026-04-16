@@ -116,18 +116,12 @@
           return '# Error: Invalid configuration';
         }
 
-        let command = `sglang serve \
-  --model-path ${config.repoId} \
-  --dit-layerwise-offload true`;
+        let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --dit-layerwise-offload true`;
         if (bestPractice === 'on') {
-          command += ` \
-  --num-gpus 4 \
-  --ulysses-degree 2 \
-  --enable-cfg-parallel`;
+          command += ` \\\n  --num-gpus 4 \\\n  --ulysses-degree 2 \\\n  --enable-cfg-parallel`;
         }
         if (selectedLoraPath && selectedLoraPath !== 'none') {
-          command += ` \
-  --lora-path ${selectedLoraPath}`;
+          command += ` \\\n  --lora-path ${selectedLoraPath}`;
         }
         return command;
       };
