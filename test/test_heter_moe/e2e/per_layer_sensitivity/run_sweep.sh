@@ -39,9 +39,19 @@ wait_ready() {
 
 kill_server() {
     local pid=$1
+    # Kill the conda-run wrapper and its children.
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
-    sleep 5
+    # Kill anything still holding the port (sglang spawns subprocesses
+    # that survive the parent kill).
+    fuser -k "${PORT}/tcp" 2>/dev/null || true
+    # Wait for GPU memory to actually free.
+    for _ in $(seq 1 12); do
+        local used
+        used=$(nvidia-smi --id="${GPU}" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null || echo "0")
+        if [[ "${used}" -lt 1000 ]]; then break; fi
+        sleep 5
+    done
 }
 
 launch_and_measure() {
@@ -56,7 +66,7 @@ launch_and_measure() {
     fi
 
     echo "=== ${tag} ==="
-    CUDA_VISIBLE_DEVICES="${GPU}" conda run --no-banner -n sglang python -m sglang.launch_server \
+    CUDA_VISIBLE_DEVICES="${GPU}" conda run -n sglang python -m sglang.launch_server \
         --model-path "${MODEL_PATH}" \
         --port "${PORT}" --trust-remote-code \
         ${extra_args} > "${log}" 2>&1 &
@@ -67,7 +77,7 @@ launch_and_measure() {
         return 1
     fi
 
-    conda run --no-banner -n sglang python "${SCRIPT_DIR}/ppl_client.py" \
+    conda run -n sglang python "${SCRIPT_DIR}/ppl_client.py" \
         --endpoint "${ENDPOINT}" \
         --tokenizer_path "${MODEL_PATH}" \
         --nsamples "${NSAMPLES}" --seqlen "${SEQLEN}" \
@@ -86,7 +96,7 @@ for (( L=0; L<NUM_LAYERS; L++ )); do
 done
 
 # --- 3. Aggregate ---
-conda run --no-banner -n sglang python -c "
+conda run -n sglang python -c "
 import glob, json, os
 out_dir = '${OUT_DIR}'
 results = {}
