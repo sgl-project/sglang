@@ -727,6 +727,29 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         self.assertIn("type", body["error"])
         self.assertIn("code", body["error"])
 
+    def test_invalid_tools_error(self):
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "input": "Hi",
+            "tools": [{"type": "some_invalid_tool_type"}],
+        }
+        r = requests.post(url, headers=headers, json=payload)
+        self.assertEqual(r.status_code, 400)
+        body = r.json()
+        self.assertIn("error", body)
+        self.assertIn("message", body["error"])
+        self.assertIn(
+            "Input should be 'web_search_preview' or 'code_interpreter'",
+            body["error"]["message"],
+        )
+        self.assertIn("type", body["error"])
+        self.assertIn("code", body["error"])
+
     def test_penalty(self):
         url = f"{self.base_url}/responses"
         headers = {
