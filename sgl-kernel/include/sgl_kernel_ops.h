@@ -668,11 +668,6 @@ void convert_vertical_slash_indexes_mergehead(
     bool causal);
 
 /*
- * From csrc/grammar
- */
-void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
-
-/*
  * From csrc/gemm (QServe)
  */
 void qserve_w4a8_per_chn_gemm(

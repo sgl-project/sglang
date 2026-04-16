@@ -402,12 +402,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("convert_vertical_slash_indexes_mergehead", torch::kCUDA, &convert_vertical_slash_indexes_mergehead);
 
   /*
-   * From csrc/grammar
-   */
-  m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
-  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
-
-  /*
    * From csrc/gemm (QServe)
    */
   m.def(

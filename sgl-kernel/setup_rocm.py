@@ -47,7 +47,6 @@ sources = [
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/topk.cu",
-    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
