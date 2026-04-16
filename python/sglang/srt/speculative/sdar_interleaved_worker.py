@@ -174,7 +174,6 @@ class SDARInterleavedWorker:
             target_worker.model_runner.model_config.context_len
         )
 
-        print(f"[SDAR_DBG TP{tp_rank}] creating draft TpModelWorker...", flush=True)
         saved_server_args = get_global_server_args()
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
@@ -191,15 +190,12 @@ class SDARInterleavedWorker:
             token_to_kv_pool_allocator=target_kv_allocator,
             memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
-        print(f"[SDAR_DBG TP{tp_rank}] draft TpModelWorker created.", flush=True)
         set_global_server_args_for_scheduler(saved_server_args)
 
         self.draft_model_runner = self.draft_worker.model_runner
-        print(f"[SDAR_DBG TP{tp_rank}] resolving mask token id...", flush=True)
 
         # Resolve mask token id
         self._mask_token_id = self._resolve_mask_token_id()
-        print(f"[SDAR_DBG TP{tp_rank}] mask_token_id={self._mask_token_id}", flush=True)
 
         # Pre-allocated position offset buffer [block_size]
         self._block_pos_offsets = torch.arange(
@@ -233,10 +229,8 @@ class SDARInterleavedWorker:
         **kwargs,
     ) -> GenerationBatchResult:
         if isinstance(batch, ModelWorkerBatch):
-            print(f"[SDAR_DBG] forward_batch_generation: ModelWorkerBatch → target fallback", flush=True)
             return self.target_worker.forward_batch_generation(batch, **kwargs)
 
-        print(f"[SDAR_DBG] forward_batch_generation: mode={batch.forward_mode}, bs={batch.batch_size()}", flush=True)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             return self._forward_prefill(batch, **kwargs)
         else:
@@ -294,7 +288,6 @@ class SDARInterleavedWorker:
         spec_state = batch.spec_info
         if not isinstance(spec_state, SDARInterleavedDraftState):
             # Fallback: plain target forward
-            print(f"[SDAR_DBG] _forward_decode FALLBACK: spec_info type={type(spec_state)}", flush=True)
             mwb = batch.get_model_worker_batch()
             return self.target_worker.forward_batch_generation(mwb, **kwargs)
 
@@ -464,7 +457,6 @@ class SDARInterleavedWorker:
             req.kv_committed_len = kv_before + num_added
 
         next_token_ids = block_tokens[:, -1]
-        print(f"[SDAR_DBG] decode done: accepted={total_accepted}, next_tok={next_token_ids.tolist()}, seq_lens={batch.seq_lens.tolist()}, out_ids_len={[len(r.output_ids) for r in batch.reqs]}, finished={[r.finished() for r in batch.reqs]}", flush=True)
 
         return GenerationBatchResult(
             logits_output=None,
