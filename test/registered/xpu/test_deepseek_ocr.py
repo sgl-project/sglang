@@ -47,7 +47,7 @@ class TestDeepSeekOCR(CustomTestCase):
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model, use_fast=False, trust_remote_code=True
         )
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = "http://127.0.0.1:21001"
         cls.image_path = str(
             (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
         )

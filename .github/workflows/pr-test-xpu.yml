@@ -127,12 +127,6 @@ jobs:
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
           docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
 
-      - name: Cleanup residual processes
-        run: |
-          cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" bash -c "pkill -9 -f sglang || true"
-          docker exec "$cid" bash -c "pkill -9 -f 'python.*test_' || true"
-
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20
         run: |
