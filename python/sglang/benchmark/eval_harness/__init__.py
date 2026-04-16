@@ -7,7 +7,8 @@ def _not_implemented(*_args, **_kwargs):
     raise NotImplementedError("eval_harness helper not yet implemented")
 
 
-BenchServingLM = _not_implemented
+from sglang.benchmark.eval_harness.bench_serving_lm import BenchServingLM
+
 merge_report = _not_implemented
 write_report = _not_implemented
 
