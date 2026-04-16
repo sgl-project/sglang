@@ -113,6 +113,39 @@ class TestBenchServingLM(unittest.TestCase):
             ["\n", "Question:"],
         )
 
+    def test_generate_until_populates_all_args_defaults(self):
+        """After set_global_args + _apply_arg_defaults, the module-level args
+        namespace must have all attrs that bench_serving internals might read."""
+        lm = self._make_lm()
+        requests = [_fake_request("Q?", max_gen_toks=16)]
+
+        captured_args = {}
+
+        async def fake_benchmark(**kwargs):
+            # At this point the module-level args global is populated.
+            from sglang import bench_serving as _bs
+            captured_args["args"] = _bs.args
+            return {"generated_texts": ["ok"], "completed": 1}
+
+        with patch("sglang.bench_serving.benchmark", new=fake_benchmark):
+            lm.generate_until(requests)
+
+        args = captured_args["args"]
+        # Sample of attrs read by benchmark() / request funcs that are NOT
+        # in our own explicit Namespace construction — these must have been
+        # filled in by _apply_arg_defaults.
+        for attr in (
+            "plot_throughput", "disable_stream", "disable_ignore_eos",
+            "return_logprob", "top_logprobs_num", "token_ids_logprob",
+            "logprob_start_len", "use_trace_timestamps",
+            "mooncake_slowdown_factor", "mooncake_num_rounds",
+            "served_model_name", "tokenize_prompt", "warmup_requests",
+            "max_concurrency", "output_details", "return_routed_experts",
+            "profile_start_step", "profile_steps", "extra_request_body",
+            "seed",
+        ):
+            self.assertTrue(hasattr(args, attr), f"missing attr: {attr}")
+
     def test_apply_chat_template_plain(self):
         lm = self._make_lm()
         msg = [{"role": "user", "content": "hi"}]

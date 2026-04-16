@@ -130,6 +130,19 @@ class BenchServingLM(LM):
             num_prompts=len(rows),
         )
         bench_serving.set_global_args(args)
+        bench_serving._apply_arg_defaults(args)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # no loop running — good
+        else:
+            raise RuntimeError(
+                "BenchServingLM.generate_until cannot be called from inside a running "
+                "asyncio event loop. lm_eval.simple_evaluate is synchronous; call it "
+                "from synchronous code, or run it in a thread if you must drive it "
+                "from an async context."
+            )
 
         perf = asyncio.run(bench_serving.benchmark(
             backend=self.backend,
