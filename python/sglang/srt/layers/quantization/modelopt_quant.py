@@ -1959,6 +1959,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
+            # DeepEP uses the legacy apply_without_routing_weights path
+            # (flashinfer_cutedsl_moe_masked) and does not need a MoeRunner.
+            if get_moe_a2a_backend().is_deepep():
+                return
+
         if not moe_runner_backend.is_flashinfer_cutlass():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
