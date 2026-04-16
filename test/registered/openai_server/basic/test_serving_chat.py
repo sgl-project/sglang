@@ -19,7 +19,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_chat import (
+    OpenAIServingChat,
+    normalize_tool_content,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -980,6 +983,43 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         )
 
         self.assertIsNone(tool_calls)
+
+
+class TestNormalizeToolContent(unittest.TestCase):
+    """Unit tests for normalize_tool_content()."""
+
+    def test_openai_text_parts_flattened(self):
+        result = normalize_tool_content("tool", [{"type": "text", "text": "10525"}])
+        self.assertEqual(result, "10525")
+
+    def test_multiple_text_parts_joined(self):
+        result = normalize_tool_content(
+            "tool",
+            [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}],
+        )
+        self.assertEqual(result, "hello world")
+
+    def test_non_text_part_list_preserved(self):
+        content = [{"name": "func", "output": "result"}]
+        result = normalize_tool_content("tool", content)
+        self.assertIs(result, content)
+
+    def test_string_content_unchanged(self):
+        self.assertEqual(normalize_tool_content("tool", "hello"), "hello")
+
+    def test_empty_list_returns_empty_string(self):
+        self.assertEqual(normalize_tool_content("tool", []), "")
+
+    def test_non_tool_role_unchanged(self):
+        content = [{"type": "text", "text": "hi"}]
+        result = normalize_tool_content("user", content)
+        self.assertIs(result, content)
+
+    def test_mixed_str_and_dict_parts(self):
+        result = normalize_tool_content(
+            "tool", ["plain", {"type": "text", "text": "rich"}]
+        )
+        self.assertEqual(result, "plain rich")
 
 
 if __name__ == "__main__":
