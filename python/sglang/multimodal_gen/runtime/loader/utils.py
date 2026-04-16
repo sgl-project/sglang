@@ -181,9 +181,7 @@ class skip_init_modules:
 
 def _normalize_component_type(module_type: str) -> str:
     """Normalize module types like 'text_encoder_2' -> 'text_encoder'."""
-    if module_type.endswith("_2"):
-        return module_type[:-2]
-    return module_type
+    return re.sub(r"_\d+$", "", module_type)
 
 
 def _clean_hf_config_inplace(model_config: dict) -> None:

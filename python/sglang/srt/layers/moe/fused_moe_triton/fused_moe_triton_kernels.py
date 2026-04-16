@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import functools
-import os
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
@@ -10,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -49,7 +49,7 @@ elif _is_cpu and _is_cpu_amx_available:
 elif _is_hip:
     pass
 
-padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+padding_size = get_moe_padding_size(_use_aiter)
 
 
 def support_tensor_descriptor():
@@ -335,6 +335,7 @@ def fused_moe_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    add_mask_ptr,
     # Matrix dimensions
     N,
     K,
@@ -377,6 +378,7 @@ def fused_moe_kernel(
     c_sorted: tl.constexpr,
     filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
+    FUSE_ADD_TO_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
 ):
@@ -441,18 +443,20 @@ def fused_moe_kernel(
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
-        write_zeros_to_output(
-            c_ptr,
-            stride_cm,
-            stride_cn,
-            pid_n,
-            N,
-            offs_token,
-            token_mask,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            compute_type,
-        )
+        if not FUSE_ADD_TO_OUTPUT:
+            # skip the zero-write to preserve existing values.
+            write_zeros_to_output(
+                c_ptr,
+                stride_cm,
+                stride_cn,
+                pid_n,
+                N,
+                offs_token,
+                token_mask,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                compute_type,
+            )
         return
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
@@ -604,7 +608,15 @@ def fused_moe_kernel(
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    if FUSE_SUM_ALL_REDUCE:
+    if FUSE_ADD_TO_OUTPUT:
+        # Accumulate into existing output with per-token mask.
+        offs_token_out = offs_token // ROUTER_TOPK
+        add_mask = tl.load(add_mask_ptr + offs_token_out, mask=token_mask, other=False)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & add_mask[:, None] & (offs_cn[None, :] < N)
+        existing = tl.load(c_ptrs, mask=c_mask, other=0.0)
+        tl.store(c_ptrs, existing + accumulator, mask=c_mask)
+    elif FUSE_SUM_ALL_REDUCE:
         offs_token_out = offs_token // ROUTER_TOPK
         c_ptrs = (
             c_ptr + stride_cm * offs_token_out[:, None] + stride_cn * offs_cn[None, :]
@@ -717,6 +729,8 @@ def invoke_fused_moe_kernel(
     filter_expert: bool = True,
     fuse_sum_all_reduce: bool = False,
     router_topk: int = 1,
+    fuse_add_to_output: bool = False,
+    add_output_mask: Optional[torch.Tensor] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -786,6 +800,13 @@ def invoke_fused_moe_kernel(
 
     if fuse_sum_all_reduce:
         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
+    if fuse_add_to_output:
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when fuse_add_to_output=True"
 
     if (
         (use_int8_w8a16 or use_int4_w4a16)
@@ -870,6 +891,7 @@ def invoke_fused_moe_kernel(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
+            add_output_mask,
             B.shape[1],
             B.shape[2] - padded_size,
             sorted_token_ids.shape[0],
@@ -901,6 +923,7 @@ def invoke_fused_moe_kernel(
             c_sorted=c_sorted,
             filter_expert=filter_expert,
             swap_ab=swap_ab,
+            FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             **config,
@@ -1168,6 +1191,82 @@ def fused_append_shared_experts(
         scale_factor=scale_factor,
         K=k,
         S=s,
+        num_warps=1,
+    )
+    return out_ids, out_weights
+
+
+@triton.jit
+def _fused_append_shared_experts_with_weights_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    shared_weights_ptr,
+    out_ids_ptr,
+    out_weights_ptr,
+    N_BASE,
+    K: tl.constexpr,
+    S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    ids_row_ptr = pid * K
+    out_row_ptr = pid * (K + S)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
+    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k, mask=mask_k)
+
+    tl.store(out_ids_ptr + out_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_row_ptr + offs_k, ws, mask=mask_k)
+
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < S
+    shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
+    shared_ws = tl.load(shared_weights_ptr + pid * S + offs_s, mask=mask_s)
+
+    tl.store(out_ids_ptr + out_row_ptr + K + offs_s, shared_ids, mask=mask_s)
+    tl.store(out_weights_ptr + out_row_ptr + K + offs_s, shared_ws, mask=mask_s)
+
+
+def fused_append_shared_experts_with_weights(
+    topk_ids, topk_weights, shared_weights, num_fused_shared_experts, N=None
+):
+    """Like fused_append_shared_experts but accepts per-token shared weights tensor."""
+    assert N is not None, "N (shared expert base id) must be provided"
+    m, k = topk_ids.shape
+    s = int(num_fused_shared_experts)
+    if s <= 0:
+        return topk_ids, topk_weights
+
+    shared_weights_2d = shared_weights.to(topk_weights.dtype)
+    if shared_weights_2d.ndim == 1:
+        shared_weights_2d = shared_weights_2d.unsqueeze(-1)
+    if shared_weights_2d.shape[1] < s:
+        shared_weights_2d = shared_weights_2d.expand(m, s)
+    shared_weights_2d = shared_weights_2d.contiguous()
+
+    out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
+    out_weights = torch.empty(
+        (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    block_k = triton.next_power_of_2(k)
+    block_s = triton.next_power_of_2(s)
+
+    _fused_append_shared_experts_with_weights_kernel[(m,)](
+        topk_ids,
+        topk_weights,
+        shared_weights_2d,
+        out_ids,
+        out_weights,
+        N_BASE=N,
+        K=k,
+        S=s,
+        BLOCK_K=block_k,
+        BLOCK_S=block_s,
         num_warps=1,
     )
     return out_ids, out_weights

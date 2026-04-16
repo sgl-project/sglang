@@ -5,7 +5,7 @@ from sglang.srt.environ import temp_set_env
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=380, suite="nightly-1-gpu", nightly=True)
 
 TEST_GCS_MODEL = "gs://vertex-model-garden-public-us/codegemma/codegemma-2b/"
 

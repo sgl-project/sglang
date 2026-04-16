@@ -124,7 +124,8 @@ def _convert(data):
 
 
 _mm_grid_attrs = {
-    Modality.IMAGE: ["image_grid_thw", "image_grid_hws"],
+    # Kimi K2.5 HF processor uses grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
+    Modality.IMAGE: ["image_grid_thw", "image_grid_hws", "grid_thws"],
     Modality.VIDEO: ["video_grid_thw"],
     Modality.AUDIO: ["audio_feature_lens_raw"],
 }
@@ -136,9 +137,17 @@ _mm_feature_attrs = {
 }
 
 
-def _get_mm_grid_dim(mm_inputs, modality):
-    for attr in _mm_grid_attrs[modality]:
-        if attr in mm_inputs:
+def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
+    # Kimi K2.5 vision processor only emits `grid_thws`; prefer it over generic keys
+    # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
+    attrs = _mm_grid_attrs[modality]
+    if (model_type or "").lower() in [
+        "kimi_k25",
+        "kimi_vl",
+    ] and modality == Modality.IMAGE:
+        attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+    for attr in attrs:
+        if attr in mm_inputs and mm_inputs[attr] is not None:
             return mm_inputs[attr]
     raise ValueError(f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}")
 
@@ -577,6 +586,16 @@ class MMEncoder:
         else:
             return int(grid[0] * grid[1] * grid[2])
 
+    def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
+        """MoonViT + tpool: output len is (h//mh)*(w//mw); temporal dim is pooled (not t*h*w/merge^2)."""
+        if isinstance(grid, torch.Tensor):
+            flat = grid.flatten()
+            _t, h, w = (int(x) for x in flat[:3].tolist())
+        else:
+            _t, h, w = int(grid[0]), int(grid[1]), int(grid[2])
+        merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
+        return (h * w) // (merge_h * merge_w)
+
     def get_num_tokens(
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
@@ -585,6 +604,11 @@ class MMEncoder:
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)
         else:
+            if (
+                self.model_type in ["kimi_k25", "kimi_vl"]
+                and modality == Modality.IMAGE
+            ):
+                return self._kimi_tokens_from_patch_grid(grid)
             merge_size = getattr(self.image_processor, "merge_size", 2)
             return self.get_num_patches(grid, modality) // (merge_size**2)
 
@@ -625,7 +649,7 @@ class MMEncoder:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
         # 1. Slice mm_feature to get only the patches for missing mm items
         sub_feature_list = []
@@ -675,7 +699,7 @@ class MMEncoder:
     ) -> torch.Tensor:
         # mm_inputs: dict
         mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
 
@@ -849,10 +873,79 @@ class MMEncoder:
         ]
         return timestamps
 
+    @staticmethod
+    def _flatten_nested_items(items):
+        if not isinstance(items, (list, tuple)):
+            return [items]
+
+        flat = []
+        for item in items:
+            if isinstance(item, (list, tuple)):
+                flat.extend(MMEncoder._flatten_nested_items(item))
+            else:
+                flat.append(item)
+        return flat
+
+    def _normalize_kimi_encoder_images(self, images):
+        """Normalize Kimi image inputs for the image processor call."""
+        from PIL import Image as PILImage
+
+        def wrap_one(img):
+            if isinstance(img, dict) and img.get("type") in ("image", "video_chunk"):
+                return [img]
+            if isinstance(img, PILImage.Image):
+                return [{"type": "image", "image": img}]
+            return [img]
+
+        if not images:
+            return images
+
+        # Disagg may supply nested lists from grouped routing.
+        images = self._flatten_nested_items(images)
+
+        # Kimi-VL image processor expects a flat list of concrete images.
+        if self.model_type == "kimi_vl":
+            normalized = []
+            for img in images:
+                if (
+                    isinstance(img, dict)
+                    and img.get("type") == "image"
+                    and "image" in img
+                ):
+                    inner = img["image"]
+                    if isinstance(inner, (list, tuple)):
+                        normalized.extend(self._flatten_nested_items(inner))
+                    else:
+                        normalized.append(inner)
+                else:
+                    normalized.append(img)
+            return normalized
+
+        # Kimi-K2.5 vision processor expects media dicts.
+        normalized = []
+        for img in images:
+            wrapped = wrap_one(img)
+            for media in wrapped:
+                # Some pipelines may produce {"type": "image", "image": [PIL]}.
+                # Split it into one media item per concrete image object.
+                if (
+                    isinstance(media, dict)
+                    and media.get("type") == "image"
+                    and isinstance(media.get("image"), (list, tuple))
+                ):
+                    for inner in self._flatten_nested_items(media["image"]):
+                        normalized.append({**media, "image": inner})
+                else:
+                    normalized.append(media)
+
+        return normalized
+
     async def _process_mm_items(self, mm_items, modality):
         if modality == Modality.IMAGE and self.image_processor:
             images = await self._flatten_and_load_images(mm_items)
             image_config = self.vision_config.get("image", {})
+            if self.model_type in ["kimi_k25", "kimi_vl"]:
+                images = self._normalize_kimi_encoder_images(images)
             processor_input = self.image_processor(images=images, **image_config)
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_image_feature
@@ -985,7 +1078,11 @@ class MMEncoder:
                 self.profiler.step()
 
             aux_data = _build_mm_aux_data(mm_inputs)
-            return _get_mm_grid_dim(mm_inputs, modality), mm_embedding, aux_data
+            return (
+                _get_mm_grid_dim(mm_inputs, modality, self.model_type),
+                mm_embedding,
+                aux_data,
+            )
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -54,7 +54,7 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import MemoryPoolConfig
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ class BaseTpWorker(ABC):
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
-    def get_memory_pool(self):
+    def get_memory_pool(self) -> Tuple[ReqToTokenPool, BaseTokenToKVPoolAllocator]:
         return (
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
@@ -210,9 +210,8 @@ class BaseTpWorker(ABC):
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch).logits_output
-        embeddings = logits_output.embeddings
-        return embeddings
+        output = self.model_runner.forward(forward_batch).logits_output
+        return output  # Returns EmbeddingPoolerOutput
 
 
 class TpModelWorker(BaseTpWorker):
