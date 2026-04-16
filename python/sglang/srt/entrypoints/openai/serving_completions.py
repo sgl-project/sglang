@@ -307,7 +307,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Abort with an explicit error status_code is a system error
-                # (timeout, OOM, validation) — emit a streaming error chunk.
+                # (timeout, OOM, validation): emit a streaming error chunk.
                 # A graceful abort (no status_code, e.g. user-initiated via
                 # /abort_request or session lifecycle cleanup) falls through
                 # to the normal chunk path, matching the non-stream behavior
