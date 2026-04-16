@@ -71,7 +71,7 @@ export const DeepSeekV31Deployment = () => {
     const checkDarkMode = () => {
       // Check Mintlify's theme class on html element
       const html = document.documentElement;
-      const isDarkMode = html.classList.contains('dark') || 
+      const isDarkMode = html.classList.contains('dark') ||
                          html.getAttribute('data-theme') === 'dark' ||
                          html.style.colorScheme === 'dark';
       setIsDark(isDarkMode);
@@ -195,4 +195,3 @@ export const DeepSeekV31Deployment = () => {
     </div>
   );
 };
-

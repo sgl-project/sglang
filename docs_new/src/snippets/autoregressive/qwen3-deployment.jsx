@@ -187,7 +187,7 @@ export const Qwen3Deployment = () => {
   useEffect(() => {
     const checkDarkMode = () => {
       const html = document.documentElement;
-      const isDarkMode = html.classList.contains('dark') || 
+      const isDarkMode = html.classList.contains('dark') ||
                          html.getAttribute('data-theme') === 'dark' ||
                          html.style.colorScheme === 'dark';
       setIsDark(isDarkMode);
@@ -328,4 +328,3 @@ export const Qwen3Deployment = () => {
     </div>
   );
 };
-
