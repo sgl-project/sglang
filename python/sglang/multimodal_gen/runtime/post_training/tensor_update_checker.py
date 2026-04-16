@@ -50,6 +50,7 @@ class TensorUpdateChecker:
         tp_rank: int,
         tp_world_size: int,
         tp_cpu_group,
+        tp_root_rank: int,
     ) -> tuple[bool, str]:
         if tp_world_size == 1:
             return self.verify(
@@ -79,7 +80,7 @@ class TensorUpdateChecker:
                 if name in local_named_tensors
                 else None,
                 gathered_tensors,
-                dst=0,
+                dst=tp_root_rank,
                 group=tp_cpu_group,
             )
             if tp_rank != 0:
@@ -153,7 +154,7 @@ class TensorUpdateChecker:
         final_result_holder = [final_result]
         torch.distributed.broadcast_object_list(
             final_result_holder,
-            src=0,
+            src=tp_root_rank,
             group=tp_cpu_group,
         )
         final_result = final_result_holder[0]

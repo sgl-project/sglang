@@ -86,22 +86,26 @@ class GPUWorkerPostTrainingMixin:
             tp_rank=get_tp_rank(),
             tp_world_size=get_tp_world_size(),
             tp_cpu_group=self.tp_cpu_group,
+            tp_root_rank=self.tp_group.first_rank,
         )
         if self.sp_group.world_size == 1:
             return result
 
         import torch
 
-        gathered_results = [None] * self.sp_group.world_size if self.sp_group.rank == 0 else None
+        is_sp_root = self.sp_group.rank_in_group == 0
+        gathered_results = (
+            [None] * self.sp_group.world_size if is_sp_root else None
+        )
         torch.distributed.gather_object(
             result,
             gathered_results,
-            dst=0,
+            dst=self.sp_group.first_rank,
             group=self.sp_cpu_group,
         )
 
         final_result = None
-        if self.sp_group.rank == 0:
+        if is_sp_root:
             failures = [
                 (rank, message)
                 for rank, (success, message) in enumerate(gathered_results)
@@ -123,7 +127,7 @@ class GPUWorkerPostTrainingMixin:
         final_result_holder = [final_result]
         torch.distributed.broadcast_object_list(
             final_result_holder,
-            src=0,
+            src=self.sp_group.first_rank,
             group=self.sp_cpu_group,
         )
         return final_result_holder[0]
