@@ -306,7 +306,7 @@ class HiCacheFile(HiCacheStorage):
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
         if enable_cp:
-            self.config_suffix += f"_cp{attn_cp_size}_{attn_cp_rank}"
+            self.config_suffix += f"_cp{attn_cp_size}"
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")

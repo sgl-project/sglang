@@ -413,9 +413,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.enable_cp = self.attn_cp_size > 1
             if self.enable_pp or self.enable_cp:
                 self.mha_suffix = (
-                    f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
+                    f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_size}"
                 )
-                self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
+                self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_size}"
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
