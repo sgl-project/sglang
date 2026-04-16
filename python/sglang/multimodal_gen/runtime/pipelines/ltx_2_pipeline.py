@@ -7,6 +7,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
+    sync_ltx23_runtime_vae_markers,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
@@ -249,6 +250,10 @@ class _BaseLTX2Pipeline(LoRAPipeline):
     def initialize_pipeline(self, server_args: ServerArgs):
         orig = self.get_module("scheduler")
         self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(orig.config)
+        sync_ltx23_runtime_vae_markers(
+            server_args.pipeline_config.vae_config.arch_config,
+            getattr(self.get_module("vae"), "config", None),
+        )
 
 
 class LTX2Pipeline(_BaseLTX2Pipeline):
