@@ -34,7 +34,6 @@ from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
     is_hip,
-    is_sm120_supported,
 )
 
 _is_hip = is_hip()
@@ -45,14 +44,13 @@ if TYPE_CHECKING:
 
 
 try:
-    if is_sm120_supported():
-        from flashinfer import fp4_quantize
-    else:
-        from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
-
     from flashinfer import fp4_quantize as fp4_quantize_flashinfer
+    from flashinfer import (
+        nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
+    )
 except ImportError:
-    fp4_quantize = None
+    fp4_quantize_flashinfer = None
+    nvfp4_block_scale_interleave_flashinfer = None
 
 
 class StandardDispatchOutput(NamedTuple):
@@ -88,8 +86,14 @@ class StandardDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.moe_ep_size = get_moe_expert_parallel_world_size()
-        self.enable_flashinfer_cutlass_moe = (
-            get_moe_runner_backend().is_flashinfer_cutlass()
+        backend = get_moe_runner_backend()
+        self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
+        # FlashInfer CUTLASS and CuteDSL handle EP internally with global expert IDs.
+        # Skip local expert mapping so topk_ids stay in global space.
+        self.skip_local_expert_mapping = (
+            backend.is_flashinfer_cutlass()
+            or backend.is_flashinfer_cutedsl()
+            or backend.is_flashinfer_trtllm_routed()
         )
         self.enable_flashinfer_trtllm_routed_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -108,8 +112,15 @@ class StandardDispatcher(BaseDispatcher):
 
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
             # all-gather fp4 hidden states
-            from flashinfer import nvfp4_block_scale_interleave
-
+            if (
+                fp4_quantize_flashinfer is None
+                or nvfp4_block_scale_interleave_flashinfer is None
+            ):
+                raise RuntimeError(
+                    "FlashInfer fp4_quantize and nvfp4_block_scale_interleave "
+                    "are required for the flashinfer_cutlass FP4 all-gather "
+                    "path."
+                )
             global_scale = self.quant_config.get("input_global_scale", None)
             assert global_scale is not None, "input_global_scale is not set"
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
@@ -134,7 +145,7 @@ class StandardDispatcher(BaseDispatcher):
                 [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
             )
             # TODO: fuse into cutlass moe
-            x_sf = nvfp4_block_scale_interleave(x_sf)
+            x_sf = nvfp4_block_scale_interleave_flashinfer(x_sf)
 
             hidden_states = x
             hidden_states_scale = x_sf
@@ -149,8 +160,7 @@ class StandardDispatcher(BaseDispatcher):
 
         if (
             self.moe_ep_size > 1
-            and not self.enable_flashinfer_cutlass_moe
-            and not self.enable_flashinfer_trtllm_routed_moe
+            and not self.skip_local_expert_mapping
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
             if self.local_expert_mapping is None:
