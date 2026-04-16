@@ -278,21 +278,35 @@ class HiCacheFile(HiCacheStorage):
     ):
         self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
 
-        tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
+        (
+            tp_rank,
+            tp_size,
+            pp_rank,
+            pp_size,
+            attn_cp_rank,
+            attn_cp_size,
+            model_name,
+            is_mla_model,
+        ) = (
             storage_config.tp_rank,
             storage_config.tp_size,
             storage_config.pp_rank,
             storage_config.pp_size,
+            storage_config.attn_cp_rank,
+            storage_config.attn_cp_size,
             storage_config.model_name,
             storage_config.is_mla_model,
         )
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
+        enable_cp = attn_cp_size > 1
         self.config_suffix = f"_{model_name}"
         if not is_mla_model:
             self.config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
+        if enable_cp:
+            self.config_suffix += f"_cp{attn_cp_size}_{attn_cp_rank}"
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
