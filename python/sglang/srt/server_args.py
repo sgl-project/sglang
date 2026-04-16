@@ -753,7 +753,7 @@ class ServerArgs:
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
     # For communications compression
-    quantize_tp_communications: Optional[bool] = False
+    enable_quant_communications: Optional[bool] = False
 
     def __post_init__(self):
         """
@@ -6345,7 +6345,7 @@ class ServerArgs:
         )
 
         parser.add_argument(
-            "--quantize-tp-communications",
+            "--enable-quant-communications",
             action="store_true",
             default=False,
             help="Enable INT8 quantization of TP communications (limited support).",
@@ -6625,17 +6625,12 @@ class ServerArgs:
             )
 
         # Check communications compression
-        if self.quantize_tp_communications and self.tp_size == 1:
+        if self.enable_quant_communications and self.tp_size == 1:
             raise ValueError(
                 "Communications quantization is only used with tp_size != 1"
             )
 
-        if self.quantize_tp_communications and self.get_model_config().hf_config.architectures[0] != "Qwen3ForCausalLM":
-            raise ValueError(
-                "Communications quantization is only supported for Qwen-3 model family"
-            )
-
-        if self.quantize_tp_communications and self.device != "npu":
+        if self.enable_quant_communications and self.device != "npu":
             raise ValueError(
                 "Communications quantization is only supported for NPU device"
             )
