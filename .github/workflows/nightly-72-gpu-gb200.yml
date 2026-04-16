@@ -9,15 +9,15 @@ on:
   workflow_dispatch:  # allow manual trigger; gated by gb200-ci environment
     inputs:
       image:
-        description: 'SGLang Docker image to benchmark (mutually exclusive with sglang_branch)'
+        description: 'Optional. SGLang Docker image to benchmark. Leave as default for the nightly image. Mutually exclusive with sglang_branch.'
         required: false
-        default: 'lmsysorg/sglang:dev-cu13'
+        default: ''
       sglang_branch:
-        description: 'SGLang branch to build from. If set, builds a fresh image from this branch (ARM64, CUDA 13) and uses it for the run. Mutually exclusive with image.'
+        description: 'Optional. SGLang branch to build from. If set, builds a fresh image from this branch (ARM64, CUDA 13) and uses it for the run. Mutually exclusive with image.'
         required: false
         default: ''
       configs:
-        description: 'Optional comma-separated matrix entry names to run (e.g. "dsr1-fp8-1k1k-max-tpt"). Leave empty to run all configs. Names are defined in scripts/ci/slurm/nightly-configs.yaml.'
+        description: 'Optional. Comma-separated names to run only a subset. Format: {model-prefix}-{precision}-{isl}{osl}-{recipe}. E.g. "dsr1-fp8-1k1k-max-tpt" or "dsr1-fp8-1k1k-max-tpt,dsr1-fp4-1k1k-mid-curve". Leave empty to run all. Available names are listed in the setup job log.'
         required: false
         default: ''
 
@@ -72,8 +72,18 @@ jobs:
           CONFIGS_FILTER: ${{ inputs.configs }}
         run: |
           pip install pyyaml -q
+
+          # List all available config names first so they're visible in logs
+          # even when a filter rejects an unknown name.
+          ALL_MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
+            scripts/ci/slurm/nightly-configs.yaml --runner gb200)
+          echo "Available config names for runner gb200:"
+          echo "$ALL_MATRIX" | python3 -c "import json,sys; [print(f'  - {e[\"name\"]}') for e in json.load(sys.stdin)]"
+
           FILTER_ARG=()
           if [ -n "$CONFIGS_FILTER" ]; then
+            echo ""
+            echo "Filtering to: $CONFIGS_FILTER"
             FILTER_ARG=(--filter "$CONFIGS_FILTER")
           fi
           MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
