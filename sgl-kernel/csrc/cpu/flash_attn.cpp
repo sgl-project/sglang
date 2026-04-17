@@ -447,8 +447,16 @@ at::Tensor flash_attn_varlen_func(
     std::optional<double> scale) {
   RECORD_FUNCTION(
       "sgl_kernel::flash_attn_varlen_func",
-      std::vector<c10::IValue>({q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
-                                scale.has_value() ? c10::IValue(scale.value()) : c10::IValue()}));
+      std::vector<c10::IValue>(
+          {q,
+           k,
+           v,
+           cu_seqlens_q,
+           cu_seqlens_k,
+           max_seqlen_q,
+           max_seqlen_k,
+           causal,
+           scale.has_value() ? c10::IValue(scale.value()) : c10::IValue()}));
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);

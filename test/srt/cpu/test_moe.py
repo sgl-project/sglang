@@ -404,7 +404,13 @@ class TestFusedExperts(CustomTestCase):
         w2s = kernel.convert_scale_packed(w2s)
 
         ref_out = native_fp8_fused_moe(
-            a, w1dq.float(), w2dq.float(), topk_weight, topk_ids, topk, activation="gelu"
+            a,
+            w1dq.float(),
+            w2dq.float(),
+            topk_weight,
+            topk_ids,
+            topk,
+            activation="gelu",
         )
         out = kernel.fused_experts_cpu(
             a,
