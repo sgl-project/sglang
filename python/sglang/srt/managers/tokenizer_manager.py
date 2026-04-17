@@ -107,7 +107,7 @@ from sglang.srt.utils import (
     get_or_create_event_loop,
     kill_process_tree,
 )
-from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.aio_rwlock import RWCondition, RWLock
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -416,15 +416,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             None
         )
         self.is_pause = False
-        self.is_pause_cond = asyncio.Condition()
+        self.is_pause_cond = RWCondition()
         self._is_pause_shm = None
 
     def _init_shared_pause(self, shm_name: str):
         """Attach to shared pause flag for multi-worker coordination.
 
         In multi-tokenizer mode, each worker process has its own is_pause flag
-        and asyncio.Condition, which cannot be shared across processes. This
-        method connects to a shared memory byte so that pause/continue from any
+        and RWCondition, which cannot be shared across processes. This method
+        connects to a shared memory byte so that pause/continue from any
         worker is visible to all workers. A background task polls the shared
         flag and updates the local is_pause + is_pause_cond. Note that the
         consistency of is_pause is reduced to eventual consistency in this
@@ -438,67 +438,77 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Background task that polls shared memory and syncs local is_pause."""
         while True:
             await asyncio.sleep(0.1)
-            shm_paused = bool(self._is_pause_shm.buf[0])
-            if shm_paused != self.is_pause:
-                async with self.is_pause_cond:
-                    self.is_pause = shm_paused
-                    self.is_pause_cond.notify_all()
+            if bool(self._is_pause_shm.buf[0]) != self.is_pause:
+                async with self.is_pause_cond.writer_lock:
+                    shm_paused = bool(self._is_pause_shm.buf[0])
+                    if shm_paused != self.is_pause:
+                        self.is_pause = shm_paused
+                        self.is_pause_cond.notify_all()
 
     @asynccontextmanager
-    async def _wait_for_pause_or_lock(self):
+    async def _ensure_paused_or_model_locked(self):
         """
-        Acquire writer lock OR skip it if the engine becomes paused.
+        Context manager: within the context, either the engine is paused OR the
+        model_update_lock writer is held.
 
-        NOTE:
-        * /continue_generation is not safe while we are within this context
-        * if using --tokenizer-worker-num > 1, entering this context without
-          pausing is not safe, i.e. `self.model_update_lock.writer_lock` is
-          local and does not guarantee lock acquisition across all workers
+        Acquires is_pause_cond as a reader, which blocks writers
+        (continue_generation, pause_generation) but not other readers
+        (send_request).  This prevents continue_generation from unpausing
+        while a weight update is in-flight (TOCTOU fix from #22304).
+
+        NOTE: with --tokenizer-worker-num > 1, is_pause_cond is process-local
+        so it cannot block continue_generation in another worker process.
+
+        NOTE: with --tokenizer-worker-num > 1, model_update_lock is
+        process-local so it cannot block model read/update in another worker
+        process.
         """
-        if self._is_pause_shm is not None:
-            # self.is_pause is eventually consistent, so check self._is_pause_shm first
-            is_paused = bool(self._is_pause_shm.buf[0])
-        else:
-            async with self.is_pause_cond:
-                is_paused = self.is_pause
-        if is_paused:
-            yield
-            return
-
-        lock_task = asyncio.create_task(self.model_update_lock.acquire_writer())
-        pause_task = asyncio.create_task(self._wait_until_paused())
-        lock_acquired = False
+        await self.is_pause_cond.acquire_reader()
+        pause_reader_held = True
         try:
-            _, pending = await asyncio.wait(
-                [lock_task, pause_task], return_when=asyncio.FIRST_COMPLETED
-            )
-            for t in pending:
-                t.cancel()
-            for t in pending:
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
-            if lock_task.done() and not lock_task.cancelled():
-                await lock_task
-                lock_acquired = True
-            if pause_task.done() and not pause_task.cancelled():
-                await pause_task
-            yield
-        finally:
-            for t in (lock_task, pause_task):
-                if not t.done():
+            if self.is_pause:
+                yield
+                return
+
+            async def wait_until_paused():
+                await self.is_pause_cond.wait_for_reader(lambda: self.is_pause)
+
+            lock_task = asyncio.create_task(self.model_update_lock.acquire_writer())
+            pause_task = asyncio.create_task(wait_until_paused())
+            lock_acquired = False
+            try:
+                _, pending = await asyncio.wait(
+                    [lock_task, pause_task], return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:
                     t.cancel()
+                for t in pending:
                     try:
                         await t
                     except asyncio.CancelledError:
                         pass
-            if lock_acquired:
-                await self.model_update_lock.release_writer()
-
-    async def _wait_until_paused(self):
-        async with self.is_pause_cond:
-            await self.is_pause_cond.wait_for(lambda: self.is_pause)
+                if lock_task.done() and not lock_task.cancelled():
+                    await lock_task
+                    lock_acquired = True
+                if pause_task.done() and not pause_task.cancelled():
+                    await pause_task
+                if lock_acquired:
+                    await self.is_pause_cond.release_reader()
+                    pause_reader_held = False
+                yield
+            finally:
+                for t in (lock_task, pause_task):
+                    if not t.done():
+                        t.cancel()
+                        try:
+                            await t
+                        except asyncio.CancelledError:
+                            pass
+                if lock_acquired:
+                    await self.model_update_lock.release_writer()
+        finally:
+            if pause_reader_held:
+                await self.is_pause_cond.release_reader()
 
     def init_lora(self):
         # LoRA
@@ -626,8 +636,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Log the request
         self.request_logger.log_received_request(obj, self.tokenizer, request)
 
-        async with self.is_pause_cond:
-            await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+        async with self.is_pause_cond.reader_lock:
+            await self.is_pause_cond.wait_for_reader(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
             await self._validate_and_resolve_lora(obj)
@@ -1551,7 +1561,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
-        async with self.is_pause_cond:
+        async with self.is_pause_cond.writer_lock:
             self.is_pause = True
             if self._is_pause_shm is not None:
                 self._is_pause_shm.buf[0] = 1
@@ -1563,13 +1573,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 while True:
                     # TODO: maybe make it async instead of fire-and-forget
                     self.abort_request(abort_all=True)
-                    is_locked = await self.model_update_lock.is_locked()
+                    is_locked = self.model_update_lock.is_locked()
                     if not is_locked:
                         break
                     await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
-        async with self.is_pause_cond:
+        async with self.is_pause_cond.writer_lock:
             self.is_pause = False
             if self._is_pause_shm is not None:
                 self._is_pause_shm.buf[0] = 0
@@ -1591,7 +1601,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        async with self._wait_for_pause_or_lock():
+        async with self._ensure_paused_or_model_locked():
             success, message, num_paused_requests = (
                 await self._wait_for_model_update_from_disk(obj)
             )
