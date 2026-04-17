@@ -177,7 +177,8 @@ done
 ```
 
 ```shell
-SGLANG_DP_ROUND_ROBIN=1 python -m sglang_router.launch_router \
+export SGLANG_DP_ROUND_ROBIN=1
+python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://P_IP:8000 8998 \
@@ -421,7 +422,8 @@ done
 ```
 
 ```shell
-SGLANG_DP_ROUND_ROBIN=1 python -m sglang_router.launch_router \
+export SGLANG_DP_ROUND_ROBIN=1
+python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://P_IP:8000 8998 \
@@ -545,7 +547,8 @@ done
 ```
 
 ```shell
-SGLANG_DP_ROUND_ROBIN=1 python -m sglang_router.launch_router \
+export SGLANG_DP_ROUND_ROBIN=1
+python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://P_IP:8000 8998 \
@@ -1317,7 +1320,8 @@ done
 ```
 
 ```shell
-SGLANG_DP_ROUND_ROBIN=1 python -m sglang_router.launch_router \
+export SGLANG_DP_ROUND_ROBIN=1
+python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://PIP:8000 8995 \
