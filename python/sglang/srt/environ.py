@@ -163,6 +163,7 @@ class Envs:
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
@@ -315,8 +316,10 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
@@ -467,7 +470,7 @@ class Envs:
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
-    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
+    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
     # Mamba
