@@ -70,6 +70,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMoEAscendMethod",
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
+    "ModelOptFp4MarlinLinearMethod",
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
