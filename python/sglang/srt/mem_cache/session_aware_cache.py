@@ -193,10 +193,25 @@ class SessionAwareCache(BasePrefixCache):
 
         slot.restore_to_req(req)
 
-        # logprob_start_len is already forced to -1 for streaming sessions
-        # (in Req.init_next_round_input), so the prefix key is not truncated
-        # and we can directly reuse the committed KV length.
-        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
+        # token_ids = fill_ids[:input_len-1] (1-token logit reserve already
+        # applied). min handles retract retry where committed_len can
+        # exceed len(token_ids) by 1.
+        prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
+
+        # Streaming sessions are append-only (session_controller rollback
+        # ensures req_nodes always points to the last successful req).
+        assert prefix_len >= slot.cache_protected_len, (
+            f"streaming session prefix shrank: {prefix_len=} < "
+            f"{slot.cache_protected_len=}"
+        )
+
+        # Free orphaned tail: alloc_for_extend will overwrite
+        # req_to_token[prefix_len:] with new indices. The range
+        # [prefix_len, kv_allocated_len) has stale indices from the
+        # previous turn's decode (e.g. alloc-commit gap on retract,
+        # or speculative draft tokens).
+        self._free_tail(slot, req, prefix_len)
+
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
@@ -248,12 +263,60 @@ class SessionAwareCache(BasePrefixCache):
             slot = SessionSlot()
             self.slots[session_id] = slot
 
+        finished_len = (
+            req.finished_len if req.finished_len is not None else len(req.output_ids)
+        )
+        self._trim_overshoot(req, finished_len)
+
         slot.save_from_req(req, is_first=is_first)
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
 
         self._mark_kv_freed(req)
+
+    def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int):
+        """match_prefix path: free orphaned KV in [prefix_len, kv_allocated_len)
+        before alloc_for_extend overwrites it. The gap appears when spec
+        decoding pushes allocated above committed, or when retract retry's
+        logit-reserve pulls prefix_len below committed.
+        """
+        self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv_allocated_len)
+        slot.kv_allocated_len = prefix_len
+        slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
+        slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, prefix_len)
+        req.kv_allocated_len = prefix_len
+        req.kv_committed_len = min(req.kv_committed_len, prefix_len)
+        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
+
+    def _trim_overshoot(self, req: Req, finished_len: int):
+        """Trim slot KV to finished_len boundary. Spec v2 may overshoot
+        max_new_tokens (verify round commits M+1 at a time); next turn's
+        input is output_ids[:finished_len], so positions past that must
+        be released to avoid token/KV mismatch.
+        """
+        target = len(req.origin_input_ids) + finished_len
+        self._free_kv_aligned(req.req_pool_idx, target, req.kv_allocated_len)
+        req.kv_allocated_len = min(req.kv_allocated_len, target)
+        req.kv_committed_len = min(req.kv_committed_len, target)
+        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, target)
+        req.output_ids = req.output_ids[:finished_len]
+
+    def _free_kv_aligned(self, pool_idx: int, target: int, end: int):
+        """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
+        because PagedTokenToKVPoolAllocator.free returns whole pages
+        (free_index // page_size), so partial-page free would corrupt pages
+        still holding committed tokens. The range [target, ceil_align(target))
+        stays attached until release_session frees the whole page.
+        """
+        if end <= target:
+            return
+        start = target
+        if self.page_size > 1:
+            start = ceil_align(start, self.page_size)
+        if start < end:
+            tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
+            self.token_to_kv_pool_allocator.free(tail)
 
     @staticmethod
     def _mark_kv_freed(req: Req):
@@ -298,14 +361,7 @@ class SessionAwareCache(BasePrefixCache):
     # -- Session lifecycle --
 
     def release_session(self, session_id: str):
-        """Release all KV resources held by a streaming session.
-
-        `slot.last_node` + `slot.cache_protected_len` are trusted directly: radix
-        tree splits mutate TreeNode objects in place (see RadixCache._split_node),
-        so a saved TreeNode reference remains valid and the locked prefix length
-        is unchanged. No rematch needed -- and `match_prefix` here would cause
-        further splits that disturb accounting.
-        """
+        """Release all KV resources held by a streaming session."""
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
