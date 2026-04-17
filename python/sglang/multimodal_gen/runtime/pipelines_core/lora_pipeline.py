@@ -69,7 +69,27 @@ class LoRAPipeline(ComposedPipelineBase):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Initialize all mutable instance attributes to avoid sharing across instances
+        self._initialize_lora_state(self.server_args)
+
+        if self.lora_path is not None:
+            self.convert_to_lora_layers()
+            self.set_lora(
+                self.lora_nickname,
+                self.lora_path,
+                strength=self.server_args.lora_scale,  # type: ignore[union-attr]
+            )  # type: ignore[arg-type]
+
+    def _initialize_lora_state(self, server_args: ServerArgs | None = None) -> None:
+        if getattr(self, "_lora_state_initialized", False):
+            if server_args is not None:
+                self.exclude_lora_layers = (
+                    server_args.pipeline_config.dit_config.arch_config.exclude_lora_layers
+                )
+                self.lora_target_modules = server_args.lora_target_modules
+                self.lora_path = server_args.lora_path
+                self.lora_nickname = server_args.lora_nickname
+            return
+
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}
         self.cur_adapter_name = {}
@@ -87,19 +107,19 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_path = None
         self.lora_nickname = "default"
 
-        # Initialize from server_args
         self.device = get_local_torch_device()
-        self.exclude_lora_layers = (
-            self.server_args.pipeline_config.dit_config.arch_config.exclude_lora_layers
-        )
-        self.lora_target_modules = self.server_args.lora_target_modules
-        self.lora_path = self.server_args.lora_path
-        self.lora_nickname = self.server_args.lora_nickname
-        if self.lora_path is not None:
-            self.convert_to_lora_layers()
-            self.set_lora(
-                self.lora_nickname, self.lora_path, strength=self.server_args.lora_scale  # type: ignore
-            )  # type: ignore
+        if server_args is not None:
+            self.exclude_lora_layers = (
+                server_args.pipeline_config.dit_config.arch_config.exclude_lora_layers
+            )
+            self.lora_target_modules = server_args.lora_target_modules
+            self.lora_path = server_args.lora_path
+            self.lora_nickname = server_args.lora_nickname
+        else:
+            self.exclude_lora_layers = []
+            self.lora_target_modules = None
+
+        self._lora_state_initialized = True
 
     def is_target_layer(self, module_name: str) -> bool:
         if self.lora_target_modules is None:

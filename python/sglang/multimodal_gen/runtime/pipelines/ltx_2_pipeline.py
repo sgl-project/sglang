@@ -312,6 +312,14 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self._stage1_lora_scale = float(server_args.lora_scale)
         self._active_lora_phase = None
 
+        if server_args.enable_torch_compile:
+            self._initialize_lora_state(server_args)
+            logger.info(
+                "Pre-converting LTX-2 two-stage transformer to LoRA layers before "
+                "torch.compile warmup"
+            )
+            self.convert_to_lora_layers()
+
     def switch_lora_phase(self, phase: str) -> None:
         if phase == self._active_lora_phase:
             return
