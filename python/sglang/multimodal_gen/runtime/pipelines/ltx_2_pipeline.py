@@ -371,7 +371,7 @@ class LTX2TwoStageDeviceManager:
                 else None
             )
             if next_param is not None and next_param.device.type == "cpu":
-                next_module.to(get_local_torch_device(), non_blocking=True)
+                next_module.to(get_local_torch_device(), non_blocking=False)
 
         self._active_phase = phase
         return True
@@ -451,6 +451,12 @@ class LTX2TwoStageDeviceManager:
             snapshot = buffer_snapshots.get(name)
             if snapshot is None:
                 raise KeyError(f"Missing CPU buffer snapshot for {module_name}.{name}")
+            # Preserve runtime-updated buffers (e.g., lazily built caches) when
+            # releasing back to CPU snapshots.
+            if buffer.device.type == "cuda":
+                snapshot.copy_(buffer.detach().to(device="cpu", dtype=snapshot.dtype))
+            elif buffer.device.type == "cpu":
+                snapshot.copy_(buffer.detach().to(dtype=snapshot.dtype))
             buffer.data = snapshot
 
     def _ensure_on_gpu(self, module_name: str) -> None:
@@ -459,7 +465,7 @@ class LTX2TwoStageDeviceManager:
             return
         param = next(module.parameters(), None)
         if param is not None and param.device.type == "cpu":
-            module.to(get_local_torch_device(), non_blocking=True)
+            module.to(get_local_torch_device(), non_blocking=False)
 
     def _pin_stage1_transformer_if_beneficial(self) -> None:
         """Optionally pin stage-1 DiT on GPU to remove first-stage cold H2D stall.
@@ -481,7 +487,7 @@ class LTX2TwoStageDeviceManager:
             next(transformer.parameters(), None) if transformer is not None else None
         )
         if transformer is not None and param is not None and param.device.type == "cpu":
-            transformer.to(get_local_torch_device(), non_blocking=True)
+            transformer.to(get_local_torch_device(), non_blocking=False)
             logger.info(
                 "Pinned stage1 transformer on GPU for LTX-2.3 two-stage startup"
             )
@@ -544,7 +550,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             server_args, "transformer", "transformer"
         )
         module, memory_usage = PipelineComponentLoader.load_component(
-            component_name="transformer",
+            component_name="transformer_2",
             component_model_path=transformer_path,
             transformers_or_diffusers="diffusers",
             server_args=server_args,
