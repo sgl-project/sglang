@@ -455,25 +455,27 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         prompt_ids_list = prompt_ids.tolist()
 
         if image_is_dynamic and image_feature is not None:
-            combined_feature = torch.cat(image_feature, dim=0)
-            items = create_data_items(
-                image=combined_feature,
-                image_offsets=img_offsets,
-                video=video_feature,
-                video_offsets=video_offsets,
-                input_ids_list=prompt_ids_list,
-            )
-            img_item_idx = 0
-            for item in items:
-                if item.modality == Modality.IMAGE and img_item_idx < len(
-                    num_tokens_per_image
-                ):
-                    item.model_specific_data = item.model_specific_data or {}
-                    item.model_specific_data["num_tokens"] = num_tokens_per_image[
-                        img_item_idx
-                    ]
-                    item.model_specific_data["is_dynamic"] = True
-                    img_item_idx += 1
+            items = []
+            for i, (pv, offset) in enumerate(zip(image_feature, img_offsets)):
+                items.append(
+                    MultimodalDataItem(
+                        modality=Modality.IMAGE,
+                        feature=pv,
+                        offsets=[offset],
+                        model_specific_data={
+                            "num_tokens": num_tokens_per_image[i],
+                            "is_dynamic": True,
+                        },
+                    )
+                )
+            if video_feature is not None:
+                items.append(
+                    MultimodalDataItem(
+                        modality=Modality.VIDEO,
+                        feature=video_feature,
+                        offsets=video_offsets,
+                    )
+                )
         else:
             items = create_data_items(
                 image=image_feature,

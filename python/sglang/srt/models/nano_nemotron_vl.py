@@ -38,6 +38,7 @@ from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.multimodal.evs import EVS, EVSConfig
+from sglang.srt.multimodal.evs.evs_module import VideoEVSDataItem
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -104,20 +105,41 @@ class NemotronH_Nano_VL_V2(EVS):
         self.config = config
 
     def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
-        # Get all special token IDs
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id
 
-        media_token_pairs = [(im_start_id, im_end_id)]
+        visual_items = [item for item in mm_inputs.mm_items if not item.is_audio()]
+        audio_items = [item for item in mm_inputs.mm_items if item.is_audio()]
+
+        all_data_offsets = []
+
+        if visual_items:
+            mm_inputs.mm_items = visual_items
+            helper = MultiModalityDataPaddingPatternTokenPairs(
+                [(im_start_id, im_end_id)]
+            )
+            input_ids = helper.pad_input_tokens(input_ids, mm_inputs)
+            all_data_offsets.extend(mm_inputs.data_offsets)
 
         audio_start_id = getattr(mm_inputs, "audio_start_id", None)
         audio_end_id = getattr(mm_inputs, "audio_end_id", None)
-        if audio_start_id is not None and audio_end_id is not None:
-            media_token_pairs.append((audio_start_id, audio_end_id))
+        if audio_items and audio_start_id is not None and audio_end_id is not None:
+            mm_inputs.mm_items = audio_items
+            helper = MultiModalityDataPaddingPatternTokenPairs(
+                [(audio_start_id, audio_end_id)]
+            )
+            input_ids = helper.pad_input_tokens(input_ids, mm_inputs)
+            all_data_offsets.extend(mm_inputs.data_offsets)
 
-        helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        mm_inputs.mm_items = visual_items + audio_items
+        mm_inputs.data_offsets = all_data_offsets
 
-        return helper.pad_input_tokens(input_ids, mm_inputs)
+        if audio_items:
+            for item in visual_items:
+                if isinstance(item, VideoEVSDataItem):
+                    item.pre_chunked_input_ids = input_ids
+
+        return input_ids
 
     def pixel_shuffle(self, x: torch.Tensor, scale_factor: float = 0.5) -> torch.Tensor:
         n, w, h, c = x.size()
