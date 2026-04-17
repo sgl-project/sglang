@@ -3709,7 +3709,7 @@ class ServerArgs:
                 )
         os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
         logger.warning(
-            "Warning: setting FLASHINFER_DISABLE_VERSION_CHECK=1 to disable FlashInfer version check on jit-cache. Please update flashinfer-jit-cache to latest version for more stable experience."
+            "Warning: setting FLASHINFER_DISABLE_VERSION_CHECK=1 to disable FlashInfer version check on jit-cache. For more stable experience, please update flashinfer-jit-cache to latest version through 'pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129 (or other index-url depending on your CUDA version)'"
         )
 
     def _handle_cache_compatibility(self):
