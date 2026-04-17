@@ -3034,7 +3034,8 @@ class ServerArgs:
                 f"got {self.mamba_ssm_dtype!r}"
             )
 
-        # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel).
+        # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
+        # for correctness and best performance.
         prefill = self.linear_attn_prefill_backend or self.linear_attn_backend
         if (
             prefill == "flashinfer"

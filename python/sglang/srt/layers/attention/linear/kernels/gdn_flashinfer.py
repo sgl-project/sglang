@@ -280,7 +280,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        if self.is_sm100plus:
+        if self.use_state_pool:
             raise NotImplementedError(
                 "FlashInfer GDN MTP verify is not yet supported on SM100+."
             )
