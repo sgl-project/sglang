@@ -518,6 +518,39 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "More reasoning")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
+    def test_continue_final_message_accepts_kwargs(self):
+        """Regression: Glm45Detector must accept continue_final_message and
+        previous_content kwargs (forwarded by ReasoningParser when the request
+        sets continue_final_message=True with a trailing assistant message)."""
+        detector = Glm45Detector(
+            continue_final_message=True,
+            previous_content="<think>prior reasoning</think>prior answer",
+        )
+        self.assertTrue(detector.continue_final_message)
+        self.assertEqual(
+            detector.previous_content, "<think>prior reasoning</think>prior answer"
+        )
+
+    def test_continue_final_message_think_start_in_previous(self):
+        """previous_content ending mid-reasoning should start in reasoning mode."""
+        detector = Glm45Detector(
+            continue_final_message=True,
+            previous_content="<think>unfinished thought",
+        )
+        self.assertTrue(detector._in_reasoning)
+
+    def test_continue_final_message_think_end_in_previous(self):
+        """previous_content with closed </think> should not start in reasoning mode,
+        and continuation text should be parsed as normal_text."""
+        detector = Glm45Detector(
+            continue_final_message=True,
+            previous_content="<think>done</think>prior answer",
+        )
+        self.assertFalse(detector._in_reasoning)
+        result = detector.detect_and_parse("continuation text")
+        self.assertEqual(result.normal_text, "continuation text")
+        self.assertEqual(result.reasoning_text, "")
+
 
 class TestNemotron3Detector(CustomTestCase):
     def setUp(self):
@@ -1247,6 +1280,30 @@ class TestReasoningParserAdvanced(CustomTestCase):
         )
         parser = ReasoningParser("qwen3", request=request)
         self.assertTrue(parser.detector.continue_final_message)
+
+    def test_continue_final_message_with_request_glm45(self):
+        """Regression: building a ReasoningParser for glm45 with a request that
+        sets continue_final_message=True must not raise. Previously raised
+        TypeError because Glm45Detector.__init__ did not accept the
+        continue_final_message / previous_content kwargs."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageGenericParam,
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[
+                ChatCompletionMessageUserParam(role="user", content="春天"),
+                ChatCompletionMessageGenericParam(role="assistant", content="春眠"),
+            ],
+            continue_final_message=True,
+        )
+        parser = ReasoningParser("glm45", request=request)
+        self.assertIsInstance(parser.detector, Glm45Detector)
+        self.assertTrue(parser.detector.continue_final_message)
+        self.assertEqual(parser.detector.previous_content, "春眠")
 
     def test_force_nonempty_content_via_chat_template_kwargs(self):
         """Test that force_nonempty_content is passed via chat_template_kwargs."""
