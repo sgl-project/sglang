@@ -162,8 +162,9 @@ class ErnieImageSelfAttention(nn.Module):
                 self.head_dim,
             )
 
-        q = _apply_rotary_bshd(q, rotary_pos_emb)
-        k = _apply_rotary_bshd(k, rotary_pos_emb)
+        rotary_cos, rotary_sin = _rotary_cos_sin_bshd(rotary_pos_emb, q.dtype)
+        q = _apply_rotary_bshd(q, rotary_cos, rotary_sin)
+        k = _apply_rotary_bshd(k, rotary_cos, rotary_sin)
 
         attn_out = self.attn(q, k, v)
         attn_out = attn_out.reshape(B, S, self.num_local_heads * self.head_dim)
@@ -251,13 +252,18 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         return x
 
 
-def _apply_rotary_bshd(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+def _rotary_cos_sin_bshd(
+    freqs: torch.Tensor, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
     freqs = freqs.permute(1, 0, 2, 3)
-    rot_dim = freqs.shape[-1]
-    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+    return torch.cos(freqs).to(dtype), torch.sin(freqs).to(dtype)
 
-    cos_ = torch.cos(freqs).to(x.dtype)
-    sin_ = torch.sin(freqs).to(x.dtype)
+
+def _apply_rotary_bshd(
+    x: torch.Tensor, cos_: torch.Tensor, sin_: torch.Tensor
+) -> torch.Tensor:
+    rot_dim = cos_.shape[-1]
+    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
 
     x1, x2 = x_rot.chunk(2, dim=-1)
     x_rotated = torch.cat((-x2, x1), dim=-1)
