@@ -2459,7 +2459,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is not None
+            and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
