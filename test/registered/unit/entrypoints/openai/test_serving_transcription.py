@@ -158,6 +158,45 @@ class TestStreamingFusedAutodetect(unittest.TestCase):
         request, frames = self._run_stream(chunks, fused=False)
         self.assertEqual(_deltas_from_sse(frames), ["Hello", " world"])
 
+    def test_streaming_timestamps_variant_scrubs_embedded_segment_tokens(self):
+        # Streaming + timestamp_granularities + language=None uses the fused
+        # timestamps variant (<|0.00|> sentinel). Segment-boundary tokens
+        # <|5.00|>, <|10.00|> land mid-stream; each delta must have them
+        # scrubbed before reaching the client. Auto-detection still works
+        # — the SSE stream carries clean text, and callers who want
+        # segment timing can use response_format=verbose_json which builds
+        # segments from output_ids on a separate path.
+        chunks = [
+            _chunk("<|en|><|transcribe|><|0.00|> Hello"),
+            _chunk("<|en|><|transcribe|><|0.00|> Hello<|5.00|> World"),
+            _chunk(
+                "<|en|><|transcribe|><|0.00|> Hello<|5.00|> World<|10.00|><|endoftext|>",
+                finish="stop",
+            ),
+        ]
+        # Mark request as having requested timestamps; the stream handler
+        # itself doesn't branch on that, but this documents the scenario.
+        tm = _MockTokenizerManager(chunks)
+        serving = OpenAIServingTranscription(tm)
+        request = TranscriptionRequest(
+            model="whisper", stream=True, timestamp_granularities=["segment"]
+        )
+        request._fused_autodetect = True
+
+        async def drive():
+            frames = []
+            async for f in serving._generate_transcription_stream(
+                GenerateReqInput(text="", modalities=["audio"]), request, Mock()
+            ):
+                frames.append(f)
+            return frames
+
+        frames = get_or_create_event_loop().run_until_complete(drive())
+        deltas = _deltas_from_sse(frames)
+        self.assertEqual(request.language, "en")
+        self.assertFalse(any("<|" in d for d in deltas))
+        self.assertEqual("".join(deltas), "Hello World")
+
     def test_trailing_endoftext_scrubbed_from_last_delta(self):
         # skip_special_tokens=False means the detokenizer may emit
         # <|endoftext|> at the tail. The fused streaming path must scrub it

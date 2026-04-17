@@ -133,21 +133,16 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # constrains the first 3 decode tokens to the forced prefix while
         # allowing free transcription afterwards — one encoder pass, no
         # extra round-trip. The adapter picks the regex variant based on
-        # whether timestamps were requested, so fused works for both
-        # response_format=json (no timestamps) and response_format=verbose_json
-        # with timestamp_granularities.
-        #
-        # One combination stays on the non-fused path: streaming + timestamps.
-        # Fused requires skip_special_tokens=False so we can extract the
-        # language from the output text; with embedded <|X.XX|> segment
-        # tokens in the timestamps variant, that would leak special tokens
-        # into per-chunk SSE deltas (and the OpenAI streaming spec doesn't
-        # return timestamps per-chunk anyway).
-        use_fused = (
-            language is None
-            and self._adapter.supports_language_detection
-            and not (stream and timestamp_granularities)
-        )
+        # whether timestamps were requested, so fused covers all four
+        # combinations of (stream, timestamp_granularities):
+        #   * non-streaming:     parse_fused_output strips the prefix and
+        #                        scrubs trailing/embedded special tokens.
+        #   * streaming:         the handler buffers until the sentinel,
+        #                        re-anchors, and scrubs each delta via
+        #                        adapter.strip_special_tokens.
+        # verbose_json segment timing still comes from _parse_segments
+        # over output_ids, which is unaffected by the string-level scrub.
+        use_fused = language is None and self._adapter.supports_language_detection
 
         # Build request
         request = TranscriptionRequest(
