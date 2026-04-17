@@ -158,6 +158,49 @@ class TestStreamingFusedAutodetect(unittest.TestCase):
         request, frames = self._run_stream(chunks, fused=False)
         self.assertEqual(_deltas_from_sse(frames), ["Hello", " world"])
 
+    def test_streaming_ts_variant_sentinel_at_chunk_boundary(self):
+        # The <|0.00|> sentinel can land in its own chunk ahead of any
+        # transcription text, and the trailing-space arrives later. The
+        # handler must buffer silently until a non-whitespace char shows
+        # up (so the first delta doesn't leak a leading space) and then
+        # scrub subsequent embedded timestamp tokens.
+        chunks = [
+            _chunk("<|en|>"),
+            _chunk("<|en|><|transcribe|>"),
+            _chunk("<|en|><|transcribe|><|0.00|>"),  # sentinel alone
+            _chunk("<|en|><|transcribe|><|0.00|> "),  # + whitespace only
+            _chunk("<|en|><|transcribe|><|0.00|> Hello"),  # first word
+            _chunk("<|en|><|transcribe|><|0.00|> Hello<|5.00|> World"),
+            _chunk(
+                "<|en|><|transcribe|><|0.00|> Hello<|5.00|> World<|endoftext|>",
+                finish="stop",
+            ),
+        ]
+        tm = _MockTokenizerManager(chunks)
+        serving = OpenAIServingTranscription(tm)
+        request = TranscriptionRequest(
+            model="whisper", stream=True, timestamp_granularities=["segment"]
+        )
+        request._fused_autodetect = True
+
+        async def drive():
+            frames = []
+            async for f in serving._generate_transcription_stream(
+                GenerateReqInput(text="", modalities=["audio"]), request, Mock()
+            ):
+                frames.append(f)
+            return frames
+
+        frames = get_or_create_event_loop().run_until_complete(drive())
+        deltas = _deltas_from_sse(frames)
+        self.assertEqual(request.language, "en")
+        self.assertFalse(any("<|" in d for d in deltas))
+        # No delta starts with a leading space (the one Whisper emits
+        # between <|0.00|> and "Hello" was consumed by the defer-on-
+        # whitespace path).
+        self.assertFalse(deltas[0].startswith(" "))
+        self.assertEqual("".join(deltas), "Hello World")
+
     def test_streaming_timestamps_variant_scrubs_embedded_segment_tokens(self):
         # Streaming + timestamp_granularities + language=None uses the fused
         # timestamps variant (<|0.00|> sentinel). Segment-boundary tokens
