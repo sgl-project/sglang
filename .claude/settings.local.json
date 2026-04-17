@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker images:*)",
+      "Bash(docker history:*)",
+      "Bash(docker system:*)",
+      "Bash(docker tag:*)"
+    ]
+  }
+}

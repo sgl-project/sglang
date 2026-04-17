@@ -3,13 +3,17 @@ name: Patch Docker Image
 on:
   workflow_dispatch:
     inputs:
-      pr_numbers:
-        description: "Comma-separated PR numbers to apply (e.g. 18962,19010)"
+      image_tag:
+        description: "Base image tag to patch (e.g. dev-x86, glm5-grace-blackwell)"
+        required: true
+      pr_branch:
+        description: "PR branch to merge into the image's source branch (e.g. feature/anthropic-api)"
         required: false
         default: ""
-      image_tag:
-        description: "Base image tag to patch (e.g. dev-x86, dev-x86-cu13)"
-        required: true
+      commits:
+        description: "Comma-separated commit SHAs to cherry-pick (e.g. abc123,def456)"
+        required: false
+        default: ""
 
 concurrency:
   group: patch-docker-${{ inputs.image_tag }}
@@ -19,11 +23,36 @@ jobs:
   patch:
     if: github.repository == 'sgl-project/sglang'
     runs-on: x64-docker-build-node
+    timeout-minutes: 120
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Validate inputs
+        run: |
+          IMAGE_TAG="${{ inputs.image_tag }}"
+          if ! [[ "${IMAGE_TAG}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "::error::Invalid image_tag: ${IMAGE_TAG}"
+            exit 1
+          fi
+
+          # Must provide exactly one of pr_branch or commits
+          if [ -n "${{ inputs.pr_branch }}" ] && [ -n "${{ inputs.commits }}" ]; then
+            echo "::error::Provide either pr_branch or commits, not both"
+            exit 1
+          fi
+          if [ -z "${{ inputs.pr_branch }}" ] && [ -z "${{ inputs.commits }}" ]; then
+            echo "::error::Must provide either pr_branch or commits"
+            exit 1
+          fi
+
+          if [ -n "${{ inputs.commits }}" ]; then
+            IFS=',' read -ra SHAS <<< "${{ inputs.commits }}"
+            for sha in "${SHAS[@]}"; do
+              sha=$(echo "${sha}" | xargs)
+              if ! [[ "${sha}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+                echo "::error::Invalid commit SHA: ${sha}"
+                exit 1
+              fi
+            done
+          fi
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -31,85 +60,160 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Pull base image and extract commit
+      - name: Pull base image and extract source branch
         run: |
           IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
           docker pull "${IMAGE}"
-          if BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
-            echo "Image built from commit: ${BASE_SHA}"
-          else
-            BASE_SHA=""
-            echo "::warning::Image has no .git directory — cannot extract base commit"
-          fi
-          echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
 
-      - name: Generate patches
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git fetch origin main
-          mkdir -p /tmp/patch-ctx
+          # Start a container to inspect the image's git state
+          CONTAINER_ID=$(docker run -d "${IMAGE}" sleep infinity)
 
-          if [ -n "${{ inputs.pr_numbers }}" ]; then
-            IFS=',' read -ra PRS <<< "${{ inputs.pr_numbers }}"
-            for pr in "${PRS[@]}"; do
-              pr=$(echo "${pr}" | xargs)
-              echo "Fetching PR #${pr}"
-              git fetch origin "pull/${pr}/head:pr-${pr}"
-              MERGE_BASE=$(git merge-base origin/main "pr-${pr}")
-              echo "  PR #${pr}: merge-base=${MERGE_BASE}"
-              git diff "${MERGE_BASE}..pr-${pr}" > "/tmp/patch-ctx/${pr}.patch"
-              echo "  PR #${pr}: $(wc -l < /tmp/patch-ctx/${pr}.patch) lines"
-            done
-          elif [ -n "${BASE_SHA}" ]; then
-            echo "Generating diff: image ${BASE_SHA} → latest main"
-            git fetch origin "${BASE_SHA}"
-            git diff "${BASE_SHA}..origin/main" > /tmp/patch-ctx/main.patch
-            echo "  main: $(wc -l < /tmp/patch-ctx/main.patch) lines"
-          else
-            echo "::error::No PR numbers specified and image has no .git — cannot generate diff against main"
+          # Extract the source branch and commit
+          BASE_SHA=$(docker exec "${CONTAINER_ID}" \
+            git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null \
+            | tr -d '[:space:]') || true
+          if [ -z "${BASE_SHA}" ]; then
+            echo "::error::Image has no .git directory — cannot patch"
+            docker rm -f "${CONTAINER_ID}"
             exit 1
           fi
 
-          TOTAL=$(cat /tmp/patch-ctx/*.patch | wc -l)
-          if [ "${TOTAL}" -eq 0 ]; then
-            echo "::warning::All patches are empty — image is already up to date"
-            echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
+          BASE_BRANCH=$(docker exec "${CONTAINER_ID}" \
+            git -C /sgl-workspace/sglang branch --show-current 2>/dev/null \
+            | tr -d '[:space:]') || true
+          if [ -z "${BASE_BRANCH}" ]; then
+            echo "::error::Image is in detached HEAD state — cannot determine source branch"
+            docker rm -f "${CONTAINER_ID}"
+            exit 1
           fi
 
-      - name: Build patched image
-        if: env.SKIP_BUILD != 'true'
-        run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
+          docker rm -f "${CONTAINER_ID}"
 
-          cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
-          ARG BASE_IMAGE
-          FROM ${BASE_IMAGE}
-          COPY *.patch /tmp/patches/
-          RUN cd /sgl-workspace/sglang \
-              && for p in /tmp/patches/*.patch; do \
-                   if [ ! -s "${p}" ]; then \
-                     echo "Skipping ${p} (empty)"; \
-                   else \
-                     echo "Applying ${p}..." \
-                     && patch -p1 --fuzz=2 --no-backup-if-mismatch -f < "${p}" \
-                     || { echo "ERROR: Failed to apply ${p}"; exit 1; }; \
-                   fi; \
-                 done \
-              && rm -rf /tmp/patches
-          DOCKERFILE
+          echo "Image built from branch: ${BASE_BRANCH} @ ${BASE_SHA}"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
+          echo "BASE_BRANCH=${BASE_BRANCH}" >> "$GITHUB_ENV"
+
+      - name: Checkout repo at image's source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT_FOR_DOCKER_PATCH }}
+
+      - name: Merge PR branch or cherry-pick commits
+        run: |
+          set -eo pipefail
+          git config user.email "ci@sglang.ai"
+          git config user.name "SGLang CI"
+
+          if [ -n "${{ inputs.pr_branch }}" ]; then
+            # --- Branch merge mode ---
+            echo "=== Merging ${{ inputs.pr_branch }} into ${BASE_BRANCH} ==="
+            git fetch origin "${{ inputs.pr_branch }}"
+
+            # Merge WITHOUT auto-resolution — fail on conflicts so they
+            # can be resolved manually
+            if ! git merge "origin/${{ inputs.pr_branch }}" --no-edit; then
+              echo ""
+              echo "::error::Merge conflict detected. Conflicting files:"
+              git diff --name-only --diff-filter=U
+              echo ""
+              echo "Resolve conflicts manually by merging ${{ inputs.pr_branch }} into ${BASE_BRANCH}, then re-run."
+              exit 1
+            fi
+            echo "Merge successful"
+
+          else
+            # --- Cherry-pick mode ---
+            IFS=',' read -ra SHAS <<< "${{ inputs.commits }}"
+            for sha in "${SHAS[@]}"; do
+              sha=$(echo "${sha}" | xargs)
+              echo "=== Cherry-picking ${sha} ==="
+
+              git fetch origin "${sha}"
+
+              if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+                echo "::error::Commit ${sha} not found"
+                exit 1
+              fi
+
+              PARENT_COUNT=$(git cat-file -p "${sha}" | grep -c '^parent' || true)
+              if [ "${PARENT_COUNT}" -gt 1 ]; then
+                echo "::error::${sha} is a merge commit — supply individual commit SHAs"
+                exit 1
+              fi
+
+              if git merge-base --is-ancestor "${sha}" HEAD 2>/dev/null; then
+                echo "  Already applied — skipping"
+                continue
+              fi
+
+              # Fail on conflicts — no auto-resolution
+              if ! git cherry-pick "${sha}" --no-edit; then
+                echo ""
+                echo "::error::Cherry-pick conflict on ${sha}. Conflicting files:"
+                git diff --name-only --diff-filter=U
+                echo ""
+                echo "Resolve conflicts manually, then re-run."
+                git cherry-pick --abort
+                exit 1
+              fi
+              echo "  Applied successfully"
+            done
+          fi
+
+          echo "PATCHED_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Rebuild Docker image
+        run: |
+          echo "=== Rebuilding image from patched source ==="
+          echo "Base branch: ${BASE_BRANCH}"
+          echo "Base commit: ${BASE_SHA}"
+          echo "New HEAD:    ${PATCHED_SHA}"
+
+          # Determine build args from the image tag
+          # Grace Blackwell images need GRACE_BLACKWELL=1 and CUDA 13
+          DOCKER_BUILD_ARGS=""
+          case "${{ inputs.image_tag }}" in
+            *grace-blackwell*)
+              DOCKER_BUILD_ARGS="--build-arg GRACE_BLACKWELL=1 --build-arg CUDA_VERSION=13.0.1 --build-arg BRANCH_TYPE=local --build-arg BUILD_TYPE=all --build-arg USE_LATEST_SGLANG=0"
+              ;;
+            *hopper-sbo*)
+              DOCKER_BUILD_ARGS="--build-arg HOPPER_SBO=1 --build-arg BRANCH_TYPE=local --build-arg BUILD_TYPE=all --build-arg USE_LATEST_SGLANG=0"
+              ;;
+            *)
+              DOCKER_BUILD_ARGS="--build-arg BRANCH_TYPE=local --build-arg BUILD_TYPE=all --build-arg USE_LATEST_SGLANG=0"
+              ;;
+          esac
 
           docker build \
-            --no-cache \
-            --build-arg BASE_IMAGE="${IMAGE}" \
+            ${DOCKER_BUILD_ARGS} \
+            --target framework \
             -t "${IMAGE}" \
-            /tmp/patch-ctx/
+            -f docker/Dockerfile \
+            .
 
-      - name: Push patched image
-        if: env.SKIP_BUILD != 'true'
+      - name: Smoke test
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
+          echo "=== Running smoke test ==="
+          docker run --rm "${IMAGE}" python3 -c "
+          import sglang as sgl
+          from sglang.srt.server import launch_server
+          print('Smoke test passed: sglang imports OK')
+          "
+
+      - name: Push image
+        run: |
           docker push "${IMAGE}"
 
           echo "### Patched \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Source:** ${{ inputs.pr_numbers && format('PRs: {0}', inputs.pr_numbers) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Base branch:** \`${BASE_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Base commit:** \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **New commit:** \`${PATCHED_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Source:** ${{ inputs.pr_branch && format('branch: {0}', inputs.pr_branch) || format('commits: {0}', inputs.commits) }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rmi "${IMAGE}" 2>/dev/null || true
