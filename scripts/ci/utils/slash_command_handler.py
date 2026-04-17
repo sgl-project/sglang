@@ -243,8 +243,24 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         elif run.conclusion == "skipped":
             print(f"Rerunning skipped workflow: {run.name} (ID: {run.id})")
             try:
-                # Skipped workflows don't have 'failed jobs', so we use full rerun()
-                run.rerun()
+                if sgl_kernel_changes and not kernel_wheel_built:
+                    # Full rerun to ensure sgl-kernel-build-wheels runs
+                    run.rerun()
+                else:
+                    # Prefer rerun_failed_jobs to avoid restarting passed jobs.
+                    # GitHub reruns failed/cancelled/timed_out jobs, which covers
+                    # cascade-skipped jobs from fast-fail. If no such jobs exist,
+                    # fall back to full rerun.
+                    try:
+                        run.rerun_failed_jobs()
+                    except Exception:
+                        # rerun_failed_jobs can fail if the workflow has no
+                        # failed/cancelled jobs (all purely skipped). Fall back.
+                        print(
+                            f"  rerun_failed_jobs not applicable for {run.id},"
+                            " falling back to full rerun"
+                        )
+                        run.rerun()
                 rerun_count += 1
             except Exception as e:
                 print(f"Failed to rerun workflow {run.id}: {e}")
