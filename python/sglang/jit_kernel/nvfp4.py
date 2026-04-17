@@ -90,6 +90,10 @@ def _jit_nvfp4_expert_quant_module() -> Module:
                     "silu_and_mul_scaled_fp4_experts_quant",
                     "silu_and_mul_scaled_fp4_experts_quant_sm100a",
                 ),
+                (
+                    "silu_and_mul_scaled_fp4_experts_quant_packed",
+                    "silu_and_mul_scaled_fp4_experts_quant_packed_sm100a",
+                ),
             ],
             extra_dependencies=["cutlass"],
             extra_cuda_cflags=_nvfp4_cuda_flags(),
@@ -344,6 +348,97 @@ def scaled_fp4_experts_quant(
         )
 
     _scaled_fp4_experts_quant_custom_op(
+        output,
+        output_scales,
+        input_tensor,
+        input_global_scale,
+        expert_offsets,
+        blockscale_offsets,
+    )
+    output_scales = output_scales.view(torch.float8_e4m3fn)
+    return output, output_scales
+
+
+@register_custom_op(
+    op_name="silu_and_mul_scaled_fp4_experts_quant_packed",
+    mutates_args=["output", "output_scales"],
+)
+def _silu_and_mul_scaled_fp4_experts_quant_packed_custom_op(
+    output: torch.Tensor,
+    output_scales: torch.Tensor,
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+) -> None:
+    module = _jit_nvfp4_expert_quant_module()
+    module.silu_and_mul_scaled_fp4_experts_quant_packed(
+        output,
+        output_scales,
+        input_tensor,
+        input_global_scale,
+        expert_offsets,
+        blockscale_offsets,
+    )
+
+
+@debug_kernel_api
+def silu_and_mul_scaled_fp4_experts_quant_packed(
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+    topk: int,
+    expert_map: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused SiLU+mul then FP4 quant for packed MoE inputs (expert_offsets aware).
+
+    Input shape is (m, 2*k) — gate+up concatenated. The kernel does SiLU(gate)*up
+    then FP4-quantizes the k-dim result.
+    """
+    assert (
+        input_tensor.ndim == 2
+    ), f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
+    if expert_map is not None:
+        m, k = input_tensor.shape
+        output_tensor_shape = (m * topk, k)
+        input_tensor = _shuffle_rows_torch(
+            input_tensor, expert_map, output_tensor_shape
+        )
+
+    m_numtopk, k_input_doubled = input_tensor.shape
+    k = k_input_doubled // 2
+
+    max_tokens_per_expert = int(
+        os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536)
+    )
+    assert m_numtopk <= max_tokens_per_expert * topk, (
+        f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT({max_tokens_per_expert})"
+        f" for cutlass_moe_fp4, observed m_numtopk = {m_numtopk}. Use"
+        " MODELOPT_MAX_TOKENS_PER_EXPERT to set this value."
+    )
+    scales_k = k // 16
+    padded_k_in_int32 = (scales_k + 3) // 4
+
+    output = torch.empty(
+        m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
+    )
+    if padded_k_in_int32 * 4 > scales_k:
+        output_scales = torch.zeros(
+            max_tokens_per_expert * topk,
+            padded_k_in_int32,
+            dtype=torch.int32,
+            device=input_tensor.device,
+        )
+    else:
+        output_scales = torch.empty(
+            max_tokens_per_expert * topk,
+            padded_k_in_int32,
+            dtype=torch.int32,
+            device=input_tensor.device,
+        )
+
+    _silu_and_mul_scaled_fp4_experts_quant_packed_custom_op(
         output,
         output_scales,
         input_tensor,
