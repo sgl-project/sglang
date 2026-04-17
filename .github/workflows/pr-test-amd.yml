@@ -38,7 +38,7 @@ on:
           - stage-c-test-4-gpu-amd
           - stage-c-test-large-8-gpu-amd
           - stage-c-test-large-8-gpu-amd-mi35x
-          - stage-b-test-large-8-gpu-disaggregation-amd
+          - stage-b-test-large-8-gpu-35x-disaggregation-amd
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
@@ -165,13 +165,14 @@ jobs:
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
@@ -200,25 +201,39 @@ jobs:
 
       - name: Run test
         timeout-minutes: 14
+        env:
+          CONTINUE_ON_ERROR: ${{ needs.check-changes.outputs.continue_on_error }}
         run: |
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_align.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_topk.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
+          # In continue-on-error mode (schedule/full runs), keep running all pytest
+          # files and aggregate the exit code. In PR mode, preserve fail-fast.
+          failures=0
+          run_pytest() {
+            if [[ "$CONTINUE_ON_ERROR" == "true" ]]; then
+              "$@" || failures=$((failures + 1))
+            else
+              "$@"
+            fi
+          }
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_align.py
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_softmax.py
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests/speculative ci_sglang python3 -m pytest test_eagle_utils.py
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_apply_token_bitmask_inplace.py
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_topk.py
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
+          exit $failures
 
   sgl-kernel-unit-test-2-gpu-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
@@ -247,21 +262,32 @@ jobs:
 
       - name: Run test
         timeout-minutes: 20
+        env:
+          CONTINUE_ON_ERROR: ${{ needs.check-changes.outputs.continue_on_error }}
         run: |
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_deterministic_custom_allreduce.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_nccl_allreduce_determinism.py
+          failures=0
+          run_pytest() {
+            if [[ "$CONTINUE_ON_ERROR" == "true" ]]; then
+              "$@" || failures=$((failures + 1))
+            else
+              "$@"
+            fi
+          }
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_deterministic_custom_allreduce.py
+          run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_nccl_allreduce_determinism.py
+          exit $failures
 
   # =============================================== primary ====================================================
 
   stage-a-test-1-gpu-small-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
-          (!failure() && !cancelled()) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
@@ -294,13 +320,14 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   jit-kernel-unit-test-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
@@ -557,13 +584,14 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   multimodal-gen-test-1-gpu-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
@@ -679,20 +707,22 @@ jobs:
               --suite 1-gpu \
               --partition-id ${{ matrix.part }} \
               --total-partitions 4 \
-              -k "not flux_2"
+              -k "not flux_2" \
+              ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
           # Post-test diagnostics
           echo "=== Post-test System Memory Status ==="
           free -h
 
   multimodal-gen-test-2-gpu-amd:
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
+          (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
@@ -806,7 +836,8 @@ jobs:
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2
+              --total-partitions 2 \
+              ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
           # Post-test diagnostics
           echo "=== Post-test System Memory Status ==="
@@ -989,7 +1020,7 @@ jobs:
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-disaggregation-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-35x-disaggregation-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
