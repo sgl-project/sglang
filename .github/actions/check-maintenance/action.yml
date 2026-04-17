@@ -1,5 +1,5 @@
 name: Check Maintenance Mode
-description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label, or env PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only). Merging non-CI-fix PRs is prohibited during maintenance mode; in severe cases, merge permissions may be revoked.
+description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label, or env PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only). If the issue body contains a `MIN_BASE_SHA: <sha>` directive, CI runs only for PRs whose branch already contains that SHA (rebase-required mode). Merging non-CI-fix PRs is prohibited during maintenance mode; in severe cases, merge permissions may be revoked.
 
 inputs:
   github-token:
@@ -18,6 +18,7 @@ runs:
         MAINTENANCE_ISSUE=21065
         REPO="${{ github.repository }}"
         PR_NUMBER="${{ github.event.pull_request.number }}"
+        PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
         # PR Test workflow only: scheduled runs and runs on main (dispatch / workflow_call) set this env
         if [[ "${PR_TEST_BYPASS_MAINTENANCE_ON_MAIN:-}" == "true" ]]; then
@@ -25,15 +26,17 @@ runs:
           exit 0
         fi
 
-        # Check if maintenance issue is open (fail-open: if API errors, allow CI to proceed)
-        ISSUE_STATE=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+        # Fetch issue state and body (fail-open: if API errors, allow CI to proceed)
+        ISSUE_JSON=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state,body 2>/dev/null || echo "")
+        ISSUE_STATE=$(printf '%s' "$ISSUE_JSON" | jq -r '.state // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+        ISSUE_BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body // ""' 2>/dev/null || echo "")
 
         if [[ "$ISSUE_STATE" != "OPEN" ]]; then
           echo "✅ Maintenance mode is OFF. Proceeding with CI."
           exit 0
         fi
 
-        # For PRs, check if bypass-maintenance label is present
+        # For PRs, check if bypass-maintenance label is present (covers both full-pause and rebase-required modes)
         if [[ -n "$PR_NUMBER" ]]; then
           HAS_BYPASS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(. == "bypass-maintenance")) | length' 2>/dev/null || echo "0")
           if [[ "$HAS_BYPASS" -gt 0 ]]; then
@@ -42,6 +45,57 @@ runs:
           fi
         fi
 
+        # Parse optional `MIN_BASE_SHA: <sha>` directive from the issue body (first occurrence wins).
+        # Presence of this directive switches from full-pause to rebase-required mode.
+        MIN_BASE_SHA=$(printf '%s' "$ISSUE_BODY" | tr -d '\r' | grep -iE '^[[:space:]]*`?MIN_BASE_SHA`?[[:space:]]*[:=]' | head -n1 | sed -E 's/.*[:=][[:space:]]*//; s/`//g' | awk '{print $1}')
+        if [[ -n "$MIN_BASE_SHA" ]] && ! [[ "$MIN_BASE_SHA" =~ ^[a-fA-F0-9]{7,40}$ ]]; then
+          WARN="⚠️  Ignoring malformed MIN_BASE_SHA directive in issue #$MAINTENANCE_ISSUE: '$MIN_BASE_SHA' (must be 7-40 hex chars)"
+          echo "$WARN"
+          echo "$WARN" >> "$GITHUB_STEP_SUMMARY"
+          MIN_BASE_SHA=""
+        fi
+
+        if [[ -n "$MIN_BASE_SHA" ]]; then
+          # Rebase-required mode: CI runs only for PRs whose branch contains MIN_BASE_SHA.
+          if [[ -z "$PR_NUMBER" || -z "$PR_HEAD_SHA" ]]; then
+            echo "✅ Not a PR context; skipping rebase check."
+            exit 0
+          fi
+
+          # Use GitHub compare API: status is "ahead"/"identical" when MIN_BASE_SHA is reachable from PR head.
+          COMPARE_STATUS=$(gh api "repos/$REPO/compare/$MIN_BASE_SHA...$PR_HEAD_SHA" --jq '.status' 2>/dev/null || echo "UNKNOWN")
+          COMPARE_STATUS="${COMPARE_STATUS:-UNKNOWN}"
+
+          case "$COMPARE_STATUS" in
+            ahead|identical)
+              echo "✅ PR #$PR_NUMBER contains required base ${MIN_BASE_SHA:0:12} ($COMPARE_STATUS). Proceeding."
+              exit 0
+              ;;
+            UNKNOWN)
+              echo "⚠️  Could not determine rebase status via GitHub API; fail-open, allowing CI to proceed."
+              exit 0
+              ;;
+          esac
+
+          MSG=$(printf "%s\n" \
+            "## ⚠️ Rebase Required Before CI Can Run" \
+            "A major update has landed on \`main\`. All PRs must rebase onto the latest \`main\` before CI will run." \
+            "Required base commit: \`${MIN_BASE_SHA:0:12}\` (your PR is \`$COMPARE_STATUS\` relative to this commit)." \
+            "" \
+            "What should you do?" \
+            "- Rebase your branch onto the latest \`main\` and push again" \
+            "- Follow CI Maintenance Mode issue: https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for context" \
+            "- CI-fix PRs may request the \`bypass-maintenance\` label to skip this check")
+
+          echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done <<< "$MSG"
+
+          exit 1
+        fi
+
+        # Full maintenance mode (issue open, no MIN_BASE_SHA directive).
         MSG=$(printf "%s\n" \
           "## ⚠️ CI Maintenance Mode is Active" \
           "The CI infrastructure is currently under maintenance." \
