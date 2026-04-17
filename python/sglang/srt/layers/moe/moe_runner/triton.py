@@ -81,7 +81,7 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             _fused_moe_kernel_sequence,
         )
 
@@ -141,7 +141,7 @@ def fused_experts_none_to_triton(
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     output = fused_experts(
@@ -182,7 +182,9 @@ def pre_permute_standard_to_triton(
     # NOTE: this is dead code as a fused func for standard format is registered.
     # This is left here for testing and examples.
 
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import _prepare_fused_moe_run
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _prepare_fused_moe_run,
+    )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
     hidden_states, topk_output = (
