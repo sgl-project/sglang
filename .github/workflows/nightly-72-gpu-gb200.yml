@@ -37,6 +37,8 @@ jobs:
   # ---------------------------------------------------------------------------
   # Reject conflicting inputs early. `image` and `sglang_branch` are mutually
   # exclusive: one selects a pre-built image, the other triggers a fresh build.
+  # Only runs on manual dispatch; all downstream jobs chain through this so
+  # invalid inputs halt the pipeline before cluster resources are reserved.
   # ---------------------------------------------------------------------------
   validate-inputs:
     if: github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch'
@@ -46,7 +48,7 @@ jobs:
         run: |
           BRANCH="${{ inputs.sglang_branch }}"
           IMAGE="${{ inputs.image }}"
-          if [ -n "$BRANCH" ] && [ -n "$IMAGE" ] && [ "$IMAGE" != "lmsysorg/sglang:dev-cu13" ]; then
+          if [ -n "$BRANCH" ] && [ -n "$IMAGE" ]; then
             echo "::error::Specify either 'image' or 'sglang_branch', not both. Got image='$IMAGE' and sglang_branch='$BRANCH'."
             exit 1
           fi
@@ -58,7 +60,11 @@ jobs:
   # To add/remove configs, edit nightly-configs.yaml only.
   # ---------------------------------------------------------------------------
   setup:
-    if: github.repository == 'sgl-project/sglang'
+    needs: validate-inputs
+    # Run if validate-inputs succeeded (dispatch) or was skipped (cron).
+    if: |
+      always() && github.repository == 'sgl-project/sglang'
+      && (needs.validate-inputs.result == 'success' || needs.validate-inputs.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.generate.outputs.matrix }}
