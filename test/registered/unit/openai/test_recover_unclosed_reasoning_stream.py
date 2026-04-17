@@ -74,6 +74,22 @@ class TestStreamStateHelpers(CustomTestCase):
         self.assertEqual(s["finish_reason"], {"type": "stop"})
         self.assertEqual(s["last_output_ids"], [1, 2, 3])
 
+    def test_update_meta_non_incremental_overwrites(self):
+        # Default (cumulative) mode: each chunk snapshots the full list so far.
+        s = new_stream_recovery_state()
+        update_stream_state_meta(s, {}, output_ids=[1, 2])
+        update_stream_state_meta(s, {}, output_ids=[1, 2, 3, 4, 5])
+        self.assertEqual(s["last_output_ids"], [1, 2, 3, 4, 5])
+
+    def test_update_meta_incremental_extends(self):
+        # Incremental mode (server flag incremental_streaming_output=True):
+        # each chunk carries only the delta and must be concatenated.
+        s = new_stream_recovery_state()
+        update_stream_state_meta(s, {}, output_ids=[1, 2], incremental=True)
+        update_stream_state_meta(s, {}, output_ids=[3], incremental=True)
+        update_stream_state_meta(s, {}, output_ids=[4, 5], incremental=True)
+        self.assertEqual(s["last_output_ids"], [1, 2, 3, 4, 5])
+
 
 class TestShouldRecoverStreamState(CustomTestCase):
     def _state(self, **overrides):
@@ -310,11 +326,14 @@ class TestStreamRecoveryChunks(CustomTestCase):
         self.assertEqual(len(chunks), 1)
         final = _parse_sse_line(chunks[0])
         self.assertEqual(final["choices"][0]["finish_reason"], "stop")
-        self.assertNotIn("content", final["choices"][0]["delta"] or {})
+        # Final finish chunk may include a `content` key but it must be empty/None.
+        self.assertFalse((final["choices"][0]["delta"] or {}).get("content"))
 
-    def test_yields_nothing_when_followup_request_cannot_be_built(self):
-        # text-mode adapted_request → build_continuation_request returns None
-        # → the helper yields nothing.
+    def test_yields_fallback_finish_when_followup_request_cannot_be_built(self):
+        # text-mode adapted_request → build_continuation_request returns None.
+        # Even on this early-return path, the helper MUST still yield a final
+        # finish_reason chunk so the caller's ``continue`` does not swallow
+        # the SSE stream's content-termination marker.
         handler = _make_handler()
         agen = stream_recovery_chunks(
             handler=handler,
@@ -331,7 +350,90 @@ class TestStreamRecoveryChunks(CustomTestCase):
             generate_request_fn=lambda *a, **kw: (_ for _ in ()),
         )
         chunks = self._run(agen)
-        self.assertEqual(chunks, [])
+        self.assertEqual(len(chunks), 1)
+        final = _parse_sse_line(chunks[0])
+        self.assertEqual(final["choices"][0]["finish_reason"], "stop")
+
+    def test_yields_fallback_finish_when_tokenizer_encode_returns_empty(self):
+        # Tokenizer returns empty list for </think> → early-return must still
+        # yield a finish chunk.
+        handler = _make_handler()
+
+        class _EmptyEncodeTok:
+            def encode(self, text, add_special_tokens=False):
+                return []
+
+        handler.tokenizer_manager.tokenizer = _EmptyEncodeTok()
+
+        agen = stream_recovery_chunks(
+            handler=handler,
+            request=_basic_request(recover_unclosed_reasoning=True),
+            raw_request=None,
+            adapted_request=self._adapted(),
+            state=self._state(),
+            request_id="x",
+            request_model="m",
+            continuous_usage_stats=False,
+            prompt_tokens=0,
+            reasoning_tokens_acc=0,
+            completion_tokens_acc=0,
+            generate_request_fn=lambda *a, **kw: (_ for _ in ()),
+        )
+        chunks = self._run(agen)
+        self.assertEqual(len(chunks), 1)
+        final = _parse_sse_line(chunks[0])
+        self.assertEqual(final["choices"][0]["finish_reason"], "stop")
+
+    def test_on_meta_update_called_with_final_followup_meta(self):
+        # The callback must be invoked exactly once, with the LAST meta seen
+        # in the continuation stream (usage fields from the follow-up are
+        # cumulative, so only the final snapshot matters for accounting).
+        handler = _make_handler()
+
+        def fake_generate(follow_req, raw):
+            async def _gen():
+                yield {
+                    "text": "ans",
+                    "meta_info": {"completion_tokens": 1, "prompt_tokens": 20},
+                }
+                yield {
+                    "text": "answer",
+                    "meta_info": {
+                        "completion_tokens": 7,
+                        "cached_tokens": 4,
+                        "prompt_tokens": 20,
+                        "finish_reason": {"type": "stop"},
+                    },
+                }
+
+            return _gen()
+
+        captured = []
+
+        def on_meta(meta):
+            captured.append(dict(meta))
+
+        agen = stream_recovery_chunks(
+            handler=handler,
+            request=_basic_request(recover_unclosed_reasoning=True),
+            raw_request=None,
+            adapted_request=self._adapted(),
+            state=self._state(),
+            request_id="chatcmpl-test",
+            request_model="m",
+            continuous_usage_stats=False,
+            prompt_tokens=10,
+            reasoning_tokens_acc=3,
+            completion_tokens_acc=3,
+            generate_request_fn=fake_generate,
+            on_meta_update=on_meta,
+        )
+        _ = self._run(agen)
+        self.assertEqual(len(captured), 1)
+        final_meta = captured[0]
+        self.assertEqual(final_meta["completion_tokens"], 7)
+        self.assertEqual(final_meta["cached_tokens"], 4)
+        self.assertEqual(final_meta["prompt_tokens"], 20)
 
 
 if __name__ == "__main__":

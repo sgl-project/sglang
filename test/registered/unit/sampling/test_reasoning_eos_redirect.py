@@ -85,6 +85,19 @@ class TestReasoningEosRedirectTriggers(CustomTestCase):
         out = self.processor(logits.clone(), self._params(req))
         self.assertTrue(torch.equal(out, original))
 
+    def test_skip_when_think_end_already_in_prompt(self):
+        # Prompt already has a closed <think>...</think> block (e.g. Qwen3's
+        # enable_thinking=False path prefilling <think>\n\n</think>). The
+        # processor must NOT redirect EOS to think_end in this case.
+        logits = _make_logits({5: 5.0, 6: 5.0, 7: 0.0})
+        req = _make_req(
+            origin_input_ids=[8, 99, 7, 100],  # think_start=8, think_end=7 in prompt
+            output_ids=[200, 201],
+        )
+        original = logits.clone()
+        out = self.processor(logits.clone(), self._params(req))
+        self.assertTrue(torch.equal(out, original))
+
     def test_skip_when_not_yet_in_reasoning(self):
         # No think_start_id present anywhere, force_reasoning=False.
         logits = _make_logits({5: 5.0, 6: 5.0, 7: 0.0})
@@ -105,11 +118,11 @@ class TestReasoningEosRedirectTriggers(CustomTestCase):
 
     def test_temperature_scales_eos_probability(self):
         # Without temperature scaling (T=1):
-        #   logits {5:1.0, 7:0.0, 1:0.5, others:-10}
-        #   softmax mass on {5} is ~0.4 (below threshold 0.5).
-        # With T=0.1, logits effectively become {5:10.0, 7:0.0, 1:5.0, ...}
-        #   so EOS mass ~ 1.0 (well above 0.5). Should trigger.
-        logits = _make_logits({5: 1.0, 7: 0.0, 1: 0.5})
+        #   logits {5:1.0, 7:0.5, 1:0.3, others:-10}
+        #   softmax mass on {5} is ~0.476 (below threshold 0.5) → NO trigger.
+        # With T=0.1, logits effectively become {5:10.0, 7:5.0, 1:3.0, ...}
+        #   so EOS mass on {5} → ~1.0 (well above 0.5). Should trigger.
+        logits = _make_logits({5: 1.0, 7: 0.5, 1: 0.3})
         # First, verify the no-trigger case at T=1:
         req_t1 = _make_req(origin_input_ids=[8], temperature=1.0)
         out_t1 = self.processor(

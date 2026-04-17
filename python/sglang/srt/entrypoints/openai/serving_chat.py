@@ -890,6 +890,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         _ensure_recovery_state(index),
                         content.get("meta_info") or {},
                         content.get("output_ids") or [],
+                        incremental=bool(
+                            self.tokenizer_manager.server_args.incremental_streaming_output
+                        ),
                     )
 
                 # Handle reasoning content
@@ -999,6 +1002,41 @@ class OpenAIServingChat(OpenAIServingBase):
                 if recovery_enabled:
                     state = recovery_states.get(idx)
                     if state is not None and should_recover_stream_state(state):
+                        # Closure to fold the continuation's final meta (usage
+                        # numbers) back into the per-index accumulators so the
+                        # terminal `usage` chunk reports first-pass + follow-up,
+                        # not just first-pass. completion_tokens / cached_tokens
+                        # are accumulated (sum). prompt_tokens uses max() because
+                        # the follow-up's prefill already covers the original
+                        # prompt + first-pass output_ids + think_end bridge —
+                        # summing would double-count.
+                        def _accumulate_followup_meta(
+                            meta: Dict[str, Any], _idx: int = idx
+                        ) -> None:
+                            try:
+                                c = meta.get("completion_tokens")
+                                if isinstance(c, int):
+                                    completion_tokens[_idx] = (
+                                        completion_tokens.get(_idx, 0) + c
+                                    )
+                                ca = meta.get("cached_tokens")
+                                if isinstance(ca, int):
+                                    cached_tokens[_idx] = (
+                                        cached_tokens.get(_idx, 0) + ca
+                                    )
+                                r = meta.get("reasoning_tokens")
+                                if isinstance(r, int):
+                                    reasoning_tokens[_idx] = (
+                                        reasoning_tokens.get(_idx, 0) + r
+                                    )
+                                p = meta.get("prompt_tokens")
+                                if isinstance(p, int):
+                                    prompt_tokens[_idx] = max(
+                                        prompt_tokens.get(_idx, 0), p
+                                    )
+                            except Exception:
+                                pass
+
                         try:
                             async for chunk in stream_recovery_chunks(
                                 handler=self,
@@ -1014,6 +1052,7 @@ class OpenAIServingChat(OpenAIServingBase):
                                 completion_tokens_acc=completion_tokens.get(
                                     idx, 0
                                 ),
+                                on_meta_update=_accumulate_followup_meta,
                             ):
                                 yield chunk
                             continue  # Skip the normal finish_reason chunk.

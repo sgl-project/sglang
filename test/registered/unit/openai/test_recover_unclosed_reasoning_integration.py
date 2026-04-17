@@ -290,34 +290,41 @@ class TestPath1AndFallbackBCoexist(CustomTestCase):
         self.assertIn("the actual content", merged["text"])
 
 
-# ----- Tool-call requests are skipped end-to-end ------------------------
+# ----- Tool-call eligibility / runtime judgement end-to-end -------------
 
 
 class TestToolCallSkipsRecovery(CustomTestCase):
-    def test_eligibility_excludes_tool_requests(self):
-        req = _basic_request(
-            tools=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "f",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                }
-            ]
-        )
+    def _tools(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+    def test_tool_choice_required_is_hard_excluded(self):
+        # tool_choice="required" is the only hard-exclude — the model is
+        # contractually obliged to emit a tool call.
+        req = _basic_request(tools=self._tools(), tool_choice="required")
         self.assertFalse(is_recovery_eligible_request(req, "qwen3"))
 
-    def test_recover_no_op_for_tool_call_requests(self):
-        adapted = GenerateReqInput(input_ids=[1, 2], sampling_params={})
+    def test_tools_with_auto_choice_is_eligible(self):
+        # Tools offered but tool_choice="auto" → runtime judgement,
+        # gate passes at the request-eligibility stage.
+        req = _basic_request(tools=self._tools(), tool_choice="auto")
+        self.assertTrue(is_recovery_eligible_request(req, "qwen3"))
 
+    def _fake_handler(self, tool_call_parser=None):
         class _FakeTok:
             eos_token_id = 200
 
             def encode(self, *a, **kw):
                 return [99]
 
-        handler = SimpleNamespace(
+        return SimpleNamespace(
             tokenizer_manager=SimpleNamespace(
                 tokenizer=_FakeTok(),
                 server_args=SimpleNamespace(
@@ -326,8 +333,15 @@ class TestToolCallSkipsRecovery(CustomTestCase):
             ),
             template_manager=SimpleNamespace(force_reasoning=False),
             reasoning_parser="qwen3",
+            tool_call_parser=tool_call_parser,
             _get_reasoning_from_request=lambda r: None,
         )
+
+    def test_recovery_fires_when_tools_offered_but_no_tool_call_emitted(self):
+        # Tools offered, model stops with unclosed <think> and no tool-call
+        # sigil in the text → runtime check passes → recovery continues.
+        adapted = GenerateReqInput(input_ids=[1, 2], sampling_params={})
+        handler = self._fake_handler(tool_call_parser="qwen25")
 
         called = {"count": 0}
 
@@ -335,7 +349,7 @@ class TestToolCallSkipsRecovery(CustomTestCase):
             called["count"] += 1
 
             async def _g():
-                yield {"text": "x", "output_ids": [1], "meta_info": {}}
+                yield {"text": " answer", "output_ids": [50], "meta_info": {}}
 
             return _g()
 
@@ -351,27 +365,69 @@ class TestToolCallSkipsRecovery(CustomTestCase):
                 handler=handler,
                 adapted_request=adapted,
                 request=_basic_request(
-                    tools=[
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "f",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {},
-                                },
-                            },
-                        }
-                    ]
+                    tools=self._tools(), tool_choice="auto"
                 ),
                 raw_request=None,
                 ret_list=ret,
                 generate_request_fn=gen,
             )
         )
-        # Skipped — original ret is returned unchanged and no follow-up issued.
-        self.assertEqual(called["count"], 0)
-        self.assertEqual(out[0]["text"], "<think>thinking")
+        # Recovery was attempted (follow-up generation was called at least once).
+        self.assertGreaterEqual(called["count"], 1)
+        self.assertIn("answer", out[0]["text"])
+
+    def test_recovery_skipped_when_tool_call_actually_emitted(self):
+        # Tools offered AND the generated text already contains a tool call
+        # (mocked via FunctionCallParser.has_tool_call returning True).
+        # Recovery must NOT trigger.
+        import sglang.srt.function_call.function_call_parser as _fcp_mod
+
+        class _FakeFCP:
+            def __init__(self, *a, **kw):
+                pass
+
+            def has_tool_call(self, text):
+                return True
+
+        orig = _fcp_mod.FunctionCallParser
+        _fcp_mod.FunctionCallParser = _FakeFCP
+        try:
+            adapted = GenerateReqInput(input_ids=[1, 2], sampling_params={})
+            handler = self._fake_handler(tool_call_parser="qwen25")
+
+            called = {"count": 0}
+
+            def gen(req, raw):
+                called["count"] += 1
+
+                async def _g():
+                    yield {"text": "x", "output_ids": [1], "meta_info": {}}
+
+                return _g()
+
+            ret = [
+                {
+                    "text": "<think>thinking",
+                    "output_ids": [1, 2],
+                    "meta_info": {"finish_reason": {"type": "stop"}},
+                }
+            ]
+            out = asyncio.new_event_loop().run_until_complete(
+                maybe_recover_non_streaming(
+                    handler=handler,
+                    adapted_request=adapted,
+                    request=_basic_request(
+                        tools=self._tools(), tool_choice="auto"
+                    ),
+                    raw_request=None,
+                    ret_list=ret,
+                    generate_request_fn=gen,
+                )
+            )
+            self.assertEqual(called["count"], 0)
+            self.assertEqual(out[0]["text"], "<think>thinking")
+        finally:
+            _fcp_mod.FunctionCallParser = orig
 
 
 if __name__ == "__main__":

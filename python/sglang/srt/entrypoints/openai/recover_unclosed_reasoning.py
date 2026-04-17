@@ -58,7 +58,15 @@ def is_recovery_eligible_request(
         # n > 1 produces multiple ret items; this simplified recovery path
         # supports n == 1 only. (When n is None we treat it as 1.)
         return False
-    if request.tools and request.tool_choice != "none":
+    # Only hard-exclude when the caller FORCES a tool call ("required"): the
+    # model is contractually obliged to emit one, so an "empty content + only
+    # reasoning" response is expected and must not be overwritten by a
+    # follow-up generation.
+    # For tool_choice in {"auto", "none", <specific tool>} we defer the
+    # decision to the runtime check in should_recover_ret_item /
+    # mark_stream_state_tool_call, which inspects whether a tool call was
+    # actually produced.
+    if request.tools and request.tool_choice == "required":
         return False
     if request.continue_final_message:
         # User is already explicitly continuing; do not double-tap.
@@ -69,6 +77,9 @@ def is_recovery_eligible_request(
 def should_recover_ret_item(
     ret_item: Dict[str, Any],
     parser: ReasoningParser,
+    *,
+    tool_call_parser: Optional[str] = None,
+    tools: Optional[List[Any]] = None,
 ) -> bool:
     """True iff this ret item looks like an unclosed reasoning emission.
 
@@ -76,6 +87,9 @@ def should_recover_ret_item(
       - finish_reason.type == "stop" (length-stops are user-visible budget hits)
       - reasoning_text is non-empty after parsing
       - normal_text is empty (or whitespace only) after parsing
+      - when tools were offered: the normal_text does NOT already contain a
+        tool call (otherwise the "empty content" is intentional — the content
+        IS the tool call).
     """
     finish = (ret_item.get("meta_info") or {}).get("finish_reason") or {}
     if finish.get("type") != "stop":
@@ -90,6 +104,30 @@ def should_recover_ret_item(
         return False
     if (normal_text or "").strip():
         return False
+
+    # Only when tools were offered AND the caller configured a tool call
+    # parser do we bother checking for actual tool-call markers in the
+    # generated text. If any is found, skip recovery (the "empty content" is
+    # intentional — the model is calling a tool).
+    if tool_call_parser and tools:
+        try:
+            from sglang.srt.function_call.function_call_parser import (
+                FunctionCallParser,
+            )
+
+            fcp = FunctionCallParser(tools, tool_call_parser)
+            # Check the raw generated text, not the post-reasoning-parser
+            # normal_text, because some models emit the tool-call sigil
+            # inside the reasoning block's tail, or the tool-call parser's
+            # start tokens may themselves look like "reasoning". has_tool_call
+            # inspects the full unparsed text.
+            if fcp.has_tool_call(text):
+                return False
+        except Exception:
+            # Be conservative: if we can't tell, allow recovery. The worst
+            # case is the continuation generates extra text after what the
+            # model considered "done".
+            pass
     return True
 
 
@@ -221,6 +259,17 @@ def merge_continuation_into_ret(
         if isinstance(a, int) and isinstance(b, int):
             merged_meta[k] = a + b
 
+    # prompt_tokens: the follow-up's prefill already consumed (original prompt
+    # + first-pass output_ids + think_end bridge). Summing a+b would
+    # double-count the original prompt; taking max() reflects the true compute
+    # cost for billing without over-reporting.
+    a_pt = merged_meta.get("prompt_tokens")
+    b_pt = follow_meta.get("prompt_tokens")
+    if isinstance(a_pt, int) and isinstance(b_pt, int):
+        merged_meta["prompt_tokens"] = max(a_pt, b_pt)
+    elif isinstance(b_pt, int):
+        merged_meta["prompt_tokens"] = b_pt
+
     new_item = dict(original_ret_item)
     new_item["text"] = merged_text
     new_item["output_ids"] = merged_output_ids
@@ -274,6 +323,12 @@ async def maybe_recover_non_streaming(
         getattr(template_manager, "force_reasoning", False)
     ) or bool(handler._get_reasoning_from_request(request))
 
+    # Capture tool-call context for runtime judgement of "did the model
+    # actually emit a tool call?". When either is missing we fall through to
+    # the plain reasoning-only check.
+    tool_call_parser = getattr(handler, "tool_call_parser", None)
+    tools = getattr(request, "tools", None)
+
     if generate_request_fn is None:
 
         def generate_request_fn(req, rr):  # type: ignore[no-redef]
@@ -292,7 +347,12 @@ async def maybe_recover_non_streaming(
             new_ret_list.append(ret_item)
             continue
 
-        if not should_recover_ret_item(ret_item, parser):
+        if not should_recover_ret_item(
+            ret_item,
+            parser,
+            tool_call_parser=tool_call_parser,
+            tools=tools,
+        ):
             new_ret_list.append(ret_item)
             continue
 
@@ -379,13 +439,29 @@ def mark_stream_state_tool_call(state: Dict[str, Any]):
 
 
 def update_stream_state_meta(
-    state: Dict[str, Any], meta_info: Dict[str, Any], output_ids: List[int]
+    state: Dict[str, Any],
+    meta_info: Dict[str, Any],
+    output_ids: List[int],
+    *,
+    incremental: bool = False,
 ):
+    """Fold one stream chunk's meta / output_ids into the recovery state.
+
+    ``incremental`` MUST match the server's ``incremental_streaming_output``
+    setting:
+
+    - ``incremental=False`` (default): each chunk carries the cumulative
+      output_ids list so far; we overwrite.
+    - ``incremental=True``: each chunk carries only the delta; we append so
+      the continuation request's ``input_ids`` include ALL previously emitted
+      tokens, not just the last delta.
+    """
     state["last_meta_info"] = dict(meta_info or {})
     if output_ids:
-        # Whether streaming is incremental or cumulative is decided by the
-        # caller; we always store the latest snapshot they pass.
-        state["last_output_ids"] = list(output_ids)
+        if incremental:
+            state["last_output_ids"].extend(output_ids)
+        else:
+            state["last_output_ids"] = list(output_ids)
     fr = (meta_info or {}).get("finish_reason")
     if fr:
         state["finish_reason"] = fr
@@ -419,6 +495,7 @@ async def stream_recovery_chunks(
     reasoning_tokens_acc: int,
     completion_tokens_acc: int,
     generate_request_fn: Optional[Callable[..., Any]] = None,
+    on_meta_update: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> AsyncGenerator[str, None]:
     """Issue the continuation generation as a stream and yield SSE chunks.
 
@@ -426,9 +503,36 @@ async def stream_recovery_chunks(
     chunks). After the continuation finishes a final ``finish_reason`` chunk
     is yielded with the continuation's finish_reason. Caller is responsible
     for the trailing ``[DONE]`` line and any usage chunks.
+
+    NOTE: Every early-return path (parser build fails, tokenizer encode
+    fails, continuation request shape invalid, ...) MUST still yield a
+    fallback finish_reason chunk before returning — otherwise the upstream
+    caller's ``continue`` will skip the normal finish chunk and the client
+    stream would lose its content-termination marker.
     """
+
+    def _fallback_finish_chunk() -> str:
+        fr = state.get("finish_reason")
+        fc = ChatCompletionStreamResponse(
+            id=request_id,
+            created=int(time.time()),
+            choices=[
+                ChatCompletionResponseStreamChoice(
+                    index=0,
+                    delta=DeltaMessage(),
+                    finish_reason=fr["type"] if fr else "stop",
+                    matched_stop=(
+                        fr.get("matched") if isinstance(fr, dict) else None
+                    ),
+                )
+            ],
+            model=request_model,
+        )
+        return f"data: {fc.model_dump_json()}\n\n"
+
     parser_name = handler.reasoning_parser
     if not parser_name:
+        yield _fallback_finish_chunk()
         return
 
     is_force_reasoning = bool(
@@ -443,6 +547,7 @@ async def stream_recovery_chunks(
             request=request,
         )
     except Exception:
+        yield _fallback_finish_chunk()
         return
     think_end_str = parser.detector.think_end_token
 
@@ -451,8 +556,10 @@ async def stream_recovery_chunks(
             think_end_str, add_special_tokens=False
         )
     except Exception:
+        yield _fallback_finish_chunk()
         return
     if not think_end_token_ids:
+        yield _fallback_finish_chunk()
         return
 
     pseudo_ret_item = {
@@ -466,6 +573,7 @@ async def stream_recovery_chunks(
         think_end_token_ids=think_end_token_ids,
     )
     if follow_req is None:
+        yield _fallback_finish_chunk()
         return
     # Streaming continuation: ask for incremental text deltas if available.
     follow_req.stream = True
@@ -480,10 +588,13 @@ async def stream_recovery_chunks(
     incremental_streaming = bool(
         getattr(handler.tokenizer_manager.server_args, "incremental_streaming_output", False)
     )
+    last_follow_meta: Dict[str, Any] = {}
 
     try:
         async for content in generate_request_fn(follow_req, raw_request):
             meta = content.get("meta_info") or {}
+            if meta:
+                last_follow_meta = meta
             text = content.get("text") or ""
             if incremental_streaming:
                 delta = text
@@ -504,6 +615,10 @@ async def stream_recovery_chunks(
                     model=request_model,
                 )
                 if continuous_usage_stats:
+                    # meta fields from the continuation are cumulative over
+                    # the continuation (completion_tokens == len(output_ids)
+                    # of the follow-up). Add onto the caller's first-pass
+                    # accumulator so per-chunk usage is monotone non-decreasing.
                     cur_completion = (
                         completion_tokens_acc + int(meta.get("completion_tokens") or 0)
                     )
@@ -523,6 +638,20 @@ async def stream_recovery_chunks(
             getattr(follow_req, "rid", "?"),
             e,
         )
+
+    # Push the final follow-up meta back to the caller so it can accumulate
+    # completion/cached/prompt_tokens for the terminal usage chunk. The meta
+    # fields are cumulative over the continuation, so we only need to flush
+    # once after the stream ends.
+    if on_meta_update is not None and last_follow_meta:
+        try:
+            on_meta_update(last_follow_meta)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "stream_recovery_chunks on_meta_update failed (rid=%s): %s",
+                getattr(follow_req, "rid", "?"),
+                e,
+            )
 
     final_chunk = ChatCompletionStreamResponse(
         id=request_id,

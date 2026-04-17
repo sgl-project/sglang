@@ -186,8 +186,13 @@ class ReasoningEosRedirectLogitProcessor(CustomLogitProcessor):
             cur_ids = req.output_ids
             origin_ids = req.origin_input_ids
 
-            # Skip if the request has already left the reasoning section.
-            if think_end_id in cur_ids:
+            # Skip if the request has already left the reasoning section
+            # (either during generation or because the prompt already contained
+            # a closed <think>...</think> block). Checking origin_input_ids
+            # mirrors the saw_start logic below and avoids redirecting EOS to
+            # think_end on requests that have no reasoning section left to
+            # close.
+            if think_end_id in cur_ids or think_end_id in origin_ids:
                 continue
 
             # Skip if the request has not entered the reasoning section yet.

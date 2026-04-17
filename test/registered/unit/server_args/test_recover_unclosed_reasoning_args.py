@@ -2,16 +2,14 @@
 flags + per-request override on ChatCompletionRequest.
 """
 
+import argparse
 import unittest
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.server_args import ServerArgs, prepare_server_args
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
-    CustomTestCase,
-)
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
@@ -29,10 +27,19 @@ class TestServerArgsDefaults(CustomTestCase):
 
 
 class TestServerArgsCli(CustomTestCase):
+    """Exercise just the argparse layer for the new flags.
+
+    We avoid ``prepare_server_args`` / ``ServerArgs.from_cli_args`` here because
+    they try to load the HF model config in ``__post_init__`` (for piecewise
+    CUDA graph detection), which requires network access in CI-like envs.
+    Parsing the flags is what we actually want to test anyway.
+    """
+
     def _parse(self, *extra):
-        return prepare_server_args(
-            ["--model-path", DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN, *extra]
-        )
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(["--model-path", "dummy", *extra])
+        return args
 
     def test_redirect_flag_is_parsed(self):
         s = self._parse("--redirect-unclosed-reasoning")

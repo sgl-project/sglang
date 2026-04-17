@@ -78,7 +78,10 @@ class TestIsRecoveryEligibleRequest(CustomTestCase):
         req = _basic_request(n=3)
         self.assertFalse(is_recovery_eligible_request(req, "qwen3"))
 
-    def test_tools_not_eligible(self):
+    def test_tools_with_tool_choice_required_not_eligible(self):
+        # Only tool_choice="required" is hard-excluded: the model is
+        # contractually obliged to emit a tool call, so empty content is
+        # expected.
         req = _basic_request(
             tools=[
                 {
@@ -89,8 +92,26 @@ class TestIsRecoveryEligibleRequest(CustomTestCase):
                     },
                 }
             ],
+            tool_choice="required",
         )
         self.assertFalse(is_recovery_eligible_request(req, "qwen3"))
+
+    def test_tools_with_auto_tool_choice_is_eligible(self):
+        # Tools offered but tool_choice="auto" → we must defer to runtime
+        # inspection of the actual generated text.
+        req = _basic_request(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "f",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+        self.assertTrue(is_recovery_eligible_request(req, "qwen3"))
 
     def test_continue_final_message_not_eligible(self):
         req = _basic_request(continue_final_message=True)
@@ -128,6 +149,66 @@ class TestShouldRecoverRetItem(CustomTestCase):
         # Pure normal output, no <think> at all → reasoning_text empty.
         item = self._ret(text="hello world")
         self.assertFalse(should_recover_ret_item(item, _qwen3_parser()))
+
+    def test_tools_offered_but_no_tool_call_emitted_triggers(self):
+        # Request declared tools (tool_choice="auto"), but the model produced
+        # only an unclosed <think> block and NOT a tool call. Recovery must
+        # trigger based on the generation result, not the request declaration.
+        item = self._ret(text="<think>partial reasoning")
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        self.assertTrue(
+            should_recover_ret_item(
+                item,
+                _qwen3_parser(),
+                tool_call_parser="qwen25",
+                tools=tools,
+            )
+        )
+
+    def test_tools_offered_and_tool_call_emitted_skips(self):
+        # Request declared tools AND the model actually produced a tool-call
+        # sigil. Recovery must NOT trigger — the "empty content" is intentional.
+        # We mock FunctionCallParser.has_tool_call to return True.
+        import sglang.srt.function_call.function_call_parser as _fcp_mod
+
+        class _FakeFCP:
+            def __init__(self, *a, **kw):
+                pass
+
+            def has_tool_call(self, text):
+                return True
+
+        orig = _fcp_mod.FunctionCallParser
+        _fcp_mod.FunctionCallParser = _FakeFCP
+        try:
+            item = self._ret(text="<think>partial reasoning")
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+            self.assertFalse(
+                should_recover_ret_item(
+                    item,
+                    _qwen3_parser(),
+                    tool_call_parser="qwen25",
+                    tools=tools,
+                )
+            )
+        finally:
+            _fcp_mod.FunctionCallParser = orig
 
 
 # ----- request building --------------------------------------------------
@@ -211,7 +292,15 @@ class TestBuildContinuationRequest(CustomTestCase):
         sp = follow.sampling_params
         if isinstance(sp, list):
             sp = sp[0]
-        self.assertEqual(sp["custom_params"], {"user_field": "keep_me"})
+        # The redirect-owned keys are stripped, user keys are preserved, and
+        # a recovery sentinel is injected for anti-recursion.
+        self.assertEqual(sp["custom_params"]["user_field"], "keep_me")
+        self.assertTrue(
+            sp["custom_params"].get("_recover_unclosed_reasoning_attempted")
+        )
+        self.assertNotIn("think_end_token_id", sp["custom_params"])
+        self.assertNotIn("redirect_eos_token_ids", sp["custom_params"])
+
 
     def test_text_mode_returns_none(self):
         adapted = GenerateReqInput(
@@ -274,6 +363,48 @@ class TestMergeContinuationIntoRet(CustomTestCase):
         # completion_tokens accumulate
         self.assertEqual(merged["meta_info"]["completion_tokens"], 5)
         self.assertEqual(merged["meta_info"]["cached_tokens"], 1)
+
+    def test_prompt_tokens_uses_max_not_sum(self):
+        # The follow-up's prefill covers (original_prompt + first_output_ids
+        # + think_end_bridge), so summing prompt_tokens would double-count the
+        # original prompt. merge_continuation_into_ret must take max().
+        original = {
+            "text": "<think>t",
+            "output_ids": [1],
+            "meta_info": {"prompt_tokens": 10, "completion_tokens": 1},
+        }
+        follow = {
+            "text": "ans",
+            "output_ids": [2],
+            "meta_info": {"prompt_tokens": 13, "completion_tokens": 1},
+        }
+        merged = merge_continuation_into_ret(
+            original_ret_item=original,
+            follow_ret_item=follow,
+            think_end_str="</think>",
+            think_end_token_ids=[99],
+        )
+        self.assertEqual(merged["meta_info"]["prompt_tokens"], 13)
+        self.assertEqual(merged["meta_info"]["completion_tokens"], 2)
+
+    def test_prompt_tokens_filled_when_only_followup_has_it(self):
+        original = {
+            "text": "<think>t",
+            "output_ids": [1],
+            "meta_info": {"completion_tokens": 1},
+        }
+        follow = {
+            "text": "ans",
+            "output_ids": [2],
+            "meta_info": {"prompt_tokens": 13, "completion_tokens": 1},
+        }
+        merged = merge_continuation_into_ret(
+            original_ret_item=original,
+            follow_ret_item=follow,
+            think_end_str="</think>",
+            think_end_token_ids=[99],
+        )
+        self.assertEqual(merged["meta_info"]["prompt_tokens"], 13)
 
     def test_does_not_mutate_inputs(self):
         original = {
