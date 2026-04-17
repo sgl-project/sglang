@@ -622,5 +622,74 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         self.assertIn("UnusedType", schema["$defs"])
 
 
+    def test_required_null_is_dropped(self):
+        """`required: null` from lenient clients must not reach the grammar backend.
+
+        Some clients (matching vLLM's permissive behavior) send ``required: null``
+        to mean "no required fields". JSON Schema requires ``required`` to be an
+        array, so strict validators such as xgrammar reject the whole tool call.
+        sglang should normalize this to the default (empty) semantics so the
+        tool call still works. See sgl-project/sglang#22693.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_current_weather",
+                    description="Get the current weather in a given location",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"},
+                            "unit": {"type": "string"},
+                        },
+                        "required": None,
+                    },
+                ),
+            ),
+        ]
+
+        schema = get_json_schema_constraint(tools, "required")
+        self.assertIsNotNone(schema)
+        # Should no longer contain a null `required` anywhere — otherwise the
+        # next stop (xgrammar) would raise on schema compilation.
+        jsonschema.Draft202012Validator.check_schema(schema)
+
+        params = schema["items"]["anyOf"][0]["properties"]["parameters"]
+        self.assertNotIn("required", params)
+
+    def test_nested_required_null_is_dropped(self):
+        """`required: null` inside nested subschemas must also be normalized."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="nested_tool",
+                    description="Nested schema with required: null inside $defs",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "user": {"$ref": "#/$defs/User"},
+                        },
+                        "required": ["user"],
+                        "$defs": {
+                            "User": {
+                                "type": "object",
+                                "properties": {"name": {"type": "string"}},
+                                "required": None,
+                            },
+                        },
+                    },
+                ),
+            ),
+        ]
+
+        schema = get_json_schema_constraint(tools, "required")
+        self.assertIsNotNone(schema)
+        jsonschema.Draft202012Validator.check_schema(schema)
+        user_def = schema["$defs"]["User"]
+        self.assertNotIn("required", user_def)
+
+
 if __name__ == "__main__":
     unittest.main()
