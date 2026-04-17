@@ -382,16 +382,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--dllm-algorithm` | The diffusion LLM algorithm, such as LowConfidence. | `None` | Type: str |
 | `--dllm-algorithm-config` | The diffusion LLM algorithm configurations. Must be a YAML file. | `None` | Type: str |
 
-## Double Sparsity
-| Argument | Description | Defaults | Options |
-| --- | --- | --- | --- |
-| `--enable-double-sparsity` | Enable double sparsity attention | `False` | bool flag (set to enable) |
-| `--ds-channel-config-path` | The path of the double sparsity channel config | `None` | Type: str |
-| `--ds-heavy-channel-num` | The number of heavy channels in double sparsity attention | `32` | Type: int |
-| `--ds-heavy-token-num` | The number of heavy tokens in double sparsity attention | `256` | Type: int |
-| `--ds-heavy-channel-type` | The type of heavy channels in double sparsity attention | `qk` | Type: str |
-| `--ds-sparse-decode-threshold` | The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel. | `4096` | Type: int |
-
 ## Offloading
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
