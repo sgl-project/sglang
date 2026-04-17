@@ -45,6 +45,27 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
 
+    def test_disable_pe_parsed_from_cli(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "sglang",
+            "generate",
+            "--model-path",
+            "/data/my-model",
+            "--disable-pe",
+            "true",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            raw_args, unknown_args = parser.parse_known_args(argv[2:])
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                args = ServerArgs.from_cli_args(raw_args, unknown_args)
+
+        self.assertTrue(args.disable_pe)
+
 
 class TestModelIdResolution(unittest.TestCase):
     def setUp(self):

@@ -1,0 +1,93 @@
+{
+  "timestamp": "2026-04-17T19:28:19.678817+00:00",
+  "request_id": "78da1b4d-9396-4a26-b703-3ce3f3a69f42",
+  "commit_hash": "5d4e899477adb5934459eb05f264d31de11fb984",
+  "tag": "cli_generate",
+  "total_duration_ms": 781.2835020013154,
+  "steps": [
+    {
+      "name": "InputValidationStage",
+      "duration_ms": 0.030070077627897263
+    },
+    {
+      "name": "TextEncodingStage",
+      "duration_ms": 20.736745093017817
+    },
+    {
+      "name": "TimestepPreparationStage",
+      "duration_ms": 0.2621659077703953
+    },
+    {
+      "name": "LatentPreparationStage",
+      "duration_ms": 0.07226900197565556
+    },
+    {
+      "name": "DenoisingStage",
+      "duration_ms": 749.2218590341508
+    },
+    {
+      "name": "DecodingStage",
+      "duration_ms": 8.882419904693961
+    }
+  ],
+  "denoise_steps_ms": [
+    {
+      "step": 0,
+      "duration_ms": 51.63710308261216
+    },
+    {
+      "step": 1,
+      "duration_ms": 75.92229801230133
+    },
+    {
+      "step": 2,
+      "duration_ms": 77.23109610378742
+    },
+    {
+      "step": 3,
+      "duration_ms": 77.67882104963064
+    },
+    {
+      "step": 4,
+      "duration_ms": 76.84941682964563
+    },
+    {
+      "step": 5,
+      "duration_ms": 77.85789016634226
+    },
+    {
+      "step": 6,
+      "duration_ms": 78.07771186344326
+    },
+    {
+      "step": 7,
+      "duration_ms": 77.24550319835544
+    },
+    {
+      "step": 8,
+      "duration_ms": 76.59802702255547
+    },
+    {
+      "step": 9,
+      "duration_ms": 76.8634439446032
+    }
+  ],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 23030.08,
+      "reserved_mb": 25380.0,
+      "peak_allocated_mb": 23030.08,
+      "peak_reserved_mb": 25380.0
+    },
+    "after_forward": {
+      "allocated_mb": 23033.53,
+      "reserved_mb": 25380.0,
+      "peak_allocated_mb": 24249.78,
+      "peak_reserved_mb": 25380.0
+    }
+  },
+  "meta": {
+    "prompt": "A cinematic photo of a glass teapot filled with glowing green tea on a wooden table, morning sunlight, sharp details",
+    "model": "/root/.cache/huggingface/hub/models--baidu--ERNIE-Image-Turbo/snapshots/bc68c81e2a1730a394d5fc9fae70713dee940140"
+  }
+}

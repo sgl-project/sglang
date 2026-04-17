@@ -45,6 +45,11 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         except Exception:
             return False
 
+    def _should_load_pe(self, server_args) -> bool:
+        return self._has_pe_in_model_index(server_args) and not getattr(
+            server_args, "disable_pe", False
+        )
+
     def _read_tokenizer_model_max_length(self, model_path: str):
         """Read model_max_length from tokenizer/tokenizer_config.json.
 
@@ -127,11 +132,15 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         return None
 
     def load_modules(self, server_args, loaded_modules=None):
-        has_pe = self._has_pe_in_model_index(server_args)
+        self._required_config_modules = [
+            module for module in self._required_config_modules if module != "pe"
+        ]
+        has_pe = self._should_load_pe(server_args)
         if has_pe:
-            if "pe" not in self._required_config_modules:
-                self._required_config_modules.insert(0, "pe")
+            self._required_config_modules.insert(0, "pe")
             logger.info("PE model detected in model_index.json, will load PE module.")
+        elif getattr(server_args, "disable_pe", False):
+            logger.info("Prompt enhancement module loading disabled by server args.")
 
         pipeline_config = server_args.pipeline_config
 

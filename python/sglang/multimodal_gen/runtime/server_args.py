@@ -159,6 +159,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
+    disable_pe: bool = False
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
@@ -812,6 +813,12 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=ServerArgs.prompt_file_path,
             help="Path to a text file containing prompts (one per line) for batch processing",
+        )
+        parser.add_argument(
+            "--disable-pe",
+            action=StoreBoolean,
+            default=ServerArgs.disable_pe,
+            help="Skip loading optional prompt enhancement modules.",
         )
 
         parser.add_argument(
