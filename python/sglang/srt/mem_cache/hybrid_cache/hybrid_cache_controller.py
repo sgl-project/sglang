@@ -437,10 +437,11 @@ class HybridCacheController(BaseHiCacheController):
         host_indices, device_indices = self.move_indices(
             operation.host_indices, operation.device_indices
         )
-        for transfer in operation.pool_transfers:
-            transfer.host_indices, transfer.device_indices = self.move_indices(
-                transfer.host_indices, transfer.device_indices
-            )
+        if operation.pool_transfers:
+            for transfer in operation.pool_transfers:
+                transfer.host_indices, transfer.device_indices = self.move_indices(
+                    transfer.host_indices, transfer.device_indices
+                )
         return host_indices, device_indices
 
     def _page_transfer(self, operation):
