@@ -105,18 +105,22 @@ class DFlashWorker:
         if draft_backend is None:
             # Use triton on ROCm (no FlashInfer), flashinfer on CUDA
             import torch as _torch
+
             draft_backend = "triton" if _torch.version.hip else "flashinfer"
         elif draft_backend == "trtllm_mha":
             import torch as _torch
+
             _fb = "triton" if _torch.version.hip else "flashinfer"
             logger.warning(
                 "DFLASH draft worker does not support 'trtllm_mha' because the "
                 "draft path requires non-causal attention. Falling back to "
-                "'%s'.", _fb
+                "'%s'.",
+                _fb,
             )
             draft_backend = _fb
         elif draft_backend not in supported_draft_backends:
             import torch as _torch
+
             _fb = "triton" if _torch.version.hip else "flashinfer"
             logger.warning(
                 "DFLASH draft worker only supports attention_backend in %s for now, "
