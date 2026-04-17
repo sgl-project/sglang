@@ -7,12 +7,14 @@ should keep buffering, non-streaming callers should fall back to a
 best-effort scrub".
 """
 
+import re
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
     WHISPER_AUTODETECT_REGEX,
     WHISPER_AUTODETECT_TS_REGEX,
+    WHISPER_LANG_TOKEN_CODES,
     WhisperAdapter,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -104,6 +106,34 @@ class TestWhisperParseFusedOutput(unittest.TestCase):
         real = [v for v in visibles if v is not None]
         for a, b in zip(real, real[1:]):
             self.assertTrue(b.startswith(a), f"monotonicity broken: {a!r} -> {b!r}")
+
+
+class TestWhisperLangTokenCoverage(unittest.TestCase):
+    """The FSM regex must cover every Whisper language token, not just the
+    narrower ISO639_1_SUPPORTED_LANGS set used for input validation."""
+
+    def test_three_letter_codes_parse(self):
+        # yue (Cantonese, v3), haw (Hawaiian), jw (Javanese, two-letter but
+        # missing from ISO639_1_SUPPORTED_LANGS) — reviewer's flagged examples.
+        for code in ("yue", "haw", "jw"):
+            with self.subTest(lang=code):
+                lang, visible = WhisperAdapter.parse_fused_output(
+                    f"<|{code}|><|transcribe|><|notimestamps|> Hi"
+                )
+                self.assertEqual(lang, code)
+                self.assertEqual(visible, "Hi")
+
+    def test_known_whisper_langs_in_allowlist(self):
+        # Spot-check: codes the reviewer named + common 3-letter tokens.
+        for code in ("yue", "haw", "jw", "su", "ba", "tt", "ln", "lo"):
+            self.assertIn(code, WHISPER_LANG_TOKEN_CODES)
+
+    def test_fsm_regex_includes_three_letter_alternatives(self):
+        # Defensive: the regex alternation must spell out the 3-letter codes
+        # so xgrammar's FSM admits the <|yue|> / <|haw|> single-token path.
+        for code in ("yue", "haw"):
+            self.assertIn(re.escape(code), WHISPER_AUTODETECT_REGEX)
+            self.assertIn(re.escape(code), WHISPER_AUTODETECT_TS_REGEX)
 
 
 class TestWhisperStripSpecialTokens(unittest.TestCase):

@@ -14,9 +14,126 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
     register_transcription_adapter,
 )
-from sglang.srt.multimodal.processors.whisper import ISO639_1_SUPPORTED_LANGS
 
 logger = logging.getLogger(__name__)
+
+# The complete set of Whisper language tokens as they appear in the tokenizer
+# vocab (<|xx|> / <|xxx|>). Intentionally defined separately from
+# ``processors.whisper.ISO639_1_SUPPORTED_LANGS`` (a narrower set used by the
+# input-validation path ``normalize_language_to_code``) — for the FSM regex
+# we want to cover every language the model was actually trained on so we
+# don't silently force a wrong nearest-match code on audio in languages the
+# model *can* detect but the input dict doesn't list (yue/Cantonese,
+# jw/Javanese, haw/Hawaiian, ba/Bashkir, su/Sundanese, ...).
+#
+# Source: ``WhisperTokenizer.LANGUAGE_CODES`` in ``transformers``. Covers
+# Whisper v1/v2 (98 codes) plus ``yue`` added in v3; harmless on older
+# models where the ``<|yue|>`` token isn't in the vocab — xgrammar simply
+# leaves that regex branch with no admissible tokens.
+WHISPER_LANG_TOKEN_CODES: frozenset[str] = frozenset(
+    {
+        "af",
+        "am",
+        "ar",
+        "as",
+        "az",
+        "ba",
+        "be",
+        "bg",
+        "bn",
+        "bo",
+        "br",
+        "bs",
+        "ca",
+        "cs",
+        "cy",
+        "da",
+        "de",
+        "el",
+        "en",
+        "es",
+        "et",
+        "eu",
+        "fa",
+        "fi",
+        "fo",
+        "fr",
+        "gl",
+        "gu",
+        "ha",
+        "haw",
+        "he",
+        "hi",
+        "hr",
+        "ht",
+        "hu",
+        "hy",
+        "id",
+        "is",
+        "it",
+        "ja",
+        "jw",
+        "ka",
+        "kk",
+        "km",
+        "kn",
+        "ko",
+        "la",
+        "lb",
+        "ln",
+        "lo",
+        "lt",
+        "lv",
+        "mg",
+        "mi",
+        "mk",
+        "ml",
+        "mn",
+        "mr",
+        "ms",
+        "mt",
+        "my",
+        "ne",
+        "nl",
+        "nn",
+        "no",
+        "oc",
+        "pa",
+        "pl",
+        "ps",
+        "pt",
+        "ro",
+        "ru",
+        "sa",
+        "sd",
+        "si",
+        "sk",
+        "sl",
+        "sn",
+        "so",
+        "sq",
+        "sr",
+        "su",
+        "sv",
+        "sw",
+        "ta",
+        "te",
+        "tg",
+        "th",
+        "tk",
+        "tl",
+        "tr",
+        "tt",
+        "uk",
+        "ur",
+        "uz",
+        "vi",
+        "yi",
+        "yo",
+        "yue",
+        "zh",
+    }
+)
 
 # Two forced-prefix variants, picked at request build time based on whether
 # the client asked for timestamp_granularities:
@@ -26,7 +143,9 @@ logger = logging.getLogger(__name__)
 #     — <|0.00|> anchors the first segment at t=0, and the model naturally
 #     emits further timestamp tokens between segments. _parse_segments
 #     reconstructs segments from output_ids afterwards.
-_LANG_ALT = "|".join(re.escape(c) for c in ISO639_1_SUPPORTED_LANGS)
+# sorted() gives a deterministic regex string so the warmup-compiled FSM is
+# reused across server restarts.
+_LANG_ALT = "|".join(re.escape(c) for c in sorted(WHISPER_LANG_TOKEN_CODES))
 _LANG_PREFIX = r"<\|(" + _LANG_ALT + r")\|>"
 WHISPER_AUTODETECT_REGEX = (
     _LANG_PREFIX + r"<\|transcribe\|>" + r"<\|notimestamps\|>" + r"[\s\S]*"
@@ -35,9 +154,9 @@ WHISPER_AUTODETECT_TS_REGEX = (
     _LANG_PREFIX + r"<\|transcribe\|>" + r"<\|0\.00\|>" + r"[\s\S]*"
 )
 
-# Pattern to extract the language code from the fused output.
-# Scoped to ISO639_1_SUPPORTED_LANGS so a bypassed/drifted FSM can't sneak
-# through a random 2-letter code.
+# Pattern to extract the language code from the fused output. Scoped to
+# WHISPER_LANG_TOKEN_CODES so a bypassed/drifted FSM can't sneak through a
+# random 2-or-3-letter code that isn't actually a Whisper language token.
 _LANG_PREFIX_RE = re.compile(r"^" + _LANG_PREFIX)
 
 # Sentinel strings that mark the boundary between the forced prefix and the
@@ -193,14 +312,14 @@ class WhisperAdapter(TranscriptionAdapter):
     def parse_language_detection_output(
         output_ids: List[int], tokenizer
     ) -> Optional[str]:
-        """Decode the predicted token and extract the ISO 639-1 language code."""
+        """Decode the predicted token and extract the Whisper language code."""
         if not output_ids:
             return None
         decoded = tokenizer.decode([output_ids[0]], skip_special_tokens=False)
-        # Whisper language tokens have the form <|xx|>
+        # Whisper language tokens have the form <|xx|> or <|xxx|>.
         if decoded.startswith("<|") and decoded.endswith("|>"):
             lang_code = decoded[2:-2]
-            if lang_code in ISO639_1_SUPPORTED_LANGS:
+            if lang_code in WHISPER_LANG_TOKEN_CODES:
                 return lang_code
         return None
 
