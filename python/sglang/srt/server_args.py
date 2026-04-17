@@ -667,6 +667,10 @@ class ServerArgs:
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
+    # Reasoning unclosed-think auto-recover (default off)
+    redirect_unclosed_reasoning: bool = False
+    redirect_eos_prob_threshold: float = 0.5
+    auto_recover_unclosed_reasoning: bool = False
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     enforce_shared_experts_fusion: bool = False
@@ -5955,6 +5959,35 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+        parser.add_argument(
+            "--redirect-unclosed-reasoning",
+            action="store_true",
+            default=ServerArgs.redirect_unclosed_reasoning,
+            help="When the model is still inside the reasoning section but the EOS-class "
+            "tokens accumulate enough probability, redirect the next sampled token to the "
+            "think_end token. Requires --enable-custom-logit-processor and a model whose "
+            "think_end is a single token (auto-detected on startup; otherwise this flag is "
+            "silently ignored for unsupported models).",
+        )
+        parser.add_argument(
+            "--redirect-eos-prob-threshold",
+            type=float,
+            default=ServerArgs.redirect_eos_prob_threshold,
+            help="Probability threshold (after temperature scaling) that the EOS-class "
+            "tokens must collectively exceed for the reasoning-EOS redirect logit "
+            "processor to fire. Only meaningful with --redirect-unclosed-reasoning.",
+        )
+        parser.add_argument(
+            "--auto-recover-unclosed-reasoning",
+            action="store_true",
+            default=ServerArgs.auto_recover_unclosed_reasoning,
+            help="If a chat completion finishes with non-empty reasoning_content but "
+            "essentially empty content (and no tool calls), transparently issue a "
+            "follow-up generation that appends the think_end token to the existing "
+            "output_ids and continues, then merge the two responses before returning to "
+            "the client. Acts as a safety net for the redirect logit processor and works "
+            "on multi-token think_end models too.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",

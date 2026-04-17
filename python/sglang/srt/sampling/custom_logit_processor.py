@@ -136,6 +136,98 @@ class DeepSeekR1ThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     NEW_LINE_TOKEN_ID: int = 201
 
 
+class ReasoningEosRedirectLogitProcessor(CustomLogitProcessor):
+    """Redirect EOS-class tokens to the think_end token while a request is still
+    in the reasoning section.
+
+    Triggers when ``softmax(logits / temperature)[redirect_eos_token_ids].sum()``
+    exceeds ``prob_threshold``. When triggered, the processor surgically masks
+    the EOS class to ``-inf`` and lifts the think_end token to a strict argmax
+    so that the next step samples the think_end token. All other token logits
+    are left untouched.
+
+    Per-request params (passed via ``SamplingParams.custom_params``):
+
+    - ``think_end_token_id`` (int, required)
+    - ``think_start_token_id`` (Optional[int]): used to detect entry into the
+      reasoning section. Pass ``None`` together with ``force_reasoning=True``
+      for models whose chat template never prefills a think-start token (e.g.
+      original DeepSeek-R1).
+    - ``redirect_eos_token_ids`` (List[int], required, non-empty): the EOS /
+      chat-end token id set whose probability mass triggers the redirect.
+    - ``prob_threshold`` (float, default 0.5)
+    - ``force_reasoning`` (bool, default False)
+    """
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        custom_param_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> torch.Tensor:
+        if not custom_param_list:
+            return logits
+
+        for i, params in enumerate(custom_param_list):
+            if not params:
+                continue
+            req = params.get("__req__")
+            think_end_id = params.get("think_end_token_id")
+            eos_ids = params.get("redirect_eos_token_ids")
+            if req is None or think_end_id is None or not eos_ids:
+                continue
+
+            think_start_id = params.get("think_start_token_id")
+            try:
+                threshold = float(params.get("prob_threshold", 0.5))
+            except (TypeError, ValueError):
+                continue
+            force_reasoning = bool(params.get("force_reasoning", False))
+
+            cur_ids = req.output_ids
+            origin_ids = req.origin_input_ids
+
+            # Skip if the request has already left the reasoning section.
+            if think_end_id in cur_ids:
+                continue
+
+            # Skip if the request has not entered the reasoning section yet.
+            saw_start = force_reasoning or (
+                think_start_id is not None
+                and (think_start_id in cur_ids or think_start_id in origin_ids)
+            )
+            if not saw_start:
+                continue
+
+            row = logits[i]
+            temperature = (
+                getattr(req.sampling_params, "temperature", 1.0)
+                if req.sampling_params is not None
+                else 1.0
+            )
+            try:
+                temperature = float(temperature)
+            except (TypeError, ValueError):
+                temperature = 1.0
+            if temperature <= 0.0:
+                temperature = 1.0
+
+            scaled = row.float() / max(temperature, 1e-6)
+            probs = torch.softmax(scaled, dim=-1)
+            eos_indices = torch.as_tensor(
+                eos_ids, device=probs.device, dtype=torch.long
+            )
+            eos_prob_sum = probs.index_select(0, eos_indices).sum().item()
+            if eos_prob_sum < threshold:
+                continue
+
+            eos_max = row[eos_indices].max().item()
+            row[eos_indices] = -float("inf")
+            new_max = max(row.max().item(), eos_max)
+            row[think_end_id] = new_max + 1.0
+
+        return logits
+
+
 # Adapted from DeepSeek's implementation: https://github.com/deepseek-ai/DeepSeek-OCR/blob/main/DeepSeek-OCR-master/DeepSeek-OCR-vllm/process/ngram_norepeat.py
 class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
     """Block n-gram repetitions within a sliding window for DeepSeek-OCR outputs."""

@@ -15,6 +15,17 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
+from sglang.srt.entrypoints.openai.recover_unclosed_reasoning import (
+    is_stream_recovery_enabled_for_request,
+    mark_stream_state_tool_call,
+    maybe_recover_non_streaming,
+    new_stream_recovery_state,
+    should_recover_stream_state,
+    stream_recovery_chunks,
+    update_stream_state_meta,
+    update_stream_state_with_content,
+    update_stream_state_with_reasoning,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -52,6 +63,12 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_redirect_registry import (
+    build_redirect_config,
+)
+from sglang.srt.sampling.custom_logit_processor import (
+    ReasoningEosRedirectLogitProcessor,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -127,6 +144,106 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+
+        # Reasoning unclosed-think auto-recover plumbing.
+        # `_redirect_cfg` is populated lazily on the first request that needs
+        # it: the tokenizer may not be ready at __init__ time on some load
+        # paths. None means path-1 is unsupported for this model.
+        self._redirect_cfg = None
+        self._redirect_cfg_built = False
+        self._redirect_processor_str = None
+
+    def _get_or_build_redirect_cfg(self):
+        if self._redirect_cfg_built:
+            return self._redirect_cfg
+        self._redirect_cfg_built = True
+        sa = self.tokenizer_manager.server_args
+        if not getattr(sa, "redirect_unclosed_reasoning", False):
+            return None
+        if not getattr(sa, "enable_custom_logit_processor", False):
+            logger.warning(
+                "redirect_unclosed_reasoning requires --enable-custom-logit-processor; "
+                "the redirect logit processor will NOT be installed."
+            )
+            return None
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        cfg = build_redirect_config(self.reasoning_parser, tokenizer)
+        if cfg is None:
+            logger.info(
+                "Reasoning EOS redirect: model/parser=%r is not eligible "
+                "(unknown parser, multi-token think_end, or no EOS tokens). "
+                "Path-1 will be skipped; Fallback B is unaffected.",
+                self.reasoning_parser,
+            )
+        else:
+            self._redirect_processor_str = (
+                ReasoningEosRedirectLogitProcessor.to_str()
+            )
+            logger.info(
+                "Reasoning EOS redirect enabled: think_end=%d, eos_set=%s, "
+                "force_reasoning=%s, threshold=%.3f",
+                cfg.think_end_token_id,
+                cfg.redirect_eos_token_ids,
+                cfg.force_reasoning,
+                getattr(sa, "redirect_eos_prob_threshold", 0.5),
+            )
+        self._redirect_cfg = cfg
+        return cfg
+
+    def _maybe_attach_redirect_processor(
+        self,
+        request: ChatCompletionRequest,
+        sampling_params: Dict[str, Any],
+    ) -> Optional[str]:
+        """If eligible, attach the reasoning-EOS redirect processor to the
+        request and return the processor JSON string (to be set on the
+        GenerateReqInput). Returns None when the processor must not be
+        installed (per-request opt-out, user already set their own processor,
+        unsupported parser/tokenizer, etc.).
+
+        Side effect: mutates ``sampling_params['custom_params']`` in-place to
+        include the per-request redirect parameters when the processor is
+        installed.
+        """
+        cfg = self._get_or_build_redirect_cfg()
+        if cfg is None:
+            return None
+
+        # Coexistence with user-supplied custom logit processors: the SGLang
+        # sampling stack only supports a single processor per request, so we
+        # bail out (and warn) if the user already supplied one.
+        if request.custom_logit_processor is not None:
+            logger.debug(
+                "Reasoning EOS redirect skipped: request already carries a "
+                "custom_logit_processor."
+            )
+            return None
+
+        threshold = float(
+            getattr(
+                self.tokenizer_manager.server_args,
+                "redirect_eos_prob_threshold",
+                0.5,
+            )
+        )
+        redirect_params = {
+            "think_end_token_id": cfg.think_end_token_id,
+            "think_start_token_id": cfg.think_start_token_id,
+            "redirect_eos_token_ids": list(cfg.redirect_eos_token_ids),
+            "prob_threshold": threshold,
+            "force_reasoning": cfg.force_reasoning,
+        }
+
+        existing = sampling_params.get("custom_params") or {}
+        if not isinstance(existing, dict):
+            logger.warning(
+                "Reasoning EOS redirect skipped: request.custom_params is not a dict."
+            )
+            return None
+        # Caller-provided keys win on conflict so users can override threshold etc.
+        merged = {**redirect_params, **existing}
+        sampling_params["custom_params"] = merged
+        return self._redirect_processor_str
 
     def _handle_last_assistant_message(
         self,
@@ -275,6 +392,17 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        # Optionally install the reasoning-EOS redirect logit processor.
+        # Mutates sampling_params["custom_params"] in place when applicable.
+        injected_processor_str = self._maybe_attach_redirect_processor(
+            request, sampling_params
+        )
+        custom_logit_processor = (
+            request.custom_logit_processor
+            if injected_processor_str is None
+            else injected_processor_str
+        )
+
         # Handle single vs multiple requests
         if is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}
@@ -323,7 +451,7 @@ class OpenAIServingChat(OpenAIServingBase):
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
-            custom_logit_processor=request.custom_logit_processor,
+            custom_logit_processor=custom_logit_processor,
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
@@ -662,6 +790,18 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
 
+        # Per-index Fallback B accumulators (only populated when the feature
+        # is enabled for this request; cheap to keep otherwise).
+        recovery_enabled = is_stream_recovery_enabled_for_request(self, request)
+        recovery_states: Dict[int, Dict[str, Any]] = {}
+
+        def _ensure_recovery_state(index: int) -> Dict[str, Any]:
+            state = recovery_states.get(index)
+            if state is None:
+                state = new_stream_recovery_state()
+                recovery_states[index] = state
+            return state
+
         stream_started = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
@@ -745,11 +885,22 @@ class OpenAIServingChat(OpenAIServingBase):
                     delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
 
+                if recovery_enabled:
+                    update_stream_state_meta(
+                        _ensure_recovery_state(index),
+                        content.get("meta_info") or {},
+                        content.get("output_ids") or [],
+                    )
+
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
+                    if recovery_enabled:
+                        update_stream_state_with_reasoning(
+                            _ensure_recovery_state(index), reasoning_text or ""
+                        )
                     if reasoning_text:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -790,6 +941,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     ):
                         if chunk:
                             yield chunk
+                    if recovery_enabled and has_tool_calls.get(index, False):
+                        mark_stream_state_tool_call(_ensure_recovery_state(index))
 
                     # Send any remaining tool call arguments when generation finishes
                     if finish_reason_type is not None and index in parser_dict:
@@ -802,6 +955,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 else:
                     # Regular content
+                    if recovery_enabled and delta:
+                        update_stream_state_with_content(
+                            _ensure_recovery_state(index), delta
+                        )
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -835,6 +992,37 @@ class OpenAIServingChat(OpenAIServingBase):
                 final_finish_reason = finish_reason_type
                 if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
                     final_finish_reason = "tool_calls"
+
+                # Fallback B: if this index has non-empty reasoning but empty
+                # content and we stopped naturally, run a continuation stream
+                # instead of emitting the original finish_reason chunk.
+                if recovery_enabled:
+                    state = recovery_states.get(idx)
+                    if state is not None and should_recover_stream_state(state):
+                        try:
+                            async for chunk in stream_recovery_chunks(
+                                handler=self,
+                                request=request,
+                                raw_request=raw_request,
+                                adapted_request=adapted_request,
+                                state=state,
+                                request_id=content["meta_info"]["id"],
+                                request_model=request.model,
+                                continuous_usage_stats=continuous_usage_stats,
+                                prompt_tokens=prompt_tokens.get(idx, 0),
+                                reasoning_tokens_acc=reasoning_tokens.get(idx, 0),
+                                completion_tokens_acc=completion_tokens.get(
+                                    idx, 0
+                                ),
+                            ):
+                                yield chunk
+                            continue  # Skip the normal finish_reason chunk.
+                        except Exception as e:
+                            logger.warning(
+                                "Streaming Fallback B failed; falling back to "
+                                "original finish_reason chunk: %s",
+                                e,
+                            )
 
                 finish_reason_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"][
@@ -941,6 +1129,24 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if not isinstance(ret, list):
             ret = [ret]
+
+        # Fallback B: post-inference unclosed-reasoning recovery. No-op when
+        # the feature is disabled, the ret items already have content, or the
+        # request shape (n>1, tools, text mode, etc.) is not eligible.
+        try:
+            ret = await maybe_recover_non_streaming(
+                handler=self,
+                adapted_request=adapted_request,
+                request=request,
+                raw_request=raw_request,
+                ret_list=ret,
+            )
+        except Exception as e:
+            logger.warning(
+                "Reasoning recovery (Fallback B) crashed; returning original "
+                "response: %s",
+                e,
+            )
 
         response = self._build_chat_response(
             request,
