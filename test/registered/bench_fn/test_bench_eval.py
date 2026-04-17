@@ -310,5 +310,36 @@ class TestRunBenchEvalEndToEnd(unittest.TestCase):
         self.assertEqual(len(jsonl.strip().splitlines()), 1)
 
 
+class TestBenchEvalCLI(unittest.TestCase):
+    def test_parser_accepts_all_flags(self):
+        from sglang.bench_eval import build_parser
+
+        args = build_parser().parse_args([
+            "--task", "gsm8k",
+            "--base-url", "http://localhost:30000",
+            "--backend", "sglang-oai",
+            "--model", "mock",
+            "--tokenizer", "mock",
+            "--num-fewshot", "5",
+            "--limit", "10",
+            "--max-gen-toks", "512",
+            "--request-rate", "8.0",
+            "--max-concurrency", "16",
+            "--apply-chat-template",
+            "--enable-thinking",
+            "--fewshot-as-multiturn",
+            "--output-file", "out.jsonl",
+            "--include-per-doc",
+        ])
+        self.assertEqual(args.task, "gsm8k")
+        self.assertEqual(args.num_fewshot, 5)
+        self.assertEqual(args.max_gen_toks, 512)
+        self.assertTrue(args.apply_chat_template)
+        self.assertTrue(args.enable_thinking)
+        self.assertTrue(args.fewshot_as_multiturn)
+        self.assertTrue(args.include_per_doc)
+        self.assertAlmostEqual(args.request_rate, 8.0)
+
+
 if __name__ == "__main__":
     unittest.main()
