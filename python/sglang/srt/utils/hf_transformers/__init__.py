@@ -20,10 +20,11 @@ path ``sglang.srt.utils.hf_transformers_utils`` is preserved by a
 separate shim module.
 """
 
-from .compat import apply_all as _apply_compat
+from ..hf_transformers_patches import apply_all as _apply_hf_patches
 
-_apply_compat()
+_apply_hf_patches()
 
+from ..hf_transformers_patches import normalize_rope_scaling_compat  # noqa: E402
 from .common import (  # noqa: E402
     CONTEXT_LENGTH_KEYS,
     AutoConfig,
@@ -37,7 +38,6 @@ from .common import (  # noqa: E402
     get_sparse_attention_config,
     get_tokenizer_from_processor,
 )
-from .compat import normalize_rope_scaling_compat  # noqa: E402
 from .config import get_config  # noqa: E402
 from .processor import get_processor  # noqa: E402
 from .tokenizer import (  # noqa: E402
