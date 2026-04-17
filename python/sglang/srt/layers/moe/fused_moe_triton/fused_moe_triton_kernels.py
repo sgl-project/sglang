@@ -555,6 +555,9 @@ def fused_moe_kernel(
         else:
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
 
+        if swap_ab:
+            a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
+
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -566,7 +569,6 @@ def fused_moe_kernel(
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
                 if swap_ab:
-                    a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
                     a_scale, b_scale = b_scale, a_scale
                 if BLOCK_SIZE_N > group_n:
                     accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
@@ -574,8 +576,6 @@ def fused_moe_kernel(
                     accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
             else:
                 if use_fp8_w8a8:
-                    if swap_ab:
-                        a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
                     accumulator = tl.dot(a, b, acc=accumulator)
                 else:
                     accumulator += tl.dot(a, b)
@@ -734,8 +734,8 @@ def invoke_fused_moe_kernel(
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
-
-    if use_fp8_w8a8:
+    use_bf16 = A.dtype == torch.bfloat16
+    if use_fp8_w8a8 or use_bf16:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
     else:
         swap_ab = False
