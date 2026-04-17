@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from sglang.multimodal_gen.test.server.testcase_configs import (
+from sglang.multimodal_gen.test.server.gpu_cases import (
     ONE_GPU_CASES,
     TWO_GPU_CASES,
-    DiffusionTestCase,
 )
+from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 
 def _select_accuracy_cases(
