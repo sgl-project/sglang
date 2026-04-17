@@ -140,6 +140,25 @@ class TestShouldRecoverStreamState(CustomTestCase):
         s = self._state(finish_reason={"type": "stop"})
         self.assertFalse(should_recover_stream_state(s))
 
+    def test_no_trigger_when_tool_branch_yielded_content(self):
+        # Regression for: tools offered with tool_choice="auto", reasoning
+        # produced, then the model produced real content (no tool call). The
+        # content delta is yielded via _process_tool_call_stream, and the
+        # caller MUST feed it back into state["content_text"] via
+        # update_stream_state_with_content — otherwise Fallback B would
+        # spuriously trigger a follow-up generation and the client would see
+        # a double-response. This test encodes the contract that updating
+        # content_text from the tool branch is sufficient to suppress
+        # recovery.
+        s = self._state(
+            reasoning_text="thinking about it",
+            finish_reason={"type": "stop"},
+        )
+        update_stream_state_with_content(s, "real answer part 1 ")
+        update_stream_state_with_content(s, "part 2")
+        self.assertEqual(s["content_text"], "real answer part 1 part 2")
+        self.assertFalse(should_recover_stream_state(s))
+
 
 class TestIsStreamRecoveryEnabledForRequest(CustomTestCase):
     def _handler(self, server_default, parser_name="qwen3"):
