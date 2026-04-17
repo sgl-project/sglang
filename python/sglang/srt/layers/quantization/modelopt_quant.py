@@ -2185,6 +2185,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             flashinfer_cutedsl_moe_masked,
         )
 
+        # flashinfer_cutedsl_moe_masked reinterprets the scale tensor as
+        # float8_e4m3fn, which requires stride(-1)==1.  Catch violating
+        # DeepEP layouts (e.g. int32-packed UE8M0 scales) early.
+        if MOE_NVFP4_DISPATCH and x[1] is not None:
+            assert x[1].stride(-1) == 1, (
+                f"NVFP4 dispatch scale tensor has stride(-1)={x[1].stride(-1)}, "
+                f"dtype={x[1].dtype}; expected 1 for .view(float8_e4m3fn). "
+                "Try SGLANG_MOE_NVFP4_DISPATCH=0 or check DeepEP version."
+            )
+
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
             layer, "down_gemm_overlap_args", None
         )
