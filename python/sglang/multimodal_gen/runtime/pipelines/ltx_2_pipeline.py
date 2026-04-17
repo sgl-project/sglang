@@ -283,11 +283,24 @@ class LTX2TwoStageDeviceManager:
 
     Modes:
     - resident: keep both DiTs on GPU; phase switch is pointer rebinding only.
-    - snapshot: keep CPU snapshots and prefetch the target DiT with async H2D. The dit_1 will always be kept a replica in CPU
-    - legacy: disable premerged stage-2 path and fall back to LoRA hot-switch.
+    - snapshot: keep CPU snapshots and prefetch the target DiT (DiT2 with pre-merged LoRA) with async H2D (similar to dit layerwise offload).
+      The DiT_1 will always be kept a replica in CPU.
+      - default snapshot behavior: allow stage1/stage2 overlap by prefetching
+        stage2 while stage1 is still running.
+      - snapshot low-VRAM behavior (`_snapshot_low_vram_mode=True`): evict
+        stage1 before stage2 prefetch and disable early overlap prefetch to
+        reduce peak VRAM, at the cost of higher phase-switch latency.
+      - default toggle: low-VRAM auto-enables on H100-like (<130 GiB) CUDA
+        GPUs, and stays disabled by default on higher-memory GPUs. It can be
+        overridden with `SGLANG_LTX2_SNAPSHOT_LOW_VRAM_MODE`.
+    - original: official two-stage semantics without premerged stage-2.
+      (legacy alias is still accepted for compatibility)
     """
 
-    VALID_MODES = ("legacy", "snapshot", "resident")
+    VALID_MODES = ("original", "snapshot", "resident")
+    MODE_ALIASES = {
+        "legacy": "original",
+    }
 
     def __init__(self, pipeline: "LTX2TwoStagePipeline", server_args: ServerArgs):
         self.pipeline = pipeline
@@ -337,6 +350,7 @@ class LTX2TwoStageDeviceManager:
         if mode is None:
             env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
             mode = env_mode.lower() if env_mode else "snapshot"
+        mode = cls.MODE_ALIASES.get(mode, mode)
         if mode not in cls.VALID_MODES:
             raise ValueError(
                 f"Invalid ltx2_two_stage_device_mode={mode!r}. "
@@ -352,7 +366,7 @@ class LTX2TwoStageDeviceManager:
         users did not explicitly provide a stage-1 LoRA path
         """
         return (
-            self.mode != "legacy"
+            self.mode != "original"
             and self.pipeline._should_merge_stage2_distilled_lora(self.server_args)
             and getattr(self.pipeline, "_stage1_lora_path", None) is None
         )
@@ -661,7 +675,9 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._device_manager = LTX2TwoStageDeviceManager(self, self.server_args)
-        self._use_premerged_stage2_transformer = self._device_manager.should_use_premerged
+        self._use_premerged_stage2_transformer = (
+            self._device_manager.should_use_premerged
+        )
         self._device_manager.initialize()
 
     @staticmethod

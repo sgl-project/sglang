@@ -72,9 +72,23 @@ logger = init_logger(__name__)
 # our validated Wan/MOVA workloads, so use a 130 GiB cutoff to keep H200-class
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
-LTX2_TWO_STAGE_DEVICE_MODES = ("legacy", "snapshot", "resident")
+LTX2_TWO_STAGE_DEVICE_MODE_ALIASES = {
+    "legacy": "original",
+}
+LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+LTX2_TWO_STAGE_DEVICE_MODES_WITH_ALIASES = (
+    *LTX2_TWO_STAGE_DEVICE_MODES,
+    *LTX2_TWO_STAGE_DEVICE_MODE_ALIASES.keys(),
+)
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+
+
+def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    mode = mode.lower()
+    return LTX2_TWO_STAGE_DEVICE_MODE_ALIASES.get(mode, mode)
 
 
 class Backend(str, Enum):
@@ -398,10 +412,12 @@ class ServerArgs(DisaggArgsMixin):
         if mode is None:
             env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
             mode = (
-                env_mode.lower()
+                _normalize_ltx2_two_stage_device_mode(env_mode)
                 if env_mode
                 else self._resolve_default_ltx2_two_stage_device_mode()
             )
+        else:
+            mode = _normalize_ltx2_two_stage_device_mode(mode)
 
         if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
             raise ValueError(
@@ -959,13 +975,14 @@ class ServerArgs(DisaggArgsMixin):
         parser.add_argument(
             "--ltx2-two-stage-device-mode",
             type=str,
-            choices=LTX2_TWO_STAGE_DEVICE_MODES,
+            choices=LTX2_TWO_STAGE_DEVICE_MODES_WITH_ALIASES,
             default=ServerArgs.ltx2_two_stage_device_mode,
             help=(
                 "LTX-2.3 two-stage device residency mode: "
-                "'legacy' disables premerged stage2, "
+                "'original' keeps official two-stage semantics without premerged stage2, "
                 "'snapshot' keeps premerged stage2 with snapshot-based release, "
                 "'resident' keeps both transformers resident on GPU. "
+                "Legacy alias: 'legacy' -> 'original'. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
             ),
         )
