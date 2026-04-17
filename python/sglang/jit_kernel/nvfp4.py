@@ -409,9 +409,7 @@ def silu_and_mul_scaled_fp4_experts_quant_packed(
     m_numtopk, k_input_doubled = input_tensor.shape
     k = k_input_doubled // 2
 
-    max_tokens_per_expert = int(
-        os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536)
-    )
+    max_tokens_per_expert = int(os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536))
     assert m_numtopk <= max_tokens_per_expert * topk, (
         f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT({max_tokens_per_expert})"
         f" for cutlass_moe_fp4, observed m_numtopk = {m_numtopk}. Use"
