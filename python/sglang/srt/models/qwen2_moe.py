@@ -66,6 +66,8 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputCheck
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    get_mxfp4_first_idle_rank,
+    get_shared_expert_tp_params,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -85,6 +87,8 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.distributed.parallel_state import get_moe_tensor_parallel_rank
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -271,10 +275,35 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
+        self._moe_tp_rank = get_moe_tensor_parallel_rank()
         if (
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         ):
+            # Idle-rank optimization: with MXFP4 + large TP (PR#21097), ranks in
+            # the upper half of the TP group receive all-zero routed expert weights.
+            # When that is the case we shard the shared expert across the upper half
+            # only; _init_idle_rank() nullifies it on active (lower-half) ranks.
+            # When no idle ranks exist (normal TP or large intermediate_size) we
+            # use full TP sharding so all ranks compute the shared expert normally.
+            _inter_per_rank = config.shared_expert_intermediate_size // self.tp_size
+            _is_mxfp4 = (
+                _use_aiter
+                and isinstance(quant_config, QuarkConfig)
+                and quant_config.is_mxfp4_moe()
+            )
+            _first_idle_rank = (
+                get_mxfp4_first_idle_rank(_inter_per_rank, self.tp_size, is_aiter_moe=True)
+                if _is_mxfp4
+                else self.tp_size
+            )
+            self._has_idle_ranks = _first_idle_rank < self.tp_size
+            _se_tp_rank, _se_tp_size = get_shared_expert_tp_params(
+                moe_tp_rank=self._moe_tp_rank,
+                tp_size=self.tp_size,
+                is_deepep=get_moe_a2a_backend().is_deepep(),
+                first_idle_rank=_first_idle_rank,
+            )
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -282,14 +311,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=add_prefix("shared_expert", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    else {}
-                ),
+                tp_rank=_se_tp_rank,
+                tp_size=_se_tp_size,
             )
+            # Lazy nullification on active ranks (only needed when idle ranks exist)
+            self._idle_rank_initialized = not self._has_idle_ranks
         else:
             self.shared_expert = None
+            self._has_idle_ranks = False
+            self._idle_rank_initialized = True  # nothing to initialize
         if _is_cpu and _is_cpu_amx_available:
             self.shared_expert_gate = ReplicatedLinear(
                 config.hidden_size,
@@ -356,6 +386,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_ids=fused_topk_ids,
             router_logits=topk_output.router_logits,
         )
+
+    def _init_idle_rank(self) -> None:
+        """Called once after weight loading. Nullify shared_expert on active ranks.
+
+        Active ranks (lower TP half) have non-zero routed expert weights and handle
+        the fused MoE kernel. Idle ranks (upper TP half) have all-zero routed expert
+        weights (PR#21097 padding effect) and run the shared expert only.
+        """
+        is_idle = getattr(self.experts, "is_idle_rank", False)
+        if not is_idle:
+            self.shared_expert = None
+        self._idle_rank_initialized = True
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         shared_output = None
@@ -442,6 +484,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if not self._idle_rank_initialized:
+            self._init_idle_rank()
 
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)

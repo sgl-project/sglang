@@ -373,6 +373,7 @@ class RoutingMethodType(IntEnum):
 
 AITER_PADDING_SIZE = 128
 TRITON_PADDING_SIZE = 128
+align_moe = lambda n, alignment: ((n + alignment - 1) // alignment) * alignment
 
 
 # Unit of padding - context dependent
@@ -403,11 +404,10 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
 
     if is_aiter_moe:
         padding_size = get_moe_padding_size(True)
-        align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
         is_padded = (w2_down_dim % padding_size) > 0
         if is_padded:
             # w2_down_dim, padding & aligned, unit: parameter dtype
-            w2_down_dim = align_aiter(w2_down_dim)
+            w2_down_dim = align_moe(w2_down_dim, padding_size)
         # up proj + gate fusion : 2x
         if is_concat:
             w13_up_dim = w2_down_dim * 2
@@ -417,3 +417,41 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+def get_mxfp4_first_idle_rank(inter_dim: int, tp_size: int, is_aiter_moe: bool) -> int:
+    if not is_aiter_moe or tp_size < 2:
+        return tp_size
+
+    padding_size = get_moe_padding_size(True)
+    w2_down_dim = inter_dim // 2
+    if w2_down_dim % padding_size == 0:
+        return tp_size
+
+    w2_down_dim_padded = align_moe(w2_down_dim, padding_size)
+    total_real = w2_down_dim * tp_size
+    first_idle = (total_real + w2_down_dim_padded - 1) // w2_down_dim_padded
+    return min(first_idle, tp_size)
+
+
+def has_mxfp4_idle_ranks(inter_dim: int, tp_size: int, is_aiter_moe: bool) -> bool:
+    return get_mxfp4_first_idle_rank(inter_dim, tp_size, is_aiter_moe) < tp_size
+
+
+def get_shared_expert_tp_params(
+    moe_tp_rank: int,
+    tp_size: int,
+    is_deepep: bool,
+    first_idle_rank: int,
+):
+    if is_deepep:
+        return 0, 1
+    if tp_size < 2:
+        return None, None
+    if first_idle_rank >= tp_size:
+        return moe_tp_rank, tp_size
+    num_idle = tp_size - first_idle_rank
+    if moe_tp_rank >= first_idle_rank:
+        return moe_tp_rank - first_idle_rank, num_idle
+    else:
+        return moe_tp_rank, tp_size
