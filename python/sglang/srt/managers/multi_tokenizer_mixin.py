@@ -35,6 +35,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -43,7 +44,6 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -400,7 +400,7 @@ class TokenizerWorker(TokenizerManager):
             self.server_args.disaggregation_transfer_backend
         )
         # Communicator
-        self.register_multi_tokenizer_communicator = _Communicator(
+        self.register_multi_tokenizer_communicator = FanOutCommunicator(
             self.send_to_scheduler, 2
         )
 
