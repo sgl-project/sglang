@@ -173,12 +173,16 @@ class TestBenchServing1GPUPart2(CustomTestCase):
                 )
 
             self.assertEqual(res["successful_requests"], res["total_requests"])
-            bounds = {
-                10: (60, 65),
-                25: (115, 120),
-                50: (190, 195),
-            }
-            avg_latency_bound, p95_latency_bound = bounds.get(batch_size, (250, 250))
+            # relax for mi300x
+            if is_in_amd_ci():
+                bounds = {10: (80, 90), 25: (140, 150), 50: (230, 240)}
+                default_bounds = (300, 300)
+            else:
+                bounds = {10: (60, 65), 25: (115, 120), 50: (190, 195)}
+                default_bounds = (250, 250)
+            avg_latency_bound, p95_latency_bound = bounds.get(
+                batch_size, default_bounds
+            )
             self.assertLess(res["avg_latency_ms"], avg_latency_bound)
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
 
