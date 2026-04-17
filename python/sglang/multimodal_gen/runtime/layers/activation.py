@@ -97,6 +97,9 @@ class NewGELU(CustomOp):
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         c = math.sqrt(2.0 / math.pi)
@@ -110,6 +113,9 @@ class QuickGELU(CustomOp):
         super().__init__()
 
     def forward_cuda(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
+
+    def forward_xpu(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:

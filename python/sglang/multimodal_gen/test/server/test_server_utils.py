@@ -179,6 +179,9 @@ class ServerContext:
             # Clean up downloaded models if HF cache is not persistent
             # This prevents disk exhaustion in CI when cache is not mounted
             self._cleanup_hf_cache_if_not_persistent()
+        else:
+            # Give the runtime a brief cooldown after server shutdown.
+            time.sleep(2)
 
     def _cleanup_hf_cache_if_not_persistent(self) -> None:
         """Clean up HF cache if it's not on a persistent volume.
