@@ -63,6 +63,28 @@ def select_sd3_vae_weight_files(
     return safetensors_list
 
 
+def select_sd3_text_encoder_weight_files(
+    safetensors_list: list[str],
+    component_model_path: str,
+    component_name: str,
+    text_encoder_precision: str,
+) -> list[str]:
+    """Pick one SD3 CLIP precision variant when checkpoints ship duplicates."""
+    if component_name not in ("text_encoder", "text_encoder_2"):
+        return safetensors_list
+
+    base_name = "model"
+    if text_encoder_precision == "fp16":
+        fp16_path = os.path.join(component_model_path, f"{base_name}.fp16.safetensors")
+        if os.path.exists(fp16_path):
+            return [fp16_path]
+
+    full_path = os.path.join(component_model_path, f"{base_name}.safetensors")
+    if os.path.exists(full_path):
+        return [full_path]
+    return safetensors_list
+
+
 @dataclass
 class SD3CLIPTextArchConfig(CLIPTextArchConfig):
     def __post_init__(self) -> None:
@@ -163,6 +185,20 @@ class StableDiffusion3PipelineConfig(SpatialImagePipelineConfig):
             component_model_path=component_model_path,
             component_name=component_name,
             vae_precision=vae_precision,
+        )
+
+    def select_text_encoder_weight_files(
+        self,
+        safetensors_list: list[str],
+        component_model_path: str,
+        component_name: str,
+        text_encoder_precision: str,
+    ) -> list[str]:
+        return select_sd3_text_encoder_weight_files(
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+            component_name=component_name,
+            text_encoder_precision=text_encoder_precision,
         )
 
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:

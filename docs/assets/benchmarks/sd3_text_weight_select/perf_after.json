@@ -1,0 +1,97 @@
+{
+  "timestamp": "2026-04-17T19:26:10.640636+00:00",
+  "request_id": "9d11dbbd-3c39-4774-aef5-b2369694818f",
+  "commit_hash": "5d4e899477adb5934459eb05f264d31de11fb984",
+  "tag": "cli_generate",
+  "total_duration_ms": 616.106686880812,
+  "steps": [
+    {
+      "name": "InputValidationStage",
+      "duration_ms": 0.03046286292374134
+    },
+    {
+      "name": "TextEncodingStage",
+      "duration_ms": 79.20628506690264
+    },
+    {
+      "name": "SD3ConditioningStage",
+      "duration_ms": 0.15214900486171246
+    },
+    {
+      "name": "TimestepPreparationStage",
+      "duration_ms": 0.20890100859105587
+    },
+    {
+      "name": "LatentPreparationStage",
+      "duration_ms": 0.06446684710681438
+    },
+    {
+      "name": "DenoisingStage",
+      "duration_ms": 483.9705100748688
+    },
+    {
+      "name": "DecodingStage",
+      "duration_ms": 3.901703981682658
+    }
+  ],
+  "denoise_steps_ms": [
+    {
+      "step": 0,
+      "duration_ms": 49.10356900654733
+    },
+    {
+      "step": 1,
+      "duration_ms": 48.01335604861379
+    },
+    {
+      "step": 2,
+      "duration_ms": 48.094725934788585
+    },
+    {
+      "step": 3,
+      "duration_ms": 48.00448706373572
+    },
+    {
+      "step": 4,
+      "duration_ms": 48.09884005226195
+    },
+    {
+      "step": 5,
+      "duration_ms": 48.064458183944225
+    },
+    {
+      "step": 6,
+      "duration_ms": 48.13059605658054
+    },
+    {
+      "step": 7,
+      "duration_ms": 47.89471789263189
+    },
+    {
+      "step": 8,
+      "duration_ms": 48.04784199222922
+    },
+    {
+      "step": 9,
+      "duration_ms": 48.38048689998686
+    }
+  ],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 25268.88,
+      "reserved_mb": 27780.0,
+      "peak_allocated_mb": 25268.88,
+      "peak_reserved_mb": 27780.0
+    },
+    "after_forward": {
+      "allocated_mb": 25282.42,
+      "reserved_mb": 27780.0,
+      "peak_allocated_mb": 26497.93,
+      "peak_reserved_mb": 27780.0
+    }
+  },
+  "meta": {
+    "prompt": "A detailed studio photo of a red vintage robot holding a sunflower, soft natural light, 35mm",
+    "model": "/root/.cache/huggingface/hub/models--ckpt--stable-diffusion-3.5-medium/snapshots/e40d4eb633c3afe53cb550f8e9b589972226fc61"
+  }
+}

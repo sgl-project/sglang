@@ -3,7 +3,7 @@ import glob
 import os
 import re
 from collections.abc import Generator, Iterable
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -67,6 +67,10 @@ class TextEncoderLoader(ComponentLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
+        pipeline_config: Any | None = None
+        component_name: str | None = None
+        text_encoder_precision: str | None = None
+
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.text_encoder_cpu_offload
         if not should_offload:
@@ -105,15 +109,16 @@ class TextEncoderLoader(ComponentLoader):
 
     def _prepare_weights(
         self,
-        model_name_or_path: str,
-        fall_back_to_pt: bool,
-        allow_patterns_overrides: list[str] | None,
+        source: "Source",
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
         # model_name_or_path = (self._maybe_download_from_modelscope(
         #     model_name_or_path, revision) or model_name_or_path)
+        model_name_or_path = source.model_or_path
+        fall_back_to_pt = source.fall_back_to_pt
+        allow_patterns_overrides = source.allow_patterns_overrides
 
         is_local = os.path.isdir(model_name_or_path)
         assert is_local, "Model path must be a local directory"
@@ -142,6 +147,20 @@ class TextEncoderLoader(ComponentLoader):
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
             )
+            selector = getattr(
+                source.pipeline_config, "select_text_encoder_weight_files", None
+            )
+            if (
+                selector is not None
+                and source.component_name is not None
+                and source.text_encoder_precision is not None
+            ):
+                hf_weights_files = selector(
+                    safetensors_list=hf_weights_files,
+                    component_model_path=hf_folder,
+                    component_name=source.component_name,
+                    text_encoder_precision=source.text_encoder_precision,
+                )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -162,9 +181,7 @@ class TextEncoderLoader(ComponentLoader):
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path,
-            source.fall_back_to_pt,
-            source.allow_patterns_overrides,
+            source,
         )
         if use_safetensors:
             weights_iterator = safetensors_weights_iterator(
@@ -182,12 +199,18 @@ class TextEncoderLoader(ComponentLoader):
         model: nn.Module,
         model_path: str,
         to_cpu: bool,
+        server_args: ServerArgs,
+        component_name: str,
+        text_encoder_precision: str,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         primary_weights = TextEncoderLoader.Source(
             model_path,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+            pipeline_config=server_args.pipeline_config,
+            component_name=component_name,
+            text_encoder_precision=text_encoder_precision,
         )
         yield from self._get_weights_iterator(
             primary_weights,
@@ -240,6 +263,7 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config,
             server_args,
             encoder_dtype,
+            component_name=component_name,
             cpu_offload_flag=cpu_offload_flag,
         )
 
@@ -271,6 +295,7 @@ class TextEncoderLoader(ComponentLoader):
         model_config: EncoderConfig,
         server_args: ServerArgs,
         dtype: str = "fp16",
+        component_name: str = "text_encoder",
         cpu_offload_flag: bool | None = None,
     ):
         # Determine CPU offload behavior and target device
@@ -306,6 +331,9 @@ class TextEncoderLoader(ComponentLoader):
                     model,
                     model_path,
                     to_cpu=should_offload,
+                    server_args=server_args,
+                    component_name=component_name,
+                    text_encoder_precision=dtype,
                 )
             )
 
