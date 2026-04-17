@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.communicator import (
@@ -58,6 +59,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2AttentionMLA,
@@ -178,7 +180,12 @@ class Glm4MoeLiteGate(nn.Module):
             torch.empty((config.n_routed_experts), dtype=torch.float32)
         )
 
-    def forward(self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None):
+    def forward(
+        self,
+        hidden_states,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        forward_batch: ForwardBatch = None,
+    ):
         # NOTE: For some unknown reason, router_gemm seems degrade accept length.
         if (
             _is_cuda
@@ -445,7 +452,11 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm4MoeLiteDecoderLayer(
