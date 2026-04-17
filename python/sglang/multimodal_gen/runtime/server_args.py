@@ -6,7 +6,6 @@
 
 import argparse
 import dataclasses
-import inspect
 import json
 import math
 import os
@@ -23,7 +22,13 @@ import yaml
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
+    DisaggArgsMixin,
+    add_disagg_cli_args,
+    convert_disagg_role_string,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -37,6 +42,11 @@ from sglang.multimodal_gen.runtime.utils.common import (
     is_valid_ipv6_address,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    CYAN,
+    GREEN,
+    RED,
+    RESET,
+    _sanitize_for_logging,
     configure_logger,
     init_logger,
 )
@@ -48,118 +58,17 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
-
-def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
-    """Return (is_tensor, torch_module_or_None) without importing torch at module import time."""
-    try:
-        import torch  # type: ignore
-
-        return isinstance(obj, torch.Tensor), torch
-    except Exception:
-        return False, None
-
-
-def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
-    """Recursively convert objects to JSON-serializable forms for concise logging.
-
-    Rules:
-    - Drop any field/dict key named 'param_names_mapping'.
-    - Render Enums using their value.
-    - Render torch.Tensor as a compact summary; if key name is 'scaling_factor', include stats.
-    - Dataclasses are expanded to dicts and sanitized recursively.
-    - Callables/functions are rendered as their qualified name.
-    - Redact sensitive fields like 'prompt' and 'negative_prompt' (only show length).
-    - Fallback to str(...) for unknown types.
-    """
-    # Handle simple types quickly
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        # redact sensitive prompt fields
-        if key_hint in ("prompt", "negative_prompt"):
-            if isinstance(obj, str):
-                return f"<redacted, len={len(obj)}>"
-        return obj
-
-    # Enum -> value for readability
-    if isinstance(obj, Enum):
-        return obj.value
-
-    # torch.Tensor handling (lazy import)
-    is_tensor, torch_mod = _is_torch_tensor(obj)
-    if is_tensor:
-        try:
-            ten = obj.detach().cpu()
-            if key_hint == "scaling_factor":
-                # Provide a compact, single-line summary for scaling_factor
-                stats = {
-                    "shape": list(ten.shape),
-                    "dtype": str(ten.dtype),
-                }
-                # Stats might fail for some dtypes; guard individually
-                try:
-                    stats["min"] = float(ten.min().item())
-                except Exception:
-                    pass
-                try:
-                    stats["max"] = float(ten.max().item())
-                except Exception:
-                    pass
-                try:
-                    stats["mean"] = float(ten.float().mean().item())
-                except Exception:
-                    pass
-                return {"tensor": "scaling_factor", **stats}
-            # Generic tensor summary
-            return {"tensor": True, "shape": list(ten.shape), "dtype": str(ten.dtype)}
-        except Exception:
-            return "<tensor>"
-
-    # Dataclasses -> dict
-    if dataclasses.is_dataclass(obj):
-        result: dict[str, Any] = {}
-        for f in dataclasses.fields(obj):
-            if not f.repr:
-                continue
-            name = f.name
-            if "names_mapping" in name:  # drop noisy mappings
-                continue
-            try:
-                value = getattr(obj, name)
-            except Exception:
-                continue
-            result[name] = _sanitize_for_logging(value, key_hint=name)
-        return result
-
-    # Dicts -> sanitize keys/values; drop 'param_names_mapping'
-    if isinstance(obj, dict):
-        result_dict: dict[str, Any] = {}
-        for k, v in obj.items():
-            try:
-                key_str = str(k)
-            except Exception:
-                key_str = "<key>"
-            if key_str == "param_names_mapping":
-                continue
-            result_dict[key_str] = _sanitize_for_logging(v, key_hint=key_str)
-        return result_dict
-
-    # Sequences/Sets -> list
-    if isinstance(obj, (list, tuple, set)):
-        return [_sanitize_for_logging(x, key_hint=key_hint) for x in obj]
-
-    # Functions / Callables -> qualified name
-    try:
-        if inspect.isroutine(obj) or inspect.isclass(obj):
-            module = getattr(obj, "__module__", "")
-            qn = getattr(obj, "__qualname__", getattr(obj, "__name__", "<callable>"))
-            return f"{module}.{qn}" if module else qn
-    except Exception:
-        pass
-
-    # Fallback: string representation
-    try:
-        return str(obj)
-    except Exception:
-        return "<unserializable>"
+# Derived from single-H200 benchmarking (~140.4 GiB total) at the maximum
+# supported 720p workloads with dit_layerwise_offload=False and
+# num_inference_steps=1:
+# - Wan-AI/Wan2.2-T2V-A14B-Diffusers, 1280x720, 81 frames:
+#   peak_reserved=108076 MB (~105.5 GiB), peak_allocated=97665 MB (~95.4 GiB)
+# - OpenMOSS-Team/MOVA-720p, 1280x720, 193 frames:
+#   peak_reserved=130264 MB (~127.2 GiB), peak_allocated=108819 MB (~106.3 GiB)
+# Also, on H200, enabling dit_layerwise_offload regressed latency noticeably on
+# our validated Wan/MOVA workloads, so use a 130 GiB cutoff to keep H200-class
+# GPUs on the faster no-offload default while preserving some headroom.
+WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 
 
 class Backend(str, Enum):
@@ -191,7 +100,7 @@ class Backend(str, Enum):
 
 
 @dataclasses.dataclass
-class ServerArgs:
+class ServerArgs(DisaggArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
 
@@ -227,8 +136,8 @@ class ServerArgs:
     dp_size: int = 1
     # number of gpu in a dp group
     dp_degree: int = 1
-    # cfg parallel
-    enable_cfg_parallel: bool = False
+    # cfg parallel (None = auto-decide based on num_gpus)
+    enable_cfg_parallel: Optional[bool] = None
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -246,6 +155,7 @@ class ServerArgs:
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
@@ -285,8 +195,7 @@ class ServerArgs:
     )
 
     # Master port for distributed inference
-    # TODO: do not hard code
-    master_port: int | None = None
+    master_port: int = 30005
 
     # http server endpoint config
     host: str | None = "127.0.0.1"
@@ -297,6 +206,9 @@ class ServerArgs:
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+
+    # Strict port mode: fail if requested port is unavailable instead of auto-selecting
+    strict_ports: bool = False
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
@@ -324,8 +236,34 @@ class ServerArgs:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # Disaggregation — fields defined here, methods in DisaggArgsMixin,
+    # CLI registration in disagg_args.add_disagg_cli_args().
+    base_gpu_id: int = 0
+    disagg_role: RoleType = RoleType.MONOLITHIC
+    disagg_timeout: int = 600
+    disagg_dispatch_policy: str = "round_robin"
+    disagg_mode: bool = False
+    disagg_server_addr: str | None = None
+    encoder_urls: str | None = None
+    denoiser_urls: str | None = None
+    decoder_urls: str | None = None
+    encoder_tp: int | None = None
+    denoiser_tp: int | None = None
+    denoiser_sp: int | None = None
+    denoiser_ulysses: int | None = None
+    denoiser_ring: int | None = None
+    decoder_tp: int | None = None
+    disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_p2p_hostname: str = "127.0.0.1"
+    disagg_ib_device: str | None = None
+    pool_work_endpoint: str | None = None
+    pool_result_endpoint: str | None = None
+
     # Logging
     log_level: str = "info"
+    uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
+
+    # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
     def broker_port(self) -> int:
@@ -371,27 +309,20 @@ class ServerArgs:
             self.input_save_path = None
 
     def _adjust_quant_config(self):
-        """validate and adjust"""
+        """
+        resolve, validate and adjust quantization config
 
-        # nunchaku
+        handles only nunchaku for now
+        """
+
         ncfg = self.nunchaku_config
         if ncfg is None or isinstance(ncfg, NunchakuConfig):
             return
-        ncfg.validate()
 
-        # propagate the path to server_args
-        if ncfg.transformer_weights_path:
-            self.transformer_weights_path = ncfg.transformer_weights_path
-
-        if not ncfg.enable_svdquant or not ncfg.transformer_weights_path:
-            self.nunchaku_config = None
-        else:
-            self.nunchaku_config = NunchakuConfig(
-                precision=self.nunchaku_config.quantization_precision,
-                rank=self.nunchaku_config.quantization_rank,
-                act_unsigned=self.nunchaku_config.quantization_act_unsigned,
-                transformer_weights_path=self.nunchaku_config.transformer_weights_path,
-            )
+        resolution = ncfg.resolve_runtime_config()
+        if resolution.transformer_weights_path:
+            self.transformer_weights_path = resolution.transformer_weights_path
+        self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
         # enable parallel folding when SP is enabled
@@ -475,6 +406,21 @@ class ServerArgs:
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
+            if (
+                current_platform.is_cuda()
+                and self.pipeline_class_name is None
+                and self.num_gpus == 1
+                and self.tp_size == 1
+                and self.sp_degree == 1
+                and self.ulysses_degree == 1
+                and self.ring_degree == 1
+                and self._is_ltx23_model_path(self.model_path)
+            ):
+                self.attention_backend = "fa"
+                logger.info(
+                    "Automatically set attention_backend=fa for LTX-2.3 one-stage on 1 GPU to preserve precision"
+                )
+                return
             self._set_default_attention_backend()
 
     def _adjust_warmup(self):
@@ -486,25 +432,74 @@ class ServerArgs:
                 "Warmup enabled, the launch time is expected to be longer than usual"
             )
 
+    @staticmethod
+    def _require_port(port: int, name: str) -> None:
+        """Raise if *port* is occupied (used under ``--strict-ports``)."""
+        if not is_port_available(port):
+            raise RuntimeError(
+                f"{name} port {port} is unavailable and --strict-ports is enabled. "
+                f"Either use a different port or disable --strict-ports."
+            )
+
     def _adjust_network_ports(self):
-        self.port = self.settle_port(self.port)
-        initial_scheduler_port = self.scheduler_port + (
-            random.randint(0, 100) if self.scheduler_port == 5555 else 0
+        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
+        # so skip settling the HTTP port to avoid unnecessary port collisions.
+        needs_http = self.disagg_role in (
+            RoleType.MONOLITHIC,
+            RoleType.SERVER,
         )
-        self.scheduler_port = self.settle_port(initial_scheduler_port)
-        initial_master_port = (
-            self.master_port
-            if self.master_port is not None
-            else (30005 + random.randint(0, 100))
-        )
-        self.master_port = self.settle_port(initial_master_port, 37)
+
+        if self.strict_ports:
+            if needs_http:
+                self._require_port(self.port, "HTTP")
+            self._require_port(self.scheduler_port, "Scheduler")
+            if self.master_port is not None:
+                self._require_port(self.master_port, "Master")
+        else:
+            if needs_http:
+                self.port = self.settle_port(self.port)
+            initial_scheduler_port = self.scheduler_port + (
+                random.randint(0, 100) if self.scheduler_port == 5555 else 0
+            )
+            self.scheduler_port = self.settle_port(initial_scheduler_port)
+            self.master_port = self.settle_port(self.master_port, 37)
 
     def _adjust_parallelism(self):
-        if self.tp_size is None:
-            self.tp_size = 1
+        tp_unspecified = self.tp_size is None
+        sp_unspecified = self.sp_degree is None
+        ulysses_unspecified = self.ulysses_degree is None
+        ring_unspecified = self.ring_degree is None
+        cfg_unspecified = self.enable_cfg_parallel is None
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
+
+        if self.tp_size is None:
+            self.tp_size = 1
+
+        # Auto-enable CFG parallel when user hasn't set any parallelism flags
+        # and there are enough GPUs.  Only auto-enable for models whose default
+        # SamplingParams use classifier-free guidance (negative_prompt is not None),
+        # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
+        if cfg_unspecified:
+            cfg_group_size = self.dp_size * self.tp_size * 2
+            if (
+                self.num_gpus >= 2
+                and self.num_gpus % cfg_group_size == 0
+                and sp_unspecified
+                and ulysses_unspecified
+                and ring_unspecified
+                and self._model_default_uses_cfg()
+            ):
+                self.enable_cfg_parallel = True
+                logger.info(
+                    "Automatically enabled CFG parallel for %d GPUs. "
+                    "Use --sp-degree / --ulysses-degree to use sequence "
+                    "parallelism instead.",
+                    self.num_gpus,
+                )
+            else:
+                self.enable_cfg_parallel = False
 
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
@@ -537,6 +532,42 @@ class ServerArgs:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
 
+    def _model_default_uses_cfg(self) -> bool:
+        """
+        Check whether the model uses classifier-free guidance by default.
+
+        CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        """
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(self.model_path, self.backend, self.model_id)
+        if model_info is None:
+            return False
+        default_params = model_info.sampling_param_cls()
+
+        # for ltx2.3, cfg-parallel performs worse than ulysses-sp
+        is_ltx = "ltx" in type(default_params).__name__.lower()
+        if is_ltx:
+            return False
+        return (
+            getattr(default_params, "negative_prompt", None) is not None
+            and getattr(default_params, "guidance_scale", 0) > 1.0
+        )
+
+    @staticmethod
+    def _is_ltx23_model_path(model_path: str | None) -> bool:
+        if not model_path:
+            return False
+        normalized = model_path.lower()
+        return any(
+            token in normalized
+            for token in (
+                "lightricks/ltx-2.3",
+                "models--lightricks--ltx-2.3",
+                "lightricks__ltx-2.3",
+            )
+        )
+
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
             self.use_fsdp_inference = False
@@ -546,15 +577,33 @@ class ServerArgs:
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
             if (
-                ("wan" in pipeline_name_lower or "mova" in pipeline_name_lower)
-                and self.dit_layerwise_offload is None
-                and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
-            ):
-                logger.info(
-                    f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} "
-                    "for low memory and performance balance"
+                "wan" in pipeline_name_lower or "mova" in pipeline_name_lower
+            ) and self.dit_layerwise_offload is None:
+                auto_enable_layerwise_offload = (
+                    current_platform.enable_dit_layerwise_offload_for_wan_by_default()
                 )
-                self.dit_layerwise_offload = True
+                if auto_enable_layerwise_offload and current_platform.is_cuda():
+                    device_total_memory_gb = (
+                        current_platform.get_device_total_memory() / BYTES_PER_GB
+                    )
+                    if (
+                        device_total_memory_gb
+                        >= WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB
+                    ):
+                        logger.info(
+                            "Skipping automatic dit_layerwise_offload for %s on a high-memory CUDA GPU (e.g. H200/B200/B300-class, %.2f GiB total)",
+                            self.pipeline_config.__class__.__name__,
+                            device_total_memory_gb,
+                        )
+                        auto_enable_layerwise_offload = False
+                        self.dit_layerwise_offload = False
+
+                if auto_enable_layerwise_offload:
+                    logger.info(
+                        f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} "
+                        "for low memory and performance balance"
+                    )
+                    self.dit_layerwise_offload = True
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:
@@ -603,6 +652,9 @@ class ServerArgs:
         # configure logger before use
         configure_logger(server_args=self)
 
+        # Convert string disagg_role to enum (from CLI/config)
+        convert_disagg_role_string(self.__dict__)
+
         # 1. adjust parameters
         self._adjust_parameters()
 
@@ -634,6 +686,15 @@ class ServerArgs:
                 "Useful when --model-path is a local directory whose name does not match "
                 "any registered HF repo name. Should be the repo name portion of the HF ID "
                 "(e.g. 'Qwen-Image' for 'Qwen/Qwen-Image')."
+            ),
+        )
+        parser.add_argument(
+            "--pipeline-class-name",
+            type=str,
+            default=ServerArgs.pipeline_class_name,
+            help=(
+                "Override pipeline class selection from model_index.json. "
+                "Must match a registered pipeline_name."
             ),
         )
         # attention
@@ -682,6 +743,7 @@ class ServerArgs:
             default=ServerArgs.num_gpus,
             help="The number of GPUs to use.",
         )
+
         parser.add_argument(
             "--tp-size",
             type=int,
@@ -709,8 +771,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cfg-parallel",
             action="store_true",
-            default=ServerArgs.enable_cfg_parallel,
-            help="Enable cfg parallel.",
+            default=None,
+            help="Enable cfg parallel. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -740,6 +802,9 @@ class ServerArgs:
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
+
+        # Disaggregated diffusion args (defined in disagg_args.py)
+        add_disagg_cli_args(parser)
 
         # Prompt text file for batch processing
         parser.add_argument(
@@ -864,6 +929,12 @@ class ServerArgs:
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--strict-ports",
+            action=StoreBoolean,
+            default=ServerArgs.strict_ports,
+            help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
+        )
+        parser.add_argument(
             "--webui",
             action=StoreBoolean,
             default=ServerArgs.webui,
@@ -908,6 +979,12 @@ class ServerArgs:
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
         )
+        parser.add_argument(
+            "--lora-weight-name",
+            type=str,
+            default=ServerArgs.lora_weight_name,
+            help="Specific safetensors filename to load from a multi-file LoRA repo",
+        )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
 
@@ -917,6 +994,15 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+        parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
         )
         parser.add_argument(
             "--backend",
@@ -984,7 +1070,11 @@ class ServerArgs:
         unknown_args: list[str],
     ) -> tuple[dict[str, str], list[str]]:
         """
-        Extract dynamic ``--<component>-path`` args from unrecognised CLI args.
+        Extract dynamic component path args from unrecognised CLI args.
+
+        Supported forms:
+        - ``--<component>-path /path/to/component``
+        - ``--component-paths.<component> /path/to/component`` (expanded from config)
         """
         component_paths: dict[str, str] = {}
         remaining: list[str] = []
@@ -992,8 +1082,15 @@ class ServerArgs:
         while i < len(unknown_args):
             arg = unknown_args[i]
             key_part = arg.split("=", 1)[0] if "=" in arg else arg
-            if key_part.startswith("--") and key_part.endswith("-path"):
+            component = None
+            if key_part.startswith("--component-paths."):
+                component = key_part[len("--component-paths.") :].replace("-", "_")
+            elif key_part.startswith("--component_paths."):
+                component = key_part[len("--component_paths.") :].replace("-", "_")
+            elif key_part.startswith("--") and key_part.endswith("-path"):
                 component = key_part[2:-5].replace("-", "_")
+
+            if component is not None:
                 if "=" in arg:
                     component_paths[component] = arg.split("=", 1)[1]
                 elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
@@ -1090,6 +1187,9 @@ class ServerArgs:
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
 
+        # Convert disagg_role string to enum if necessary
+        convert_disagg_role_string(kwargs)
+
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
@@ -1167,6 +1267,18 @@ class ServerArgs:
                     "causing shape mismatch errors. "
                     "Please disable either --dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
                 )
+
+            logger.warning(
+                "dit_layerwise_offload is enabled: %slower GPU memory usage%s, but %smay reduce throughput or increase latency%s. "
+                "%sIf you are using multi-GPU deployment and already have enough memory headroom, prefer keeping dit_layerwise_offload disabled.%s "
+                "Please tune this based on your memory headroom and performance target.",
+                GREEN,
+                RESET,
+                RED,
+                RESET,
+                CYAN,
+                RESET,
+            )
 
     def _validate_parallelism(self):
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:

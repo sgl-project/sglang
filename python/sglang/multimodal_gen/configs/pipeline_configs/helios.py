@@ -19,7 +19,8 @@ logger = init_logger(__name__)
 
 
 # Helios UMT5 max sequence length (used for both tokenizer and post-processing padding)
-HELIOS_MAX_SEQUENCE_LENGTH = 226
+# Matches diffusers HeliosPipeline.__call__ default max_sequence_length=512
+HELIOS_MAX_SEQUENCE_LENGTH = 512
 
 
 def umt5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:

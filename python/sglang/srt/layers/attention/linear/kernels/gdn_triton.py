@@ -7,6 +7,9 @@ from sglang.srt.utils import is_cpu, is_npu
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.srt.layers.attention.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_packed_decode,
+    )
     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
@@ -30,6 +33,63 @@ elif is_cpu():
 
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
+
+    supports_packed_decode: bool = not is_cpu() and not is_npu()
+
+    def packed_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_v_heads: int,
+        head_v_dim: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Packed decode fast path: fuse QKV extraction + gating + recurrent
+        update into a single Triton kernel, eliminating intermediate tensors
+        and extra kernel launches.
+
+        Args:
+            mixed_qkv: [B, qkv_dim] packed projection output after conv1d.
+            a, b: [B, HV] gating inputs.
+            A_log: [HV] log-space decay parameter.
+            dt_bias: [HV] time-step bias.
+            scale: attention scale factor (typically head_k_dim ** -0.5).
+            ssm_states: [num_slots, HV, V, K] full state pool.
+            cache_indices: [B] per-request state slot indices.
+            num_v_heads: number of value heads (after TP sharding).
+            head_v_dim: dimension per value head.
+
+        Returns:
+            output tensor of shape [1, B, HV, V] matching the existing
+            decode kernel output layout.
+        """
+        B = mixed_qkv.shape[0]
+        # Packed kernel expects output shape [B, 1, HV, V]
+        out = mixed_qkv.new_empty(B, 1, num_v_heads, head_v_dim)
+
+        fused_recurrent_gated_delta_rule_packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=ssm_states,
+            out=out,
+            ssm_state_indices=cache_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # Convert [B, 1, HV, V] → [1, B, HV, V] to match existing output
+        # layout. transpose() returns a view — zero cost.
+        return out.transpose(0, 1)
 
     def decode(
         self,

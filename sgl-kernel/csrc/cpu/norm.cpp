@@ -10,17 +10,24 @@ void l2norm_kernel_impl(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
     int64_t batch_size,
+    int64_t seq_len,
     int64_t hidden_size,
+    int64_t input_strideB,
+    int64_t input_strideS,
+    int64_t output_strideB,
+    int64_t output_strideS,
     float eps = 1e-5) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
-  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, batch_size * seq_len, 0, [&](int64_t begin, int64_t end) {
+    int64_t bi{0}, si{0};
+    data_index_init(begin, bi, batch_size, si, seq_len);
     for (int64_t i = begin; i < end; ++i) {
       // local ptrs
-      scalar_t* __restrict__ out_ptr = output + i * hidden_size;
-      const scalar_t* __restrict__ input_ptr = input + i * hidden_size;
+      scalar_t* __restrict__ out_ptr = output + bi * output_strideB + si * output_strideS;
+      const scalar_t* __restrict__ input_ptr = input + bi * input_strideB + si * input_strideS;
 
       fVec sum_fvec = fVec(float(0));
       float sum_val = float(0);
@@ -62,17 +69,24 @@ void l2norm_kernel_impl(
         float x_val = static_cast<float>(input_ptr[d]);
         out_ptr[d] = static_cast<scalar_t>(x_val * rsqrt_var);
       }
+      // move to the next index
+      data_index_step(bi, batch_size, si, seq_len);
     }
   });
 }
+
 template <typename scalar_t, typename func_t, typename vec_func_t>
 void rmsnorm_kernel_impl(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
     const scalar_t* __restrict__ weight,
     int64_t batch_size,
+    int64_t seq_len,
     int64_t hidden_size,
-    int64_t input_strideN,
+    int64_t input_strideB,
+    int64_t input_strideS,
+    int64_t output_strideB,
+    int64_t output_strideS,
     const func_t& f,
     const vec_func_t& vf,
     float eps = 1e-5) {
@@ -80,11 +94,13 @@ void rmsnorm_kernel_impl(
   using fVec = at::vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
-  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, batch_size * seq_len, 0, [&](int64_t begin, int64_t end) {
+    int64_t bi{0}, si{0};
+    data_index_init(begin, bi, batch_size, si, seq_len);
     for (int64_t i = begin; i < end; ++i) {
       // local ptrs
-      scalar_t* __restrict__ out_ptr = output + i * hidden_size;
-      const scalar_t* __restrict__ input_ptr = input + i * input_strideN;
+      scalar_t* __restrict__ out_ptr = output + bi * output_strideB + si * output_strideS;
+      const scalar_t* __restrict__ input_ptr = input + bi * input_strideB + si * input_strideS;
 
       fVec sum_fvec = fVec(float(0));
       float sum_val = float(0);
@@ -131,6 +147,8 @@ void rmsnorm_kernel_impl(
         float w_val = static_cast<float>(weight[d]);
         out_ptr[d] = static_cast<scalar_t>(x_val * rsqrt_var * f(w_val));
       }
+      // move to the next index
+      data_index_step(bi, batch_size, si, seq_len);
     }
   });
 }
@@ -222,8 +240,10 @@ void fused_add_rmsnorm_kernel_impl(
     const scalar_t* __restrict__ weight,
     float* __restrict__ buffer,
     int64_t batch_size,
+    int64_t seq_len,
     int64_t hidden_size,
-    int64_t input_strideN,
+    int64_t input_strideB,
+    int64_t input_strideS,
     const func_t& f,
     const vec_func_t& vf,
     float eps = 1e-5) {
@@ -231,13 +251,15 @@ void fused_add_rmsnorm_kernel_impl(
   using fVec = at::vec::Vectorized<float>;
 
   constexpr int kVecSize = bVec::size();
-  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, batch_size * seq_len, 0, [&](int64_t begin, int64_t end) {
+    int64_t bi{0}, si{0};
+    data_index_init(begin, bi, batch_size, si, seq_len);
     int tid = at::get_thread_num();
     float* __restrict__ buffer_ptr = buffer + tid * hidden_size;
 
     for (int64_t i = begin; i < end; ++i) {
       // local ptrs
-      scalar_t* __restrict__ input_ptr = input + i * input_strideN;
+      scalar_t* __restrict__ input_ptr = input + bi * input_strideB + si * input_strideS;
       scalar_t* __restrict__ residual_ptr = residual + i * hidden_size;
 
       fVec sum_fvec = fVec(float(0));
@@ -301,6 +323,8 @@ void fused_add_rmsnorm_kernel_impl(
         float x_val = buffer_ptr[d] * rsqrt_var * static_cast<float>(f(weight[d]));
         input_ptr[d] = x_val;
       }
+      // move to the next index
+      data_index_step(bi, batch_size, si, seq_len);
     }
   });
 }
@@ -388,26 +412,32 @@ void fused_rmsnorm_gated_kernel_impl(
 
 template <typename scalar_t>
 void fused_add_layernorm_kernel_impl(
-    scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
     scalar_t* __restrict__ residual,
     const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
     float* __restrict__ buffer,
     int64_t batch_size,
+    int64_t seq_len,
     int64_t hidden_size,
     int64_t input_strideN,
     float eps = 1e-5) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
-
   constexpr int kVecSize = bVec::size();
-  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
-    int tid = at::get_thread_num();
-    float* __restrict__ buffer_ptr = buffer + tid * hidden_size;
+
+  const bool has_residual{residual != nullptr};
+  const bool has_bias{bias != nullptr};
+  const int64_t parallel_size{batch_size * seq_len};
+  at::parallel_for(0, parallel_size, 0, [&](int64_t begin, int64_t end) {
+    float* __restrict__ buffer_ptr = buffer + at::get_thread_num() * hidden_size;
 
     for (int64_t i = begin; i < end; ++i) {
-      scalar_t* __restrict__ input_ptr = input + i * input_strideN;
+      scalar_t* __restrict__ out_ptr = output + i * hidden_size;
+      const scalar_t* __restrict__ input_ptr = input + i * input_strideN;
       scalar_t* __restrict__ residual_ptr{(scalar_t*)nullptr};
-      if (residual != nullptr) {
+      if (has_residual) {
         residual_ptr = residual + i * hidden_size;
       }
 
@@ -422,7 +452,7 @@ void fused_add_layernorm_kernel_impl(
         fVec x_fvec0, x_fvec1;
         std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
-        if (residual_ptr != nullptr) {
+        if (has_residual) {
           bVec r_bvec = bVec::loadu(residual_ptr + d);
           fVec r_fvec0, r_fvec1;
           std::tie(r_fvec0, r_fvec1) = at::vec::convert_to_float(r_bvec);
@@ -445,7 +475,7 @@ void fused_add_layernorm_kernel_impl(
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
         float x_val = static_cast<float>(input_ptr[d]);
-        if (residual_ptr != nullptr) {
+        if (has_residual) {
           float r_val = static_cast<float>(residual_ptr[d]);
           x_val += r_val;
           residual_ptr[d] = static_cast<scalar_t>(x_val);
@@ -475,7 +505,6 @@ void fused_add_layernorm_kernel_impl(
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
         fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
-
         bVec w_bvec = bVec::loadu(weight + d);
         fVec w_fvec0, w_fvec1;
         std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
@@ -483,14 +512,25 @@ void fused_add_layernorm_kernel_impl(
         x_fvec0 = (x_fvec0 - mean_fvec) * scale_fvec * w_fvec0;
         x_fvec1 = (x_fvec1 - mean_fvec) * scale_fvec * w_fvec1;
 
-        bVec x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        x_bvec.store(input_ptr + d);
+        if (has_bias) {
+          bVec b_bvec = bVec::loadu(bias + d);
+          fVec b_fvec0, b_fvec1;
+          std::tie(b_fvec0, b_fvec1) = at::vec::convert_to_float(b_bvec);
+          x_fvec0 += b_fvec0;
+          x_fvec1 += b_fvec1;
+        }
+
+        bVec o_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        o_bvec.store(out_ptr + d);
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
         float normalized = (buffer_ptr[d] - mean) * rsqrt_var;
         float x_val = normalized * static_cast<float>(weight[d]);
-        input_ptr[d] = static_cast<scalar_t>(x_val);
+        if (has_bias) {
+          x_val += static_cast<float>(bias[d]);
+        }
+        out_ptr[d] = static_cast<scalar_t>(x_val);
       }
     }
   });
@@ -507,25 +547,46 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
   at::Tensor output = at::empty_like(input);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "l2norm_kernel", [&] {
-    l2norm_kernel_impl<scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), batch_size, hidden_size, eps);
+    l2norm_kernel_impl<scalar_t>(
+        output.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        batch_size,
+        1,
+        hidden_size,
+        hidden_size,
+        0,
+        hidden_size,
+        0,
+        eps);
   });
   return output;
 }
 
-// input : {batch_size, hidden_size}
+// input : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
 // weight: {hidden_size}
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   RECORD_FUNCTION("sgl-kernel::rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
-  CHECK_DIM(2, input);
+  int64_t inp_dim{input.dim()};
+  TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "Expected input dim to be 2 or 3, but got ", inp_dim);
   CHECK_DIM(1, weight);
-  CHECK_EQ(input.size(1), weight.size(0));
+  CHECK_EQ(input.size(-1), weight.size(0));
+
   int64_t batch_size = input.size(0);
-  int64_t hidden_size = input.size(1);
+  int64_t seq_len = 1;
+  int64_t hidden_size = input.size(-1);
+  int64_t input_strideB = input.stride(0);
+  int64_t input_strideS = 0;
   at::Tensor output = at::empty_like(input);
-  int64_t input_strideN = input.stride(0);
+  int64_t output_strideB = output.stride(0);
+  int64_t output_strideS = 0;
+  if (inp_dim == 3) {
+    seq_len = input.size(1);
+    input_strideS = input.stride(1);
+    output_strideS = output.stride(1);
+  }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "rmsnorm_kernel", [&] {
     using Vec = at::vec::Vectorized<float>;
@@ -534,8 +595,12 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
         input.data_ptr<scalar_t>(),
         weight.data_ptr<scalar_t>(),
         batch_size,
+        seq_len,
         hidden_size,
-        input_strideN,
+        input_strideB,
+        input_strideS,
+        output_strideB,
+        output_strideS,
         [](float x) { return x; },
         [](Vec x) { return x; },
         eps);
@@ -543,33 +608,52 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   return output;
 }
 
-// input : {batch_size, hidden_size}
+// input : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
 // weight: {hidden_size}
-void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
+// bias  : {hidden_size}
+at::Tensor
+layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::optional<at::Tensor>& bias, double eps) {
   RECORD_FUNCTION("sgl-kernel::layernorm_cpu", std::vector<c10::IValue>({input, weight}));
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
-  CHECK_DIM(2, input);
+  int64_t inp_dim{input.dim()};
+  TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "Expected input dim to be 2 or 3, but got ", inp_dim);
   CHECK_DIM(1, weight);
-  CHECK_EQ(input.size(1), weight.size(0));
-  int64_t batch_size = input.size(0);
-  int64_t hidden_size = input.size(1);
-  int64_t input_strideN = input.stride(0);
+  if (bias.has_value()) {
+    CHECK_DIM(1, bias.value());
+    CHECK_EQ(bias.value().size(0), weight.size(0));
+  }
 
+  int64_t batch_size{input.size(0)}, seq_len{1}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
+  if (inp_dim == 3) {
+    CHECK_EQ(input.size(2), weight.size(0));
+    seq_len = input.size(1);
+    hidden_size = input.size(2);
+    input_strideN = input.stride(1);
+  } else {
+    CHECK_EQ(input.size(1), weight.size(0));
+  }
+
+  at::Tensor output = at::empty_like(input);
   int64_t num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "layernorm_kernel", [&] {
     fused_add_layernorm_kernel_impl<scalar_t>(
+        output.data_ptr<scalar_t>(),
         input.data_ptr<scalar_t>(),
         nullptr,
         weight.data_ptr<scalar_t>(),
+        conditional_data_ptr<scalar_t>(bias),
         buffer.data_ptr<float>(),
         batch_size,
+        seq_len,
         hidden_size,
         input_strideN,
         eps);
   });
+  return output;
 }
 
 at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
@@ -584,6 +668,7 @@ at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) 
   int64_t hidden_size = input.size(1);
   at::Tensor output = at::empty_like(input);
   int64_t input_strideN = input.stride(0);
+  int64_t output_strideN = output.stride(0);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma_rmsnorm_kernel", [&] {
     using Vec = at::vec::Vectorized<float>;
@@ -593,8 +678,12 @@ at::Tensor gemma_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) 
         input.data_ptr<scalar_t>(),
         weight.data_ptr<scalar_t>(),
         batch_size,
+        1,
         hidden_size,
         input_strideN,
+        0,
+        output_strideN,
+        0,
         [](float x) { return x + 1; },
         [one_vec](Vec x) { return x + one_vec; },
         eps);
@@ -618,6 +707,7 @@ at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps)
   at::Tensor output = at::empty_like(input);
   if (input.dim() == 2) {
     int64_t input_strideN = input.stride(0);
+    int64_t output_strideN = output.stride(0);
 
     AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma3_rmsnorm_kernel", [&] {
       using Vec = at::vec::Vectorized<float>;
@@ -627,8 +717,12 @@ at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps)
           input.data_ptr<scalar_t>(),
           weight.data_ptr<scalar_t>(),
           batch_size,
+          1,
           hidden_size,
           input_strideN,
+          0,
+          output_strideN,
+          0,
           [](float x) { return x + 1; },
           [one_vec](Vec x) { return x + one_vec; },
           eps);
@@ -656,6 +750,71 @@ at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps)
           input_strideS,
           output_strideB,
           output_strideH,
+          output_strideS,
+          eps);
+    });
+  }
+  return output;
+}
+
+// Gemma4RMSNorm: with_scale ? norm(x) * (weight + scale_shift) : norm(x)
+// input : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
+// weight: {hidden_size}
+at::Tensor gemma4_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps, double scale_shift, bool with_scale) {
+  RECORD_FUNCTION("sgl-kernel::gemma4_rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_INPUT(weight);
+  int64_t inp_dim{input.dim()};
+  TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "gemma4_rmsnorm_cpu: expected input dim 2 or 3, got ", inp_dim);
+  CHECK_DIM(1, weight);
+  CHECK_EQ(input.size(-1), weight.size(0));
+
+  int64_t hidden_size = input.size(-1);
+  at::Tensor output = at::empty_like(input);
+  int64_t batch_size = input.size(0);
+  int64_t seq_len = 1;
+  int64_t input_strideB = input.stride(0);
+  int64_t input_strideS = 0;
+  int64_t output_strideB = output.stride(0);
+  int64_t output_strideS = 0;
+  if (inp_dim == 3) {
+    seq_len = input.size(1);
+    input_strideS = input.stride(1);
+    output_strideS = output.stride(1);
+  }
+
+  if (with_scale) {
+    float shift = static_cast<float>(scale_shift);
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
+      using Vec = at::vec::Vectorized<float>;
+      Vec shift_vec = Vec(shift);
+      rmsnorm_kernel_impl<scalar_t>(
+          output.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          weight.data_ptr<scalar_t>(),
+          batch_size,
+          seq_len,
+          hidden_size,
+          input_strideB,
+          input_strideS,
+          output_strideB,
+          output_strideS,
+          [shift](float x) { return x + shift; },
+          [shift_vec](Vec x) { return x + shift_vec; },
+          eps);
+    });
+  } else {
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
+      l2norm_kernel_impl<scalar_t>(
+          output.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          batch_size,
+          seq_len,
+          hidden_size,
+          input_strideB,
+          input_strideS,
+          output_strideB,
           output_strideS,
           eps);
     });
@@ -697,23 +856,31 @@ at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Te
   return output;
 }
 
-// input   : {batch_size, hidden_size}
-// residual: {batch_size, hidden_size}
+// input   : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
+// residual: {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
 // weight  : {hidden_size}
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
   RECORD_FUNCTION("sgl-kernel::fused_add_rmsnorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);
-  CHECK_DIM(2, input);
-  CHECK_DIM(2, residual);
+  int64_t inp_dim{input.dim()}, res_dim{residual.dim()};
+  CHECK_EQ(inp_dim, res_dim);
+  TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "Expected input dim to be 2 or 3, but got ", inp_dim);
   CHECK_DIM(1, weight);
   CHECK_EQ(input.size(0), residual.size(0));
-  CHECK_EQ(input.size(1), residual.size(1));
-  CHECK_EQ(input.size(1), weight.size(0));
+  CHECK_EQ(input.size(-1), residual.size(-1));
+  CHECK_EQ(input.size(-1), weight.size(0));
+
   int64_t batch_size = input.size(0);
-  int64_t hidden_size = input.size(1);
-  int64_t input_strideN = input.stride(0);
+  int64_t seq_len = 1;
+  int64_t hidden_size = input.size(-1);
+  int64_t input_strideB = input.stride(0);
+  int64_t input_strideS = 0;
+  if (inp_dim == 3) {
+    seq_len = input.size(1);
+    input_strideS = input.stride(1);
+  }
 
   // allocate temp buffer to store x in float32 per thread
   // TODO: implement a singleton for context
@@ -728,8 +895,10 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
         weight.data_ptr<scalar_t>(),
         buffer.data_ptr<float>(),
         batch_size,
+        seq_len,
         hidden_size,
-        input_strideN,
+        input_strideB,
+        input_strideS,
         [](float x) { return x; },
         [](Vec x) { return x; },
         eps);
@@ -768,44 +937,75 @@ void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Te
         weight.data_ptr<scalar_t>(),
         buffer.data_ptr<float>(),
         batch_size,
+        1,
         hidden_size,
         input_strideN,
+        0,
         [](float x) { return x + 1; },
         [one_vec](Vec x) { return x + one_vec; },
         eps);
   });
 }
 
-// input   : {batch_size, hidden_size}
-// residual: {batch_size, hidden_size}
+// input   : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
+// residual: {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
 // weight  : {hidden_size}
-void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
+// bias    : {hidden_size}
+at::Tensor fused_add_layernorm_cpu(
+    const at::Tensor& input,
+    at::Tensor& residual,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    double eps) {
   RECORD_FUNCTION("sgl-kernel::fused_add_layernorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);
-  CHECK_DIM(2, input);
-  CHECK_DIM(2, residual);
+  int64_t inp_dim{input.dim()}, res_dim{residual.dim()};
+  CHECK_EQ(inp_dim, res_dim);
+  TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "Expected input dim to be 2 or 3, but got ", inp_dim);
+  TORCH_CHECK(res_dim == 2 || res_dim == 3, "Expected residual dim to be 2 or 3, but got ", res_dim);
+
   CHECK_DIM(1, weight);
+  if (bias.has_value()) {
+    CHECK_DIM(1, bias.value());
+    CHECK_EQ(bias.value().size(0), weight.size(0));
+  }
   CHECK_EQ(input.size(0), residual.size(0));
   CHECK_EQ(input.size(1), residual.size(1));
-  CHECK_EQ(input.size(1), weight.size(0));
-  int64_t batch_size = input.size(0);
-  int64_t hidden_size = input.size(1);
-  int64_t input_strideN = input.stride(0);
+  if (inp_dim == 3) {
+    CHECK_EQ(input.size(2), residual.size(2));
+    CHECK_EQ(input.size(2), weight.size(0));
+  } else {
+    CHECK_EQ(input.size(1), weight.size(0));
+  }
 
+  int64_t batch_size{input.size(0)}, seq_len{1}, hidden_size{input.size(1)}, input_strideN{input.stride(0)};
+  if (inp_dim == 3) {
+    seq_len = input.size(1);
+    hidden_size = input.size(2);
+    input_strideN = input.stride(1);
+  }
+  at::Tensor output = at::empty_like(input);
+
+  // Allocate temp buffer to store x in float32 per thread
+  // It is necessary to store FP32 precision of residual-add results to pass UT acc test
   int64_t num_threads = at::get_num_threads();
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_layernorm_kernel", [&] {
     fused_add_layernorm_kernel_impl<scalar_t>(
+        output.data_ptr<scalar_t>(),
         input.data_ptr<scalar_t>(),
         residual.data_ptr<scalar_t>(),
         weight.data_ptr<scalar_t>(),
+        conditional_data_ptr<scalar_t>(bias),
         buffer.data_ptr<float>(),
         batch_size,
+        seq_len,
         hidden_size,
         input_strideN,
         eps);
   });
+  return output;
 }

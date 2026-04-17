@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Literal, Optional
 
 from rich.markup import escape
 
+from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
 from sglang.srt.debug_utils.comparator.aligner.unsharder.types import UnsharderPlan
 from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
@@ -70,11 +71,13 @@ def _category_marker(category: str) -> tuple[bool, str, str]:
 # ---------------------------------------------------------------------------
 
 
+_STAT_HEADER = (
+    f"      [dim]{'':10s} {'baseline':>10s}   {'target':>10s}       {'Δ':s}[/]"
+)
+
+
 def _format_stat_line(stat_name: str, val_b: float, val_t: float, diff: float) -> str:
-    return (
-        f"      [blue]{stat_name:10s}[/] {val_b:>10.4f} vs {val_t:>10.4f}"
-        f"  Δ {_fmt_diff_colored(diff)}"
-    )
+    return f"      [blue]{stat_name:10s}[/] {val_b:>10.4f}   {val_t:>10.4f}   {_fmt_diff_colored(diff)}"
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +355,7 @@ def _format_bundle_section(
 
     for label, side in [("baseline", bundle_info.x), ("target", bundle_info.y)]:
         if not side.files:
-            lines.append(f"      {label}  [dim](no files)[/]")
+            lines.append(f"      {label:8s}  [dim](no files)[/]")
             continue
 
         dtype_desc: str = _strip_torch_prefix(side.files[0].dtype)
@@ -360,7 +363,7 @@ def _format_bundle_section(
         if verbose:
             dims_part: str = f"  dims: {side.dims}" if side.dims else ""
             lines.append(
-                f"      {label}  [cyan]{side.num_files} files[/]"
+                f"      {label:8s}  [cyan]{side.num_files} files[/]"
                 f" {dtype_desc}{dims_part}"
             )
 
@@ -371,8 +374,9 @@ def _format_bundle_section(
                     par_part = " " + " ".join(
                         f"{k}={v}" for k, v in f.parallel_info.items()
                     )
+                file_part: str = f"  [dim]{escape(f.filename)}[/]" if f.filename else ""
                 lines.append(
-                    f"         [{idx}] {_esc_shape(f.shape)}  {rank_part}{par_part}"
+                    f"         [{idx}] {_esc_shape(f.shape)}  {rank_part}{par_part}{file_part}"
                 )
         else:
             shapes: list[list[int]] = [f.shape for f in side.files]
@@ -385,7 +389,7 @@ def _format_bundle_section(
 
             dims_part = f"  [dim]dims: {side.dims}[/]" if side.dims else ""
             lines.append(
-                f"      {label}  [cyan]{side.num_files} files[/]"
+                f"      {label:8s}  [cyan]{side.num_files} files[/]"
                 f" × {shape_desc} {dtype_desc}{dims_part}"
             )
 
@@ -404,7 +408,7 @@ def _format_plan_section_rich(
         ("target", traced_plan.per_side.y),
     ]:
         if not traced_side.step_plans:
-            lines.append(f"      {side_label}  [dim](passthrough)[/]")
+            lines.append(f"      {side_label:8s}  [dim](passthrough)[/]")
             continue
 
         parts: list[str] = [
@@ -412,7 +416,7 @@ def _format_plan_section_rich(
             for traced_step in traced_side.step_plans
             for traced_sub in traced_step.sub_plans
         ]
-        lines.append(f"      {side_label}  " + " → ".join(parts))
+        lines.append(f"      {side_label:8s}  " + " → ".join(parts))
 
     lines.extend(_format_cross_side_plan_rich(traced_plan.plan))
     return lines
@@ -423,9 +427,11 @@ def _format_sub_plan_rich(traced_sub: TracedSubPlan) -> str:
     snapshot: Optional[ShapeSnapshot] = traced_sub.snapshot
 
     op_name: str = sub.type
-    axis_str: str = ""
+    qualifier: str = ""
     if isinstance(sub, UnsharderPlan):
-        axis_str = f"({sub.axis})"
+        qualifier = f"({sub.axis.value})"
+    elif isinstance(sub, ReordererPlan):
+        qualifier = f"({sub.params.op})"
 
     shape_change: str = ""
     if snapshot:
@@ -437,9 +443,9 @@ def _format_sub_plan_rich(traced_sub: TracedSubPlan) -> str:
         out_shape: str = (
             _esc_shape(snapshot.output_shapes[0]) if snapshot.output_shapes else "?"
         )
-        shape_change = f" {in_count}×{in_shape} → {out_count}×{out_shape}"
+        shape_change = f" ({in_count}×{in_shape} → {out_count}×{out_shape})"
 
-    return f"[magenta]{op_name}{axis_str}[/]{shape_change}"
+    return f"[magenta]{op_name}{qualifier}[/]{shape_change}"
 
 
 def _format_cross_side_plan_rich(plan: AlignerPlan) -> list[str]:
@@ -469,7 +475,7 @@ def _format_stats_rich(
     target: TensorStats,
     verbose: bool = False,
 ) -> list[str]:
-    lines: list[str] = []
+    lines: list[str] = [_STAT_HEADER]
 
     if verbose:
         # All stat fields
@@ -486,7 +492,7 @@ def _format_stats_rich(
             val_t = target.percentiles[p]
             lines.append(_format_stat_line(f"p{p}", val_b, val_t, val_t - val_b))
     else:
-        # Compact: mean, std, range (min/max combined)
+        # Compact: mean, std, range, then percentiles
         for stat_name in ("mean", "std"):
             val_b = getattr(baseline, stat_name)
             val_t = getattr(target, stat_name)
@@ -495,7 +501,13 @@ def _format_stats_rich(
         # Range line: combine min/max (escape brackets to avoid Rich markup)
         range_baseline: str = escape(f"[{baseline.min:.4f}, {baseline.max:.4f}]")
         range_target: str = escape(f"[{target.min:.4f}, {target.max:.4f}]")
-        lines.append(f"      [blue]{'range':10s}[/] {range_baseline} vs {range_target}")
+        lines.append(f"      [blue]{'range':10s}[/] {range_baseline}   {range_target}")
+
+        # Percentiles (compact: same as verbose)
+        for p in sorted(set(baseline.percentiles) & set(target.percentiles)):
+            val_b = baseline.percentiles[p]
+            val_t = target.percentiles[p]
+            lines.append(_format_stat_line(f"p{p}", val_b, val_t, val_t - val_b))
 
     return lines
 

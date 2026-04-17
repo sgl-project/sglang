@@ -169,10 +169,10 @@ def _load_architecture_specific_ops():
     cuda_version = torch.version.cuda
     if cuda_version and cuda_version.startswith("13"):
         install_hint = (
-            "pip install sgl-kernel --index-url https://docs.sglang.ai/whl/cu130/"
+            "pip install sglang-kernel --index-url https://docs.sglang.ai/whl/cu130/"
         )
     else:
-        install_hint = "pip install --upgrade sgl_kernel"
+        install_hint = "pip install --upgrade sglang-kernel"
 
     error_msg = f"""
 [sgl_kernel] CRITICAL: Could not load any common_ops library!

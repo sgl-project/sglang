@@ -116,6 +116,10 @@ class NPUPlatformBase(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
+        if selected_backend == AttentionBackendEnum.FA:
+            logger.info("Using Ascend Flash Attention backend.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
+
         logger.info("Using Torch SDPA backend.")
         return (
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"

@@ -74,13 +74,33 @@ class TestExtendAttention(CustomTestCase):
             start_q, start_kv = end_q, end_kv
         return output
 
-    def _test_extend_attention_once(self, B, N_CTX, H_Q, H_KV, D, DV, mla=False):
+    def _test_extend_attention_once(
+        self,
+        B,
+        N_CTX,
+        H_Q,
+        H_KV,
+        D,
+        DV,
+        mla=False,
+        *,
+        b_seq_len_prefix=None,
+        b_seq_len_extend=None,
+    ):
         dtype = torch.bfloat16
 
-        b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
-        if mla:
-            b_seq_len_prefix.zero_()
-        b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+        if b_seq_len_prefix is None:
+            b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+            if mla:
+                b_seq_len_prefix.zero_()
+        else:
+            b_seq_len_prefix = torch.as_tensor(b_seq_len_prefix, dtype=torch.int32)
+
+        if b_seq_len_extend is None:
+            b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+        else:
+            b_seq_len_extend = torch.as_tensor(b_seq_len_extend, dtype=torch.int32)
+
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
         max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
 
@@ -118,8 +138,8 @@ class TestExtendAttention(CustomTestCase):
             v_extend[extend_start:extend_end] = v_buffer[
                 extend_start_in_buffer:extend_end_in_buffer
             ]
-            q_extend[extend_start:extend_end] = torch.randn(
-                (b_seq_len_extend[i], H_Q, D), dtype=dtype
+            q_extend[extend_start:extend_end] = (
+                torch.randn((b_seq_len_extend[i], H_Q, D), dtype=dtype) * 20
             )
 
         # q_extend, k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors
@@ -184,6 +204,18 @@ class TestExtendAttention(CustomTestCase):
             self._test_extend_attention_once(1, 123, 16, 1, 128, 96, is_mla)
             self._test_extend_attention_once(4, 1230, 16, 4, 128, 96, is_mla)
             self._test_extend_attention_once(1, 9000, 16, 1, 32, 32, is_mla)
+
+    def test_extend_attention_large_seq_causal_mask(self):
+        self._test_extend_attention_once(
+            B=1,
+            N_CTX=5001,
+            H_Q=8,
+            H_KV=2,
+            D=64,
+            DV=64,
+            b_seq_len_prefix=[0],
+            b_seq_len_extend=[5000],
+        )
 
 
 if __name__ == "__main__":

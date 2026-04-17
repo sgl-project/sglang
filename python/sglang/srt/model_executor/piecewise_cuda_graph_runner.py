@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
@@ -59,6 +60,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
+# Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
+warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -203,6 +206,9 @@ class PiecewiseCudaGraphRunner:
 
         self.is_multimodal = model_runner.is_multimodal
         self.mamba_track_enabled = self.is_mamba_track_enabled()
+        # Classification/reward forwards branch on return_pooled_hidden_states; piecewise
+        # CUDA graph capture must use the same flag value as replay for those models.
+        self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # Graph inputs
         with torch.device(self.device):
@@ -384,8 +390,10 @@ class PiecewiseCudaGraphRunner:
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
+                num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
         # Attention backend
@@ -413,6 +421,19 @@ class PiecewiseCudaGraphRunner:
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
+            return False
+        # PCG graphs are captured with ForwardMode.EXTEND and spec_info=None.
+        # TARGET_VERIFY has different spec_info and capture_hidden_mode,
+        # so it must not use PCG-captured graphs.
+        if forward_batch.forward_mode.is_target_verify():
+            return False
+        # PCG graphs are captured with the runner's capture_hidden_mode.
+        # If the batch needs a different mode (e.g. FULL for speculative
+        # decoding), PCG replay would return wrong/missing hidden_states.
+        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+            return False
+        # Disable for token embedding overrides (dynamic per-request)
+        if forward_batch.replace_embeds is not None:
             return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
@@ -541,8 +562,10 @@ class PiecewiseCudaGraphRunner:
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
+                num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -606,7 +629,7 @@ class PiecewiseCudaGraphRunner:
             buffers.input_ids[num_tokens:static_num_tokens].zero_()
             buffers.positions[num_tokens:static_num_tokens].zero_()
             if self.is_multimodal:
-                buffers.input_embeds[:, num_tokens:static_num_tokens].zero_()
+                buffers.input_embeds[num_tokens:static_num_tokens].zero_()
             if forward_batch.mrope_positions is not None:
                 buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
 
@@ -644,7 +667,7 @@ class PiecewiseCudaGraphRunner:
 
         out_cache_loc_swa = (
             buffers.out_cache_loc_swa[:static_num_tokens]
-            if forward_batch.out_cache_loc_swa is not None
+            if buffers.out_cache_loc_swa is not None
             else None
         )
 
@@ -679,8 +702,20 @@ class PiecewiseCudaGraphRunner:
 
         next_token_logits_buffer = None
 
+        # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1) doesn't fail on MIXED=3.
+        pcg_forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.forward_mode == ForwardMode.MIXED
+            else forward_batch.forward_mode
+        )
+        pcg_global_forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.global_forward_mode == ForwardMode.MIXED
+            else forward_batch.global_forward_mode
+        )
+
         static_forward_batch = ForwardBatch(
-            forward_mode=forward_batch.forward_mode,
+            forward_mode=pcg_forward_mode,
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,
@@ -718,7 +753,8 @@ class PiecewiseCudaGraphRunner:
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=forward_batch.num_token_non_padded,
-            global_forward_mode=forward_batch.global_forward_mode,
+            num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
+            global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
@@ -727,7 +763,14 @@ class PiecewiseCudaGraphRunner:
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
+            return_pooled_hidden_states=(
+                self.capture_return_pooled_hidden_states
+                or forward_batch.return_pooled_hidden_states
+            ),
         )
+
+        if out_cache_loc_swa is not None:
+            self.model_runner.token_to_kv_pool.set_swa_loc(out_cache_loc_swa)
 
         return static_forward_batch
 
@@ -737,8 +780,6 @@ class PiecewiseCudaGraphRunner:
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
-            # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
             with set_forward_context(
@@ -748,6 +789,8 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
             ):
+                # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
+                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,

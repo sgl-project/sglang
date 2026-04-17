@@ -34,12 +34,7 @@ jobs:
       - name: Generate PR wheel version
         id: gen_version
         run: |
-          # Get base version from the latest v*.*.* git tag directly
-          # Note: We cannot use setuptools_scm here because the [tool.setuptools_scm]
-          # config (with custom git_describe_command) lives in python/pyproject.toml,
-          # not at the repo root. Without that config, setuptools_scm falls back to
-          # default git describe which finds gateway-* tags instead of v*.*.* release tags.
-          LATEST_TAG=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1)
+          LATEST_TAG=$(python3 python/tools/get_version_tag.py)
           BASE_VERSION=${LATEST_TAG#v}
           echo "Latest release tag: ${LATEST_TAG}"
 

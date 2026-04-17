@@ -12,19 +12,23 @@ on:
         default: 'all'
         options:
           - 'all'
-          - 'nightly-test-general-1-gpu-runner'
+          - 'nightly-test-general-1-gpu-h100'
           - 'nightly-test-general-4-gpu-h100'
           - 'nightly-test-general-8-gpu-h200'
           - 'nightly-test-general-8-gpu-h20'
           - 'nightly-test-general-8-gpu-b200'
-          - 'nightly-test-text-accuracy-2-gpu-runner'
-          - 'nightly-test-text-perf-2-gpu-runner'
-          - 'nightly-test-vlm-accuracy-2-gpu-runner'
-          - 'nightly-test-vlm-perf-2-gpu-runner'
+          - 'nightly-test-text-accuracy-2-gpu-h100'
+          - 'nightly-test-text-perf-2-gpu-h100'
+          - 'nightly-test-vlm-accuracy-2-gpu-h100'
+          - 'nightly-test-vlm-perf-2-gpu-h100'
           - 'nightly-test-multimodal-server-1-gpu'
           - 'nightly-test-multimodal-server-2-gpu'
           - 'nightly-test-perf-4-gpu-b200'
           - 'nightly-test-perf-8-gpu-b200'
+          - 'nightly-test-specialized-8-gpu-b200'
+          - 'nightly-test-kernel-1-gpu-h100'
+          - 'nightly-test-diffusion-comparison'
+          - 'nightly-test-kernel-8-gpu-h200'
   workflow_call:
     inputs:
       ref:
@@ -50,14 +54,16 @@ env:
 
 jobs:
   # General tests - 1 GPU
-  nightly-test-general-1-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-1-gpu-runner')
-    runs-on: 1-gpu-runner
+  nightly-test-general-1-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-1-gpu-h100')
+    runs-on: 1-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
         run: |
@@ -65,12 +71,78 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-1-gpu --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
+
+  # JIT kernel full unit tests (expanded parameter ranges via SGLANG_JIT_KERNEL_RUN_FULL_TESTS)
+  nightly-test-kernel-1-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-kernel-1-gpu-h100')
+    runs-on: 1-gpu-h100
+    timeout-minutes: 240
+    env:
+      # Full jit_kernel test grids (see sglang.jit_kernel.utils.should_run_full_tests)
+      SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+      # Match pr-test-jit-kernel workflow for consistent JIT warmup behavior
+      SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+      # Allow maintenance bypass on default branch (same semantics as PR JIT workflow)
+      SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run jit kernel nightly suite
+        timeout-minutes: 60
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+  nightly-test-kernel-8-gpu-h200:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-kernel-8-gpu-h200')
+    runs-on: 8-gpu-h200
+    timeout-minutes: 240
+    env:
+      SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+      SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+      SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run multi-GPU jit kernel nightly suite
+        timeout-minutes: 90
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-kernel-8-gpu-h200 --nightly --continue-on-error
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
 
   # General tests - 4 GPU H100
   nightly-test-general-4-gpu-h100:
@@ -81,6 +153,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
         run: |
@@ -93,7 +167,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-4-gpu --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # General tests - 8 GPU H200
   nightly-test-general-8-gpu-h200:
@@ -110,6 +184,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
         run: |
@@ -157,7 +233,7 @@ jobs:
       - name: Collect performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_metrics.py \
+          python3 scripts/ci/utils/save_metrics.py \
             --gpu-config 8-gpu-h200 \
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
@@ -175,7 +251,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
 
@@ -191,6 +267,8 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
@@ -204,7 +282,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-h20 --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # General tests - 8 GPU B200
   nightly-test-general-8-gpu-b200:
@@ -220,9 +298,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run common 8-GPU model tests
         if: always()
@@ -233,7 +313,7 @@ jobs:
           GPU_CONFIG: "8-gpu-b200"
         run: |
           cd test
-          IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
+          python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
 
       - name: Publish traces to storage repo
         if: always()
@@ -257,7 +337,7 @@ jobs:
       - name: Collect performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_metrics.py \
+          python3 scripts/ci/utils/save_metrics.py \
             --gpu-config 8-gpu-b200 \
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
@@ -275,19 +355,21 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
 
   # Text model accuracy tests
-  nightly-test-text-accuracy-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-accuracy-2-gpu-runner')
-    runs-on: 2-gpu-runner
+  nightly-test-text-accuracy-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-accuracy-2-gpu-h100')
+    runs-on: 2-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
         run: |
@@ -300,17 +382,19 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-eval-text-2-gpu --nightly --continue-on-error --timeout-per-file 4500
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # Text model performance tests
-  nightly-test-text-perf-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-perf-2-gpu-runner')
-    runs-on: 2-gpu-runner
+  nightly-test-text-perf-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-text-perf-2-gpu-h100')
+    runs-on: 2-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
         run: |
@@ -321,7 +405,7 @@ jobs:
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "2-gpu-runner"
+          GPU_CONFIG: "2-gpu-h100"
         run: |
           cd test
           rm -rf performance_profiles_text_models/
@@ -336,17 +420,19 @@ jobs:
           python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_text_models
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # VLM accuracy tests
-  nightly-test-vlm-accuracy-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-accuracy-2-gpu-runner')
-    runs-on: 2-gpu-runner
+  nightly-test-vlm-accuracy-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-accuracy-2-gpu-h100')
+    runs-on: 2-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
         run: |
@@ -359,17 +445,19 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-eval-vlm-2-gpu --nightly --continue-on-error --timeout-per-file 9000
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # VLM performance tests
-  nightly-test-vlm-perf-2-gpu-runner:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-perf-2-gpu-runner')
-    runs-on: 2-gpu-runner
+  nightly-test-vlm-perf-2-gpu-h100:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-vlm-perf-2-gpu-h100')
+    runs-on: 2-gpu-h100
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
         run: |
@@ -380,7 +468,7 @@ jobs:
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          GPU_CONFIG: "2-gpu-runner"
+          GPU_CONFIG: "2-gpu-h100"
         run: |
           cd test
           rm -rf performance_profiles_vlms/
@@ -395,12 +483,12 @@ jobs:
           python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_vlms
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # diffusion performance tests
   nightly-test-multimodal-server-1-gpu:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-multimodal-server-1-gpu')
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -412,6 +500,8 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -421,9 +511,9 @@ jobs:
         env:
           SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GPU_CONFIG: "1-gpu-runner"
+          GPU_CONFIG: "1-gpu-h100"
 
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
@@ -434,8 +524,8 @@ jobs:
       - name: Collect diffusion performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_diffusion_metrics.py \
-            --gpu-config 1-gpu-runner \
+          python3 scripts/ci/utils/diffusion/save_diffusion_metrics.py \
+            --gpu-config 1-gpu-h100 \
             --run-id ${{ github.run_id }} \
             --output python/diffusion-metrics-1gpu-partition-${{ matrix.part }}.json \
             --results-json python/diffusion-results.json
@@ -450,13 +540,13 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
   nightly-test-multimodal-server-2-gpu:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-multimodal-server-2-gpu')
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -468,6 +558,8 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+
       - name: Install dependencies
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -477,9 +569,9 @@ jobs:
         env:
           SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GPU_CONFIG: "2-gpu-runner"
+          GPU_CONFIG: "2-gpu-h100"
 
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
@@ -490,8 +582,8 @@ jobs:
       - name: Collect diffusion performance metrics
         if: always()
         run: |
-          python3 scripts/ci/save_diffusion_metrics.py \
-            --gpu-config 2-gpu-runner \
+          python3 scripts/ci/utils/diffusion/save_diffusion_metrics.py \
+            --gpu-config 2-gpu-h100 \
             --run-id ${{ github.run_id }} \
             --output python/diffusion-metrics-2gpu-partition-${{ matrix.part }}.json \
             --results-json python/diffusion-results.json
@@ -506,7 +598,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -520,9 +612,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 300
@@ -531,11 +625,11 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error --timeout-per-file 12000
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # Specialized B200 tests - 8 GPU, for specific backends and configs
   nightly-test-specialized-8-gpu-b200:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-8-gpu-b200')
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-8-gpu-b200' || inputs.job_filter == 'nightly-test-specialized-8-gpu-b200')
     runs-on: 8-gpu-b200
     env:
       RUNNER_LABELS: 8-gpu-b200
@@ -545,9 +639,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - uses: ./.github/actions/check-maintenance
+
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 120
@@ -558,7 +654,71 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
 
       - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+  # Diffusion cross-framework comparison
+  nightly-test-diffusion-comparison:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion-comparison')
+    runs-on: 4-gpu-h100
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run cross-framework comparison
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PYTHONUNBUFFERED: "1"
+        timeout-minutes: 210
+        run: |
+          python3 -u scripts/ci/utils/diffusion/run_comparison.py \
+            --output comparison-results.json
+
+      - name: Generate dashboard
         if: always()
+        env:
+          GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/utils/diffusion/generate_diffusion_dashboard.py \
+            --results comparison-results.json \
+            --output dashboard.md \
+            --charts-dir comparison-charts \
+            --fetch-history \
+            --step-summary
+
+      - name: Publish to sglang-ci-data
+        if: always()
+        env:
+          GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python3 scripts/ci/utils/diffusion/publish_comparison_results.py \
+            --results comparison-results.json \
+            --dashboard dashboard.md \
+            --charts-dir comparison-charts
+
+      - name: Upload comparison artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-comparison-${{ github.run_id }}
+          path: |
+            comparison-results.json
+            dashboard.md
+            comparison-charts/
+            comparison-logs/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
 
   # Consolidate performance metrics from all jobs
   consolidate-metrics:
@@ -589,7 +749,7 @@ jobs:
 
       - name: Merge metrics
         run: |
-          python3 scripts/ci/merge_metrics.py \
+          python3 scripts/ci/utils/merge_metrics.py \
             --input-dir metrics/ \
             --output consolidated-metrics-${{ github.run_id }}.json \
             --run-id ${{ github.run_id }} \
@@ -608,19 +768,20 @@ jobs:
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
-      - nightly-test-general-1-gpu-runner
+      - nightly-test-general-1-gpu-h100
       - nightly-test-general-4-gpu-h100
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-h20
       - nightly-test-general-8-gpu-b200
-      - nightly-test-text-accuracy-2-gpu-runner
-      - nightly-test-text-perf-2-gpu-runner
-      - nightly-test-vlm-accuracy-2-gpu-runner
-      - nightly-test-vlm-perf-2-gpu-runner
+      - nightly-test-text-accuracy-2-gpu-h100
+      - nightly-test-text-perf-2-gpu-h100
+      - nightly-test-vlm-accuracy-2-gpu-h100
+      - nightly-test-vlm-perf-2-gpu-h100
       - nightly-test-multimodal-server-1-gpu
       - nightly-test-multimodal-server-2-gpu
       - nightly-test-perf-4-gpu-b200
       - nightly-test-specialized-8-gpu-b200
+      - nightly-test-diffusion-comparison
       - consolidate-metrics
     runs-on: ubuntu-latest
     steps:

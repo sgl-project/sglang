@@ -50,7 +50,12 @@ class SchedulerActor:
     ):
         import dataclasses
 
-        from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
+        from sglang.srt.utils.numa_utils import (
+            get_numa_node_if_available,
+            numa_bind_to_node,
+        )
 
         # Override dist_init_addr if provided (for multi-node)
         if dist_init_addr:
@@ -72,8 +77,9 @@ class SchedulerActor:
             logger.info(f"[TP{tp_rank}] Using passed gpu_id: {gpu_id}")
 
         # Configure worker (logging, process title, etc.)
-        dp_rank = configure_scheduler(
+        dp_rank = configure_scheduler_process(
             server_args,
+            actual_gpu_id,
             tp_rank,
             attn_cp_rank,
             moe_dp_rank,
@@ -81,6 +87,18 @@ class SchedulerActor:
             pp_rank,
             dp_rank,
         )
+
+        # Ray actors can't use the numactl subprocess-wrapping approach
+        # (SGLANG_NUMA_BIND_V2's normal path), so bind in-process via libnuma.
+        # The V1 path inside configure_scheduler_process already handles
+        # SGLANG_NUMA_BIND_V2=False.
+        if envs.SGLANG_NUMA_BIND_V2.get():
+            numa_node = get_numa_node_if_available(server_args, actual_gpu_id)
+            if numa_node is not None:
+                numa_bind_to_node(numa_node)
+                logger.info(
+                    f"[TP{tp_rank}] Bound to NUMA node {numa_node} for GPU {actual_gpu_id}"
+                )
 
         # Create scheduler (loads model into GPU, initializes NCCL)
         self.scheduler = Scheduler(
@@ -105,6 +123,10 @@ class SchedulerActor:
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop. Blocks until shutdown."""
         try:
+            import torch
+
+            # Need to set the GPU id for the event loop for nccl to work
+            torch.cuda.set_device(self.scheduler.gpu_id)
             self.scheduler.run_event_loop()
         except Exception as e:
             logger.error(f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}")
