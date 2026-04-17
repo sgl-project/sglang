@@ -933,7 +933,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     and request.tools
                     and self.tool_call_parser
                 ):
-                    async for chunk in self._process_tool_call_stream(
+                    async for chunk, normal_text_delta in self._process_tool_call_stream(
                         index,
                         delta,
                         parser_dict,
@@ -944,6 +944,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     ):
                         if chunk:
                             yield chunk
+                        # Fallback B accounting: feed the actually-yielded
+                        # content text into the recovery state so an unclosed
+                        # reasoning + real answer (no tool call) does NOT
+                        # spuriously trigger a continuation request.
+                        if recovery_enabled and normal_text_delta:
+                            update_stream_state_with_content(
+                                _ensure_recovery_state(index), normal_text_delta
+                            )
                     if recovery_enabled and has_tool_calls.get(index, False):
                         mark_stream_state_tool_call(_ensure_recovery_state(index))
 
@@ -1634,7 +1642,10 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
 
-        # Yield normal text
+        # Yield normal text. Tuple form ``(sse_chunk, normal_text_delta)`` lets
+        # the caller feed the content accumulator used by Fallback B (streaming
+        # unclosed-reasoning recovery). ``normal_text_delta`` is None for
+        # tool-call chunks and a non-empty string for content chunks.
         if normal_text:
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
@@ -1659,7 +1670,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_tokens=reasoning_tokens,
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", normal_text
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
@@ -1711,7 +1722,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_tokens=reasoning_tokens,
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json()}\n\n", None
 
     def _check_for_unstreamed_tool_args(
         self,
