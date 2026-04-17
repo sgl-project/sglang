@@ -18,24 +18,33 @@ from sglang.srt.multimodal.processors.whisper import ISO639_1_SUPPORTED_LANGS
 
 logger = logging.getLogger(__name__)
 
-# Regex that matches the forced decoder prefix output:
-#   <|lang|><|transcribe|><|notimestamps|>  followed by any transcription text.
-# Built once, reused for every auto-detect request.
+# Two forced-prefix variants, picked at request build time based on whether
+# the client asked for timestamp_granularities:
+#   * notimestamps variant: <|lang|><|transcribe|><|notimestamps|> text...
+#     — drops segment/word timing, used when the client doesn't request it.
+#   * timestamps variant:   <|lang|><|transcribe|><|0.00|> text <|X.XX|> ...
+#     — <|0.00|> anchors the first segment at t=0, and the model naturally
+#     emits further timestamp tokens between segments. _parse_segments
+#     reconstructs segments from output_ids afterwards.
 _LANG_ALT = "|".join(re.escape(c) for c in ISO639_1_SUPPORTED_LANGS)
+_LANG_PREFIX = r"<\|(" + _LANG_ALT + r")\|>"
 WHISPER_AUTODETECT_REGEX = (
-    r"<\|("
-    + _LANG_ALT
-    + r")\|>"
-    + r"<\|transcribe\|>"
-    + r"<\|notimestamps\|>"
-    + r"[\s\S]*"
+    _LANG_PREFIX + r"<\|transcribe\|>" + r"<\|notimestamps\|>" + r"[\s\S]*"
+)
+WHISPER_AUTODETECT_TS_REGEX = (
+    _LANG_PREFIX + r"<\|transcribe\|>" + r"<\|0\.00\|>" + r"[\s\S]*"
 )
 
 # Pattern to extract the language code from the fused output.
 # Scoped to ISO639_1_SUPPORTED_LANGS so a bypassed/drifted FSM can't sneak
 # through a random 2-letter code.
-_LANG_PREFIX_RE = re.compile(r"^<\|(" + _LANG_ALT + r")\|>")
-_FUSED_SENTINEL = "<|notimestamps|>"
+_LANG_PREFIX_RE = re.compile(r"^" + _LANG_PREFIX)
+
+# Sentinel strings that mark the boundary between the forced prefix and the
+# user-visible transcription. Ordered so we match the notimestamps variant
+# first when both could theoretically appear (they never do in practice:
+# the FSM emits exactly one of the two at position 2).
+_FUSED_SENTINELS = ("<|notimestamps|>", "<|0.00|>")
 
 
 @register_transcription_adapter("Whisper")
@@ -63,24 +72,54 @@ class WhisperAdapter(TranscriptionAdapter):
         """Build sampling params for a single fused detect+transcribe request.
 
         Uses SGLang's native structured generation (``regex``) to constrain
-        the first 3 decode tokens to ``<|lang|><|transcribe|><|notimestamps|>``
-        while allowing free transcription afterwards.  This runs language
-        detection and transcription in a single encoder pass with no extra
-        HTTP round-trip.
+        the first 3 decode tokens. Picks the regex variant based on whether
+        the client requested ``timestamp_granularities``:
+
+          * no timestamps:  ``<|lang|><|transcribe|><|notimestamps|>text``
+          * with timestamps: ``<|lang|><|transcribe|><|0.00|>text<|X.XX|>...``
+            — ``<|0.00|>`` anchors segment 0 at t=0; the model naturally
+            emits further timestamp tokens between segments and
+            ``_parse_segments`` reconstructs them from ``output_ids``.
+
+        Either way, detection and transcription run in a single encoder
+        pass with no extra HTTP round-trip.
         """
-        return {
+        use_ts = bool(request.timestamp_granularities)
+        params: dict = {
             "temperature": request.temperature,
             # Whisper's max_target_positions is 448 — 3 forced prefix tokens
             # + up to 445 transcription tokens stays under the position-embed cap.
             "max_new_tokens": 448,
-            "regex": WHISPER_AUTODETECT_REGEX,
+            "regex": (
+                WHISPER_AUTODETECT_TS_REGEX if use_ts else WHISPER_AUTODETECT_REGEX
+            ),
             "skip_special_tokens": False,
             "_detect_language": True,
         }
+        if use_ts:
+            params["timestamp_granularities"] = request.timestamp_granularities
+        return params
+
+    @staticmethod
+    def _find_fused_sentinel(text: str) -> tuple[int, int]:
+        """Locate the prefix sentinel and return ``(start_index, length)``.
+
+        Tries each variant in ``_FUSED_SENTINELS``. The FSM emits exactly
+        one of them at position 2, and the timestamps-variant ``<|0.00|>``
+        only appears as the forced prefix (later segment-boundary timestamp
+        tokens use non-zero values), so the first ``find`` hit is safe.
+        Returns ``(-1, 0)`` when no sentinel is found.
+        """
+        for sentinel in _FUSED_SENTINELS:
+            idx = text.find(sentinel)
+            if idx >= 0:
+                return idx, len(sentinel)
+        return -1, 0
 
     @staticmethod
     def parse_fused_output(text: str) -> tuple[Optional[str], str]:
         """Parse fused output ``<|en|><|transcribe|><|notimestamps|> Hello...``
+        or the timestamps variant ``<|en|><|transcribe|><|0.00|> Hello<|5.00|>...``.
 
         Returns ``(language_code, transcription_text)`` on success, or
         ``(None, text)`` on parse failure. Callers must treat ``None`` as a
@@ -97,15 +136,16 @@ class WhisperAdapter(TranscriptionAdapter):
                 text[:64],
             )
             return None, text
-        sentinel_idx = text.find(_FUSED_SENTINEL)
+        sentinel_idx, sentinel_len = WhisperAdapter._find_fused_sentinel(text)
         if sentinel_idx < 0:
             logger.warning(
-                "Whisper fused auto-detect parse failed: missing %s sentinel in %r",
-                _FUSED_SENTINEL,
+                "Whisper fused auto-detect parse failed: missing prefix sentinel "
+                "(expected one of %s) in %r",
+                _FUSED_SENTINELS,
                 text[:64],
             )
             return None, text
-        transcription = text[sentinel_idx + len(_FUSED_SENTINEL) :]
+        transcription = text[sentinel_idx + sentinel_len :]
         return m.group(1), transcription.strip()
 
     @staticmethod
@@ -113,19 +153,20 @@ class WhisperAdapter(TranscriptionAdapter):
         """Char offset in *text* of the first user-visible transcription char.
 
         Returns ``-1`` when the boundary isn't locatable yet — either the
-        ``<|notimestamps|>`` sentinel hasn't arrived, or the sentinel is in
-        but only trailing whitespace follows it. Deferring in the
-        whitespace-only case matches ``parse_fused_output``'s ``.strip()``
-        behavior and prevents the first streamed delta from leaking the
-        leading space Whisper emits between the prefix and the first word.
+        prefix sentinel (``<|notimestamps|>`` or ``<|0.00|>``) hasn't
+        arrived, or the sentinel is in but only trailing whitespace
+        follows it. Deferring in the whitespace-only case matches
+        ``parse_fused_output``'s ``.strip()`` behavior and prevents the
+        first streamed delta from leaking the leading space Whisper emits
+        between the prefix and the first word.
 
         Used by the streaming handler to re-anchor ``stream_buffer`` so
         deltas sent to the client never include the forced special tokens.
         """
-        idx = text.find(_FUSED_SENTINEL)
+        idx, sentinel_len = WhisperAdapter._find_fused_sentinel(text)
         if idx < 0:
             return -1
-        end = idx + len(_FUSED_SENTINEL)
+        end = idx + sentinel_len
         while end < len(text) and text[end].isspace():
             end += 1
         if end >= len(text):

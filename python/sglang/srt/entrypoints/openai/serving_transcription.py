@@ -130,18 +130,23 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         # When language is not specified and the adapter supports detection,
         # use a single fused request: SGLang's structured generation (regex)
-        # constrains the first 3 decode tokens to <|lang|><|transcribe|><|notimestamps|>
-        # while allowing free transcription afterwards — one encoder pass, no
-        # extra round-trip. Both streaming and non-streaming handlers strip
-        # the forced prefix from the user-visible text.
+        # constrains the first 3 decode tokens to the forced prefix while
+        # allowing free transcription afterwards — one encoder pass, no
+        # extra round-trip. The adapter picks the regex variant based on
+        # whether timestamps were requested, so fused works for both
+        # response_format=json (no timestamps) and response_format=verbose_json
+        # with timestamp_granularities.
         #
-        # Skip the fused path only when timestamp_granularities is set, because
-        # the regex hard-codes <|notimestamps|> and segment/word timestamps
-        # would be lost.
+        # One combination stays on the non-fused path: streaming + timestamps.
+        # Fused requires skip_special_tokens=False so we can extract the
+        # language from the output text; with embedded <|X.XX|> segment
+        # tokens in the timestamps variant, that would leak special tokens
+        # into per-chunk SSE deltas (and the OpenAI streaming spec doesn't
+        # return timestamps per-chunk anyway).
         use_fused = (
             language is None
-            and not timestamp_granularities
             and self._adapter.supports_language_detection
+            and not (stream and timestamp_granularities)
         )
 
         # Build request
