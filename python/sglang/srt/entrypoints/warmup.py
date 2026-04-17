@@ -52,11 +52,11 @@ async def whisper_autodetect(
         WHISPER_AUTODETECT_REGEX,
     )
 
-    logger.info(
-        "Compiling Whisper auto-detect regex FSM (one-time, ~15-20s)..."
-    )
+    logger.info("Compiling Whisper auto-detect regex FSM (one-time, ~15-20s)...")
     # A short silent audio encoded as base64 WAV (0.1s, 16kHz, mono)
-    import base64, io, struct
+    import base64
+    import io
+    import struct
 
     sr, dur = 16000, 0.1
     n = int(sr * dur)
@@ -80,7 +80,10 @@ async def whisper_autodetect(
         },
         modalities=["audio"],
     )
-    await tokenizer_manager.generate_request(req, None).__anext__()
+    # Drain the generator so the FSM is fully installed and any downstream
+    # exception surfaces instead of being swallowed after the first yield.
+    async for _ in tokenizer_manager.generate_request(req, None):
+        pass
     logger.info("Whisper auto-detect regex FSM compiled.")
 
 

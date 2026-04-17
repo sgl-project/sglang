@@ -132,8 +132,17 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # use a single fused request: SGLang's structured generation (regex)
         # constrains the first 3 decode tokens to <|lang|><|transcribe|><|notimestamps|>
         # while allowing free transcription afterwards — one encoder pass, no
-        # extra round-trip.
-        use_fused = language is None and self._adapter.supports_language_detection
+        # extra round-trip. Both streaming and non-streaming handlers strip
+        # the forced prefix from the user-visible text.
+        #
+        # Skip the fused path only when timestamp_granularities is set, because
+        # the regex hard-codes <|notimestamps|> and segment/word timestamps
+        # would be lost.
+        use_fused = (
+            language is None
+            and not timestamp_granularities
+            and self._adapter.supports_language_detection
+        )
 
         # Build request
         request = TranscriptionRequest(
@@ -176,10 +185,14 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         # For fused auto-detect requests, strip the forced prefix
         # (<|lang|><|transcribe|><|notimestamps|>) and extract the language.
+        # parse_fused_output returns (None, text) on parse failure; in that
+        # case leave request.language unset rather than claim a bogus
+        # detection.
         if getattr(request, "_fused_autodetect", False):
             lang, text = self._adapter.parse_fused_output(text)
-            request.language = lang
-            logger.info("Auto-detected language: '%s'", lang)
+            if lang is not None:
+                request.language = lang
+                logger.info("Auto-detected language: '%s'", lang)
 
         usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
@@ -230,6 +243,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
         model = request.model
         stream_buffer = ""
 
+        # For fused auto-detect requests, buffer deltas until the forced
+        # prefix (<|lang|><|transcribe|><|notimestamps|>) has fully arrived,
+        # then treat the sentinel boundary as the start of the user-visible
+        # stream. parse_fused_output finds the sentinel and extracts lang.
+        fused_mode = getattr(request, "_fused_autodetect", False)
+        prefix_stripped = not fused_mode
+
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -237,8 +257,33 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 finish_reason = content["meta_info"]["finish_reason"]
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
-                # Calculate delta (new text since last chunk)
                 current_text = content.get("text", "")
+
+                if not prefix_stripped:
+                    prefix_end = self._adapter.fused_prefix_end(current_text)
+                    if prefix_end < 0:
+                        # Forced prefix hasn't finished arriving yet — keep
+                        # buffering silently. If the stream ends before the
+                        # sentinel shows up, fall through once to emit what
+                        # we have as a best-effort tail.
+                        if not finish_reason_type:
+                            continue
+                        logger.warning(
+                            "Fused auto-detect stream finished before prefix "
+                            "sentinel arrived; emitting raw tail."
+                        )
+                    else:
+                        lang, _ = self._adapter.parse_fused_output(current_text)
+                        if lang is not None:
+                            request.language = lang
+                            logger.info("Auto-detected language: '%s'", lang)
+                        # Re-anchor stream_buffer to the boundary so all
+                        # subsequent deltas are computed against the
+                        # sentinel-stripped view.
+                        stream_buffer = current_text[:prefix_end]
+                    prefix_stripped = True
+
+                # Calculate delta (new text since last chunk)
                 delta = current_text[len(stream_buffer) :]
                 stream_buffer = current_text
 

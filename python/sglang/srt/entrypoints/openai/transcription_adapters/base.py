@@ -42,8 +42,22 @@ class TranscriptionAdapter(ABC):
         """
         raise NotImplementedError
 
-    def parse_fused_output(self, text: str) -> tuple:
-        """Parse the fused output to extract (language_code, transcription_text)."""
+    def parse_fused_output(self, text: str) -> tuple[Optional[str], str]:
+        """Parse the fused output to extract (language_code, transcription_text).
+
+        Return ``(None, text)`` on parse failure (FSM abort, truncation, regex
+        drift). Callers must treat ``None`` as an error and not overwrite
+        ``request.language`` with it.
+        """
+        raise NotImplementedError
+
+    def fused_prefix_end(self, text: str) -> int:
+        """Char offset in *text* where user-visible transcription begins.
+
+        Returns ``-1`` if the forced prefix hasn't fully arrived yet. Used by
+        the streaming handler to buffer deltas across the forced-prefix
+        boundary without leaking special tokens to clients.
+        """
         raise NotImplementedError
 
     # -- Standalone detection (for external callers) -----------------------

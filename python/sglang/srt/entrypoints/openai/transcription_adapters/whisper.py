@@ -23,11 +23,19 @@ logger = logging.getLogger(__name__)
 # Built once, reused for every auto-detect request.
 _LANG_ALT = "|".join(re.escape(c) for c in ISO639_1_SUPPORTED_LANGS)
 WHISPER_AUTODETECT_REGEX = (
-    r"<\|(" + _LANG_ALT + r")\|>" + r"<\|transcribe\|>" + r"<\|notimestamps\|>" + r"[\s\S]*"
+    r"<\|("
+    + _LANG_ALT
+    + r")\|>"
+    + r"<\|transcribe\|>"
+    + r"<\|notimestamps\|>"
+    + r"[\s\S]*"
 )
 
 # Pattern to extract the language code from the fused output.
-_LANG_PREFIX_RE = re.compile(r"^<\|([a-z]{2})\|>")
+# Scoped to ISO639_1_SUPPORTED_LANGS so a bypassed/drifted FSM can't sneak
+# through a random 2-letter code.
+_LANG_PREFIX_RE = re.compile(r"^<\|(" + _LANG_ALT + r")\|>")
+_FUSED_SENTINEL = "<|notimestamps|>"
 
 
 @register_transcription_adapter("Whisper")
@@ -62,28 +70,69 @@ class WhisperAdapter(TranscriptionAdapter):
         """
         return {
             "temperature": request.temperature,
-            # 3 forced prefix tokens + 448 transcription tokens
-            "max_new_tokens": 451,
+            # Whisper's max_target_positions is 448 — 3 forced prefix tokens
+            # + up to 445 transcription tokens stays under the position-embed cap.
+            "max_new_tokens": 448,
             "regex": WHISPER_AUTODETECT_REGEX,
             "skip_special_tokens": False,
             "_detect_language": True,
         }
 
     @staticmethod
-    def parse_fused_output(text: str) -> tuple[str, str]:
+    def parse_fused_output(text: str) -> tuple[Optional[str], str]:
         """Parse fused output ``<|en|><|transcribe|><|notimestamps|> Hello...``
 
-        Returns (language_code, transcription_text).
+        Returns ``(language_code, transcription_text)`` on success, or
+        ``(None, text)`` on parse failure. Callers must treat ``None`` as a
+        parse error and not write it back to ``request.language``.
+
+        Failure modes surface as ``None`` rather than a silent ``"en"``
+        default so an FSM abort, truncation, or regex drift is visible in
+        logs instead of being reported as a correct English detection.
         """
         m = _LANG_PREFIX_RE.match(text)
-        lang = m.group(1) if m else "en"
-        # Strip the 3-token forced prefix
-        prefix_end = text.find("<|notimestamps|>")
-        if prefix_end >= 0:
-            transcription = text[prefix_end + len("<|notimestamps|>") :]
-        else:
-            transcription = text
-        return lang, transcription.strip()
+        if not m:
+            logger.warning(
+                "Whisper fused auto-detect parse failed: missing language prefix in %r",
+                text[:64],
+            )
+            return None, text
+        sentinel_idx = text.find(_FUSED_SENTINEL)
+        if sentinel_idx < 0:
+            logger.warning(
+                "Whisper fused auto-detect parse failed: missing %s sentinel in %r",
+                _FUSED_SENTINEL,
+                text[:64],
+            )
+            return None, text
+        transcription = text[sentinel_idx + len(_FUSED_SENTINEL) :]
+        return m.group(1), transcription.strip()
+
+    @staticmethod
+    def fused_prefix_end(text: str) -> int:
+        """Char offset in *text* of the first user-visible transcription char.
+
+        Returns ``-1`` when the boundary isn't locatable yet — either the
+        ``<|notimestamps|>`` sentinel hasn't arrived, or the sentinel is in
+        but only trailing whitespace follows it. Deferring in the
+        whitespace-only case matches ``parse_fused_output``'s ``.strip()``
+        behavior and prevents the first streamed delta from leaking the
+        leading space Whisper emits between the prefix and the first word.
+
+        Used by the streaming handler to re-anchor ``stream_buffer`` so
+        deltas sent to the client never include the forced special tokens.
+        """
+        idx = text.find(_FUSED_SENTINEL)
+        if idx < 0:
+            return -1
+        end = idx + len(_FUSED_SENTINEL)
+        while end < len(text) and text[end].isspace():
+            end += 1
+        if end >= len(text):
+            # Sentinel seen but no non-whitespace transcription char yet —
+            # defer so streaming doesn't emit a leading space.
+            return -1
+        return end
 
     # -- Standalone detection (for external callers) -------------------------
 
