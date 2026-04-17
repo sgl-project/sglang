@@ -18,7 +18,9 @@ OUTPUT_JSON_PATH = ROOT / "src" / "generated" / "lmsys_sglang_blogs.json"
 START_MARKER = "{/* BEGIN_LMSYS_SGLANG_BLOG_CARDS */}"
 END_MARKER = "{/* END_LMSYS_SGLANG_BLOG_CARDS */}"
 
-LMSYS_BLOG_API_URL = "https://api.github.com/repos/lm-sys/lm-sys.github.io/contents/blog"
+LMSYS_BLOG_API_URL = (
+    "https://api.github.com/repos/lm-sys/lm-sys.github.io/contents/blog"
+)
 LMSYS_BLOG_BASE_URL = "https://lmsys.org/blog"
 LMSYS_BASE_URL = "https://lmsys.org"
 DEFAULT_IMAGE_URL = "https://lmsys.org/social.png"
@@ -30,7 +32,7 @@ KEYWORDS = [
     "sgl-kernel",
     "sglang-jax",
     "sgl diffusion",
-    "sglang diffusion"
+    "sglang diffusion",
 ]
 
 FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", flags=re.DOTALL)
@@ -209,12 +211,12 @@ def render_cards(posts: list[BlogPost]) -> str:
                 "          }}",
                 "        />",
                 "      </div>",
-                "      <div style={{ padding: \"0.9rem 1rem 1rem\" }}>",
+                '      <div style={{ padding: "0.9rem 1rem 1rem" }}>',
                 "        <p",
                 "          style={{",
-                '            margin: 0,',
-                '            fontWeight: 600,',
-                '            lineHeight: 1.35,',
+                "            margin: 0,",
+                "            fontWeight: 600,",
+                "            lineHeight: 1.35,",
                 '            fontSize: "0.98rem",',
                 "          }}",
                 "        >",
@@ -224,7 +226,7 @@ def render_cards(posts: list[BlogPost]) -> str:
                 "          style={{",
                 '            margin: "0.55rem 0 0",',
                 '            fontSize: "0.85rem",',
-                '            opacity: 0.75,',
+                "            opacity: 0.75,",
                 "          }}",
                 "        >",
                 f"          {{{json.dumps(post.date)}}}",
@@ -243,7 +245,9 @@ def replace_generated_block(index_text: str, generated_cards: str) -> str:
         flags=re.DOTALL,
     )
     replacement = f"{START_MARKER}\n{generated_cards}\n{END_MARKER}"
-    updated_text, replacements = pattern.subn(lambda _match: replacement, index_text, count=1)
+    updated_text, replacements = pattern.subn(
+        lambda _match: replacement, index_text, count=1
+    )
     if replacements != 1:
         raise RuntimeError(
             f"Could not find exactly one marker block in {INDEX_PATH.name}. "

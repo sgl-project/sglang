@@ -250,7 +250,7 @@ input_ids = processor_output["input_ids"][0].detach().cpu().tolist()
 
 # Process image through vision encoder
 image_outputs = vision(
-    processor_output["pixel_values"].to("cuda"), 
+    processor_output["pixel_values"].to("cuda"),
     aspect_ratio_ids=processor_output["aspect_ratio_ids"].to("cuda"),
     aspect_ratio_mask=processor_output["aspect_ratio_mask"].to("cuda"),
     output_hidden_states=False
@@ -263,8 +263,8 @@ precomputed_embeddings = multi_modal_projector(vision_flat)
 
 # Build precomputed embedding data item
 mm_item = dict(
-    processor_output, 
-    format="precomputed_embedding", 
+    processor_output,
+    format="precomputed_embedding",
     feature=precomputed_embeddings
 )
 
@@ -273,4 +273,3 @@ out = llm.generate(input_ids=input_ids, image_data=[mm_item])
 print("Llama 4 precomputed embedding response:")
 print(out["text"])
 ```
-

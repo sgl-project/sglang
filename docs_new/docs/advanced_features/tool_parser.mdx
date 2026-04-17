@@ -718,7 +718,7 @@ for tool_call in tool_calls:
 terminate_process(server_process)
 ```
 
-> **Note:**  
+> **Note:**
 > The model may still default to JSON if it was heavily finetuned on that format. Prompt engineering (including examples) is the only way to increase the chance of pythonic output if you are not using a chat template.
 
 
@@ -738,4 +738,3 @@ terminate_process(server_process)
     class NewModelDetector(BaseFormatDetector):
 ```
 3. Add the new detector to the MultiFormatParser class that manages all the format detectors.
-
