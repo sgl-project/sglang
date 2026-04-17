@@ -70,6 +70,15 @@ class QuarkConfig(QuantizationConfig):
     def get_name(self) -> str:
         return "quark"
 
+    def is_mxfp4_moe(self) -> bool:
+        global_config = self.quant_config.get("global_quant_config")
+        if global_config is not None:
+            weight_config = global_config.get("weight")
+            input_config = global_config.get("input_tensors")
+            if self._is_mx_fp4(weight_config, input_config):
+                return True
+        return False
+
     def apply_weight_name_mapper(self, hf_to_sglang_mapper):
         self.exclude_layers = hf_to_sglang_mapper.apply_list(self.exclude_layers)
 
