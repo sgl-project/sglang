@@ -752,6 +752,10 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
+    # For repetition penalty
+    enable_repetition_check: bool = False
+    repetition_check_threshold: int = 16
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -4846,6 +4850,18 @@ class ServerArgs:
             "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
             "'model' uses the model's generation_config.json to get the recommended "
             "sampling parameters if available. Default is 'model'.",
+        )
+
+        parser.add_argument(
+            "--enable-repetition-check",
+            action="store_true",
+            help="Enable repetition check to prevent infinite loops.",
+        )
+        parser.add_argument(
+            "--repetition-check-threshold",
+            type=int,
+            default=ServerArgs.repetition_check_threshold,
+            help="The threshold for repetition check.",
         )
 
         # Data parallelism

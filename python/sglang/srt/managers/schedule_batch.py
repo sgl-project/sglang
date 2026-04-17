@@ -1198,6 +1198,42 @@ class Req(ReqDllmMixin):
         if self._check_str_based_finish():
             return
 
+        if self._check_repetition_finish():
+            return
+
+    def _check_repetition_finish(self):
+        server_args = get_global_server_args()
+        if not server_args.enable_repetition_check:
+            return False
+
+        threshold = server_args.repetition_check_threshold
+
+        # Only check if we have enough tokens to form a repetition
+        if len(self.output_ids) < threshold + 1:
+            return False
+
+        # Limit max period to check to avoid performance impact on very long generations
+        # 512 tokens is large enough for most loops (paragraphs)
+        max_period = min(512, len(self.output_ids) - threshold)
+
+        current_tail = self.output_ids[-threshold:]
+
+        # We iterate P from 1 to max_period.
+        # This catches loops with period P.
+        # e.g. "A B C A B C" (period 3) -> matches P=3.
+        # "A A A" (period 1) -> matches P=1.
+        for p in range(1, max_period + 1):
+            # Check if the last `threshold` tokens match the sequence ending `p` tokens ago.
+            # This implies a repetition of length `threshold` with period `p`.
+            if self.output_ids[-threshold - p : -p] == current_tail:
+                self.finished_reason = FINISH_MATCHED_STR(
+                    matched=f"Repetition loop detected (period {p})"
+                )
+                self.finished_len = len(self.output_ids)
+                return True
+
+        return False
+
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
