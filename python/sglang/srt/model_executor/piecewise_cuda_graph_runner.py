@@ -206,6 +206,9 @@ class PiecewiseCudaGraphRunner:
 
         self.is_multimodal = model_runner.is_multimodal
         self.mamba_track_enabled = self.is_mamba_track_enabled()
+        # Classification/reward forwards branch on return_pooled_hidden_states; piecewise
+        # CUDA graph capture must use the same flag value as replay for those models.
+        self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # Graph inputs
         with torch.device(self.device):
@@ -390,6 +393,7 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
         # Attention backend
@@ -417,6 +421,16 @@ class PiecewiseCudaGraphRunner:
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
+            return False
+        # PCG graphs are captured with ForwardMode.EXTEND and spec_info=None.
+        # TARGET_VERIFY has different spec_info and capture_hidden_mode,
+        # so it must not use PCG-captured graphs.
+        if forward_batch.forward_mode.is_target_verify():
+            return False
+        # PCG graphs are captured with the runner's capture_hidden_mode.
+        # If the batch needs a different mode (e.g. FULL for speculative
+        # decoding), PCG replay would return wrong/missing hidden_states.
+        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
             return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -551,6 +565,7 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -748,6 +763,10 @@ class PiecewiseCudaGraphRunner:
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
+            return_pooled_hidden_states=(
+                self.capture_return_pooled_hidden_states
+                or forward_batch.return_pooled_hidden_states
+            ),
         )
 
         if out_cache_loc_swa is not None:

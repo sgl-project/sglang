@@ -84,16 +84,35 @@ class TestExtendAttention(CustomTestCase):
         return output
 
     def _test_extend_attention_once(
-        self, B, N_CTX, H_Q, H_KV, D, DV, mla=False, is_cross_attn=False
+        self,
+        B,
+        N_CTX,
+        H_Q,
+        H_KV,
+        D,
+        DV,
+        mla=False,
+        is_cross_attn=False,
+        *,
+        b_seq_len_prefix=None,
+        b_seq_len_extend=None,
     ):
         dtype = torch.bfloat16
 
-        b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+        if b_seq_len_prefix is None:
+            b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+        else:
+            b_seq_len_prefix = torch.as_tensor(b_seq_len_prefix, dtype=torch.int32)
+
         encoder_lens = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int64)
         if mla:
             b_seq_len_prefix.zero_()
             encoder_lens.zero_()
-        b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+
+        if b_seq_len_extend is None:
+            b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+        else:
+            b_seq_len_extend = torch.as_tensor(b_seq_len_extend, dtype=torch.int32)
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
         max_len_in_batch = (
             torch.max(b_seq_len, 0)[0].item() + torch.max(encoder_lens, 0)[0].item()
@@ -216,6 +235,18 @@ class TestExtendAttention(CustomTestCase):
                 self._test_extend_attention_once(
                     1, 9000, 16, 1, 32, 32, is_mla, is_cross_attn
                 )
+
+    def test_extend_attention_large_seq_causal_mask(self):
+        self._test_extend_attention_once(
+            B=1,
+            N_CTX=5001,
+            H_Q=8,
+            H_KV=2,
+            D=64,
+            DV=64,
+            b_seq_len_prefix=[0],
+            b_seq_len_extend=[5000],
+        )
 
 
 if __name__ == "__main__":

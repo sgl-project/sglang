@@ -33,6 +33,10 @@ default parameters when initializing and generating videos.
 | TurboWan2.1 T2V 14B          | `IPostYellow/TurboWan2.1-T2V-14B-Diffusers`       | 480p                 |    ✅     |         ❌         |     ❌     |              ❌               |               ✅               |                   ✅                    |             ⭕             |
 | TurboWan2.1 T2V 14B 720P     | `IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers`  | 720p                 |    ✅     |         ❌         |     ❌     |              ❌               |               ✅               |                   ✅                    |             ⭕             |
 | TurboWan2.2 I2V A14B         | `IPostYellow/TurboWan2.2-I2V-A14B-Diffusers`      | 720p                 |    ✅     |         ❌         |     ❌     |              ❌               |               ✅               |                   ✅                    |             ⭕             |
+| Wan2.1 Fun 1.3B InP           | `weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers`          | 480p                 |    ✅     |         ✅         |     ✅     |              ⭕               |               ❌               |                   ❌                    |             ✅             |
+| Helios Base                   | `BestWishYsh/Helios-Base`                          | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
+| Helios Mid                    | `BestWishYsh/Helios-Mid`                           | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
+| Helios Distilled              | `BestWishYsh/Helios-Distilled`                     | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
 | LTX-2 (one and two stages)   | `Lightricks/LTX-2`                                | 768×512<br>1536×1024 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
 | LTX-2.3 (one and two stages) | `Lightricks/LTX-2.3`                              | 768×512<br>1536×1024 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
 
@@ -40,23 +44,41 @@ default parameters when initializing and generating videos.
 
 1. Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.
 2. SageSLA is based on SpargeAttn. Install it first with `pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation`
-3. LTX-2 two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline`. The spatial upsampler and distilled LoRA are auto-resolved from the model snapshot by default, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
 3. LTX-2 and LTX-2.3 two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline`. The spatial upsampler and distilled LoRA are auto-resolved from the model snapshot by default, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
   - For LTX models, the `Resolutions` column uses output video `width×height` semantics, matching `sglang generate --width ... --height ...`.
 
 ### Image Generation Models
 
-| Model Name           | HuggingFace Model ID                |
-|:---------------------|:------------------------------------|
-| FLUX.1-dev           | `black-forest-labs/FLUX.1-dev`      |
-| FLUX.2-dev           | `black-forest-labs/FLUX.2-dev`      |
-| FLUX.2-Klein         | `black-forest-labs/FLUX.2-klein-4B` |
-| Z-Image-Turbo        | `Tongyi-MAI/Z-Image-Turbo`          |
-| GLM-Image            | `zai-org/GLM-Image`                 |
-| Qwen Image           | `Qwen/Qwen-Image`                   |
-| Qwen Image 2512      | `Qwen/Qwen-Image-2512`              |
-| Qwen Image Edit      | `Qwen/Qwen-Image-Edit`              |
-| Qwen Image Edit 2511 | `Qwen/Qwen-Image-Edit-2511`         |
+| Model Name                | HuggingFace Model ID                                     |
+|:--------------------------|:---------------------------------------------------------|
+| FLUX.1-dev                | `black-forest-labs/FLUX.1-dev`                           |
+| FLUX.2-dev                | `black-forest-labs/FLUX.2-dev`                           |
+| FLUX.2-dev-NVFP4          | `black-forest-labs/FLUX.2-dev-NVFP4`                     |
+| FLUX.2-Klein-4B           | `black-forest-labs/FLUX.2-klein-4B`                      |
+| FLUX.2-Klein-9B           | `black-forest-labs/FLUX.2-klein-9B`                      |
+| Z-Image                   | `Tongyi-MAI/Z-Image`                                    |
+| Z-Image-Turbo             | `Tongyi-MAI/Z-Image-Turbo`                              |
+| GLM-Image                 | `zai-org/GLM-Image`                                     |
+| Qwen Image                | `Qwen/Qwen-Image`                                       |
+| Qwen Image 2512           | `Qwen/Qwen-Image-2512`                                  |
+| Qwen Image Edit           | `Qwen/Qwen-Image-Edit`                                  |
+| Qwen Image Edit 2509      | `Qwen/Qwen-Image-Edit-2509`                             |
+| Qwen Image Edit 2511      | `Qwen/Qwen-Image-Edit-2511`                             |
+| Qwen Image Layered        | `Qwen/Qwen-Image-Layered`                               |
+| SD3 Medium                | `stabilityai/stable-diffusion-3-medium-diffusers`        |
+| SD3.5 Medium              | `stabilityai/stable-diffusion-3.5-medium-diffusers`      |
+| SD3.5 Large               | `stabilityai/stable-diffusion-3.5-large-diffusers`       |
+| Hunyuan3D-2               | `tencent/Hunyuan3D-2`                                    |
+| SANA 1.5 1.6B             | `Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers`   |
+| SANA 1.5 4.8B             | `Efficient-Large-Model/SANA1.5_4.8B_1024px_diffusers`   |
+| SANA 1600M 1024px         | `Efficient-Large-Model/Sana_1600M_1024px_diffusers`     |
+| SANA 600M 1024px          | `Efficient-Large-Model/Sana_600M_1024px_diffusers`      |
+| SANA 1600M 512px          | `Efficient-Large-Model/Sana_1600M_512px_diffusers`      |
+| SANA 600M 512px           | `Efficient-Large-Model/Sana_600M_512px_diffusers`       |
+| FireRed-Image-Edit 1.0    | `FireRedTeam/FireRed-Image-Edit-1.0`                     |
+| FireRed-Image-Edit 1.1    | `FireRedTeam/FireRed-Image-Edit-1.1`                     |
+| ERNIE-Image               | `baidu/ERNIE-Image`                                      |
+| ERNIE-Image-Turbo         | `baidu/ERNIE-Image-Turbo`                                |
 
 ## Supported Components
 
