@@ -117,6 +117,9 @@ class BenchServingLM(LM):
 
         # bench_serving reads module-level args in a few places (warmup
         # branching, flush_cache, dataset_name guards). Populate it.
+        # Assumes single-threaded access to bench_serving.benchmark(); if
+        # parallel calls become a goal, replace set_global_args with a
+        # context-local or argument-passing mechanism.
         args = Namespace(
             dataset_name="bench_eval",
             backend=self.backend,

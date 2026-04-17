@@ -301,9 +301,11 @@ class TestRunBenchEvalEndToEnd(unittest.TestCase):
 
         report, jsonl = _asyncio.run(_run())
         self.assertEqual(report["task"], "gsm8k")
-        # gsm8k produces exact_match metrics (possibly with filter tags).
-        self.assertTrue(any("exact_match" in k for k in report["accuracy"]))
-        self.assertIn("mean_ttft_ms", report["perf"])
+        # gsm8k's filter pipeline produces two tagged variants.
+        self.assertIn("exact_match,strict-match", report["accuracy"])
+        self.assertIn("exact_match,flexible-extract", report["accuracy"])
+        self.assertGreater(report["perf"]["mean_ttft_ms"], 0.0)
+        self.assertEqual(report["perf"]["completed"], 3)
         self.assertEqual(report["n_samples"].get("effective"), 3)
         self.assertEqual(len(jsonl.strip().splitlines()), 1)
 

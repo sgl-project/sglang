@@ -70,8 +70,10 @@ def run_bench_eval(
 
     if lm.last_perf is None:
         raise RuntimeError(
-            "simple_evaluate returned without invoking generate_until. "
-            "Check that the task is generative (output_type=='generate_until')."
+            f"simple_evaluate({task!r}) returned without invoking generate_until. "
+            f"Possible causes: (1) task is not generative — check its output_type "
+            f"(expected 'generate_until'); (2) limit={limit} filtered out all "
+            f"instances; (3) task produced zero requests."
         )
 
     report = merge_report(
