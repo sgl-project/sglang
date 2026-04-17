@@ -108,6 +108,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def can_fuse_shared_expert(
     config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
 
@@ -120,6 +121,20 @@ def can_fuse_shared_expert(
         or get_moe_a2a_backend().is_deepep()
     ):
         return False
+
+    # If the shared expert is excluded from quantization (stored as FP32 in the
+    # checkpoint), fusing it into the quantized MoE weight tensor requires online
+    # quantization which is not supported. Disable fusion in this case.
+    if quant_config is not None:
+        exclude_layers = getattr(quant_config, "exclude_layers", [])
+        if any(
+            "shared_expert" in layer
+            and "shared_expert_gate" not in layer
+            and not layer.startswith("mtp.")
+            for layer in exclude_layers
+        ):
+            return False
+
     return True
 
 
@@ -212,7 +227,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if _use_aiter:
             # enable shared expert fusion when use aiter
             self.enable_shared_expert_fusion = (
-                support_shared_expert_fusion and can_fuse_shared_expert(config)
+                support_shared_expert_fusion
+                and can_fuse_shared_expert(config, quant_config)
             )
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
@@ -323,20 +339,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_weights = self._get_shared_expert_weights(hidden_states)
         if shared_weights is None:
             return topk_output
-        M = topk_output.topk_ids.shape[0]
-        shared_expert_id = self.num_experts
-        shared_ids = torch.full(
-            (M, self.num_fused_shared_experts),
-            shared_expert_id,
-            dtype=topk_output.topk_ids.dtype,
-            device=topk_output.topk_ids.device,
+
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+            fused_append_shared_experts_with_weights,
         )
-        shared_weights = shared_weights.expand(M, self.num_fused_shared_experts).to(
-            topk_output.topk_weights.dtype
-        )
-        fused_topk_ids = torch.cat([topk_output.topk_ids, shared_ids], dim=-1)
-        fused_topk_weights = torch.cat(
-            [topk_output.topk_weights, shared_weights], dim=-1
+
+        fused_topk_ids, fused_topk_weights = fused_append_shared_experts_with_weights(
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            shared_weights,
+            self.num_fused_shared_experts,
+            N=self.num_experts,
         )
         return StandardTopKOutput(
             topk_weights=fused_topk_weights,

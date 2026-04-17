@@ -946,6 +946,7 @@ class ModelConfig:
             "fbgemm_fp8",
             "w8a8_fp8",
             "petit_nvfp4",
+            "petit_mxfp4",
             "quark",
             "mxfp4",
             "auto-round",
@@ -970,6 +971,7 @@ class ModelConfig:
             "qoq",
             "w4afp8",
             "petit_nvfp4",
+            "petit_mxfp4",
             "quark",
             "modelslim",
         ]
@@ -978,6 +980,7 @@ class ModelConfig:
             "modelopt_fp4": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
+            "petit_mxfp4": ["mxfp4", "quark"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
@@ -1434,6 +1437,17 @@ def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
         arch in piecewise_cuda_graph_disabled_model_archs
         for arch in model_architectures
     )
+
+
+# SequenceClassification models that use CrossEncodingPooler
+_cross_encoding_pooler_archs = [
+    "BertForSequenceClassification",
+    "XLMRobertaForSequenceClassification",
+]
+
+
+def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
+    return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
