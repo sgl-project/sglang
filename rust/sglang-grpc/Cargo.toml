@@ -6,7 +6,7 @@ description = "In-process Rust gRPC server for SGLang"
 license = "Apache-2.0"
 
 [lib]
-name = "sglang_grpc_rs"
+name = "_core"
 crate-type = ["cdylib"]
 
 [dependencies]

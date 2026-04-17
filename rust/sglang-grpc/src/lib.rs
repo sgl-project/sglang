@@ -78,7 +78,7 @@ fn start_server(host: String, port: u16, runtime_handle: PyObject) -> PyResult<G
 
 /// Python module exported by the Rust extension.
 #[pymodule]
-fn sglang_grpc_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
     m.add_class::<GrpcServerHandle>()?;
     Ok(())
