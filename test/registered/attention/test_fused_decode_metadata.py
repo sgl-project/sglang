@@ -33,9 +33,7 @@ def _reference_decode_set_metadata(
 ):
     """Pure-PyTorch reference matching normal_decode_set_metadata (no SWA)."""
     cache_seqlens_int32.copy_(seq_lens + seq_len_delta)
-    cu_seqlens_k[1:].copy_(
-        torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32)
-    )
+    cu_seqlens_k[1:].copy_(torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32))
     page_indices = req_to_token[
         req_pool_indices[:, None],
         strided_indices[:max_seq_pages][None, :],
@@ -67,9 +65,7 @@ class TestFusedDecodeMetadata(CustomTestCase):
             dtype=torch.int64,
             device=device,
         )
-        req_pool_indices = torch.randperm(max_batch, device=device)[:bs].to(
-            torch.int64
-        )
+        req_pool_indices = torch.randperm(max_batch, device=device)[:bs].to(torch.int64)
 
         upper = max(max_context_len // 2, 2)
         seq_lens = torch.randint(1, upper, (bs,), dtype=torch.int32, device=device)
@@ -136,12 +132,8 @@ class TestFusedDecodeMetadata(CustomTestCase):
         self.assertTrue(
             torch.equal(ref_cache, fused_cache), f"cache_seqlens mismatch ({ctx})"
         )
-        self.assertTrue(
-            torch.equal(ref_cu, fused_cu), f"cu_seqlens_k mismatch ({ctx})"
-        )
-        self.assertTrue(
-            torch.equal(ref_pt, fused_pt), f"page_table mismatch ({ctx})"
-        )
+        self.assertTrue(torch.equal(ref_cu, fused_cu), f"cu_seqlens_k mismatch ({ctx})")
+        self.assertTrue(torch.equal(ref_pt, fused_pt), f"page_table mismatch ({ctx})")
 
     # -- parameterized correctness sweeps -------------------------------
 
@@ -241,9 +233,7 @@ class TestFusedDecodeMetadata(CustomTestCase):
             dtype=torch.int64,
             device=device,
         )
-        req_pool_indices = torch.randperm(max_batch, device=device)[:bs].to(
-            torch.int64
-        )
+        req_pool_indices = torch.randperm(max_batch, device=device)[:bs].to(torch.int64)
         seq_lens = torch.full(
             (bs,), max_context_len - 1, dtype=torch.int32, device=device
         )
