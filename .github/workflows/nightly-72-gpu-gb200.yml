@@ -144,6 +144,16 @@ jobs:
           # Otherwise fall back to the branch name on sgl-project/sglang.
           ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || inputs.sglang_branch }}
 
+      - name: Verify checkout
+        run: |
+          echo "Resolved ref: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'detached HEAD')"
+          echo "Commit SHA:   $(git rev-parse HEAD)"
+          echo "Author:       $(git log -1 --format='%an <%ae>')"
+          echo "Date:         $(git log -1 --format='%aI')"
+          echo "Subject:      $(git log -1 --format='%s')"
+          echo ""
+          echo "Cross-check against: https://github.com/sgl-project/sglang/pull/${{ inputs.pr_number }}/commits"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
