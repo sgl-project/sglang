@@ -94,7 +94,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
             ssm_state_indices = torch.arange(
-                mamba_indices.shape[0] * spec_info.draft_token_num, dtype=torch.int32, device=mamba_indices.device
+                mamba_indices.shape[0] * spec_info.draft_token_num,
+                dtype=torch.int32,
+                device=mamba_indices.device,
             )
             self.state_indices_list_gdn[bs - 1][
                 : len(mamba_indices) * spec_info.draft_token_num
@@ -151,8 +153,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 )
         elif forward_mode.is_target_verify():
             ssm_state_indices = torch.arange(
-                len(mamba_indices[:bs - num_padding]) * spec_info.draft_token_num,
-                dtype=torch.int32, device=mamba_indices.device
+                len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num,
+                dtype=torch.int32,
+                device=mamba_indices.device,
             )
             self.state_indices_list_gdn[bs - 1][
                 : len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num
@@ -246,9 +249,11 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
         dst_indices_tensor = state_indices_tensor.to(torch.int64)  # [N]
-        src_indices_tensor = torch.arange(dst_indices_tensor.shape[0],
-                                          device=dst_indices_tensor.device,
-                                          dtype=torch.int64)
+        src_indices_tensor = torch.arange(
+            dst_indices_tensor.shape[0],
+            device=dst_indices_tensor.device,
+            dtype=torch.int64,
+        )
         last_steps = accepted_steps.to(torch.int64)  # [N]
 
         move_intermediate_cache(
@@ -256,7 +261,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             intermediate_state_cache,
             dst_indices_tensor,
             src_indices_tensor,
-            last_steps
+            last_steps,
         )
 
         draft_token_num = intermediate_state_cache.shape[2]
