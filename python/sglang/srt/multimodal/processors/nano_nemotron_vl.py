@@ -27,6 +27,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.models.parakeet import ParakeetExtractor
+from sglang.srt.multimodal.audio_from_video import extract_audio_from_video_bytes
 from sglang.srt.multimodal.evs import EVSProcessor
 from sglang.srt.multimodal.internvl_utils import (
     compute_budgeted_image_sizes,
@@ -366,16 +367,42 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
                     )
             video_feature = torch.cat(preprocessed_videos, dim=0)
 
+        # Extract audio from video if requested and no explicit audio provided
+        use_audio_in_video = getattr(request_obj, "use_audio_in_video", False)
+        extracted_audios: list[np.ndarray] = []
+        if (
+            use_audio_in_video
+            and base_output.videos
+            and not base_output.audios
+            and self.audio_extractor is not None
+        ):
+            for video_wrapper in base_output.videos:
+                video_bytes = video_wrapper.source_bytes
+                if video_bytes is not None:
+                    audio_array = extract_audio_from_video_bytes(
+                        video_bytes,
+                        target_sr=self.audio_extractor.sampling_rate,
+                    )
+                    if audio_array is not None:
+                        extracted_audios.append(audio_array)
+
+        all_audios: list[np.ndarray] = (
+            list(base_output.audios) if base_output.audios else []
+        )
+        all_audios.extend(extracted_audios)
+
         # Process audio data through the Parakeet feature extractor
         audio_items: list[MultimodalDataItem] = []
-        if base_output.audios and self.audio_extractor is not None:
+        if all_audios and self.audio_extractor is not None:
             extractor = self.audio_extractor
-            for audio in base_output.audios:
+            for audio in all_audios:
                 num_tokens = extractor.audio_token_count(len(audio))
                 rendered = self.render_audio(num_tokens=num_tokens)
-                prompt = prompt.replace(self.AUDIO_CONTEXT_TOKEN, rendered, 1)
+                if self.AUDIO_CONTEXT_TOKEN in prompt:
+                    prompt = prompt.replace(self.AUDIO_CONTEXT_TOKEN, rendered, 1)
+                else:
+                    prompt = prompt + rendered
 
-            all_audios = list(base_output.audios)
             extracted = extractor(
                 all_audios,
                 sampling_rate=extractor.sampling_rate,
