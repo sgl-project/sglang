@@ -665,6 +665,16 @@ class FlashAttentionBackend(AttentionBackend):
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+
+        # TurboQuant: rotate Q into WHT domain for extend
+        # K/V are NOT rotated here — set_kv_buffer (above) quantizes original K/V
+        # with internal WHT, and the page cache returns rotspace data via lazy dequant.
+        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        if tq_config is not None:
+            q = tq_config.rotate_query(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            ).reshape(q.shape)
+
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -722,6 +732,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
+
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
@@ -998,6 +1009,12 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     o = result
 
+        # TurboQuant: inverse-rotate output back to original domain
+        if tq_config is not None:
+            o = tq_config.inverse_rotate_output(
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            ).reshape(o.shape)
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -1076,6 +1093,14 @@ class FlashAttentionBackend(AttentionBackend):
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+
+        # TurboQuant: rotate Q into WHT domain
+        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        if tq_config is not None:
+            q = tq_config.rotate_query(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            ).reshape(q.shape)
+
         if not self.use_mla:
             # Do multi-head attention
 
@@ -1288,6 +1313,12 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 o = result
+
+        # TurboQuant: inverse-rotate output back to original domain
+        if tq_config is not None:
+            o = tq_config.inverse_rotate_output(
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            ).reshape(o.shape)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
