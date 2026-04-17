@@ -54,10 +54,7 @@ jobs:
           cd python
           cp ../README.md ../LICENSE .
 
-          # Parse git describe output to get latest tag
-          # Use same command as pyproject.toml to ensure version consistency
-          DESC=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long 2>/dev/null || echo 'v0.0.0-0-g0000000')
-          TAG=$(echo "$DESC" | cut -d- -f1)
+          TAG=$(python3 ../python/tools/get_version_tag.py)
           HASH="g$(git rev-parse --short HEAD)"
           BUILD_DATE=$(date -u +%Y%m%d)
 

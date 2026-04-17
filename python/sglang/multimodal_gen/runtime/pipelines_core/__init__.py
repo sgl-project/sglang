@@ -66,6 +66,7 @@ def build_pipeline(
         )
     else:
         logger.info("No pipeline_class_name specified, using model_index.json")
+
         model_info = get_model_info(
             model_path,
             backend=server_args.backend,
