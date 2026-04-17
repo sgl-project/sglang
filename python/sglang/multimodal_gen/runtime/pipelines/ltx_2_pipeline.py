@@ -358,7 +358,7 @@ class LTX2TwoStageDeviceManager:
         )
 
     def initialize(self) -> None:
-        if not self.should_use_premerged():
+        if not self.should_use_premerged:
             return
 
         self.pipeline._initialize_premerged_stage2_transformer(self.server_args)
@@ -381,7 +381,7 @@ class LTX2TwoStageDeviceManager:
 
     def switch_phase(self, phase: str) -> bool:
         """Switch active two-stage DiT with minimal transfer/sync overhead."""
-        if not self.should_use_premerged():
+        if not self.should_use_premerged:
             return False
         if phase == self._active_phase:
             return True
@@ -432,7 +432,7 @@ class LTX2TwoStageDeviceManager:
     def prefetch_stage2_after_stage1(self) -> None:
         """Kick off stage-2 H2D right after stage-1 denoising to hide switch latency."""
         if (
-            not self.should_use_premerged()
+            not self.should_use_premerged
             or self.mode != "snapshot"
             or not self.server_args.dit_cpu_offload
         ):
@@ -455,7 +455,7 @@ class LTX2TwoStageDeviceManager:
         )
 
     def ensure_phase_ready(self, phase: str | None) -> None:
-        if not self.should_use_premerged() or phase not in ("stage1", "stage2"):
+        if not self.should_use_premerged or phase not in ("stage1", "stage2"):
             return
         if self.mode == "resident":
             return
@@ -465,7 +465,7 @@ class LTX2TwoStageDeviceManager:
         torch.get_device_module().current_stream().wait_event(ready_event)
 
     def release_premerged_transformers(self) -> None:
-        if not self.should_use_premerged() or self.mode != "snapshot":
+        if not self.should_use_premerged or self.mode != "snapshot":
             return
         # Keep stage-1 resident across requests so the next request can start
         # denoising immediately while stage-2 is prefetched in the background.
@@ -661,9 +661,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._device_manager = LTX2TwoStageDeviceManager(self, self.server_args)
-        self._use_premerged_stage2_transformer = (
-            self._device_manager.should_use_premerged()
-        )
+        self._use_premerged_stage2_transformer = self._device_manager.should_use_premerged
         self._device_manager.initialize()
 
     @staticmethod
