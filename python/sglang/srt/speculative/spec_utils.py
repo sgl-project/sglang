@@ -45,6 +45,12 @@ logger = logging.getLogger(__name__)
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
+# Safe token ID used by SIMULATE_ACC_LEN to fill predicted tokens.
+# Must decode cleanly (no replacement char) and not be an EOS token.
+# Initialized via set_simulate_safe_token_id() from the scheduler once the
+# tokenizer is available.  Falls back to 0 if never set.
+_SIMULATE_SAFE_TOKEN_ID: int = 0
+
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
 
@@ -55,6 +61,31 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
 
     # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
     return not server_args.enable_multi_layer_eagle
+
+
+def set_simulate_safe_token_id(tokenizer) -> None:
+    """Compute a token ID that decodes cleanly for SIMULATE_ACC_LEN mode.
+
+    Encodes the ASCII character "d" through the tokenizer and uses the
+    first resulting token ID.  This avoids byte-token models (e.g. Kimi-K2.5)
+    where low IDs (0-255) decode to replacement characters, stalling the
+    detokenizer.
+    """
+    global _SIMULATE_SAFE_TOKEN_ID
+    try:
+        ids = tokenizer.encode("d", add_special_tokens=False)
+        if ids:
+            _SIMULATE_SAFE_TOKEN_ID = ids[0]
+            logger.info(
+                "SIMULATE_ACC_LEN safe token ID set to %d", _SIMULATE_SAFE_TOKEN_ID
+            )
+    except Exception as e:
+        logger.warning(
+            "Failed to compute safe token ID for SIMULATE_ACC_LEN, "
+            "falling back to %d: %s",
+            _SIMULATE_SAFE_TOKEN_ID,
+            e,
+        )
 
 
 @triton.jit
@@ -562,7 +593,7 @@ def generate_simulated_accept_index(
         simulate_acc_len, device=accept_index.device
     )
     accept_length.fill_(simulate_acc_len - 1)
-    predict.fill_(100)  # some legit token id
+    predict.fill_(_SIMULATE_SAFE_TOKEN_ID)
     return sim_accept_index
 
 

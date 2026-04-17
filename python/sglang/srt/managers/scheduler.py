@@ -208,6 +208,10 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import (
+    SIMULATE_ACC_LEN,
+    set_simulate_safe_token_id,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -414,6 +418,11 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+        # Set a safe token ID for SIMULATE_ACC_LEN benchmarking mode.
+        # Must happen after tokenizer init so we can encode a known-safe string.
+        if SIMULATE_ACC_LEN > 0 and self.tokenizer is not None:
+            set_simulate_safe_token_id(self.tokenizer)
 
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
