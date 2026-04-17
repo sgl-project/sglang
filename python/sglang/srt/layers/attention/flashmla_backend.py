@@ -479,7 +479,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     ):
         if (
             forward_batch.forward_mode == ForwardMode.EXTEND
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
         ):
             return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
         else:
