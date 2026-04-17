@@ -20,9 +20,9 @@ from pathlib import Path
 
 from diffusion_case_parser import (
     BASELINE_REL_PATH,
-    CASE_CONFIG_REL_PATHS,
     RUN_SUITE_REL_PATH,
     collect_diffusion_suites,
+    resolve_case_config_path,
 )
 
 DYNAMIC_SUITES = {"1-gpu", "2-gpu"}
@@ -39,27 +39,18 @@ def load_execution_reports(reports_dir: Path) -> list[dict]:
 
 def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     """
-    Get all expected cases from case configs and run_suite.py.
+    Get all expected cases from case config and run_suite.py.
 
     Returns:
         Dictionary mapping suite name to set of expected case IDs.
         Standalone files are represented as "standalone:<filename>".
     """
-    case_config_paths = [repo_root / rel_path for rel_path in CASE_CONFIG_REL_PATHS]
-    existing_case_config_paths = [
-        config_path for config_path in case_config_paths if config_path.exists()
-    ]
     baseline_path = repo_root / BASELINE_REL_PATH
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
-
-    if not existing_case_config_paths:
-        raise FileNotFoundError(
-            "No diffusion case config found. Checked: "
-            + ", ".join(str(p) for p in case_config_paths)
-        )
+    case_config_path = resolve_case_config_path(repo_root, run_suite_path)
 
     suites = collect_diffusion_suites(
-        existing_case_config_paths,
+        case_config_path,
         run_suite_path,
         baseline_path,
     )
@@ -78,7 +69,7 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
         suite_name
         for suite_name in DYNAMIC_SUITES
         if suite_name in expected
-        and not any(
+           and not any(
             not case_id.startswith("standalone:") for case_id in expected[suite_name]
         )
     ]
@@ -292,7 +283,11 @@ def main():
         sys.exit(1)
 
     # Get expected cases
-    expected = get_expected_cases(repo_root)
+    try:
+        expected = get_expected_cases(repo_root)
+    except (RuntimeError, FileNotFoundError) as exc:
+        print(f"\nERROR: {exc}")
+        sys.exit(1)
     print("\nExpected cases by suite:")
     for suite, cases in expected.items():
         print(f"  {suite}: {len(cases)} cases")

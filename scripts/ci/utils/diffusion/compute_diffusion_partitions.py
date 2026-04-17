@@ -16,10 +16,10 @@ from pathlib import Path
 
 from diffusion_case_parser import (
     BASELINE_REL_PATH,
-    CASE_CONFIG_REL_PATHS,
     RUN_SUITE_REL_PATH,
     DiffusionSuiteInfo,
     collect_diffusion_suites,
+    resolve_case_config_path,
 )
 
 SUITE_OUTPUT_NAMES = {
@@ -39,10 +39,7 @@ class PartitionItem:
 
 def validate_suite_case_coverage(suites: dict[str, DiffusionSuiteInfo]) -> None:
     """
-    Guardrail: dynamic diffusion suites must keep parametrized cases.
-
-    If both suites suddenly become case-less, partitioning silently collapses to
-    a single shard and CI signal quality regresses.
+    Guardrail: dynamic diffusion suites must contain parametrized cases.
     """
     suites_with_no_cases = []
     for suite_name in SUITE_OUTPUT_NAMES:
@@ -57,8 +54,8 @@ def validate_suite_case_coverage(suites: dict[str, DiffusionSuiteInfo]) -> None:
         joined = ", ".join(suites_with_no_cases)
         print(
             "Error: Parsed zero parametrized cases for diffusion suites: "
-            f"{joined}. This usually means case definitions moved (for example "
-            "to gpu_cases.py) but parser inputs were not updated."
+            f"{joined}. This usually means run_suite case imports changed but "
+            "diffusion parser logic was not updated."
         )
         sys.exit(1)
 
@@ -255,25 +252,20 @@ def main():
     script_dir = Path(__file__).resolve().parent
     repo_root = script_dir.parent.parent.parent.parent
 
-    case_config_paths = [repo_root / rel_path for rel_path in CASE_CONFIG_REL_PATHS]
-    existing_case_config_paths = [
-        config_path for config_path in case_config_paths if config_path.exists()
-    ]
     baseline_path = repo_root / BASELINE_REL_PATH
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
 
-    if not existing_case_config_paths:
-        print(
-            "Error: No diffusion case config found. Checked: "
-            + ", ".join(str(p) for p in case_config_paths)
-        )
-        sys.exit(1)
     if not run_suite_path.exists():
         print(f"Error: Run suite not found: {run_suite_path}")
         sys.exit(1)
+    try:
+        case_config_path = resolve_case_config_path(repo_root, run_suite_path)
+    except (RuntimeError, FileNotFoundError) as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
 
     suites = collect_diffusion_suites(
-        existing_case_config_paths,
+        case_config_path,
         run_suite_path,
         baseline_path,
     )
