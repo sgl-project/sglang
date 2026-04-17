@@ -8,6 +8,7 @@ All transfer, compute, and event-loop logic for disaggregated roles
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -49,6 +50,8 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
+from sglang.srt.observability.trace import TraceReqContext
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
@@ -85,6 +88,12 @@ _EXCLUDE_FIELDS = frozenset(
         "step_index",
         "prompt_template",
         "max_sequence_length",
+        # trace_ctx holds live OTel SDK objects that aren't JSON-serializable.
+        # We propagate tracing across the JSON hop via a separate, JSON-safe
+        # ``_trace_state`` scalar field built from ``TraceReqContext.__getstate__``
+        # (same W3C carrier SRT relies on for pickle transport) and rebuild it
+        # on the receiver in ``_build_disagg_req``.
+        "trace_ctx",
     }
 )
 
@@ -234,6 +243,18 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
                             _ti.dtype,
                             _sz,
                         )
+
+    # Propagate OTel trace context over the JSON hop. TraceReqContext.__getstate__
+    # reduces the live context to a JSON-safe dict (W3C traceparent/tracestate in
+    # root_span_context). Receiver rebuilds via __setstate__ in _build_disagg_req.
+    trace_ctx = getattr(req, "trace_ctx", None)
+    if trace_ctx is not None and getattr(trace_ctx, "tracing_enable", False):
+        try:
+            trace_state = trace_ctx.__getstate__()
+            if trace_state and trace_state.get("tracing_enable"):
+                scalar_fields["_trace_state"] = trace_state
+        except Exception as e:
+            logger.debug("Failed to export trace state: %s", e)
 
     return tensor_fields, scalar_fields
 
@@ -1235,12 +1256,14 @@ class SchedulerDisaggMixin:
                     extra_kwargs["mu"] = mu
                 scheduler_mod.set_timesteps(num_steps, device=device, **extra_kwargs)
 
-            self.worker.execute_forward([req], return_req=True)
+            with self._disagg_trace_dispatch(req):
+                self.worker.execute_forward([req], return_req=True)
 
         elif self._disagg_role == RoleType.DECODER:
             req.save_output = False
             req.return_file_paths_only = False
-            self.worker.execute_forward([req])
+            with self._disagg_trace_dispatch(req):
+                self.worker.execute_forward([req])
 
     def _build_disagg_req(self: Scheduler, scalar_fields: dict, tensors: dict) -> Req:
         """Reconstruct a Req from transfer scalar fields and loaded GPU tensors.
@@ -1248,6 +1271,10 @@ class SchedulerDisaggMixin:
         Initializes all dataclass field defaults first, then overlays
         scalar and tensor fields from the transfer message.
         """
+        # Pop _trace_state before the generic setattr loop so it doesn't land
+        # on the Req as a stray attribute.
+        trace_state = scalar_fields.pop("_trace_state", None)
+
         req = object.__new__(Req)
         # Initialize all dataclass fields with their defaults
         for f in dataclasses.fields(Req):
@@ -1272,8 +1299,42 @@ class SchedulerDisaggMixin:
             gen = torch.Generator(device="cpu")
             gen.manual_seed(int(seed))
             req.generator = gen
+        # Rebuild trace_ctx from the propagated __getstate__ dict so this role's
+        # spans nest under the sender's trace (same mechanism SRT uses via pickle).
+        if trace_state and trace_state.get("tracing_enable"):
+            try:
+                ctx = object.__new__(TraceReqContext)
+                ctx.__setstate__(trace_state)
+                req.trace_ctx = ctx
+            except Exception as e:
+                logger.debug("Failed to rebuild trace_ctx from _trace_state: %s", e)
         req.validate()
         return req
+
+    @contextlib.contextmanager
+    def _disagg_trace_dispatch(self: Scheduler, req: Req):
+        """Wrap a disagg role's worker.execute_forward in the tracing lifecycle.
+
+        Mirrors the monolithic path in ``scheduler._handle_generation``: rebuild
+        the thread context under the (potentially remote) root_span_context that
+        was propagated in via ``_trace_state`` / pickle, then emit a
+        ``scheduler_dispatch`` span for this role with ``thread_finish_flag``
+        so the thread span closes when compute returns. If tracing is disabled
+        (TraceNullContext), everything is a no-op.
+        """
+        ctx = getattr(req, "trace_ctx", None)
+        if ctx is None:
+            yield
+            return
+        # Disagg receive (__setstate__) and compute may run on different
+        # threads (e.g. recv-prefetch vs scheduler main). Align the ctx's pid
+        # with the current compute thread so __create_thread_context's
+        # threads_info lookup resolves via the local registration.
+        if getattr(ctx, "tracing_enable", False):
+            ctx.pid = threading.get_native_id()
+        ctx.rebuild_thread_context()
+        with trace_slice(ctx, DiffStage.SCHEDULER_DISPATCH, thread_finish_flag=True):
+            yield
 
     def _disagg_denoiser_compute(
         self: Scheduler, req: Req, request_id: str, role_name: str
@@ -1285,7 +1346,8 @@ class SchedulerDisaggMixin:
         """
         # Run denoising
         start_time = time.monotonic()
-        result = self.worker.execute_forward([req], return_req=True)
+        with self._disagg_trace_dispatch(req):
+            result = self.worker.execute_forward([req], return_req=True)
         duration_s = time.monotonic() - start_time
 
         if not isinstance(result, Req):
@@ -1375,7 +1437,8 @@ class SchedulerDisaggMixin:
         req.return_file_paths_only = False
 
         start_time = time.monotonic()
-        output_batch = self.worker.execute_forward([req])
+        with self._disagg_trace_dispatch(req):
+            output_batch = self.worker.execute_forward([req])
         duration_s = time.monotonic() - start_time
 
         # Send result as raw ZMQ frames (no TRANSFER_MAGIC prefix).
@@ -1424,7 +1487,8 @@ class SchedulerDisaggMixin:
             self._disagg_metrics.record_request_start(request_id)
 
         # Run encoder stages
-        req_result = self.worker.execute_forward(reqs, return_req=True)
+        with self._disagg_trace_dispatch(req):
+            req_result = self.worker.execute_forward(reqs, return_req=True)
 
         if not isinstance(req_result, Req):
             # Error — send error via scalar fields (rank 0 only)
