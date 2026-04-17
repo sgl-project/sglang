@@ -98,6 +98,7 @@
             "pages": [
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
+              "docs/advanced_features/object_storage",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/speculative_decoding",
@@ -107,6 +108,7 @@
               "docs/advanced_features/separate_reasoning",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
+              "docs/advanced_features/dp_dpa_smg_guide",
               "docs/advanced_features/expert_parallelism",
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",
@@ -124,6 +126,8 @@
               "docs/advanced_features/vlm_query",
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
+              "docs/advanced_features/breakable_cuda_graph",
+              "docs/advanced_features/piecewise_cuda_graph",
               "docs/advanced_features/sgl_model_gateway",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
@@ -244,15 +248,15 @@
               {
                 "group": "Ascend NPUs",
                 "pages": [
-                  "docs/hardware-platforms/ascend-npus/Best Practice on Ascend NPU",
-                  "docs/hardware-platforms/ascend-npus/DeepSeek Examples",
+                  "docs/hardware-platforms/ascend-npus/Best-Practice-on-Ascend-NPU",
+                  "docs/hardware-platforms/ascend-npus/DeepSeek-Examples",
                   "docs/hardware-platforms/ascend-npus/GLM-5",
-                  "docs/hardware-platforms/ascend-npus/MindSpore Models",
-                  "docs/hardware-platforms/ascend-npus/Qwen3 Examples",
+                  "docs/hardware-platforms/ascend-npus/MindSpore-Models",
+                  "docs/hardware-platforms/ascend-npus/Qwen3-Examples",
                   "docs/hardware-platforms/ascend-npus/Qwen3.5",
-                  "docs/hardware-platforms/ascend-npus/SGLang installation with NPUs support",
-                  "docs/hardware-platforms/ascend-npus/Support Features on Ascend NPU",
-                  "docs/hardware-platforms/ascend-npus/Support Models on Ascend NPU"
+                  "docs/hardware-platforms/ascend-npus/SGLang-installation-with-NPUs-support",
+                  "docs/hardware-platforms/ascend-npus/Support-Features-on-Ascend-NPU",
+                  "docs/hardware-platforms/ascend-npus/Support-Models-on-Ascend-NPU"
                 ]
               },
               "docs/hardware-platforms/cpu-server",
@@ -283,6 +287,7 @@
                   {
                     "group": "Qwen",
                     "pages": [
+                      "cookbook/autoregressive/Qwen/Qwen3.6",
                       "cookbook/autoregressive/Qwen/Qwen3.5",
                       "cookbook/autoregressive/Qwen/Qwen3",
                       "cookbook/autoregressive/Qwen/Qwen3-Next",

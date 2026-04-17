@@ -82,7 +82,7 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
         ```
 
     - Use the "anonymous" flag to not specify a slice name at the start of the slice, allowing the slice name to be determined by trace_slice_end.
-    
+
 Note: Anonymous slices must not be nested.
         ```python Example
         trace_slice_start("", rid, anonymous = True)

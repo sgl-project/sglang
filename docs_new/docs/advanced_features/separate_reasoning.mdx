@@ -207,7 +207,7 @@ print_highlight("==== Text ====")
 print_highlight(content)
 ```
 
-The reasoning separation is enable by default when specify . 
+The reasoning separation is enable by default when specify .
 **To disable it, set the `separate_reasoning` option to `False` in request.**
 
 
@@ -226,7 +226,7 @@ print_highlight("==== Original Output ====")
 print_highlight(response_non_stream.choices[0].message.content)
 ```
 
-### SGLang Native API 
+### SGLang Native API
 
 
 
@@ -315,4 +315,3 @@ llm.shutdown()
 ## Supporting New Reasoning Model Schemas
 
 For future reasoning models, you can implement the reasoning parser as a subclass of `BaseReasoningFormatDetector` in `python/sglang/srt/reasoning_parser.py` and specify the reasoning parser for new reasoning model schemas accordingly.
-
