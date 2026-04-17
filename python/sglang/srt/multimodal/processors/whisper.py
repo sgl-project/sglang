@@ -1,8 +1,6 @@
 import logging
 from typing import Any, Dict, Optional
 
-import torch
-
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -156,16 +154,11 @@ class WhisperProcessor(BaseMultimodalProcessor):
 
         # Whisper expects input features padded to max_length (3000 frames = 30 seconds)
         # This is the standard context length for Whisper
-        fe_kwargs: dict[str, Any] = dict(
+        input_features = self._processor.feature_extractor(
+            audios[0],
             sampling_rate=16000,
             padding="max_length",  # Pad to 3000 frames
             return_tensors="pt",
-        )
-        if torch.cuda.is_available():
-            fe_kwargs["device"] = "cuda"
-        input_features = self._processor.feature_extractor(
-            audios[0],
-            **fe_kwargs,
         )["input_features"][0]
 
         # Whisper is a pure speech-to-text model; text prompts are ignored.
