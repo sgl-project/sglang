@@ -510,6 +510,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | --- | --- | --- | --- |
 | `--custom-weight-loader` | The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func | `None` | List[str] |
 | `--weight-loader-disable-mmap` | Disable mmap while loading weight using safetensors. | `False` | bool flag (set to enable) |
+| `--weight-loader-prefetch-checkpoints` | Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards in a background thread, reducing total network I/O on shared filesystems (NFS/Lustre) from N\*checkpoint to 1\*checkpoint. Recommended for models on network storage. | `False` | bool flag (set to enable) |
+| `--weight-loader-prefetch-num-threads` | Number of threads per rank for checkpoint prefetching. | `4` | Type: int |
 | `--remote-instance-weight-loader-seed-instance-ip` | The ip of the seed instance for loading weights from remote instance. | `None` | Type: str |
 | `--remote-instance-weight-loader-seed-instance-service-port` | The service port of the seed instance for loading weights from remote instance. | `None` | Type: int |
 | `--remote-instance-weight-loader-send-weights-group-ports` | The communication group ports for loading weights from remote instance. | `None` | Type: JSON list |
