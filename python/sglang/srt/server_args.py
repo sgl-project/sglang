@@ -2307,10 +2307,26 @@ class ServerArgs:
                     self.disable_overlap_schedule = False
             else:
                 if not self.disable_radix_cache:
-                    raise ValueError(
-                        f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
-                        "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
-                    )
+                    if is_cuda():
+                        # Automatically switch to extra_buffer + SPEC_V2 on CUDA
+                        # to support Qwen3.5 MoE speculative decoding out of the box.
+                        logger.warning(
+                            f"Speculative decoding for {model_arch} requires "
+                            "--mamba-scheduler-strategy extra_buffer on CUDA. "
+                            "Automatically switching to extra_buffer and enabling SGLANG_ENABLE_SPEC_V2."
+                        )
+                        self.mamba_scheduler_strategy = "extra_buffer"
+                        if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                            envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    else:
+                        # On ROCm/non-CUDA, extra_buffer is unsupported.
+                        # Automatically disable radix cache instead.
+                        logger.warning(
+                            f"Speculative decoding for {model_arch} is not compatible "
+                            "with radix cache on non-CUDA devices. "
+                            "Automatically disabling radix cache."
+                        )
+                        self.disable_radix_cache = True
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
