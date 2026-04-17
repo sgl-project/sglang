@@ -381,10 +381,27 @@ def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
     return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
 
 
+def _ltx2_is_torch_compiling() -> bool:
+    try:
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
+            return bool(torch.compiler.is_compiling())
+        if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "is_compiling"):
+            return bool(torch._dynamo.is_compiling())
+    except Exception:
+        return False
+    return False
+
+
+def _ltx2_can_use_custom_modulation_kernel(x: torch.Tensor) -> bool:
+    # Under torch.compile, keep the raw PyTorch expression visible so Inductor can
+    # fuse modulation into the surrounding graph instead of calling small kernels.
+    return x.is_cuda and not _ltx2_is_torch_compiling()
+
+
 def _ltx2_can_use_fused_norm(x: torch.Tensor) -> bool:
     return (
         fused_norm_scale_shift is not None
-        and x.is_cuda
+        and _ltx2_can_use_custom_modulation_kernel(x)
         and x.ndim == 3
         and x.shape[-1] % 256 == 0
         and x.shape[-1] <= 8192
@@ -400,7 +417,7 @@ def _ltx2_scale_shift(
 ) -> torch.Tensor:
     if (
         fuse_scale_shift_kernel is not None
-        and x.is_cuda
+        and _ltx2_can_use_custom_modulation_kernel(x)
         and x.ndim == 3
         and scale.is_cuda
     ):
@@ -1051,7 +1068,6 @@ class LTX2TransformerBlock(nn.Module):
         v2a_cross_attn_perturbation_mask: Optional[torch.Tensor] = None,
         audio_replicated_for_sp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         batch_size = hidden_states.size(0)
 
         # 1. Video and Audio Self-Attention
@@ -1671,7 +1687,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         audio_replicated_for_sp: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-
         batch_size = hidden_states.size(0)
         audio_timestep = audio_timestep if audio_timestep is not None else timestep
 
