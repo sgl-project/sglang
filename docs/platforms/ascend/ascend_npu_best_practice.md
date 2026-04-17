@@ -173,7 +173,7 @@ done
 ```
 
 ```shell
-python -m sglang_router.launch_router \
+SGLANG_DP_ROUND_ROBIN=1 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
     --prefill http://P_IP:8000 8998 \
@@ -462,7 +462,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 256  --random-input-len 2048 --random-output-len 2048 --num-prompts 1024 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 352  --random-input-len 2048 --random-output-len 2048 --num-prompts 1408 --random-range-ratio 1
 ```
 
 ### DeepSeek-R1 2K-2K 50ms on A3 16 Cards Disaggregation Mode
@@ -523,7 +523,7 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export HCCL_BUFFSIZE=1536
+        export HCCL_BUFFSIZE=2600
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
@@ -531,11 +531,11 @@ do
         export GLOO_SOCKET_IFNAME=lo
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
         --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
-        --tp-size 16 --mem-fraction-static 0.8 --attention-backend ascend --device npu --quantization modelslim \
-        --disaggregation-transfer-backend ascend --max-running-requests 8 --context-length 8192  --disable-radix-cache \
-        --chunked-prefill-size 32768 --max-prefill-tokens 28680 --moe-a2a-backend deepep --deepep-mode normal \
+        --tp-size 16 --mem-fraction-static 0.7 --attention-backend ascend --device npu --quantization modelslim \
+        --disaggregation-transfer-backend ascend --max-running-requests 32 --context-length 8192  --disable-radix-cache \
+        --chunked-prefill-size -1 --max-prefill-tokens 10240 --moe-a2a-backend deepep --deepep-mode normal \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
-        --dp-size 1 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16
+        --dp-size 8 --enable-dp-attention --disable-shared-experts-fusion --dtype bfloat16
         NODE_RANK=$i
         break
     fi
@@ -549,17 +549,17 @@ do
         echo "${D_IP[$i]}"
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
-        export HCCL_BUFFSIZE=720
+        export HCCL_BUFFSIZE=900
         export SGLANG_DP_ROUND_ROBIN=1
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=112
         export TASK_QUEUE_ENABLE=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 4 \
-        --mem-fraction-static 0.8 --max-running-requests 24 --attention-backend ascend --device npu --quantization modelslim \
+        --port 8001 --trust-remote-code --nnodes 1 --node-rank 0 --tp-size 16 --dp-size 16 \
+        --mem-fraction-static 0.8 --max-running-requests 448 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
-        --cuda-graph-bs 8 10 12 14 16 18 20 22 24 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
+        --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
 		--load-balance-method round_robin
@@ -586,7 +586,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 400  --random-input-len 2048 --random-output-len 2048 --num-prompts 3200 --random-range-ratio 1 --request-rate 8
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 448  --random-input-len 2048 --random-output-len 2048 --num-prompts 1792 --random-range-ratio 1 --request-rate 32
 ```
 
 ### DeepSeek-R1 3_5K-1_5K 50ms on A3 8 Cards Mixed Mode
@@ -662,7 +662,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 144  --random-input-len 3500 --random-output-len 1500 --num-prompts 576 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 224  --random-input-len 3500 --random-output-len 1500 --num-prompts 896 --random-range-ratio 1
 ```
 
 ### DeepSeek-R1 3_5K-1_5K 50ms on A3 16 Cards Disaggregation Mode
@@ -785,7 +785,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 384  --random-input-len 3500 --random-output-len 1500 --num-prompts 1536 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 416  --random-input-len 3500 --random-output-len 1500 --num-prompts 1664 --random-range-ratio 1
 ```
 
 ### DeepSeek-V3.2 128K-1K 26ms on A3 32 Cards Disaggregation Mode
