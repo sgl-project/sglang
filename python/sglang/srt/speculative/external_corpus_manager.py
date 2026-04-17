@@ -101,7 +101,10 @@ class ExternalCorpusManager:
         self, recv_req: ListExternalCorporaReqInput
     ) -> ListExternalCorporaReqOutput:
         try:
-            ids = self._worker.list_external_corpora()
-            return ListExternalCorporaReqOutput(success=True, corpus_ids=ids)
+            token_counts = self._worker.list_external_corpora()
+            return ListExternalCorporaReqOutput(
+                success=True,
+                corpus_token_counts=token_counts,
+            )
         except Exception as e:
             return ListExternalCorporaReqOutput(success=False, message=str(e))

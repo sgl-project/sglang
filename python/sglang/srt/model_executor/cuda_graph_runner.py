@@ -41,6 +41,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -87,6 +88,13 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 _is_hip = is_hip()
+
+if not _is_hip:
+    from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+        BreakableCUDAGraph,
+        BreakableCUDAGraphCapture,
+        eager_on_graph,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -637,25 +645,6 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # Speculative_inference
-        if (
-            model_runner.spec_algorithm.is_eagle3()
-            and model_runner.eagle_use_aux_hidden_state
-        ):
-            self.model_runner.model.set_eagle3_layers_to_capture()
-        if (
-            model_runner.spec_algorithm.is_dflash()
-            and model_runner.dflash_use_aux_hidden_state
-        ):
-            if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
-                raise ValueError(
-                    f"Model {self.model_runner.model.__class__.__name__} does not implement set_dflash_layers_to_capture, "
-                    "which is required for DFLASH aux hidden capture."
-                )
-            self.model_runner.model.set_dflash_layers_to_capture(
-                self.model_runner.dflash_target_layer_ids
-            )
-
         # Capture
         try:
             with model_capture_mode():
@@ -833,20 +822,43 @@ class CudaGraphRunner:
             self._post_process_after_profile(prof)
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
+        if self.model_runner.server_args.debug_cuda_graph:
+            assert (
+                envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get()
+            ), "Breakable CUDA graph is not enabled in debug mode"
+
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.model_runner.server_args.enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
-        graph_fn = (
-            partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
-            if memory_saver_adapter.enabled
-            else self.device_module.graph
-        )
-        with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
-            out = run_once_fn()
+
+        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+            if memory_saver_adapter.enabled:
+                raise NotImplementedError(
+                    "Breakable CUDA graph is not compatible with memory saver mode"
+                )
+            graph_ctx = BreakableCUDAGraphCapture
+        else:
+            graph_ctx = (
+                partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
+                if memory_saver_adapter.enabled
+                else self.device_module.graph
+            )
+
+        if self.model_runner.server_args.debug_cuda_graph:
+            captured_fn = eager_on_graph(True)(run_once_fn)
+        else:
+            captured_fn = run_once_fn
+
+        with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
+            out = captured_fn()
         return out
 
     def _create_device_graph(self):
+        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+            if _is_hip:
+                raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
+            return BreakableCUDAGraph()
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
@@ -870,7 +882,20 @@ class CudaGraphRunner:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+
+        # Adjust for attention TP if needed (matching replay path in
+        # populate_from_forward_batch).
         buffers.num_token_non_padded[...] = num_tokens
+        if (
+            enable_num_token_non_padded(self.model_runner.server_args)
+            and self.require_gathered_buffer
+            and not self.nsa_enable_prefill_cp
+        ):
+            local = compute_local_num_token_non_padded(
+                global_num_token_non_padded=buffers.num_token_non_padded,
+                num_tokens_per_dp=num_tokens,
+            )
+            buffers.num_token_non_padded.copy_(local)
 
         # pipeline parallelism
         if self.pp_size > 1:
