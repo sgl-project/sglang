@@ -3,7 +3,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX1_FP8_TRANSFORMER,
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
-    MODELOPT_FLUX2_NVFP4_MODEL,
+    MODELOPT_FLUX2_NVFP4_WEIGHTS,
     MODELOPT_NVFP4_B200_ENV_VARS,
     MODELOPT_WAN22_FP8_TRANSFORMER,
     MODELOPT_WAN22_NVFP4_TRANSFORMER,
@@ -398,10 +398,10 @@ else:
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_nvfp4_t2i",
-            model_path=MODELOPT_FLUX2_NVFP4_MODEL,
+            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
-            extras=[],
+            extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
         ),
         _make_modelopt_ci_case(
