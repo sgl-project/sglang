@@ -15,6 +15,7 @@ and aggregation. We only implement generate_until; loglikelihood raises.
 from __future__ import annotations
 
 import asyncio
+import os
 from argparse import Namespace
 from typing import Any, Dict, List, Optional
 
@@ -120,6 +121,10 @@ class BenchServingLM(LM):
         # Assumes single-threaded access to bench_serving.benchmark(); if
         # parallel calls become a goal, replace set_global_args with a
         # context-local or argument-passing mechanism.
+        # output_file=os.devnull suppresses bench_serving's unconditional
+        # auto-named JSONL dump in CWD. Callers who want a persisted report
+        # should use sglang.bench_eval's --output-file (handled at a higher
+        # layer via write_report).
         args = Namespace(
             dataset_name="bench_eval",
             backend=self.backend,
@@ -128,9 +133,10 @@ class BenchServingLM(LM):
             random_input_len=0,
             random_output_len=0,
             random_range_ratio=1.0,
-            output_file=None,
+            output_file=os.devnull,
             output_details=False,
             num_prompts=len(rows),
+            warmup_requests=self.warmup_requests,
         )
         bench_serving.set_global_args(args)
         bench_serving._apply_arg_defaults(args)
