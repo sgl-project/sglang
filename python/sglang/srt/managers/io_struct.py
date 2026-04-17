@@ -1115,7 +1115,7 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     token_steps: List[List[int]] = None
 
     # Load for DP balance
-    load: GetLoadReqOutput = None
+    load: GetLoadsReqOutput = None
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
@@ -1177,7 +1177,7 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     token_steps: List[List[int]] = None
 
     # Load for DP balance
-    load: GetLoadReqOutput = None
+    load: GetLoadsReqOutput = None
 
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -1889,21 +1889,6 @@ class BlockReqInput(BaseReq):
 
 
 @dataclass
-class GetLoadReqInput(BaseReq):
-    pass
-
-
-@dataclass
-class GetLoadReqOutput(BaseReq):
-    dp_rank: int
-    num_reqs: int
-    num_waiting_reqs: int
-    num_tokens: int
-    num_pending_tokens: int
-    ts_tic: float
-
-
-@dataclass
 class MemoryMetrics:
     """Memory breakdown metrics."""
 
@@ -2020,6 +2005,11 @@ class GetLoadsReqOutput(BaseReq):
     num_used_tokens: int = field(
         metadata={"metric": ("gauge", "Number of tokens in use")}
     )
+    # num_used_tokens + pending prefill tokens (waiting-queue seqlen, incl.
+    # disagg bootstrap/prealloc/transfer queues). Used for DP balance.
+    num_total_tokens: int = field(
+        metadata={"metric": ("gauge", "Used tokens plus pending prefill tokens")}
+    )
     max_total_num_tokens: int = field(
         metadata={"metric": ("gauge", "Maximum token capacity")}
     )
@@ -2048,7 +2038,7 @@ class GetLoadsReqOutput(BaseReq):
 
 @dataclass
 class WatchLoadUpdateReq(BaseReq):
-    loads: List[GetLoadReqOutput]
+    loads: List[GetLoadsReqOutput]
 
 
 @dataclass
