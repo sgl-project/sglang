@@ -232,6 +232,25 @@ class AnthropicServing:
                             }
                         )
 
+                elif block.type == "search_result":
+                    # Anthropic web_search tool returns search_result blocks
+                    # with source URL, title, and content. Flatten to text.
+                    parts = []
+                    if block.title:
+                        parts.append(block.title)
+                    if isinstance(block.source, str):
+                        parts.append(block.source)
+                    if isinstance(block.content, list):
+                        for item in block.content:
+                            if isinstance(item, dict) and item.get("text"):
+                                parts.append(item["text"])
+                    elif isinstance(block.content, str) and block.content:
+                        parts.append(block.content)
+                    if parts:
+                        content_parts.append(
+                            {"type": "text", "text": "\n".join(parts)}
+                        )
+
             # Attach tool calls to assistant messages
             if tool_calls:
                 openai_msg["tool_calls"] = tool_calls
@@ -270,10 +289,12 @@ class AnthropicServing:
 
         chat_request = ChatCompletionRequest(**request_data)
 
-        # Convert tools
+        # Convert tools (skip built-in tools like web_search that have no schema)
         if anthropic_request.tools:
             tools = []
             for tool in anthropic_request.tools:
+                if tool.input_schema is None:
+                    continue
                 tools.append(
                     Tool(
                         type="function",
@@ -284,7 +305,8 @@ class AnthropicServing:
                         },
                     )
                 )
-            chat_request.tools = tools
+            if tools:
+                chat_request.tools = tools
 
         # Convert tool choice
         if anthropic_request.tool_choice is not None:
