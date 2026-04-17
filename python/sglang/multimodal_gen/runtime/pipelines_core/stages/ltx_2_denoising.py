@@ -1,32 +1,13 @@
 import copy
-import json
-import math
-import os
 from dataclasses import dataclass, field
-from io import BytesIO
 
-import av
-import numpy as np
-import PIL.Image
 import torch
-from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-from diffusers.models.modeling_outputs import AutoencoderKLOutput
-from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
-    LTX23VideoConditionEncoder,
-)
-from sglang.multimodal_gen.runtime.models.vision_utils import (
-    load_image,
-    normalize,
-    numpy_to_pt,
-    pil_to_numpy,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
@@ -36,10 +17,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -73,8 +52,6 @@ class LTX2DenoisingStage(DenoisingStage):
         super().__init__(
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
-        self._condition_image_encoder = None
-        self._condition_image_encoder_dir = None
 
     @staticmethod
     def _get_video_latent_num_frames_for_model(
@@ -306,78 +283,13 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         return cls._ltx2_apply_rescale(cond, pred, rescale_scale)
 
-    @staticmethod
-    def _resize_center_crop(
-        img: PIL.Image.Image, *, width: int, height: int
-    ) -> PIL.Image.Image:
-        return img.resize((width, height), resample=PIL.Image.Resampling.BILINEAR)
-
-    @staticmethod
-    def _apply_video_codec_compression(
-        img_array: np.ndarray, crf: int = 33
-    ) -> np.ndarray:
-        """Encode as a single H.264 frame and decode back to simulate compression artifacts."""
-        if crf == 0:
-            return img_array
-        height, width = img_array.shape[0] // 2 * 2, img_array.shape[1] // 2 * 2
-        img_array = img_array[:height, :width]
-        buffer = BytesIO()
-        container = av.open(buffer, mode="w", format="mp4")
-        stream = container.add_stream(
-            "libx264", rate=1, options={"crf": str(crf), "preset": "veryfast"}
-        )
-        stream.height, stream.width = height, width
-        frame = av.VideoFrame.from_ndarray(img_array, format="rgb24").reformat(
-            format="yuv420p"
-        )
-        container.mux(stream.encode(frame))
-        container.mux(stream.encode())
-        container.close()
-        buffer.seek(0)
-        container = av.open(buffer)
-        decoded = next(container.decode(container.streams.video[0]))
-        container.close()
-        return decoded.to_ndarray(format="rgb24")
-
-    @staticmethod
-    def _resize_center_crop_tensor(
-        img: PIL.Image.Image,
-        *,
-        width: int,
-        height: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        apply_codec_compression: bool = True,
-        codec_crf: int = 33,
-    ) -> torch.Tensor:
-        """Resize, center-crop, and normalize to [1, C, 1, H, W] tensor in [-1, 1]."""
-        img_array = np.array(img).astype(np.uint8)[..., :3]
-        if apply_codec_compression:
-            img_array = LTX2DenoisingStage._apply_video_codec_compression(
-                img_array, crf=codec_crf
-            )
-        tensor = (
-            torch.from_numpy(img_array.astype(np.float32))
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .to(device=device)
-        )
-        src_h, src_w = tensor.shape[2], tensor.shape[3]
-        scale = max(height / src_h, width / src_w)
-        new_h, new_w = math.ceil(src_h * scale), math.ceil(src_w * scale)
-        tensor = torch.nn.functional.interpolate(
-            tensor, size=(new_h, new_w), mode="bilinear", align_corners=False
-        )
-        top, left = (new_h - height) // 2, (new_w - width) // 2
-        tensor = tensor[:, :, top : top + height, left : left + width]
-        return ((tensor / 127.5 - 1.0).to(dtype=dtype)).unsqueeze(2)
-
-    @staticmethod
-    def _pil_to_normed_tensor(img: PIL.Image.Image) -> torch.Tensor:
-        # PIL -> numpy [0,1] -> torch [B,C,H,W], then [-1,1]
-        arr = pil_to_numpy(img)
-        t = numpy_to_pt(arr)
-        return normalize(t)
+    def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
+        """LTX-2 TI2V applies image_latent in token space *after* SP sharding,
+        so the base implementation must not shard it."""
+        saved = batch.image_latent
+        batch.image_latent = None
+        super()._preprocess_sp_latents(batch, server_args)
+        batch.image_latent = saved
 
     @staticmethod
     def _should_apply_ltx2_ti2v(batch: Req) -> bool:
@@ -404,176 +316,6 @@ class LTX2DenoisingStage(DenoisingStage):
         is_ltx23_variant: bool,
     ) -> bool:
         return False
-
-    def _get_condition_image_encoder(
-        self,
-        server_args: ServerArgs,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> LTX23VideoConditionEncoder | None:
-        arch_config = server_args.pipeline_config.vae_config.arch_config
-        encoder_subdir = str(getattr(arch_config, "condition_encoder_subdir", ""))
-        if not encoder_subdir:
-            return None
-
-        vae_model_path = server_args.model_paths["vae"]
-        encoder_dir = os.path.join(vae_model_path, encoder_subdir)
-        config_path = os.path.join(encoder_dir, "config.json")
-        weights_path = os.path.join(encoder_dir, "model.safetensors")
-        if not os.path.exists(config_path) or not os.path.exists(weights_path):
-            raise ValueError(
-                f"LTX-2 condition encoder files not found under {encoder_dir}"
-            )
-
-        cached_dir = self._condition_image_encoder_dir
-        encoder = self._condition_image_encoder
-        if encoder is None or cached_dir != encoder_dir:
-            with open(config_path, encoding="utf-8") as f:
-                config = json.load(f)
-            encoder = LTX23VideoConditionEncoder(config)
-            encoder.load_state_dict(safetensors_load_file(weights_path), strict=True)
-            self._condition_image_encoder = encoder
-            self._condition_image_encoder_dir = encoder_dir
-
-        encoder = encoder.to(device=device, dtype=dtype)
-        return encoder
-
-    def _prepare_ltx2_image_latent(self, batch: Req, server_args: ServerArgs) -> None:
-        """Encode `batch.image_path` into packed token latents for LTX-2 TI2V."""
-        if (
-            batch.image_latent is not None
-            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
-        ):
-            return
-        batch.ltx2_num_image_tokens = 0
-        batch.image_latent = None
-
-        if batch.image_path is None:
-            return
-        if batch.width is None or batch.height is None:
-            raise ValueError("width/height must be provided for LTX-2 TI2V.")
-        if self.vae is None:
-            raise ValueError("VAE must be provided for LTX-2 TI2V.")
-
-        image_path = (
-            batch.image_path[0]
-            if isinstance(batch.image_path, list)
-            else batch.image_path
-        )
-
-        img = load_image(image_path)
-        img_array = np.array(img).astype(np.uint8)[..., :3]
-        img_array = self._apply_video_codec_compression(img_array, crf=33)
-        conditioned_img = PIL.Image.fromarray(img_array)
-        batch.condition_image = self._resize_center_crop(
-            conditioned_img, width=int(batch.width), height=int(batch.height)
-        )
-
-        latents_device = (
-            batch.latents.device
-            if isinstance(batch.latents, torch.Tensor)
-            else torch.device("cpu")
-        )
-        encode_dtype = batch.latents.dtype
-        original_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        vae_autocast_enabled = (
-            original_dtype != torch.float32
-        ) and not server_args.disable_autocast
-        condition_image_encoder = self._get_condition_image_encoder(
-            server_args, device=latents_device, dtype=encode_dtype
-        )
-        if condition_image_encoder is None:
-            self.vae = self.vae.to(device=latents_device, dtype=encode_dtype)
-
-        video_condition = self._resize_center_crop_tensor(
-            conditioned_img,
-            width=int(batch.width),
-            height=int(batch.height),
-            device=latents_device,
-            dtype=encode_dtype,
-            apply_codec_compression=False,
-        )
-
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=original_dtype,
-            enabled=vae_autocast_enabled,
-        ):
-            try:
-                if (
-                    condition_image_encoder is None
-                    and server_args.pipeline_config.vae_tiling
-                ):
-                    self.vae.enable_tiling()
-            except Exception:
-                pass
-            if not vae_autocast_enabled:
-                video_condition = video_condition.to(encode_dtype)
-
-            if condition_image_encoder is not None:
-                latent = condition_image_encoder(video_condition)
-            else:
-                latent_dist: DiagonalGaussianDistribution = self.vae.encode(
-                    video_condition
-                )
-                if isinstance(latent_dist, AutoencoderKLOutput):
-                    latent_dist = latent_dist.latent_dist
-
-        if condition_image_encoder is None:
-            mode = server_args.pipeline_config.vae_config.encode_sample_mode()
-            if mode == "argmax":
-                latent = latent_dist.mode()
-            elif mode == "sample":
-                if batch.generator is None:
-                    raise ValueError("Generator must be provided for VAE sampling.")
-                latent = latent_dist.sample(batch.generator)
-            else:
-                raise ValueError(f"Unsupported encode_sample_mode: {mode}")
-
-            # Per-channel normalization: normalized = (x - mean) / std
-            mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latent)
-            std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latent)
-            latent = (latent - mean) / std
-        else:
-            latent = latent.to(dtype=encode_dtype)
-
-        packed = server_args.pipeline_config.maybe_pack_latents(
-            latent, latent.shape[0], batch
-        )
-        if not (isinstance(packed, torch.Tensor) and packed.ndim == 3):
-            raise ValueError("Expected packed image latents [B, S0, D].")
-
-        # Fail-fast token count: must match one latent frame's tokens.
-        vae_sf = int(server_args.pipeline_config.vae_scale_factor)
-        patch = int(server_args.pipeline_config.patch_size)
-        latent_h = int(batch.height) // vae_sf
-        latent_w = int(batch.width) // vae_sf
-        expected_tokens = (latent_h // patch) * (latent_w // patch)
-        if int(packed.shape[1]) != int(expected_tokens):
-            raise ValueError(
-                "LTX-2 conditioning token count mismatch: "
-                f"{int(packed.shape[1])=} {int(expected_tokens)=}."
-            )
-
-        batch.image_latent = packed
-        batch.ltx2_num_image_tokens = int(packed.shape[1])
-
-        if batch.debug:
-            logger.info(
-                "LTX2 TI2V conditioning prepared: %d tokens (shape=%s) for %sx%s",
-                batch.ltx2_num_image_tokens,
-                tuple(batch.image_latent.shape),
-                batch.width,
-                batch.height,
-            )
-
-        if condition_image_encoder is None:
-            self.vae.to(original_dtype)
-        if server_args.vae_cpu_offload:
-            self.vae = self.vae.to("cpu")
-            if condition_image_encoder is not None:
-                self._condition_image_encoder = condition_image_encoder.to("cpu")
 
     def _prepare_denoising_loop(
         self,
@@ -602,8 +344,6 @@ class LTX2DenoisingStage(DenoisingStage):
         # Video and audio keep separate scheduler state throughout the denoising loop.
         ctx.audio_scheduler = copy.deepcopy(self.scheduler)
 
-        # Prepare image latents and embeddings for LTX-2 TI2V generation.
-        self._prepare_ltx2_image_latent(batch, server_args)
         do_ti2v = self._should_apply_ltx2_ti2v(batch)
 
         if ctx.use_ltx23_legacy_one_stage:
