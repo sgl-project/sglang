@@ -1091,9 +1091,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if language_model_cls is Qwen3LLMModel:
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
-            self.config = config.text_config  # for qwen3-omni
+            self.config = config.text_config  # for qwen3-omni / qwen3-vl-moe
             self.config.encoder_only = getattr(config, "encoder_only", False)
             self.config.language_only = getattr(config, "language_only", False)
+            # Propagate tie_word_embeddings from parent config. In transformers
+            # v5.5.3+, Qwen3VLMoeTextConfig sets tie_word_embeddings=True by
+            # default but the actual model checkpoint has a separate lm_head.
+            # The parent Qwen3VLMoeConfig correctly has tie_word_embeddings=False.
+            if hasattr(config, "tie_word_embeddings"):
+                self.config.tie_word_embeddings = config.tie_word_embeddings
 
         if not hasattr(config, "encoder_only") or not config.encoder_only:
             self.model = language_model_cls(
