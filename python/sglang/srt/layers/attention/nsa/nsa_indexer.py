@@ -11,7 +11,6 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_nsa_fused_store,
     fused_store_index_k_cache,
 )
-from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
     is_in_piecewise_cuda_graph,
@@ -79,6 +78,7 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda:
+    from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
 
     @register_custom_op(mutates_args=["topk_result"])
@@ -119,6 +119,37 @@ if _is_cuda:
             metadata,
             topk_result,
         )
+
+    def _logits_head_gate_pcg_fake_impl(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (x.shape[0], weight.shape[0], q_scale.shape[-1]),
+            dtype=torch.float32,
+            device=x.device,
+        )
+
+    @register_custom_op(fake_impl=_logits_head_gate_pcg_fake_impl)
+    def logits_head_gate_pcg(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+        q_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.deep_gemm_wrapper import entrypoint as deep_gemm_wrapper
+
+        out = torch.empty(
+            (x.shape[0], weight.shape[0]), dtype=torch.float32, device=x.device
+        )
+        deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
+        weights = out * n_heads_inv_sqrt
+        weights = weights.unsqueeze(-1) * q_scale * softmax_scale
+        return weights
 
 
 class BaseIndexerMetadata(ABC):
@@ -1267,7 +1298,16 @@ class Indexer(MultiPlatformOp):
             else:
                 x_for_gate = x
 
-            weights = self._get_logits_head_gate(x_for_gate, q_scale)
+            if is_in_piecewise_cuda_graph():
+                weights = logits_head_gate_pcg(
+                    x_for_gate,
+                    self.weights_proj.weight,
+                    self.n_heads**-0.5,
+                    self.softmax_scale,
+                    q_scale,
+                )
+            else:
+                weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
         if _is_cuda or _is_hip:
             assert forward_batch.seq_lens_cpu is not None
