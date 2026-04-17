@@ -3742,7 +3742,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --mem-fraction-static 0.85 \
     --disable-radix-cache --max-prefill-tokens 28672 --context-length 26384 --max-total-tokens 122304 \
     --enable-dp-attention --enable-dp-lm-head \
-    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  --speculative-draft-model-quantization  unquant \
+    --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant \
     --chunked-prefill-size -1 --max-running-requests 16 \
     --cuda-graph-bs 2 4 8 \
     --mamba-ssm-dtype bfloat16 \
@@ -3754,5 +3754,5 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 1 --random-output-len 1500 --random-input-len 3500 --num-prompts 1
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --random-range-ratio 1 --max-concurrency 1 --random-output-len 1500 --random-input-len 3500 --num-prompts 1
 ```
