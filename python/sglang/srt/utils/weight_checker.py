@@ -78,11 +78,36 @@ def _check_tensors(
         name = expect_name
         should_compare = expect_should_compare
 
+        # Metadata mismatches (dtype/shape/device) are always treated as errors,
+        # regardless of `should_compare`, since they indicate a structural divergence
+        # rather than a benign numerical difference (e.g. dequantized fp8).
+        meta_mismatches = []
+        if expect.dtype != actual.dtype:
+            meta_mismatches.append(f"dtype expect={expect.dtype} actual={actual.dtype}")
+        if tuple(expect.shape) != tuple(actual.shape):
+            meta_mismatches.append(
+                f"shape expect={tuple(expect.shape)} actual={tuple(actual.shape)}"
+            )
+        if expect.device.type != actual.device.type:
+            meta_mismatches.append(
+                f"device expect={expect.device} actual={actual.device}"
+            )
+        if meta_mismatches:
+            error_messages.append(
+                f"name={name} metadata_mismatch=[{'; '.join(meta_mismatches)}] "
+                f"{get_tensor_info(expect)=} {get_tensor_info(actual)=}"
+            )
+            # Skip value comparison when shapes differ (would raise); otherwise fall
+            # through so we still report any value diff alongside the dtype/device issue.
+            if tuple(expect.shape) != tuple(actual.shape):
+                continue
+
         expect = expect.cuda()
         actual = actual.cuda()
 
-        if torch.all(expect == actual):
-            good_names.append(name)
+        if expect.dtype == actual.dtype and torch.all(expect == actual):
+            if not meta_mismatches:
+                good_names.append(name)
         else:
             abs_diff = (actual.float() - expect.float()).abs()
             msg = (
