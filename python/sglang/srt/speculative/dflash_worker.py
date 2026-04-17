@@ -20,6 +20,8 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
@@ -1179,7 +1181,12 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+
         self._prepare_for_speculative_decoding(batch, draft_input)
+
+        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+        set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
@@ -1227,6 +1234,11 @@ class DFlashWorker:
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
+
+        if get_global_tracing_enabled():
+            for idx, req in enumerate(batch.reqs):
+                accepted = accept_length_per_req_cpu[idx]
+                req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
         num_accepted_tokens = sum(accept_length_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:

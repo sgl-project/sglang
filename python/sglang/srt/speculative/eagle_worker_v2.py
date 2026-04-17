@@ -36,6 +36,8 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
@@ -721,21 +723,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
+            set_time_batch(model_worker_batch.reqs, "set_spec_draft_start_time", trace_only=True)
+
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
+
+            set_time_batch(model_worker_batch.reqs, "set_spec_draft_end_time", trace_only=True)
+            set_time_batch(model_worker_batch.reqs, "set_spec_verify_start_time", trace_only=True)
+
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
+
+            if get_global_tracing_enabled() and model_worker_batch.reqs:
+                for idx, req in enumerate(model_worker_batch.reqs):
+                    accepted = batch_output.accept_lens[idx].item()
+                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+
+            set_time_batch(model_worker_batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
+
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
+
+            set_time_batch(model_worker_batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
+
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):

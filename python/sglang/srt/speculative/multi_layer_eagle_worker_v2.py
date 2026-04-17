@@ -26,6 +26,8 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -664,11 +666,29 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
             draft_input: EagleDraftInput = model_worker_batch.spec_info
+
+            set_time_batch(model_worker_batch.reqs, "set_spec_draft_start_time", trace_only=True)
+
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+
+            set_time_batch(model_worker_batch.reqs, "set_spec_draft_end_time", trace_only=True)
+            set_time_batch(model_worker_batch.reqs, "set_spec_verify_start_time", trace_only=True)
+
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
+
+            if get_global_tracing_enabled() and model_worker_batch.reqs:
+                for idx, req in enumerate(model_worker_batch.reqs):
+                    accepted = batch_output.accept_lens[idx].item()
+                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+
+            set_time_batch(model_worker_batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
+
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+
+            set_time_batch(model_worker_batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
+
             return batch_output
 
     def verify(
