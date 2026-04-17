@@ -371,7 +371,7 @@ class LTX2TwoStageDeviceManager:
                 else None
             )
             if next_param is not None and next_param.device.type == "cpu":
-                next_module.to(get_local_torch_device(), non_blocking=False)
+                next_module.to(get_local_torch_device(), non_blocking=True)
 
         self._active_phase = phase
         return True
@@ -465,7 +465,7 @@ class LTX2TwoStageDeviceManager:
             return
         param = next(module.parameters(), None)
         if param is not None and param.device.type == "cpu":
-            module.to(get_local_torch_device(), non_blocking=False)
+            module.to(get_local_torch_device(), non_blocking=True)
 
     def _pin_stage1_transformer_if_beneficial(self) -> None:
         """Optionally pin stage-1 DiT on GPU to remove first-stage cold H2D stall.
@@ -487,7 +487,7 @@ class LTX2TwoStageDeviceManager:
             next(transformer.parameters(), None) if transformer is not None else None
         )
         if transformer is not None and param is not None and param.device.type == "cpu":
-            transformer.to(get_local_torch_device(), non_blocking=False)
+            transformer.to(get_local_torch_device(), non_blocking=True)
             logger.info(
                 "Pinned stage1 transformer on GPU for LTX-2.3 two-stage startup"
             )
