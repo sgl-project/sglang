@@ -59,6 +59,14 @@ on:
         required: false
         type: boolean
         default: false
+      runner_arch:
+        description: 'AMD runner pool to dispatch GPU jobs to'
+        required: false
+        type: choice
+        default: mi300
+        options:
+          - mi300
+          - mi325
   workflow_call:
     inputs:
       ref:
@@ -175,11 +183,7 @@ jobs:
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-1gpu-sglang]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -222,11 +226,7 @@ jobs:
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-2gpu-sglang]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -265,11 +265,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-1gpu-sglang]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -304,11 +300,7 @@ jobs:
           needs.check-changes.outputs.jit_kernel == 'true'
         )
       )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-1gpu-sglang]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -373,9 +365,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -410,11 +401,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-1gpu-sglang]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -491,9 +478,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
         part: [0, 1, 2]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -531,9 +517,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
         part: [0, 1]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -571,9 +556,8 @@ jobs:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
         part: [0, 1, 2, 3]  # 2 partitions: 11 tests ÷ 2 = ~5-6 tests each
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -700,9 +684,8 @@ jobs:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
         part: [0, 1]  # 2 partitions: 9 tests ÷ 2 = ~4-5 tests each
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -854,9 +837,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-4gpu-sglang]
         part: [0]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -908,13 +890,12 @@ jobs:
         )
       )
     env:
-      RUNNER_LABELS: linux-mi325-8gpu-sglang
+      RUNNER_LABELS: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-8gpu-sglang]
         part: [0, 1, 2]
-    runs-on: ${{matrix.runner}}
+    runs-on: ${{ format('linux-{0}-8gpu-sglang', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
