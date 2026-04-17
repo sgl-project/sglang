@@ -3707,6 +3707,10 @@ class ServerArgs:
                     "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                     "All operations will run eagerly through the graph capture/replay path."
                 )
+        os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
+        logger.warning(
+            "Warning: setting FLASHINFER_DISABLE_VERSION_CHECK=1 to disable FlashInfer version check on jit-cache. Please update flashinfer-jit-cache to latest version for more stable experience."
+        )
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
