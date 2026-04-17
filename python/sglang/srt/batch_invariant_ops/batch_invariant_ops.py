@@ -3,7 +3,7 @@
 import contextlib
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 import torch
 import triton
@@ -21,6 +21,17 @@ from sglang.srt.utils.common import (
 _is_npu = is_npu()
 if _is_npu:
     import torch_npu
+
+    from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
+        npu_add_rms_norm_batch_invariant,
+        npu_fused_infer_attention_score_batch_invariant,
+        npu_log_softmax_batch_invariant,
+        npu_matmul_batch_invariant,
+        npu_mean_batch_invariant,
+        npu_mm_batch_invariant,
+        npu_reduce_sum_batch_invariant,
+    )
+
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -587,21 +598,10 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
     return log_softmax(input, dim=dim)
 
 
-def _npu_log_softmax_batch_invariant(input, dim, _half_to_float):
-    assert not _half_to_float, "not implemented"
-    return torch.ops.batch_invariant_ops.npu_log_softmax_batch_invariant(input, dim=dim)
-
-
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
     if len(dim) == 1:
-        return (
-            mean_dim(input, dim[0], keepdim=keepdim)
-            if not _is_npu
-            else torch.ops.batch_invariant_ops.npu_reduce_mean_batch_invariant(
-                input, dim[0], keepdim=keepdim
-            )
-        )
+        return mean_dim(input, dim[0], keepdim=keepdim)
     else:
         assert input.dtype in {
             torch.float16,
@@ -950,50 +950,6 @@ def rms_norm_batch_invariant(
     return rms_norm(input, weight, eps=eps)
 
 
-_ONES_CACHE: dict[Tuple, torch.Tensor] = {}
-
-
-def _get_or_make_ones(shape, device, dtype) -> torch.Tensor:
-    key = (tuple(shape), device, dtype)
-    t = _ONES_CACHE.get(key)
-    if t is None:
-        t = torch.ones(shape, device=device, dtype=dtype)
-        _ONES_CACHE[key] = t
-    return t
-
-
-def _rms_norm_aten_compat(input, normalized_shape, weight=None, eps=None):
-    if eps is None:
-        eps = torch.finfo(input.dtype).eps
-    if weight is None:
-        weight = _get_or_make_ones(normalized_shape, input.device, input.dtype)
-    assert tuple(normalized_shape) == (input.shape[-1],), (
-        "rms_norm_batch_invariant only supports last-dim normalization "
-        f"(got normalized_shape={tuple(normalized_shape)}, "
-        f"input.shape={tuple(input.shape)})"
-    )
-    return rms_norm_batch_invariant(input, weight, eps=eps)
-
-
-def _mm_dtype_compat(self, mat2, out_dtype):
-    return matmul_persistent(self.contiguous(), mat2.contiguous()).to(out_dtype)
-
-
-def npu_add_rms_norm_batch_invariant(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-):
-    """AclnnAddRmsNorm can't ensure batch invariant,
-    so we need to split it into add and rms_norm.
-    """
-    x_ = x + residual
-    residual_ = x_
-    x_, _ = torch_npu.npu_rms_norm(x_, weight, eps)
-    return x_, None, residual_
-
-
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _original_torch_bmm = None
@@ -1027,29 +983,22 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
             _original_torch_bmm = torch.bmm
             torch.bmm = bmm_batch_invariant
     else:
-        import batch_invariant_ops  # noqa: F401
-
-        _batch_invariant_LIB.impl(
-            "aten::mm", torch.ops.batch_invariant_ops.npu_mm_batch_invariant, "NPU"
-        )
+        _batch_invariant_LIB.impl("aten::mm", npu_mm_batch_invariant, "NPU")
         _batch_invariant_LIB.impl(
             "aten::matmul",
-            torch.ops.batch_invariant_ops.npu_matmul_batch_invariant,
+            npu_matmul_batch_invariant,
             "NPU",
         )
         _batch_invariant_LIB.impl(
-            "aten::sum.dim",
-            torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant,
-            "NPU",
+            "aten::sum.dim", npu_reduce_sum_batch_invariant, "NPU"
         )
-        _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, "NPU")
+        _batch_invariant_LIB.impl("aten::mean.dim", npu_mean_batch_invariant, "NPU")
         _batch_invariant_LIB.impl(
-            "aten::_log_softmax", _npu_log_softmax_batch_invariant, "NPU"
+            "aten::_log_softmax", npu_log_softmax_batch_invariant, "NPU"
         )
         torch.ops.npu.npu_fused_infer_attention_score = (
-            torch.ops.batch_invariant_ops.npu_fused_infer_attention_score_batch_invariant
+            npu_fused_infer_attention_score_batch_invariant
         )
-
         torch_npu.npu_add_rms_norm = npu_add_rms_norm_batch_invariant
 
 
