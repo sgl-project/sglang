@@ -3,47 +3,25 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import time
-from typing import List, Union
+from typing import List
 
 import torch
-from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
-    get_tp_rank,
-    get_tp_world_size,
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
-    get_ring_parallel_rank,
-    get_ring_parallel_world_size,
     get_tp_group,
-    get_ulysses_parallel_rank,
-    get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
-from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
-from sglang.multimodal_gen.runtime.loader.weights_updater import (
-    WeightsUpdater,
-    get_updatable_modules,
-)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
-    LoRAPipeline,
     Req,
-    build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
-    OffloadableDiTMixin,
-    iter_materialized_weights,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
@@ -51,8 +29,9 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
 )
 from sglang.srt.utils import cpu_has_amx_support, get_cpu_ids_by_node
-from sglang.srt.utils.network import NetworkAddress
-from .gpu_worker import GPUWorker, OOM_MSG, _oom_exceptions
+
+from .gpu_worker import OOM_MSG, GPUWorker, _oom_exceptions
+
 _is_cpu_amx_available = cpu_has_amx_support()
 
 logger = init_logger(__name__)
@@ -88,75 +67,6 @@ class CPUWorker(GPUWorker):
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
 
-    def init_device_and_model(self) -> None:
-        """Initialize the device and load the model."""
-        torch.get_device_module().set_device(self.local_rank)
-        # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.master_port)
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["RANK"] = str(self.rank)
-        os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
-        # initialize the distributed environment
-        maybe_init_distributed_environment_and_model_parallel(
-            tp_size=self.server_args.tp_size,
-            enable_cfg_parallel=self.server_args.enable_cfg_parallel,
-            ulysses_degree=self.server_args.ulysses_degree,
-            ring_degree=self.server_args.ring_degree,
-            sp_size=self.server_args.sp_degree,
-            dp_size=self.server_args.dp_size,
-            distributed_init_method=NetworkAddress(
-                "127.0.0.1", self.master_port
-            ).to_tcp(),
-            dist_timeout=self.server_args.dist_timeout,
-        )
-
-        # set proc title
-        if model_parallel_is_initialized():
-            suffix = ""
-            if get_tp_world_size() != 1:
-                tp_rank = get_tp_rank()
-                suffix += f"_TP{tp_rank}"
-            if get_ulysses_parallel_world_size() != 1:
-                u_rank = get_ulysses_parallel_rank()
-                suffix += f"_U{u_rank}"
-            if get_ring_parallel_world_size() != 1:
-                r_rank = get_ring_parallel_rank()
-                suffix += f"_R{r_rank}"
-            if get_classifier_free_guidance_world_size() != 1:
-                c_rank = get_classifier_free_guidance_rank()
-                suffix += f"_C{c_rank}"
-            setproctitle(f"sgl_diffusion::scheduler{suffix}")
-        else:
-            setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
-
-        self.pipeline = build_pipeline(self.server_args)
-
-        # apply layerwise offload after lora is applied while building LoRAPipeline
-        # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.dit_layerwise_offload:
-            # enable layerwise offload if possible
-            for module_name in [
-                "transformer",
-                "transformer_2",
-                "video_dit",
-                "video_dit_2",
-                "audio_dit",
-            ]:
-                dit = self.pipeline.get_module(module_name)
-                if dit:
-                    if isinstance(dit, OffloadableDiTMixin):
-                        dit.configure_layerwise_offload(self.server_args)
-                    else:
-                        logger.info(
-                            f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
-                        )
-
-        logger.info(
-            f"Worker {self.rank}: Initialized device, model, and distributed environment."
-        )
-
-
     def execute_forward(self, batch: List[Req]) -> OutputBatch:
         """
         Execute a forward pass.
@@ -186,7 +96,6 @@ class CPUWorker(GPUWorker):
                 )
             else:
                 output_batch = result
-
 
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.metrics.total_duration_ms = duration_ms
@@ -220,7 +129,6 @@ class CPUWorker(GPUWorker):
                 output_batch.audio = None
                 output_batch.audio_sample_rate = None
 
-
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 # Avoid logging warmup perf records that share the same request_id.
@@ -249,110 +157,6 @@ class CPUWorker(GPUWorker):
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         return output_batch
-
-    def set_lora(
-        self,
-        lora_nickname: Union[str, List[str]],
-        lora_path: Union[str, None, List[Union[str, None]]] = None,
-        target: Union[str, List[str]] = "all",
-        strength: Union[float, List[float]] = 1.0,
-    ) -> OutputBatch:
-        """
-        Set the LoRA adapter(s) for the pipeline.
-        Supports both single LoRA (backward compatible) and multiple LoRA adapters.
-
-        Args:
-            lora_nickname: The nickname(s) of the adapter(s). Can be a string or a list of strings.
-            lora_path: Path(s) to the LoRA adapter(s). Can be a string, None, or a list of strings/None.
-            target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
-            strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
-        """
-        if not isinstance(self.pipeline, LoRAPipeline):
-            return OutputBatch(error="Lora is not enabled")
-        self.pipeline.set_lora(lora_nickname, lora_path, target, strength)
-        return OutputBatch()
-
-    def merge_lora_weights(
-        self, target: str = "all", strength: float = 1.0
-    ) -> OutputBatch:
-        """
-        Merge LoRA weights.
-
-        Args:
-            target: Which transformer(s) to merge.
-            strength: LoRA strength for merge, default 1.0.
-        """
-        if not isinstance(self.pipeline, LoRAPipeline):
-            return OutputBatch(error="Lora is not enabled")
-        self.pipeline.merge_lora_weights(target, strength)
-        return OutputBatch()
-
-    def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
-        """
-        Unmerge LoRA weights.
-
-        Args:
-            target: Which transformer(s) to unmerge.
-        """
-        if not isinstance(self.pipeline, LoRAPipeline):
-            return OutputBatch(error="Lora is not enabled")
-        self.pipeline.unmerge_lora_weights(target)
-        return OutputBatch()
-
-    def list_loras(self) -> OutputBatch:
-        """
-        List loaded LoRA adapters and current application status per module.
-        """
-        from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
-            LoRAPipeline,
-        )
-
-        if not isinstance(self.pipeline, LoRAPipeline):
-            return OutputBatch(error="Lora is not enabled")
-        status = self.pipeline.get_lora_status()
-        return OutputBatch(output=status)
-
-    def update_weights_from_disk(
-        self,
-        model_path: str,
-        flush_cache: bool = True,
-        target_modules: list[str] | None = None,
-    ) -> tuple[bool, str]:
-        """Update model weights from disk inplace without restarting the server."""
-        if not self.pipeline:
-            return False, "Pipeline is not initialized"
-
-        updater = WeightsUpdater(self.pipeline)
-        success, message = updater.update_weights_from_disk(
-            model_path,
-            flush_cache=flush_cache,
-            target_modules=target_modules,
-        )
-        if success:
-            self.server_args.model_path = model_path
-            self.pipeline.model_path = model_path
-        return success, message
-
-    def get_weights_checksum(
-        self, module_names: list[str] | None = None
-    ) -> dict[str, str]:
-        """Compute SHA-256 checksum of each module's weights."""
-        if not self.pipeline:
-            return {"error": "Pipeline is not initialized"}
-
-        all_modules = get_updatable_modules(self.pipeline)
-        names = module_names if module_names is not None else list(all_modules.keys())
-
-        checksums: dict[str, str] = {}
-        for name in names:
-            module = all_modules.get(name)
-            if module is None:
-                checksums[name] = "not_found"
-                continue
-            checksums[name] = compute_weights_checksum(
-                iter_materialized_weights(module)
-            )
-        return checksums
 
     def init_cpu_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
@@ -398,4 +202,3 @@ class CPUWorker(GPUWorker):
         @torch.library.register_fake("sgl_kernel::shm_allgather")
         def _(data, dim):
             return torch.cat([data] * self.server_args.tp_size, dim=dim)
-
