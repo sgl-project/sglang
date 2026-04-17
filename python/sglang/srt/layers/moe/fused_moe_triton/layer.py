@@ -1066,25 +1066,15 @@ class FusedMoE(torch.nn.Module):
         """
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
             CuteDslFp4MoeQuantInfo,
-            ensure_cutedsl_wrapper,
-            fused_experts_none_to_flashinfer_cutedsl_fp4,
-        )
-        from sglang.srt.layers.moe.token_dispatcher.standard import (
-            StandardDispatchOutput,
+            _cutedsl_fp4_core,
+            ensure_cutedsl_wrapper_dwdp,
         )
 
-        ensure_cutedsl_wrapper(self)
-
-        # Construct StandardDispatchOutput directly — no dispatcher mapping
-        dispatch_output = StandardDispatchOutput(
-            hidden_states=hidden_states,
-            hidden_states_scale=None,
-            topk_output=topk_output,
-        )
+        ensure_cutedsl_wrapper_dwdp(self)
 
         # Build CuteDslFp4MoeQuantInfo with multi-B List[Tensor] weights
         quant_info = CuteDslFp4MoeQuantInfo(
-            wrapper=self._cutedsl_wrapper,
+            wrapper=self._cutedsl_wrapper_dwdp,
             w13_weight=weight_view.w13_weights,
             w2_weight=weight_view.w2_weights,
             w13_weight_sf=weight_view.w13_weight_sfs,
@@ -1095,13 +1085,13 @@ class FusedMoE(torch.nn.Module):
             input_scale=self._cutedsl_input_scale,
         )
 
-        # Call fused function directly, bypassing quant_method.apply()
-        combine_input = fused_experts_none_to_flashinfer_cutedsl_fp4(
-            dispatch_output=dispatch_output,
+        # Call core CuteDSL compute directly, bypassing quant_method.apply()
+        return _cutedsl_fp4_core(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
             quant_info=quant_info,
             runner_config=self.moe_runner_config,
         )
-        return combine_input.hidden_states
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory

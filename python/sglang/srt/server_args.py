@@ -2792,10 +2792,10 @@ class ServerArgs:
         if self.disaggregation_mode == "prefill":
             self.moe_a2a_backend = "none"
         else:
-            # Hybrid mode: extend→DWDP, decode→EP
+            # Hybrid mode: extend→DWDP, decode→EP with flashinfer A2A
             self.enable_mixed_chunk = False
             if self.moe_a2a_backend == "none":
-                self.moe_a2a_backend = "deepep"
+                self.moe_a2a_backend = "flashinfer"
 
         logger.info(
             f"DWDP enabled: dwdp_size={self.dwdp_size}, dp_size={self.dp_size}, "
@@ -2860,9 +2860,10 @@ class ServerArgs:
             assert self.moe_a2a_backend in [
                 "none",
                 "deepep",
+                "flashinfer",
             ], (
-                f"flashinfer_cutedsl supports moe_a2a_backend='none' (standard path) "
-                f"or 'deepep' (DeepEP low-latency path), got '{self.moe_a2a_backend}'."
+                f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', "
+                f"or 'flashinfer', got '{self.moe_a2a_backend}'."
             )
             self.disable_shared_experts_fusion = True
             logger.warning(
