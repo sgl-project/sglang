@@ -200,8 +200,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         beta_fi = beta[0].to(torch.float32)
 
         if self.is_sm100plus:
-            # SM100+: slot 0 is reserved as dummy/scratch (never assigned to real
-            # sequences), so clamp(-1 → 0).
+            # Negative indices (e.g. -1) are padding markers for slots not yet
+            # assigned to a real sequence; clamp them to 0 (the reserved dummy
+            # slot) so the FlashInfer kernel never reads out-of-bounds state.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
             num_seqs = ssm_cache_indices.shape[0]
             num_sab_heads = max(q.shape[2], num_v_heads)
