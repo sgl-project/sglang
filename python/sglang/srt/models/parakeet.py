@@ -76,7 +76,6 @@ class ProjectedParakeet(nn.Module):
             input_features=input_features, attention_mask=attention_mask
         )
         outputs = outputs.last_hidden_state
-        outputs = outputs.to(dtype=torch.bfloat16)
         outputs = self.projection(outputs)
         return outputs
 
@@ -104,7 +103,7 @@ class ProjectedParakeet(nn.Module):
             if target is None:
                 target = buffers_dict.get(target_name)
             if target is None:
-                raise ValueError(f"Unknown weight: {name}")
+                continue
             weight_loader = getattr(target, "weight_loader", default_weight_loader)
             with torch.no_grad():
                 weight_loader(target, weight)
@@ -132,14 +131,22 @@ class ParakeetExtractor(ParakeetFeatureExtractor):
             clip_sizes.append(max(remainder, self._tail_min_samples))
         return clip_sizes
 
+    def _subsampling_output_length(self, length: int) -> int:
+        import math
+
+        kernel_size = self.config.subsampling_conv_kernel_size
+        stride = self.config.subsampling_conv_stride
+        num_layers = int(math.log2(self.config.subsampling_factor))
+        add_pad = (kernel_size - 1) // 2 * 2 - kernel_size
+        for _ in range(num_layers):
+            length = int(math.floor((length + add_pad) / stride + 1.0))
+        return max(1, length)
+
     def audio_token_count(self, audio_len: int) -> int:
         total_tokens = 0
         for clip_size in self._clip_sizes(audio_len):
             num_frames = clip_size // self.hop_length
-            n_tokens = HFParakeetEncoder._get_subsampling_output_length(
-                self, torch.tensor([num_frames], dtype=torch.float)
-            )
-            total_tokens += int(n_tokens.item())
+            total_tokens += self._subsampling_output_length(num_frames)
         return max(1, total_tokens)
 
     def split_audio_into_clips(self, audio: np.ndarray) -> list[np.ndarray]:

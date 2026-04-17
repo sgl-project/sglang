@@ -67,9 +67,13 @@ class NemotronH_Nano_VL_V2(EVS):
         )
 
         vit_hidden_size = config.vit_hidden_size
-        self.rmsnorm_hidden_size = vit_hidden_size * int(1 / self.downsample_ratio) ** 2
+        self.rmsnorm_hidden_size = (
+            vit_hidden_size * int(round(1 / self.downsample_ratio)) ** 2
+        )
         vision_projection_hidden_size = config.projector_hidden_size
         llm_hidden_size = config.llm_config.hidden_size
+        self.llm_hidden_size = llm_hidden_size
+        self.model_dtype = self.language_model.config.torch_dtype
 
         self.mlp1 = nn.Sequential(
             RMSNorm(
@@ -83,7 +87,7 @@ class NemotronH_Nano_VL_V2(EVS):
             ),
             ReLU2(),
             nn.Linear(vision_projection_hidden_size, llm_hidden_size, bias=False),
-        ).to(self.language_model.config.torch_dtype)
+        ).to(self.model_dtype)
 
         self.sound_encoder: ProjectedParakeet | None = None
         if getattr(config, "sound_config", None) is not None:
@@ -142,24 +146,22 @@ class NemotronH_Nano_VL_V2(EVS):
         return self.language_model.get_input_embeddings()
 
     def extract_feature(self, pixel_values):
-        # Process images in a micro-batch of at most 128 frames per call
-        # This is done on purpose to ensure peak GPU ram usage of huge batch
-        # (namely for really long videos with EVS ON) won't cause any problems
-        # as we don't support chunked prefill for video media
         micro_batch_size = 128
         n = pixel_values.shape[0]
+        patch_size = self.config.patch_size
+        h_patches = pixel_values.shape[-2] // patch_size
+        w_patches = pixel_values.shape[-1] // patch_size
         vit_embeds_list = []
         for i in range(0, n, micro_batch_size):
-            vit_embeds = self.vision_model(pixel_values[i : i + micro_batch_size])
-            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
-            h = w = int(vit_embeds.shape[1] ** 0.5)
-            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+            chunk = pixel_values[i : i + micro_batch_size]
+            batch_size = chunk.shape[0]
+            vit_embeds = self.vision_model(chunk)
+            vit_embeds = vit_embeds.to(dtype=self.model_dtype)
+            vit_embeds = vit_embeds.reshape(batch_size, h_patches, w_patches, -1)
             vit_embeds = self.pixel_shuffle(
                 vit_embeds, scale_factor=self.downsample_ratio
             )
-            vit_embeds = vit_embeds.view(-1, self.rmsnorm_hidden_size)
-            vit_embeds = self.mlp1(vit_embeds)
-            vit_embeds = vit_embeds.view(n, -1, self.rmsnorm_hidden_size)
+            vit_embeds = vit_embeds.view(batch_size, -1, self.llm_hidden_size)
             vit_embeds_list.append(vit_embeds)
         vit_embeds = torch.cat(vit_embeds_list, dim=0)
         return vit_embeds
