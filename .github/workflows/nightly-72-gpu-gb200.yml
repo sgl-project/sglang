@@ -113,6 +113,15 @@ jobs:
       image_ref: ${{ steps.build.outputs.image_ref }}
       version_id: ${{ steps.resolve.outputs.version_id }}
     steps:
+      # Self-hosted runners retain the workspace across jobs. Prior `docker buildx`
+      # runs on this node leave root-owned build artifacts (e.g. sgl-kernel/build/)
+      # that actions/checkout cannot remove, causing EACCES on rmdir. Wipe them
+      # via a throwaway root container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
