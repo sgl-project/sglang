@@ -7,6 +7,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
+    sync_ltx23_runtime_vae_markers,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
@@ -22,6 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     LTX2AVDenoisingStage,
     LTX2AVLatentPreparationStage,
     LTX2HalveResolutionStage,
+    LTX2ImageEncodingStage,
     LTX2LoRASwitchStage,
     LTX2RefinementStage,
     LTX2TextConnectorStage,
@@ -46,9 +48,9 @@ def _resolve_ltx2_two_stage_component_paths(
 
     if "spatial_upsampler" not in resolved:
         spatial_candidates = [
-            os.path.join(model_path, "latent_upsampler"),
-            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
             os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"),
+            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+            os.path.join(model_path, "latent_upsampler"),
             os.path.join(model_path, "ltx-2-spatial-upscaler-x2-1.0.safetensors"),
         ]
         for candidate in spatial_candidates:
@@ -59,6 +61,7 @@ def _resolve_ltx2_two_stage_component_paths(
 
     if "distilled_lora" not in resolved:
         distilled_lora_candidates = [
+            os.path.join(model_path, "ltx-2.3-20b-distilled-lora-384.safetensors"),
             os.path.join(model_path, "ltx-2.3-22b-distilled-lora-384.safetensors"),
             os.path.join(model_path, "ltx-2-19b-distilled-lora-384.safetensors"),
         ]
@@ -173,6 +176,9 @@ def _add_ltx2_stage1_generation_stages(pipeline: ComposedPipelineBase):
                 transformer=pipeline.get_module("transformer"),
                 audio_vae=pipeline.get_module("audio_vae"),
             ),
+            LTX2ImageEncodingStage(
+                vae=pipeline.get_module("vae"),
+            ),
             LTX2AVDenoisingStage(
                 transformer=pipeline.get_module("transformer"),
                 scheduler=pipeline.get_module("scheduler"),
@@ -248,6 +254,10 @@ class _BaseLTX2Pipeline(LoRAPipeline):
     def initialize_pipeline(self, server_args: ServerArgs):
         orig = self.get_module("scheduler")
         self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(orig.config)
+        sync_ltx23_runtime_vae_markers(
+            server_args.pipeline_config.vae_config.arch_config,
+            getattr(self.get_module("vae"), "config", None),
+        )
 
 
 class LTX2Pipeline(_BaseLTX2Pipeline):
@@ -263,6 +273,12 @@ class LTX2Pipeline(_BaseLTX2Pipeline):
 class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     pipeline_name = "LTX2TwoStagePipeline"
     STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+
+    @staticmethod
+    def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:
+        return is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        )
 
     def initialize_pipeline(self, server_args: ServerArgs):
         super().initialize_pipeline(server_args)
@@ -332,10 +348,12 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 lora_path=lora_paths,
                 target=lora_targets,
                 strength=lora_strengths,
-                # Keep the distilled adapter unmerged when it is the only active LoRA.
-                # Merging it into the base weights makes the subsequent switch back to
-                # stage 1 depend on unmerge bookkeeping instead of the original base.
-                merge_weights=self._stage1_lora_path is not None,
+                # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
+                # into the transformer weights. Legacy LTX-2 should keep the
+                # preexisting unmerged behavior to avoid regressing stage 2 quality.
+                merge_weights=self._should_merge_stage2_distilled_lora(
+                    self.server_args
+                ),
             )
         else:
             raise ValueError(f"Unknown LTX2 two-stage LoRA phase: {phase}")
@@ -359,6 +377,12 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 (
                     LTX2LoRASwitchStage(pipeline=self, phase="stage2"),
                     "ltx2_lora_switch_stage2",
+                ),
+                (
+                    LTX2ImageEncodingStage(
+                        vae=self.get_module("vae"),
+                    ),
+                    "ltx2_image_encoding_stage2",
                 ),
                 LTX2RefinementStage(
                     transformer=self.get_module("transformer"),

@@ -924,6 +924,11 @@ class Qwen3MoeModel(Qwen2MoeModel):
             alt_stream=alt_stream,
         )
 
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
@@ -1078,6 +1083,18 @@ class Qwen3MoeForCausalLM(nn.Module):
             )  # Specific layers for EAGLE3 support
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

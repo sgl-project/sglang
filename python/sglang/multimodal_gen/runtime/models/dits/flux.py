@@ -261,6 +261,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 bias=bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_q" if prefix else "to_q",
             )
             self.to_k = ColumnParallelLinear(
                 query_dim,
@@ -268,6 +269,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 bias=bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_k" if prefix else "to_k",
             )
             self.to_v = ColumnParallelLinear(
                 query_dim,
@@ -275,6 +277,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 bias=bias,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_v" if prefix else "to_v",
             )
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
@@ -310,6 +313,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     bias=added_proj_bias,
                     gather_output=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.add_q_proj" if prefix else "add_q_proj",
                 )
                 self.add_k_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
@@ -317,6 +321,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     bias=added_proj_bias,
                     gather_output=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.add_k_proj" if prefix else "add_k_proj",
                 )
                 self.add_v_proj = ColumnParallelLinear(
                     added_kv_proj_dim,
@@ -324,6 +329,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                     bias=added_proj_bias,
                     gather_output=True,
                     quant_config=quant_config,
+                    prefix=f"{prefix}.add_v_proj" if prefix else "add_v_proj",
                 )
             self.to_add_out = ColumnParallelLinear(
                 self.inner_dim,
@@ -495,6 +501,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.proj_mlp" if prefix else "proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
             self.proj_out = ColumnParallelLinear(
@@ -503,6 +510,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 gather_output=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.proj_out" if prefix else "proj_out",
             )
             self.attn = FluxAttention(
                 query_dim=dim,
@@ -513,6 +521,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 eps=1e-6,
                 pre_only=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.attn" if prefix else "attn",
             )
 
     def forward(
