@@ -24,7 +24,10 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
+from sglang.srt.layers.moe.utils import (
+    is_flashinfer_cutedsl_v1_path,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -1548,7 +1551,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
-    # "v1" (legacy): cutedsl + deepep low-latency.
+    # "v1": cutedsl + deepep low-latency.
     #   - Bypasses MoeRunner entirely; calls apply_without_routing_weights ->
     #     flashinfer_cutedsl_moe_masked (grouped_gemm_nt_masked).
     #   - Expects W13 in default [Gate, Up] order, NOT interleaved.
@@ -1561,15 +1564,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def _is_cutedsl_v1_deepep(self) -> bool:
-        """Legacy CuteDSL + DeepEP low-latency path (no MoeRunner)."""
-        return self.enable_flashinfer_cutedsl_moe and get_moe_a2a_backend().is_deepep()
+        """CuteDSL v1 + DeepEP low-latency path (no MoeRunner)."""
+        return is_flashinfer_cutedsl_v1_path()
 
     @property
     def _is_cutedsl_v2_standard(self) -> bool:
         """New CuteDSL standard path (a2a=none or flashinfer, uses MoeRunner)."""
-        return (
-            self.enable_flashinfer_cutedsl_moe and not get_moe_a2a_backend().is_deepep()
-        )
+        return self.enable_flashinfer_cutedsl_moe and not self._is_cutedsl_v1_deepep
 
     def create_weights(
         self,
@@ -1840,7 +1841,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             if self._is_cutedsl_v2_standard and layer.moe_runner_config.is_gated:
                 # CuteDSL v2 only: interleave the two logical W13 halves in
                 # 64-row chunks for the fused SwiGLU GEMM1 layout expected by
-                # CuteDslMoEWrapper.  The legacy v1 (deepep) path uses
+                # CuteDslMoEWrapper.  The v1 (deepep) path uses
                 # grouped_gemm_nt_masked which expects plain contiguous halves.
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                     interleave_w13_halves,
@@ -1905,7 +1906,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             if self._is_cutedsl_v2_standard:
                 # CuteDSL v2 only: convert blockscales to MMA layout for
-                # CuteDslMoEWrapper.  The legacy v1 (deepep) path uses the
+                # CuteDslMoEWrapper.  The v1 (deepep) path uses the
                 # swizzled blockscales directly via flashinfer_cutedsl_moe_masked.
                 from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
@@ -1970,7 +1971,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
-        # The legacy CuteDSL v1 (deepep) path uses [Gate, Up] -- do NOT flip.
+        # The CuteDSL v1 (deepep) path uses [Gate, Up] -- do NOT flip.
         return self.moe_runner_config.is_gated and (
             self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard
         )
@@ -1989,7 +1990,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
-            # CuteDSL v1 (deepep) uses the legacy apply_without_routing_weights
+            # CuteDSL v1 (deepep) uses the apply_without_routing_weights
             # path (flashinfer_cutedsl_moe_masked) and does not need a MoeRunner.
             if self._is_cutedsl_v1_deepep:
                 return
@@ -2163,7 +2164,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
-        """CuteDSL v1 (legacy deepep low-latency) path.
+        """CuteDSL v1 (deepep low-latency) path.
 
         Called by the DeepEP dispatcher instead of apply().  Uses
         flashinfer_cutedsl_moe_masked (grouped_gemm_nt_masked) directly,

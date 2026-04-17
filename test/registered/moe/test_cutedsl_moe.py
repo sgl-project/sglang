@@ -778,7 +778,7 @@ class TestCuteDslV2(unittest.TestCase):
 
 
 class TestCuteDslV1(unittest.TestCase):
-    """Correctness tests for the CuteDSL v1 (legacy deepep) path.
+    """Correctness tests for the CuteDSL v1 (deepep) path.
 
     The v1 path (apply_without_routing_weights -> flashinfer_cutedsl_moe_masked)
     is used when --moe-runner-backend flashinfer_cutedsl and --moe-a2a-backend
