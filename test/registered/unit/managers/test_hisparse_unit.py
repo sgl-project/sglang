@@ -305,10 +305,14 @@ class TestHiSparseUnit(unittest.TestCase):
             for i in range(TOP_K):
                 if batch[b, i] < 0:
                     continue
-                nd = self.device_pool.kv_buffer[layer_id][naive_locs[b, i].long()]
-                kd = self.device_pool.kv_buffer[layer_id][kernel_locs[b, i].long()]
+                naive_data = self.device_pool.kv_buffer[layer_id][
+                    naive_locs[b, i].long()
+                ]
+                kernel_data = self.device_pool.kv_buffer[layer_id][
+                    kernel_locs[b, i].long()
+                ]
                 self.assertTrue(
-                    torch.allclose(nd.float(), kd.float(), atol=1e-2),
+                    torch.allclose(naive_data.float(), kernel_data.float(), atol=1e-2),
                     f"{msg}layer {layer_id}, b{b} idx {i}: naive != kernel",
                 )
 

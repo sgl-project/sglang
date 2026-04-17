@@ -63,6 +63,7 @@ EIGHT_NPU_CASES: list[DiffusionTestCase] = [
             model_path="/root/.cache/modelscope/hub/models/Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8",
             num_gpus=8,
             tp_size=4,
+            ulysses_degree=2,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
