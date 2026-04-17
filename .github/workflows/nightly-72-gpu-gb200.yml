@@ -9,11 +9,15 @@ on:
   workflow_dispatch:  # allow manual trigger; gated by gb200-ci environment
     inputs:
       image:
-        description: 'Optional. SGLang Docker image to benchmark. Leave as default for the nightly image. Mutually exclusive with sglang_branch.'
+        description: 'Optional. SGLang Docker image to benchmark. Leave empty for the default nightly image. Mutually exclusive with pr_number and sglang_branch.'
+        required: false
+        default: ''
+      pr_number:
+        description: 'Optional. PR number to build from (works for PRs from forks too, via refs/pull/<N>/head). Preferred over sglang_branch when a PR exists. Mutually exclusive with image and sglang_branch.'
         required: false
         default: ''
       sglang_branch:
-        description: 'Optional. SGLang branch to build from. If set, builds a fresh image from this branch (ARM64, CUDA 13) and uses it for the run. Mutually exclusive with image.'
+        description: 'Optional. Branch name on sgl-project/sglang to build from (use when no PR is open yet). For fork branches, open a PR and use pr_number instead. Mutually exclusive with image and pr_number.'
         required: false
         default: ''
       configs:
@@ -35,10 +39,10 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Reject conflicting inputs early. `image` and `sglang_branch` are mutually
-  # exclusive: one selects a pre-built image, the other triggers a fresh build.
-  # Only runs on manual dispatch; all downstream jobs chain through this so
-  # invalid inputs halt the pipeline before cluster resources are reserved.
+  # Reject conflicting inputs early. At most one of `image`, `pr_number`,
+  # `sglang_branch` may be set — they select different image sources. Only runs
+  # on manual dispatch; all downstream jobs chain through this so invalid
+  # inputs halt the pipeline before cluster resources are reserved.
   # ---------------------------------------------------------------------------
   validate-inputs:
     if: github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch'
@@ -46,10 +50,19 @@ jobs:
     steps:
       - name: Reject conflicting inputs
         run: |
-          BRANCH="${{ inputs.sglang_branch }}"
           IMAGE="${{ inputs.image }}"
-          if [ -n "$BRANCH" ] && [ -n "$IMAGE" ]; then
-            echo "::error::Specify either 'image' or 'sglang_branch', not both. Got image='$IMAGE' and sglang_branch='$BRANCH'."
+          PR="${{ inputs.pr_number }}"
+          BRANCH="${{ inputs.sglang_branch }}"
+          sources=0
+          [ -n "$IMAGE" ]  && sources=$((sources + 1))
+          [ -n "$PR" ]     && sources=$((sources + 1))
+          [ -n "$BRANCH" ] && sources=$((sources + 1))
+          if [ "$sources" -gt 1 ]; then
+            echo "::error::Specify at most one of 'image' ('$IMAGE'), 'pr_number' ('$PR'), or 'sglang_branch' ('$BRANCH')."
+            exit 1
+          fi
+          if [ -n "$PR" ] && ! echo "$PR" | grep -Eq '^[0-9]+$'; then
+            echo "::error::pr_number must be a positive integer, got '$PR'."
             exit 1
           fi
 
@@ -97,14 +110,17 @@ jobs:
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------------------------
-  # When sglang_branch is provided, build an ARM64 (GB200) image from that
-  # branch and push it to GHCR. The image is deleted by `cleanup-image` at the
-  # end of the run. This job is skipped for nightly (cron) runs and any manual
-  # run that doesn't specify sglang_branch.
+  # When pr_number or sglang_branch is provided, build an ARM64 (GB200) image
+  # from that ref and push it to GHCR. Uses refs/pull/<N>/head for PRs so fork
+  # PRs work without cross-repo auth. The image is deleted by `cleanup-image`
+  # at the end of the run. Skipped on nightly (cron) runs and manual runs with
+  # neither pr_number nor sglang_branch.
   # ---------------------------------------------------------------------------
   build-image:
     needs: [validate-inputs, setup]
-    if: github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch' && inputs.sglang_branch != ''
+    if: |
+      github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch'
+      && (inputs.pr_number != '' || inputs.sglang_branch != '')
     runs-on: arm-docker-build-node
     permissions:
       contents: read
@@ -125,7 +141,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.sglang_branch }}
+          # PRs (including fork PRs) resolve via refs/pull/<N>/head on upstream.
+          # Otherwise fall back to the branch name on sgl-project/sglang.
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || inputs.sglang_branch }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -140,10 +158,16 @@ jobs:
       - name: Build and push ARM64 image
         id: build
         run: |
-          SANITIZED_BRANCH=$(echo "${{ inputs.sglang_branch }}" | tr '/' '-' | tr -cd '[:alnum:]._-')
-          TAG="${SANITIZED_BRANCH}-${{ github.run_id }}"
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            TAG_STUB="pr-${{ inputs.pr_number }}"
+            SOURCE_DESC="PR #${{ inputs.pr_number }}"
+          else
+            TAG_STUB=$(echo "${{ inputs.sglang_branch }}" | tr '/' '-' | tr -cd '[:alnum:]._-')
+            SOURCE_DESC="branch ${{ inputs.sglang_branch }}"
+          fi
+          TAG="${TAG_STUB}-${{ github.run_id }}"
           IMAGE_REF="ghcr.io/sgl-project/${CI_IMAGE_PACKAGE}:${TAG}"
-          echo "Building ${IMAGE_REF} from branch ${{ inputs.sglang_branch }}"
+          echo "Building ${IMAGE_REF} from ${SOURCE_DESC}"
 
           docker buildx build \
             --platform linux/arm64 \
