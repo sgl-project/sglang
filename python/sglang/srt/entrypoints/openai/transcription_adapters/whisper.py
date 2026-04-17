@@ -124,41 +124,40 @@ class WhisperAdapter(TranscriptionAdapter):
         return -1, 0
 
     @staticmethod
-    def parse_fused_output(text: str) -> tuple[Optional[str], str]:
-        """Parse fused output ``<|en|><|transcribe|><|notimestamps|> Hello...``
-        or the timestamps variant ``<|en|><|transcribe|><|0.00|> Hello<|5.00|>...``.
+    def parse_fused_output(text: str) -> tuple[Optional[str], Optional[str]]:
+        """Parse fused output into ``(language_code, user_visible_text)``.
 
-        Returns ``(language_code, transcription_text)`` on success, or
-        ``(None, text)`` on parse failure. Callers must treat ``None`` as a
-        parse error and not write it back to ``request.language``.
+        Handles both prefix variants:
+          * ``<|en|><|transcribe|><|notimestamps|> Hello...``
+          * ``<|en|><|transcribe|><|0.00|> Hello<|5.00|>...``
 
-        Failure modes surface as ``None`` rather than a silent ``"en"``
-        default so an FSM abort, truncation, or regex drift is visible in
-        logs instead of being reported as a correct English detection.
+        Return cases:
+
+        * ``(None, None)`` — the forced prefix isn't locatable yet (language
+          tag missing, or sentinel not in). Streaming callers should keep
+          buffering; non-streaming / end-of-stream callers should treat
+          this as a parse failure and fall back to a best-effort scrub of
+          the raw text.
+        * ``(lang, visible)`` — prefix fully parsed. ``visible`` is the
+          transcription with the forced prefix removed, any embedded
+          special tokens (``<|X.XX|>``, ``<|endoftext|>``) scrubbed, and
+          surrounding whitespace trimmed. It grows monotonically across
+          streaming chunks because Whisper's special tokens detokenize
+          atomically, so callers can compute deltas against it directly.
         """
         m = _LANG_PREFIX_RE.match(text)
         if not m:
-            logger.warning(
-                "Whisper fused auto-detect parse failed: missing language prefix in %r",
-                text[:64],
-            )
-            return None, text
+            return None, None
         sentinel_idx, sentinel_len = WhisperAdapter._find_fused_sentinel(text)
         if sentinel_idx < 0:
-            logger.warning(
-                "Whisper fused auto-detect parse failed: missing prefix sentinel "
-                "(expected one of %s) in %r",
-                _FUSED_SENTINELS,
-                text[:64],
-            )
-            return None, text
+            return None, None
         transcription = text[sentinel_idx + sentinel_len :]
-        # Scrub any remaining special tokens. ``skip_special_tokens=False``
-        # is set on fused requests so the language prefix survives for
-        # parsing, but that also preserves trailing ``<|endoftext|>`` and,
-        # in the timestamps variant, embedded ``<|X.XX|>`` segment tokens.
-        # Those are unwanted in the user-visible text (verbose_json gets
-        # its segments from _parse_segments over output_ids instead).
+        # Scrub any remaining special tokens. skip_special_tokens=False is
+        # set on fused requests so the language prefix survives for
+        # parsing, but that also preserves trailing <|endoftext|> and, in
+        # the timestamps variant, embedded <|X.XX|> segment tokens. Those
+        # are unwanted in the user-visible text (verbose_json gets its
+        # segments from _parse_segments over output_ids instead).
         transcription = _SPECIAL_TOKEN_RE.sub("", transcription)
         return m.group(1), transcription.strip()
 
@@ -166,40 +165,10 @@ class WhisperAdapter(TranscriptionAdapter):
     def strip_special_tokens(text: str) -> str:
         """Remove any ``<|...|>`` special-token strings from *text*.
 
-        Used by the streaming handler to scrub individual deltas in
-        fused-autodetect mode, where ``skip_special_tokens=False`` keeps
-        the language prefix readable at the anchor boundary but would
-        otherwise let ``<|endoftext|>`` and timestamp-variant
-        ``<|X.XX|>`` tokens leak into client-facing SSE chunks.
+        Used as the best-effort scrub on FSM abort / parse failure when
+        the full ``parse_fused_output`` path can't locate the prefix.
         """
         return _SPECIAL_TOKEN_RE.sub("", text)
-
-    @staticmethod
-    def fused_prefix_end(text: str) -> int:
-        """Char offset in *text* of the first user-visible transcription char.
-
-        Returns ``-1`` when the boundary isn't locatable yet — either the
-        prefix sentinel (``<|notimestamps|>`` or ``<|0.00|>``) hasn't
-        arrived, or the sentinel is in but only trailing whitespace
-        follows it. Deferring in the whitespace-only case matches
-        ``parse_fused_output``'s ``.strip()`` behavior and prevents the
-        first streamed delta from leaking the leading space Whisper emits
-        between the prefix and the first word.
-
-        Used by the streaming handler to re-anchor ``stream_buffer`` so
-        deltas sent to the client never include the forced special tokens.
-        """
-        idx, sentinel_len = WhisperAdapter._find_fused_sentinel(text)
-        if idx < 0:
-            return -1
-        end = idx + sentinel_len
-        while end < len(text) and text[end].isspace():
-            end += 1
-        if end >= len(text):
-            # Sentinel seen but no non-whitespace transcription char yet —
-            # defer so streaming doesn't emit a leading space.
-            return -1
-        return end
 
     # -- Standalone detection (for external callers) -------------------------
 

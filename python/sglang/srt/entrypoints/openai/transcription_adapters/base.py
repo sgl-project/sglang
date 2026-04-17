@@ -42,33 +42,30 @@ class TranscriptionAdapter(ABC):
         """
         raise NotImplementedError
 
-    def parse_fused_output(self, text: str) -> tuple[Optional[str], str]:
-        """Parse the fused output to extract (language_code, transcription_text).
+    def parse_fused_output(self, text: str) -> tuple[Optional[str], Optional[str]]:
+        """Parse the fused output into ``(language_code, user_visible_text)``.
 
-        Return ``(None, text)`` on parse failure (FSM abort, truncation, regex
-        drift). Callers must treat ``None`` as an error and not overwrite
-        ``request.language`` with it.
-        """
-        raise NotImplementedError
+        Called by both streaming and non-streaming handlers with the same
+        contract:
 
-    def fused_prefix_end(self, text: str) -> int:
-        """Char offset in *text* where user-visible transcription begins.
-
-        Returns ``-1`` if the forced prefix hasn't fully arrived yet. Used by
-        the streaming handler to buffer deltas across the forced-prefix
-        boundary without leaking special tokens to clients.
+        * ``(None, None)`` — the forced prefix is not yet locatable.
+          Streaming callers keep buffering; non-streaming / end-of-stream
+          callers treat this as a parse failure and fall back to
+          ``strip_special_tokens`` on the raw text.
+        * ``(lang, visible)`` — prefix parsed. ``visible`` is fully
+          user-visible (prefix removed, embedded special tokens scrubbed).
+          It must grow monotonically across cumulative streaming snapshots
+          so callers can compute deltas against it directly.
         """
         raise NotImplementedError
 
     def strip_special_tokens(self, text: str) -> str:
-        """Remove model-specific special-token strings from *text*.
+        """Best-effort scrub of model-specific special-token strings.
 
-        Called by the streaming handler in fused-autodetect mode to scrub
-        each delta. Default is an identity pass-through; adapters that
-        request generation with ``skip_special_tokens=False`` should
-        override this to strip any non-prefix specials (e.g. Whisper's
-        trailing ``<|endoftext|>`` or embedded ``<|X.XX|>`` timestamp
-        tokens) before the delta reaches the client.
+        Used as a fallback when ``parse_fused_output`` reports a parse
+        failure (e.g. FSM abort). Default is an identity pass-through;
+        adapters that request generation with ``skip_special_tokens=False``
+        should override to strip their special-token syntax.
         """
         return text
 

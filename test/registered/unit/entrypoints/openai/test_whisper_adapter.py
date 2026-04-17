@@ -1,9 +1,10 @@
 """Unit tests for the Whisper transcription adapter.
 
-Focused on ``WhisperAdapter.parse_fused_output`` — a pure static method that
-parses the fused auto-detect output (``<|lang|><|transcribe|><|notimestamps|>
-text``) and must fail strictly rather than silently defaulting to English on
-malformed input.
+Focused on ``WhisperAdapter.parse_fused_output`` — a pure static method
+that parses the fused auto-detect output into ``(language, user_visible_text)``.
+``visible=None`` means "forced prefix not yet locatable; streaming callers
+should keep buffering, non-streaming callers should fall back to a
+best-effort scrub".
 """
 
 import unittest
@@ -20,143 +21,107 @@ register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
 class TestWhisperParseFusedOutput(unittest.TestCase):
-    """parse_fused_output: (language_code | None, transcription)."""
+    """parse_fused_output: (language, visible) where visible=None means defer."""
 
     def test_happy_english(self):
-        lang, text = WhisperAdapter.parse_fused_output(
+        lang, visible = WhisperAdapter.parse_fused_output(
             "<|en|><|transcribe|><|notimestamps|> Hello world"
         )
-        self.assertEqual(lang, "en")
-        self.assertEqual(text, "Hello world")
+        self.assertEqual((lang, visible), ("en", "Hello world"))
 
     def test_happy_non_english(self):
-        lang, text = WhisperAdapter.parse_fused_output(
+        lang, visible = WhisperAdapter.parse_fused_output(
             "<|zh|><|transcribe|><|notimestamps|>你好世界"
         )
-        self.assertEqual(lang, "zh")
-        self.assertEqual(text, "你好世界")
+        self.assertEqual((lang, visible), ("zh", "你好世界"))
 
-    def test_missing_language_prefix_returns_none(self):
-        lang, text = WhisperAdapter.parse_fused_output("raw untagged output")
-        self.assertIsNone(lang)
-        self.assertEqual(text, "raw untagged output")
-
-    def test_missing_sentinel_returns_none(self):
-        # Repro from the PR review: truncation/FSM abort leaves the language
-        # tag but no <|notimestamps|>. Must not leak the special-token prefix.
-        lang, text = WhisperAdapter.parse_fused_output("<|zh|> Hi")
-        self.assertIsNone(lang)
-
-    def test_truncated_after_transcribe_returns_none(self):
-        lang, _ = WhisperAdapter.parse_fused_output("<|en|><|transcribe|>")
-        self.assertIsNone(lang)
-
-    def test_unsupported_language_code_returns_none(self):
-        # The FSM regex only allows codes from ISO639_1_SUPPORTED_LANGS.
-        # If a code outside the allow-list ever reaches this parser (e.g.
-        # FSM bypassed in a future refactor), it must be rejected, not
-        # silently accepted as a language.
-        lang, _ = WhisperAdapter.parse_fused_output(
-            "<|xx|><|transcribe|><|notimestamps|>hi"
+    def test_missing_language_prefix_defers(self):
+        # Partial prefix or raw untagged text — streaming callers should
+        # keep buffering; non-streaming callers fall back to best-effort.
+        self.assertEqual(
+            WhisperAdapter.parse_fused_output("raw untagged output"), (None, None)
         )
-        self.assertIsNone(lang)
+        self.assertEqual(WhisperAdapter.parse_fused_output(""), (None, None))
 
-    def test_empty_transcription_preserved(self):
-        lang, text = WhisperAdapter.parse_fused_output(
-            "<|en|><|transcribe|><|notimestamps|>"
+    def test_missing_sentinel_defers(self):
+        # Reviewer's repro: <|zh|> Hi — language tag in but no sentinel.
+        self.assertEqual(WhisperAdapter.parse_fused_output("<|zh|> Hi"), (None, None))
+
+    def test_truncated_after_transcribe_defers(self):
+        self.assertEqual(
+            WhisperAdapter.parse_fused_output("<|en|><|transcribe|>"), (None, None)
         )
-        self.assertEqual(lang, "en")
-        self.assertEqual(text, "")
 
-    def test_trailing_endoftext_stripped(self):
-        # skip_special_tokens=False means <|endoftext|> can survive into the
-        # raw text; make sure it doesn't leak into the user-visible result.
-        lang, text = WhisperAdapter.parse_fused_output(
+    def test_unsupported_language_code_defers(self):
+        # FSM regex only allows ISO639_1_SUPPORTED_LANGS. A bypassed-FSM
+        # <|xx|> must not leak through as a valid detection.
+        self.assertEqual(
+            WhisperAdapter.parse_fused_output("<|xx|><|transcribe|><|notimestamps|>hi"),
+            (None, None),
+        )
+
+    def test_sentinel_in_but_whitespace_only_returns_empty_visible(self):
+        # Prefix arrived at a chunk boundary before the first word. The
+        # .strip() collapses to "" so streaming callers see no delta yet;
+        # the language is still reported as soon as the sentinel lands.
+        self.assertEqual(
+            WhisperAdapter.parse_fused_output("<|en|><|transcribe|><|notimestamps|>"),
+            ("en", ""),
+        )
+        self.assertEqual(
+            WhisperAdapter.parse_fused_output("<|en|><|transcribe|><|notimestamps|>  "),
+            ("en", ""),
+        )
+
+    def test_trailing_endoftext_scrubbed(self):
+        lang, visible = WhisperAdapter.parse_fused_output(
             "<|en|><|transcribe|><|notimestamps|> Hello world<|endoftext|>"
         )
-        self.assertEqual(lang, "en")
-        self.assertEqual(text, "Hello world")
+        self.assertEqual((lang, visible), ("en", "Hello world"))
 
-    def test_embedded_timestamp_tokens_stripped_from_text(self):
-        # Timestamps variant: segment-boundary tokens must not appear in the
-        # plain-text field (verbose_json builds segments from output_ids via
-        # _parse_segments, a separate path).
-        lang, text = WhisperAdapter.parse_fused_output(
+    def test_embedded_timestamp_tokens_scrubbed(self):
+        # Timestamps variant: segment-boundary tokens must not appear in
+        # the plain-text field. verbose_json segment timing comes from
+        # _parse_segments over output_ids on a separate path.
+        lang, visible = WhisperAdapter.parse_fused_output(
             "<|en|><|transcribe|><|0.00|> Hello<|5.00|> world<|10.00|><|endoftext|>"
         )
-        self.assertEqual(lang, "en")
-        self.assertEqual(text, "Hello world")
+        self.assertEqual((lang, visible), ("en", "Hello world"))
+
+    def test_visible_grows_monotonically_across_snapshots(self):
+        # Streaming property: cumulative text produces cumulative visible.
+        snapshots = [
+            "<|en|><|transcribe|>",
+            "<|en|><|transcribe|><|notimestamps|>",
+            "<|en|><|transcribe|><|notimestamps|> Hello",
+            "<|en|><|transcribe|><|notimestamps|> Hello world",
+            "<|en|><|transcribe|><|notimestamps|> Hello world<|endoftext|>",
+        ]
+        visibles = [WhisperAdapter.parse_fused_output(s)[1] for s in snapshots]
+        # (None, "", "Hello", "Hello world", "Hello world")
+        self.assertEqual(visibles, [None, "", "Hello", "Hello world", "Hello world"])
+        # Every non-None entry is a prefix of the next non-None entry.
+        real = [v for v in visibles if v is not None]
+        for a, b in zip(real, real[1:]):
+            self.assertTrue(b.startswith(a), f"monotonicity broken: {a!r} -> {b!r}")
 
 
-class TestWhisperFusedPrefixEnd(unittest.TestCase):
-    """fused_prefix_end: streaming boundary offset (-1 when sentinel absent)."""
+class TestWhisperStripSpecialTokens(unittest.TestCase):
+    """Fallback scrub used when parse_fused_output defers."""
 
-    def test_returns_offset_after_sentinel_and_leading_whitespace(self):
-        text = "<|en|><|transcribe|><|notimestamps|> Hello"
-        end = WhisperAdapter.fused_prefix_end(text)
-        self.assertEqual(text[end:], "Hello")
-
-    def test_returns_offset_when_no_leading_whitespace(self):
-        text = "<|zh|><|transcribe|><|notimestamps|>你好"
-        end = WhisperAdapter.fused_prefix_end(text)
-        self.assertEqual(text[end:], "你好")
-
-    def test_returns_minus_one_when_sentinel_missing(self):
-        # Partial prefix still arriving on the wire.
-        self.assertEqual(WhisperAdapter.fused_prefix_end("<|en|><|transcribe|>"), -1)
-        self.assertEqual(WhisperAdapter.fused_prefix_end(""), -1)
-        self.assertEqual(WhisperAdapter.fused_prefix_end("<|zh|> Hi"), -1)
-
-    def test_defers_when_only_whitespace_follows_sentinel(self):
-        # Sentinel arrived at chunk boundary but transcription text hasn't —
-        # anchor now would leak the leading space on the next delta.
+    def test_strips_all_whisper_specials(self):
         self.assertEqual(
-            WhisperAdapter.fused_prefix_end("<|en|><|transcribe|><|notimestamps|>"),
-            -1,
-        )
-        self.assertEqual(
-            WhisperAdapter.fused_prefix_end("<|en|><|transcribe|><|notimestamps|>  "),
-            -1,
+            WhisperAdapter.strip_special_tokens(
+                "<|en|><|transcribe|><|0.00|>hi<|5.00|>world<|endoftext|>"
+            ),
+            "hiworld",
         )
 
-
-class TestWhisperFusedTimestampsVariant(unittest.TestCase):
-    """Timestamps-aware fused regex: <|lang|><|transcribe|><|0.00|> text <|X.XX|>..."""
-
-    def test_parse_fused_output_with_ts_sentinel(self):
-        # The first <|0.00|> is the forced prefix sentinel. Subsequent
-        # <|5.00|>, <|10.00|> etc are segment-boundary tokens — meaningful
-        # for verbose_json's _parse_segments (which decodes output_ids
-        # separately) but unwanted noise in the plain text field, so they
-        # get scrubbed here along with any trailing <|endoftext|>.
-        text = "<|en|><|transcribe|><|0.00|> Hello<|5.00|> World<|10.00|>"
-        lang, out = WhisperAdapter.parse_fused_output(text)
-        self.assertEqual(lang, "en")
-        self.assertEqual(out, "Hello World")
-
-    def test_fused_prefix_end_with_ts_sentinel(self):
-        text = "<|zh|><|transcribe|><|0.00|> 你好<|5.00|>"
-        end = WhisperAdapter.fused_prefix_end(text)
-        self.assertEqual(text[end:], "你好<|5.00|>")
-
-    def test_strip_special_tokens_removes_timestamps_and_eos(self):
-        self.assertEqual(
-            WhisperAdapter.strip_special_tokens("Hello<|5.00|> world<|endoftext|>"),
-            "Hello world",
-        )
+    def test_identity_on_plain_text(self):
         self.assertEqual(
             WhisperAdapter.strip_special_tokens("plain text"), "plain text"
         )
         self.assertEqual(WhisperAdapter.strip_special_tokens(""), "")
-
-    def test_fused_prefix_end_defers_on_partial_ts_prefix(self):
-        self.assertEqual(WhisperAdapter.fused_prefix_end("<|en|><|transcribe|>"), -1)
-        self.assertEqual(
-            WhisperAdapter.fused_prefix_end("<|en|><|transcribe|><|0.00|>"), -1
-        )
-        self.assertEqual(
-            WhisperAdapter.fused_prefix_end("<|en|><|transcribe|><|0.00|>  "), -1
-        )
 
 
 class TestWhisperBuildFusedAutodetectParams(unittest.TestCase):

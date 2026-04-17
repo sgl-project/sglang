@@ -183,16 +183,23 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         text = self._adapter.postprocess_text(ret.get("text", ""))
 
-        # For fused auto-detect requests, strip the forced prefix
-        # (<|lang|><|transcribe|><|notimestamps|>) and extract the language.
-        # parse_fused_output returns (None, text) on parse failure; in that
-        # case leave request.language unset rather than claim a bogus
-        # detection.
+        # For fused auto-detect, parse_fused_output returns the scrubbed
+        # user-visible text. On parse failure (FSM abort, truncation) it
+        # returns (None, None) and we fall back to a best-effort scrub —
+        # the language stays unset rather than reporting a bogus detection.
         if getattr(request, "_fused_autodetect", False):
-            lang, text = self._adapter.parse_fused_output(text)
-            if lang is not None:
-                request.language = lang
-                logger.info("Auto-detected language: '%s'", lang)
+            lang, visible = self._adapter.parse_fused_output(text)
+            if visible is None:
+                logger.warning(
+                    "Fused auto-detect parse failed on non-streaming response; "
+                    "falling back to raw-text scrub."
+                )
+                text = self._adapter.strip_special_tokens(text)
+            else:
+                text = visible
+                if lang is not None:
+                    request.language = lang
+                    logger.info("Auto-detected language: '%s'", lang)
 
         usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
@@ -237,18 +244,21 @@ class OpenAIServingTranscription(OpenAIServingBase):
         request: TranscriptionRequest,
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
-        """Generate streaming transcription response."""
+        """Generate streaming transcription response.
+
+        In fused auto-detect mode, each cumulative-text snapshot is passed
+        through ``parse_fused_output`` — which returns ``(None, None)``
+        while the forced prefix is still arriving and ``(lang, visible)``
+        once it's in. ``visible`` is already stripped of the prefix and
+        scrubbed of embedded special tokens, and it grows monotonically
+        across snapshots, so deltas are a plain suffix slice.
+        """
         created_time = int(time.time())
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
-        stream_buffer = ""
+        visible_buffer = ""
 
-        # For fused auto-detect requests, buffer deltas until the forced
-        # prefix (<|lang|><|transcribe|><|notimestamps|>) has fully arrived,
-        # then treat the sentinel boundary as the start of the user-visible
-        # stream. parse_fused_output finds the sentinel and extracts lang.
         fused_mode = getattr(request, "_fused_autodetect", False)
-        prefix_stripped = not fused_mode
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -259,40 +269,27 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
                 current_text = content.get("text", "")
 
-                if not prefix_stripped:
-                    prefix_end = self._adapter.fused_prefix_end(current_text)
-                    if prefix_end < 0:
-                        # Forced prefix hasn't finished arriving yet — keep
-                        # buffering silently. If the stream ends before the
-                        # sentinel shows up, fall through once to emit what
-                        # we have as a best-effort tail.
+                if fused_mode:
+                    lang, visible = self._adapter.parse_fused_output(current_text)
+                    if visible is None:
+                        # Prefix not yet locatable. Keep buffering unless
+                        # the stream has ended, in which case do a
+                        # best-effort scrub of whatever we have.
                         if not finish_reason_type:
                             continue
                         logger.warning(
                             "Fused auto-detect stream finished before prefix "
-                            "sentinel arrived; emitting raw tail."
+                            "was parseable; emitting scrubbed raw tail."
                         )
-                    else:
-                        lang, _ = self._adapter.parse_fused_output(current_text)
-                        if lang is not None:
-                            request.language = lang
-                            logger.info("Auto-detected language: '%s'", lang)
-                        # Re-anchor stream_buffer to the boundary so all
-                        # subsequent deltas are computed against the
-                        # sentinel-stripped view.
-                        stream_buffer = current_text[:prefix_end]
-                    prefix_stripped = True
+                        visible = self._adapter.strip_special_tokens(current_text)
+                    elif lang is not None and request.language is None:
+                        request.language = lang
+                        logger.info("Auto-detected language: '%s'", lang)
+                else:
+                    visible = current_text
 
-                # Calculate delta (new text since last chunk)
-                delta = current_text[len(stream_buffer) :]
-                stream_buffer = current_text
-
-                # In fused-autodetect mode, scrub any trailing <|endoftext|>
-                # or embedded <|X.XX|> timestamp tokens that survive into
-                # the delta (skip_special_tokens=False is required for
-                # prefix parsing but leaks later specials here).
-                if fused_mode and delta:
-                    delta = self._adapter.strip_special_tokens(delta)
+                delta = visible[len(visible_buffer) :]
+                visible_buffer = visible
 
                 # Send content delta if there's new text
                 if delta:
