@@ -128,18 +128,19 @@ class LoRAAdapter(nn.Module):
             # added/extra token emb
             self.added_tokens_embeddings[name] = loaded_weight.cpu()
             assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
-                f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
-                f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+                f"LoRA adapter {self.uid} has lora_added_tokens_size {self.config.lora_added_tokens_size} specified in the config, "
+                f"but the loaded weight '{name}' has shape {loaded_weight.shape[0]} in first dimension"
             )
 
     def _normalize_weights(self):
-        # normalize kv_proj and gate_up_proj
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self._rename_expert_w_to_proj(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
+            weight_names = list(layer.weights.keys())
+            self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -241,6 +242,33 @@ class LoRAAdapter(nn.Module):
                     repeat_dims[ndim - 2] = 2
                     weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
                 # else: no-op as LoRA B weight is already stacked.
+
+    def normalize_fused_qkv_a_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
+        """Fuse separate q_a_proj and kv_a_proj_with_mqa LoRA weights into
+        a single fused_qkv_a_proj_with_mqa entry (concat along dim 0 for
+        both A and B), matching the DeepSeek MLA fused projection layout."""
+        for weight_name in weight_names:
+            if "q_a_proj" not in weight_name:
+                continue
+            if "fused_qkv_a_proj_with_mqa" in weight_name:
+                continue
+
+            q_a_name = weight_name
+            kv_a_name = weight_name.replace("q_a_proj", "kv_a_proj_with_mqa")
+            fused_name = weight_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
+
+            kv_a_weight = (
+                weights[kv_a_name]
+                if kv_a_name in weights
+                else torch.zeros_like(weights[q_a_name])
+            )
+
+            weights[fused_name] = torch.cat((weights[q_a_name], kv_a_weight), dim=0)
+            weights.pop(q_a_name)
+            if kv_a_name in weights:
+                weights.pop(kv_a_name)
 
     def pin_weights_in_cpu(self):
         for layer in self.layers:

@@ -148,6 +148,7 @@ class CommonKVManager(BaseKVManager):
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
@@ -216,11 +217,19 @@ class CommonKVManager(BaseKVManager):
 
         # Sanity checks
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
-            raise RuntimeError(
-                f"Page size mismatch: prefill server has page_size={info.page_size}, "
-                f"but decode server has page_size={self.kv_args.page_size}. "
-                f"Both servers must use the same --page-size value."
-            )
+            if self.server_args.enable_hisparse:
+                # HiSparse: decode host pool page_size=1, prefill device pool page_size >= 1.
+                # Transfer will use send_kvcache_hisparse with per-token item_lens.
+                logger.info(
+                    f"HiSparse PD transfer mode: prefill page_size={info.page_size}, "
+                    f"decode host page_size={self.kv_args.page_size}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Page size mismatch: prefill server has page_size={info.page_size}, "
+                    f"but decode server has page_size={self.kv_args.page_size}. "
+                    f"Both servers must use the same --page-size value."
+                )
 
         if (
             info.kv_cache_dtype is not None
@@ -434,11 +443,28 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if (
-            self.kv_mgr.server_args.dp_size > 1
-            and self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room"
-        ):
-            self._register_prefill_dp_rank()
+        if self.kv_mgr.server_args.dp_size > 1:
+            if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
+                self._register_prefill_dp_rank()
+            elif (
+                self.kv_mgr.attn_dp_rank
+                != self.bootstrap_room % self.kv_mgr.server_args.dp_size
+            ):
+                # follow_bootstrap_room was overridden by external routed_dp_rank
+                if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
+                    self._register_prefill_dp_rank()
+                else:
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"follow_bootstrap_room conflict: dispatched to dp_rank "
+                        f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
+                        f"{self.bootstrap_room} implies dp_rank "
+                        f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
+                        f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
+                        f"to allow mixed routing.",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
@@ -501,6 +527,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
+        self.require_staging: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -528,6 +555,12 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
         )
+
+        if self.kv_mgr.enable_staging:
+            self.require_staging = (
+                self.prefill_info.attn_tp_size != 0
+                and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
+            )
 
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()

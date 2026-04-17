@@ -1,5 +1,3 @@
-import inspect
-import json
 import math
 import os
 
@@ -7,102 +5,231 @@ import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    is_ltx23_native_variant,
+    sync_ltx23_runtime_vae_markers,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    PipelineComponentLoader,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
     LTX2AVDecodingStage,
     LTX2AVDenoisingStage,
     LTX2AVLatentPreparationStage,
+    LTX2HalveResolutionStage,
+    LTX2ImageEncodingStage,
+    LTX2LoRASwitchStage,
+    LTX2RefinementStage,
     LTX2TextConnectorStage,
+    LTX2UpsampleStage,
     TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
+BASE_SHIFT_ANCHOR = 1024
+MAX_SHIFT_ANCHOR = 4096
 
 
-def prepare_mu(batch: Req, server_args: ServerArgs):
-    height = batch.height
-    width = batch.width
-    num_frames = batch.num_frames
+def _resolve_ltx2_two_stage_component_paths(
+    model_path: str, component_paths: dict[str, str]
+) -> dict[str, str]:
+    resolved = dict(component_paths)
+    auto_resolved = []
 
-    vae_arch = getattr(
-        getattr(server_args.pipeline_config, "vae_config", None), "arch_config", None
+    if "spatial_upsampler" not in resolved:
+        spatial_candidates = [
+            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"),
+            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+            os.path.join(model_path, "latent_upsampler"),
+            os.path.join(model_path, "ltx-2-spatial-upscaler-x2-1.0.safetensors"),
+        ]
+        for candidate in spatial_candidates:
+            if os.path.exists(candidate):
+                resolved["spatial_upsampler"] = candidate
+                auto_resolved.append(f"spatial_upsampler={candidate}")
+                break
+
+    if "distilled_lora" not in resolved:
+        distilled_lora_candidates = [
+            os.path.join(model_path, "ltx-2.3-20b-distilled-lora-384.safetensors"),
+            os.path.join(model_path, "ltx-2.3-22b-distilled-lora-384.safetensors"),
+            os.path.join(model_path, "ltx-2-19b-distilled-lora-384.safetensors"),
+        ]
+        for distilled_lora in distilled_lora_candidates:
+            if os.path.exists(distilled_lora):
+                resolved["distilled_lora"] = distilled_lora
+                auto_resolved.append(f"distilled_lora={distilled_lora}")
+                break
+
+    if auto_resolved:
+        logger.info(
+            "Auto-resolved LTX2 two-stage components: %s", ", ".join(auto_resolved)
+        )
+
+    return resolved
+
+
+def calculate_ltx2_shift(
+    image_seq_len: int,
+    base_seq_len: int = BASE_SHIFT_ANCHOR,
+    max_seq_len: int = MAX_SHIFT_ANCHOR,
+    base_shift: float = 0.95,
+    max_shift: float = 2.05,
+) -> float:
+    mm = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - mm * base_seq_len
+    return image_seq_len * mm + b
+
+
+def prepare_ltx2_mu(batch: Req, server_args: ServerArgs):
+    if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+        return "mu", None
+    latent_num_frames = (int(batch.num_frames) - 1) // int(
+        server_args.pipeline_config.vae_temporal_compression
+    ) + 1
+    latent_height = int(batch.height) // int(
+        server_args.pipeline_config.vae_scale_factor
     )
-    vae_scale_factor = (
-        getattr(vae_arch, "spatial_compression_ratio", None)
-        or getattr(vae_arch, "vae_scale_factor", None)
-        or getattr(server_args.pipeline_config, "vae_scale_factor", None)
+    latent_width = int(batch.width) // int(server_args.pipeline_config.vae_scale_factor)
+    video_sequence_length = latent_num_frames * latent_height * latent_width
+    return "mu", calculate_ltx2_shift(video_sequence_length)
+
+
+def build_official_ltx2_sigmas(
+    steps: int,
+    *,
+    max_shift: float = 2.05,
+    base_shift: float = 0.95,
+    stretch: bool = True,
+    terminal: float = 0.1,
+    default_number_of_tokens: int = MAX_SHIFT_ANCHOR,
+) -> list[float]:
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float32)
+
+    mm = (max_shift - base_shift) / (MAX_SHIFT_ANCHOR - BASE_SHIFT_ANCHOR)
+    b = base_shift - mm * BASE_SHIFT_ANCHOR
+    sigma_shift = float(default_number_of_tokens) * mm + b
+
+    non_zero_mask = sigmas != 0
+    shifted = torch.where(
+        non_zero_mask,
+        math.exp(sigma_shift) / (math.exp(sigma_shift) + (1.0 / sigmas - 1.0)),
+        torch.zeros_like(sigmas),
     )
-    vae_temporal_compression = getattr(
-        vae_arch, "temporal_compression_ratio", None
-    ) or getattr(server_args.pipeline_config, "vae_temporal_compression", None)
 
-    # Values from LTX2Pipeline in diffusers
-    mu = calculate_shift(
-        4096,
-        base_seq_len=1024,
-        max_seq_len=4096,
-        base_shift=0.95,
-        max_shift=2.05,
+    if stretch:
+        one_minus_z = 1.0 - shifted[non_zero_mask]
+        scale_factor = one_minus_z[-1] / (1.0 - terminal)
+        shifted[non_zero_mask] = 1.0 - (one_minus_z / scale_factor)
+
+    return shifted[:-1].tolist()
+
+
+class LTX2SigmaPreparationStage(PipelineStage):
+    """Prepare native LTX-2 sigma schedule before timestep setup."""
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        batch.extra["ltx2_phase"] = "stage1"
+        if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+            batch.sigmas = build_official_ltx2_sigmas(int(batch.num_inference_steps))
+        else:
+            batch.sigmas = np.linspace(
+                1.0,
+                1.0 / int(batch.num_inference_steps),
+                int(batch.num_inference_steps),
+            ).tolist()
+        return batch
+
+
+def _add_ltx2_front_stages(pipeline: ComposedPipelineBase):
+    pipeline.add_stages(
+        [
+            InputValidationStage(),
+            TextEncodingStage(
+                text_encoders=[pipeline.get_module("text_encoder")],
+                tokenizers=[pipeline.get_module("tokenizer")],
+            ),
+            LTX2TextConnectorStage(connectors=pipeline.get_module("connectors")),
+        ]
     )
-    return "mu", mu
 
 
-def _load_component_config(model_path: str, component_name: str):
-    """Helper to load component config from model_index.json or config.json"""
-    try:
-        # Try loading model_index.json first
-        index_path = os.path.join(model_path, "model_index.json")
-        if os.path.exists(index_path):
-            with open(index_path, "r") as f:
-                index = json.load(f)
-
-            if component_name in index:
-                # It's a subfolder
-                subfolder = index[component_name][1]
-                config_path = os.path.join(model_path, subfolder, "config.json")
-                if os.path.exists(config_path):
-                    with open(config_path, "r") as f:
-                        return json.load(f)
-
-        # Fallback to direct config.json in subfolder if standard structure
-        config_path = os.path.join(model_path, component_name, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
-                return json.load(f)
-
-    except Exception as e:
-        logger.warning(f"Failed to load config for {component_name}: {e}")
-
-    return {}
+def _add_ltx2_stage1_generation_stages(pipeline: ComposedPipelineBase):
+    pipeline.add_stage(LTX2SigmaPreparationStage())
+    pipeline.add_standard_timestep_preparation_stage(
+        prepare_extra_kwargs=[prepare_ltx2_mu]
+    )
+    pipeline.add_stages(
+        [
+            LTX2AVLatentPreparationStage(
+                scheduler=pipeline.get_module("scheduler"),
+                transformer=pipeline.get_module("transformer"),
+                audio_vae=pipeline.get_module("audio_vae"),
+            ),
+            LTX2ImageEncodingStage(
+                vae=pipeline.get_module("vae"),
+            ),
+            LTX2AVDenoisingStage(
+                transformer=pipeline.get_module("transformer"),
+                scheduler=pipeline.get_module("scheduler"),
+                vae=pipeline.get_module("vae"),
+                audio_vae=pipeline.get_module("audio_vae"),
+                pipeline=pipeline,
+            ),
+        ]
+    )
 
 
-def _filter_kwargs_for_cls(cls, kwargs):
-    """Filter kwargs to only include those accepted by cls.__init__"""
-    sig = inspect.signature(cls.__init__)
-    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+def _add_ltx2_decoding_stage(pipeline: ComposedPipelineBase):
+    pipeline.add_stage(
+        LTX2AVDecodingStage(
+            vae=pipeline.get_module("vae"),
+            audio_vae=pipeline.get_module("audio_vae"),
+            vocoder=pipeline.get_module("vocoder"),
+            pipeline=pipeline,
+        )
+    )
 
 
 class LTX2FlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
     """Override ``_time_shift_exponential`` to use torch f32 instead of numpy f64."""
+
+    def set_timesteps(
+        self,
+        num_inference_steps=None,
+        device=None,
+        sigmas=None,
+        mu=None,
+        timesteps=None,
+    ):
+        if sigmas is not None and timesteps is None and mu is None:
+            sigmas = torch.tensor(sigmas, dtype=torch.float32, device=device)
+            timesteps = sigmas * self.config.num_train_timesteps
+            sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
+            self.num_inference_steps = len(timesteps)
+            self.timesteps = timesteps
+            self.sigmas = sigmas
+            self._step_index = None
+            self._begin_index = None
+            return
+
+        return super().set_timesteps(
+            num_inference_steps=num_inference_steps,
+            device=device,
+            sigmas=sigmas,
+            mu=mu,
+            timesteps=timesteps,
+        )
 
     def _time_shift_exponential(self, mu, sigma, t):
         if isinstance(t, np.ndarray):
@@ -112,10 +239,7 @@ class LTX2FlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
         return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
 
 
-class LTX2Pipeline(ComposedPipelineBase):
-    # NOTE: must match `model_index.json`'s `_class_name` for native dispatch.
-    pipeline_name = "LTX2Pipeline"
-
+class _BaseLTX2Pipeline(LoRAPipeline):
     _required_config_modules = [
         "transformer",
         "text_encoder",
@@ -130,42 +254,146 @@ class LTX2Pipeline(ComposedPipelineBase):
     def initialize_pipeline(self, server_args: ServerArgs):
         orig = self.get_module("scheduler")
         self.modules["scheduler"] = LTX2FlowMatchScheduler.from_config(orig.config)
+        sync_ltx23_runtime_vae_markers(
+            server_args.pipeline_config.vae_config.arch_config,
+            getattr(self.get_module("vae"), "config", None),
+        )
+
+
+class LTX2Pipeline(_BaseLTX2Pipeline):
+    # Must match model_index.json `_class_name`.
+    pipeline_name = "LTX2Pipeline"
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_stages(
-            [
-                InputValidationStage(),
-                TextEncodingStage(
-                    text_encoders=[self.get_module("text_encoder")],
-                    tokenizers=[self.get_module("tokenizer")],
-                ),
-                LTX2TextConnectorStage(connectors=self.get_module("connectors")),
-            ]
+        _add_ltx2_front_stages(self)
+        _add_ltx2_stage1_generation_stages(self)
+        _add_ltx2_decoding_stage(self)
+
+
+class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
+    pipeline_name = "LTX2TwoStagePipeline"
+    STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+
+    @staticmethod
+    def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:
+        return is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
         )
 
-        self.add_standard_timestep_preparation_stage(prepare_extra_kwargs=[prepare_mu])
+    def initialize_pipeline(self, server_args: ServerArgs):
+        super().initialize_pipeline(server_args)
+        server_args.component_paths = _resolve_ltx2_two_stage_component_paths(
+            self.model_path, server_args.component_paths
+        )
 
+        upsampler_path = server_args.component_paths.get("spatial_upsampler")
+        if not upsampler_path:
+            raise ValueError(
+                "LTX2TwoStagePipeline requires --spatial-upsampler-path "
+                "(component_paths['spatial_upsampler'])."
+            )
+        module, memory_usage = PipelineComponentLoader.load_component(
+            component_name="spatial_upsampler",
+            component_model_path=upsampler_path,
+            transformers_or_diffusers="diffusers",
+            server_args=server_args,
+        )
+        self.modules["spatial_upsampler"] = module
+        self.memory_usages["spatial_upsampler"] = memory_usage
+
+        distilled_lora_path = server_args.component_paths.get("distilled_lora")
+        if not distilled_lora_path:
+            raise ValueError(
+                "LTX2TwoStagePipeline requires --distilled-lora-path "
+                "(component_paths['distilled_lora'])."
+            )
+        self._distilled_lora_path = distilled_lora_path
+        self._stage1_lora_path = server_args.lora_path
+        self._stage1_lora_scale = float(server_args.lora_scale)
+        self._active_lora_phase = None
+
+    def switch_lora_phase(self, phase: str) -> None:
+        if phase == self._active_lora_phase:
+            return
+
+        if phase == "stage1":
+            if self._stage1_lora_path:
+                self.set_lora(
+                    lora_nickname="ltx2_stage1_base",
+                    lora_path=self._stage1_lora_path,
+                    target="transformer",
+                    strength=self._stage1_lora_scale,
+                )
+            else:
+                # Stage 1 must run on the base transformer weights. If stage 2 left the
+                # distilled adapter active, stage 1 quality drifts away from the official
+                # two-stage pipeline immediately.
+                self.deactivate_lora_weights(target="transformer")
+        elif phase == "stage2":
+            lora_nicknames = []
+            lora_paths = []
+            lora_strengths = []
+            lora_targets = []
+            if self._stage1_lora_path:
+                lora_nicknames.append("ltx2_stage1_base")
+                lora_paths.append(self._stage1_lora_path)
+                lora_strengths.append(self._stage1_lora_scale)
+                lora_targets.append("transformer")
+            lora_nicknames.append("ltx2_stage2_distilled")
+            lora_paths.append(self._distilled_lora_path)
+            lora_strengths.append(1.0)
+            lora_targets.append("transformer")
+            self.set_lora(
+                lora_nickname=lora_nicknames,
+                lora_path=lora_paths,
+                target=lora_targets,
+                strength=lora_strengths,
+                # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
+                # into the transformer weights. Legacy LTX-2 should keep the
+                # preexisting unmerged behavior to avoid regressing stage 2 quality.
+                merge_weights=self._should_merge_stage2_distilled_lora(
+                    self.server_args
+                ),
+            )
+        else:
+            raise ValueError(f"Unknown LTX2 two-stage LoRA phase: {phase}")
+
+        self._active_lora_phase = phase
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        _add_ltx2_front_stages(self)
+        self.add_stage(LTX2HalveResolutionStage())
+        self.add_stage(
+            LTX2LoRASwitchStage(pipeline=self, phase="stage1"),
+        )
+        _add_ltx2_stage1_generation_stages(self)
         self.add_stages(
             [
-                LTX2AVLatentPreparationStage(
-                    scheduler=self.get_module("scheduler"),
-                    transformer=self.get_module("transformer"),
-                    audio_vae=self.get_module("audio_vae"),
-                ),
-                LTX2AVDenoisingStage(
-                    transformer=self.get_module("transformer"),
-                    scheduler=self.get_module("scheduler"),
+                LTX2UpsampleStage(
+                    spatial_upsampler=self.get_module("spatial_upsampler"),
                     vae=self.get_module("vae"),
                     audio_vae=self.get_module("audio_vae"),
                 ),
-                LTX2AVDecodingStage(
+                (
+                    LTX2LoRASwitchStage(pipeline=self, phase="stage2"),
+                    "ltx2_lora_switch_stage2",
+                ),
+                (
+                    LTX2ImageEncodingStage(
+                        vae=self.get_module("vae"),
+                    ),
+                    "ltx2_image_encoding_stage2",
+                ),
+                LTX2RefinementStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                    distilled_sigmas=self.STAGE_2_DISTILLED_SIGMA_VALUES,
                     vae=self.get_module("vae"),
                     audio_vae=self.get_module("audio_vae"),
-                    vocoder=self.get_module("vocoder"),
-                    pipeline=self,
                 ),
             ]
         )
+        _add_ltx2_decoding_stage(self)
 
 
-EntryClass = LTX2Pipeline
+EntryClass = [LTX2Pipeline, LTX2TwoStagePipeline]
