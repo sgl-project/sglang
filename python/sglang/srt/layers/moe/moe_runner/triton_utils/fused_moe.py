@@ -491,7 +491,16 @@ def _fused_moe_kernel_sequence(
     )
 
     if hooks and hooks.after_gate_up:
-        hooks.after_gate_up(hidden_states, intermediate_cache1, topk_weights, topk_ids)
+        # Hooks expect intermediate_cache1 shaped (num_tokens, topk, N); the
+        # underlying buffer is laid out as (total_tokens, N) where
+        # total_tokens = num_tokens * topk (+ TMA padding). Slice off any
+        # padding and reshape for the hook, which writes in-place on the view.
+        hooks.after_gate_up(
+            hidden_states,
+            intermediate_cache1[: num_tokens * topk].view(num_tokens, topk, N),
+            topk_weights,
+            topk_ids,
+        )
 
     intermediate_cache2 = torch.empty(
         (total_tokens, N // 2),
