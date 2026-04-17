@@ -160,6 +160,7 @@ class Envs:
     # config_backup_{small,large}.json, "auto" = pick small/large based on the
     # checkpoint's num_hidden_layers.
     SGLANG_APPLY_CONFIG_BACKUP = EnvStr("auto")
+    SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)

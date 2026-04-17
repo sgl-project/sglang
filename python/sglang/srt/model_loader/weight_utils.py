@@ -1,10 +1,12 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
+import collections
 import concurrent.futures
 import fnmatch
 import glob
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -33,7 +35,7 @@ from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed import get_tensor_model_parallel_rank, get_world_group
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -58,6 +60,18 @@ except ImportError as e:
     SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
+
+# Block size for sequential checkpoint prefetch reads (page cache warming).
+_PREFETCH_BLOCK_SIZE = None
+
+
+def _get_prefetch_block_size() -> int:
+    global _PREFETCH_BLOCK_SIZE
+    if _PREFETCH_BLOCK_SIZE is None:
+        from sglang.srt.environ import envs
+
+        _PREFETCH_BLOCK_SIZE = envs.SGLANG_PREFETCH_BLOCK_SIZE_MB.get() * 1024 * 1024
+    return _PREFETCH_BLOCK_SIZE
 
 
 def enable_hf_transfer():
@@ -700,6 +714,109 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+def _prefetch_checkpoint_file(file_path: str) -> None:
+    """Prefetch a checkpoint file into the OS page cache.
+
+    Reads the file sequentially in 16 MB blocks so the kernel caches its pages
+    before workers load the same file via mmap.
+    """
+    with open(file_path, "rb") as f:
+        while f.read(_get_prefetch_block_size()):
+            pass
+
+
+def _prefetch_all_checkpoints(
+    sorted_files: List[str],
+    num_threads: int = 4,
+) -> None:
+    """Start prefetching checkpoint files into page cache in a background thread.
+
+    When multiple ranks on the same node load the same checkpoint (e.g.
+    DP-attention), each rank independently mmaps the same files, causing
+    redundant NFS/Lustre reads. By distributing the prefetch across ranks
+    (each rank reads 1/Nth of the shards), the total network I/O is reduced
+    from N * checkpoint_size to 1 * checkpoint_size, with subsequent
+    mmap accesses hitting the shared OS page cache.
+
+    The prefetch runs in a background thread so that loading can start
+    immediately and benefit from pages that have already been cached,
+    rather than blocking until all files are prefetched. This pipelining
+    naturally adapts to any RAM size — even if the full checkpoint does
+    not fit in page cache, the prefetch thread stays ahead of the loader.
+    """
+    import asyncio
+    import threading
+    import time
+
+    # Use node-local rank so that each node independently prefetches the
+    # full checkpoint into its own page cache. Global rank would split files
+    # across nodes, but page cache is not shared across nodes.
+    if torch.distributed.is_initialized():
+        world_group = get_world_group()
+        local_rank = world_group.local_rank
+        local_world_size = world_group.local_size or world_group.world_size
+    else:
+        local_rank = 0
+        local_world_size = 1
+
+    my_files = sorted_files[local_rank::local_world_size]
+    total_for_rank = len(my_files)
+
+    logger.info(
+        "Rank %d: prefetching %d/%d checkpoint shards into page cache "
+        "(background, %d local ranks sharing the work, %d threads per rank)...",
+        local_rank,
+        total_for_rank,
+        len(sorted_files),
+        local_world_size,
+        num_threads,
+    )
+
+    async def _prefetch_all() -> None:
+        semaphore = asyncio.Semaphore(num_threads)
+        completed = 0
+        next_log_pct = 10
+
+        async def prefetch_one(path: str) -> None:
+            nonlocal completed, next_log_pct
+            try:
+                async with semaphore:
+                    await asyncio.to_thread(_prefetch_checkpoint_file, path)
+                completed += 1
+                if total_for_rank > 0 and next_log_pct <= 100:
+                    pct = 100 * completed / total_for_rank
+                    if pct >= next_log_pct:
+                        logger.info(
+                            "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
+                            local_rank,
+                            next_log_pct,
+                            completed,
+                            total_for_rank,
+                        )
+                        next_log_pct += 10
+            except Exception:
+                logger.warning(
+                    "Failed to prefetch checkpoint file %r.",
+                    path,
+                    exc_info=True,
+                )
+
+        await asyncio.gather(*(prefetch_one(p) for p in my_files))
+
+    def _run_prefetch() -> None:
+        start = time.perf_counter()
+        asyncio.run(_prefetch_all())
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "Rank %d: prefetching checkpoint files into page cache "
+            "finished in %.2fs",
+            local_rank,
+            elapsed,
+        )
+
+    threading.Thread(target=_run_prefetch, daemon=True).start()
+
+
 def decrypt(fn, key):
     raise NotImplementedError()
 
@@ -717,6 +834,8 @@ def safetensors_weights_iterator(
     is_all_weights_sharded: bool = False,
     decryption_key: Optional[str] = None,
     disable_mmap: bool = False,
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -732,8 +851,14 @@ def safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+
+    sorted_files = sorted(hf_weights_files)
+
+    if prefetch and not disable_mmap:
+        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+
     for st_file in tqdm(
-        hf_weights_files,
+        sorted_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
         bar_format=BAR_FORMAT,
@@ -811,12 +936,18 @@ def multi_thread_safetensors_weights_iterator(
     decryption_key: Optional[str] = None,
     max_workers: int = 4,
     disable_mmap: bool = False,
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files.
 
     If is_all_weights_sharded is True, it uses more optimize read by reading an
     entire file instead of reading each tensor one by one.
     """
+    if prefetch and not disable_mmap:
+        _prefetch_all_checkpoints(
+            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        )
     if decryption_key:
         logger.warning(
             "Multi-Thread loading is not working for encrypted safetensor weights."
@@ -858,6 +989,69 @@ def multi_thread_safetensors_weights_iterator(
             state_dict = future.result()
             for name, param in state_dict.items():
                 yield name, param
+
+
+def buffered_multi_thread_safetensors_weights_iterator(
+    hf_weights_files: List[str],
+    max_workers: int,
+    disable_mmap: bool = False,
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Multi-threaded safetensor loader with bounded memory via a sliding window.
+
+    At most (max_workers + 1) shard files are in-flight at any time:
+    max_workers loading concurrently + 1 prefetched and ready to yield.
+    Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+    """
+    sorted_files = sorted(hf_weights_files)
+    if prefetch and not disable_mmap:
+        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    def _load_file(st_file: str):
+        if disable_mmap:
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
+        return result
+
+    # Sliding window: max_workers loading + 1 prefetched.
+    buffer_size = max_workers + 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        file_iter = iter(sorted_files)
+        pending: collections.deque = collections.deque()
+
+        # Seed the buffer.
+        for st_file in itertools.islice(file_iter, buffer_size):
+            pending.append(executor.submit(_load_file, st_file))
+
+        with tqdm(
+            total=len(hf_weights_files),
+            desc="Multi-thread loading shards",
+            disable=not enable_tqdm,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        ) as pbar:
+            while pending:
+                future = pending.popleft()
+                state_dict = future.result()
+                del future  # let GC reclaim the Future's internal result
+
+                # Replenish: submit the next file to keep the buffer full.
+                next_file = next(file_iter, None)
+                if next_file is not None:
+                    pending.append(executor.submit(_load_file, next_file))
+
+                for name in sorted(state_dict.keys()):
+                    yield name, state_dict[name]
+                del state_dict
+                pbar.update(1)
 
 
 def _load_pt_file(bin_file: str) -> dict:
