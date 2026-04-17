@@ -69,7 +69,7 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
         suite_name
         for suite_name in DYNAMIC_SUITES
         if suite_name in expected
-           and not any(
+        and not any(
             not case_id.startswith("standalone:") for case_id in expected[suite_name]
         )
     ]
