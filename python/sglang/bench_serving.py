@@ -1651,49 +1651,64 @@ def set_global_args(args_: argparse.Namespace):
     args = args_
 
 
+def _apply_arg_defaults(args_: argparse.Namespace) -> None:
+    """Populate optional args.* attributes with defaults.
+
+    bench_serving.benchmark() and the request funcs it calls read many
+    optional args attributes. When bench_serving is driven by its own CLI
+    these are set by argparse; when driven programmatically (e.g. by
+    sglang.bench_eval), the caller may not supply all of them. Apply the
+    same defaults that run_benchmark does so programmatic callers don't
+    hit AttributeError on code paths they didn't anticipate.
+    """
+    if not hasattr(args_, "max_concurrency"):
+        args_.max_concurrency = None
+    if not hasattr(args_, "warmup_requests"):
+        args_.warmup_requests = 1
+    if not hasattr(args_, "output_details"):
+        args_.output_details = False
+    if not hasattr(args_, "tokenize_prompt"):
+        args_.tokenize_prompt = False
+    if not hasattr(args_, "plot_throughput"):
+        args_.plot_throughput = False
+    if not hasattr(args_, "top_logprobs_num"):
+        args_.top_logprobs_num = 0
+    if not hasattr(args_, "token_ids_logprob"):
+        args_.token_ids_logprob = None
+    if not hasattr(args_, "logprob_start_len"):
+        args_.logprob_start_len = -1
+    if not hasattr(args_, "return_logprob"):
+        args_.return_logprob = False
+    if not hasattr(args_, "use_trace_timestamps"):
+        args_.use_trace_timestamps = False
+    if not hasattr(args_, "mooncake_slowdown_factor"):
+        args_.mooncake_slowdown_factor = 1.0
+    if not hasattr(args_, "mooncake_num_rounds"):
+        args_.mooncake_num_rounds = 1
+    if not hasattr(args_, "served_model_name"):
+        args_.served_model_name = None
+    # Additional attrs read by request funcs that run_benchmark didn't default:
+    if not hasattr(args_, "disable_stream"):
+        args_.disable_stream = False
+    if not hasattr(args_, "disable_ignore_eos"):
+        args_.disable_ignore_eos = False
+    if not hasattr(args_, "return_routed_experts"):
+        args_.return_routed_experts = False
+    if not hasattr(args_, "profile_start_step"):
+        args_.profile_start_step = None
+    if not hasattr(args_, "profile_steps"):
+        args_.profile_steps = None
+    if not hasattr(args_, "extra_request_body"):
+        args_.extra_request_body = None
+    if not hasattr(args_, "seed"):
+        args_.seed = 0
+
+
 def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
 
-    # Set default value for max_concurrency if not present
-    if not hasattr(args, "max_concurrency"):
-        args.max_concurrency = None
-
-    # Set default value for warmup_requests if not present
-    if not hasattr(args, "warmup_requests"):
-        args.warmup_requests = 1
-
-    if not hasattr(args, "output_details"):
-        args.output_details = False
-
-    if not hasattr(args, "tokenize_prompt"):
-        args.tokenize_prompt = False
-
-    if not hasattr(args, "plot_throughput"):
-        args.plot_throughput = False
-
-    if not hasattr(args, "top_logprobs_num"):
-        args.top_logprobs_num = 0
-    if not hasattr(args, "token_ids_logprob"):
-        args.token_ids_logprob = None
-    if not hasattr(args, "logprob_start_len"):
-        args.logprob_start_len = -1
-    if not hasattr(args, "return_logprob"):
-        args.return_logprob = False
-
-    if not hasattr(args, "use_trace_timestamps"):
-        args.use_trace_timestamps = False
-    if not hasattr(args, "mooncake_slowdown_factor"):
-        args.mooncake_slowdown_factor = 1.0
-
-    if not hasattr(args, "mooncake_slowdown_factor"):
-        args.mooncake_slowdown_factor = 1.0
-
-    if not hasattr(args, "mooncake_num_rounds"):
-        args.mooncake_num_rounds = 1
-
-    if not hasattr(args, "served_model_name"):
-        args.served_model_name = None
+    _apply_arg_defaults(args)
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
