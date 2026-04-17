@@ -206,6 +206,7 @@ MODELS = {
             "--num-inference-steps=30",
             "--guidance-scale=3.0",
             "--num-gpus=2",
+            "--warmup",
         ],
     },
     # 11. Skill-only extra preset
@@ -223,6 +224,7 @@ MODELS = {
             "--num-inference-steps=30",
             "--guidance-scale=3.0",
             "--num-gpus=2",
+            "--warmup",
         ],
     },
     # 12. Skill-only extra preset
@@ -343,7 +345,7 @@ def build_sglang_cmd(
 
     if save_output:
         cmd.append("--save-output")
-    if warmup:
+    if warmup and "--warmup" not in cmd:
         cmd.append("--warmup")
     if torch_compile:
         cmd.append("--enable-torch-compile")
