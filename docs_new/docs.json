@@ -287,6 +287,7 @@
                   {
                     "group": "Qwen",
                     "pages": [
+                      "cookbook/autoregressive/Qwen/Qwen3.6",
                       "cookbook/autoregressive/Qwen/Qwen3.5",
                       "cookbook/autoregressive/Qwen/Qwen3",
                       "cookbook/autoregressive/Qwen/Qwen3-Next",

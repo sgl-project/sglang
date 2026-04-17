@@ -113,6 +113,15 @@ export const Qwen35Deployment = () => {
       getDynamicItems: (currentValues) => {
         const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
         const isAmdGpu = amdGpus.includes(currentValues.hardware);
+        const mtpEnabled = currentValues.speculative === 'enabled';
+
+        // MTP requires V2 mamba radix cache
+        if (mtpEnabled && !isAmdGpu) {
+          return [
+            { id: 'v1', label: 'V1', default: false, disabled: true },
+            { id: 'v2', label: 'V2', default: true }
+          ];
+        }
 
         // Show V2 as disabled for AMD GPUs (V2 requires FLA backend, NVIDIA only)
         if (isAmdGpu) {
@@ -293,8 +302,9 @@ export const Qwen35Deployment = () => {
     }
 
     // Force Mamba V1 for AMD GPUs (V2 requires FLA backend)
+    // Force Mamba V2 when MTP is enabled
     const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
-    const actualMambaCache = amdGpus.includes(hardware) ? 'v1' : mambaCache;
+    const actualMambaCache = amdGpus.includes(hardware) ? 'v1' : (speculative === 'enabled' ? 'v2' : mambaCache);
 
     // Apply commandRules from options (reasoning, toolcall, speculative, mambaCache)
     // Skip quantization and model (handled via model name)
@@ -302,7 +312,7 @@ export const Qwen35Deployment = () => {
       reasoning: (value) => value === 'enabled' ? '--reasoning-parser qwen3' : null,
       toolcall: (value) => value === 'enabled' ? '--tool-call-parser qwen3_coder' : null,
       speculative: (value) => value === 'enabled' ? '--speculative-algorithm EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
-      mambaCache: (value) => value === 'v2' ? '--mamba-scheduler-strategy extra_buffer \\\n  --page-size 64' : null,
+      mambaCache: (value) => value === 'v2' ? '--mamba-scheduler-strategy extra_buffer' : null,
     };
 
     // Iterate options in order, applying commandRules
