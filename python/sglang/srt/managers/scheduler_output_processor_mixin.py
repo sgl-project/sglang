@@ -449,7 +449,20 @@ class SchedulerOutputProcessorMixin:
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             else:
-                req.output_ids.extend(next_token_id)
+                # Check stop conditions per-token so that tail_str() window can catch stop strings that appear in the middle of the accepted sequence (not just the last token) in spec v2.
+                kept_token_ids = []
+                for tok in next_token_id:
+                    req.output_ids.append(tok)
+                    kept_token_ids.append(tok)
+                    req.check_finished()
+                    if req.finished():
+                        break
+                dropped_cnt = len(next_token_id) - len(kept_token_ids)
+                if dropped_cnt > 0:
+                    # _resolve_spec_overlap_token_ids has already advanced kv_committed_len by the full accept_lens.
+                    # If we stop early, roll back the tail tokens that are not kept. Otherwise memory leaks.
+                    req.kv_committed_len -= dropped_cnt
+                next_token_id = kept_token_ids
                 new_accepted_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
@@ -457,7 +470,9 @@ class SchedulerOutputProcessorMixin:
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
-            req.check_finished(new_accepted_len)
+            if batch.spec_algorithm.is_none():
+                req.check_finished(new_accepted_len)
+            # else: already called check_finished per-token in the loop above
 
             self._handle_finished_req(req, i, logits_output)
 
