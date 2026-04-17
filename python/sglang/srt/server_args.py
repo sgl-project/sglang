@@ -1004,7 +1004,7 @@ class ServerArgs:
         # Native gRPC flags — env-only for now, not exposed as CLI args.
         # Set as instance attributes (not dataclass fields) to avoid
         # argparse namespace lookup in from_cli_args.
-        self.disable_grpc = envs.SGLANG_DISABLE_GRPC.get()
+        self.enable_grpc = envs.SGLANG_ENABLE_GRPC.get()
 
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
         self.grpc_port = (
@@ -6646,7 +6646,7 @@ class ServerArgs:
             )
 
         if (
-            not self.disable_grpc
+            self.enable_grpc
             and self.grpc_port is not None
             and self.grpc_port == self.port
         ):

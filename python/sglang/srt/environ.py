@@ -514,7 +514,7 @@ class Envs:
 
     # Native gRPC server (internal, not yet user-facing)
     SGLANG_GRPC_PORT = EnvInt(None)
-    SGLANG_DISABLE_GRPC = EnvBool(False)
+    SGLANG_ENABLE_GRPC = EnvBool(False)
 
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")

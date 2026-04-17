@@ -28,7 +28,7 @@ def run_server(server_args):
             launch_server(server_args)
     elif server_args.grpc_mode:
         # TODO: Once the native Rust gRPC server starts alongside HTTP in the
-        # default path below (controlled by SGLANG_DISABLE_GRPC / SGLANG_GRPC_PORT),
+        # default path below (controlled by SGLANG_ENABLE_GRPC / SGLANG_GRPC_PORT),
         # remove this legacy SMG path and the grpc_mode flag.
         from sglang.srt.entrypoints.grpc_server import serve_grpc
 
