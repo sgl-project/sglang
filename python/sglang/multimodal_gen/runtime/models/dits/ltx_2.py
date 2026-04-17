@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.common import is_torch_compiling
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -381,21 +382,10 @@ def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
     return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
 
 
-def _ltx2_is_torch_compiling() -> bool:
-    try:
-        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
-            return bool(torch.compiler.is_compiling())
-        if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "is_compiling"):
-            return bool(torch._dynamo.is_compiling())
-    except Exception:
-        return False
-    return False
-
-
 def _ltx2_can_use_custom_modulation_kernel(x: torch.Tensor) -> bool:
     # Under torch.compile, keep the raw PyTorch expression visible so Inductor can
     # fuse modulation into the surrounding graph instead of calling small kernels.
-    return x.is_cuda and not _ltx2_is_torch_compiling()
+    return x.is_cuda and not is_torch_compiling()
 
 
 def _ltx2_can_use_fused_norm(x: torch.Tensor) -> bool:

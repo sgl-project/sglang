@@ -18,6 +18,26 @@ import zmq
 logger = logging.getLogger(__name__)
 
 
+def is_torch_compiling() -> bool:
+    try:
+        compiler = getattr(torch, "compiler", None)
+        if compiler is not None:
+            is_compiling = getattr(compiler, "is_compiling", None)
+            if is_compiling is not None and bool(is_compiling()):
+                return True
+            is_dynamo_compiling = getattr(compiler, "is_dynamo_compiling", None)
+            if is_dynamo_compiling is not None and bool(is_dynamo_compiling()):
+                return True
+
+        dynamo = getattr(torch, "_dynamo", None)
+        is_compiling = getattr(dynamo, "is_compiling", None)
+        if is_compiling is not None and bool(is_compiling()):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
