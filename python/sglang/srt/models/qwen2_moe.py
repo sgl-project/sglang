@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.parallel_state import get_moe_tensor_parallel_rank
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -70,6 +71,7 @@ from sglang.srt.layers.moe.utils import (
     get_shared_expert_tp_params,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -87,8 +89,6 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.distributed.parallel_state import get_moe_tensor_parallel_rank
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -293,7 +293,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 and quant_config.is_mxfp4_moe()
             )
             _first_idle_rank = (
-                get_mxfp4_first_idle_rank(_inter_per_rank, self.tp_size, is_aiter_moe=True)
+                get_mxfp4_first_idle_rank(
+                    _inter_per_rank, self.tp_size, is_aiter_moe=True
+                )
                 if _is_mxfp4
                 else self.tp_size
             )
