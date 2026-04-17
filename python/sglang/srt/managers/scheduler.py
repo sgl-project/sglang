@@ -3206,6 +3206,7 @@ class Scheduler(
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
+            self.tp_worker.clear_runtime_state()
             self.reset_metrics()
 
             if self.draft_worker:
@@ -3347,6 +3348,7 @@ class Scheduler(
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.tp_worker.cleanup_requests([req.rid])
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -3394,6 +3396,7 @@ class Scheduler(
                         self.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )
+                        self.tp_worker.cleanup_requests([decode_req.rid])
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted

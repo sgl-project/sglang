@@ -64,11 +64,17 @@ class MlxTpModelWorker(TpModelWorker):
             model_path=self.server_args.model_path,
             trust_remote_code=self.server_args.trust_remote_code,
         )
-        self._mlx_active_rids: set[str] = set()
 
     def get_pad_input_ids_func(self):
         """Override since the stub ModelRunner has no real model."""
         return None
+
+    def cleanup_requests(self, req_ids: list[str]):
+        for req_id in req_ids:
+            self._mlx_runner.remove_request(req_id)
+
+    def clear_runtime_state(self):
+        self._mlx_runner.clear()
 
     def forward_batch_generation(
         self,
@@ -111,13 +117,9 @@ class MlxTpModelWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
 
-        # Auto-cleanup: remove MLX state for requests no longer in the batch
-        current_rids = {req.rid for req in reqs}
-        stale_rids = self._mlx_active_rids - current_rids
-        for rid in stale_rids:
-            self._mlx_runner.remove_request(rid)
-        self._mlx_active_rids = current_rids
-
+        # A request can legitimately disappear from one scheduler batch and
+        # reappear in a later decode batch, so batch membership is not a safe
+        # signal for tearing down MLX request state.
         next_token_ids_list = []
 
         if forward_mode.is_extend():
