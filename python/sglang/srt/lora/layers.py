@@ -70,6 +70,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_backend)
         self.weight = base_layer.weight
+        self.num_embeddings = base_layer.num_embeddings
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
 
