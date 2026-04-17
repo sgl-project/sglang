@@ -384,6 +384,7 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_kv_connector = server_args.kv_connector_cls is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -874,6 +875,44 @@ class Scheduler(
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
                 self.tree_cache = MambaRadixCache(params)
+            elif server_args.kv_connector_cls is not None:
+                import importlib
+
+                from sglang.srt.mem_cache.extended_radix_cache import (
+                    ExtendedRadixCache,
+                )
+                from sglang.srt.mem_cache.kv_connector import BaseKVConnector
+
+                # module_path, class_name = server_args.kv_connector_cls.rsplit(".", 1)
+                _KV_CONNECTOR_ALIASES = {
+                    "flexkv": "sglang.srt.mem_cache.storage.flexkv.flexkv_connector.FlexKVConnector",
+                }
+                connector_cls_path = _KV_CONNECTOR_ALIASES.get(
+                    server_args.kv_connector_cls, server_args.kv_connector_cls
+                )
+                module_path, class_name = connector_cls_path.rsplit(".", 1)
+                module = importlib.import_module(module_path)
+                connector_cls = getattr(module, class_name)
+                if not issubclass(connector_cls, BaseKVConnector):
+                    raise TypeError(
+                        f"Connector class {class_name} must inherit from "
+                        "sglang.srt.mem_cache.kv_connector.BaseKVConnector"
+                    )
+                connector = connector_cls(
+                    params=params,
+                    server_args=server_args,
+                    tp_group=self.tp_group,
+                    tp_rank=self.tp_rank,
+                    kvcache=params.token_to_kv_pool_allocator.get_kvcache(),
+                )
+                self.tree_cache = ExtendedRadixCache(
+                    params=params,
+                    connector=connector,
+                )
+                if self.tree_cache.layer_done_counter is not None:
+                    self.tp_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.layer_done_counter
+                    )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
                     LMCRadixCache,
@@ -2052,6 +2091,8 @@ class Scheduler(
                     last_hash,
                     prefix_keys,
                 )
+        elif self.enable_kv_connector:
+            self.tree_cache.prefetch(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -2128,7 +2169,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hicache_storage:
+                if self.enable_hicache_storage or self.enable_kv_connector:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
@@ -2160,7 +2201,7 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
+                if self.enable_hicache_storage or self.enable_kv_connector:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
                 self.send_to_tokenizer.send_output(
@@ -2392,6 +2433,7 @@ class Scheduler(
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
+                self.running_batch.batch_is_full = False
                 ret = None
 
         # Handle DP attention and log stats
@@ -2438,8 +2480,8 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+        if self.enable_hierarchical_cache or self.enable_kv_connector:
+            self.tree_cache.check_kv_events()
 
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -2541,7 +2583,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_kv_connector:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
@@ -2617,7 +2659,7 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_kv_connector:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -2672,7 +2714,7 @@ class Scheduler(
 
         # Eagerly release lock_ref on completed write-through nodes so they
         # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_kv_connector:
             self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory
@@ -3326,7 +3368,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_kv_connector:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
