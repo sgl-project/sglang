@@ -46,6 +46,13 @@ _LANG_PREFIX_RE = re.compile(r"^" + _LANG_PREFIX)
 # the FSM emits exactly one of the two at position 2).
 _FUSED_SENTINELS = ("<|notimestamps|>", "<|0.00|>")
 
+# Matches any Whisper special token (``<|...|>``). Used to scrub trailing
+# ``<|endoftext|>`` and embedded ``<|X.XX|>`` timestamp tokens from the
+# user-visible text in fused-autodetect responses, where
+# ``skip_special_tokens=False`` is needed to preserve the language prefix
+# for parsing but would otherwise leak other special tokens downstream.
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]+\|>")
+
 
 @register_transcription_adapter("Whisper")
 class WhisperAdapter(TranscriptionAdapter):
@@ -146,7 +153,26 @@ class WhisperAdapter(TranscriptionAdapter):
             )
             return None, text
         transcription = text[sentinel_idx + sentinel_len :]
+        # Scrub any remaining special tokens. ``skip_special_tokens=False``
+        # is set on fused requests so the language prefix survives for
+        # parsing, but that also preserves trailing ``<|endoftext|>`` and,
+        # in the timestamps variant, embedded ``<|X.XX|>`` segment tokens.
+        # Those are unwanted in the user-visible text (verbose_json gets
+        # its segments from _parse_segments over output_ids instead).
+        transcription = _SPECIAL_TOKEN_RE.sub("", transcription)
         return m.group(1), transcription.strip()
+
+    @staticmethod
+    def strip_special_tokens(text: str) -> str:
+        """Remove any ``<|...|>`` special-token strings from *text*.
+
+        Used by the streaming handler to scrub individual deltas in
+        fused-autodetect mode, where ``skip_special_tokens=False`` keeps
+        the language prefix readable at the anchor boundary but would
+        otherwise let ``<|endoftext|>`` and timestamp-variant
+        ``<|X.XX|>`` tokens leak into client-facing SSE chunks.
+        """
+        return _SPECIAL_TOKEN_RE.sub("", text)
 
     @staticmethod
     def fused_prefix_end(text: str) -> int:

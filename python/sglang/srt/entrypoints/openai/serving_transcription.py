@@ -292,6 +292,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 delta = current_text[len(stream_buffer) :]
                 stream_buffer = current_text
 
+                # In fused-autodetect mode, scrub any trailing <|endoftext|>
+                # or embedded <|X.XX|> timestamp tokens that survive into
+                # the delta (skip_special_tokens=False is required for
+                # prefix parsing but leaks later specials here).
+                if fused_mode and delta:
+                    delta = self._adapter.strip_special_tokens(delta)
+
                 # Send content delta if there's new text
                 if delta:
                     choice_data = TranscriptionStreamChoice(

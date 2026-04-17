@@ -60,6 +60,18 @@ class TranscriptionAdapter(ABC):
         """
         raise NotImplementedError
 
+    def strip_special_tokens(self, text: str) -> str:
+        """Remove model-specific special-token strings from *text*.
+
+        Called by the streaming handler in fused-autodetect mode to scrub
+        each delta. Default is an identity pass-through; adapters that
+        request generation with ``skip_special_tokens=False`` should
+        override this to strip any non-prefix specials (e.g. Whisper's
+        trailing ``<|endoftext|>`` or embedded ``<|X.XX|>`` timestamp
+        tokens) before the delta reaches the client.
+        """
+        return text
+
     # -- Standalone detection (for external callers) -----------------------
 
     def build_language_detection_params(self, tokenizer) -> dict:

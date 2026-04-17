@@ -137,16 +137,16 @@ class TestStreamingFusedAutodetect(unittest.TestCase):
 
     def test_fsm_abort_before_sentinel_flushes_tail(self):
         # Sentinel never arrives; stream terminates on finish_reason. The
-        # handler should log a warning and emit whatever raw text it has
-        # rather than swallow it silently.
+        # handler logs a warning and falls through. After the per-delta
+        # special-token scrub, a tail that contains only forced-prefix
+        # specials collapses to an empty string — no content delta is
+        # emitted, but the warning still surfaces and language stays unset.
         chunks = [
             _chunk("<|en|>"),
             _chunk("<|en|><|transcribe|>", finish="length"),
         ]
         request, frames = self._run_stream(chunks)
-        deltas = _deltas_from_sse(frames)
-        self.assertEqual(deltas, ["<|en|><|transcribe|>"])
-        # Language was never confidently extracted — do not overwrite.
+        self.assertEqual(_deltas_from_sse(frames), [])
         self.assertIsNone(request.language)
 
     def test_non_fused_stream_passes_through(self):
@@ -157,6 +157,22 @@ class TestStreamingFusedAutodetect(unittest.TestCase):
         ]
         request, frames = self._run_stream(chunks, fused=False)
         self.assertEqual(_deltas_from_sse(frames), ["Hello", " world"])
+
+    def test_trailing_endoftext_scrubbed_from_last_delta(self):
+        # skip_special_tokens=False means the detokenizer may emit
+        # <|endoftext|> at the tail. The fused streaming path must scrub it
+        # per-delta so clients never see special tokens in SSE chunks.
+        chunks = [
+            _chunk("<|en|><|transcribe|><|notimestamps|> Hello"),
+            _chunk(
+                "<|en|><|transcribe|><|notimestamps|> Hello world<|endoftext|>",
+                finish="stop",
+            ),
+        ]
+        _, frames = self._run_stream(chunks)
+        deltas = _deltas_from_sse(frames)
+        self.assertEqual(deltas, ["Hello", " world"])
+        self.assertFalse(any("<|" in d for d in deltas))
 
 
 if __name__ == "__main__":
