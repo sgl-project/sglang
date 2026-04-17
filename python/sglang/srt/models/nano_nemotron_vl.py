@@ -164,6 +164,20 @@ class NemotronH_Nano_VL_V2(EVS):
             offset += num_patches
         return torch.cat(results, dim=0)
 
+    def extract_video_feature_temporal(self, pixel_values, num_frames):
+        """Extract video features with temporal compression (tubelet grouping)."""
+        vit_embeds = self.vision_model(pixel_values, num_frames=num_frames)
+        num_tubelets = vit_embeds.shape[0]
+        patch_size = self.config.patch_size
+        h_patches = pixel_values.shape[-2] // patch_size
+        w_patches = pixel_values.shape[-1] // patch_size
+        vit_embeds = vit_embeds.reshape(num_tubelets, h_patches, w_patches, -1)
+        vit_embeds = self.pixel_shuffle(vit_embeds, self.downsample_ratio)
+        vit_embeds = vit_embeds.view(-1, self.rmsnorm_hidden_size)
+        vit_embeds = self.mlp1(vit_embeds)
+        vit_embeds = vit_embeds.view(num_tubelets, -1, self.llm_hidden_size)
+        return vit_embeds
+
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
 
@@ -212,6 +226,9 @@ class NemotronH_Nano_VL_V2(EVS):
             video_features (`torch.Tensor`): Video feature tensor of shape `(num_videos, video_length, embed_dim)`).
         """
         pixel_values = torch.cat([item.feature for item in items])
+        if getattr(self.config, "video_temporal_patch_size", 1) > 1:
+            num_frames = pixel_values.shape[0]
+            return self.extract_video_feature_temporal(pixel_values, num_frames)
         video_features = self.extract_feature(pixel_values)
         return video_features
 

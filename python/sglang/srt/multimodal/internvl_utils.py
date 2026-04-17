@@ -275,3 +275,80 @@ def compute_budgeted_image_sizes(
             per_image_max[i] = max(min_num_patches, int(current_patches * scale))
 
     return results
+
+
+def get_video_target_size_and_feature_size(
+    orig_w: int,
+    orig_h: int,
+    target_num_patches: int,
+    maintain_aspect_ratio: bool,
+    patch_size: int,
+    downsample_ratio: float,
+) -> tuple[int, int, int]:
+    """Compute target resize dimensions and post-downsample token count for video.
+
+    Single source of truth for video spatial dimensions — used by both
+    video_to_pixel_values (resize) and the processor (token counting).
+
+    Returns:
+        (target_w, target_h, feature_size) where feature_size is the
+        post-pixel-shuffle token count.
+    """
+    ds = int(1 / downsample_ratio)
+
+    if target_num_patches > 0 and maintain_aspect_ratio:
+        aspect = orig_w / max(orig_h, 1)
+        ph = math.sqrt(target_num_patches / max(aspect, 1e-6))
+        pw = ph * aspect
+        target_pw = max(ds, int(round(pw / ds)) * ds)
+        target_ph = max(ds, int(round(ph / ds)) * ds)
+    elif target_num_patches > 0:
+        side = int(math.sqrt(target_num_patches))
+        target_pw = max(ds, int(round(side / ds)) * ds)
+        target_ph = target_pw
+    else:
+        target_pw = max(ds, round(orig_w / patch_size / ds) * ds)
+        target_ph = max(ds, round(orig_h / patch_size / ds) * ds)
+
+    target_w = target_pw * patch_size
+    target_h = target_ph * patch_size
+    feature_size = (target_pw // ds) * (target_ph // ds)
+
+    return target_w, target_h, feature_size
+
+
+def video_to_pixel_values(
+    frame: Image.Image,
+    patch_size: int,
+    downsample_ratio: float,
+    target_num_patches: int,
+    maintain_aspect_ratio: bool,
+    mean: tuple[float, float, float] = IMAGENET_MEAN,
+    std: tuple[float, float, float] = IMAGENET_STD,
+) -> tuple[torch.Tensor, int]:
+    """Resize a single video frame for temporal compression pipeline.
+
+    Returns:
+        (pixel_values [1, 3, H, W], feature_size) where feature_size is
+        the post-pixel-shuffle token count.
+    """
+    orig_w, orig_h = frame.size
+    target_w, target_h, feature_size = get_video_target_size_and_feature_size(
+        orig_w,
+        orig_h,
+        target_num_patches,
+        maintain_aspect_ratio,
+        patch_size,
+        downsample_ratio,
+    )
+
+    frame = frame.convert("RGB")
+    frame = frame.resize((target_w, target_h), Image.BICUBIC)
+    transform = T.Compose(
+        [
+            T.ToTensor(),
+            T.Normalize(mean=mean, std=std),
+        ]
+    )
+    pixel_values = transform(frame).unsqueeze(0)
+    return pixel_values, feature_size

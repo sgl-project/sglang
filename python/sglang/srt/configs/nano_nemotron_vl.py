@@ -116,6 +116,20 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         self.max_num_patches = self.raw_vision_config.get("max_num_patches", 0)
         self.dynamic_resolution = self.min_num_patches > 0
 
+        # Video temporal compression: from vision_config top-level
+        self.video_temporal_patch_size = self.raw_vision_config.get(
+            "video_temporal_patch_size", 1
+        )
+        self.separate_video_embedder = self.raw_vision_config.get(
+            "separate_video_embedder", True
+        )
+        self.video_target_num_patches = self.raw_vision_config.get(
+            "video_target_num_patches", 0
+        )
+        self.video_maintain_aspect_ratio = self.raw_vision_config.get(
+            "video_maintain_aspect_ratio", True
+        )
+
     def create_radio_config(self):
         config = self.raw_vision_config
         model_name = config["args"]["model"]
@@ -130,5 +144,9 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             image_size=image_size,
             min_num_patches=self.min_num_patches,
             max_num_patches=self.max_num_patches,
+            video_temporal_patch_size=self.video_temporal_patch_size,
+            separate_video_embedder=self.separate_video_embedder,
+            video_target_num_patches=self.video_target_num_patches,
+            video_maintain_aspect_ratio=self.video_maintain_aspect_ratio,
         )
         return radio_config

@@ -121,6 +121,8 @@ class ViTPatchGenerator(nn.Module):
         register_multiple: int | None = None,
         num_registers: int | None = None,
         patch_bias: bool = False,
+        video_temporal_patch_size: int = 1,
+        separate_video_embedder: bool = True,
         device=None,
         dtype=None,
     ):
@@ -176,6 +178,17 @@ class ViTPatchGenerator(nn.Module):
             nn.LayerNorm(embed_dim) if normalize_patches else nn.Identity()
         )
 
+        self.video_temporal_patch_size = video_temporal_patch_size
+        self.video_embedder = None
+        self._video_embedder_loaded = False
+        if video_temporal_patch_size > 1 and separate_video_embedder:
+            self.video_embedder = nn.Linear(
+                3 * video_temporal_patch_size * patch_size * patch_size,
+                embed_dim,
+                bias=False,
+                **factory,
+            )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         patches = self.embed_patches(x)
         patches, pos_enc = self.apply_pos_enc(patches, input_size=x.shape[2:])
@@ -183,6 +196,40 @@ class ViTPatchGenerator(nn.Module):
         patches = self.patch_normalizer(patches)
         if self.return_pos_enc:
             return patches, pos_enc
+        return patches
+
+    def forward_video(self, x: torch.Tensor, temporal_patch_size: int) -> torch.Tensor:
+        """Embed video frames with temporal compression via tubelet grouping."""
+        assert (
+            self.video_embedder is not None
+        ), "video_embedder is required for temporal compression"
+        T = temporal_patch_size
+        num_frames = x.shape[0]
+
+        if num_frames % T != 0:
+            pad = T - (num_frames % T)
+            x = torch.cat(
+                [x, x[-1:].expand(pad, -1, -1, -1)],
+                dim=0,
+            )
+
+        padded_frames = x.shape[0]
+        num_tubelets = padded_frames // T
+
+        patches = self.im_to_patches(x)
+        num_spatial = patches.shape[1]
+        feat_dim = patches.shape[2]
+
+        patches = patches.reshape(num_tubelets, T, num_spatial, feat_dim)
+        patches = patches.permute(0, 2, 1, 3).reshape(
+            num_tubelets, num_spatial, T * feat_dim
+        )
+
+        patches = self.video_embedder(patches)
+
+        patches, _ = self.apply_pos_enc(patches, input_size=x.shape[2:])
+        patches = self.cls_token(patches)
+        patches = self.patch_normalizer(patches)
         return patches
 
     @property
@@ -392,6 +439,9 @@ class RadioInternVisionModel(nn.Module):
         max_img_size = int(
             round(config.max_img_size / config.patch_size) * config.patch_size
         )
+        video_temporal_patch_size = getattr(config, "video_temporal_patch_size", 1)
+        separate_video_embedder = getattr(config, "separate_video_embedder", True)
+
         self.patch_generator = ViTPatchGenerator(
             config.patch_size,
             config.hidden_size,
@@ -399,6 +449,8 @@ class RadioInternVisionModel(nn.Module):
             max_input_dims=max_img_size,
             cls_token=True,
             register_multiple=config.reg_tokens,
+            video_temporal_patch_size=video_temporal_patch_size,
+            separate_video_embedder=separate_video_embedder,
         )
 
         self.encoder = InternVisionEncoder(config=config, quant_config=quant_config)
@@ -443,7 +495,13 @@ class RadioModel(nn.Module):
     def forward(
         self,
         pixel_values: torch.Tensor | list[torch.Tensor] | None = None,
+        num_frames: int | None = None,
     ) -> torch.FloatTensor:
+        if (
+            num_frames is not None
+            and getattr(self.config, "video_temporal_patch_size", 1) > 1
+        ):
+            return self._forward_video_temporal(pixel_values, num_frames)
         if isinstance(pixel_values, list):
             return self._forward_dynamic(pixel_values)
         y = self.model(pixel_values)
@@ -483,6 +541,32 @@ class RadioModel(nn.Module):
             num_patches_list,
         )
 
+    def _forward_video_temporal(
+        self, pixel_values: torch.Tensor, num_frames: int
+    ) -> torch.Tensor:
+        """Process video frames with temporal compression (tubelet grouping)."""
+        T = self.config.video_temporal_patch_size
+        patch_gen = self.model.patch_generator
+
+        patches = patch_gen.forward_video(pixel_values, T)
+        num_tubelets = patches.shape[0]
+        seq_per_tubelet = patches.shape[1]
+
+        cu_seqlens = torch.arange(
+            0,
+            (num_tubelets + 1) * seq_per_tubelet,
+            seq_per_tubelet,
+            dtype=torch.int32,
+            device=patches.device,
+        )
+        packed = patches.reshape(1, -1, patches.shape[-1])
+
+        out = self.model.encoder.forward(inputs_embeds=packed, cu_seqlens=cu_seqlens)
+        features = out.last_hidden_state.reshape(num_tubelets, seq_per_tubelet, -1)
+
+        num_skip = patch_gen.num_skip
+        return features[:, num_skip:]
+
     def load_weights(self, weights) -> set[str]:
         remap_substrings = {
             "attn": "attn.attn",
@@ -512,6 +596,8 @@ class RadioModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, weight)
                 loaded_params.add(name)
+                if "video_embedder" in name:
+                    self.model.patch_generator._video_embedder_loaded = True
 
         return loaded_params
 
