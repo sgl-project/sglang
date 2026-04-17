@@ -45,7 +45,11 @@ class PrefillStagingContext:
     watermark_cv: threading.Condition = dataclasses.field(
         default_factory=threading.Condition
     )
+    # (room, chunk_idx, session_id) keys for chunks already requested.
     prefetch_requested: set = dataclasses.field(default_factory=set)
+    # Rooms that have already had their full prefetch fan-out triggered. Used
+    # to short-circuit per-room prefetch entry on every chunk after the first.
+    prefetched_rooms: set = dataclasses.field(default_factory=set)
     prefetch_sockets: dict = dataclasses.field(default_factory=dict)
 
 
@@ -793,8 +797,9 @@ def prefetch_staging_reqs(
     full_chunk_pages = max(1, cps // page_size)
 
     for session_id, tinfo in transfer_infos[room].items():
-        _is_dummy = tinfo.is_dummy() if callable(tinfo.is_dummy) else tinfo.is_dummy
-        if _is_dummy:
+        # Both mooncake (dataclass field) and NIXL (@property) expose is_dummy
+        # as a plain attribute, so a single attribute access works for either.
+        if tinfo.is_dummy:
             continue
         total_pages = len(tinfo.dst_kv_indices)
         if total_pages == 0:
