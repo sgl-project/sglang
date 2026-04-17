@@ -51,9 +51,7 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_hip_external_llmm1_enabled = (
-    get_bool_env_var("SGLANG_HIP_EXTERNAL_LLMM1") and _is_hip
-)
+_hip_external_llmm1_enabled = get_bool_env_var("SGLANG_HIP_EXTERNAL_LLMM1") and _is_hip
 _hip_external_llmm1_rows_per_block = int(
     os.getenv("SGLANG_HIP_EXTERNAL_LLMM1_ROWS_PER_BLOCK", "2")
 )
