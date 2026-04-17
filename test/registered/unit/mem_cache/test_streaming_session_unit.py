@@ -69,8 +69,7 @@ class _FakeReq:
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
         self.mamba_pool_idx = None
-        self.mamba_ping_pong_track_buffer = None
-        self.mamba_next_track_idx = None
+        self.pending_radix_mamba_slot = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.pop_overallocated_calls = 0

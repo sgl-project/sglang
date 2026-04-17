@@ -270,8 +270,10 @@ class TreeComponent(ABC):
         return int >= 0 for effective cache length.
         - Full: no-op, returns None.
         - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
-        - Mamba: prepares mamba_value (finished from ping-pong buffer,
-          unfinished fork from req); returns mamba_last_track_seqlen."""
+        - Mamba: prepares mamba_value by transferring ownership of
+          req.pending_radix_mamba_slot to the insert (both finished and
+          unfinished paths with enable_mamba_extra_buffer); returns
+          mamba_last_track_seqlen."""
         return None
 
     def cleanup_after_caching_req(

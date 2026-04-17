@@ -202,30 +202,44 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-                mamba_value = (
-                    req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
-                )
-            else:
-                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+                if req.pending_radix_mamba_slot is not None:
+                    # The track kernel already wrote the snapshot into the
+                    # pending slot; transfer ownership to the tree (zero-copy).
+                    mamba_value = req.pending_radix_mamba_slot.clone()
+                    req.pending_radix_mamba_slot = None
+                    insert_params.mamba_value = mamba_value
+                    return cache_len
+                # No pending slot available (producer-side alloc did not
+                # succeed under mamba pool pressure). Returning 0 causes
+                # cache_finished_req to free kv beyond cache_protected_len
+                # and issue an empty-key insert, which _insert_helper
+                # short-circuits — no tree nodes created.
+                return 0
+            mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
             insert_params.mamba_value = mamba_value
             return cache_len
         else:
             if cache_len is None:
                 return 0
             if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-                mamba_value = (
-                    req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
-                )
-            else:
-                mamba_value = self.cache.req_to_token_pool.get_mamba_indices(
-                    req.req_pool_idx
-                ).unsqueeze(-1)
+                if req.pending_radix_mamba_slot is None:
+                    # No pending slot available; skip this caching round.
+                    # Returning 0 takes the effective_cache_len<=0 branch
+                    # in unified_radix_cache.cache_unfinished_req: it
+                    # preserves prefix_indices and invokes cleanup, which
+                    # retries producer-side alloc for the next round.
+                    return 0
+                # The track kernel already wrote the snapshot into the
+                # pending slot; transfer ownership to the tree (zero-copy,
+                # in contrast to the fork_from path below).
+                mamba_value = req.pending_radix_mamba_slot.clone()
+                req.pending_radix_mamba_slot = None
+                insert_params.mamba_value = mamba_value
+                return cache_len
+            # enable_mamba_extra_buffer=False: legacy fork_from path.
+            mamba_value = self.cache.req_to_token_pool.get_mamba_indices(
+                req.req_pool_idx
+            ).unsqueeze(-1)
             mamba_value_forked = self.cache.req_to_token_pool.mamba_pool.fork_from(
                 mamba_value
             )
@@ -249,22 +263,33 @@ class MambaComponent(TreeComponent):
             mamba_exist = (
                 insert_result.mamba_exist if insert_result is not None else True
             )
-            if self.enable_mamba_extra_buffer:
-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-            else:
-                keep_idx = None
-            if mamba_exist:
-                keep_idx = None
+            if mamba_exist and self.enable_mamba_extra_buffer:
+                # Tree already holds mamba state for this prefix (or the
+                # insert was a no-op); the pre-allocated pending slot is
+                # no longer needed.
+                if req.pending_radix_mamba_slot is not None:
+                    self.cache.req_to_token_pool.mamba_pool.free(
+                        req.pending_radix_mamba_slot
+                    )
+                    req.pending_radix_mamba_slot = None
             free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
             if free_mamba_cache:
-                self.cache.req_to_token_pool.free_mamba_cache(
-                    req, mamba_ping_pong_track_buffer_to_keep=keep_idx
-                )
+                # Frees the working slot and any remaining pending slot.
+                self.cache.req_to_token_pool.free_mamba_cache(req)
         else:
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
             ):
                 self.cache.req_to_token_pool.mamba_pool.free(insert_params.mamba_value)
             req.mamba_last_track_seqlen = None
+            # Producer-side: pre-allocate the next pending slot off the
+            # forward hot path so the next track interval can write into it
+            # directly. Evict once on failure; leave as None if the pool
+            # remains exhausted (tracking will be skipped for that interval).
+            if self.enable_mamba_extra_buffer and req.pending_radix_mamba_slot is None:
+                pending = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                if pending is None:
+                    self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    pending = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                if pending is not None:
+                    req.pending_radix_mamba_slot = pending
