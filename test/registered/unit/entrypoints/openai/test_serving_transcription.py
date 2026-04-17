@@ -48,7 +48,9 @@ class _MockTokenizerManager:
         self.model_config.hf_config = Mock()
         self.model_config.hf_config.architectures = ["WhisperForConditionalGeneration"]
         # Not a real ServerArgs, so base class sets allowed_custom_labels=None.
-        self.server_args = Mock()
+        # Default tests assume cumulative-text streaming (the sglang upstream
+        # default); tests for incremental_streaming_output=True override this.
+        self.server_args = Mock(incremental_streaming_output=False)
         self.tokenizer = Mock()
         self._stream_chunks = stream_chunks
 
@@ -255,6 +257,68 @@ class TestStreamingFusedAutodetect(unittest.TestCase):
         deltas = _deltas_from_sse(frames)
         self.assertEqual(deltas, ["Hello", " world"])
         self.assertFalse(any("<|" in d for d in deltas))
+
+
+class TestStreamingIncrementalOutputMode(unittest.TestCase):
+    """incremental_streaming_output=True: ``content["text"]`` is the per-chunk
+    delta, not cumulative. The handler must accumulate locally.
+
+    Without that, the slice ``current_text[len(stream_buffer):]`` double-strips
+    every chunk (consumed by e.g. sglang.private's sampling client, which
+    overrides the flag to True). Repro from bench_sglang.py at c=64 on
+    whisper-large-v3: detokenizer EMITs ``' The' ' President' ':' ...`` but
+    SSE deltas come out as ``' The' 'sident' 'Thank' ...`` — WER 99%+.
+    """
+
+    def _run_incremental_stream(self, chunk_deltas, fused=False):
+        """Server in incremental mode: yield per-chunk delta, not cumulative."""
+        chunks = [
+            _chunk(d, finish=("stop" if i == len(chunk_deltas) - 1 else None))
+            for i, d in enumerate(chunk_deltas)
+        ]
+        tm = _MockTokenizerManager(chunks)
+        tm.server_args = Mock(incremental_streaming_output=True)
+        serving = OpenAIServingTranscription(tm)
+
+        request = TranscriptionRequest(model="whisper", stream=True)
+        if fused:
+            request._fused_autodetect = True
+        adapted = GenerateReqInput(text="", modalities=["audio"])
+
+        async def drive():
+            frames = []
+            async for f in serving._generate_transcription_stream(
+                adapted, request, Mock()
+            ):
+                frames.append(f)
+            return frames
+
+        return request, get_or_create_event_loop().run_until_complete(drive())
+
+    def test_incremental_non_fused_emits_each_delta_verbatim(self):
+        # sglang.private default: each content["text"] IS the new delta, so
+        # the handler should NOT slice it. Client should see exactly what
+        # the detokenizer emitted.
+        deltas_in = [" The", " President", ":", " Thank", " you"]
+        _, frames = self._run_incremental_stream(deltas_in, fused=False)
+        self.assertEqual(_deltas_from_sse(frames), deltas_in)
+
+    def test_incremental_fused_autodetect_still_strips_prefix(self):
+        # Incremental + fused: the handler must accumulate to find the
+        # sentinel, then emit only the post-prefix portion per chunk.
+        deltas_in = [
+            "<|en|>",
+            "<|transcribe|>",
+            "<|notimestamps|>",
+            " Hello",
+            " world",
+        ]
+        request, frames = self._run_incremental_stream(deltas_in, fused=True)
+        emitted = _deltas_from_sse(frames)
+        # Prefix never leaks, and concat matches the expected transcription.
+        self.assertFalse(any("<|" in d for d in emitted))
+        self.assertEqual("".join(emitted), "Hello world")
+        self.assertEqual(request.language, "en")
 
 
 if __name__ == "__main__":

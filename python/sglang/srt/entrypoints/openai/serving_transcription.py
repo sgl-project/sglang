@@ -259,6 +259,17 @@ class OpenAIServingTranscription(OpenAIServingBase):
         visible_buffer = ""
 
         fused_mode = getattr(request, "_fused_autodetect", False)
+        # When ``incremental_streaming_output`` is enabled, each chunk's
+        # ``content["text"]`` is the new delta from the detokenizer, not
+        # the cumulative text. Always reconstruct cumulative text locally
+        # so the rest of the loop (prefix parse + visible-buffer slice)
+        # works uniformly under either mode.
+        incremental = getattr(
+            self.tokenizer_manager.server_args,
+            "incremental_streaming_output",
+            False,
+        )
+        cumulative_text = ""
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -267,10 +278,14 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 finish_reason = content["meta_info"]["finish_reason"]
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
-                current_text = content.get("text", "")
+                chunk_text = content.get("text", "")
+                if incremental:
+                    cumulative_text += chunk_text
+                else:
+                    cumulative_text = chunk_text
 
                 if fused_mode:
-                    lang, visible = self._adapter.parse_fused_output(current_text)
+                    lang, visible = self._adapter.parse_fused_output(cumulative_text)
                     if visible is None:
                         # Prefix not yet locatable. Keep buffering unless
                         # the stream has ended, in which case do a
@@ -281,12 +296,12 @@ class OpenAIServingTranscription(OpenAIServingBase):
                             "Fused auto-detect stream finished before prefix "
                             "was parseable; emitting scrubbed raw tail."
                         )
-                        visible = self._adapter.strip_special_tokens(current_text)
+                        visible = self._adapter.strip_special_tokens(cumulative_text)
                     elif lang is not None and request.language is None:
                         request.language = lang
                         logger.info("Auto-detected language: '%s'", lang)
                 else:
-                    visible = current_text
+                    visible = cumulative_text
 
                 delta = visible[len(visible_buffer) :]
                 visible_buffer = visible
