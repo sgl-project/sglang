@@ -1,6 +1,4 @@
 import copy
-import os
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -21,7 +19,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
 
@@ -54,21 +51,6 @@ class LTX2DenoisingStage(DenoisingStage):
     def __init__(self, transformer, scheduler, vae=None, **kwargs):
         super().__init__(
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
-        )
-
-    @staticmethod
-    def _ltx_perf_context(stage_name: str, batch: Req):
-        enabled = (
-            batch.perf_dump_path is not None
-            or os.environ.get("SGLANG_LTX_PROFILE_HOTSPOTS", "0") == "1"
-        )
-        if not enabled:
-            return nullcontext()
-        return StageProfiler(
-            stage_name,
-            logger=logger,
-            metrics=batch.metrics,
-            perf_dump_path_provided=True,
         )
 
     @staticmethod
@@ -433,11 +415,10 @@ class LTX2DenoisingStage(DenoisingStage):
         self, ctx: LTX2DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Reset the mirrored audio scheduler before the shared loop begins."""
-        with self._ltx_perf_context("LTX2BeforeDenoisingLoop", batch):
-            super()._before_denoising_loop(ctx, batch, server_args)
-            if ctx.audio_scheduler is None:
-                raise ValueError("LTX-2 audio scheduler was not prepared.")
-            ctx.audio_scheduler.set_begin_index(0)
+        super()._before_denoising_loop(ctx, batch, server_args)
+        if ctx.audio_scheduler is None:
+            raise ValueError("LTX-2 audio scheduler was not prepared.")
+        ctx.audio_scheduler.set_begin_index(0)
 
     def _prepare_step_attn_metadata(
         self,
@@ -696,49 +677,43 @@ class LTX2DenoisingStage(DenoisingStage):
                         v2a_cross_attention_mask, cfg_batch_size
                     )
 
-            first_step_forward_context = (
-                self._ltx_perf_context("LTX2FirstStepForward", batch)
-                if step.step_index == 0
-                else nullcontext()
-            )
-            with first_step_forward_context:
-                with set_forward_context(
-                    current_timestep=step.step_index, attn_metadata=step.attn_metadata
-                ):
-                    model_video, model_audio = step.current_model(
-                        **build_model_kwargs(
-                            encoder_hidden_states=encoder_hidden_states,
-                            audio_encoder_hidden_states=audio_encoder_hidden_states,
-                            encoder_attention_mask=encoder_attention_mask,
-                        )
+            with set_forward_context(
+                current_timestep=step.step_index, attn_metadata=step.attn_metadata
+            ):
+                model_video, model_audio = step.current_model(
+                    **build_model_kwargs(
+                        encoder_hidden_states=encoder_hidden_states,
+                        audio_encoder_hidden_states=audio_encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
                     )
-
-                model_video = model_video.float()
-                model_audio = model_audio.float()
-                if batch.do_classifier_free_guidance:
-                    model_video_uncond, model_video_text = model_video.chunk(2)
-                    model_audio_uncond, model_audio_text = model_audio.chunk(2)
-                    model_video = model_video_uncond + (
-                        batch.guidance_scale * (model_video_text - model_video_uncond)
-                    )
-                    model_audio = model_audio_uncond + (
-                        batch.guidance_scale * (model_audio_text - model_audio_uncond)
-                    )
-
-                ctx.latents = self.scheduler.step(
-                    model_video, step.t_device, ctx.latents, return_dict=False
-                )[0]
-                ctx.audio_latents = ctx.audio_scheduler.step(
-                    model_audio, step.t_device, ctx.audio_latents, return_dict=False
-                )[0]
-                if ctx.denoise_mask is not None and ctx.clean_latent is not None:
-                    ctx.latents = (
-                        ctx.latents.float() * ctx.denoise_mask
-                        + ctx.clean_latent.float() * (1.0 - ctx.denoise_mask)
-                    ).to(dtype=ctx.latents.dtype)
-                ctx.latents = self.post_forward_for_ti2v_task(
-                    batch, server_args, ctx.reserved_frames_mask, ctx.latents, ctx.z
                 )
+
+            model_video = model_video.float()
+            model_audio = model_audio.float()
+            if batch.do_classifier_free_guidance:
+                model_video_uncond, model_video_text = model_video.chunk(2)
+                model_audio_uncond, model_audio_text = model_audio.chunk(2)
+                model_video = model_video_uncond + (
+                    batch.guidance_scale * (model_video_text - model_video_uncond)
+                )
+                model_audio = model_audio_uncond + (
+                    batch.guidance_scale * (model_audio_text - model_audio_uncond)
+                )
+
+            ctx.latents = self.scheduler.step(
+                model_video, step.t_device, ctx.latents, return_dict=False
+            )[0]
+            ctx.audio_latents = ctx.audio_scheduler.step(
+                model_audio, step.t_device, ctx.audio_latents, return_dict=False
+            )[0]
+            if ctx.denoise_mask is not None and ctx.clean_latent is not None:
+                ctx.latents = (
+                    ctx.latents.float() * ctx.denoise_mask
+                    + ctx.clean_latent.float() * (1.0 - ctx.denoise_mask)
+                ).to(dtype=ctx.latents.dtype)
+            ctx.latents = self.post_forward_for_ti2v_task(
+                batch, server_args, ctx.reserved_frames_mask, ctx.latents, ctx.z
+            )
             return
 
         encoder_hidden_states = batch.prompt_embeds[0]
