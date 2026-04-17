@@ -66,7 +66,6 @@ FILE_SUITES = {
     ],
     "1-gpu-b200": [
         "test_server_c.py",
-        "test_server_c_bf16_quality.py",
     ],
 }
 

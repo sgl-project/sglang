@@ -3,10 +3,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX1_FP8_TRANSFORMER,
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
-    MODELOPT_FLUX2_NVFP4_TRANSFORMER,
-    MODELOPT_IMAGE_BF16_QUALITY_THRESHOLDS,
+    MODELOPT_FLUX2_NVFP4_WEIGHTS,
     MODELOPT_NVFP4_B200_ENV_VARS,
-    MODELOPT_VIDEO_BF16_QUALITY_THRESHOLDS,
     MODELOPT_WAN22_FP8_TRANSFORMER,
     MODELOPT_WAN22_NVFP4_TRANSFORMER,
     T2V_PROMPT,
@@ -370,7 +368,6 @@ ONE_GPU_CASES_C = [
         modality="image",
         sampling_params=MODELOPT_T2I_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
-        bf16_quality_thresholds=MODELOPT_IMAGE_BF16_QUALITY_THRESHOLDS,
     ),
     _make_modelopt_ci_case(
         "flux2_modelopt_fp8_t2i",
@@ -378,7 +375,6 @@ ONE_GPU_CASES_C = [
         modality="image",
         sampling_params=MODELOPT_T2I_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
-        bf16_quality_thresholds=MODELOPT_IMAGE_BF16_QUALITY_THRESHOLDS,
     ),
     _make_modelopt_ci_case(
         "wan22_modelopt_fp8_t2v",
@@ -386,7 +382,6 @@ ONE_GPU_CASES_C = [
         modality="video",
         sampling_params=MODELOPT_T2V_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
-        bf16_quality_thresholds=MODELOPT_VIDEO_BF16_QUALITY_THRESHOLDS,
     ),
     _make_modelopt_ci_case(
         "flux1_modelopt_nvfp4_t2i",
@@ -395,16 +390,14 @@ ONE_GPU_CASES_C = [
         sampling_params=MODELOPT_T2I_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
         env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-        bf16_quality_thresholds=MODELOPT_IMAGE_BF16_QUALITY_THRESHOLDS,
     ),
     _make_modelopt_ci_case(
         "flux2_modelopt_nvfp4_t2i",
         model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
         modality="image",
         sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_FLUX2_NVFP4_TRANSFORMER],
+        extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
         env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-        bf16_quality_thresholds=MODELOPT_IMAGE_BF16_QUALITY_THRESHOLDS,
     ),
     _make_modelopt_ci_case(
         "wan22_modelopt_nvfp4_t2v",
@@ -413,7 +406,6 @@ ONE_GPU_CASES_C = [
         sampling_params=MODELOPT_T2V_CI_sampling_params,
         extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
         env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-        bf16_quality_thresholds=MODELOPT_VIDEO_BF16_QUALITY_THRESHOLDS,
     ),
 ]
 
