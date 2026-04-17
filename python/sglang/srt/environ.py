@@ -305,6 +305,8 @@ class Envs:
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
+    # Set to 1/true to enable. Use with NIXL backend + UCX_CUDA_IPC_ENABLE_MNNVL=yes.
+    SGLANG_NIXL_VMM_MEM_POOL = EnvBool(False)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)

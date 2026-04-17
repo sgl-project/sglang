@@ -337,6 +337,14 @@ def maybe_init_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
+    # NIXL VMM allocator: MNNVL-compatible KV cache allocation.
+    # Use with NIXL backend + UCX_CUDA_IPC_ENABLE_MNNVL=yes.
+    if envs.SGLANG_NIXL_VMM_MEM_POOL.get():
+        from sglang.srt.mem_cache.nixl_vmm_allocator import init_nixl_vmm_mem_pool
+
+        success, pool = init_nixl_vmm_mem_pool(device)
+        return success, pool, "NVLINK_VMM" if success else None
+
     enable_custom_mem_pool = (
         True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
     )
