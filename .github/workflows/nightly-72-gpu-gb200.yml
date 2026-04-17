@@ -145,14 +145,22 @@ jobs:
           ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || inputs.sglang_branch }}
 
       - name: Verify checkout
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BRANCH: ${{ inputs.sglang_branch }}
         run: |
-          echo "Resolved ref: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'detached HEAD')"
-          echo "Commit SHA:   $(git rev-parse HEAD)"
-          echo "Author:       $(git log -1 --format='%an <%ae>')"
-          echo "Date:         $(git log -1 --format='%aI')"
-          echo "Subject:      $(git log -1 --format='%s')"
+          SHA=$(git rev-parse HEAD)
+          echo "Commit SHA: $SHA"
+          echo "Author:     $(git log -1 --format='%an <%ae>')"
+          echo "Date:       $(git log -1 --format='%aI')"
+          echo "Subject:    $(git log -1 --format='%s')"
           echo ""
-          echo "Cross-check against: https://github.com/sgl-project/sglang/pull/${{ inputs.pr_number }}/commits"
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Cross-check: https://github.com/sgl-project/sglang/pull/${PR_NUMBER}/commits"
+          else
+            echo "Cross-check: https://github.com/sgl-project/sglang/commits/${BRANCH}"
+          fi
+          echo "Commit URL:  https://github.com/sgl-project/sglang/commit/${SHA}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
