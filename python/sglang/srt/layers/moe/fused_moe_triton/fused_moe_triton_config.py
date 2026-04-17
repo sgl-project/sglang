@@ -191,12 +191,26 @@ def get_default_config(
         }
         # A heuristic: fused marlin works faster with this config for small M
         if M <= E or (is_marlin and M <= 32):
-            config = {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-            }
+            if _is_hip and M <= 2 and not is_marlin:
+                # AMD-optimized config for very small M (batch=1-2 decode).
+                # BLOCK_SIZE_K=256 feeds MFMA units more efficiently;
+                # BLOCK_SIZE_N=16 with num_warps=2 reduces register pressure.
+                # Benchmarked 1.66x faster at M=1 on MI355X (fused_moe kernel).
+                config = {
+                    "BLOCK_SIZE_M": 16,
+                    "BLOCK_SIZE_N": 16,
+                    "BLOCK_SIZE_K": 256,
+                    "GROUP_SIZE_M": 1,
+                    "num_warps": 2,
+                    "num_stages": 2,
+                }
+            else:
+                config = {
+                    "BLOCK_SIZE_M": 16,
+                    "BLOCK_SIZE_N": 32,
+                    "BLOCK_SIZE_K": 64,
+                    "GROUP_SIZE_M": 1,
+                }
     return config
 
 
