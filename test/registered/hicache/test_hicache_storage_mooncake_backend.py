@@ -277,6 +277,7 @@ class TestMooncakeBackendQwen330BCP2(
         server_args.update(
             {
                 "--tp-size": 2,
+                "--moe-dp-size": 2,
                 "--attn-cp-size": 2,
                 "--enable-prefill-context-parallel": True,
                 "--trust-remote-code": True,
