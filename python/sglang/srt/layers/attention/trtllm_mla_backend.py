@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
+from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
 
 if is_flashinfer_available():
     import flashinfer
@@ -1121,7 +1122,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 dtype=self.q_data_type,
                 device=q.device,
             )
-            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 **common_trtllm_args,
                 seq_lens=forward_batch.prefix_chunk_seq_lens[chunk_idx],
                 max_kv_len=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
@@ -1131,6 +1132,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=True,
                 out=out,
             )
+
+            # The TRT-LLM ragged attention cubin kernel does not correctly
+            # handle rows with kv_len == 0: it leaves stale data in the
+            # workspace softmaxStats buffer and may produce non-zero output
+            # for those rows.  Fix up by forcing out=0 and lse=-inf for
+            # zero-KV rows so that downstream merge_state ignores them.
+            # Skip entirely when this chunk has no zero-KV rows (pure CPU
+            # check, precomputed in prepare_chunked_prefix_cache_info).
+            if forward_batch.prefix_chunk_has_zero_kv[chunk_idx]:
+                out_tensor, lse_tensor = result
+                fixup_zero_kv_rows(
+                    out_tensor,
+                    lse_tensor,
+                    forward_batch.prefix_chunk_seq_lens[chunk_idx],
+                    self.forward_prefill_metadata.cum_seq_lens,
+                    self.forward_prefill_metadata.max_seq_len,
+                )
+
+            return result
         else:
             out = torch.zeros(
                 q.shape[0],
