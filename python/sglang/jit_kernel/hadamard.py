@@ -20,6 +20,7 @@ def _jit_hadamard_module(dtype: torch.dtype) -> Module:
         cuda_files=["fast-hadamard-transform/hadamard_jit.cuh"],
         cuda_wrappers=[
             ("hadamard_transform", f"HadamardKernel<{args}>::run"),
+            ("hadamard_transform_with_signs", f"HadamardWithSignsKernel<{args}>::run"),
             ("hadamard_transform_12n", f"Hadamard12NKernel<{args}>::run"),
             ("hadamard_transform_20n", f"Hadamard20NKernel<{args}>::run"),
             ("hadamard_transform_28n", f"Hadamard28NKernel<{args}>::run"),
@@ -59,6 +60,46 @@ def _hadamard_transform_impl(
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
     return _hadamard_transform_impl(x, scale, 8, module.hadamard_transform)
+
+
+def hadamard_transform_with_signs(
+    x: torch.Tensor,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Fused WHT rotation: out = signs2 * H(signs1 * x) * scale.
+
+    Fuses signs1 multiply, Hadamard transform, and signs2 multiply into a
+    single CUDA kernel launch, eliminating 2 elementwise kernel launches.
+
+    Args:
+        x: (..., dim) tensor, any dtype. Will be cast to float32 internally.
+        signs1: (dim,) float32 sign vector applied before Hadamard.
+        signs2: (dim,) float32 sign vector applied after Hadamard.
+        scale: scalar multiplier (typically 1/sqrt(dim)).
+
+    Returns:
+        out: same shape as x, float32.
+    """
+    if not x.is_cuda:
+        raise RuntimeError("hadamard_transform_with_signs only supports CUDA tensors")
+
+    shapes_og = x.size()
+    dim_og = x.size(-1)
+
+    x = x.reshape(-1, dim_og)
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+
+    # Use x's native dtype — the CUDA kernel handles bf16/fp16 I/O
+    # with float32 computation internally (load converts to float,
+    # store converts back to input_t)
+    out = torch.empty_like(x)
+    module = _jit_hadamard_module(x.dtype)
+    module.hadamard_transform_with_signs(x, out, signs1, signs2, scale)
+
+    return out.reshape(shapes_og)
 
 
 def hadamard_transform_12n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:

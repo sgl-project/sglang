@@ -775,6 +775,14 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+
+        # TurboQuant: rotate Q into WHT domain (K/V rotated after set_kv_buffer below)
+        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        if tq_config is not None:
+            q = tq_config.rotate_query(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            ).reshape(q.shape)
+
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -866,6 +874,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        # TurboQuant: inverse-rotate output back to original domain
+        if tq_config is not None:
+            o = tq_config.inverse_rotate_output(
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            ).reshape(o.shape)
+
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     @debug_kernel_api
@@ -895,8 +909,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         # Call the wrapped function
+        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        q_input = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if tq_config is not None:
+            q_input = tq_config.rotate_query(q_input)
         o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_input,
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
@@ -904,6 +922,11 @@ class FlashInferAttnBackend(AttentionBackend):
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
+
+        if tq_config is not None:
+            o = tq_config.inverse_rotate_output(
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            ).reshape(o.shape)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

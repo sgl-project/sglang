@@ -130,7 +130,26 @@ class ModelRunnerKVCacheMixin:
                     * kv_size
                 )
 
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            if hasattr(self, "turboquant_bits"):
+                # TurboQuant: packed indices + bf16 dequant_scale per layer.
+                # No shared dequant buffer (fused kernels read packed directly).
+                n = self.model_config.get_num_kv_heads(get_attention_tp_size())
+                d = self.model_config.head_dim
+                k_bits = getattr(self, "turboquant_k_bits", self.turboquant_bits)
+                v_bits = getattr(self, "turboquant_v_bits", self.turboquant_bits)
+
+                def _packed_bytes(bits, n, d):
+                    if bits == 2:
+                        return n * (d // 4)  # uint8, 4 values/byte
+                    else:  # 4-bit
+                        return n * (d // 2)  # uint8, 2 values/byte
+
+                per_layer_per_token = (
+                    _packed_bytes(k_bits, n, d) + _packed_bytes(v_bits, n, d)
+                    + 2 * n * 2  # k_dequant_scale + v_dequant_scale (bf16)
+                )
+                cell_size = per_layer_per_token * num_layers
+            elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
 
@@ -678,7 +697,30 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                if hasattr(self, "turboquant_bits"):
+                    from sglang.srt.mem_cache.memory_pool import (
+                        MHATokenToKVPoolTurboQuant,
+                    )
+
+                    self.token_to_kv_pool = MHATokenToKVPoolTurboQuant(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        turboquant_bits=self.turboquant_bits,
+                        turboquant_k_bits=getattr(self, "turboquant_k_bits", 0),
+                        turboquant_v_bits=getattr(self, "turboquant_v_bits", 0),
+                        turboquant_uniform=getattr(self, "turboquant_uniform", False),
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
+                elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,

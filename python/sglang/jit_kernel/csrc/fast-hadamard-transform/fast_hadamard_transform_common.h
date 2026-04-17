@@ -176,6 +176,52 @@ inline __device__ void store_output(output_t* out, float out_vals[kNChunks][kNEl
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Fused WHT rotation variants: apply per-element signs during load/store
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int kNChunks, int kNElts, typename input_t>
+inline __device__ void load_input_with_signs(input_t* x, float x_vals[kNChunks][kNElts], int dim,
+                                              const float* __restrict__ signs) {
+  using vec_t = typename BytesToType<sizeof(input_t) * kNElts>::Type;
+  input_t x_vals_load[kNChunks][kNElts] = {0};
+#pragma unroll
+  for (int c = 0; c < kNChunks; ++c) {
+    if ((c * blockDim.x + threadIdx.x) * kNElts < dim) {
+      reinterpret_cast<vec_t*>(x_vals_load)[c] = reinterpret_cast<const vec_t*>(x)[c * blockDim.x + threadIdx.x];
+    }
+  }
+#pragma unroll
+  for (int c = 0; c < kNChunks; ++c) {
+    int base_idx = (c * blockDim.x + threadIdx.x) * kNElts;
+#pragma unroll
+    for (int i = 0; i < kNElts; ++i) {
+      x_vals[c][i] = float(x_vals_load[c][i]) * signs[base_idx + i];
+    }
+  }
+}
+
+template <int kNChunks, int kNElts, typename output_t>
+inline __device__ void store_output_with_signs(output_t* out, float out_vals[kNChunks][kNElts], int dim,
+                                                float scale, const float* __restrict__ signs) {
+  using vec_t = typename BytesToType<sizeof(output_t) * kNElts>::Type;
+  output_t out_vals_store[kNChunks][kNElts];
+#pragma unroll
+  for (int c = 0; c < kNChunks; ++c) {
+    int base_idx = (c * blockDim.x + threadIdx.x) * kNElts;
+#pragma unroll
+    for (int i = 0; i < kNElts; ++i) {
+      out_vals_store[c][i] = out_vals[c][i] * signs[base_idx + i] * scale;
+    }
+  }
+#pragma unroll
+  for (int c = 0; c < kNChunks; ++c) {
+    if ((c * blockDim.x + threadIdx.x) * kNElts < dim) {
+      reinterpret_cast<vec_t*>(out)[c * blockDim.x + threadIdx.x] = reinterpret_cast<const vec_t*>(out_vals_store)[c];
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Pre=true means the exchange before the hadamard_mult_warp, Pre=false means after.
 template <int kNChunks, int kChunksPerExchange, int kNElts, int kWarpSize, int kNWarps, bool Pre, typename vec_t>

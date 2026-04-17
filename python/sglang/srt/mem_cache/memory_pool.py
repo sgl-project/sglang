@@ -1224,6 +1224,213 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
+    """TurboQuant KV cache: WHT rotation + optimal scalar quantization.
+
+    Stores KV as packed uint8 indices + bf16 dequant scales.
+    Fused decode/extend kernels read packed KV directly — no dequant buffer needed.
+
+    Memory layout:
+      - Per-layer: k/v_buffer (uint8), k/v_dequant_scale_buffer (bf16)
+      - Shared: _quant_kv_unit, _quant_kv_norms (small pre-alloc for CUDA graph)
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        turboquant_bits: int = 4,
+        turboquant_k_bits: int = 0,
+        turboquant_v_bits: int = 0,
+        turboquant_uniform: bool = False,
+        v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        self.turboquant_bits = turboquant_bits
+        from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
+        k_bits = turboquant_k_bits or turboquant_bits
+        v_bits = turboquant_v_bits or turboquant_bits
+        self.tq_config = TurboQuantConfig(
+            bit_width=turboquant_bits,
+            head_dim=head_dim,
+            device=device,
+            k_bit_width=k_bits,
+            v_bit_width=v_bits,
+            uniform=turboquant_uniform,
+        )
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            v_head_dim=v_head_dim,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=False,
+            enable_kv_cache_copy=False,
+        )
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+
+                # Packed quantized indices (K and V may have different dim/dtype)
+                self.k_buffer = [
+                    torch.zeros(
+                        (m, self.head_num, self.tq_config.k_packed_dim),
+                        dtype=self.tq_config.k_packed_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (m, self.head_num, self.tq_config.v_packed_dim),
+                        dtype=self.tq_config.v_packed_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                # Per-vector dequant scale: norm / max(quant_norm, eps)
+                # Precomputed at quantize time to save 2 loads + 1 div in decode kernel
+                self.k_dequant_scale_buffer = [
+                    torch.zeros(
+                        (m, self.head_num),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_dequant_scale_buffer = [
+                    torch.zeros(
+                        (m, self.head_num),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                # Pre-allocated buffers for quantize path (avoids torch.empty inside CUDA graph)
+                max_bs = 256  # matches cuda_graph_max_bs default
+                self._quant_kv_unit = torch.empty(
+                    2 * max_bs, self.head_num, self.head_dim, dtype=torch.float32, device=self.device
+                )
+                self._quant_kv_norms = torch.empty(
+                    2 * max_bs, self.head_num, dtype=torch.float32, device=self.device
+                )
+
+        # data_ptrs / data_strides — point to packed buffers (per-layer)
+        self.k_data_ptrs = torch.tensor(
+            [self.k_buffer[i].data_ptr() for i in range(self.layer_num)],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [self.v_buffer[i].data_ptr() for i in range(self.layer_num)],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        k_stride = int(np.prod(self.k_buffer[0].shape[1:])) * self.k_buffer[0].dtype.itemsize
+        v_stride = int(np.prod(self.v_buffer[0].shape[1:])) * self.v_buffer[0].dtype.itemsize
+        self.data_strides = torch.tensor(
+            [k_stride] * self.layer_num + [v_stride] * self.layer_num,
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_dequant_scale_buffer
+        del self.v_dequant_scale_buffer
+        del self._quant_kv_unit
+        del self._quant_kv_norms
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+        k_pre_rotated: bool = False,
+    ):
+        from sglang.srt.layers.attention.triton_ops.turboquant_quantize import (
+            fused_turboquant_quantize_and_store_kv,
+        )
+
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        idx = layer_id - self.start_layer
+
+        cfg = self.tq_config
+
+        # Quantize K+V with batched norm+WHT, using pre-allocated buffers
+        fused_turboquant_quantize_and_store_kv(
+            cache_k, cache_v,
+            cfg.signs1, cfg.signs2,
+            cfg.k_centroids, cfg.k_boundaries, cfg.k_bit_width,
+            cfg.v_centroids, cfg.v_boundaries, cfg.v_bit_width,
+            self.k_buffer[idx], self.k_dequant_scale_buffer[idx],
+            self.v_buffer[idx], self.v_dequant_scale_buffer[idx],
+            loc,
+            pre_kv_unit=self._quant_kv_unit,
+            pre_kv_norms=self._quant_kv_norms,
+        )
+
+    def _get_key_buffer(self, layer_id: int):
+        raise NotImplementedError(
+            "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
+            "Dequant buffer path not supported."
+        )
+
+    def _get_value_buffer(self, layer_id: int):
+        raise NotImplementedError(
+            "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
+            "Dequant buffer path not supported."
+        )
+
+    def get_v_head_dim(self):
+        return self.head_dim
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        for i in range(self.layer_num):
+            self.k_buffer[i][tgt_loc] = self.k_buffer[i][src_loc]
+            self.v_buffer[i][tgt_loc] = self.v_buffer[i][src_loc]
+            self.k_dequant_scale_buffer[i][tgt_loc] = self.k_dequant_scale_buffer[i][src_loc]
+            self.v_dequant_scale_buffer[i][tgt_loc] = self.v_dequant_scale_buffer[i][src_loc]
+
+    def get_kv_size_bytes(self):
+        """Total GPU memory used by all TurboQuant buffers."""
+        total = 0
+        for i in range(self.layer_num):
+            total += self.k_buffer[i].nbytes + self.v_buffer[i].nbytes
+            total += self.k_dequant_scale_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
+        return total
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 

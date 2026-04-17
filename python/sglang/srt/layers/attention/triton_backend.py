@@ -72,10 +72,18 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
+        from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+            tq_decode_attention_fwd,
+        )
+        from sglang.srt.layers.attention.triton_ops.turboquant_extend_attention import (
+            tq_extend_attention_fwd,
+        )
 
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        self.tq_decode_attention_fwd = torch.compiler.disable(tq_decode_attention_fwd)
+        self.tq_extend_attention_fwd = torch.compiler.disable(tq_extend_attention_fwd)
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -117,9 +125,11 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            pool = model_runner.token_to_kv_pool
+            if hasattr(pool, "get_v_head_dim"):
+                self.v_head_dim = pool.get_v_head_dim()
+            else:
+                self.v_head_dim = pool.get_value_buffer(0).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -862,7 +872,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        _kv_from_pool = False  # Track if K/V came from dequant buffer (already rotspace)
         if k is None and v is None:
+            _kv_from_pool = True
             pool = forward_batch.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
@@ -907,11 +919,52 @@ class TritonAttnBackend(AttentionBackend):
         ):
             causal = False
 
+        # TurboQuant: rotate Q into WHT domain; rotate K/V only if fresh (not from pool)
+        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        if tq_config is not None:
+            if (
+                not _kv_from_pool
+                and k is not None
+                and v is not None
+                and layer.qk_head_dim == layer.v_head_dim
+            ):
+                # Batch Q+K+V rotation into single WHT launch (3→1)
+                q_shape, k_shape, v_shape = q.shape, k.shape, v.shape
+                q_flat = q.reshape(-1, layer.qk_head_dim)
+                k_flat = k.reshape(-1, layer.qk_head_dim)
+                v_flat = v.reshape(-1, layer.v_head_dim)
+                nq, nk = q_flat.shape[0], k_flat.shape[0]
+                qkv_rot = tq_config.rotate_query(
+                    torch.cat([q_flat, k_flat, v_flat], dim=0)
+                )
+                q = qkv_rot[:nq].view(q_shape)
+                k = qkv_rot[nq : nq + nk].view(k_shape)
+                v = qkv_rot[nq + nk :].view(v_shape)
+            else:
+                # Fallback: separate rotations (pool KV or asymmetric head dims)
+                q = tq_config.rotate_query(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                ).reshape(q.shape)
+                if not _kv_from_pool:
+                    if k is not None:
+                        k = tq_config.rotate_query(
+                            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                        ).reshape(k.shape)
+                    if v is not None:
+                        v = tq_config.rotate_query(
+                            v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+                        ).reshape(v.shape)
+
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
-            return self._forward_extend_unified(
+            o = self._forward_extend_unified(
                 q, o, layer, forward_batch, causal, logits_soft_cap, sinks
             )
+            if tq_config is not None:
+                o = tq_config.inverse_rotate_output(
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                ).reshape(o.shape)
+            return o
 
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
@@ -934,29 +987,81 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            self.forward_metadata.qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.forward_metadata.custom_mask,
-            causal,
-            self.forward_metadata.mask_indptr,
-            self.forward_metadata.max_extend_len,
-            k_descale,
-            v_descale,
-            layer.scaling,
-            logit_cap=logits_soft_cap,
-            sliding_window_size=sliding_window_size,
-            sinks=sinks,
-            window_kv_offsets=window_kv_offsets,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        # Get prefix KV buffers
+        pool = forward_batch.token_to_kv_pool
+        if (tq_config is not None
+            and tq_config.k_bit_width in (2, 4)
+            and tq_config.v_bit_width in (2, 4)
+            and not self.enable_deterministic
+            and sliding_window_size == -1
+            and kv_indptr is not None):
+            # Fused TQ extend: read packed uint8 KV directly, skip dequant buffer
+            # Supports symmetric and asymmetric K/V bit widths
+            idx = layer.layer_id - pool.start_layer
+            self.tq_extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                pool.k_buffer[idx],
+                pool.v_buffer[idx],
+                pool.k_dequant_scale_buffer[idx],
+                pool.v_dequant_scale_buffer[idx],
+                tq_config.k_centroids,
+                tq_config.v_centroids,
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                causal,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                sm_scale=layer.scaling,
+                k_bit_width=tq_config.k_bit_width,
+                v_bit_width=tq_config.v_bit_width,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+        else:
+            # Fallback: standard extend kernel (non-TQ path)
+            if tq_config is not None:
+                raise RuntimeError(
+                    "TurboQuant extend fallback not supported. "
+                    "Ensure: enable_deterministic=False, no sliding_window."
+                )
+            key_buffer = pool.get_key_buffer(layer.layer_id)
+            value_buffer = pool.get_value_buffer(layer.layer_id)
+
+            self.extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                key_buffer,
+                value_buffer,
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                causal,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,
+                window_kv_offsets=window_kv_offsets,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+        # TurboQuant: inverse-rotate output back to original domain
+        # (skipped when rotation is fused into o_proj weights)
+        if tq_config is not None and not getattr(tq_config, 'output_rotation_fused', False):
+            o = tq_config.inverse_rotate_output(
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            ).reshape(o.shape)
         return o
 
     def _forward_extend_unified(
@@ -1153,24 +1258,66 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
-            attn_logits,
-            self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
-            layer.scaling,
-            k_descale,
-            v_descale,
-            logit_cap=logits_soft_cap,
-            sinks=sinks,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        # TurboQuant: rotate Q into WHT domain
+        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        if tq_config is not None:
+            q = tq_config.rotate_query(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            ).reshape(q.shape)
+
+        if tq_config is not None and tq_config.k_bit_width in (2, 4) and tq_config.v_bit_width in (2, 4):
+            # Fused TQ decode: read packed uint8 KV directly, skip dequant buffer
+            # Supports symmetric (K=V) and asymmetric (K!=V) bit widths
+            pool = forward_batch.token_to_kv_pool
+            idx = layer.layer_id - pool.start_layer
+            self.tq_decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                pool.k_buffer[idx],
+                pool.v_buffer[idx],
+                pool.k_dequant_scale_buffer[idx],
+                pool.v_dequant_scale_buffer[idx],
+                tq_config.k_centroids,
+                tq_config.v_centroids,
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                k_bit_width=tq_config.k_bit_width,
+                v_bit_width=tq_config.v_bit_width,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                uniform=getattr(tq_config, 'uniform', False),
+            )
+        else:
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                k_descale,
+                v_descale,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+
+        # TurboQuant: inverse-rotate output back to original domain
+        if tq_config is not None and not getattr(tq_config, 'output_rotation_fused', False):
+            o = tq_config.inverse_rotate_output(
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            ).reshape(o.shape)
         return o
 
 

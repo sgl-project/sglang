@@ -21,4 +21,10 @@ struct HadamardParamsBase {
   // Common data pointers.
   void* __restrict__ x_ptr;
   void* __restrict__ out_ptr;
+
+  // Optional per-element sign vectors for fused WHT rotation.
+  // When non-null, load multiplies by signs1 and store multiplies by signs2.
+  // Shape: (dim,) float32. Set to nullptr to skip.
+  const float* __restrict__ signs1_ptr;
+  const float* __restrict__ signs2_ptr;
 };

@@ -197,6 +197,89 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void fast_hadamard_transform_ke
   store_output<kNChunks, kNElts, input_t>(out, x_vals, params.dim, params.scale);
 }
 
+// Fused WHT rotation kernel: out = signs2 * H(signs1 * x) * scale
+template <typename Ktraits>
+__global__ __launch_bounds__(Ktraits::kNThreads) void fast_hadamard_transform_with_signs_kernel(HadamardParamsBase params) {
+  constexpr int kNThreads = Ktraits::kNThreads;
+  constexpr int kNElts = Ktraits::kNElts;
+  constexpr int kNExchangePerVec = Ktraits::kNExchangePerVec;
+  constexpr int kNChunks = Ktraits::kNChunks;
+  using input_t = typename Ktraits::input_t;
+  using vec_t = typename Ktraits::vec_t;
+
+  constexpr int kLogNElts = cilog2(Ktraits::kNElts);
+  static_assert(1 << kLogNElts == kNElts, "kNElts must be a power of 2");
+
+  constexpr int kWarpSize = kNThreads < 32 ? kNThreads : 32;
+  constexpr int kLogWarpSize = cilog2(kWarpSize);
+  static_assert(1 << kLogWarpSize == kWarpSize, "Warp size must be a power of 2");
+
+  constexpr int kNWarps = kNThreads / kWarpSize;
+  constexpr int kLogNWarps = cilog2(kNWarps);
+  static_assert(1 << kLogNWarps == kNWarps, "kNWarps must be a power of 2");
+
+  constexpr int kChunksPerExchange = Ktraits::kSmemExchangeSize / (sizeof(vec_t) * kNExchangePerVec * kNThreads);
+  static_assert(kChunksPerExchange * sizeof(vec_t) * kNExchangePerVec * kNThreads == Ktraits::kSmemExchangeSize);
+  constexpr int kNExchanges = kNChunks / kChunksPerExchange;
+  static_assert(kNExchanges * kChunksPerExchange == kNChunks);
+
+  extern __shared__ char smem_[];
+  vec_t* smem_exchange = reinterpret_cast<vec_t*>(smem_);
+
+  const int batch_id = static_cast<int>(blockIdx.x);
+  input_t* x = reinterpret_cast<input_t*>(params.x_ptr) + batch_id * params.x_batch_stride;
+  input_t* out = reinterpret_cast<input_t*>(params.out_ptr) + batch_id * params.out_batch_stride;
+
+  float x_vals[kNChunks][kNElts];
+  // Fused: load + multiply by signs1
+  load_input_with_signs<kNChunks, kNElts, input_t>(x, x_vals, params.dim, params.signs1_ptr);
+
+  hadamard_mult_thread<kLogNElts, kNChunks>(x_vals);
+  hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts>(x_vals);
+
+  if constexpr (kNWarps > 1) {
+    exchange_smem_pre<kNChunks, kChunksPerExchange, kNElts, kWarpSize, kNWarps, true, vec_t>(x_vals, smem_exchange);
+    hadamard_mult_warp<kLogNWarps, 0, kNChunks, kNElts>(x_vals);
+    exchange_smem_pre<kNChunks, kChunksPerExchange, kNElts, kWarpSize, kNWarps, false, vec_t>(x_vals, smem_exchange);
+  }
+
+  if constexpr (kNChunks > 1) {
+    float x_vals_transposed[kNElts][kNChunks];
+#pragma unroll
+    for (int c = 0; c < kNChunks; ++c) {
+#pragma unroll
+      for (int i = 0; i < kNElts; ++i) {
+        x_vals_transposed[i][c] = x_vals[c][i];
+      }
+    }
+
+    if constexpr (kNChunks == 12) {
+      hadamard_mult_thread_chunk_12<kNElts>(x_vals_transposed);
+    } else if constexpr (kNChunks == 20) {
+      hadamard_mult_thread_chunk_20<kNElts>(x_vals_transposed);
+    } else if constexpr (kNChunks == 28) {
+      hadamard_mult_thread_chunk_28<kNElts>(x_vals_transposed);
+    } else if constexpr (kNChunks == 40) {
+      hadamard_mult_thread_chunk_40<kNElts>(x_vals_transposed);
+    } else {
+      constexpr int kLogNChunks = cilog2(kNChunks);
+      static_assert(1 << kLogNChunks == kNChunks, "kNChunks must be a power of 2");
+      hadamard_mult_thread<kLogNChunks, kNElts>(x_vals_transposed);
+    }
+
+#pragma unroll
+    for (int c = 0; c < kNChunks; ++c) {
+#pragma unroll
+      for (int i = 0; i < kNElts; ++i) {
+        x_vals[c][i] = x_vals_transposed[i][c];
+      }
+    }
+  }
+
+  // Fused: multiply by signs2 + scale + store
+  store_output_with_signs<kNChunks, kNElts, input_t>(out, x_vals, params.dim, params.scale, params.signs2_ptr);
+}
+
 template <typename Ktraits>
 inline void set_max_dynamic_smem() {
   constexpr int kSmemSize = Ktraits::kSmemSize;
@@ -476,6 +559,113 @@ template <typename DType>
 struct Hadamard40NKernel {
   static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView out, float scale) {
     run_hadamard<40, DType>(x, out, scale);
+  }
+};
+
+
+// --- Fused WHT rotation: launch helpers ---
+
+template <typename Ktraits>
+inline void launch_kernel_with_signs(HadamardParamsBase& params, DLDevice device) {
+  constexpr int kSmemSize = Ktraits::kSmemSize;
+  set_max_dynamic_smem<Ktraits>();
+  auto kernel = &fast_hadamard_transform_with_signs_kernel<Ktraits>;
+  host::LaunchKernel(dim3(params.batch), dim3(Ktraits::kNThreads), device, kSmemSize)(kernel, params);
+  host::RuntimeDeviceCheck();
+}
+
+template <int kNThreads, int kLogN, typename input_t>
+inline void fast_hadamard_transform_with_signs_launch(HadamardParamsBase& params, DLDevice device) {
+  using Ktraits = FastHadamardKernelTraits<kNThreads, kLogN, input_t>;
+  launch_kernel_with_signs<Ktraits>(params, device);
+}
+
+template <typename input_t>
+inline void fast_hadamard_transform_with_signs_cuda(HadamardParamsBase& params, DLDevice device) {
+  if (params.log_N == 3) {
+    fast_hadamard_transform_with_signs_launch<1, 3, input_t>(params, device);
+  } else if (params.log_N == 4) {
+    fast_hadamard_transform_with_signs_launch<2, 4, input_t>(params, device);
+  } else if (params.log_N == 5) {
+    fast_hadamard_transform_with_signs_launch<4, 5, input_t>(params, device);
+  } else if (params.log_N == 6) {
+    fast_hadamard_transform_with_signs_launch<8, 6, input_t>(params, device);
+  } else if (params.log_N == 7) {
+    fast_hadamard_transform_with_signs_launch<16, 7, input_t>(params, device);
+  } else if (params.log_N == 8) {
+    fast_hadamard_transform_with_signs_launch<32, 8, input_t>(params, device);
+  } else if (params.log_N == 9) {
+    fast_hadamard_transform_with_signs_launch<32, 9, input_t>(params, device);
+  } else if (params.log_N == 10) {
+    fast_hadamard_transform_with_signs_launch<128, 10, input_t>(params, device);
+  } else if (params.log_N == 11) {
+    fast_hadamard_transform_with_signs_launch<256, 11, input_t>(params, device);
+  } else if (params.log_N == 12) {
+    fast_hadamard_transform_with_signs_launch<256, 12, input_t>(params, device);
+  } else if (params.log_N == 13) {
+    fast_hadamard_transform_with_signs_launch<256, 13, input_t>(params, device);
+  } else if (params.log_N == 14) {
+    fast_hadamard_transform_with_signs_launch<256, 14, input_t>(params, device);
+  } else if (params.log_N == 15) {
+    fast_hadamard_transform_with_signs_launch<256, 15, input_t>(params, device);
+  } else {
+    host::Panic("fast_hadamard_transform_with_signs: unsupported log_N=", params.log_N);
+  }
+}
+
+inline void set_hadamard_params_with_signs(
+    HadamardParamsBase& params,
+    int64_t batch,
+    int64_t dim,
+    int64_t multiple,
+    const tvm::ffi::TensorView x,
+    const tvm::ffi::TensorView out,
+    const tvm::ffi::TensorView signs1,
+    const tvm::ffi::TensorView signs2,
+    float scale) {
+  set_hadamard_params(params, batch, dim, multiple, x, out, scale);
+  params.signs1_ptr = reinterpret_cast<const float*>(signs1.data_ptr());
+  params.signs2_ptr = reinterpret_cast<const float*>(signs2.data_ptr());
+}
+
+template <int kMultiple, typename DType>
+inline void run_hadamard_with_signs(
+    const tvm::ffi::TensorView x, const tvm::ffi::TensorView out,
+    const tvm::ffi::TensorView signs1, const tvm::ffi::TensorView signs2,
+    float scale) {
+  using namespace host;
+
+  auto N = SymbolicSize{"batch"};
+  auto D = SymbolicSize{"dim"};
+  auto SX = SymbolicSize{"x_batch_stride"};
+  auto SO = SymbolicSize{"out_batch_stride"};
+  auto DS = SymbolicSize{"signs_dim"};
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA>();
+
+  TensorMatcher({N, D}).with_strides({SX, 1}).with_dtype<DType>().with_device(device).verify(x);
+  TensorMatcher({N, D}).with_strides({SO, 1}).with_dtype<DType>().with_device(device).verify(out);
+  TensorMatcher({DS}).with_dtype<float>().with_device(device).verify(signs1);
+  TensorMatcher({DS}).with_dtype<float>().with_device(device).verify(signs2);
+
+  const int64_t batch = N.unwrap();
+  const int64_t dim = D.unwrap();
+
+  RuntimeCheck(dim % 8 == 0, "fast_hadamard_transform_with_signs only supports hidden dim divisible by 8");
+  RuntimeCheck(dim <= 32768, "fast_hadamard_transform_with_signs only supports hidden dim <= 32768");
+  RuntimeCheck(DS.unwrap() == dim, "signs dim must match input dim");
+
+  HadamardParamsBase params;
+  set_hadamard_params_with_signs(params, batch, dim, kMultiple, x, out, signs1, signs2, scale);
+  fast_hadamard_transform_with_signs_cuda<DType>(params, device.unwrap());
+}
+
+template <typename DType>
+struct HadamardWithSignsKernel {
+  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView out,
+                  const tvm::ffi::TensorView signs1, const tvm::ffi::TensorView signs2,
+                  float scale) {
+    run_hadamard_with_signs<1, DType>(x, out, signs1, signs2, scale);
   }
 };
 

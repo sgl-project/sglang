@@ -623,6 +623,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
+        # TurboQuant: fuse inverse WHT rotation into o_proj weights
+        self._maybe_fuse_tq_output_rotation()
+
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
@@ -1957,6 +1960,54 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype.startswith("turboquant_"):
+            import re
+
+            tq_str = self.server_args.kv_cache_dtype.split("_", 1)[1]
+            # Check for uniform quantization suffix
+            self.turboquant_uniform = tq_str.endswith("_uniform")
+            if self.turboquant_uniform:
+                tq_str = tq_str.rsplit("_uniform", 1)[0]
+            # Asymmetric: "k4v2"
+            asym_match = re.match(r"k(\d)v(\d)", tq_str)
+            if asym_match:
+                self.turboquant_k_bits = int(asym_match.group(1))
+                self.turboquant_v_bits = int(asym_match.group(2))
+                self.turboquant_bits = self.turboquant_k_bits  # for backwards compat
+            else:
+                # Symmetric: "2bit", "4bit"
+                bits = int(tq_str.replace("bit", ""))
+                self.turboquant_k_bits = bits
+                self.turboquant_v_bits = bits
+                self.turboquant_bits = bits
+            self.kv_cache_dtype = torch.bfloat16
+            # TurboQuant fused decode kernel is Triton-only.
+            # Only override DECODE backend to triton; prefill keeps default (fa3/flashinfer)
+            # for maximum prefill throughput. Prefill reads from shared dequant buffer (bf16),
+            # which is compatible with any attention backend.
+            if self.server_args.decode_attention_backend is None or \
+               self.server_args.decode_attention_backend != "triton":
+                prev = self.server_args.decode_attention_backend or "default"
+                self.server_args.decode_attention_backend = "triton"
+                logger.info(
+                    f"TurboQuant: overriding decode-attention-backend={prev} → triton "
+                    f"(fused decode kernel). Prefill backend unchanged for optimal throughput."
+                )
+            # Fused decode kernel supports symmetric and asymmetric 2-bit and 4-bit.
+            has_fused = (
+                self.turboquant_k_bits in (2, 4)
+                and self.turboquant_v_bits in (2, 4)
+            )
+            if not has_fused:
+                if not self.server_args.disable_cuda_graph:
+                    logger.warning(
+                        f"TurboQuant K={self.turboquant_k_bits}bit V={self.turboquant_v_bits}bit: "
+                        f"no fused decode kernel, disabling CUDA graph."
+                    )
+                    self.server_args.disable_cuda_graph = True
+            logger.info(
+                f"TurboQuant K={self.turboquant_k_bits}bit V={self.turboquant_v_bits}bit KV cache enabled"
+            )
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -2076,6 +2127,78 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+        # Pre-warm TurboQuant JIT kernels so they're compiled before CUDA graph capture
+        if hasattr(self, 'turboquant_bits'):
+            self._warmup_turboquant_kernels()
+
+    def _warmup_turboquant_kernels(self):
+        """Trigger JIT compilation of hadamard + Triton kernels before graph capture."""
+        from sglang.jit_kernel.hadamard import hadamard_transform
+
+        head_dim = self.model_config.head_dim
+        dummy = torch.randn(1, 1, head_dim, dtype=torch.float32, device=self.device)
+        scale = 1.0 / (head_dim ** 0.5)
+        # Warm up JIT hadamard kernel
+        hadamard_transform(dummy, scale=scale)
+
+        # Warm up fused Triton quantize kernel (4-bit only)
+        if self.turboquant_k_bits == 4:
+            from sglang.srt.layers.attention.triton_ops.turboquant_quantize import (
+                fused_turboquant_quantize,
+            )
+            from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
+            cfg = TurboQuantConfig(
+                bit_width=4, head_dim=head_dim, device=self.device,
+                k_bit_width=self.turboquant_k_bits, v_bit_width=self.turboquant_v_bits,
+                uniform=getattr(self, 'turboquant_uniform', False),
+            )
+            dummy_kv = torch.randn(1, 1, head_dim, dtype=torch.bfloat16, device=self.device)
+            fused_turboquant_quantize(
+                dummy_kv, cfg.signs1, cfg.signs2,
+                cfg.k_centroids, cfg.k_boundaries, 4,
+            )
+
+    def _maybe_fuse_tq_output_rotation(self):
+        if not hasattr(self, "turboquant_bits") or self.turboquant_bits is None:
+            return
+        if self.token_to_kv_pool_allocator is None:
+            return
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        tq_cfg = getattr(kvcache, "tq_config", None)
+        if tq_cfg is None:
+            return
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("TurboQuant: fusing inverse WHT rotation into o_proj weights...")
+        fused = 0
+        skipped_fp8 = False
+        for _, mod in self.model.named_modules():
+            if hasattr(mod, "o_proj") and hasattr(mod.o_proj, "weight"):
+                w = mod.o_proj.weight
+                # FP8 quantized weights have associated scale factors.
+                # Fusing rotation would corrupt the weight-scale relationship.
+                # Skip fusion and use runtime inverse rotation instead.
+                if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    skipped_fp8 = True
+                    continue
+                n_heads = w.shape[1] // tq_cfg.head_dim
+                if w.shape[1] % tq_cfg.head_dim == 0 and n_heads > 0:
+                    with torch.no_grad():
+                        wt = w.data.t().contiguous()
+                        wf = tq_cfg.fuse_inverse_rotation_into_o_proj(wt, n_heads)
+                        w.data.copy_(wf.t().contiguous())
+                        fused += 1
+        if skipped_fp8:
+            logger.info(
+                "TurboQuant: skipping rotation fusion (FP8 weights), "
+                "using runtime inverse rotation"
+            )
+        elif fused > 0:
+            tq_cfg.output_rotation_fused = True
+            logger.info("TurboQuant: fused inverse rotation into %d o_proj layers", fused)
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
