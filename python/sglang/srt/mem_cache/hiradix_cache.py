@@ -1038,6 +1038,12 @@ class HiRadixCache(RadixCache):
     def flush_write_through_acks(self) -> None:
         self.writing_check()
 
+    def flush_pending_writes_on_idle(self):
+        """Synchronize write stream and drain hicache event queues on idle."""
+        if len(self.ongoing_write_through) > 0:
+            self.cache_controller.write_stream.synchronize()
+        self.check_hicache_events()
+
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()

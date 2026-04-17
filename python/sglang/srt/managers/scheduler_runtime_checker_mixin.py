@@ -543,7 +543,10 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def on_idle(self: Scheduler):
-        """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        """Idle housekeeping: flush hicache, check, metrics, reset, sleep."""
+        if self.enable_hierarchical_cache:
+            self.tree_cache.flush_pending_writes_on_idle()
+
         if not self.is_fully_idle():
             return
 
