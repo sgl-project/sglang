@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_dual_transformer,
     refresh_context_on_transformer,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -151,6 +152,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     This stage handles the iterative denoising process that transforms
     the initial noise into the final output.
     """
+
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
 
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None

@@ -1575,7 +1575,28 @@ class Scheduler(
                     src=self.attn_cp_group.ranks[0],
                 )
 
-            if self.tp_size != 1:
+            # When dp_attention_local_control_broadcast is enabled, each DP
+            # group leader already receives control messages from the DP
+            # controller, so we broadcast within attn_tp_group + attn_cp_group
+            # instead of the full tp_group.  This avoids an expensive
+            # all-ranks gloo sync.
+            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            if _local_ctrl:
+                if self.attn_tp_size != 1:
+                    control_reqs = broadcast_pyobj(
+                        control_reqs,
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
+                if self.attn_cp_size != 1:
+                    control_reqs = broadcast_pyobj(
+                        control_reqs,
+                        self.attn_cp_group.rank,
+                        self.attn_cp_cpu_group,
+                        src=self.attn_cp_group.ranks[0],
+                    )
+            elif self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     self.tp_group.rank,
@@ -2438,7 +2459,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is not None
+            and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
