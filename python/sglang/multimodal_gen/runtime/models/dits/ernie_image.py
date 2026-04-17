@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
+from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
     ErnieImageDitConfig,
 )
@@ -241,11 +242,11 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         gate_mlp: torch.Tensor,
     ) -> torch.Tensor:
         residual = x
-        x = self.adaLN_sa_ln(x) * (1 + scale_msa) + shift_msa
+        x = fuse_scale_shift_kernel(self.adaLN_sa_ln(x), scale_msa, shift_msa)
         x = residual + gate_msa * self.self_attention(x, rotary_pos_emb)
 
         residual = x
-        x = self.adaLN_mlp_ln(x) * (1 + scale_mlp) + shift_mlp
+        x = fuse_scale_shift_kernel(self.adaLN_mlp_ln(x), scale_mlp, shift_mlp)
         x = residual + gate_mlp * self.mlp(x)
 
         return x
@@ -463,7 +464,9 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             )
 
         scale, shift = self.final_norm["linear"](c).chunk(2, dim=-1)
-        x = self.final_norm["norm"](x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        x = fuse_scale_shift_kernel(
+            self.final_norm["norm"](x), scale.unsqueeze(1), shift.unsqueeze(1)
+        )
 
         patches, _ = self.final_linear(x[:, :N_img, :])
 
