@@ -223,9 +223,24 @@ void extend_attention_kernel_impl(
               /* C     */ s_i);
 
           // apply causal mask
-          if (num_keys - n <= BLOCK_N) {
+          // [Note] condition to apply causal mask.
+          // Mask any block whose last key (n + n_size - 1) is strictly after the first query position (m), i.e. n +
+          // n_size - 1 > m. The original condition was `num_keys - n <= BLOCK_N` (last n-block only). That was correct
+          // when BLOCK_M <= BLOCK_N/2 because earlier n-blocks were guaranteed to contain only past keys.  With
+          // BLOCK_M=512, BLOCK_N=768:
+          //   BLOCK_M > BLOCK_N/2, so the first n-block can contain future keys.
+          //   Example: m=512 (mb=1), num_keys=1024, first n-block covers keys [0, 768).
+          //   Query row=0 is at position 512, so keys 513..767 are future and must be
+          //   masked — but `num_keys - 0 = 1024 > BLOCK_N` skips masking entirely,
+          //   producing wrong (non-causal) attention for rows 0..254 of this m-block.
+          if (n + n_size - 1 > m) {
             for (int row = 0; row < m_size; ++row) {
               int last_col = m + row - n;
+              // [Note] mask the entire row if last_col < 0.
+              // Clamp to -1: when n > m + row every key in this block is a future
+              // key, so the entire row should be masked.  Without this clamp,
+              // last_col+1 <= 0 and fill_stub would write before row_ptr.
+              last_col = std::max(last_col, -1);
               // fill [last_col + 1, n_size) to -inf
               float* row_ptr = s_i + row * BLOCK_N;
               fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);

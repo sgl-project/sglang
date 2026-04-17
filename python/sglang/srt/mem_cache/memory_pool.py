@@ -1887,6 +1887,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
@@ -1898,6 +1900,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
@@ -1922,6 +1926,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
                  k_fp8: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
         """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetKAndS.execute(
             self,

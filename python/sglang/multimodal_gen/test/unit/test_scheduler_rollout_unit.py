@@ -71,6 +71,48 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         self.assertEqual(tuple(local_elem_count.shape), (sample.shape[0],))
         self.assertTrue(torch.all(local_elem_count == float(sample[0].numel())))
 
+    def test_ode_bit_exact_with_non_rollout_path(self):
+        """ODE rollout must produce the exact same prev_sample as the
+        non-rollout deterministic branch in
+        ``scheduling_flow_match_euler_discrete.step`` (``prev_sample =
+        sample + dt * model_output``). Uses bf16 model_output because the
+        wrapped-scalar promotion difference that a spurious
+        ``model_output.float()`` in the ODE branch would introduce is most
+        visible at bf16 precision."""
+        scheduler = _DummyScheduler()
+        batch = self._build_batch(debug_mode=False)
+        scheduler.prepare_rollout(batch)
+
+        sample = torch.randn(2, 4, 8, 8, dtype=torch.float32)
+        model_output = torch.randn_like(sample).to(torch.bfloat16)
+        current_sigma = torch.tensor(0.6, dtype=torch.float32)
+        next_sigma = torch.tensor(0.4, dtype=torch.float32)
+        dt = next_sigma - current_sigma
+
+        rollout_prev = scheduler.flow_sde_sampling(
+            batch,
+            model_output=model_output,
+            sample=sample,
+            current_sigma=current_sigma,
+            next_sigma=next_sigma,
+            generator=torch.Generator(device=sample.device).manual_seed(0),
+        )
+        # Exact expression used by the non-rollout branch at
+        # scheduling_flow_match_euler_discrete.py `prev_sample = sample +
+        # dt * model_output` (after the shared ``sample.to(fp32)`` cast).
+        non_rollout_prev = sample + dt * model_output
+
+        self.assertEqual(rollout_prev.dtype, non_rollout_prev.dtype)
+        self.assertTrue(torch.equal(rollout_prev, non_rollout_prev))
+        # Also verify the post-cast to model_output.dtype (what scheduler.step
+        # returns downstream) is bit-exact.
+        self.assertTrue(
+            torch.equal(
+                rollout_prev.to(model_output.dtype),
+                non_rollout_prev.to(model_output.dtype),
+            )
+        )
+
     def test_ode_debug_tensors_have_shape_safe_noise_std(self):
         scheduler = _DummyScheduler()
         batch = self._build_batch(debug_mode=True)
@@ -215,8 +257,19 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 model_output = torch.randn(shape, generator=g, dtype=torch.float32)
                 sample = torch.randn(shape, generator=g, dtype=torch.float32)
                 variance_noise = torch.randn(shape, generator=g, dtype=torch.float32)
+
+                def _mock_rollout_variance_noise(_batch, *_args, **_kwargs):
+                    # flow_sde_sampling reads the full pre-shard noise from
+                    # rollout_session_data.noise_buffer to compute log_prob, so
+                    # the mock must populate it alongside returning the
+                    # (single-GPU trivially-sharded) noise.
+                    scheduler._get_rollout_session_data(  # type: ignore[attr-defined]
+                        _batch
+                    ).noise_buffer = variance_noise
+                    return variance_noise
+
                 scheduler._rollout_variance_noise = (  # type: ignore[method-assign]
-                    lambda _batch, *_args, **_kwargs: variance_noise
+                    _mock_rollout_variance_noise
                 )
 
                 prev_sgl = scheduler.flow_sde_sampling(
@@ -276,6 +329,57 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                         atol,
                         msg=f"{sde_type} seed={seed} {name} max_abs={err:.9f}",
                     )
+
+    def test_sde_cps_force_fp32_with_bf16_model_output(self):
+        """Regression for PyTorch's wrapped-scalar promotion trap: a 0-dim
+        fp32 ``noise_std_dev`` multiplied by an N-dim bf16 tensor silently
+        demotes to bf16, which would corrupt log-prob precision. SDE/CPS
+        branches therefore cast ``model_output.float()`` at entry. Passing
+        bf16 ``model_output`` must still yield an fp32 noise buffer and
+        an fp32 log-prob sum."""
+        scheduler = _DummyScheduler()
+        current_sigma = torch.tensor(0.5, dtype=torch.float32)
+        next_sigma = torch.tensor(0.3, dtype=torch.float32)
+        shape = (1, 16, 1, 32, 32)
+        pipeline_config = types.SimpleNamespace(
+            shard_latents_for_sp=lambda batch, latents: (latents, False)
+        )
+
+        for sde_type in ("sde", "cps"):
+            batch = self._build_batch(sde_type=sde_type, shape=shape)
+            scheduler.release_rollout_resources(batch)
+            scheduler.prepare_rollout(batch=batch, pipeline_config=pipeline_config)
+
+            g = torch.Generator(device="cpu").manual_seed(0)
+            model_output = torch.randn(shape, generator=g, dtype=torch.float32).to(
+                torch.bfloat16
+            )
+            sample = torch.randn(shape, generator=g, dtype=torch.float32)
+
+            # Use the real _rollout_variance_noise (no mock) so its dtype
+            # propagates from the (original) model_output.dtype into the
+            # noise buffer. If flow_sde_sampling fails to cast to fp32 at
+            # entry, the buffer is bf16 → log_prob becomes bf16.
+            scheduler.flow_sde_sampling(
+                batch,
+                model_output=model_output,
+                sample=sample,
+                current_sigma=current_sigma,
+                next_sigma=next_sigma,
+                generator=g,
+            )
+            log_prob_sum, _count = scheduler.consume_local_rollout_log_probs(batch)
+            self.assertEqual(
+                log_prob_sum.dtype,
+                torch.float32,
+                msg=f"{sde_type}: log_prob_sum must be fp32 with bf16 model_output",
+            )
+            noise_buffer = scheduler._get_rollout_session_data(batch).noise_buffer
+            self.assertEqual(
+                noise_buffer.dtype,
+                torch.float32,
+                msg=f"{sde_type}: noise_buffer must be fp32 with bf16 model_output",
+            )
 
 
 if __name__ == "__main__":
