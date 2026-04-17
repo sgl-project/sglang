@@ -446,7 +446,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         # Encoder Disaggregation
         self.encoder_url_registry = None
         if self.server_args.language_only:
-            from sglang.srt.disaggregation.encoder_bootstrap_server import (
+            from sglang.srt.disaggregation.encode_server import (
                 EncoderURLRegistry,
             )
 
