@@ -23,7 +23,7 @@ ARG GPU_ARCH=gfx950
 # Base image 942 with rocm700 and args
 FROM $BASE_IMAGE_942 AS gfx942
 ENV BUILD_VLLM="0"
-ENV BUILD_TRITON="0"
+ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
@@ -43,7 +43,7 @@ ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 # Base image 950 and args
 FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
-ENV BUILD_TRITON="0"
+ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
@@ -75,8 +75,10 @@ ARG SGL_BRANCH=${SGL_DEFAULT}
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
-ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
-ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
+# triton version align with vllm docker file https://github.com/vllm-project/vllm/blob/main/docker/Dockerfile.rocm_base
+# See https://github.com/ROCm/triton-internal/issues/1542, otherwise moe and gemm kernels will cause VGPR spills
+ARG TRITON_REPO="https://github.com/ROCm/triton.git"
+ARG TRITON_COMMIT="57c693b6"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
@@ -451,7 +453,7 @@ txt = meta.read_text(encoding="utf-8")
 # Example: replace one exact requirement form.
 # Adjust the string to match what you actually see.
 pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
-txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
+txt2, n = re.subn(pat, r"triton>=3.4.0;", txt, flags=re.MULTILINE)
 if txt2 == txt:
     raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
 meta.write_text(txt2, encoding="utf-8")

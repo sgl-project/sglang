@@ -242,7 +242,7 @@ class BenchmarkWorker:
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        self.device_id = 0
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
@@ -272,8 +272,6 @@ class BenchmarkWorker:
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
         N = shard_intermediate_size // 2
-        if use_int4_w4a16:
-            N = N // 2
         op_config = get_moe_configs(
             num_experts,
             N,
@@ -375,6 +373,9 @@ def main(args: argparse.Namespace):
     model_config = get_model_config(
         args.model, args.tp_size, args.ep_size, args.disable_shared_experts_fusion
     )
+
+    print(f"{args=}")
+    print(f"{model_config=}")
 
     E = model_config["num_experts"]
     topk = model_config["topk"]

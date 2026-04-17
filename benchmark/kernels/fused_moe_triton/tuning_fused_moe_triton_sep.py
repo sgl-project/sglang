@@ -23,12 +23,8 @@ from common_utils import (
 from ray.experimental.tqdm_ray import tqdm
 
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-    get_config_dtype_str,
     invoke_fused_moe_kernel,
     moe_align_block_size,
-)
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
-    get_config_file_name,
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -37,6 +33,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.hf_transformers_utils import get_config
 
 _is_hip = is_hip()
 
@@ -47,6 +44,19 @@ class MoeInputs:
     sorted_token_ids: torch.Tensor
     expert_ids: torch.Tensor
     num_tokens_post_padded: torch.Tensor
+
+
+@dataclasses.dataclass
+class MoeLayerNums:
+    num_layers: int = 61
+    dense_layers: int = 3
+
+    @property
+    def moe_layers(self) -> int:
+        return self.num_layers - self.dense_layers
+
+
+_moe_layer_nums: MoeLayerNums = None
 
 
 class KernelWrapper:
@@ -116,10 +126,34 @@ class KernelWrapper:
         return time_cost
 
 
-def load_topk_ids(topk_ids_dir, i: int):
+def set_moe_layer_nums(model_name):
+    config = get_config(model_name, trust_remote_code=True)
+
+    # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
+    if hasattr(config, "text_config"):
+        config = config.get_text_config()
+
     num_layers = 61
     dense_layers = 3
+
+    if hasattr(config, "num_hidden_layers"):
+        num_layers = config.num_hidden_layers
+    if hasattr(config, "first_k_dense_replace"):
+        dense_layers = config.first_k_dense_replace
+
+    global _moe_layer_nums
+    _moe_layer_nums = MoeLayerNums(num_layers=num_layers, dense_layers=dense_layers)
+    print(f"{_moe_layer_nums=}")
+
+
+def load_topk_ids(topk_ids_dir, i: int):
+    assert (
+        _moe_layer_nums is not None
+    ), "Call set_moe_layer_nums() before load_topk_ids()"
+    num_layers = _moe_layer_nums.num_layers
+    dense_layers = _moe_layer_nums.dense_layers
     moe_layers = num_layers - dense_layers
+
     return torch.load(
         f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
     )
@@ -374,15 +408,30 @@ def benchmark_config(
 
     use_cuda_graph = True if not ncu_enable else False
 
+    enable_tma = True
+    # fused_moe_kernel_gptq_awq kernel currently don't support tma
+    if (
+        (use_int8_w8a16 or use_int4_w4a16)
+        and block_shape is not None
+        and block_shape[1] > 0
+    ):
+        enable_tma = False
+
+    # hip currently don't support tma
+    if is_hip:
+        enable_tma = False
+
     kernel0, kernel1 = get_kernel_wrapper(False, inner_iter, use_cuda_graph)
-    kernel_tma0, kernel_tma1 = get_kernel_wrapper(True, inner_iter, use_cuda_graph)
+    if enable_tma:
+        kernel_tma0, kernel_tma1 = get_kernel_wrapper(True, inner_iter, use_cuda_graph)
 
     # JIT compilation & warmup
     if not ncu_enable:
         kernel0.forward_cost()
         kernel1.forward_cost()
-        kernel_tma0.forward_cost()
-        kernel_tma1.forward_cost()
+        if enable_tma:
+            kernel_tma0.forward_cost()
+            kernel_tma1.forward_cost()
 
     ts0 = []
     ts1 = []
@@ -393,14 +442,19 @@ def benchmark_config(
         prepare(i, inner_iter)
         ts0.append(kernel0.forward_cost())
         ts1.append(kernel1.forward_cost())
-        ts_tma0.append(kernel_tma0.forward_cost())
-        ts_tma1.append(kernel_tma1.forward_cost())
+        if enable_tma:
+            ts_tma0.append(kernel_tma0.forward_cost())
+            ts_tma1.append(kernel_tma1.forward_cost())
     torch.cuda.synchronize()
 
     avg = sum(ts0) / (num_iters) * 1000  # us
     avg1 = sum(ts1) / (num_iters) * 1000  # us
-    avg_tma = sum(ts_tma0) / (num_iters) * 1000  # us
-    avg1_tma = sum(ts_tma1) / (num_iters) * 1000  # us
+    if enable_tma:
+        avg_tma = sum(ts_tma0) / (num_iters) * 1000  # us
+        avg1_tma = sum(ts_tma1) / (num_iters) * 1000  # us
+    else:
+        avg_tma = float("inf")
+        avg1_tma = float("inf")
 
     return avg, avg_tma, avg1, avg1_tma
 
@@ -632,22 +686,19 @@ def save_configs_sep(
     block_shape: List[int],
     down_moe: bool = False,
 ) -> None:
-    dtype_str = get_config_dtype_str(
-        dtype,
-        use_int8_w8a16=use_int8_w8a16,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int4_w4a16=use_int4_w4a16,
-    )
-
-    # NOTE(woosuk): The current naming convention uses w2.shape[2], which
-    # is the intermediate size after silu_and_mul.
-    filename = get_config_file_name(
+    filename = get_config_filename(
         num_experts,
-        shard_intermediate_size // 2,
-        dtype_str,
+        shard_intermediate_size,
+        hidden_size,
+        topk,
+        dtype,
+        use_fp8_w8a8,
+        use_int8_w8a8,
+        use_int8_w8a16,
+        use_int4_w4a16,
+        False,
         block_shape,
-        down_moe=down_moe,
+        down_moe,
     )
 
     print(f"Writing best config to {filename}...")
@@ -658,6 +709,8 @@ def save_configs_sep(
 
 def main(args: argparse.Namespace):
     print(args)
+
+    set_moe_layer_nums(args.model)
 
     server_args = ServerArgs(
         model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
@@ -878,7 +931,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int8_w4a16"],
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int4_w4a16"],
         default="auto",
     )
     parser.add_argument("--seed", type=int, default=0)
