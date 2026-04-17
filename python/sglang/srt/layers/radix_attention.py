@@ -148,6 +148,12 @@ def unified_attention_with_output(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    # MLA / TRT-LLM / NSA paths pass these through RadixAttention.forward(**kwargs);
+    # they must appear in the schema when --enforce-piecewise-cuda-graph is on.
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> None:
     context = get_forward_context()
     forward_batch = context.forward_batch
@@ -166,6 +172,14 @@ def unified_attention_with_output(
         kwargs["k_rope"] = k_rope[:real_num_tokens]
     if sinks is not None:
         kwargs["sinks"] = sinks
+    if cos_sin_cache is not None:
+        kwargs["cos_sin_cache"] = cos_sin_cache
+    if is_neox is not None:
+        kwargs["is_neox"] = is_neox
+    if llama_4_scaling is not None:
+        kwargs["llama_4_scaling"] = llama_4_scaling
+    if topk_indices is not None:
+        kwargs["topk_indices"] = topk_indices
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_out_cache_loc_swa = forward_batch.out_cache_loc_swa

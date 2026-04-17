@@ -11,6 +11,11 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_nsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
@@ -71,6 +76,49 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+
+
+if _is_cuda:
+    from sglang.srt.utils.custom_op import register_custom_op
+
+    @register_custom_op(mutates_args=["topk_result"])
+    @register_split_op()
+    def k_cache_and_topk_result(
+        layer_id: int,
+        key: torch.Tensor,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        topk_result: torch.Tensor,
+    ) -> None:
+        assert (
+            _is_cuda
+        ), "Internal error: piecewise cuda graph is only supported on CUDA"
+        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+
+        forward_batch = get_forward_context().forward_batch
+        indexer = get_forward_context().nsa_indexers[layer_id]
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+
+        # slice off padding from piecewise cuda graph
+        extend_num_tokens = forward_batch.extend_num_tokens
+
+        indexer._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key[:extend_num_tokens],
+            act_quant=act_quant,
+        )
+        indexer._get_topk_ragged(
+            False,
+            forward_batch,
+            layer_id,
+            q_fp8[:extend_num_tokens],
+            weights,
+            metadata,
+            topk_result,
+        )
 
 
 class BaseIndexerMetadata(ABC):
@@ -553,6 +601,7 @@ class Indexer(MultiPlatformOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        topk_result: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
@@ -586,9 +635,10 @@ class Indexer(MultiPlatformOp):
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
 
-        topk_result = torch.full(
-            (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
-        )
+        if topk_result is None:
+            topk_result = torch.full(
+                (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
+            )
         if batch_size == 0:
             return topk_result
 
@@ -773,6 +823,9 @@ class Indexer(MultiPlatformOp):
         actual_seq_q: int,
         cp_index: List[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
+        assert (
+            not is_in_piecewise_cuda_graph()
+        ), "NSA CP path (_get_topk_ragged_with_cp) not supported under piecewise CUDA graph"
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
@@ -919,6 +972,9 @@ class Indexer(MultiPlatformOp):
         topk: int,
         layer_id: int,
     ) -> Optional[torch.Tensor]:
+        assert (
+            not is_in_piecewise_cuda_graph()
+        ), "NSA forward_indexer (non-CUDA loop path) not supported under piecewise CUDA graph"
         if not _is_npu:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import fp8_index
 
@@ -1101,7 +1157,10 @@ class Indexer(MultiPlatformOp):
         # Determine if should skip topk based on sequence length
         # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
-        if forward_batch.forward_mode.is_extend_without_speculative():
+        if (
+            not is_in_piecewise_cuda_graph()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
@@ -1154,7 +1213,7 @@ class Indexer(MultiPlatformOp):
                         act_quant=act_quant,
                     )
                 current_stream.wait_stream(self.alt_stream)
-            else:
+            elif not is_in_piecewise_cuda_graph():
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
@@ -1162,6 +1221,10 @@ class Indexer(MultiPlatformOp):
                     key=key,
                     act_quant=act_quant,
                 )
+            else:
+                # piecewise CUDA graph need to split graph on store_k_cache and mqa_logits,
+                # so cannot use dual stream and delay store_k_cache after weights proj.
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
             # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
@@ -1269,6 +1332,24 @@ class Indexer(MultiPlatformOp):
                         actual_seq_q_next,
                     )
                     return torch.cat([topk_result_prev, topk_result_next], dim=0)
+                elif is_in_piecewise_cuda_graph():
+                    assert (
+                        not enable_dual_stream
+                    ), "Internal error: piecewise CUDA graph should not be enabled with dual stream"
+
+                    topk_result = torch.full(
+                        (q_fp8.shape[0], self.index_topk),
+                        -1,
+                        device=q_fp8.device,
+                        dtype=torch.int32,
+                    )
+                    k_cache_and_topk_result(
+                        layer_id=layer_id,
+                        key=key,
+                        q_fp8=q_fp8,
+                        weights=weights,
+                        topk_result=topk_result,
+                    )
                 else:
                     topk_result = self._get_topk_ragged(
                         enable_dual_stream,
