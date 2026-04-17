@@ -1471,6 +1471,7 @@ def get_attn_cp_group() -> GroupCoordinator:
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
+_DWDP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -1486,6 +1487,23 @@ def get_moe_ep_group() -> GroupCoordinator:
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
+
+
+def get_dwdp_group() -> GroupCoordinator:
+    assert _DWDP is not None, "DWDP group is not initialized"
+    return _DWDP
+
+
+def get_dwdp_rank() -> int:
+    if _DWDP is None:
+        return 0
+    return _DWDP.rank_in_group
+
+
+def get_dwdp_world_size() -> int:
+    if _DWDP is None:
+        return 1
+    return _DWDP.world_size
 
 
 # kept for backward compatibility
@@ -1717,6 +1735,7 @@ def initialize_model_parallel(
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
+    dwdp_size: int = 1,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1960,6 +1979,13 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_tp",
         )
+
+    # Build the DWDP group (alias to TP group when dwdp_size == tp_size).
+    global _DWDP
+    if dwdp_size > 1:
+        assert _DWDP is None, "DWDP group is already initialized"
+        # Since dwdp_size == tp_size is enforced, DWDP group = TP group
+        _DWDP = _TP
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
@@ -2217,6 +2243,18 @@ def destroy_model_parallel():
     if _MOE_DP:
         _MOE_DP.destroy()
     _MOE_DP = None
+
+    # DWDP: cleanup manager resources before destroying the group
+    from sglang.srt.layers.moe.dwdp import get_global_dwdp_manager, set_global_dwdp_manager
+
+    dwdp_mgr = get_global_dwdp_manager()
+    if dwdp_mgr is not None:
+        dwdp_mgr.cleanup()
+        set_global_dwdp_manager(None)
+
+    # DWDP group is aliased to TP group, so don't destroy it separately
+    global _DWDP
+    _DWDP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]

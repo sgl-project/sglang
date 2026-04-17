@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, List, Union
 
 import torch
 
@@ -255,6 +255,18 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     # _dummy_run which runs under inference_mode(); inference tensors cannot
     # be inplace-updated during later CUDA graph capture (which runs outside
     # inference_mode), so we must opt out here.
+    from sglang.srt.layers.moe.dwdp import enable_dwdp
+
+    if enable_dwdp():
+        # DWDP: wrapper sees all routed experts, offset=0
+        num_local_experts_for_wrapper = layer._num_global_routed
+        local_expert_offset_for_wrapper = 0
+    else:
+        num_local_experts_for_wrapper = layer.num_local_experts
+        local_expert_offset_for_wrapper = (
+            layer.moe_ep_rank * layer.num_local_experts
+        )
+
     with torch.inference_mode(False):
         layer._cutedsl_wrapper = CuteDslMoEWrapper(
             num_experts=layer.num_experts,
@@ -263,8 +275,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             intermediate_size=layer.intermediate_size_per_partition,
             use_cuda_graph=use_cuda_graph,
             max_num_tokens=max_num_tokens,
-            num_local_experts=layer.num_local_experts,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            num_local_experts=num_local_experts_for_wrapper,
+            local_expert_offset=local_expert_offset_for_wrapper,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
         )
@@ -283,22 +295,27 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
 
 @dataclass
 class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
-    """Quantization payload consumed by FlashInfer CuteDSL FP4 MoE kernels."""
+    """Quantization payload consumed by FlashInfer CuteDSL FP4 MoE kernels.
+
+    Weight fields accept either a single Tensor (standard path) or a
+    List[Tensor] (DWDP multi-B path where each entry corresponds to a
+    different DWDP rank's expert weights).
+    """
 
     # Lazily-created CuteDslMoEWrapper (stashed on layer)
     wrapper: Any
 
     # Weights (uint8 FP4 packed)
-    w13_weight: torch.Tensor
-    w2_weight: torch.Tensor
+    w13_weight: Union[torch.Tensor, List[torch.Tensor]]
+    w2_weight: Union[torch.Tensor, List[torch.Tensor]]
 
     # Block-scale factors
-    w13_weight_sf: torch.Tensor
-    w2_weight_sf: torch.Tensor
+    w13_weight_sf: Union[torch.Tensor, List[torch.Tensor]]
+    w2_weight_sf: Union[torch.Tensor, List[torch.Tensor]]
 
     # Per-expert GEMM scales
-    w1_alpha: torch.Tensor
-    w2_alpha: torch.Tensor
+    w1_alpha: Union[torch.Tensor, List[torch.Tensor]]
+    w2_alpha: Union[torch.Tensor, List[torch.Tensor]]
 
     # Intermediate quantization scale (fc2 input)
     fc2_input_scale: torch.Tensor
@@ -336,6 +353,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         is_sf_swizzled_layout=False,
     )
 
+    # CuteDSL multi-B API accepts List[Tensor] natively for DWDP
     output = quant_info.wrapper.run(
         x=x_fp4,
         x_sf=x_sf,

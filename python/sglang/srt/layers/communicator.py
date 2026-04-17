@@ -365,12 +365,15 @@ class LayerScatterModes:
     @classmethod
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
+            from sglang.srt.layers.moe.dwdp import enable_dwdp
+
             return (
                 ScatterMode.SCATTERED
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 if (
                     not get_moe_a2a_backend().is_none()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    or enable_dwdp()
                 )
                 else ScatterMode.FULL
             )

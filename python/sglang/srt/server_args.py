@@ -547,6 +547,8 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
+    dwdp_size: int = 1
+    dwdp_num_experts_per_worker: Optional[int] = None
     elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
@@ -826,6 +828,9 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+
+        # Handle DWDP (must be before data parallelism).
+        self._handle_dwdp()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -2754,6 +2759,49 @@ class ServerArgs:
             assert (
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
+
+    def _handle_dwdp(self):
+        if self.dwdp_size <= 1:
+            return
+
+        # Validations
+        assert self.dwdp_size == self.tp_size, (
+            f"dwdp_size ({self.dwdp_size}) must equal tp_size ({self.tp_size})"
+        )
+        assert self.quantization == "modelopt_fp4", (
+            "DWDP requires modelopt_fp4 quantization"
+        )
+        assert self.moe_runner_backend in ("flashinfer_cutedsl", "auto"), (
+            "DWDP requires flashinfer_cutedsl moe_runner_backend"
+        )
+        if self.moe_runner_backend == "auto":
+            self.moe_runner_backend = "flashinfer_cutedsl"
+        assert not self.enable_eplb, "DWDP is incompatible with EPLB"
+        assert self.disaggregation_mode != "decode", (
+            "DWDP is not supported on decode-only instances"
+        )
+
+        # Auto-force common settings
+        self.dp_size = self.tp_size
+        self.enable_dp_attention = True
+        self.moe_dense_tp_size = 1
+        self.ep_size = self.dwdp_size
+        self.moe_dp_size = 1
+
+        # Mode-specific settings
+        if self.disaggregation_mode == "prefill":
+            self.moe_a2a_backend = "none"
+        else:
+            # Hybrid mode: extend→DWDP, decode→EP
+            self.enable_mixed_chunk = False
+            if self.moe_a2a_backend == "none":
+                self.moe_a2a_backend = "deepep"
+
+        logger.info(
+            f"DWDP enabled: dwdp_size={self.dwdp_size}, dp_size={self.dp_size}, "
+            f"ep_size={self.ep_size}, moe_a2a_backend={self.moe_a2a_backend}, "
+            f"enable_mixed_chunk={self.enable_mixed_chunk}"
+        )
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -5395,6 +5443,23 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dense_tp_size,
             help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+        )
+        parser.add_argument(
+            "--dwdp-size",
+            type=int,
+            default=ServerArgs.dwdp_size,
+            help="Number of ranks per DWDP (Distributed Weight Data Parallelism) group. "
+            "When > 1, enables DWDP for MoE prefill: weights are prefetched via NVLink "
+            "and all tokens are processed locally, eliminating all-to-all overhead. "
+            "Must equal tp_size. Default: 1 (disabled).",
+        )
+        parser.add_argument(
+            "--dwdp-num-experts-per-worker",
+            type=int,
+            default=ServerArgs.dwdp_num_experts_per_worker,
+            help="Number of experts stored locally per rank for DWDP. "
+            "Default: num_routed_experts // dwdp_size (equal partition). "
+            "Set higher for overlapping allocation to reduce NVLink prefetch volume.",
         )
         parser.add_argument(
             "--elastic-ep-backend",

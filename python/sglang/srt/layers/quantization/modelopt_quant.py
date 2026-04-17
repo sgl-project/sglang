@@ -1915,6 +1915,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     requires_grad=False,
                 )
 
+            # Register weights with DWDP manager for IPC handle exchange
+            from sglang.srt.layers.moe.dwdp import enable_dwdp, get_global_dwdp_manager
+
+            if enable_dwdp():
+                get_global_dwdp_manager().register_layer_weights(
+                    layer_id=layer.layer_id,
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    w13_weight_sf=layer.w13_blockscale_mma,
+                    w2_weight_sf=layer.w2_blockscale_mma,
+                    w1_alpha=layer.g1_alphas,
+                    w2_alpha=layer.g2_alphas,
+                )
+
             # Both flashinfer cutlass and regular cutlass use same processing for w2
 
             # Set up CUTLASS MoE parameters (reuse to keep CUDA graph stable)

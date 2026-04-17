@@ -400,6 +400,10 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
 
+        from sglang.srt.layers.moe.dwdp import enable_dwdp
+
+        self._dwdp_enabled = enable_dwdp()
+
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -588,6 +592,16 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
+        # DWDP path: extend (prefill) batches only
+        if (
+            self._dwdp_enabled
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_extend()
+        ):
+            return self.forward_dwdp(
+                hidden_states, forward_batch, gemm_output_zero_allocator
+            )
+
         if not self._enable_a2a_moe:
             if (
                 self.alt_stream is not None
@@ -610,6 +624,60 @@ class DeepseekV2MoE(nn.Module):
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_dwdp(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ) -> torch.Tensor:
+        """DWDP forward path: all tokens stay on-rank, use prefetched weights."""
+        from sglang.srt.layers.moe.dwdp import get_global_dwdp_manager
+
+        dwdp_manager = get_global_dwdp_manager()
+
+        # Shared experts (same as forward_normal)
+        if hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0:
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
+        else:
+            shared_output = None
+
+        # Router + top-k (no EPLB dispatch_info)
+        if hidden_states.shape[0] > 0:
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            shared_output = None
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        # Get DWDP multi-B weight view (prefetched peer weights + local weights)
+        weight_view = dwdp_manager.get_weight_view(self.layer_id)
+
+        # Call FusedMoE.forward_dwdp() — bypasses dispatcher and uses
+        # multi-B List[Tensor] weights via CuteDSL runner
+        final_hidden_states = self.experts.forward_dwdp(
+            hidden_states, topk_output, weight_view
+        )
+
+        if (
+            not _is_cuda
+            and not _is_xpu
+            and not _use_aiter
+            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        ):
+            final_hidden_states *= self.routed_scaling_factor
+
+        # Record compute done + trigger next layer's prefetch
+        dwdp_manager.record_compute_and_prefetch_next(self.layer_id)
+
+        # Accumulate shared experts (same as forward_normal)
+        if shared_output is not None:
+            final_hidden_states += shared_output
+
+        # NO tensor_model_parallel_all_reduce — each rank is fully independent
+        return final_hidden_states
 
     def forward_normal_dual_stream(
         self,

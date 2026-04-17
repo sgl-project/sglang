@@ -209,7 +209,18 @@ class FusedMoE(torch.nn.Module):
 
         assert (num_experts - num_shared_slots) % self.moe_ep_size == 0
         self._num_global_routed = num_experts - num_shared_slots
-        self._num_local_routed = self._num_global_routed // self.moe_ep_size
+
+        from sglang.srt.layers.moe.dwdp import enable_dwdp, get_global_dwdp_manager
+
+        self._dwdp_enabled = enable_dwdp()
+        if self._dwdp_enabled:
+            dwdp_layout = get_global_dwdp_manager().expert_layout
+            self._num_local_routed = dwdp_layout.num_experts_per_worker
+            self._dwdp_local_expert_start = dwdp_layout.local_expert_start
+        else:
+            self._num_local_routed = self._num_global_routed // self.moe_ep_size
+            self._dwdp_local_expert_start = None
+
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
 
@@ -571,7 +582,10 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        start_idx = self.moe_ep_rank * self._num_local_routed
+        if self._dwdp_enabled:
+            start_idx = self._dwdp_local_expert_start
+        else:
+            start_idx = self.moe_ep_rank * self._num_local_routed
         end_idx = start_idx + self._num_local_routed
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
@@ -1038,6 +1052,56 @@ class FusedMoE(torch.nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
+
+    def forward_dwdp(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output,
+        weight_view,
+    ) -> torch.Tensor:
+        """DWDP forward: all experts, weights from prefetch buffer.
+
+        Bypasses dispatcher.dispatch()/combine() entirely — tokens stay
+        on-rank and expert IDs remain in global space for CuteDSL multi-B.
+        """
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+            CuteDslFp4MoeQuantInfo,
+            ensure_cutedsl_wrapper,
+            fused_experts_none_to_flashinfer_cutedsl_fp4,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+
+        ensure_cutedsl_wrapper(self)
+
+        # Construct StandardDispatchOutput directly — no dispatcher mapping
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_output=topk_output,
+        )
+
+        # Build CuteDslFp4MoeQuantInfo with multi-B List[Tensor] weights
+        quant_info = CuteDslFp4MoeQuantInfo(
+            wrapper=self._cutedsl_wrapper,
+            w13_weight=weight_view.w13_weights,
+            w2_weight=weight_view.w2_weights,
+            w13_weight_sf=weight_view.w13_weight_sfs,
+            w2_weight_sf=weight_view.w2_weight_sfs,
+            w1_alpha=weight_view.w1_alphas,
+            w2_alpha=weight_view.w2_alphas,
+            fc2_input_scale=self._cutedsl_scales[1],
+            input_scale=self._cutedsl_input_scale,
+        )
+
+        # Call fused function directly, bypassing quant_method.apply()
+        combine_input = fused_experts_none_to_flashinfer_cutedsl_fp4(
+            dispatch_output=dispatch_output,
+            quant_info=quant_info,
+            runner_config=self.moe_runner_config,
+        )
+        return combine_input.hidden_states
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
