@@ -371,6 +371,7 @@ class Mistral3Model(nn.Module):
 
 
 class Mistral3ForConditionalGeneration(nn.Module):
+    _aliases = ["Mistral3Model"]
     _checkpoint_conversion_mapping = {
         "^language_model.model": "model.language_model",
         "^multi_modal_projector": "model.multi_modal_projector",
