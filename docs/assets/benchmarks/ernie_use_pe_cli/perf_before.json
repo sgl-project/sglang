@@ -1,0 +1,97 @@
+{
+  "timestamp": "2026-04-17T19:27:26.463720+00:00",
+  "request_id": "eef4e555-4a64-4666-9803-4abf1a36a4bf",
+  "commit_hash": "5d4e899477adb5934459eb05f264d31de11fb984",
+  "tag": "cli_generate",
+  "total_duration_ms": 777.1180889103562,
+  "steps": [
+    {
+      "name": "InputValidationStage",
+      "duration_ms": 0.02711080014705658
+    },
+    {
+      "name": "PromptEnhancementStage",
+      "duration_ms": 0.00793207436800003
+    },
+    {
+      "name": "TextEncodingStage",
+      "duration_ms": 20.014503970742226
+    },
+    {
+      "name": "TimestepPreparationStage",
+      "duration_ms": 0.2459899988025427
+    },
+    {
+      "name": "LatentPreparationStage",
+      "duration_ms": 0.06711017340421677
+    },
+    {
+      "name": "DenoisingStage",
+      "duration_ms": 746.346163097769
+    },
+    {
+      "name": "DecodingStage",
+      "duration_ms": 8.85695405304432
+    }
+  ],
+  "denoise_steps_ms": [
+    {
+      "step": 0,
+      "duration_ms": 51.38036189600825
+    },
+    {
+      "step": 1,
+      "duration_ms": 75.5519240628928
+    },
+    {
+      "step": 2,
+      "duration_ms": 76.26888807862997
+    },
+    {
+      "step": 3,
+      "duration_ms": 77.22957106307149
+    },
+    {
+      "step": 4,
+      "duration_ms": 77.3142441175878
+    },
+    {
+      "step": 5,
+      "duration_ms": 78.08951195329428
+    },
+    {
+      "step": 6,
+      "duration_ms": 77.40418892353773
+    },
+    {
+      "step": 7,
+      "duration_ms": 76.90730202011764
+    },
+    {
+      "step": 8,
+      "duration_ms": 76.87418488785625
+    },
+    {
+      "step": 9,
+      "duration_ms": 76.88715518452227
+    }
+  ],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 30338.14,
+      "reserved_mb": 32676.0,
+      "peak_allocated_mb": 30338.14,
+      "peak_reserved_mb": 32676.0
+    },
+    "after_forward": {
+      "allocated_mb": 30341.59,
+      "reserved_mb": 32678.0,
+      "peak_allocated_mb": 31557.84,
+      "peak_reserved_mb": 32678.0
+    }
+  },
+  "meta": {
+    "prompt": "A cinematic photo of a glass teapot filled with glowing green tea on a wooden table, morning sunlight, sharp details",
+    "model": "/root/.cache/huggingface/hub/models--baidu--ERNIE-Image-Turbo/snapshots/bc68c81e2a1730a394d5fc9fae70713dee940140"
+  }
+}

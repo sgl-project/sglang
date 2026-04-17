@@ -886,6 +886,11 @@ class SamplingParams:
             help="Enable sequence dimension shard with sequence parallelism.",
         )
         add_argument(
+            "--use-pe",
+            action=StoreBoolean,
+            help="Enable ERNIE-Image prompt enhancement for this request.",
+        )
+        add_argument(
             "--enable-frame-interpolation",
             action="store_true",
             help="Enable post-generation frame interpolation using RIFE 4.22.lite.",

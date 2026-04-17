@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.ernie_image import (
+    ErnieImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
     Flux2SamplingParams,
@@ -185,6 +188,9 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
     def _make_qwen_image_params(self, argv: list[str]) -> QwenImageSamplingParams:
         return QwenImageSamplingParams(**self._parse_cli_kwargs(argv))
 
+    def _make_ernie_image_params(self, argv: list[str]) -> ErnieImageSamplingParams:
+        return ErnieImageSamplingParams(**self._parse_cli_kwargs(argv))
+
     def test_get_cli_args_drops_unset_sampling_params(self):
         self.assertEqual(self._parse_cli_kwargs([]), {})
 
@@ -221,6 +227,18 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
 
         self.assertEqual(params.guidance_scale, SamplingParams.guidance_scale)
         self.assertEqual(params.negative_prompt, SamplingParams.negative_prompt)
+
+    def test_ernie_image_cli_path_preserves_prompt_enhancement_default(self):
+        params = self._make_ernie_image_params([])
+
+        self.assertTrue(params.use_pe)
+
+    def test_ernie_image_cli_path_allows_disabling_prompt_enhancement(self):
+        kwargs = self._parse_cli_kwargs(["--use-pe", "false"])
+        params = ErnieImageSamplingParams(**kwargs)
+
+        self.assertFalse(params.use_pe)
+        self.assertEqual(kwargs["use_pe"], False)
 
     def test_merge_allows_explicit_field_matching_base_default(self):
         target = DiffusersGenericSamplingParams()
