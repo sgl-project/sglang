@@ -313,7 +313,7 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang \
 --host 127.0.0.1 \
 --port 6688 \
---max-concurrency 1088  \
+--max-concurrency 1088 \
 --random-input-len 2048 \
 --random-output-len 2048 \
 --num-prompts 12800 \
@@ -591,7 +591,7 @@ Please Turn to [DeepSeek-R1 3_9K-1K 19ms on A3 32 Cards Disaggregation Mode](#de
 
 We tested it based on the `RANDOM` dataset.
 
-```bash
+```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -629,7 +629,7 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 32  \
+    --max-concurrency 32 \
     --random-input-len 3500 \
     --random-output-len 1024 \
     --num-prompts 32 \
@@ -813,7 +813,7 @@ do
         --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
-		--load-balance-method round_robin
+        --load-balance-method round_robin
         NODE_RANK=$i
         break
     fi
