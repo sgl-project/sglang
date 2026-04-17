@@ -15,6 +15,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
+    ZImageRolloutPipelineMixin,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_sp_parallel_rank,
@@ -40,7 +43,7 @@ class TransformersModelConfig(EncoderConfig):
 
 
 @dataclass
-class ZImagePipelineConfig(ImagePipelineConfig):
+class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)

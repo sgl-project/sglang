@@ -37,7 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
 
-register_cuda_ci(est_time=620, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=602, suite="stage-b-test-1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
@@ -425,11 +425,13 @@ class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=False,
             )
-        except RuntimeError as e:
-            if "meta" not in str(e):
+        except (RuntimeError, AttributeError) as e:
+            if isinstance(e, RuntimeError) and "meta" not in str(e):
                 raise
             # Transformers v5 always uses meta tensors for init, which breaks
             # models calling .item() in __init__ (e.g. InternVL's drop_path_rate).
+            # Transformers v5.5.3 may also raise AttributeError for remote-code
+            # models missing new internal attributes (e.g. all_tied_weights_keys).
             # Fall back to from_config + manual weight loading.
             import gc
             import glob
@@ -594,6 +596,13 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True
         )
+        # In transformers v5.5.3, AutoTokenizer may return TokenizersBackend
+        # which lacks model-specific attributes (e.g. im_start_id for MiniCPM-V).
+        # Replace with sglang's tokenizer which handles this via declared-class
+        # fallback, then fix added tokens encoding.
+        from sglang.srt.utils.hf_transformers import get_tokenizer
+
+        cls.processor.tokenizer = get_tokenizer(cls.model_path, trust_remote_code=True)
         _fix_added_tokens_encoding(cls.processor.tokenizer)
         cls._init_visual()
 
