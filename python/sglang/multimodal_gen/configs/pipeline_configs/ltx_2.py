@@ -19,7 +19,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
-    sequence_model_parallel_all_gather,
 )
 
 
@@ -117,6 +116,24 @@ def pack_text_embeds_v2(
 
 def is_ltx23_native_variant(arch_config: object) -> bool:
     return str(getattr(arch_config, "ltx_variant", "ltx_2")) == "ltx_2_3"
+
+
+def sync_ltx23_runtime_vae_markers(
+    arch_config: object,
+    loaded_vae_config: object | None,
+) -> None:
+    if loaded_vae_config is None:
+        return
+    source = getattr(loaded_vae_config, "arch_config", loaded_vae_config)
+    for key in (
+        "ltx_variant",
+        "condition_encoder_subdir",
+        "video_decoder_variant",
+        "video_decoder_config",
+    ):
+        value = getattr(source, key, None)
+        if value is not None:
+            setattr(arch_config, key, value)
 
 
 def _gemma_postprocess_func(
@@ -383,7 +400,7 @@ class LTX2PipelineConfig(PipelineConfig):
         if get_sp_world_size() <= 1:
             return latents
         if isinstance(latents, torch.Tensor) and latents.ndim == 3:
-            return sequence_model_parallel_all_gather(latents.contiguous(), dim=1)
+            return self._gather_sp_tensor(latents, dim=1)
         return super().gather_latents_for_sp(latents, batch=batch)
 
     def shard_audio_latents_for_sp(self, batch, audio_latents):
@@ -432,18 +449,21 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
     def gather_audio_latents_for_sp(self, audio_latents, batch):
+        """Gather packed audio latents after SP and trim any pad-only tail tokens."""
         if get_sp_world_size() <= 1:
             return audio_latents
         if not (isinstance(audio_latents, torch.Tensor) and audio_latents.ndim == 3):
             return audio_latents
 
-        audio_latents = sequence_model_parallel_all_gather(
-            audio_latents.contiguous(), dim=1
+        audio_latents = self._gather_sp_tensor(
+            audio_latents,
+            dim=1,
         )
-        orig_num_frames = int(batch.sp_audio_orig_num_frames)
-        if orig_num_frames > 0:
-            audio_latents = audio_latents[:, :orig_num_frames, :]
-        return audio_latents
+        return self._trim_sp_gather_padding(
+            audio_latents,
+            orig_len=getattr(batch, "sp_audio_orig_num_frames", None),
+            dim=1,
+        )
 
     def prepare_video_rope_coords_for_sp(
         self,
