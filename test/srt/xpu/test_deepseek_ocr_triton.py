@@ -6,7 +6,7 @@ import os
 import unittest
 from pathlib import Path
 
-import test_deepseek_ocr as deepseek_ocr
+from test_deepseek_ocr import TestDeepSeekOCR
 from transformers import AutoTokenizer
 
 from sglang.test.test_utils import (
@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
+class TestDeepSeekOCRTriton(TestDeepSeekOCR):
     @classmethod
     def setUpClass(cls):
         cls._cleanup_xpu_memory()
@@ -45,6 +45,10 @@ class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
                 *cls.common_args,
             ],
         )
+
+
+# Avoid pytest collecting the imported base test class in this module.
+del TestDeepSeekOCR
 
 
 if __name__ == "__main__":
