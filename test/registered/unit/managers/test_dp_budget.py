@@ -1,4 +1,10 @@
-"""Unit tests for DPBudget — field mapping and dispatch logic."""
+"""Unit tests for DPBudget — field mapping regression guard.
+
+This PR changed DPBudget.update_budget to read num_running_reqs +
+num_waiting_reqs and num_total_tokens from the new GetLoadsReqOutput.
+These tests lock in that mapping. Pre-existing dispatch logic is not
+retested here — it's covered by DP balance integration tests.
+"""
 
 import dataclasses
 import unittest
@@ -8,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.data_parallel_controller import DPBudget, LoadBalanceMethod
+from sglang.srt.managers.data_parallel_controller import DPBudget
 from sglang.srt.managers.io_struct import GetLoadsReqOutput, WatchLoadUpdateReq
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
@@ -47,8 +53,9 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.total_requests, [5, 6])
 
-    def test_maps_num_total_tokens_to_total_tokens(self):
-        # Reads num_total_tokens (used + pending prefill), not num_used_tokens.
+    def test_maps_num_total_tokens_not_num_used_tokens(self):
+        # Reads num_total_tokens (used + pending prefill), NOT num_used_tokens.
+        # A silent swap here would break DP balance for long-prompt workloads.
         budget = DPBudget(dp_size=2)
         budget.update_budget(
             WatchLoadUpdateReq(
@@ -78,42 +85,6 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.total_requests, [10, 2, 30])
         self.assertEqual(budget.total_tokens, [100, 50, 300])
-
-
-class TestDPBudgetDispatch(CustomTestCase):
-    def test_total_requests_picks_min_and_bumps(self):
-        budget = DPBudget(dp_size=3)
-        budget.total_requests = [5, 2, 8]
-        target = budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.assertEqual(target, 1)
-        # The chosen rank's request count is bumped by 1.
-        self.assertEqual(budget.total_requests[1], 3)
-
-    def test_total_tokens_picks_min_and_bumps_requests(self):
-        budget = DPBudget(dp_size=3)
-        budget.total_tokens = [500, 200, 800]
-        budget.total_requests = [1, 1, 1]
-        target = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
-        self.assertEqual(target, 1)
-        # Requests counter gets bumped; total_tokens itself is unchanged.
-        self.assertEqual(budget.total_requests[1], 2)
-        self.assertEqual(budget.total_tokens[1], 200)
-
-    def test_total_tokens_tiebreak_by_requests(self):
-        budget = DPBudget(dp_size=3)
-        budget.total_tokens = [100, 100, 100]
-        budget.total_requests = [5, 1, 3]
-        target = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
-        self.assertEqual(target, 1)
-
-    def test_unsupported_methods_return_none(self):
-        budget = DPBudget(dp_size=2)
-        for method in (
-            LoadBalanceMethod.ROUND_ROBIN,
-            LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM,
-        ):
-            with self.subTest(method=method):
-                self.assertIsNone(budget.dispatch(method))
 
 
 if __name__ == "__main__":

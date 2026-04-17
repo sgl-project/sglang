@@ -1,22 +1,17 @@
-"""Unit tests for /v1/loads helpers: _compute_aggregate and _loads_dict_factory."""
+"""Unit tests for /v1/loads _compute_aggregate.
+
+Narrow scope: lock in the semantic of new aggregate keys added by this PR
+(total_used_tokens vs total_tokens). Trivial helpers (dict filtering,
+zero-init branch) are not covered — they would just restate Python.
+"""
 
 import unittest
 
-from sglang.srt.entrypoints.v1_loads import _compute_aggregate, _loads_dict_factory
+from sglang.srt.entrypoints.v1_loads import _compute_aggregate
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
-
-
-_INT_AGG_KEYS = (
-    "total_running_reqs",
-    "total_waiting_reqs",
-    "total_reqs",
-    "total_used_tokens",
-    "total_tokens",
-)
-_FLOAT_AGG_KEYS = ("avg_token_usage", "avg_throughput", "avg_utilization")
 
 
 def _load(
@@ -43,23 +38,6 @@ def _load(
 
 
 class TestComputeAggregate(CustomTestCase):
-    def test_empty_input_zero_for_every_key(self):
-        agg = _compute_aggregate([])
-        for k in _INT_AGG_KEYS:
-            with self.subTest(key=k):
-                self.assertEqual(agg[k], 0)
-        for k in _FLOAT_AGG_KEYS:
-            with self.subTest(key=k):
-                self.assertEqual(agg[k], 0.0)
-
-    def test_single_dp_rank_sums(self):
-        agg = _compute_aggregate([_load(running=4, waiting=2, used=100, total=150)])
-        self.assertEqual(agg["total_running_reqs"], 4)
-        self.assertEqual(agg["total_waiting_reqs"], 2)
-        self.assertEqual(agg["total_reqs"], 6)
-        self.assertEqual(agg["total_used_tokens"], 100)
-        self.assertEqual(agg["total_tokens"], 150)
-
     def test_multi_dp_rank_sums(self):
         agg = _compute_aggregate(
             [
@@ -87,28 +65,11 @@ class TestComputeAggregate(CustomTestCase):
 
     def test_total_tokens_differs_from_total_used_tokens(self):
         # Regression: total_tokens sums num_total_tokens, NOT num_used_tokens.
+        # Gateway reads aggregate.total_tokens for DP load estimation, so a
+        # silent swap would under-report load.
         agg = _compute_aggregate([_load(used=10, total=30), _load(used=20, total=45)])
         self.assertEqual(agg["total_used_tokens"], 30)
         self.assertEqual(agg["total_tokens"], 75)
-
-
-class TestLoadsDictFactory(CustomTestCase):
-    def test_filters_none_values(self):
-        d = _loads_dict_factory(
-            [("dp_rank", 0), ("memory", None), ("num_used_tokens", 42)]
-        )
-        self.assertEqual(d, {"dp_rank": 0, "num_used_tokens": 42})
-
-    def test_strips_timestamp_key(self):
-        d = _loads_dict_factory(
-            [("dp_rank", 1), ("timestamp", 1234.5), ("num_used_tokens", 0)]
-        )
-        self.assertNotIn("timestamp", d)
-        self.assertEqual(d["dp_rank"], 1)
-
-    def test_keeps_zero_values(self):
-        d = _loads_dict_factory([("num_running_reqs", 0), ("token_usage", 0.0)])
-        self.assertEqual(d, {"num_running_reqs": 0, "token_usage": 0.0})
 
 
 if __name__ == "__main__":
