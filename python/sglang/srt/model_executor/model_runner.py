@@ -2398,20 +2398,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.attn_backend = self.decode_attn_backend
             else:
                 self.attn_backend.init_forward_metadata(forward_batch)
-        else:
-            # Update seq_lens_cpu_int after prepare_mlp_sync_batch may have modified seq_lens
-            # Use forward_batch.attn_backend if set (for speculative decoding), else use self.attn_backend
-            attn_backend = (
-                getattr(forward_batch, "attn_backend", None) or self.attn_backend
-            )
-            if (
-                hasattr(attn_backend, "forward_metadata")
-                and attn_backend.forward_metadata is not None
-                and attn_backend.forward_metadata.seq_lens_cpu_int is not None
-            ):
-                attn_backend.forward_metadata.seq_lens_cpu_int = (
-                    forward_batch.seq_lens.cpu().int()
-                )
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:

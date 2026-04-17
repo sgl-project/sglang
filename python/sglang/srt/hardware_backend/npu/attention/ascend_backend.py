@@ -1602,6 +1602,9 @@ class AscendAttnBackend(AttentionBackend):
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
+                    self.forward_metadata.seq_lens_cpu_int = (
+                        forward_batch.seq_lens.cpu().int()
+                    )
                     actual_seq_len_kv = (
                         self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                     )
