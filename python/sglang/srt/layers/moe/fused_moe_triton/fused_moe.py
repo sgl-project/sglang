@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -320,56 +320,30 @@ def _down_moe_use_tma():
     return support_tensor_descriptor()
 
 
-def fused_experts_impl(
+def _prepare_fused_moe_run(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    b1: Optional[torch.Tensor] = None,
-    b2: Optional[torch.Tensor] = None,
-    inplace: bool = False,
-    activation: str = "silu",
-    is_gated: bool = True,
-    apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    use_int8_w8a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    per_channel_quant: bool = False,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[List[int]] = None,
-    no_combine: bool = False,
-    routed_scaling_factor: Optional[float] = None,
-    gemm1_alpha: Optional[float] = None,
-    gemm1_limit: Optional[float] = None,
-    filter_expert: bool = True,
+    *,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    block_shape: Optional[List[int]],
 ):
+    """Resolve config, down_config, TMA flag, and aligned expert routing ids.
+
+    Shared by ``fused_experts_impl`` and ``pre_permute_standard_to_triton`` so
+    both paths compute alignment from the same source.
+    """
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
 
-    # Check constraints.
-    if use_int4_w4a16:
-        assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
-    else:
-        assert (
-            hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), f"Hidden size mismatch"
-    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
-    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.is_contiguous(), "Expert weights1 must be contiguous"
-    assert w2.is_contiguous(), "Expert weights2 must be contiguous"
-    assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
-
-    num_tokens, _ = hidden_states.shape
-    E, N, _ = w1.shape
-    M = num_tokens
+    num_tokens = hidden_states.shape[0]
+    E = w1.shape[0]
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -383,7 +357,7 @@ def fused_experts_impl(
         (w2.shape[0], w2.shape[1], w2.shape[2] - padded_size),
         topk_ids.shape[1],
         config_dtype,
-        M,
+        num_tokens,
         block_shape=block_shape,
         per_channel_quant=per_channel_quant,
         return_down_config=True,
@@ -393,13 +367,76 @@ def fused_experts_impl(
         and down_config is not None
         and down_config.pop("USE_TMA", False)
     )
-    topk = topk_ids.shape[1]
-    padded_tokens = (
-        min(M * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1) if down_moe_use_tma else 0
-    )
-    total_tokens = M * topk + padded_tokens
 
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, config["BLOCK_SIZE_M"], E
+    )
+
+    return (
+        config,
+        down_config,
+        down_moe_use_tma,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    )
+
+
+def _fused_moe_kernel_sequence(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    config: Dict[str, Any],
+    down_config: Optional[Dict[str, Any]],
+    down_moe_use_tma: bool,
+    *,
+    b1: Optional[torch.Tensor],
+    b2: Optional[torch.Tensor],
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    w1_scale: Optional[torch.Tensor],
+    w2_scale: Optional[torch.Tensor],
+    w1_zp: Optional[torch.Tensor],
+    w2_zp: Optional[torch.Tensor],
+    a1_scale: Optional[torch.Tensor],
+    a2_scale: Optional[torch.Tensor],
+    block_shape: Optional[List[int]],
+    activation: str,
+    is_gated: bool,
+    no_combine: bool,
+    inplace: bool,
+    apply_router_weight_on_input: bool,
+    routed_scaling_factor: Optional[float],
+    gemm1_alpha: Optional[float],
+    gemm1_limit: Optional[float],
+    filter_expert: bool,
+    hooks: Optional[Any] = None,
+) -> torch.Tensor:
+    """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
+
+    Inputs are already aligned and the block-size config is already resolved.
+    Supports optional LoRA hooks that fire between the two kernels and before
+    combine. Returns ``out_hidden_states``.
+    """
+    num_tokens = hidden_states.shape[0]
+    E, N, _ = w1.shape
+    topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+
+    padded_tokens = (
+        min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
+        if down_moe_use_tma
+        else 0
+    )
+    total_tokens = num_tokens * topk + padded_tokens
 
     if no_combine:
         assert not inplace
@@ -419,10 +456,6 @@ def fused_experts_impl(
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
-    )
-
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, config["BLOCK_SIZE_M"], E
     )
 
     intermediate_cache1 = torch.empty(
@@ -457,6 +490,9 @@ def fused_experts_impl(
         c_sorted=down_moe_use_tma,
         filter_expert=filter_expert,
     )
+
+    if hooks and hooks.after_gate_up:
+        hooks.after_gate_up(hidden_states, intermediate_cache1, topk_weights, topk_ids)
 
     intermediate_cache2 = torch.empty(
         (total_tokens, N // 2),
@@ -539,10 +575,14 @@ def fused_experts_impl(
     del intermediate_cache1
 
     intermediate_cache3 = torch.empty(
-        (M, topk, w2.shape[1]),
+        (num_tokens, topk, w2.shape[1]),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+
+    # LoRA hooks force the second kernel to write to intermediate_cache3 so
+    # hooks.after_down can inspect/modify it before reduction.
+    _use_intermediate = not no_combine and (topk != 1 or hooks)
 
     out_slice = None
     if use_fused_moe_sum_all_reduce:
@@ -558,7 +598,7 @@ def fused_experts_impl(
             if use_fused_moe_sum_all_reduce
             else (
                 intermediate_cache3
-                if not no_combine and topk != 1
+                if _use_intermediate
                 else out_hidden_states.unsqueeze(0)
             )
         ),
@@ -587,6 +627,11 @@ def fused_experts_impl(
         router_topk=topk,
     )
 
+    if hooks and hooks.after_down:
+        hooks.after_down(
+            intermediate_cache2, intermediate_cache3, topk_weights, topk_ids
+        )
+
     del intermediate_cache2
 
     if routed_scaling_factor is None:
@@ -599,8 +644,8 @@ def fused_experts_impl(
             if routed_scaling_factor != 1.0:
                 assert out_slice is not None
                 out_slice.mul_(routed_scaling_factor)
-        elif topk == 1 and routed_scaling_factor == 1.0:
-            pass  # we write directly into out_hidden_states
+        elif topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
+            pass  # we wrote directly into out_hidden_states
         elif topk == 2 and routed_scaling_factor == 1.0:
             torch.add(
                 intermediate_cache3[:, 0],
@@ -621,7 +666,6 @@ def fused_experts_impl(
                     out_hidden_states,
                     routed_scaling_factor,
                 )
-
     elif _is_hip:
         if _use_aiter:
             moe_sum(
@@ -665,6 +709,112 @@ def fused_experts_impl(
     del intermediate_cache3
 
     return out_hidden_states
+
+
+def fused_experts_impl(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
+    inplace: bool = False,
+    activation: str = "silu",
+    is_gated: bool = True,
+    apply_router_weight_on_input: bool = False,
+    use_fp8_w8a8: bool = False,
+    use_int8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
+):
+    padded_size = padding_size
+    if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
+        padded_size = 0
+
+    # Check constraints.
+    if use_int4_w4a16:
+        assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
+    else:
+        assert (
+            hidden_states.shape[1] == w1.shape[2] - padded_size
+        ), f"Hidden size mismatch"
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+    assert w1.is_contiguous(), "Expert weights1 must be contiguous"
+    assert w2.is_contiguous(), "Expert weights2 must be contiguous"
+    assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+    (
+        config,
+        down_config,
+        down_moe_use_tma,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    ) = _prepare_fused_moe_run(
+        hidden_states,
+        w1,
+        w2,
+        topk_ids,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        block_shape=block_shape,
+    )
+
+    return _fused_moe_kernel_sequence(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        config,
+        down_config,
+        down_moe_use_tma,
+        b1=b1,
+        b2=b2,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_shape=block_shape,
+        activation=activation,
+        is_gated=is_gated,
+        no_combine=no_combine,
+        inplace=inplace,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        routed_scaling_factor=routed_scaling_factor,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        filter_expert=filter_expert,
+        hooks=None,
+    )
 
 
 def fused_moe(
