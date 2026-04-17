@@ -23,6 +23,22 @@ class SchedulerConfig:
     backend_name: str = "sglang"
     backend_version: Optional[str] = None
 
+    @property
+    def attn_tp_size(self) -> int:
+        return self.tp_size / self.dp_size
+
+    @property
+    def attn_dp_size(self) -> int:
+        return self.dp_size
+
+    @property
+    def moe_tp_size(self) -> int:
+        return self.tp_size / self.ep_size
+
+    @property
+    def moe_ep_size(self) -> int:
+        return self.ep_size
+
 
 class SimulationMode(Enum):
     BLOCKING = "BLOCKING"
@@ -32,7 +48,7 @@ class SimulationMode(Enum):
 @dataclass
 class RequestStats:
     rid: str = ""
-    last_event_time: float = 1.0
+    last_event_time: float = 0.0
     input_length: int = 1
     output_length: int = 1
     final_reused_tokens: int = 0

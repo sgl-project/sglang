@@ -166,6 +166,11 @@ class ConfigManager:
             database_mode = predictor_config.get("database_mode", "SILICON")
             prefill_scale_factor = predictor_config.get("prefill_scale_factor", 1)
             decode_scale_factor = predictor_config.get("decode_scale_factor", 1)
+            workload_distribution = predictor_config.get(
+                "workload_distribution", "balanced"
+            )
+            enable_oom_check = predictor_config.get("enable_oom_check", False)
+
             return AIConfiguratorTimePredictor(
                 model,
                 hw=hw,
@@ -174,6 +179,8 @@ class ConfigManager:
                 database_mode=database_mode,
                 prefill_scale_factor=prefill_scale_factor,
                 decode_scale_factor=decode_scale_factor,
+                workload_distribution=workload_distribution,
+                enable_oom_check=enable_oom_check,
             )
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")

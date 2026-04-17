@@ -4,7 +4,7 @@ import sglang_simulator.hook as sgl_simulator_hook
 # define hook
 class C_DemoHook(sgl_simulator_hook.BaseHook):
     # if running with pytest, the module name is "test_hook_demo"
-    HOOK_MODULE_NAME = "test_hook_demo"
+    HOOK_MODULE_NAME = __name__
     HOOK_CLASS_NAME = "Demo"
 
     @classmethod
@@ -34,11 +34,8 @@ def test_hook_demo():
     demo = Demo()
     msg = "Message"
     res = demo.run(msg)
-    # the message will be returned form hook, otherwise from demo
-    if __name__ == "__main__":
-        assert res == f"{msg} from Demo"
-    else:
-        assert res == f"{msg} from Hook"
+    # the message will be returned form hook
+    assert res == f"{msg} from Hook"
 
 
 if __name__ == "__main__":
