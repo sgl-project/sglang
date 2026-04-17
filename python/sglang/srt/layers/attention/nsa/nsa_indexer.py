@@ -109,6 +109,7 @@ if _is_cuda:
             layer_id=layer_id,
             key=key[:extend_num_tokens],
             act_quant=act_quant,
+            out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
         )
         indexer._get_topk_ragged(
             False,
@@ -1088,21 +1089,28 @@ class Indexer(MultiPlatformOp):
         key: torch.Tensor,
         *,
         act_quant=None,  # fallback only
+        out_cache_loc: Optional[
+            torch.Tensor
+        ] = None,  # override for PCG (sliced to real tokens)
     ) -> None:
         """
         Store NSA indexer K cache for current step.
 
         Preferred: fused_store_index_k_cache(key, cache, out_cache_loc, page_size)
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
+
+        out_cahce_loc will default to forward_batch.out_cache_loc if not provided.
         """
 
-        # Fast path: JIT fused store (CUDA, page_size=64, non-fnuz)
+        if out_cache_loc is None:
+            out_cache_loc = forward_batch.out_cache_loc
+
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
             and can_use_nsa_fused_store(
                 key.dtype,
-                forward_batch.out_cache_loc.dtype,
+                out_cache_loc.dtype,
                 forward_batch.token_to_kv_pool.page_size,
             )
         ):
@@ -1113,7 +1121,7 @@ class Indexer(MultiPlatformOp):
             fused_store_index_k_cache(
                 key,
                 buf,
-                forward_batch.out_cache_loc,
+                out_cache_loc,
                 forward_batch.token_to_kv_pool.page_size,
             )
             return
@@ -1138,7 +1146,7 @@ class Indexer(MultiPlatformOp):
         assert act_quant is not None
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
-        out_loc = forward_batch.out_cache_loc
+        out_loc = out_cache_loc
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
 
