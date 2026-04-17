@@ -25,6 +25,7 @@ def alloc_extend_cpu(
     out_indices: torch.Tensor,  # Pre-allocated output tensor (consistent with Triton kernel)
     bs_upper: int,  # CPU doesn't need this, but kept for interface consistency (can be ignored)
     page_size: int,
+    extend_num_tokens=None,
 ):
     # Convert to Python list or scalar for processing
     pre_lens = pre_lens_ptr.cpu().tolist()

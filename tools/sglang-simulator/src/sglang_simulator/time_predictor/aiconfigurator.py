@@ -59,7 +59,7 @@ MAP_DTYPE_TO_FMHAQuantMode = {
 MAP_DTYPE_TO_MoEQuantMode = {
     DataType.FP16: MoEQuantMode.float16,
     DataType.BF16: MoEQuantMode.float16,
-    DataType.FP8: MoEQuantMode.fp8,
+    DataType.FP8: MoEQuantMode.fp8_block,
     DataType.INT8: MoEQuantMode.fp8,
     DataType.FP4: MoEQuantMode.nvfp4,
     DataType.INT4: MoEQuantMode.int4_wo,
@@ -76,13 +76,17 @@ MAP_DTYPE_TO_CommQunatMode = {
 logger = get_logger("sgl_simulator")
 
 
-def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.BaseModel:
+def get_perf_model(
+    sched_config: SchedulerConfig,
+    model: ModelInfo,
+    workload_distribution: str = "balanced",
+) -> models.BaseModel:
     model_config = ModelConfig(
         pp_size=sched_config.pp_size,
-        tp_size=sched_config.tp_size,
-        moe_tp_size=sched_config.tp_size // sched_config.ep_size,
-        moe_ep_size=sched_config.ep_size,
-        attention_dp_size=sched_config.tp_size // sched_config.dp_size,
+        tp_size=sched_config.attn_tp_size,
+        moe_tp_size=sched_config.moe_tp_size,
+        moe_ep_size=sched_config.moe_ep_size,
+        attention_dp_size=sched_config.attn_dp_size,
         gemm_quant_mode=MAP_DTYPE_TO_GEMMQuantMode.get(
             sched_config.data_type, GEMMQuantMode.float16
         ),
@@ -98,7 +102,7 @@ def get_perf_model(sched_config: SchedulerConfig, model: ModelInfo) -> models.Ba
         comm_quant_mode=MAP_DTYPE_TO_CommQunatMode.get(
             sched_config.data_type, CommQuantMode.half
         ),
-        workload_distribution="power_law_1.2",
+        workload_distribution=workload_distribution,
     )
 
     return models.get_model(
@@ -118,6 +122,8 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         database_mode: DatabaseMode | str = DatabaseMode.SILICON,
         prefill_scale_factor: float = 1,
         decode_scale_factor: float = 1,
+        workload_distribution: str = "balanced",
+        enable_oom_check: bool = False,
     ):
         super().__init__(model, hw, config)
 
@@ -156,10 +162,13 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         # --- End --- #
 
         self._session = InferenceSession(
-            model=get_perf_model(config, model),
+            model=get_perf_model(config, model, workload_distribution),
             backend=get_backend(self.config.backend_name),
             database=database,
         )
+
+        self.enable_oom_check = enable_oom_check
+        self._is_oom = False
 
     def _get_database_mode(self, mode: str) -> DatabaseMode:
         return {
@@ -187,15 +196,23 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
 
         return actual_flops / avg_flops
 
-    def predict_infer_time(self, batch: ScheduleBatch) -> float:
-        infer_time = 0
+    def predict_infer_latency_dict(self, batch: ScheduleBatch) -> dict:
+        # Returns latency details for debugging operators.
         if batch.is_decode():
             # Decode: output sequence length (osl) = 2, input sequence length (isl) = mean(past_kv_length)
             isl = int(np.mean([req.past_kv_length for req in batch.reqs]))
             runtime_config = RuntimeConfig(batch_size=batch.batch_size, isl=isl, osl=2)
-            summary = self._session.run_static(runtime_config, mode="static_gen")
-            latency_dict = summary.get_generation_latency_dict()
-
+            if self.enable_oom_check:
+                summary = self._session.run_static(runtime_config, mode="static_gen")
+                latency_dict = summary.get_generation_latency_dict()
+            else:
+                # faster path
+                _, _, latency_dict, _ = self._session._backend._run_static_breakdown(
+                    self._session._model,
+                    self._session._database,
+                    runtime_config,
+                    mode="static_gen",
+                )
         else:
             # Prefill: output sequence length (osl) = 1, input sequence length (isl) = mean(past_kv + input), prefix = mean(past_kv)
             mean_past = np.mean([req.past_kv_length for req in batch.reqs])
@@ -222,10 +239,24 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
                     batch_size=batch.batch_size, isl=isl, prefix=prefix, osl=1
                 )
 
-            summary = self._session.run_static(runtime_config, mode="static_ctx")
-            latency_dict = summary.get_context_latency_dict()
+            if self.enable_oom_check:
+                summary = self._session.run_static(runtime_config, mode="static_ctx")
+                latency_dict = summary.get_context_latency_dict()
+            else:
+                # faster path
+                latency_dict, _, _, _ = self._session._backend._run_static_breakdown(
+                    self._session._model,
+                    self._session._database,
+                    runtime_config,
+                    mode="static_ctx",
+                )
+        return latency_dict
+
+    def predict_infer_time(self, batch: ScheduleBatch) -> float:
+        latency_dict = self.predict_infer_latency_dict(batch)
         infer_time = sum(latency_dict.values())
-        if summary.check_oom():
+
+        if self._is_oom:
             logger.warning("Out of memory detected during estimation.")
             infer_time = -infer_time
         if batch.is_decode():
