@@ -557,8 +557,7 @@ Consider updating perf_baselines.json with the snippets below:
                         case.id, num_gpus, is_video, output_format
                     )
                 )
-            logger.error(
-                f"""
+            logger.error(f"""
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
@@ -579,8 +578,7 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
       "mean_abs_diff_threshold": 8.0
     }}
   }}
-"""
-            )
+""")
             pytest.fail(
                 f"GT not found for {case.id}. See logs for instructions to add GT."
             )
