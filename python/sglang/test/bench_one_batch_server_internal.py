@@ -119,6 +119,8 @@ class BenchArgs:
     backend: str = "sglang"
     fake_prefill: bool = False
     server_args_for_metrics: Optional[List[str]] = None
+    lora_name: Optional[str] = None
+    enable_multi_batch: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -261,6 +263,33 @@ class BenchArgs:
             nargs="*",
             default=None,
             help="Server launch arguments to record in metrics output (for tracking configurations).",
+        )
+        parser.add_argument(
+            "--lora-name",
+            type=str,
+            default=BenchArgs.lora_name,
+            help="Name of a pre-loaded LoRA adapter to apply to every prompt in the "
+            "batch (sent as `lora_path` in the SGLang /generate payload). "
+            "Requires the server to be launched with --enable-lora and "
+            "--lora-paths <name>=<path>.",
+        )
+        parser.add_argument(
+            "--enable-multi-batch",
+            action="store_true",
+            help=(
+                "Allow --batch-size to exceed the server's "
+                "effective_max_running_requests_per_dp * dp_size. The surplus "
+                "requests are queued by the scheduler and promoted as slots "
+                "free, so the batch is served as multiple sequential batches "
+                "at the running-batch cap. Useful for stabilizing throughput "
+                "measurements: driving more total prompts through a "
+                "fixed running batch amortizes per-request prefill and "
+                "first-step transients into steady-state decode. "
+                "NOTE: only `overall_throughput` (= total_tokens / wall_time) "
+                "is meaningful in this mode; input_throughput, "
+                "output_throughput, last_ttft, and ITL assume one-shot "
+                "batching and will be misleading."
+            ),
         )
 
     @classmethod
@@ -440,6 +469,7 @@ def run_one_case(
     gsp_question_len: int = BenchArgs.gsp_question_len,
     gsp_output_len: int = BenchArgs.gsp_output_len,
     fake_prefill: bool = False,
+    lora_name: Optional[str] = None,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -537,6 +567,8 @@ def run_one_case(
         if fake_prefill:
             payload["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
             payload["bootstrap_room"] = 0
+        if lora_name is not None:
+            payload["lora_path"] = lora_name
         gen_url = url + "/generate"
 
     # Warm up cache if cache_hit_rate > 0.0
@@ -851,6 +883,18 @@ def run_benchmark_internal(
         print(f"{skip_max_running_requests_threshold=}")
         print(f"{skip_token_capacity_threshold=}")
 
+    # Under --enable-multi-batch the client intentionally sends more prompts
+    # than the server's running cap; surplus requests are queued (no KV
+    # reservation) and promoted batch-by-batch. Peak live KV footprint is
+    # bounded by the running cap, not by bs, so re-scope both guards:
+    #   * max_running_requests: disabled (the whole point of the flag).
+    #   * token_capacity: check against min(bs, running_cap) * (il + ol).
+    effective_running_cap: Optional[int] = None
+    if bench_args.enable_multi_batch:
+        if skip_max_running_requests_threshold != float("inf"):
+            effective_running_cap = skip_max_running_requests_threshold
+        skip_max_running_requests_threshold = float("inf")
+
     gsp_kwargs = dict(
         gsp_num_groups=bench_args.gsp_num_groups,
         gsp_system_prompt_len=bench_args.gsp_system_prompt_len,
@@ -882,6 +926,7 @@ def run_benchmark_internal(
                 backend=bench_args.backend,
                 model_name=model_name,
                 fake_prefill=bench_args.fake_prefill,
+                lora_name=bench_args.lora_name,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -893,10 +938,13 @@ def run_benchmark_internal(
         for bs, il, ol in itertools.product(
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         ):
+            kv_footprint_bs = (
+                bs if effective_running_cap is None else min(bs, effective_running_cap)
+            )
             if should_skip_due_to_max_running_requests(
                 bs, skip_max_running_requests_threshold
             ) or should_skip_due_to_token_capacity(
-                bs, il, ol, skip_token_capacity_threshold
+                kv_footprint_bs, il, ol, skip_token_capacity_threshold
             ):
                 continue
             results.append(
@@ -919,6 +967,7 @@ def run_benchmark_internal(
                     backend=bench_args.backend,
                     model_name=model_name,
                     fake_prefill=bench_args.fake_prefill,
+                    lora_name=bench_args.lora_name,
                     **gsp_kwargs,
                 )
             )
@@ -929,10 +978,15 @@ def run_benchmark_internal(
                 for bs, il, ol in itertools.product(
                     bench_args.batch_size, bench_args.input_len, bench_args.output_len
                 ):
+                    kv_footprint_bs = (
+                        bs
+                        if effective_running_cap is None
+                        else min(bs, effective_running_cap)
+                    )
                     if should_skip_due_to_max_running_requests(
                         bs, skip_max_running_requests_threshold
                     ) or should_skip_due_to_token_capacity(
-                        bs, il, ol, skip_token_capacity_threshold
+                        kv_footprint_bs, il, ol, skip_token_capacity_threshold
                     ):
                         continue
                     profile_prefix = (
@@ -965,6 +1019,7 @@ def run_benchmark_internal(
                             backend=bench_args.backend,
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,
+                            lora_name=bench_args.lora_name,
                             **gsp_kwargs,
                         )
                     )
