@@ -115,7 +115,9 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
     def calc_priority(
-        self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
+        self,
+        waiting_queue: List[Req],
+        current_decode_batch: Optional[ScheduleBatch] = None,
     ) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -152,8 +154,10 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.RANDOM:
                 SchedulePolicy._sort_randomly(waiting_queue)
             elif policy == CacheAgnosticPolicy.ROUTING_KEY:
-                if running_batch is not None:
-                    SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
+                if current_decode_batch is not None:
+                    SchedulePolicy._sort_by_routing_key(
+                        waiting_queue, current_decode_batch
+                    )
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed
@@ -313,11 +317,11 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_routing_key(
-        waiting_queue: List[Req], running_batch: ScheduleBatch
+        waiting_queue: List[Req], current_decode_batch: ScheduleBatch
     ) -> None:
         """Sorts waiting queue by routing key frequency in running batch."""
         routing_key_counts = Counter(
-            r.routing_key for r in running_batch.reqs if r.routing_key
+            r.routing_key for r in current_decode_batch.reqs if r.routing_key
         )
 
         if _ROUTING_KEY_POLICY_DEBUG_LOG:
@@ -378,7 +382,7 @@ class PrefillAdder:
         page_size: int,
         tree_cache: BasePrefixCache,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        running_batch: ScheduleBatch,
+        current_decode_batch: ScheduleBatch,
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
@@ -393,7 +397,7 @@ class PrefillAdder:
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.running_batch = running_batch
+        self.current_decode_batch = current_decode_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
@@ -415,11 +419,11 @@ class PrefillAdder:
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
 
-        if running_batch is not None:
+        if current_decode_batch is not None:
             self.rem_total_token_offset += sum(
                 [
                     self._get_running_request_total_token_offset(r)
-                    for r in running_batch.reqs
+                    for r in current_decode_batch.reqs
                 ]
             )
 
@@ -701,8 +705,8 @@ class PrefillAdder:
         if self.req_states is None:
             self.req_states = []
             add_req_state(req)
-            if self.running_batch is not None:
-                for r in self.running_batch.reqs:
+            if self.current_decode_batch is not None:
+                for r in self.current_decode_batch.reqs:
                     add_req_state(r)
             for r in self.can_run_list:
                 add_req_state(r)
@@ -763,7 +767,7 @@ class PrefillAdder:
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
-                running_batch=self.running_batch.batch_size(),
+                current_decode_batch=self.current_decode_batch.batch_size(),
                 max_prefill_bs=self.max_prefill_bs,
                 max_running_requests=self.max_running_requests,
             )
@@ -901,13 +905,13 @@ class PrefillAdder:
 
         # NOTE: A request finishes in two phases:
         #   1) check_finished + release_kv_cache  (in process_batch_result)
-        #   2) filter out of batch                (in get_next_batch_to_run / update_running_batch)
+        #   2) filter out of batch                (in get_next_batch_to_run / update_current_decode_batch)
         # Preemption runs between these two phases (inside get_new_batch_prefill),
-        # so running_batch may still contain requests whose KV cache is already freed.
+        # so current_decode_batch may still contain requests whose KV cache is already freed.
         # We must skip them here to avoid a double-free on release_req.
         valid_running_reqs = (
             r
-            for r in self.running_batch.reqs
+            for r in self.current_decode_batch.reqs
             if r not in self.preempt_list and not r.finished()
         )
 
@@ -947,17 +951,19 @@ class PrefillAdder:
         preemptible_reqs = set(preemptible_reqs)
         keep_indices = []
         release_counter = 0
-        for i, running_req in enumerate(self.running_batch.reqs):
+        for i, running_req in enumerate(self.current_decode_batch.reqs):
             if running_req in preemptible_reqs:
                 self.rem_total_token_offset -= (
                     self._get_running_request_total_token_offset(running_req)
                 )
                 release_counter += 1
-                self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
+                self.current_decode_batch.release_req(
+                    i,
+                    len(self.current_decode_batch.reqs) - release_counter,
+                    server_args,
                 )
             else:
                 keep_indices.append(i)
-        self.running_batch.filter_batch(keep_indices=keep_indices)
+        self.current_decode_batch.filter_batch(keep_indices=keep_indices)
         self.preempt_list.extend(preemptible_reqs)
         return True

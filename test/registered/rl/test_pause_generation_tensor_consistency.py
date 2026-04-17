@@ -86,7 +86,7 @@ class _FakeBatch:
 
 
 class TestPauseGenerationTensorConsistency(CustomTestCase):
-    """Verify pause_generation does not corrupt the running_batch tensors."""
+    """Verify pause_generation does not corrupt the current_decode_batch tensors."""
 
     # ------------------------------------------------------------------
     # Bug reproduction
@@ -96,7 +96,7 @@ class TestPauseGenerationTensorConsistency(CustomTestCase):
         """Without the fix, merging an all-finished extend batch breaks the
         invariant ``len(reqs) == seq_lens.shape[0]``."""
         N = 651
-        running_batch = _FakeBatch(N)
+        current_decode_batch = _FakeBatch(N)
         last_batch = _FakeBatch(1, all_finished=True)
 
         # Pre-fix pause_generation path:
@@ -107,14 +107,14 @@ class TestPauseGenerationTensorConsistency(CustomTestCase):
         self.assertEqual(last_batch.seq_lens.shape[0], 1)
 
         # BUG: unconditional merge
-        running_batch.merge_batch(last_batch)
+        current_decode_batch.merge_batch(last_batch)
 
         # Invariant is now violated.
-        self.assertEqual(len(running_batch.reqs), N)
-        self.assertEqual(running_batch.seq_lens.shape[0], N + 1)
+        self.assertEqual(len(current_decode_batch.reqs), N)
+        self.assertEqual(current_decode_batch.seq_lens.shape[0], N + 1)
         self.assertNotEqual(
-            len(running_batch.reqs),
-            running_batch.seq_lens.shape[0],
+            len(current_decode_batch.reqs),
+            current_decode_batch.seq_lens.shape[0],
             "len(reqs) != seq_lens.shape[0] — invariant broken",
         )
 
@@ -125,30 +125,30 @@ class TestPauseGenerationTensorConsistency(CustomTestCase):
     def test_fix_preserves_invariant_when_all_reqs_finished(self):
         """With the is_empty() guard the merge is skipped and invariant holds."""
         N = 651
-        running_batch = _FakeBatch(N)
+        current_decode_batch = _FakeBatch(N)
         last_batch = _FakeBatch(1, all_finished=True)
 
         last_batch.filter_batch()  # reqs=[], tensors untouched
 
         # FIX: mirror get_next_batch_to_run's is_empty() guard
         if not last_batch.is_empty():
-            if running_batch.is_empty():
-                running_batch = last_batch
+            if current_decode_batch.is_empty():
+                current_decode_batch = last_batch
             else:
-                running_batch.merge_batch(last_batch)
+                current_decode_batch.merge_batch(last_batch)
 
         self.assertEqual(
-            len(running_batch.reqs),
-            running_batch.seq_lens.shape[0],
+            len(current_decode_batch.reqs),
+            current_decode_batch.seq_lens.shape[0],
             "Invariant preserved: len(reqs) == seq_lens.shape[0]",
         )
-        self.assertEqual(len(running_batch.reqs), N)
-        self.assertEqual(running_batch.seq_lens.shape[0], N)
+        self.assertEqual(len(current_decode_batch.reqs), N)
+        self.assertEqual(current_decode_batch.seq_lens.shape[0], N)
 
     def test_fix_still_merges_partial_extend_batch(self):
         """The fix must not skip a merge when some extend requests survive."""
         N = 651
-        running_batch = _FakeBatch(N)
+        current_decode_batch = _FakeBatch(N)
 
         # 3-req extend batch: 1 finished, 2 still running
         last_batch = _FakeBatch(3, all_finished=False)
@@ -160,52 +160,54 @@ class TestPauseGenerationTensorConsistency(CustomTestCase):
         self.assertFalse(last_batch.is_empty())
 
         if not last_batch.is_empty():
-            if running_batch.is_empty():
-                running_batch = last_batch
+            if current_decode_batch.is_empty():
+                current_decode_batch = last_batch
             else:
-                running_batch.merge_batch(last_batch)
+                current_decode_batch.merge_batch(last_batch)
 
-        self.assertEqual(len(running_batch.reqs), N + 2)
-        self.assertEqual(running_batch.seq_lens.shape[0], N + 2)
+        self.assertEqual(len(current_decode_batch.reqs), N + 2)
+        self.assertEqual(current_decode_batch.seq_lens.shape[0], N + 2)
 
-    def test_fix_handles_empty_running_batch(self):
-        """When running_batch is empty and last_batch has live reqs, the fix
-        replaces running_batch (matches get_next_batch_to_run semantics)."""
-        running_batch = _FakeBatch(0)
+    def test_fix_handles_empty_current_decode_batch(self):
+        """When current_decode_batch is empty and last_batch has live reqs, the fix
+        replaces current_decode_batch (matches get_next_batch_to_run semantics)."""
+        current_decode_batch = _FakeBatch(0)
         last_batch = _FakeBatch(3, all_finished=False)
 
         last_batch.filter_batch()  # all 3 alive -> no-op
 
         if not last_batch.is_empty():
-            if running_batch.is_empty():
-                running_batch = last_batch
+            if current_decode_batch.is_empty():
+                current_decode_batch = last_batch
             else:
-                running_batch.merge_batch(last_batch)
+                current_decode_batch.merge_batch(last_batch)
 
-        self.assertEqual(len(running_batch.reqs), 3)
-        self.assertEqual(running_batch.seq_lens.shape[0], 3)
+        self.assertEqual(len(current_decode_batch.reqs), 3)
+        self.assertEqual(current_decode_batch.seq_lens.shape[0], 3)
 
     def test_next_filter_batch_early_return_preserves_inconsistency(self):
         """After the buggy merge, the next filter_batch call returns early
         (because keep_indices covers all N reqs), leaving N+1 tensors behind."""
         N = 651
-        running_batch = _FakeBatch(N)
+        current_decode_batch = _FakeBatch(N)
         last_batch = _FakeBatch(1, all_finished=True)
 
         last_batch.filter_batch()
-        running_batch.merge_batch(last_batch)  # BUG path
+        current_decode_batch.merge_batch(last_batch)  # BUG path
 
-        # Simulate update_running_batch -> filter_batch: all N reqs still alive
-        running_batch.filter_batch()
+        # Simulate update_current_decode_batch -> filter_batch: all N reqs still alive
+        current_decode_batch.filter_batch()
 
         # Early return: tensors NOT trimmed
-        self.assertEqual(len(running_batch.reqs), N)
+        self.assertEqual(len(current_decode_batch.reqs), N)
         self.assertEqual(
-            running_batch.seq_lens.shape[0],
+            current_decode_batch.seq_lens.shape[0],
             N + 1,
             "seq_lens is still N+1 after the second filter_batch early-return",
         )
-        self.assertNotEqual(len(running_batch.reqs), running_batch.seq_lens.shape[0])
+        self.assertNotEqual(
+            len(current_decode_batch.reqs), current_decode_batch.seq_lens.shape[0]
+        )
 
 
 if __name__ == "__main__":

@@ -257,7 +257,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
 
 class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
     """Regression test: pause_generation must not leak prefill requests into
-    running_batch.  With a small --max-running-requests the leak fills the
+    current_decode_batch.  With a small --max-running-requests the leak fills the
     scheduling budget and blocks all subsequent prefills."""
 
     MAX_RUNNING = 4
@@ -275,14 +275,14 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
 
     def test_retract_pause_no_leak_on_prefill(self):
         """Retract-mode pause on a disagg prefill node must not leak prefill
-        requests into running_batch. Without the fix, each retract pause merges
-        last_batch into running_batch, but the prefill event loop never cleans
-        them up via update_running_batch. After enough cycles the
+        requests into current_decode_batch. Without the fix, each retract pause merges
+        last_batch into current_decode_batch, but the prefill event loop never cleans
+        them up via update_current_decode_batch. After enough cycles the
         max-running-requests budget is exhausted and all new prefills hang."""
         asyncio.run(self._run_pause_resume_leak_test("retract"))
 
-    def test_retract_pause_empty_running_batch(self):
-        """Retract-mode pause must not crash when running_batch is empty.
+    def test_retract_pause_empty_current_decode_batch(self):
+        """Retract-mode pause must not crash when current_decode_batch is empty.
         Regression test for issue #20272."""
         asyncio.run(self._run_pause_on_idle("retract"))
 
@@ -401,7 +401,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             await asyncio.gather(*workers, return_exceptions=True)
 
             # Wait for abort cleanup, then check for leaked phantom requests.
-            # With the bug, running_batch accumulates phantom prefill requests
+            # With the bug, current_decode_batch accumulates phantom prefill requests
             # that are never cleaned up.
             await asyncio.sleep(2)
             num_running = await self._get_num_running_reqs(session)
@@ -409,7 +409,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
                 num_running,
                 0,
                 f"Prefill node has {num_running} phantom running requests "
-                f"after abort — pause_generation is leaking into running_batch",
+                f"after abort — pause_generation is leaking into current_decode_batch",
             )
 
 

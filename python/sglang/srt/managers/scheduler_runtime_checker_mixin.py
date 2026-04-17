@@ -142,13 +142,13 @@ class SchedulerRuntimeCheckerMixin:
         )
 
     def _active_pool_idxs(self: Scheduler) -> set:
-        """Pool idxs currently owned by reqs in last_batch / running_batch.
+        """Pool idxs currently owned by reqs in last_batch / current_decode_batch.
 
         Used to decide which session slots' KV is owned by batch reqs
         (and thus counted via uncached_size, not session_held).
         """
         idxs = set()
-        for batch in [self.last_batch, self.running_batch]:
+        for batch in [self.last_batch, self.current_decode_batch]:
             if batch is None or batch.is_empty():
                 continue
             for req in batch.reqs:
@@ -385,14 +385,14 @@ class SchedulerRuntimeCheckerMixin:
         For full pool: uncached = allocated - cache_protected_len
         For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
         """
-        # After decode: running_batch IS last_batch (same object), count once.
+        # After decode: current_decode_batch IS last_batch (same object), count once.
         # After prefill: they differ, both hold uncached tokens.
         batches = [self.last_batch]
         if (
-            self.running_batch not in (None, self.last_batch)
-            and not self.running_batch.is_empty()
+            self.current_decode_batch not in (None, self.last_batch)
+            and not self.current_decode_batch.is_empty()
         ):
-            batches.append(self.running_batch)
+            batches.append(self.current_decode_batch)
 
         full_uncached = 0
         swa_uncached = 0
@@ -511,7 +511,7 @@ class SchedulerRuntimeCheckerMixin:
 
         priority_enabled = self.enable_priority_scheduling
         self.stats.num_running_reqs = QueueCount.from_reqs(
-            self.running_batch.reqs, priority_enabled
+            self.current_decode_batch.reqs, priority_enabled
         )
         self.stats.gen_throughput = 0
         self.stats.num_queue_reqs = QueueCount.from_reqs(

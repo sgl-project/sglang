@@ -1935,18 +1935,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
-    def mix_with_running(self, running_batch: "ScheduleBatch"):
+    def mix_with_running(self, current_decode_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
-        running_bs = running_batch.batch_size()
+        current_decode_bs = current_decode_batch.batch_size()
 
-        for req in running_batch.reqs:
+        for req in current_decode_batch.reqs:
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.set_extend_input_len(1)
 
-        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        input_ids = torch.cat([self.input_ids, current_decode_batch.input_ids])
+        out_cache_loc = torch.cat(
+            [self.out_cache_loc, current_decode_batch.out_cache_loc]
+        )
 
-        self.merge_batch(running_batch)
+        self.merge_batch(current_decode_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
 
@@ -1957,13 +1959,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefix_lens.extend(
             [
                 len(r.origin_input_ids) + len(r.output_ids) + delta
-                for r in running_batch.reqs
+                for r in current_decode_batch.reqs
             ]
         )
-        self.extend_lens.extend([1] * running_bs)
-        self.extend_num_tokens += running_bs
+        self.extend_lens.extend([1] * current_decode_bs)
+        self.extend_num_tokens += current_decode_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
-        self.extend_logprob_start_lens.extend([0] * running_bs)
+        self.extend_logprob_start_lens.extend([0] * current_decode_bs)
         self.is_prefill_only = False
 
     def new_tokens_required_next_decode(
@@ -2332,7 +2334,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         # NOTE: spec_info filtered before batch filtering only happens in:
         # - Spec v1's verify phase
-        # - Only for decode batch (running_batch)
+        # - Only for decode batch (current_decode_batch)
         has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
 
         if self.spec_info:
@@ -2347,7 +2349,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # 2) other is always decode, which is finished in previous step
         # so verify_done is already synced and this is a no-op.
         # In disagg decode + overlap, merge_batch can be called before
-        # filter_batch, so running_batch.seq_lens may still be a forward_stream
+        # filter_batch, so current_decode_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
         self.maybe_wait_verify_done()
 

@@ -917,7 +917,9 @@ class Scheduler(
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
-        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.current_decode_batch: ScheduleBatch = ScheduleBatch(
+            reqs=[], batch_is_full=False
+        )
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -1344,11 +1346,11 @@ class Scheduler(
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
-        if self.running_batch.is_empty():
+        if self.current_decode_batch.is_empty():
             return
 
         deadline = time.perf_counter() - timeout_s
-        for req in self.running_batch.reqs:
+        for req in self.current_decode_batch.reqs:
             if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
@@ -2312,7 +2314,7 @@ class Scheduler(
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
-            # only finished requests to running_batch.
+            # only finished requests to current_decode_batch.
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
@@ -2321,13 +2323,15 @@ class Scheduler(
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
-                if self.running_batch.is_empty():
-                    self.running_batch = new_batch
+                if self.current_decode_batch.is_empty():
+                    self.current_decode_batch = new_batch
                 else:
-                    self.running_batch.merge_batch(new_batch)
-                self.running_batch.hisparse_coordinator = self.hisparse_coordinator
+                    self.current_decode_batch.merge_batch(new_batch)
+                self.current_decode_batch.hisparse_coordinator = (
+                    self.hisparse_coordinator
+                )
             # Reset batch_is_full so the scheduler can schedule more prefills.
-            self.running_batch.batch_is_full = False
+            self.current_decode_batch.batch_is_full = False
 
         if (
             not self.enable_hisparse
@@ -2348,23 +2352,23 @@ class Scheduler(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
             if self.last_batch.batch_size() < last_bs:
-                self.running_batch.batch_is_full = False
+                self.current_decode_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
             if not self.last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
+                if self.current_decode_batch.is_empty():
+                    self.current_decode_batch = self.last_batch
                 else:
-                    # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+                    # Merge current_decode_batch with prefill batch
+                    self.current_decode_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
-        # won't go through the decode step. This keeps running_batch accurate
+        # won't go through the decode step. This keeps current_decode_batch accurate
         # for load reporting (num_running_reqs via /get_load).
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
-        if self.running_batch.is_prefill_only:
-            self.running_batch.filter_batch()
+        if self.current_decode_batch.is_prefill_only:
+            self.current_decode_batch.filter_batch()
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
@@ -2386,11 +2390,17 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if (
-                not self.running_batch.is_empty()
-                and not self.running_batch.is_prefill_only
+                not self.current_decode_batch.is_empty()
+                and not self.current_decode_batch.is_prefill_only
             ):
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
+                self.current_decode_batch = self.update_current_decode_batch(
+                    self.current_decode_batch
+                )
+                ret = (
+                    self.current_decode_batch
+                    if not self.current_decode_batch.is_empty()
+                    else None
+                )
             else:
                 ret = None
 
@@ -2405,8 +2415,8 @@ class Scheduler(
 
         return ret
 
-    def get_num_allocatable_reqs(self, running_bs):
-        res = get_global_server_args().pp_max_micro_batch_size - running_bs
+    def get_num_allocatable_reqs(self, current_decode_bs):
+        res = get_global_server_args().pp_max_micro_batch_size - current_decode_bs
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res
@@ -2443,14 +2453,14 @@ class Scheduler(
 
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
-            self.running_batch.batch_is_full = False
+            self.current_decode_batch.batch_is_full = False
 
         if (
-            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+            self.current_decode_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             return None
 
-        running_bs = len(self.running_batch.reqs)
+        current_decode_bs = len(self.current_decode_batch.reqs)
 
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
@@ -2458,17 +2468,17 @@ class Scheduler(
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            self.get_num_allocatable_reqs(current_decode_bs) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
-            self.running_batch.batch_is_full = True
+            self.current_decode_batch.batch_is_full = True
             return None
 
         # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, self.running_batch)
+        self.policy.calc_priority(self.waiting_queue, self.current_decode_batch)
 
-        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+        if TEST_RETRACT and current_decode_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
@@ -2487,11 +2497,11 @@ class Scheduler(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
-            self.running_batch,
+            self.current_decode_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            current_decode_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
@@ -2505,7 +2515,7 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            running_loras = {req.lora_id for req in self.running_batch.reqs}
+            running_loras = {req.lora_id for req in self.current_decode_batch.reqs}
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -2525,16 +2535,18 @@ class Scheduler(
                     ):
                         continue
 
-            running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                self.running_batch.batch_is_full = True
+            current_decode_bs = len(self.current_decode_batch.reqs)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                current_decode_bs
+            ):
+                self.current_decode_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    self.running_batch.batch_is_full = True
+                    self.current_decode_batch.batch_is_full = True
 
-            if self.running_batch.batch_is_full:
+            if self.current_decode_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
@@ -2565,11 +2577,11 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
-                        self.running_batch.batch_is_full = len(
+                        self.current_decode_batch.batch_is_full = len(
                             adder.can_run_list
-                        ) > 0 or (not self.running_batch.is_empty())
+                        ) > 0 or (not self.current_decode_batch.is_empty())
                     else:
-                        self.running_batch.batch_is_full = True
+                        self.current_decode_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added and req.mamba_pool_idx is not None:
@@ -2601,7 +2613,7 @@ class Scheduler(
         # Record for logging prefill stats after forward
         self.adder = adder
         self.can_run_list = can_run_list
-        self.running_bs = len(self.running_batch.reqs)
+        self.current_decode_bs = len(self.current_decode_batch.reqs)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -2628,7 +2640,7 @@ class Scheduler(
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
-            self.running_batch.reqs,
+            self.current_decode_batch.reqs,
             self.enable_priority_scheduling,
             num_pending_tokens=self._get_num_pending_tokens(
                 chunk_deduct=(
@@ -2642,26 +2654,30 @@ class Scheduler(
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
-            and not self.running_batch.is_empty()
-            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+            and not self.current_decode_batch.is_empty()
+            and not (
+                new_batch.return_logprob or self.current_decode_batch.return_logprob
+            )
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
-            if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
-                new_batch.mix_with_running(self.running_batch)
-                new_batch.decoding_reqs = self.running_batch.reqs
-            self.running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=self.running_batch.batch_is_full
+            self.current_decode_batch.filter_batch(v1_spec_info_filtered=True)
+            if not self.current_decode_batch.is_empty():
+                self.current_decode_batch.prepare_for_decode()
+                new_batch.mix_with_running(self.current_decode_batch)
+                new_batch.decoding_reqs = self.current_decode_batch.reqs
+            self.current_decode_batch = ScheduleBatch(
+                reqs=[], batch_is_full=self.current_decode_batch.batch_is_full
             )
         else:
             new_batch.decoding_reqs = None
 
         return new_batch
 
-    def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    def update_current_decode_batch(
+        self, batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
@@ -3052,13 +3068,13 @@ class Scheduler(
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
-        # Only running_batch + waiting_queue guarantee active GPU processing;
+        # Only current_decode_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
         # any request actually running on GPU — e.g. stuck handshake, full
         # KV cache, or stalled transfer — so they can't carry health info.
         # Batch running status
         idle = (
-            self.running_batch.is_empty()
+            self.current_decode_batch.is_empty()
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
@@ -3114,7 +3130,7 @@ class Scheduler(
                 message=(
                     "Reject attach: scheduler is not idle. "
                     f"#queue-req={len(self.waiting_queue)} "
-                    f"#running-req={len(self.running_batch.reqs)}"
+                    f"#running-req={len(self.current_decode_batch.reqs)}"
                 ),
             )
 
@@ -3167,7 +3183,7 @@ class Scheduler(
                 message=(
                     "Reject detach: scheduler is not idle. "
                     f"#queue-req={len(self.waiting_queue)} "
-                    f"#running-req={len(self.running_batch.reqs)}"
+                    f"#running-req={len(self.current_decode_batch.reqs)}"
                 ),
             )
 
@@ -3219,7 +3235,7 @@ class Scheduler(
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
+                f"#running-req: {len(self.current_decode_batch.reqs)}"
             )
             success = False
         return success
@@ -3399,10 +3415,10 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
+        if self.cur_batch is self.current_decode_batch or self.cur_batch is None:
+            reqs = self.current_decode_batch.reqs
         else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
+            reqs = self.current_decode_batch.reqs + self.cur_batch.reqs
 
         for req in reqs:
             if not req.finished() and (
@@ -3422,7 +3438,7 @@ class Scheduler(
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
+            # All scheduler state (current_decode_batch, last_batch, chunked_req,
             # result_queue) is left untouched. On resume, the normal event
             # loop (get_next_batch_to_run) handles last_batch merge,
             # chunked_req cleanup, and overlap result processing through
@@ -3442,28 +3458,28 @@ class Scheduler(
             )
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
-            # running_batch leaks them, since the prefill event loop never
-            # calls update_running_batch to clean them up.
+            # current_decode_batch leaks them, since the prefill event loop never
+            # calls update_current_decode_batch to clean them up.
             if (
                 not self.last_batch.is_empty()
                 and self.disaggregation_mode != DisaggregationMode.PREFILL
             ):
-                if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
+                if self.current_decode_batch.is_empty():
+                    self.current_decode_batch = self.last_batch
                 else:
-                    self.running_batch.merge_batch(self.last_batch)
+                    self.current_decode_batch.merge_batch(self.last_batch)
 
         self.last_batch = None
         self.cur_batch = None
 
-        if recv_req.mode == "retract" and not self.running_batch.is_empty():
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
-            if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_all(self.server_args)
+        if recv_req.mode == "retract" and not self.current_decode_batch.is_empty():
+            self.current_decode_batch.filter_batch(v1_spec_info_filtered=True)
+            if len(self.current_decode_batch.reqs) != 0:
+                retracted_reqs = self.current_decode_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 
-            self.running_batch.batch_is_full = False
+            self.current_decode_batch.batch_is_full = False
             self.chunked_req = None
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):

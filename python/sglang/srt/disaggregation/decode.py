@@ -662,7 +662,7 @@ class DecodePreallocQueue:
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
         retractable_tokens = sum(
             len(r.origin_input_ids) + len(r.output_ids)
-            for r in self.scheduler.running_batch.reqs
+            for r in self.scheduler.current_decode_batch.reqs
         )
         allocatable_tokens = self._allocatable_tokens(
             retractable_tokens=retractable_tokens, count_retracted=True
@@ -836,11 +836,11 @@ class DecodePreallocQueue:
                     min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
                     + len(x.origin_input_ids)
                     - retractable_tokens
-                    for x in self.scheduler.running_batch.reqs
+                    for x in self.scheduler.current_decode_batch.reqs
                 ]
             )
             if retractable_tokens is not None
-            and len(self.scheduler.running_batch.reqs) > 0
+            and len(self.scheduler.current_decode_batch.reqs) > 0
             else 0
         )
         if self.scheduler.enable_hisparse:
@@ -855,7 +855,7 @@ class DecodePreallocQueue:
             # preserve some space for future decode
             self.num_reserved_decode_tokens
             * (
-                len(self.scheduler.running_batch.reqs)
+                len(self.scheduler.current_decode_batch.reqs)
                 + len(self.transfer_queue.queue)
                 + len(self.scheduler.waiting_queue)
             ),
@@ -1262,21 +1262,27 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result_prebuilt(new_prebuilt_batch)
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = new_prebuilt_batch
+                if self.current_decode_batch.is_empty():
+                    self.current_decode_batch = new_prebuilt_batch
                     if self.enable_hisparse:
-                        self.running_batch.hisparse_coordinator = (
+                        self.current_decode_batch.hisparse_coordinator = (
                             self.hisparse_coordinator
                         )
                 else:
-                    self.running_batch.merge_batch(new_prebuilt_batch)
+                    self.current_decode_batch.merge_batch(new_prebuilt_batch)
 
         # Schedule decode batch
-        if self.running_batch.is_empty():
+        if self.current_decode_batch.is_empty():
             ret = None
         else:
-            self.running_batch = self.update_running_batch(self.running_batch)
-            ret = self.running_batch if not self.running_batch.is_empty() else None
+            self.current_decode_batch = self.update_current_decode_batch(
+                self.current_decode_batch
+            )
+            ret = (
+                self.current_decode_batch
+                if not self.current_decode_batch.is_empty()
+                else None
+            )
 
         ret = self.maybe_prepare_mlp_sync_batch(ret)
         if ret:
@@ -1293,7 +1299,7 @@ class SchedulerDisaggregationDecodeMixin:
         if len(self.waiting_queue) == 0:
             return None
 
-        curr_batch_size = self.running_batch.batch_size()
+        curr_batch_size = self.current_decode_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 

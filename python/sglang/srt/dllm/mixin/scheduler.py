@@ -29,17 +29,17 @@ class SchedulerDllmMixin:
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
         if self.enable_priority_preemption:
-            self.running_batch.batch_is_full = False
+            self.current_decode_batch.batch_is_full = False
 
         # Early exit if batch is full or no requests available
         if self._should_skip_prefill():
             return None
 
-        running_bs = len(self.running_batch.reqs)
+        current_decode_bs = len(self.current_decode_batch.reqs)
         self.policy.calc_priority(self.waiting_queue)
 
         # Create prefill adder with resource constraints
-        adder = self._create_dllm_prefill_adder(running_bs)
+        adder = self._create_dllm_prefill_adder(current_decode_bs)
 
         # Initialize DLLM manager and transfer requests
         self.dllm_manager.init_next_round()
@@ -54,7 +54,7 @@ class SchedulerDllmMixin:
 
         # Record metrics and update state
         set_time_batch(can_run_list, "set_forward_entry_time")
-        self._update_state_for_batch(can_run_list, adder, running_bs)
+        self._update_state_for_batch(can_run_list, adder, current_decode_bs)
 
         # Create and prepare batch
         new_batch = self._create_dllm_batch(can_run_list, forward_mode)
@@ -114,32 +114,34 @@ class SchedulerDllmMixin:
     def _should_skip_prefill(self: Scheduler) -> bool:
         """Check if DLLM prefill should be skipped."""
         if (
-            self.running_batch.batch_is_full or not self.waiting_queue
+            self.current_decode_batch.batch_is_full or not self.waiting_queue
         ) and self.dllm_manager.is_empty():
             return True
 
-        running_bs = len(self.running_batch.reqs)
+        current_decode_bs = len(self.current_decode_batch.reqs)
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            self.get_num_allocatable_reqs(current_decode_bs) <= 0
             and self.dllm_manager.is_empty()
             and not self.enable_priority_preemption
         ):
-            self.running_batch.batch_is_full = True
+            self.current_decode_batch.batch_is_full = True
             return True
 
         return False
 
-    def _create_dllm_prefill_adder(self: Scheduler, running_bs: int) -> PrefillAdder:
+    def _create_dllm_prefill_adder(
+        self: Scheduler, current_decode_bs: int
+    ) -> PrefillAdder:
         """Create a prefill adder configured for DLLM scheduling."""
         return PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
-            self.running_batch,
+            self.current_decode_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            current_decode_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
             dllm_config=self.dllm_config,
@@ -189,7 +191,10 @@ class SchedulerDllmMixin:
             self.process_dllm_incoming_reqs(adder, incoming_reqs)
 
     def _update_state_for_batch(
-        self: Scheduler, can_run_list: List[Req], adder: PrefillAdder, running_bs: int
+        self: Scheduler,
+        can_run_list: List[Req],
+        adder: PrefillAdder,
+        current_decode_bs: int,
     ) -> None:
         """Update state for the batch."""
 
@@ -203,7 +208,7 @@ class SchedulerDllmMixin:
 
         self.adder = adder
         self.can_run_list = can_run_list
-        self.running_bs = len(self.running_batch.reqs)
+        self.current_decode_bs = len(self.current_decode_batch.reqs)
 
     def _create_dllm_batch(
         self: Scheduler, can_run_list: List[Req], forward_mode: ForwardMode
@@ -227,7 +232,7 @@ class SchedulerDllmMixin:
         from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
 
         new_batch.prefill_stats = PrefillStats.from_adder(
-            self.adder, self.running_batch.reqs, self.enable_priority_scheduling
+            self.adder, self.current_decode_batch.reqs, self.enable_priority_scheduling
         )
 
         return new_batch
@@ -239,12 +244,14 @@ class SchedulerDllmMixin:
         res = AddReqResult.CONTINUE
         for req in reqs:
             # Check if batch is full
-            running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                self.running_batch.batch_is_full = True
+            current_decode_bs = len(self.current_decode_batch.reqs)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                current_decode_bs
+            ):
+                self.current_decode_batch.batch_is_full = True
 
             # Try preemption if batch is full
-            if self.running_batch.batch_is_full:
+            if self.current_decode_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
@@ -261,7 +268,7 @@ class SchedulerDllmMixin:
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    self.running_batch.batch_is_full = True
+                    self.current_decode_batch.batch_is_full = True
                 break
 
         return res

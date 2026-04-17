@@ -37,7 +37,7 @@ class SchedulerStatusLogger:
         )
 
     def maybe_dump(
-        self, running_batch: "ScheduleBatch", waiting_queue: List["Req"]
+        self, current_decode_batch: "ScheduleBatch", waiting_queue: List["Req"]
     ) -> None:
         now = time.time()
         if now - self.last_dump_time < self.dump_interval:
@@ -49,7 +49,7 @@ class SchedulerStatusLogger:
             "scheduler.status",
             {
                 "rank": self.rank,
-                "running_rids": [r.rid for r in running_batch.reqs],
+                "running_rids": [r.rid for r in current_decode_batch.reqs],
                 "queued_rids": [r.rid for r in waiting_queue],
             },
         )

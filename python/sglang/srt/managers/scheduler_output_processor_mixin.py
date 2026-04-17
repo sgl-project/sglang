@@ -535,7 +535,7 @@ class SchedulerOutputProcessorMixin:
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         self.report_decode_stats(
             can_run_cuda_graph,
-            running_batch=batch,
+            current_decode_batch=batch,
             num_accepted_tokens=result.num_accepted_tokens,
         )
 

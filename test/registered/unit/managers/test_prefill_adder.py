@@ -51,7 +51,7 @@ class TestPrefillAdder(CustomTestCase):
         allocator.available_size.return_value = available_size
         return allocator
 
-    def create_running_batch(self, reqs=None) -> MagicMock:
+    def create_current_decode_batch(self, reqs=None) -> MagicMock:
         batch = MagicMock()
         batch.reqs = list(reqs or [])
         batch.release_req.return_value = None
@@ -79,12 +79,12 @@ class TestPrefillAdder(CustomTestCase):
         req.finished.return_value = False
         return req
 
-    def create_adder(self, running_batch, **kwargs):
+    def create_adder(self, current_decode_batch, **kwargs):
         defaults = dict(
             page_size=1,
             tree_cache=self.mock_tree_cache,
             token_to_kv_pool_allocator=self.mock_token_allocator,
-            running_batch=running_batch,
+            current_decode_batch=current_decode_batch,
             new_token_ratio=1.0,
             rem_input_tokens=10000,
             rem_chunk_tokens=None,
@@ -107,8 +107,8 @@ class TestPrefillAdder(CustomTestCase):
         mock_server_args = self.create_server_args(
             schedule_low_priority_values_first=False
         )
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        current_decode_batch = self.create_current_decode_batch(running_reqs)
+        adder = self.create_adder(current_decode_batch)
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
@@ -124,7 +124,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(success)
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 175)  # 50 + 75 + 100 - 50 = 175
-        running_batch.release_req.assert_called_once()
+        current_decode_batch.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first(self):
         params = [
@@ -139,8 +139,8 @@ class TestPrefillAdder(CustomTestCase):
         mock_server_args = self.create_server_args(
             schedule_low_priority_values_first=True
         )
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        current_decode_batch = self.create_current_decode_batch(running_reqs)
+        adder = self.create_adder(current_decode_batch)
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
@@ -156,7 +156,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 125)  # 50 + 75 + 100 - 100 = 125
-        running_batch.release_req.assert_called_once()
+        current_decode_batch.release_req.assert_called_once()
 
     def test_preempt_fail_low_priority_values_first(self):
         params = [
@@ -171,8 +171,8 @@ class TestPrefillAdder(CustomTestCase):
         mock_server_args = self.create_server_args(
             schedule_low_priority_values_first=True
         )
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        current_decode_batch = self.create_current_decode_batch(running_reqs)
+        adder = self.create_adder(current_decode_batch)
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
@@ -211,8 +211,8 @@ class TestPrefillAdder(CustomTestCase):
         mock_server_args = self.create_server_args(
             schedule_low_priority_values_first=False
         )
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        current_decode_batch = self.create_current_decode_batch(running_reqs)
+        adder = self.create_adder(current_decode_batch)
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
@@ -251,8 +251,8 @@ class TestPrefillAdder(CustomTestCase):
         mock_server_args = self.create_server_args(
             schedule_low_priority_values_first=False
         )
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        current_decode_batch = self.create_current_decode_batch(running_reqs)
+        adder = self.create_adder(current_decode_batch)
 
         self.assertEqual(adder.rem_total_token_offset, 225)
 
@@ -267,7 +267,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(first_success)
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.rem_total_token_offset, 175)
-        running_batch.release_req.assert_called_once()
+        current_decode_batch.release_req.assert_called_once()
 
         # Second call needs more tokens than currently free, so it would need to
         # preempt req_prio_0 again if already-preempted requests were not filtered out.
@@ -279,7 +279,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertFalse(second_success)
         self.assertEqual(adder.rem_total_token_offset, 175)
         self.assertEqual(adder.preempt_list.count(running_reqs[0]), 1)
-        running_batch.release_req.assert_called_once()
+        current_decode_batch.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first_exact_once(self):
         params = [
@@ -296,8 +296,8 @@ class TestPrefillAdder(CustomTestCase):
         mock_server_args = self.create_server_args(
             schedule_low_priority_values_first=True
         )
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        current_decode_batch = self.create_current_decode_batch(running_reqs)
+        adder = self.create_adder(current_decode_batch)
 
         self.assertEqual(adder.rem_total_token_offset, 475)
 
@@ -314,7 +314,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.rem_total_token_offset, 375
         )  # 50 + 75 + 100 + 125 + 125 - 100 = 375
-        running_batch.release_req.assert_called_once()
+        current_decode_batch.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first_exact_twice(self):
         params = [
@@ -331,8 +331,8 @@ class TestPrefillAdder(CustomTestCase):
         mock_server_args = self.create_server_args(
             schedule_low_priority_values_first=True
         )
-        running_batch = self.create_running_batch(running_reqs)
-        adder = self.create_adder(running_batch)
+        current_decode_batch = self.create_current_decode_batch(running_reqs)
+        adder = self.create_adder(current_decode_batch)
 
         self.assertEqual(adder.rem_total_token_offset, 475)
 
@@ -350,7 +350,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.rem_total_token_offset, 250
         )  # 50 + 75 + 100 + 125 + 125 - 100 - 125 = 250
-        self.assertEqual(running_batch.release_req.call_count, 2)
+        self.assertEqual(current_decode_batch.release_req.call_count, 2)
 
     def test_mixed_chunk_prefill_budgets(self):
         self.mock_token_allocator.available_size.return_value = 1000
@@ -359,10 +359,10 @@ class TestPrefillAdder(CustomTestCase):
             self.create_mock_req(f"decode_{i}", priority=0, max_new_tokens=50)
             for i in range(8)
         ]
-        running_batch = self.create_running_batch(decode_reqs)
+        current_decode_batch = self.create_current_decode_batch(decode_reqs)
 
         adder = self.create_adder(
-            running_batch,
+            current_decode_batch,
             rem_input_tokens=200,
             rem_chunk_tokens=64,
             mixed_with_decode_tokens=len(decode_reqs),
@@ -394,10 +394,10 @@ class TestPrefillAdder(CustomTestCase):
 
         # 3 decode requests finished
         remaining_decode_reqs = decode_reqs[3:]
-        running_batch2 = self.create_running_batch(remaining_decode_reqs)
+        current_decode_batch2 = self.create_current_decode_batch(remaining_decode_reqs)
 
         adder2 = self.create_adder(
-            running_batch2,
+            current_decode_batch2,
             rem_input_tokens=200,
             rem_chunk_tokens=64,
             mixed_with_decode_tokens=len(remaining_decode_reqs),

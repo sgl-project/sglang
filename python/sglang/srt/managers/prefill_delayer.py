@@ -54,7 +54,7 @@ class PrefillDelayer:
             f"token_usage_low_watermark={self._token_usage_low_watermark}"
         )
         # The global_info contains four pieces of information:
-        # prefillable, token_watermark_force_allow, running_batch, and max_prefill_bs.
+        # prefillable, token_watermark_force_allow, current_decode_batch, and max_prefill_bs.
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
@@ -115,7 +115,7 @@ class PrefillDelayer:
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
-        global_running_batch = tp0_info[:, 2]
+        global_current_decode_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
 
         # Compute derived global states
@@ -151,10 +151,10 @@ class PrefillDelayer:
                     max_running_requests + self.dp_size - 1
                 ) // self.dp_size
             if (
-                max_running_requests - global_running_batch.max().item()
+                max_running_requests - global_current_decode_batch.max().item()
                 < global_max_prefill_bs.max().item()
             ):
-                # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
+                # When the "max_decode_bs - current_decode_bs < max_prefill_bs" condition is met,
                 # the first merge_batch causes the decoding to fail to reach the maximum batch size.
                 if self.skip_first_delayer:
                     self.skip_first_delayer = False
@@ -219,7 +219,7 @@ class PrefillDelayer:
             [
                 int(local_prefillable),
                 int(local_token_watermark_force_allow),
-                kwargs.get("running_batch", 0),
+                kwargs.get("current_decode_batch", 0),
                 kwargs.get("max_prefill_bs", 0),
             ],
             device="cpu",

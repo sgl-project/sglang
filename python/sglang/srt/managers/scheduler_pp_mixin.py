@@ -72,7 +72,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self.running_batch = self.running_mbs[mb_id]
+                self.current_decode_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
@@ -88,7 +88,7 @@ class SchedulerPPMixin:
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
-                self.running_mbs[mb_id] = self.running_batch
+                self.running_mbs[mb_id] = self.current_decode_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
@@ -198,7 +198,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self.running_batch = self.running_mbs[mb_id]
+                self.current_decode_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
@@ -227,7 +227,7 @@ class SchedulerPPMixin:
                 batch = self.get_new_batch_prefill()
                 batch = self.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
-                self.running_mbs[mb_id] = self.running_batch
+                self.running_mbs[mb_id] = self.current_decode_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
@@ -314,7 +314,7 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
-                self.running_batch.batch_is_full = False
+                self.current_decode_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
@@ -341,7 +341,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self.running_batch = self.running_mbs[mb_id]
+                self.current_decode_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
@@ -375,7 +375,7 @@ class SchedulerPPMixin:
                 # get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
                 self.mbs[mb_id] = batch
-                self.running_mbs[mb_id] = self.running_batch
+                self.running_mbs[mb_id] = self.current_decode_batch
 
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
@@ -496,7 +496,7 @@ class SchedulerPPMixin:
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
 
-                self.running_batch.batch_is_full = False
+                self.current_decode_batch.batch_is_full = False
 
             # When the server is idle, self-check and re-init some states
             queue_size = (

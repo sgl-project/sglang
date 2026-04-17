@@ -462,10 +462,10 @@ class SchedulerMetricsMixin:
     def report_decode_stats(
         self: Scheduler,
         can_run_cuda_graph: bool,
-        running_batch: ScheduleBatch = None,
+        current_decode_batch: ScheduleBatch = None,
         num_accepted_tokens: int = 0,
     ):
-        batch = running_batch or self.running_batch
+        batch = current_decode_batch or self.current_decode_batch
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
@@ -735,10 +735,10 @@ class SchedulerMetricsMixin:
                         for req in batch.reqs:
                             if hasattr(req, "lora_id") and req.lora_id is not None:
                                 active_lora_ids.add(req.lora_id)
-            # For normal mode, check running_batch
-            elif hasattr(self, "running_batch") and self.running_batch:
-                if hasattr(self.running_batch, "reqs"):
-                    for req in self.running_batch.reqs:
+            # For normal mode, check current_decode_batch
+            elif hasattr(self, "current_decode_batch") and self.current_decode_batch:
+                if hasattr(self.current_decode_batch, "reqs"):
+                    for req in self.current_decode_batch.reqs:
                         if hasattr(req, "lora_id") and req.lora_id is not None:
                             active_lora_ids.add(req.lora_id)
 
@@ -806,7 +806,7 @@ class SchedulerMetricsMixin:
 
         return GetLoadReqOutput(
             dp_rank=self.dp_rank,
-            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
+            num_reqs=len(self.current_decode_batch.reqs) + num_waiting_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
             num_pending_tokens=num_pending_tokens,
@@ -829,7 +829,7 @@ class SchedulerMetricsMixin:
         include = set(req.include) if req.include else {"core"}
         include_all = "all" in include
 
-        num_running_reqs = len(self.running_batch.reqs)
+        num_running_reqs = len(self.current_decode_batch.reqs)
 
         waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

@@ -206,7 +206,7 @@ class TestSchedulePolicy(CustomTestCase):
             Req("r2", "b", [2], SamplingParams(), routing_key="key_a"),
             Req("r3", "c", [3], SamplingParams(), routing_key="key_b"),
         ]
-        running_batch = ScheduleBatch(reqs=running_reqs)
+        current_decode_batch = ScheduleBatch(reqs=running_reqs)
 
         waiting_queue = [
             Req("w1", "d", [4], SamplingParams(), routing_key="key_b"),
@@ -221,7 +221,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue, running_batch)
+        policy.calc_priority(waiting_queue, current_decode_batch)
 
         self.assertEqual(waiting_queue[0].rid, "w2")
         self.assertEqual(waiting_queue[1].rid, "w1")
@@ -235,7 +235,7 @@ class TestSchedulePolicy(CustomTestCase):
             Req("r1", "a", [1], SamplingParams(), routing_key="key_b"),
             Req("r2", "b", [2], SamplingParams(), routing_key="key_a"),
         ]
-        running_batch = ScheduleBatch(reqs=running_reqs)
+        current_decode_batch = ScheduleBatch(reqs=running_reqs)
 
         waiting_queue = [
             Req("w1", "d", [4], SamplingParams(), routing_key="key_b"),
@@ -249,7 +249,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue, running_batch)
+        policy.calc_priority(waiting_queue, current_decode_batch)
 
         self.assertEqual(waiting_queue[0].rid, "w2")
         self.assertEqual(waiting_queue[1].rid, "w1")
@@ -263,7 +263,7 @@ class TestSchedulePolicy(CustomTestCase):
             Req("r2", "b", [2], SamplingParams(), routing_key="key_b"),
             Req("r3", "c", [3], SamplingParams(), routing_key="key_c"),
         ]
-        running_batch = ScheduleBatch(reqs=running_reqs)
+        current_decode_batch = ScheduleBatch(reqs=running_reqs)
 
         waiting_queue = [
             Req("w1", "d", [4], SamplingParams(), routing_key="key_d"),
@@ -278,17 +278,17 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue, running_batch)
+        policy.calc_priority(waiting_queue, current_decode_batch)
 
         self.assertEqual(waiting_queue[0].rid, "w3")
         self.assertEqual(waiting_queue[1].rid, "w1")
         self.assertEqual(waiting_queue[2].rid, "w2")
 
-    def test_calc_priority_routing_key_empty_running_batch(self):
+    def test_calc_priority_routing_key_empty_current_decode_batch(self):
         """Test routing-key policy: empty running batch keeps original order."""
         tree_cache = RadixCache.create_simulated()
 
-        running_batch = ScheduleBatch(reqs=[])
+        current_decode_batch = ScheduleBatch(reqs=[])
 
         waiting_queue = [
             Req("w1", "d", [4], SamplingParams(), routing_key="key_a"),
@@ -303,7 +303,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue, running_batch)
+        policy.calc_priority(waiting_queue, current_decode_batch)
 
         self.assertEqual(waiting_queue[0].rid, "w1")
         self.assertEqual(waiting_queue[1].rid, "w2")

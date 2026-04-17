@@ -22,10 +22,10 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.last_batch = None
         scheduler.cur_batch = None
         scheduler.chunked_req = None
-        scheduler.running_batch = MagicMock()
-        scheduler.running_batch.reqs = []
-        scheduler.running_batch.is_empty.return_value = True
-        scheduler.running_batch.batch_is_full = False
+        scheduler.current_decode_batch = MagicMock()
+        scheduler.current_decode_batch.reqs = []
+        scheduler.current_decode_batch.is_empty.return_value = True
+        scheduler.current_decode_batch.batch_is_full = False
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()
@@ -76,7 +76,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertEqual(len(scheduler.result_queue), 1)
 
     def test_inplace_does_not_merge_batch(self):
-        """in_place should not filter or merge last_batch into running_batch."""
+        """in_place should not filter or merge last_batch into current_decode_batch."""
         scheduler = self._new_scheduler()
         last_batch = MagicMock()
         last_batch.forward_mode.is_extend.return_value = True
@@ -85,7 +85,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
         last_batch.filter_batch.assert_not_called()
-        scheduler.running_batch.merge_batch.assert_not_called()
+        scheduler.current_decode_batch.merge_batch.assert_not_called()
 
     def test_abort_clears_state(self):
         """abort mode should clear last_batch and cur_batch."""
@@ -100,25 +100,25 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         self.assertIsNone(scheduler.last_batch)
         self.assertIsNone(scheduler.cur_batch)
 
-    def test_retract_clears_running_batch(self):
-        """retract mode should retract all requests from running_batch."""
+    def test_retract_clears_current_decode_batch(self):
+        """retract mode should retract all requests from current_decode_batch."""
         scheduler = self._new_scheduler()
         scheduler.last_batch = None
-        scheduler.running_batch.reqs = [MagicMock(), MagicMock()]
-        scheduler.running_batch.__len__ = lambda self: len(self.reqs)
-        scheduler.running_batch.is_empty.return_value = False
+        scheduler.current_decode_batch.reqs = [MagicMock(), MagicMock()]
+        scheduler.current_decode_batch.__len__ = lambda self: len(self.reqs)
+        scheduler.current_decode_batch.is_empty.return_value = False
         scheduler.waiting_queue = []
         scheduler._add_request_to_queue = MagicMock()
 
         retracted = [MagicMock(), MagicMock()]
-        scheduler.running_batch.retract_all.return_value = retracted
-        scheduler.running_batch.filter_batch = MagicMock()
+        scheduler.current_decode_batch.retract_all.return_value = retracted
+        scheduler.current_decode_batch.filter_batch = MagicMock()
         scheduler.server_args = MagicMock()
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertTrue(scheduler._engine_paused)
-        scheduler.running_batch.retract_all.assert_called_once()
+        scheduler.current_decode_batch.retract_all.assert_called_once()
         self.assertEqual(scheduler._add_request_to_queue.call_count, 2)
         self.assertIsNone(scheduler.chunked_req)
 

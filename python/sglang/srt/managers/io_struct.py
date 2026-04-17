@@ -1315,7 +1315,7 @@ class PauseGenerationReqInput(BaseReq):
             The requests in the engine will be paused and stay in the event_loop,
             then continue generation after continue_generation with the old kv cache.
             Note: In 'inplace' mode, flush_cache will fail if there are any requests
-            in the running_batch.
+            in the current_decode_batch.
 
     retract: Pause the scheduler's event loop from performing inference;
             only non-inference requests will be handled, and all currently running
