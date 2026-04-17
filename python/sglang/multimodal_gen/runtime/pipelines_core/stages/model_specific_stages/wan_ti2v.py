@@ -145,7 +145,10 @@ def expand_wan_ti2v_timestep(
 
     local_seq_len = seq_len
     if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
-        local_seq_len = seq_len // get_sp_world_size()
+        # Time-sharded latents: per-rank length, same ceil-to-sp rounding as prepare_wan_ti2v_latents.
+        seq_len_rounded = int(
+            math.ceil(seq_len / get_sp_world_size())) * get_sp_world_size()
+        local_seq_len = seq_len_rounded // get_sp_world_size()
 
     if get_sp_parallel_rank() == 0 and reserved_frames_mask is not None:
         temp_ts = (reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded).flatten()
