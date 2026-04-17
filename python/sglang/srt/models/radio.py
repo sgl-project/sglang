@@ -13,6 +13,7 @@
 # ==============================================================================
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/radio.py
 
+import logging
 import math
 from collections.abc import Iterable
 from itertools import repeat
@@ -32,6 +33,8 @@ from sglang.srt.model_loader.weight_utils import (
     replace_substrings,
 )
 from sglang.srt.models.internvl import InternVisionEncoder
+
+logger = logging.getLogger(__name__)
 
 input_dim_t: TypeAlias = int | tuple[int, int]
 norm_t: TypeAlias = tuple[float, float, float] | torch.Tensor
@@ -105,7 +108,6 @@ class ClsToken(nn.Module):
 class ViTPatchGenerator(nn.Module):
     def __init__(
         self,
-        #  config: PretrainedConfig,
         patch_size: int,
         embed_dim: int,
         input_dims: input_dim_t,
@@ -319,66 +321,21 @@ class ViTPatchGenerator(nn.Module):
             return pos_embed
 
         if self.cpe_mode:
-            if self.training:
-                min_scale = math.sqrt(0.1)
-                scale = (
-                    torch.rand(batch_size, 1, 1, device=pos_embed.device)
-                    * (1 - min_scale)
-                    + min_scale
-                )
-                aspect_min = math.log(3 / 4)
-                aspect_max = -aspect_min
-                aspect = torch.exp(
-                    torch.rand(batch_size, 1, 1, device=pos_embed.device)
-                    * (aspect_max - aspect_min)
-                    + aspect_min
-                )
+            max_dim = max(input_dims)
+            pos_embed = F.interpolate(
+                pos_embed.float(),
+                size=(max_dim, max_dim),
+                align_corners=False,
+                mode="bilinear",
+            ).to(pos_embed.dtype)
 
-                scale_x = scale * aspect
-                scale_y = scale * (1 / aspect)
-                scale_xy = torch.stack([scale_x, scale_y], dim=-1).clamp_(0, 1)
-
-                pos_xy = torch.rand(batch_size, 1, 1, 2, device=pos_embed.device) * (
-                    1 - scale_xy
-                )
-
-                lin_x = torch.linspace(
-                    0, 1, steps=input_dims[1], device=pos_embed.device
-                )[None, None].expand(batch_size, input_dims[0], -1)
-                lin_y = torch.linspace(
-                    0, 1, steps=input_dims[0], device=pos_embed.device
-                )[None, :, None].expand(batch_size, -1, input_dims[1])
-
-                lin_xy = torch.stack([lin_x, lin_y], dim=-1)
-
-                grid_xy = lin_xy * scale_xy + pos_xy
-
-                # Convert to [-1, 1] range
-                grid_xy.mul_(2).sub_(1)
-
-                pos_embed = F.grid_sample(
-                    pos_embed.float().expand(batch_size, -1, -1, -1),
-                    grid=grid_xy,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=True,
-                ).to(pos_embed.dtype)
-            else:
-                max_dim = max(input_dims)
-                pos_embed = F.interpolate(
-                    pos_embed.float(),
-                    size=(max_dim, max_dim),
-                    align_corners=True,
-                    mode="bilinear",
-                ).to(pos_embed.dtype)
-
-                pos_embed = window_select(pos_embed)
+            pos_embed = window_select(pos_embed)
         else:
             pos_embed = window_select(pos_embed)
 
         if pos_embed.shape[-2:] != input_dims:
             pos_embed = F.interpolate(
-                pos_embed.float(), size=input_dims, align_corners=True, mode="bilinear"
+                pos_embed.float(), size=input_dims, align_corners=False, mode="bilinear"
             ).to(pos_embed.dtype)
 
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)
@@ -485,11 +442,46 @@ class RadioModel(nn.Module):
 
     def forward(
         self,
-        pixel_values: torch.Tensor | None = None,
-        pixel_embeds: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | list[torch.Tensor] | None = None,
     ) -> torch.FloatTensor:
+        if isinstance(pixel_values, list):
+            return self._forward_dynamic(pixel_values)
         y = self.model(pixel_values)
         return self._extract_final(y)
+
+    def _forward_dynamic(
+        self, images: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Process variable-size images with ragged packing via cu_seqlens."""
+        patch_gen = self.model.patch_generator
+        all_patches = []
+        seqlens = [0]
+
+        for img in images:
+            patches = patch_gen(img)
+            seq_len = patches.shape[1]
+            all_patches.append(patches.squeeze(0))
+            seqlens.append(seqlens[-1] + seq_len)
+
+        hidden = torch.cat(all_patches, dim=0).unsqueeze(0)
+        cu_seqlens = torch.tensor(seqlens, dtype=torch.int32, device=hidden.device)
+
+        out = self.model.encoder.forward(inputs_embeds=hidden, cu_seqlens=cu_seqlens)
+        features = out.last_hidden_state
+
+        num_skip = patch_gen.num_skip
+        per_image_features = []
+        num_patches_list = []
+        for i in range(len(images)):
+            start = seqlens[i] + num_skip
+            end = seqlens[i + 1]
+            per_image_features.append(features[0, start:end])
+            num_patches_list.append(end - start)
+
+        return (
+            torch.cat(per_image_features, dim=0).unsqueeze(0),
+            num_patches_list,
+        )
 
     def load_weights(self, weights) -> set[str]:
         remap_substrings = {

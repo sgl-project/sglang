@@ -142,6 +142,28 @@ class NemotronH_Nano_VL_V2(EVS):
             x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
+    def extract_feature_dynamic(self, pixel_values_list: list[torch.Tensor]):
+        """Extract features from variable-size images (dynamic resolution).
+
+        Each image has different spatial dimensions. They are passed as a list
+        to RADIO which handles ragged packing with cu_seqlens internally.
+        """
+        features, num_patches_list = self.vision_model(pixel_values_list)
+        patch_size = self.config.patch_size
+        results = []
+        offset = 0
+        for i, num_patches in enumerate(num_patches_list):
+            img_feats = features[0, offset : offset + num_patches]
+            h_patches = pixel_values_list[i].shape[-2] // patch_size
+            w_patches = pixel_values_list[i].shape[-1] // patch_size
+            img_feats = img_feats.reshape(1, h_patches, w_patches, -1)
+            img_feats = self.pixel_shuffle(img_feats, self.downsample_ratio)
+            img_feats = img_feats.view(-1, self.rmsnorm_hidden_size)
+            img_feats = self.mlp1(img_feats)
+            results.append(img_feats)
+            offset += num_patches
+        return torch.cat(results, dim=0)
+
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
 
@@ -173,6 +195,11 @@ class NemotronH_Nano_VL_V2(EVS):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
+        is_dynamic = any(getattr(item, "is_dynamic", False) for item in items)
+        if is_dynamic:
+            pixel_values_list = [item.feature for item in items]
+            return self.extract_feature_dynamic(pixel_values_list)
+
         pixel_values = torch.cat([item.feature for item in items])
         image_features = self.extract_feature(pixel_values)
         return image_features

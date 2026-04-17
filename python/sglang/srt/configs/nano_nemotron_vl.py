@@ -111,6 +111,11 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         self.audio_start_token = audio_start_token
         self.audio_end_token = audio_end_token
 
+        # Dynamic resolution: from vision_config top-level
+        self.min_num_patches = self.raw_vision_config.get("min_num_patches", 0)
+        self.max_num_patches = self.raw_vision_config.get("max_num_patches", 0)
+        self.dynamic_resolution = self.min_num_patches > 0
+
     def create_radio_config(self):
         config = self.raw_vision_config
         model_name = config["args"]["model"]
@@ -123,5 +128,7 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             model_name=model_name,
             reg_tokens=reg_tokens,
             image_size=image_size,
+            min_num_patches=self.min_num_patches,
+            max_num_patches=self.max_num_patches,
         )
         return radio_config

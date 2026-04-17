@@ -74,6 +74,8 @@ class RadioConfig(PretrainedConfig):
         norm_mean: tuple[float, float, float] | list = OPENAI_CLIP_MEAN,
         norm_std: tuple[float, float, float] | list = OPENAI_CLIP_STD,
         reg_tokens: int | None = None,
+        min_num_patches: int = 0,
+        max_num_patches: int = 0,
         drop_path_rate: float = 0.0,
         dropout: float = 0.0,
         **kwargs,
@@ -101,6 +103,8 @@ class RadioConfig(PretrainedConfig):
             list(norm_std) if isinstance(norm_std, (tuple, list)) else norm_std
         )
         self.reg_tokens = reg_tokens
+        self.min_num_patches = min_num_patches
+        self.max_num_patches = max_num_patches
         self.drop_path_rate = drop_path_rate
         self.dropout = dropout
         super().__init__(**kwargs)

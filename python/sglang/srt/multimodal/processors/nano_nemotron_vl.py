@@ -27,7 +27,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.models.parakeet import ParakeetExtractor
 from sglang.srt.multimodal.evs import EVSProcessor
-from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
+from sglang.srt.multimodal.internvl_utils import (
+    compute_budgeted_image_sizes,
+    image_to_pixel_values,
+    resize_image_to_pixels,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -107,6 +111,15 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         self.norm_std = hf_config.norm_std
         self.use_thumbnail = hf_config.use_thumbnail
 
+        # Dynamic resolution config
+        self.dynamic_resolution = getattr(hf_config, "dynamic_resolution", False)
+        self.min_num_patches = getattr(hf_config, "min_num_patches", 0)
+        self.max_num_patches = getattr(hf_config, "max_num_patches", 0)
+        self.patch_size = hf_config.patch_size
+        self.downsample_ratio = hf_config.downsample_ratio
+
+        self.max_model_len = getattr(server_args, "context_length", None) or 8192
+
         self.PLACEHOLDER = self.tokenizer.unk_token
         assert isinstance(self.PLACEHOLDER, str)
         self.PLACEHOLDER_ID = tokenizer.convert_tokens_to_ids(self.PLACEHOLDER)
@@ -126,6 +139,9 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
 
     def render_image(self, *, num_tiles: int):
         return f"{self.IMG_START_TOKEN}{self.IMG_CONTEXT_TOKEN * self.num_image_token * num_tiles}{self.IMG_END_TOKEN}"
+
+    def render_image_dynamic(self, *, num_tokens: int):
+        return f"{self.IMG_START_TOKEN}{self.IMG_CONTEXT_TOKEN * num_tokens}{self.IMG_END_TOKEN}"
 
     def render_frame(self, frame_index: int, *, timestamp: float, num_tokens: int):
         return f"Frame {frame_index + 1} sampled at {timestamp:.2f} seconds: {self.PLACEHOLDER}{self.IMG_CONTEXT_TOKEN * num_tokens}{self.IMG_END_TOKEN}"
@@ -177,8 +193,44 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         )
 
         prompt = input_text
+        image_is_dynamic = False
+        num_tokens_per_image = []
         image_feature = None
-        if base_output.images:
+        if base_output.images and self.dynamic_resolution:
+            image_is_dynamic = True
+            image_sizes = [(img.width, img.height) for img in base_output.images]
+            text_only = input_text.replace(self.IMG_CONTEXT_TOKEN, "")
+            text_tokens = len(
+                self.tokenizer(text_only, add_special_tokens=False)["input_ids"]
+            )
+            total_token_budget = self.max_model_len - text_tokens
+            budgeted_sizes = compute_budgeted_image_sizes(
+                image_sizes,
+                total_token_budget,
+                self.patch_size,
+                self.downsample_ratio,
+                self.min_num_patches,
+                self.max_num_patches,
+            )
+            preprocessed_images = []
+            for image, (target_w, target_h, n_tokens) in zip(
+                base_output.images, budgeted_sizes
+            ):
+                pv = resize_image_to_pixels(
+                    image,
+                    target_w,
+                    target_h,
+                    mean=self.norm_mean,
+                    std=self.norm_std,
+                )
+                preprocessed_images.append(pv.to(dtype=torch.bfloat16))
+                num_tokens_per_image.append(n_tokens)
+            rendered_images = [
+                self.render_image_dynamic(num_tokens=nt) for nt in num_tokens_per_image
+            ]
+            prompt = prompt.replace(self.IMG_CONTEXT_TOKEN, "".join(rendered_images), 1)
+            image_feature = preprocessed_images
+        elif base_output.images:
             preprocessed_images = [
                 self.preprocess_image(image) for image in base_output.images
             ]
@@ -280,13 +332,34 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
 
         prompt_ids_list = prompt_ids.tolist()
 
-        items = create_data_items(
-            image=image_feature,
-            image_offsets=img_offsets,
-            video=video_feature,
-            video_offsets=video_offsets,
-            input_ids_list=prompt_ids_list,
-        )
+        if image_is_dynamic and image_feature is not None:
+            combined_feature = torch.cat(image_feature, dim=0)
+            items = create_data_items(
+                image=combined_feature,
+                image_offsets=img_offsets,
+                video=video_feature,
+                video_offsets=video_offsets,
+                input_ids_list=prompt_ids_list,
+            )
+            img_item_idx = 0
+            for item in items:
+                if item.modality == Modality.IMAGE and img_item_idx < len(
+                    num_tokens_per_image
+                ):
+                    item.model_specific_data = item.model_specific_data or {}
+                    item.model_specific_data["num_tokens"] = num_tokens_per_image[
+                        img_item_idx
+                    ]
+                    item.model_specific_data["is_dynamic"] = True
+                    img_item_idx += 1
+        else:
+            items = create_data_items(
+                image=image_feature,
+                image_offsets=img_offsets,
+                video=video_feature,
+                video_offsets=video_offsets,
+                input_ids_list=prompt_ids_list,
+            )
         items.extend(audio_items)
 
         return MultimodalProcessorOutput(
