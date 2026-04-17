@@ -12,7 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import GetLoadsReqInput
-from sglang.srt.observability.scheduler_metrics_mixin import SchedulerMetricsMixin
+from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
@@ -90,7 +90,7 @@ class TestGetLoadsNumTotalTokens(CustomTestCase):
             waiting_seqlens=(7, 5),
             num_used_tokens=100,
         )
-        out = SchedulerMetricsMixin.get_loads(scheduler, GetLoadsReqInput())
+        out = Scheduler.get_loads(scheduler, GetLoadsReqInput())
         self.assertEqual(out.num_running_reqs, 2)
         self.assertEqual(out.num_waiting_reqs, 2)
         self.assertEqual(out.num_used_tokens, 100)
@@ -105,7 +105,7 @@ class TestGetLoadsNumTotalTokens(CustomTestCase):
             disagg_prefill_bootstrap=(11, 13),
             num_used_tokens=50,
         )
-        out = SchedulerMetricsMixin.get_loads(scheduler, GetLoadsReqInput())
+        out = Scheduler.get_loads(scheduler, GetLoadsReqInput())
         # waiting (3) + bootstrap (11+13) = 3 waiting reqs.
         self.assertEqual(out.num_waiting_reqs, 3)
         # 50 + 3 + 11 + 13.
@@ -121,7 +121,7 @@ class TestGetLoadsNumTotalTokens(CustomTestCase):
             disagg_decode_retracted=(1,),
             num_used_tokens=20,
         )
-        out = SchedulerMetricsMixin.get_loads(scheduler, GetLoadsReqInput())
+        out = Scheduler.get_loads(scheduler, GetLoadsReqInput())
         # 1 (waiting) + 2 (prealloc) + 1 (transfer) + 1 (retracted) = 5.
         self.assertEqual(out.num_waiting_reqs, 5)
         # 20 + 2 + 4 + 6 + 8 + 1.
@@ -129,7 +129,7 @@ class TestGetLoadsNumTotalTokens(CustomTestCase):
 
     def test_empty_state_yields_zero_total(self):
         scheduler = _make_scheduler(num_used_tokens=0)
-        out = SchedulerMetricsMixin.get_loads(scheduler, GetLoadsReqInput())
+        out = Scheduler.get_loads(scheduler, GetLoadsReqInput())
         self.assertEqual(out.num_running_reqs, 0)
         self.assertEqual(out.num_waiting_reqs, 0)
         self.assertEqual(out.num_total_tokens, 0)
@@ -138,9 +138,7 @@ class TestGetLoadsNumTotalTokens(CustomTestCase):
 class TestGetLoadsSectionGating(CustomTestCase):
     def test_core_only_leaves_all_sections_none(self):
         scheduler = _make_scheduler(num_used_tokens=10)
-        out = SchedulerMetricsMixin.get_loads(
-            scheduler, GetLoadsReqInput(include=["core"])
-        )
+        out = Scheduler.get_loads(scheduler, GetLoadsReqInput(include=["core"]))
         self.assertIsNone(out.memory)
         self.assertIsNone(out.speculative)
         self.assertIsNone(out.lora)
@@ -149,9 +147,7 @@ class TestGetLoadsSectionGating(CustomTestCase):
 
     def test_include_queues_populates_queues_only(self):
         scheduler = _make_scheduler(waiting_seqlens=(5, 7))
-        out = SchedulerMetricsMixin.get_loads(
-            scheduler, GetLoadsReqInput(include=["queues"])
-        )
+        out = Scheduler.get_loads(scheduler, GetLoadsReqInput(include=["queues"]))
         self.assertIsNone(out.memory)
         self.assertIsNone(out.speculative)
         self.assertIsNone(out.lora)
@@ -164,9 +160,7 @@ class TestGetLoadsSectionGating(CustomTestCase):
             disagg_mode=DisaggregationMode.PREFILL,
             disagg_prefill_bootstrap=(10,),
         )
-        out = SchedulerMetricsMixin.get_loads(
-            scheduler, GetLoadsReqInput(include=["disagg"])
-        )
+        out = Scheduler.get_loads(scheduler, GetLoadsReqInput(include=["disagg"]))
         self.assertIsNotNone(out.disaggregation)
         self.assertEqual(out.disaggregation.mode, "prefill")
         self.assertEqual(out.disaggregation.prefill_prealloc_queue_reqs, 1)
@@ -176,9 +170,7 @@ class TestGetLoadsSectionGating(CustomTestCase):
             waiting_seqlens=(3,),
             disagg_mode=DisaggregationMode.NULL,
         )
-        out = SchedulerMetricsMixin.get_loads(
-            scheduler, GetLoadsReqInput(include=["all"])
-        )
+        out = Scheduler.get_loads(scheduler, GetLoadsReqInput(include=["all"]))
         # `speculative` stays None because spec_algorithm.is_none() -> True.
         # `memory` stays None because the mem-usage attrs are MagicMock and
         # pass through round(), but the AttributeError guard only catches
