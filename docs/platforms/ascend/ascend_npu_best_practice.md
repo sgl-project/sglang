@@ -42,6 +42,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Qwen3-32B       | Atlas 800I A3 | 2     | PD Mixed    | 6K+1.5K | 17ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-17ms-on-a3-2-cards-mixed-mode)      |
 | Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)        |
 | Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 12ms | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-6k-1_5k-12ms-on-a3-1-cards-mixed-mode)       |
+| Qwen3-8B        | Atlas 800I A3 | 1     | PD Mixed    | 3.5K+1.5K | 5ms | W8A8 INT8   | [Optimal Configuration](#qwen3-8b-3_5k-1_5k-5ms-on-a3-1-cards-mixed-mode)      |
 | Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 6K+1.5K | 10ms | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-6k-1_5k-10ms-on-a3-1-cards-mixed-mode)  |
 | Qwen3-30B-A3B   | Atlas 800I A3 | 1     | PD Mixed    | 1K+0.3K | 7ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-1k-0_3k-7ms-on-a3-1-cards-mixed-mode)   |
 | Qwen3-Next-A3B-Instruct       | Atlas 800I A3 | 2     | PD Mixed    | 1K+0.3K | 14.21ms | W8A8 INT8    | [Optimal Configuration](#qwen3-next-1k-0_3k-14_21ms-on-a3-2-cards-mixed-mode)      |
@@ -3570,7 +3571,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --tp-size 1 \
     --max-running-requests 70 \
     --max-prefill-tokens 16384 \
-    --served-model-name Qwen3-14B \
+    --served-model-name Qwen3-8B \
     --chunked-prefill-size 16384 \
     --cuda-graph-bs 8 12 24 36 48 51 55 60 63 64 66 68 70 \
     --dtype bfloat16 \
@@ -3643,7 +3644,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --tp-size 2 \
     --max-running-requests 1 \
     --max-prefill-tokens 16384 \
-    --served-model-name Qwen3-14B \
+    --served-model-name Qwen3-8B \
     --chunked-prefill-size -1 \
     --cuda-graph-bs 1 \
     --dtype bfloat16 \
