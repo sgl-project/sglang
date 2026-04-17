@@ -61,6 +61,9 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    should_use_fp4_marlin_fallback,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -565,6 +568,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     CompressedTensorsW4A4Fp4.get_min_capability(), error=False
                 )
                 if is_fp4a4_nvfp4_supported:
+                    # Route to self-contained Marlin fallback on non-Blackwell.
+                    if should_use_fp4_marlin_fallback():
+                        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4_marlin import (
+                            CompressedTensorsW4A4MarlinFp4,
+                        )
+
+                        return CompressedTensorsW4A4MarlinFp4()
                     return CompressedTensorsW4A4Fp4()
                 else:
                     raise NotImplementedError(
@@ -699,6 +709,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
+            if should_use_fp4_marlin_fallback():
+                from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4_marlin import (
+                    CompressedTensorsW4A4Nvfp4MarlinMoE,
+                )
+
+                logger.info_once("Using CompressedTensorsW4A4Nvfp4MarlinMoE")
+                return CompressedTensorsW4A4Nvfp4MarlinMoE()
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()
         elif self._is_fp8_w8a8(weight_quant, input_quant):

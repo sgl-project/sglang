@@ -34,7 +34,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        # SM75+ (Turing) via Marlin FP4 fallback; SM100 uses native FP4.
+        return 75
 
     def create_weights(
         self,

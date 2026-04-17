@@ -50,8 +50,8 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Requires sm100(blackwell) architecture
-        return 100
+        # SM75+ (Turing) via Marlin FP4 fallback; SM100 uses native FP4.
+        return 75
 
     def create_weights(
         self,

@@ -303,7 +303,13 @@ class FusedMoE(torch.nn.Module):
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
 
         self.should_fuse_routed_scaling_factor_in_topk = (
-            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            (
+                isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+                # Marlin FP4 fallback applies routed_scaling_factor during
+                # moe_sum_reduce; opt out of the topk fusion here. See
+                # ModelOptNvFp4MarlinFusedMoEMethod._is_marlin_fallback.
+                and not getattr(self.quant_method, "_is_marlin_fallback", False)
+            )
             or (
                 isinstance(self.quant_method, Fp8MoEMethod)
                 and (

@@ -40,6 +40,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    should_use_fp4_marlin_fallback,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -1136,7 +1139,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        # SM75+ (Turing) via Marlin FP4 fallback; SM100 uses native FP4.
+        return 75
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
@@ -1263,6 +1267,21 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        # Route to self-contained Marlin fallback on non-Blackwell GPUs.
+        if should_use_fp4_marlin_fallback():
+            # Lazy import to avoid circular dependency (modelopt_fp4_marlin
+            # imports the native classes defined below in this module).
+            from sglang.srt.layers.quantization.modelopt_fp4_marlin import (
+                ModelOptFp4MarlinLinearMethod,
+                ModelOptNvFp4MarlinFusedMoEMethod,
+            )
+
+            return self._get_quant_method(
+                layer,
+                prefix,
+                Linear=ModelOptFp4MarlinLinearMethod,
+                Moe=ModelOptNvFp4MarlinFusedMoEMethod,
+            )
         return self._get_quant_method(
             layer,
             prefix,
