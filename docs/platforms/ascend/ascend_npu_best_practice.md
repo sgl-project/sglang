@@ -67,6 +67,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-3_5k-1_5k-50ms-on-a2-8-cards-mixed-mode)                                |
 | Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed          | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-2k-2k-50ms-on-a2-8-cards-mixed-mode)                                    |
 | Qwen3-14B                      | Atlas 800I A3 | 1     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-14b-3_5k-1_5k-50ms-on-a3-1-cards-mixed-mode)                                |
+| Qwen3-8B                       | Atlas 800I A3 | 1     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-8b-3_5k-1_5k-50ms-on-a3-1-cards-mixed-mode)                                 |
 
 ## Optimal Configuration
 
@@ -3509,4 +3510,152 @@ We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 144 --random-output-len 1500 --random-input-len 3500 --num-prompts 576 --random-range-ratio 1
+```
+
+### Qwen3-8B 3_5K-1_5K 50ms on A3 1 Cards Mixed Mode
+
+Model: Qwen3-8B
+
+Hardware: Atlas 800I A3 1Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 50ms
+
+#### Model Deployment
+
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+MODEL_PATH=xxx
+
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=50
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
+    --attention-backend ascend --device npu --quantization modelslim \
+    --disable-radix-cache --mem-fraction-static 0.9 \
+    --tp-size 1 \
+    --max-running-requests 70 \
+    --max-prefill-tokens 16384 \
+    --served-model-name Qwen3-14B \
+    --chunked-prefill-size 16384 \
+    --cuda-graph-bs 8 12 24 36 48 51 55 60 63 64 66 68 70 \
+    --dtype bfloat16 \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+    --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 64 --random-output-len 1500 --random-input-len 3500 --num-prompts 256 --random-range-ratio 1
+```
+
+### Qwen3-8B 3_5K-1_5K 5ms on A3 1 Cards Mixed Mode
+
+Model: Qwen3-8B
+
+Hardware: Atlas 800I A3 1Card
+
+DeployMode: PD Mixed
+
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
+
+TPOT: 5ms
+
+#### Model Deployment
+
+```shell
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
+
+MODEL_PATH=xxx
+
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_OP_EXPANSION_MODE="AIV"
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+python -m sglang.launch_server --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
+    --attention-backend ascend --device npu --quantization modelslim \
+    --disable-radix-cache --mem-fraction-static 0.894 \
+    --tp-size 2 \
+    --max-running-requests 1 \
+    --max-prefill-tokens 16384 \
+    --served-model-name Qwen3-14B \
+    --chunked-prefill-size -1 \
+    --cuda-graph-bs 1 \
+    --dtype bfloat16 \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+    --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 1 --random-output-len 1500 --random-input-len 3500 --num-prompts 4 --random-range-ratio 1
 ```
