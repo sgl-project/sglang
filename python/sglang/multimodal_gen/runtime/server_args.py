@@ -73,6 +73,8 @@ logger = init_logger(__name__)
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("legacy", "snapshot", "resident")
+# H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
+LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 
 
 class Backend(str, Enum):
@@ -395,7 +397,11 @@ class ServerArgs(DisaggArgsMixin):
         mode = self.ltx2_two_stage_device_mode
         if mode is None:
             env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
-            mode = env_mode.lower() if env_mode else "snapshot"
+            mode = (
+                env_mode.lower()
+                if env_mode
+                else self._resolve_default_ltx2_two_stage_device_mode()
+            )
 
         if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
             raise ValueError(
@@ -404,6 +410,35 @@ class ServerArgs(DisaggArgsMixin):
             )
 
         self.ltx2_two_stage_device_mode = mode
+
+    def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
+        if not current_platform.is_cuda():
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=snapshot on non-CUDA platform"
+            )
+            return "snapshot"
+
+        device_name = str(current_platform.get_device_name(0)).upper()
+        device_total_memory_gb = (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+        )
+        if (
+            "H200" in device_name
+            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+        ):
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
+                device_name,
+                device_total_memory_gb,
+            )
+            return "resident"
+
+        logger.info(
+            "Automatically set ltx2_two_stage_device_mode=snapshot for CUDA GPU (%s, %.2f GiB total)",
+            device_name,
+            device_total_memory_gb,
+        )
+        return "snapshot"
 
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
@@ -930,7 +965,8 @@ class ServerArgs(DisaggArgsMixin):
                 "LTX-2.3 two-stage device residency mode: "
                 "'legacy' disables premerged stage2, "
                 "'snapshot' keeps premerged stage2 with snapshot-based release, "
-                "'resident' keeps both transformers resident on GPU."
+                "'resident' keeps both transformers resident on GPU. "
+                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
             ),
         )
         parser.add_argument(

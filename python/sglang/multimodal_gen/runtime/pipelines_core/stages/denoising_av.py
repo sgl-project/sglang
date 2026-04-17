@@ -83,11 +83,17 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             batch.audio_latents = audio_latents
 
         pipeline = self.pipeline() if self.pipeline else None
+        current_phase = (
+            str(getattr(batch, "extra", {}).get("ltx2_phase", ""))
+            if hasattr(batch, "extra")
+            else ""
+        )
         if (
             pipeline is not None
             and getattr(pipeline, "_use_premerged_stage2_transformer", False)
             and server_args.dit_cpu_offload
             and not server_args.use_fsdp_inference
+            and current_phase == "stage2"
         ):
             release_to_snapshots = getattr(
                 pipeline, "release_premerged_transformers_to_cpu_snapshots", None
