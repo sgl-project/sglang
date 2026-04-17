@@ -369,8 +369,84 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         self.layer_names = ["layers"]
+        self._rotary_pos_emb_cache: dict[
+            tuple[int, int, int, int, str], torch.Tensor
+        ] = {}
 
         self.__post_init__()
+
+    def _build_rotary_pos_emb(
+        self,
+        batch_size: int,
+        height_patches: int,
+        width_patches: int,
+        text_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        num_image_tokens = height_patches * width_patches
+        grid_yx = torch.stack(
+            torch.meshgrid(
+                torch.arange(height_patches, device=device, dtype=torch.float32),
+                torch.arange(width_patches, device=device, dtype=torch.float32),
+                indexing="ij",
+            ),
+            dim=-1,
+        ).reshape(-1, 2)
+
+        image_ids = torch.cat(
+            [
+                torch.full(
+                    (batch_size, num_image_tokens, 1),
+                    text_len,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                grid_yx.view(1, num_image_tokens, 2).expand(batch_size, -1, -1),
+            ],
+            dim=-1,
+        )
+
+        if text_len > 0:
+            text_ids = torch.cat(
+                [
+                    torch.arange(text_len, device=device, dtype=torch.float32)
+                    .view(1, text_len, 1)
+                    .expand(batch_size, -1, -1),
+                    torch.zeros((batch_size, text_len, 2), device=device),
+                ],
+                dim=-1,
+            )
+        else:
+            text_ids = torch.zeros((batch_size, 0, 3), device=device)
+
+        all_ids = torch.cat([image_ids, text_ids], dim=1)
+        return self.pos_embed(all_ids)
+
+    def _get_rotary_pos_emb(
+        self,
+        batch_size: int,
+        height_patches: int,
+        width_patches: int,
+        text_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self.training:
+            return self._build_rotary_pos_emb(
+                batch_size, height_patches, width_patches, text_len, device
+            )
+
+        key = (batch_size, height_patches, width_patches, text_len, str(device))
+        cached = self._rotary_pos_emb_cache.get(key)
+        if cached is not None and cached.device == device:
+            return cached
+
+        rotary_pos_emb = self._build_rotary_pos_emb(
+            batch_size, height_patches, width_patches, text_len, device
+        )
+        if len(self._rotary_pos_emb_cache) >= 8:
+            self._rotary_pos_emb_cache.clear()
+        self._rotary_pos_emb_cache[key] = rotary_pos_emb
+        return rotary_pos_emb
 
     def forward(
         self,
@@ -408,39 +484,7 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         Tmax = text_tokens.shape[1]
 
         x = torch.cat([img_tokens, text_tokens], dim=1)  # [B, S, D]
-
-        grid_yx = torch.stack(
-            torch.meshgrid(
-                torch.arange(Hp, device=device, dtype=torch.float32),
-                torch.arange(Wp, device=device, dtype=torch.float32),
-                indexing="ij",
-            ),
-            dim=-1,
-        ).reshape(-1, 2)
-
-        image_ids = torch.cat(
-            [
-                torch.full((B, N_img, 1), Tmax, device=device, dtype=torch.float32),
-                grid_yx.view(1, N_img, 2).expand(B, -1, -1),
-            ],
-            dim=-1,
-        )
-
-        if Tmax > 0:
-            text_ids = torch.cat(
-                [
-                    torch.arange(Tmax, device=device, dtype=torch.float32)
-                    .view(1, Tmax, 1)
-                    .expand(B, -1, -1),
-                    torch.zeros((B, Tmax, 2), device=device),
-                ],
-                dim=-1,
-            )
-        else:
-            text_ids = torch.zeros((B, 0, 3), device=device)
-
-        all_ids = torch.cat([image_ids, text_ids], dim=1)
-        rotary_pos_emb = self.pos_embed(all_ids)
+        rotary_pos_emb = self._get_rotary_pos_emb(B, Hp, Wp, Tmax, device)
 
         t_emb = self.time_proj(timestep.to(dtype))
         c = self.time_embedding(t_emb.to(dtype=dtype))
