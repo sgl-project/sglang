@@ -127,7 +127,6 @@ jobs:
       packages: write
     outputs:
       image_ref: ${{ steps.build.outputs.image_ref }}
-      version_id: ${{ steps.resolve.outputs.version_id }}
     steps:
       # Self-hosted runners retain the workspace across jobs. Prior `docker buildx`
       # runs on this node leave root-owned build artifacts (e.g. sgl-kernel/build/)
@@ -165,7 +164,9 @@ jobs:
             TAG_STUB=$(echo "${{ inputs.sglang_branch }}" | tr '/' '-' | tr -cd '[:alnum:]._-')
             SOURCE_DESC="branch ${{ inputs.sglang_branch }}"
           fi
-          TAG="${TAG_STUB}-${{ github.run_id }}"
+          # run_attempt disambiguates "Re-run jobs" so the squash filename
+          # (derived from the image URL) doesn't collide with a stale one.
+          TAG="${TAG_STUB}-${{ github.run_id }}-${{ github.run_attempt }}"
           IMAGE_REF="ghcr.io/sgl-project/${CI_IMAGE_PACKAGE}:${TAG}"
           echo "Building ${IMAGE_REF} from ${SOURCE_DESC}"
 
@@ -184,30 +185,6 @@ jobs:
             .
 
           echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
-          echo "image_tag=${TAG}" >> $GITHUB_OUTPUT
-
-      - name: Resolve GHCR package version id (for cleanup)
-        id: resolve
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.build.outputs.image_tag }}
-        run: |
-          # Retry: GHCR may take a few seconds to index a freshly pushed tag.
-          VERSION_ID=""
-          for i in 1 2 3 4 5; do
-            VERSION_ID=$(gh api "/orgs/sgl-project/packages/container/${CI_IMAGE_PACKAGE}/versions" \
-              --jq "[.[] | select(.metadata.container.tags[]? == \"${TAG}\")][0].id" || true)
-            if [ -n "$VERSION_ID" ] && [ "$VERSION_ID" != "null" ]; then
-              break
-            fi
-            echo "Version id not yet available (attempt $i), retrying..."
-            sleep 5
-          done
-          if [ -z "$VERSION_ID" ] || [ "$VERSION_ID" = "null" ]; then
-            echo "::warning::Could not resolve GHCR version id for tag ${TAG}; cleanup will be skipped."
-            VERSION_ID=""
-          fi
-          echo "version_id=${VERSION_ID}" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------------------------
   # Import Docker images to Lustre squash files once before all benchmark jobs.
@@ -401,22 +378,26 @@ jobs:
           python3 scripts/ci/slurm/summarize.py results/ >> $GITHUB_STEP_SUMMARY
 
   # ---------------------------------------------------------------------------
-  # Delete the ephemeral GHCR image built by `build-image`. Runs after all
-  # benchmark jobs complete (success or failure) so the image doesn't linger.
-  # No-op when build-image was skipped.
+  # Delete the entire ephemeral GHCR package built by `build-image`. Safe to
+  # wipe everything because:
+  #   - `concurrency: nightly-test-gb200` serializes runs so nothing else is
+  #     using the package mid-run,
+  #   - the sqsh file is already on Lustre by the time this runs, so the
+  #     benchmark jobs no longer need the GHCR image,
+  #   - this package is CI-only — no human artifacts live here.
+  # Skipped when build-image was skipped.
   # ---------------------------------------------------------------------------
   cleanup-image:
     needs: [build-image, nightly-gb200-benchmark]
-    if: always() && needs.build-image.result == 'success' && needs.build-image.outputs.version_id != ''
+    if: always() && needs.build-image.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       packages: write
     steps:
-      - name: Delete GHCR image version
+      - name: Delete GHCR package
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION_ID: ${{ needs.build-image.outputs.version_id }}
+          IMAGE_REF: ${{ needs.build-image.outputs.image_ref }}
         run: |
-          echo "Deleting GHCR package version ${VERSION_ID} (${{ needs.build-image.outputs.image_ref }})"
-          gh api --method DELETE \
-            "/orgs/sgl-project/packages/container/${CI_IMAGE_PACKAGE}/versions/${VERSION_ID}"
+          echo "Deleting GHCR package ${CI_IMAGE_PACKAGE} (built image: ${IMAGE_REF})"
+          gh api --method DELETE "/orgs/sgl-project/packages/container/${CI_IMAGE_PACKAGE}"
