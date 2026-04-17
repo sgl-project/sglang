@@ -20,8 +20,8 @@ from pathlib import Path
 
 from diffusion_case_parser import (
     BASELINE_REL_PATH,
+    CASE_CONFIG_REL_PATHS,
     RUN_SUITE_REL_PATH,
-    TESTCASE_CONFIG_REL_PATH,
     collect_diffusion_suites,
 )
 
@@ -39,18 +39,27 @@ def load_execution_reports(reports_dir: Path) -> list[dict]:
 
 def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     """
-    Get all expected cases from testcase_configs.py and run_suite.py.
+    Get all expected cases from case configs and run_suite.py.
 
     Returns:
         Dictionary mapping suite name to set of expected case IDs.
         Standalone files are represented as "standalone:<filename>".
     """
-    testcase_config_path = repo_root / TESTCASE_CONFIG_REL_PATH
+    case_config_paths = [repo_root / rel_path for rel_path in CASE_CONFIG_REL_PATHS]
+    existing_case_config_paths = [
+        config_path for config_path in case_config_paths if config_path.exists()
+    ]
     baseline_path = repo_root / BASELINE_REL_PATH
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
 
+    if not existing_case_config_paths:
+        raise FileNotFoundError(
+            "No diffusion case config found. Checked: "
+            + ", ".join(str(p) for p in case_config_paths)
+        )
+
     suites = collect_diffusion_suites(
-        testcase_config_path,
+        existing_case_config_paths,
         run_suite_path,
         baseline_path,
     )
@@ -64,6 +73,21 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
         for standalone_file in suite_info.standalone_files:
             case_ids.add(f"standalone:{standalone_file}")
         expected[suite_name] = case_ids
+
+    empty_dynamic_suites = [
+        suite_name
+        for suite_name in DYNAMIC_SUITES
+        if suite_name in expected
+        and not any(
+            not case_id.startswith("standalone:") for case_id in expected[suite_name]
+        )
+    ]
+    if empty_dynamic_suites:
+        raise RuntimeError(
+            "Parsed zero parametrized cases for diffusion suites: "
+            + ", ".join(sorted(empty_dynamic_suites))
+            + ". Refuse to pass coverage verification."
+        )
 
     return expected
 

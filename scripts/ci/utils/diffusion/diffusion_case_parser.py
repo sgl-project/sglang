@@ -2,21 +2,21 @@
 """
 AST-based parser for diffusion test cases.
 
-This module parses testcase_configs.py and run_suite.py using AST
+This module parses diffusion case configs and run_suite.py using AST
 to extract test case information without requiring sglang dependencies.
 Designed to run on lightweight CI runners (ubuntu-latest).
 
 Usage:
     # From sibling scripts in this directory:
     from diffusion_case_parser import collect_diffusion_suites
-    suites = collect_diffusion_suites(testcase_config_path, run_suite_path, baseline_path)
+    suites = collect_diffusion_suites(case_config_paths, run_suite_path, baseline_path)
 """
 
 import ast
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 # Mapping from list variable names to suite names
 CASE_LIST_TO_SUITE = {
@@ -34,9 +34,14 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 
 # Paths relative to repository root
-TESTCASE_CONFIG_REL_PATH = (
+LEGACY_TESTCASE_CONFIG_REL_PATH = (
     "python/sglang/multimodal_gen/test/server/testcase_configs.py"
 )
+GPU_CASES_REL_PATH = "python/sglang/multimodal_gen/test/server/gpu_cases.py"
+# Parse in this order so newer gpu_cases definitions override legacy ones.
+CASE_CONFIG_REL_PATHS = [LEGACY_TESTCASE_CONFIG_REL_PATH, GPU_CASES_REL_PATH]
+# Backward-compatible alias used by older call sites.
+TESTCASE_CONFIG_REL_PATH = GPU_CASES_REL_PATH
 BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
 
@@ -233,6 +238,20 @@ def parse_testcase_configs(config_path: Path) -> Dict[str, List[str]]:
     return visitor.cases
 
 
+def parse_case_configs(config_paths: Sequence[Path]) -> Dict[str, List[str]]:
+    """
+    Parse multiple case config files and merge known case lists.
+
+    Later files in config_paths override list definitions from earlier files.
+    """
+    merged_case_lists: Dict[str, List[str]] = {}
+    for config_path in config_paths:
+        if not config_path.exists():
+            continue
+        merged_case_lists.update(parse_testcase_configs(config_path))
+    return merged_case_lists
+
+
 def parse_run_suite_standalone_data(
     run_suite_path: Path,
 ) -> tuple[Dict[str, List[str]], Dict[str, Dict[str, float]]]:
@@ -272,7 +291,7 @@ def validate_standalone_est_times(
 
 
 def collect_diffusion_suites(
-    testcase_config_path: Path,
+    case_config_paths: Sequence[Path],
     run_suite_path: Path,
     baseline_path: Path,
 ) -> Dict[str, DiffusionSuiteInfo]:
@@ -280,15 +299,15 @@ def collect_diffusion_suites(
     Collect all diffusion test suite information using AST parsing.
 
     Args:
-        testcase_config_path: Path to testcase_configs.py
+        case_config_paths: Paths to case config sources
         run_suite_path: Path to run_suite.py
         baseline_path: Path to perf_baselines.json
 
     Returns:
         Dictionary mapping suite name to DiffusionSuiteInfo.
     """
-    # Parse case IDs from testcase_configs.py
-    case_lists = parse_testcase_configs(testcase_config_path)
+    # Parse case IDs from case config sources (legacy and current).
+    case_lists = parse_case_configs(case_config_paths)
 
     # Parse standalone files from run_suite.py
     standalone_files, standalone_est_times = parse_run_suite_standalone_data(
