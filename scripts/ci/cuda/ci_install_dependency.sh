@@ -260,7 +260,7 @@ mark_step_done "Uninstall Flashinfer"
 
 FLASHINFER_CLEAR_CACHE=true
 if [ -d "${HOME}/.cache/flashinfer" ] && [ "$FLASHINFER_CLEAR_CACHE" = true ]; then
-    rm -rf ${HOME}/.cache/flashinfer
+    find "${HOME}/.cache/flashinfer" -name "cached_ops" -type d -exec rm -rf {} + 2>/dev/null || true
     echo "Cleared stale FlashInfer JIT cached_ops"
 fi
 
