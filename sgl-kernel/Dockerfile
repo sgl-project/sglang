@@ -87,30 +87,6 @@ RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}
 
-# Override system CUDA runtime libs with torch's pip-installed versions.
-# The manylinux builder image has CUDA 13 nvcc but CUDA 12 runtime libs (cublas,
-# nvrtc, cudart) for backward compatibility. This causes compiled .so files to
-# link against libnvrtc.so.12 etc. For cu13 builds, symlink torch's cu13 pip
-# libs into the system CUDA path so cmake finds the correct SONAME (.so.13).
-ARG CUDA_VERSION
-RUN set -eux; \
-    CU_MAJOR=$(echo "${CUDA_VERSION}" | cut -d. -f1); \
-    if [ "${CU_MAJOR}" = "13" ]; then \
-      SITE=$( ${PYTHON_ROOT_PATH}/bin/python -c "import site; print(site.getsitepackages()[0])" ); \
-      for pkg_dir in "${SITE}"/nvidia/*/lib; do \
-        [ -d "${pkg_dir}" ] || continue; \
-        for so in "${pkg_dir}"/*.so*; do \
-          [ -f "${so}" ] || continue; \
-          base=$(basename "${so}"); \
-          ln -sf "${so}" "/usr/local/cuda/lib64/${base}"; \
-        done; \
-      done; \
-      echo "Symlinked cu13 NVIDIA pip libs into /usr/local/cuda/lib64/"; \
-      ls -la /usr/local/cuda/lib64/libnvrtc.so* /usr/local/cuda/lib64/libcublas.so* 2>/dev/null || true; \
-    else \
-      echo "CUDA ${CU_MAJOR} — using system libs (no override needed)"; \
-    fi
-
 # Build stage: copy source and build wheel
 FROM deps AS build
 WORKDIR /sgl-kernel
