@@ -267,12 +267,14 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
     cache_dir = os.path.dirname(path)
     try:
         os.makedirs(cache_dir, exist_ok=True)
-    except FileExistsError:
-        # Race condition: another process created the directory between
-        # the existence check and mkdir inside os.makedirs (Python 3.10 bug).
-        # Verify it's actually a directory; if not, re-raise.
+    except (FileExistsError, NotADirectoryError):
         if not os.path.isdir(cache_dir):
-            raise
+            # Path exists as a file (stale cache/lock). Remove and retry.
+            try:
+                os.remove(cache_dir)
+            except OSError:
+                pass
+            os.makedirs(cache_dir, exist_ok=True)
     from sglang.srt.distributed.parallel_state import get_world_group
 
     if (not is_distributed or get_world_group().local_rank == 0) and (
