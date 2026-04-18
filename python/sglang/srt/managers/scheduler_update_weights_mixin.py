@@ -87,9 +87,15 @@ class SchedulerUpdateWeightsMixin:
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
-        """Update the online model parameter."""
+        """Update the online model parameter.
+
+        When a draft worker exists (e.g. speculative/MTP), route through
+        it so both draft and target models are updated — matching the
+        behavior of update_weights_from_tensor.
+        """
         self._quiesce_for_weight_update()
-        success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+        worker = self.draft_worker or self.tp_worker
+        success, message = worker.update_weights_from_distributed(recv_req)
         if success:
             if recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()
