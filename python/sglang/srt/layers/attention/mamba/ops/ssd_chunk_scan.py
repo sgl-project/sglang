@@ -272,7 +272,7 @@ def _chunk_scan_fwd_kernel(
             else:
                 # - if there is initstates, we will rely on prev_states, no zeroing
                 #   required.
-                scale_m = tl.exp(dA_cs_m - dA_cs_m_boundary)
+                scale_m = tl.exp(tl.minimum(dA_cs_m - dA_cs_m_boundary, 0.0))
         else:
             scale_m = tl.exp(dA_cs_m)
         if BLOCK_SIZE_DSTATE <= 128:

@@ -428,7 +428,7 @@ def _chunk_state_varlen_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        scale = tl.exp(dA_cs_last - dA_cs_boundary)
+        scale = tl.exp(tl.minimum(dA_cs_last - dA_cs_boundary, 0.0))
         acc += past_states * scale
 
     states = acc.to(states_ptr.dtype.element_ty)
