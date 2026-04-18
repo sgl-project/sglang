@@ -22,7 +22,7 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=85, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=79, suite="stage-b-test-1-gpu-small")
 
 _CAUSAL_LM_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST  # Llama-3.2-1B-Instruct
 _SEQCLS_MODEL = "Qwen/Qwen3-0.6B"  # backbone; arch overridden to SeqCls below

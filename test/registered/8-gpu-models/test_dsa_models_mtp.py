@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=910, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=916, suite="stage-c-test-8-gpu-h200")
 
 FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 GLM5_MODEL_PATH = "zai-org/GLM-5-FP8"

@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.lora.lora_moe_runners import LoRAInfo
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=600, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=86, suite="stage-b-test-1-gpu-large")
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ from test_streaming_session import (  # noqa: E402
     TestStreamingSessionAbortLeakRepro,
 )
 
-register_cuda_ci(est_time=450, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=503, suite="stage-b-test-1-gpu-large")
 
 
 SWA_MODEL = "openai/gpt-oss-20b"

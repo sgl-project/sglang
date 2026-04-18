@@ -29,7 +29,7 @@ from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 # python -m unittest test_encoder_embedding_models.TestEncoderEmbeddingModels.test_prefill_logits
 
 
-register_cuda_ci(est_time=198, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=294, suite="stage-b-test-1-gpu-small")
 
 MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]
 

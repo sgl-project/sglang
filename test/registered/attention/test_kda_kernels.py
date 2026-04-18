@@ -8,7 +8,7 @@ from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
 from sglang.srt.layers.attention.fla.kda import fused_kda_gate, fused_recurrent_kda
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=7, suite="stage-b-test-1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")

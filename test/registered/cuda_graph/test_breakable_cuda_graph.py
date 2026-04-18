@@ -13,7 +13,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # CI Registration
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=6, suite="stage-b-test-1-gpu-small")
 
 
 def _skip_if_no_cuda(test_func):

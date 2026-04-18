@@ -35,7 +35,7 @@ register_amd_ci(
     suite="stage-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
-register_cuda_ci(est_time=102, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=108, suite="stage-b-test-1-gpu-small")
 
 MODEL_TO_CONFIG = {
     "Alibaba-NLP/gte-Qwen2-1.5B-instruct": (1, 1e-5),

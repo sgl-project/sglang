@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 )
 
 # FlashMLA attention backend tests with MTP speculative decoding
-register_cuda_ci(est_time=296, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=306, suite="stage-b-test-1-gpu-large")
 
 
 class TestFlashMLAAttnBackend(unittest.TestCase):

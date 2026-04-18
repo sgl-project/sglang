@@ -19,7 +19,7 @@ from sglang.test.vlm_utils import (
     VideoOpenAITestMixin,
 )
 
-register_cuda_ci(est_time=736, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=702, suite="stage-b-test-1-gpu-large")
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
