@@ -22,7 +22,16 @@ import yaml
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    is_ltx23_native_variant,
+)
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
+    DisaggArgsMixin,
+    add_disagg_cli_args,
+    convert_disagg_role_string,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -63,6 +72,16 @@ logger = init_logger(__name__)
 # our validated Wan/MOVA workloads, so use a 130 GiB cutoff to keep H200-class
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
+LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+# H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
+LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+
+
+def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    mode = mode.lower()
+    return mode
 
 
 class Backend(str, Enum):
@@ -94,7 +113,7 @@ class Backend(str, Enum):
 
 
 @dataclasses.dataclass
-class ServerArgs:
+class ServerArgs(DisaggArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
 
@@ -130,8 +149,8 @@ class ServerArgs:
     dp_size: int = 1
     # number of gpu in a dp group
     dp_degree: int = 1
-    # cfg parallel
-    enable_cfg_parallel: bool = False
+    # cfg parallel (None = auto-decide based on num_gpus)
+    enable_cfg_parallel: Optional[bool] = None
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -169,6 +188,7 @@ class ServerArgs:
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
+    ltx2_two_stage_device_mode: str | None = None
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -230,9 +250,34 @@ class ServerArgs:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # Disaggregation — fields defined here, methods in DisaggArgsMixin,
+    # CLI registration in disagg_args.add_disagg_cli_args().
+    base_gpu_id: int = 0
+    disagg_role: RoleType = RoleType.MONOLITHIC
+    disagg_timeout: int = 600
+    disagg_dispatch_policy: str = "round_robin"
+    disagg_mode: bool = False
+    disagg_server_addr: str | None = None
+    encoder_urls: str | None = None
+    denoiser_urls: str | None = None
+    decoder_urls: str | None = None
+    encoder_tp: int | None = None
+    denoiser_tp: int | None = None
+    denoiser_sp: int | None = None
+    denoiser_ulysses: int | None = None
+    denoiser_ring: int | None = None
+    decoder_tp: int | None = None
+    disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_p2p_hostname: str = "127.0.0.1"
+    disagg_ib_device: str | None = None
+    pool_work_endpoint: str | None = None
+    pool_result_endpoint: str | None = None
+
     # Logging
     log_level: str = "info"
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
+
+    # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
     def broker_port(self) -> int:
@@ -252,6 +297,7 @@ class ServerArgs:
     def _adjust_parameters(self):
         """set defaults and normalize values."""
         self._adjust_offload()
+        self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
         self._adjust_quant_config()
         self._adjust_warmup()
@@ -347,6 +393,62 @@ class ServerArgs:
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = True
 
+    def _adjust_ltx2_two_stage_device_mode(self):
+        is_ltx23_two_stage = self.pipeline_class_name == "LTX2TwoStagePipeline" and (
+            self._is_ltx23_model_path(self.model_path)
+            or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
+        )
+        if not is_ltx23_two_stage:
+            return
+
+        mode = self.ltx2_two_stage_device_mode
+        if mode is None:
+            env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
+            mode = (
+                _normalize_ltx2_two_stage_device_mode(env_mode)
+                if env_mode
+                else self._resolve_default_ltx2_two_stage_device_mode()
+            )
+        else:
+            mode = _normalize_ltx2_two_stage_device_mode(mode)
+
+        if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
+            raise ValueError(
+                f"Invalid ltx2_two_stage_device_mode={mode!r}. "
+                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODES}."
+            )
+
+        self.ltx2_two_stage_device_mode = mode
+
+    def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
+        if not current_platform.is_cuda():
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=snapshot on non-CUDA platform"
+            )
+            return "snapshot"
+
+        device_name = str(current_platform.get_device_name(0)).upper()
+        device_total_memory_gb = (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+        )
+        if (
+            "H200" in device_name
+            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+        ):
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
+                device_name,
+                device_total_memory_gb,
+            )
+            return "resident"
+
+        logger.info(
+            "Automatically set ltx2_two_stage_device_mode=snapshot for CUDA GPU (%s, %.2f GiB total)",
+            device_name,
+            device_total_memory_gb,
+        )
+        return "snapshot"
+
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
@@ -411,12 +513,22 @@ class ServerArgs:
             )
 
     def _adjust_network_ports(self):
+        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
+        # so skip settling the HTTP port to avoid unnecessary port collisions.
+        needs_http = self.disagg_role in (
+            RoleType.MONOLITHIC,
+            RoleType.SERVER,
+        )
+
         if self.strict_ports:
-            self._require_port(self.port, "HTTP")
+            if needs_http:
+                self._require_port(self.port, "HTTP")
             self._require_port(self.scheduler_port, "Scheduler")
-            self._require_port(self.master_port, "Master")
+            if self.master_port is not None:
+                self._require_port(self.master_port, "Master")
         else:
-            self.port = self.settle_port(self.port)
+            if needs_http:
+                self.port = self.settle_port(self.port)
             initial_scheduler_port = self.scheduler_port + (
                 random.randint(0, 100) if self.scheduler_port == 5555 else 0
             )
@@ -428,12 +540,37 @@ class ServerArgs:
         sp_unspecified = self.sp_degree is None
         ulysses_unspecified = self.ulysses_degree is None
         ring_unspecified = self.ring_degree is None
+        cfg_unspecified = self.enable_cfg_parallel is None
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
 
         if self.tp_size is None:
             self.tp_size = 1
+
+        # Auto-enable CFG parallel when user hasn't set any parallelism flags
+        # and there are enough GPUs.  Only auto-enable for models whose default
+        # SamplingParams use classifier-free guidance (negative_prompt is not None),
+        # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
+        if cfg_unspecified:
+            cfg_group_size = self.dp_size * self.tp_size * 2
+            if (
+                self.num_gpus >= 2
+                and self.num_gpus % cfg_group_size == 0
+                and sp_unspecified
+                and ulysses_unspecified
+                and ring_unspecified
+                and self._model_default_uses_cfg()
+            ):
+                self.enable_cfg_parallel = True
+                logger.info(
+                    "Automatically enabled CFG parallel for %d GPUs. "
+                    "Use --sp-degree / --ulysses-degree to use sequence "
+                    "parallelism instead.",
+                    self.num_gpus,
+                )
+            else:
+                self.enable_cfg_parallel = False
 
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
@@ -465,6 +602,28 @@ class ServerArgs:
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def _model_default_uses_cfg(self) -> bool:
+        """
+        Check whether the model uses classifier-free guidance by default.
+
+        CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        """
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(self.model_path, self.backend, self.model_id)
+        if model_info is None:
+            return False
+        default_params = model_info.sampling_param_cls()
+
+        # for ltx2.3, cfg-parallel performs worse than ulysses-sp
+        is_ltx = "ltx" in type(default_params).__name__.lower()
+        if is_ltx:
+            return False
+        return (
+            getattr(default_params, "negative_prompt", None) is not None
+            and getattr(default_params, "guidance_scale", 0) > 1.0
+        )
 
     @staticmethod
     def _is_ltx23_model_path(model_path: str | None) -> bool:
@@ -564,6 +723,9 @@ class ServerArgs:
         # configure logger before use
         configure_logger(server_args=self)
 
+        # Convert string disagg_role to enum (from CLI/config)
+        convert_disagg_role_string(self.__dict__)
+
         # 1. adjust parameters
         self._adjust_parameters()
 
@@ -652,6 +814,7 @@ class ServerArgs:
             default=ServerArgs.num_gpus,
             help="The number of GPUs to use.",
         )
+
         parser.add_argument(
             "--tp-size",
             type=int,
@@ -679,8 +842,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cfg-parallel",
             action="store_true",
-            default=ServerArgs.enable_cfg_parallel,
-            help="Enable cfg parallel.",
+            default=None,
+            help="Enable cfg parallel. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -710,6 +873,9 @@ class ServerArgs:
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
+
+        # Disaggregated diffusion args (defined in disagg_args.py)
+        add_disagg_cli_args(parser)
 
         # Prompt text file for batch processing
         parser.add_argument(
@@ -798,6 +964,19 @@ class ServerArgs:
             action=StoreBoolean,
             help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
             "Should be enabled in almost all cases",
+        )
+        parser.add_argument(
+            "--ltx2-two-stage-device-mode",
+            type=str,
+            choices=LTX2_TWO_STAGE_DEVICE_MODES,
+            default=ServerArgs.ltx2_two_stage_device_mode,
+            help=(
+                "LTX-2.3 two-stage device residency mode: "
+                "'original' keeps official two-stage semantics without premerged stage2, "
+                "'snapshot' keeps premerged stage2 with snapshot-based release, "
+                "'resident' keeps both transformers resident on GPU. "
+                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
+            ),
         )
         parser.add_argument(
             "--disable-autocast",
@@ -1091,6 +1270,9 @@ class ServerArgs:
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
+
+        # Convert disagg_role string to enum if necessary
+        convert_disagg_role_string(kwargs)
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)

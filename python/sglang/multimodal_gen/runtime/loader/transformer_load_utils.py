@@ -40,6 +40,7 @@ PostLoadHook = Callable[[nn.Module], None]
 _PRECISION_VARIANT_SUFFIX_RE = re.compile(
     r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
 )
+_MIXED_SAFETENSORS_RE = re.compile(r".*-mixed(?:-\d+-of-\d+)?\.safetensors$")
 
 
 @dataclass
@@ -217,6 +218,7 @@ def resolve_transformer_safetensors_to_load(
     else:
         safetensors_list = _list_safetensors_files(component_model_path)
 
+    safetensors_list = _prefer_mixed_safetensors_files(safetensors_list)
     safetensors_list = _filter_duplicate_precision_variant_safetensors(safetensors_list)
 
     if not safetensors_list:
@@ -225,6 +227,31 @@ def resolve_transformer_safetensors_to_load(
         )
 
     return safetensors_list
+
+
+def _prefer_mixed_safetensors_files(safetensors_list: list[str]) -> list[str]:
+    """Prefer mixed-precision transformer exports over sibling full exports.
+
+    Some raw ModelOpt NVFP4 repos ship both `foo-mixed.safetensors` and
+    `foo.safetensors`. They are alternative full transformer exports, not
+    shards, so loading both trips duplicate tensor-name validation.
+    """
+    mixed_files = [
+        path
+        for path in safetensors_list
+        if _MIXED_SAFETENSORS_RE.match(os.path.basename(path))
+    ]
+    if not mixed_files or len(mixed_files) == len(safetensors_list):
+        return safetensors_list
+
+    logger.info(
+        "Using %d mixed transformer safetensors file(s) and ignoring %d sibling "
+        "non-mixed file(s): %s",
+        len(mixed_files),
+        len(safetensors_list) - len(mixed_files),
+        mixed_files,
+    )
+    return mixed_files
 
 
 def _filter_duplicate_precision_variant_safetensors(
