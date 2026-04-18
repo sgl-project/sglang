@@ -1178,9 +1178,17 @@ class Indexer(MultiPlatformOp):
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        metadata = forward_batch.attn_backend.get_indexer_metadata(
-            layer_id, forward_batch
-        )
+        # In PCG mode, metadata is fetched inside split ops via get_forward_context() to
+        # prevent Dynamo from guarding on forward_metadata identity (which changes each
+        # replay when init_forward_metadata creates a new ForwardMetadata object).
+        if not is_in_piecewise_cuda_graph():
+            metadata = forward_batch.attn_backend.get_indexer_metadata(
+                layer_id, forward_batch
+            )
+            if metadata is None:
+                return None
+        else:
+            metadata = None
 
         enable_dual_stream = (
             self.alt_stream is not None
@@ -1188,10 +1196,6 @@ class Indexer(MultiPlatformOp):
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
-
-        # skip NSA if attention backend choose to skip this batch
-        if metadata is None:
-            return None
 
         # Determine if should skip topk based on sequence length
         # We can only skip the logits computation if cuda graph is not involved
