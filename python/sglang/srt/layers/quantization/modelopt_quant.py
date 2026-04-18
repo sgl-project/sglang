@@ -2185,13 +2185,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             flashinfer_cutedsl_moe_masked,
         )
 
-        # flashinfer_cutedsl_moe_masked reinterprets the scale tensor as
-        # float8_e4m3fn, which requires stride(-1)==1.  Catch violating
-        # DeepEP layouts (e.g. int32-packed UE8M0 scales) early.
-        if MOE_NVFP4_DISPATCH and x[1] is not None:
-            assert x[1].stride(-1) == 1, (
-                f"NVFP4 dispatch scale tensor has stride(-1)={x[1].stride(-1)}, "
-                f"dtype={x[1].dtype}; expected 1 for .view(float8_e4m3fn). "
+        # flashinfer_cutedsl_moe_masked reinterprets scales as float8_e4m3fn.
+        # Same-dtype .view is a no-op; only wider dtypes (e.g. int32-packed
+        # UE8M0) need stride(-1)==1.
+        if (
+            MOE_NVFP4_DISPATCH
+            and x[1] is not None
+            and x[1].element_size() != 1
+            and x[1].stride(-1) != 1
+        ):
+            raise AssertionError(
+                f"NVFP4 dispatch scale has stride(-1)={x[1].stride(-1)}, "
+                f"dtype={x[1].dtype}; .view(float8_e4m3fn) requires stride(-1)==1. "
                 "Try SGLANG_MOE_NVFP4_DISPATCH=0 or check DeepEP version."
             )
 
