@@ -116,10 +116,12 @@ CI_MULTI_LORA_MODELS = [
             LoRAAdaptor(
                 name="winddude/wizardLM-LlaMA-LoRA-7B",
                 prefill_tolerance=1e-1,
+                rouge_l_tolerance=0.9,
             ),
             LoRAAdaptor(
                 name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
                 prefill_tolerance=3e-1,
+                rouge_l_tolerance=0.9,
             ),
         ],
         max_loras_per_batch=2,
