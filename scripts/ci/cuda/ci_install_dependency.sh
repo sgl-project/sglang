@@ -399,7 +399,11 @@ mark_step_done "Fix other dependencies"
 # Download kernels from kernels community
 kernels download python || true
 kernels lock python || true
-mkdir -p ${HOME}/.cache/sglang/ && mv python/kernels.lock ${HOME}/.cache/sglang/ || true
+# Ensure target is a directory — on fresh containers or after a previous buggy
+# `mv` that created a FILE at this path, mkdir -p would fail silently.
+[ -e "${HOME}/.cache/sglang" ] && [ ! -d "${HOME}/.cache/sglang" ] && rm -f "${HOME}/.cache/sglang"
+mkdir -p "${HOME}/.cache/sglang/"
+mv python/kernels.lock "${HOME}/.cache/sglang/" || true
 
 # Install human-eval. This script is sourced from ci_install_deepep.sh, so a
 # bare `cd human-eval` would leave the caller stuck in that directory for the
