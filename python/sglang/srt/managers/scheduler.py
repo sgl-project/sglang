@@ -914,6 +914,9 @@ class Scheduler(
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_running_status(self):
+        self.num_continuous_decode_steps = max(
+            1, self.server_args.num_continuous_decode_steps
+        )
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
@@ -1397,6 +1400,21 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+
+                # Decode multiple steps to reduce scheduler overhead.
+                for _ in range(self.num_continuous_decode_steps - 1):
+                    if not self._can_run_continuous_decode(batch):
+                        break
+                    batch = self.update_running_batch(self.running_batch)
+                    if (
+                        batch is None
+                        or batch.is_empty()
+                        or not batch.forward_mode.is_decode()
+                    ):
+                        break
+                    self.cur_batch = batch
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -1418,6 +1436,40 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        def run_one_overlap_step(
+            current_batch: Optional[ScheduleBatch],
+        ) -> None:
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(current_batch)
+
+            # If we do not need to overlap the current batch with the last batch,
+            # we can process the last batch immediately.
+            if disable_overlap_for_batch:
+                pop_and_process()
+
+            # Launch the current batch
+            if current_batch:
+                current_batch_result = self.run_batch(current_batch)
+                self.result_queue.append((current_batch.copy(), current_batch_result))
+            else:
+                current_batch_result = None
+                self.cancel_bubble_timer()
+
+            # Process the last batch
+            if self.last_batch:
+                if not disable_overlap_for_batch:
+                    pop_and_process()
+            elif current_batch is None:
+                # When the server is idle, do self-check and re-init some states
+                self.self_check_during_idle()
+
+            # Run sample of the current batch
+            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            if self.is_generation:
+                self.launch_batch_sample_if_needed(current_batch_result)
+
+            # Update last_batch
+            self.last_batch = current_batch
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -1428,40 +1480,40 @@ class Scheduler(
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            run_one_overlap_step(batch)
 
-            # If we do not need to overlap the current batch with the last batch,
-            # we can process the last batch immediately.
-            if disable_overlap_for_batch:
-                pop_and_process()
+            # Decode multiple steps to reduce scheduler overhead.
+            for _ in range(self.num_continuous_decode_steps - 1):
+                if not self._can_run_continuous_decode(batch):
+                    break
+                batch = self.update_running_batch(self.running_batch)
+                if (
+                    batch is None
+                    or batch.is_empty()
+                    or not batch.forward_mode.is_decode()
+                ):
+                    break
+                self.cur_batch = batch
+                run_one_overlap_step(batch)
 
-            # Launch the current batch
-            if batch:
-                batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
-            else:
-                batch_result = None
-                self.cancel_bubble_timer()
-
-            # Process the last batch
-            if self.last_batch:
-                if not disable_overlap_for_batch:
-                    pop_and_process()
-            elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.on_idle()
-
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result)
-
-            # Update last_batch
-            self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
-    def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
+    def _can_run_continuous_decode(self, batch: Optional[ScheduleBatch]) -> bool:
+        if self.num_continuous_decode_steps <= 1:
+            return False
+        if batch is None or not batch.forward_mode.is_decode():
+            return False
+        if self._engine_paused:
+            return False
+        # Avoid hurting TTFT when there are pending requests waiting for prefill.
+        if self.waiting_queue:
+            return False
+        if self.chunked_req is not None:
+            return False
+        return True
+
+    def is_disable_overlap_for_batch(self, batch: Optional[ScheduleBatch]) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
         # In DP attention mode, use the globally synchronized is_extend_in_batch
