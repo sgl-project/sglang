@@ -11,21 +11,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Compatibility patches for transformers v5.x.
+"""Monkey-patches on transformers internals.
 
-This module applies monkey-patches to work around breaking changes in
-transformers v5.  Each patch is tagged with the upstream issue it works
-around so it can be removed once the upstream fix lands.
+Mix of backward-compat shims (re-add symbols removed in v5), workarounds
+for transformers v5 bugs, fixes for remote-model-code (trust_remote_code)
+that hasn't been updated for v5 yet, and CI-only patches (e.g. neutralize
+HF API calls to avoid rate limits).
 
 Import this module early (before any ``from_pretrained`` call) to activate
 all patches.  It is safe to import multiple times -- patches are idempotent.
-
-Patches fall into two categories:
-
-1. **Transformers bugs / regressions** -- issues in transformers itself.
-2. **Remote-model-code compat** -- remote model code (trust_remote_code)
-   that hasn't been updated for v5 yet.  These should be removed once
-   the model authors publish fixes.
 """
 
 import inspect
@@ -44,9 +38,18 @@ def apply_all():
     """Apply all transformers compatibility patches (idempotent).
 
     Call this once at import time.  It is safe to call multiple times.
+
+    No-op when the ``transformers`` package is not installed -- frontend-only
+    sglang users should not be forced to install transformers just to import
+    the top-level ``sglang`` package.
     """
     global _applied
     if _applied:
+        return
+    try:
+        import transformers  # noqa: F401
+    except ImportError:
+        _applied = True
         return
     _applied = True
 
@@ -61,6 +64,9 @@ def apply_all():
     # v5 general patches
     _ensure_clean_up_tokenization_compat()
     _ensure_is_torch_fx_available_compat()
+
+    # CI-only: neutralize HF API calls inside tokenizer from_pretrained
+    patch_is_base_mistral_in_ci()
 
     logger.debug("transformers compatibility patches applied")
 
