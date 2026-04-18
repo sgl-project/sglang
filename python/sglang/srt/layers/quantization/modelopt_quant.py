@@ -2048,6 +2048,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_alpha=w2_alpha,
                 fc2_input_scale=fc2_input_scale,
                 input_scale=layer._cutedsl_input_scale,
+                layer=layer,
             )
             return self.runner.run(dispatch_output, quant_info)
 

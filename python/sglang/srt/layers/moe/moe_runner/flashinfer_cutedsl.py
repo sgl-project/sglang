@@ -340,6 +340,12 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     # Activation quantization scale (scalarized)
     input_scale: torch.Tensor
 
+    # Reference to the FusedMoE layer for the masked kernel path (DeepEP LL).
+    # The masked kernel needs different weight formats (swizzled blockscale,
+    # raw per-expert alphas) than the wrapper path (MMA blockscale, scalarized
+    # alphas).  Optional — only populated when DeepEP A2A is active.
+    layer: Any = None
+
 
 def _cutedsl_fp4_core(
     hidden_states: torch.Tensor,
@@ -415,3 +421,56 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         runner_config,
     )
     return FlashinferCombineInput(hidden_states=output)
+
+
+@register_fused_func("deepep", "flashinfer_cutedsl")
+def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
+    dispatch_output,
+    quant_info: CuteDslFp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+):
+    """DeepEP LL + CuteDSL: use the masked grouped-GEMM kernel directly.
+
+    This mirrors modelopt_quant.py:apply_without_routing_weights() — same
+    weight attributes, same call signature to flashinfer_cutedsl_moe_masked().
+    The masked kernel uses swizzled blockscale and raw per-expert alphas,
+    which differ from the wrapper path's MMA blockscale and scalarized alphas.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+        flashinfer_cutedsl_moe_masked,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
+    assert dispatch_output.format.name == "DEEPEP_LL", (
+        f"DeepEP Normal + CuteDSL not supported; DWDP hybrid decode uses LL mode. "
+        f"Got format: {dispatch_output.format}"
+    )
+
+    layer = quant_info.layer
+    assert layer is not None, (
+        "CuteDslFp4MoeQuantInfo.layer must be set for DeepEP LL path"
+    )
+
+    moe_nvfp4_dispatch = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
+
+    output = flashinfer_cutedsl_moe_masked(
+        hidden_states=(dispatch_output.hidden_states, dispatch_output.hidden_states_scale),
+        input_global_scale=(
+            None if moe_nvfp4_dispatch else layer.w13_input_scale_quant
+        ),
+        w1=layer.w13_weight,
+        w1_blockscale=layer.w13_blockscale_swizzled,
+        w1_alpha=layer.g1_alphas,
+        w2=layer.w2_weight,
+        a2_global_scale=layer.w2_input_scale_quant,
+        w2_blockscale=layer.w2_blockscale_swizzled,
+        w2_alpha=layer.g2_alphas,
+        masked_m=dispatch_output.masked_m,
+    )
+
+    return DeepEPLLCombineInput(
+        hidden_states=output,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+    )
