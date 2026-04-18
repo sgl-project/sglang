@@ -16,7 +16,7 @@ import torch
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
 
 # ---------------------------------------------------------------------------
 # Test configuration (small-scale for fast CI runs)

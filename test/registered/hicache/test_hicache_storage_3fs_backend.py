@@ -13,7 +13,7 @@ from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=150, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=156, suite="stage-b-test-2-gpu-large")
 register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large")
 
 
