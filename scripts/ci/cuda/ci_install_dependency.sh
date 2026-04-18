@@ -347,11 +347,13 @@ mark_step_done "Download flashinfer artifacts"
 CU_STRIP="${CU_VERSION#cu}"
 CU_MAJOR="${CU_STRIP:0:2}"
 if [ "$CU_MAJOR" = "13" ]; then
-    NVRTC_SPEC="nvidia-cuda-nvrtc"
+    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post1"
+    EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
 else
-    NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
+    MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post1"
+    EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
 fi
-$PIP_CMD install mooncake-transfer-engine==0.3.10.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
