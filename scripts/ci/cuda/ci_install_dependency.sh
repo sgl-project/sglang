@@ -295,8 +295,10 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
         ls -alh sgl-kernel/dist/
         exit 1
     fi
-    echo "Installing sgl-kernel wheel: $KERNEL_WHL"
-    $PIP_CMD install "$KERNEL_WHL" --force-reinstall $PIP_INSTALL_SUFFIX
+    echo "Custom sgl-kernel wheel found: $KERNEL_WHL (will install after all other deps)"
+    # Deferred: install AFTER all other pip commands so it doesn't get overwritten
+    # by dependency resolution in later steps. Stored in CUSTOM_KERNEL_WHL.
+    CUSTOM_KERNEL_WHL="$KERNEL_WHL"
 elif [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; then
     # CUSTOM_BUILD_SGL_KERNEL was set but artifacts not available (e.g., stage rerun without wheel build)
     # Fail instead of falling back to PyPI - we need to test the built kernel, not PyPI version
@@ -419,6 +421,18 @@ $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
     cd human-eval
     $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
 )
+
+# ------------------------------------------------------------------------------
+# Install custom sgl-kernel wheel (deferred)
+# ------------------------------------------------------------------------------
+# Must run AFTER all other pip installs. Earlier pip/uv commands trigger
+# dependency resolution that can replace sglang-kernel==0.4.1+cu130 with
+# sglang-kernel==0.4.1 from the index. --no-deps prevents resolution.
+if [ -n "${CUSTOM_KERNEL_WHL:-}" ]; then
+    echo "Installing deferred custom sgl-kernel wheel: $CUSTOM_KERNEL_WHL"
+    $PIP_CMD install "$CUSTOM_KERNEL_WHL" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    mark_step_done "Install custom sgl-kernel wheel (deferred)"
+fi
 
 # ------------------------------------------------------------------------------
 # Prepare runner
