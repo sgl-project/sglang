@@ -399,7 +399,7 @@ mark_step_done "Fix other dependencies"
 # Download kernels from kernels community
 kernels download python || true
 kernels lock python || true
-mv python/kernels.lock ${HOME}/.cache/sglang || true
+mkdir -p ${HOME}/.cache/sglang/ && mv python/kernels.lock ${HOME}/.cache/sglang/ || true
 
 # Install human-eval. This script is sourced from ci_install_deepep.sh, so a
 # bare `cd human-eval` would leave the caller stuck in that directory for the
