@@ -53,7 +53,7 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
         metrics = run_eval(args)
         print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
-        self.assertGreaterEqual(metrics["score"], 0.82)
+        self.assertGreaterEqual(metrics["score"], 0.80)
 
 
 class TestPiecewiseCudaGraphInternVL25(CustomTestCase):

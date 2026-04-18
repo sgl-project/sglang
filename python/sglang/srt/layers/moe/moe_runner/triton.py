@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import functools
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
-import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -19,53 +16,11 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
-    )
-
-
-_is_hip = is_hip()
-_is_cuda = is_cuda()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-_use_aiter = bool(int(os.getenv("SGLANG_USE_AITER", "0")))
-_is_xpu = is_xpu()
-_MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
-
-
-if _is_cuda or _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
-
-    if _is_hip:
-        _has_vllm = False
-        if _use_aiter:
-            try:
-                from aiter import moe_sum
-            except ImportError:
-                raise ImportError(
-                    "aiter is required when SGLANG_USE_AITER is set to True"
-                )
-        else:
-            try:
-                from vllm import _custom_ops as vllm_ops  # moe_sum
-
-                _has_vllm = True
-            except ImportError:
-                # Fallback: vllm not available, will use triton moe_sum
-                _has_vllm = False
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_xpu:
-    from sgl_kernel import moe_sum_reduce, silu_and_mul
-
-
-if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel import (  # noqa: F401
-        moe_align_block_size as sgl_moe_align_block_size,
     )
 
 
@@ -126,246 +81,54 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
-
-        # TODO: move these functions to the triton runner
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-            _swiglu_gpt_oss_sigmoid_alpha,
-            _swiglu_silu_clamp_mul,
-            invoke_fused_moe_kernel,
-            moe_sum_reduce_torch_compile,
-            moe_sum_reduce_triton,
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+            _fused_moe_kernel_sequence,
         )
 
-        hidden_states = runner_input.hidden_states
-        topk_weights = runner_input.topk_weights
-        topk_ids = runner_input.topk_ids
-        sorted_token_ids = runner_input.sorted_token_ids
-        expert_ids = runner_input.expert_ids
-        num_tokens_post_padded = runner_input.num_tokens_post_padded
-
-        w13 = quant_info.w13_weight
-        w2 = quant_info.w2_weight
-        b13 = quant_info.b13
-        b2 = quant_info.b2
-        a13_scale = quant_info.a13_scale
-        a2_scale = quant_info.a2_scale
-        w13_scale = quant_info.w13_scale
-        w2_scale = quant_info.w2_scale
-        w13_zp = quant_info.w13_zp
-        w2_zp = quant_info.w2_zp
-        block_shape = quant_info.block_shape
-        per_channel_quant = quant_info.per_channel_quant
-        use_fp8_w8a8 = quant_info.use_fp8_w8a8
-        use_int8_w8a8 = quant_info.use_int8_w8a8
-        use_int8_w8a16 = quant_info.use_int8_w8a16
-        use_int4_w4a16 = quant_info.use_int4_w4a16
-
-        activation = self.config.activation
-        no_combine = self.config.no_combine
-        inplace = self.config.inplace
-        gemm1_alpha = self.config.gemm1_alpha
-        gemm1_limit = self.config.gemm1_clamp_limit
-        routed_scaling_factor = self.config.routed_scaling_factor
-        apply_router_weight_on_input = self.config.apply_router_weight_on_input
-
-        assert self.config.is_gated, "Only gated MoEs are supported for Triton runner"
-
-        M = hidden_states.shape[0]
-        E, N, _ = w13.shape
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+        filter_expert = (
+            self.config.num_experts is None
+            or self.config.num_experts != self.config.num_local_experts
         )
 
-        intermediate_cache1 = torch.empty(
-            (M, topk_ids.shape[1], N),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-
-        invoke_fused_moe_kernel(
-            hidden_states,
-            w13,
-            b13,
-            intermediate_cache1,
-            a13_scale,
-            w13_scale,
-            w13_zp,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input,
-            topk_ids.shape[1],
+        out = _fused_moe_kernel_sequence(
+            runner_input.hidden_states,
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            runner_input.topk_weights,
+            runner_input.topk_ids,
+            runner_input.sorted_token_ids,
+            runner_input.expert_ids,
+            runner_input.num_tokens_post_padded,
             running_state["config"],
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
+            running_state.get("down_config"),
+            running_state.get("down_moe_use_tma", False),
+            b1=quant_info.b13,
+            b2=quant_info.b2,
+            use_fp8_w8a8=quant_info.use_fp8_w8a8,
+            use_int8_w8a8=quant_info.use_int8_w8a8,
+            use_int8_w8a16=quant_info.use_int8_w8a16,
+            use_int4_w4a16=quant_info.use_int4_w4a16,
+            per_channel_quant=quant_info.per_channel_quant,
+            w1_scale=quant_info.w13_scale,
+            w2_scale=quant_info.w2_scale,
+            w1_zp=quant_info.w13_zp,
+            w2_zp=quant_info.w2_zp,
+            a1_scale=quant_info.a13_scale,
+            a2_scale=quant_info.a2_scale,
+            block_shape=quant_info.block_shape,
+            activation=self.config.activation,
+            is_gated=self.config.is_gated,
+            no_combine=self.config.no_combine,
+            inplace=self.config.inplace,
+            apply_router_weight_on_input=self.config.apply_router_weight_on_input,
+            routed_scaling_factor=self.config.routed_scaling_factor,
+            gemm1_alpha=self.config.gemm1_alpha,
+            gemm1_limit=self.config.gemm1_clamp_limit,
+            filter_expert=filter_expert,
+            hooks=hooks,
         )
 
-        if hooks and hooks.after_gate_up:
-            hooks.after_gate_up(
-                hidden_states, intermediate_cache1, topk_weights, topk_ids
-            )
-
-        intermediate_cache2 = torch.empty(
-            (M * topk_ids.shape[1], N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-
-        if activation == "silu":
-            if gemm1_alpha is not None:
-                assert gemm1_limit is not None
-                intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
-                    intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
-                )
-            elif gemm1_limit is not None:
-                intermediate_cache2 = _swiglu_silu_clamp_mul(
-                    intermediate_cache1.view(-1, N), gemm1_limit
-                )
-            elif _is_cuda or _is_hip or _is_xpu:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-        elif activation == "gelu":
-            assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
-            assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_cuda or _is_hip:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-        else:
-            raise ValueError(f"Unsupported activation: {activation=}")
-
-        intermediate_cache3 = torch.empty(
-            (M, topk_ids.shape[1], w2.shape[1]),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-
-        if no_combine:
-            assert not inplace
-            out_hidden_states = torch.empty(
-                (M, topk_ids.shape[1], w2.shape[1]),
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-        elif inplace:
-            out_hidden_states = hidden_states
-        else:
-            out_hidden_states = torch.empty_like(hidden_states)
-
-        # When LoRA hooks are present, always write to intermediate_cache3
-        # so the hook can modify it before reduction.
-        _use_intermediate = not no_combine and (topk_ids.shape[1] != 1 or hooks)
-        invoke_fused_moe_kernel(
-            intermediate_cache2,
-            w2,
-            b2,
-            (
-                intermediate_cache3
-                if _use_intermediate
-                else out_hidden_states.unsqueeze(0)
-            ),
-            a2_scale,
-            w2_scale,
-            w2_zp,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input,
-            1,
-            running_state["config"],
-            compute_type=compute_type,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_int8_w8a8=use_int8_w8a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
-            per_channel_quant=per_channel_quant,
-            block_shape=block_shape,
-        )
-
-        if hooks and hooks.after_down:
-            hooks.after_down(
-                intermediate_cache2, intermediate_cache3, topk_weights, topk_ids
-            )
-
-        if routed_scaling_factor is None:
-            routed_scaling_factor = 1.0
-
-        if no_combine:
-            pass
-        elif _is_cuda:
-            if (
-                topk_ids.shape[1] == 1
-                and routed_scaling_factor == 1.0
-                and not _use_intermediate
-            ):
-                pass  # we wrote directly into out_hidden_states
-            elif topk_ids.shape[1] == 2 and routed_scaling_factor == 1.0:
-                torch.add(
-                    intermediate_cache3[:, 0],
-                    intermediate_cache3[:, 1],
-                    out=out_hidden_states,
-                ).squeeze(dim=1)
-            else:
-                # According to micro benchmark results, torch.compile can get better performance for small token.
-                if M <= 32:
-                    moe_sum_reduce_torch_compile(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
-                        out_hidden_states,
-                        routed_scaling_factor,
-                    )
-                else:
-                    moe_sum_reduce_triton(
-                        intermediate_cache3.view(*intermediate_cache3.shape),
-                        out_hidden_states,
-                        routed_scaling_factor,
-                    )
-        elif _is_hip:
-            if _use_aiter:
-                moe_sum(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                )
-            elif _has_vllm:
-                vllm_ops.moe_sum(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                )
-            else:
-                # Fallback: use triton moe_sum when vllm is not available
-                moe_sum_reduce_triton(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states,
-                    routed_scaling_factor,
-                )
-        elif _is_xpu:
-            moe_sum_reduce(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states,
-                routed_scaling_factor,
-            )
-        else:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states,
-            )
-
-        return TritonRunnerOutput(
-            hidden_states=out_hidden_states,
-        )
+        return TritonRunnerOutput(hidden_states=out)
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -378,7 +141,7 @@ def fused_experts_none_to_triton(
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     output = fused_experts(
@@ -419,10 +182,8 @@ def pre_permute_standard_to_triton(
     # NOTE: this is dead code as a fused func for standard format is registered.
     # This is left here for testing and examples.
 
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-        get_config_dtype_str,
-        moe_align_block_size,
-        try_get_optimal_moe_config,
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _prepare_fused_moe_run,
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
@@ -433,47 +194,29 @@ def pre_permute_standard_to_triton(
 
     assert TopKOutputChecker.format_is_standard(topk_output)
 
-    num_tokens = hidden_states.shape[0]
-    num_local_experts = runner_config.num_local_experts
-
-    if (
-        not (quant_info.use_fp8_w8a8 or quant_info.use_int8_w8a8)
-        or quant_info.block_shape is not None
-        or _use_aiter
-    ):
-        padding_size = 0
-    else:
-        padding_size = _MOE_PADDING_SIZE
-
-    config_dtype = get_config_dtype_str(
+    (
+        config,
+        down_config,
+        down_moe_use_tma,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    ) = _prepare_fused_moe_run(
+        hidden_states,
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        topk_output.topk_ids,
         use_fp8_w8a8=quant_info.use_fp8_w8a8,
         use_int8_w8a8=quant_info.use_int8_w8a8,
         use_int8_w8a16=quant_info.use_int8_w8a16,
         use_int4_w4a16=quant_info.use_int4_w4a16,
-        dtype=hidden_states.dtype,
-    )
-
-    get_config_func = functools.partial(
-        try_get_optimal_moe_config,
-        quant_info.w13_weight.shape,
-        (
-            num_local_experts,
-            quant_info.w2_weight.shape[1],
-            quant_info.w2_weight.shape[2] - padding_size,
-        ),
-        topk_output.topk_ids.shape[1],
-        config_dtype,
-        block_shape=quant_info.block_shape,
         per_channel_quant=quant_info.per_channel_quant,
-    )
-
-    config = get_config_func(num_tokens)
-
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_output.topk_ids, config["BLOCK_SIZE_M"], num_local_experts
+        block_shape=quant_info.block_shape,
     )
 
     running_state["config"] = config
+    running_state["down_config"] = down_config
+    running_state["down_moe_use_tma"] = down_moe_use_tma
 
     return TritonRunnerInput(
         hidden_states=hidden_states,

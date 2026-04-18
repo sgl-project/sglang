@@ -35,7 +35,10 @@ def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
     """
     try:
         response = requests.get(url + "/metrics", timeout=5)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError:
+            return None
 
         # Parse Prometheus text format
         # Looking for: sglang:cached_tokens_total{...} <value>
