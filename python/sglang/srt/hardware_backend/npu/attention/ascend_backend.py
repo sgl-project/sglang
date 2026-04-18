@@ -948,12 +948,14 @@ class AscendAttnBackend(AttentionBackend):
                     ]
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=q,
-                    key=k,
-                    value=v,
+                    key=k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim),
+                    value=v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim),
+                    block_table=self.forward_metadata.block_tables,
+                    block_size=self.page_size,
                     atten_mask=self.fia_mask,
                     input_layout="TND",
                     actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
-                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_list_cumsum,
+                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
                     num_key_value_heads=layer.tp_k_head_num,
                     num_heads=layer.tp_q_head_num,
                     scale=layer.scaling,
