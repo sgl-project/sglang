@@ -173,6 +173,7 @@ jobs:
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
+    name: ${{ format('sgl-kernel-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     needs: [check-changes]
     if: |
       always() &&
@@ -216,6 +217,7 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
 
   sgl-kernel-unit-test-2-gpu-amd:
+    name: ${{ format('sgl-kernel-unit-test-2-gpu-amd (linux-{0}-2gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     needs: [check-changes]
     if: |
       always() &&
@@ -254,6 +256,7 @@ jobs:
   # =============================================== primary ====================================================
 
   stage-a-test-1-gpu-small-amd:
+    name: ${{ format('stage-a-test-1-gpu-small-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     needs: [check-changes]
     if: |
       always() &&
@@ -290,6 +293,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   jit-kernel-unit-test-amd:
+    name: ${{ format('jit-kernel-unit-test-amd (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     needs: [check-changes]
     if: |
       always() &&
@@ -351,6 +355,7 @@ jobs:
           max-wait-minutes: '240'
 
   stage-b-test-1-gpu-small-amd:
+    name: ${{ format('stage-b-test-1-gpu-small-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -390,6 +395,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-nondeterministic:
+    name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic (linux-{0}-1gpu-sglang)', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325')) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -464,6 +470,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-large-amd:
+    name: ${{ format('stage-b-test-1-gpu-large-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -503,6 +510,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-2-gpu-large-amd:
+    name: ${{ format('stage-b-test-2-gpu-large-amd (linux-{0}-2gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
     needs: [check-changes, wait-for-stage-a-amd]
     if: |
       always() &&
@@ -542,6 +550,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   multimodal-gen-test-1-gpu-amd:
+    name: ${{ format('multimodal-gen-test-1-gpu-amd (linux-{0}-1gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
     needs: [check-changes]
     if: |
       always() &&
@@ -670,6 +679,7 @@ jobs:
           free -h
 
   multimodal-gen-test-2-gpu-amd:
+    name: ${{ format('multimodal-gen-test-2-gpu-amd (linux-{0}-2gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
     needs: [check-changes]
     if: |
       always() &&
@@ -823,6 +833,7 @@ jobs:
           max-wait-minutes: '480'
 
   stage-c-test-4-gpu-amd:
+    name: ${{ format('stage-c-test-4-gpu-amd (linux-{0}-4gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
@@ -878,6 +889,7 @@ jobs:
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-c-test-large-8-gpu-amd:
+    name: ${{ format('stage-c-test-large-8-gpu-amd (linux-{0}-8gpu-sglang, {1})', inputs.runner_arch || (github.event_name == 'pull_request' && 'mi300' || 'mi325'), matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
