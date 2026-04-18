@@ -92,6 +92,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,
     is_cuda,
+    is_npu,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -100,6 +101,10 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
 
 
 @triton.jit
@@ -817,6 +822,40 @@ class MiniMaxM2Attention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
+    def forward_prepare_npu(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.use_qk_norm:
+            # q = self.q_norm(q.contiguous())
+            # k = self.k_norm(k.contiguous())
+            cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            q, k, v = split_qkv_tp_rmsnorm_rope(
+                input=qkv,
+                cos=cos,
+                sin=sin,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                q_hidden_size=self.q_size,
+                kv_hidden_size=self.kv_size,
+                head_dim=self.head_dim,
+                rotary_dim=self.rotary_dim,
+                eps=self.q_norm.variance_epsilon,
+                tp_world=self.q_norm.attn_tp_size,
+                tp_group=get_attention_tp_group().device_group,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = q.contiguous(), k.contiguous()
+            q, k = self.rotary_emb(positions, q, k)
+
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
@@ -831,11 +870,18 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if _is_npu:
+            s = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         return self.forward_core(s)
 
     def op_prepare(self, state):
