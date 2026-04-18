@@ -112,7 +112,7 @@ async def _save_first_input_image(
     request_id: str,
     uploads_dir: str,
     *,
-    prefer_remote_source: bool = True,
+    prefer_remote_source: bool = False,
 ) -> str | None:
     """Save the first input image from a list of sources and return its path."""
     image_list = merge_image_input_list(image_sources)
@@ -237,6 +237,7 @@ async def create_video(
                 image_sources,
                 request_id,
                 uploads_dir,
+                prefer_remote_source=server_args.input_save_path is None,
             )
         except Exception as e:
             raise HTTPException(
@@ -314,6 +315,7 @@ async def create_video(
                         payload.get("reference_url"),
                         request_id,
                         uploads_dir,
+                        prefer_remote_source=server_args.input_save_path is None,
                     )
                 except Exception as e:
                     raise HTTPException(

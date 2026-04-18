@@ -142,7 +142,7 @@ async def save_image_to_path(
     image: Union[UploadFile, str],
     target_path: str,
     *,
-    prefer_remote_source: bool = True,
+    prefer_remote_source: bool = False,
 ) -> str:
     input_path = await _maybe_url_image(
         image, target_path, prefer_remote_source=prefer_remote_source
@@ -165,13 +165,14 @@ async def _maybe_url_image(
     img_url: str,
     target_path: str,
     *,
-    prefer_remote_source: bool = True,
+    prefer_remote_source: bool = False,
 ) -> str | None:
     if not isinstance(img_url, str):
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # reuse srt-style in-memory loading path when input persistence is disabled
+        # Only bypass persistence when the caller explicitly disables input saves.
+        # Otherwise keep the prefetch outside the measured server stages.
         if prefer_remote_source:
             return img_url
         # download image from URL and persist on disk
