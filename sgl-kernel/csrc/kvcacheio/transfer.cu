@@ -916,6 +916,7 @@ inline void transfer_kv_page_first_direct_impl(
   TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
   if (num_copies > 0) {
     cudaError_t err;
+    size_t fail_idx = std::numeric_limits<size_t>::max();
     if (use_v13_signature) {
       using FnV13 = cudaError_t (*)(void *const *, const void *const *, const size_t *, size_t,
                                     cudaMemcpyAttributes*, size_t*, size_t, cudaStream_t);
@@ -933,7 +934,6 @@ inline void transfer_kv_page_first_direct_impl(
       using FnV12 = cudaError_t (*)(void**, void**, size_t*, size_t,
                                     cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
       auto fn = reinterpret_cast<FnV12>(cuda_memcpy_batch_async_sym);
-      size_t fail_idx = std::numeric_limits<size_t>::max();
       err = fn(
           batch_dsts.data(),
           batch_srcs.data(),
@@ -950,7 +950,7 @@ inline void transfer_kv_page_first_direct_impl(
       return;
     }
     if (err != cudaSuccess) {
-      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. error=", cudaGetErrorString(err));
+      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
     }
   }
 #endif
