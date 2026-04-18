@@ -142,7 +142,7 @@ async def save_image_to_path(
     image: Union[UploadFile, str],
     target_path: str,
     *,
-    prefer_remote_source: bool = False,
+    prefer_remote_source: bool = True,
 ) -> str:
     input_path = await _maybe_url_image(
         image, target_path, prefer_remote_source=prefer_remote_source
@@ -165,7 +165,7 @@ async def _maybe_url_image(
     img_url: str,
     target_path: str,
     *,
-    prefer_remote_source: bool = False,
+    prefer_remote_source: bool = True,
 ) -> str | None:
     if not isinstance(img_url, str):
         return None
