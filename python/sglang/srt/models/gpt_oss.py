@@ -105,6 +105,7 @@ if _is_tinygemm_supported and get_cuda_version()[0] < 13:
         _is_tinygemm_supported = False
 else:
     tinygemm_bf16 = None
+    _is_tinygemm_supported = False
 
 
 class GptOssConfig(PretrainedConfig):
