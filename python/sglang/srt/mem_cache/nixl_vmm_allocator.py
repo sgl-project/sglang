@@ -198,15 +198,10 @@ def init_nixl_vmm_mem_pool(device: str) -> Tuple[bool, Optional[torch.cuda.MemPo
     try:
         import torch.utils.cpp_extension
 
-        out_dir = os.path.join(tempfile.gettempdir(), "nixl_vmm_allocator")
+        import getpass
+        out_dir = os.path.join(tempfile.gettempdir(), f"sglang_nixl_vmm_{getpass.getuser()}")
         os.makedirs(out_dir, exist_ok=True)
 
-        # Remove stale build artifacts left by a previously crashed compilation.
-        # Wiping the directory ensures a clean rebuild rather than reusing a
-        # potentially corrupted main.cpp or lock file.
-        import shutil
-        shutil.rmtree(out_dir, ignore_errors=True)
-        os.makedirs(out_dir, exist_ok=True)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
