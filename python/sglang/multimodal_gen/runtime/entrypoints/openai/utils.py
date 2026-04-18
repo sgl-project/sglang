@@ -138,8 +138,15 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     return sampling_params
 
 
-async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
-    input_path = await _maybe_url_image(image, target_path)
+async def save_image_to_path(
+    image: Union[UploadFile, str],
+    target_path: str,
+    *,
+    prefer_remote_source: bool = False,
+) -> str:
+    input_path = await _maybe_url_image(
+        image, target_path, prefer_remote_source=prefer_remote_source
+    )
     if input_path is None:
         input_path = await _save_upload_to_path(image, target_path)
     return input_path
@@ -154,16 +161,26 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
+async def _maybe_url_image(
+    img_url: str,
+    target_path: str,
+    *,
+    prefer_remote_source: bool = False,
+) -> str | None:
     if not isinstance(img_url, str):
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # Download image from URL
+        # Reuse srt-style in-memory loading path when input persistence is disabled.
+        if prefer_remote_source:
+            return img_url
+        # Download image from URL and persist on disk.
         input_path = await _save_url_image_to_path(img_url, target_path)
         return input_path
     elif img_url.startswith("data:image"):
-        # encode image base64 url
+        if prefer_remote_source:
+            return img_url
+        # encode image base64 url and persist on disk.
         input_path = await _save_base64_image_to_path(img_url, target_path)
         return input_path
     else:
