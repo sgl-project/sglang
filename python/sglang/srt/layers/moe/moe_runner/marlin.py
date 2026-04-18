@@ -20,6 +20,38 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+
+def build_fp4_marlin_moe_quant_info(
+    layer: torch.nn.Module, num_experts_hint: int
+) -> "MarlinMoeQuantInfo":
+    """Build MarlinMoeQuantInfo for an FP4 Marlin fallback MoE layer.
+
+    Shared by ModelOpt and compressed-tensors NVFP4 Marlin MoE methods.
+    """
+    expert_map = None
+    global_num_experts = -1
+    if hasattr(layer, "dispatcher") and hasattr(
+        layer.dispatcher, "local_expert_mapping"
+    ):
+        expert_map = layer.dispatcher.local_expert_mapping
+        if expert_map is not None:
+            global_num_experts = num_experts_hint
+
+    return MarlinMoeQuantInfo(
+        w13_qweight=layer.w13_weight,
+        w2_qweight=layer.w2_weight,
+        w13_scales=layer.w13_weight_scale,
+        w2_scales=layer.w2_weight_scale,
+        w13_g_idx_sort_indices=None,
+        w2_g_idx_sort_indices=None,
+        weight_bits=4,
+        w13_global_scale=layer.w13_weight_scale_2,
+        w2_global_scale=layer.w2_weight_scale_2,
+        expert_map=expert_map,
+        global_num_experts=global_num_experts,
+    )
+
+
 MARLIN_MOE_WORKSPACE: Optional[torch.Tensor] = None
 
 

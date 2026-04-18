@@ -3,11 +3,11 @@
 
 """NVFP4 Marlin fallback: run FP4-quantized models on non-Blackwell GPUs via Marlin kernel."""
 
-import logging
 from typing import Optional
 
 import torch
 
+from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
 from sglang.srt.layers.quantization.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
     marlin_make_workspace,
@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
 from sglang.srt.utils import direct_register_custom_op, get_device_capability, is_cuda
+from sglang.srt.utils.common import print_info_once, print_warning_once
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -24,8 +25,6 @@ if _is_cuda:
     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
-
-logger = logging.getLogger(__name__)
 
 # NVFP4 always uses group_size=16
 FP4_MARLIN_GROUP_SIZE = 16
@@ -45,8 +44,6 @@ def is_fp4_marlin_supported() -> bool:
 
 def should_use_fp4_marlin_fallback() -> bool:
     """True if non-Blackwell GPU AND Marlin kernel available (SM >= 75)."""
-    from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
-
     return (not is_blackwell_supported()) and is_fp4_marlin_supported()
 
 
@@ -59,7 +56,7 @@ def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     marlin_scales = marlin_scales.to(torch.half)
 
     if not (marlin_scales >= 0).all():
-        logger.warning_once(
+        print_warning_once(
             "NVFP4 Marlin assumes scales >= 0, but encountered negative scales. "
             "Accuracy may be degraded. The scales are converted from FP8-S1E4M3 "
             "to a special FP8-S0E5M3 format to speed up dequantization."
@@ -168,7 +165,7 @@ def prepare_fp4_layer_for_marlin(
     weight_global_scale_attr: str = "weight_global_scale",
 ) -> None:
     """Repack NVFP4 linear layer weights into Marlin format in-place."""
-    logger.info(
+    print_info_once(
         "Loading NVFP4 checkpoint via Marlin fallback (non-native FP4 GPU). "
         "Note: on non-Blackwell GPUs, INT4 AWQ checkpoints may offer "
         "comparable or better accuracy for dense models."
@@ -236,7 +233,7 @@ def prepare_fp4_layer_for_marlin(
 
 def prepare_moe_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     """Repack NVFP4 MoE weights into Marlin format in-place (per-expert)."""
-    logger.info(
+    print_info_once(
         "Loading NVFP4 checkpoint via Marlin fallback for MoE layers "
         "(non-native FP4 GPU). Note: on non-Blackwell GPUs, INT4 AWQ "
         "checkpoints may offer comparable or better accuracy."

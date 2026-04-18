@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -10,7 +9,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.moe.moe_runner import MoeRunner
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.marlin import build_fp4_marlin_moe_quant_info
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_fp4_layer_for_marlin,
@@ -27,8 +26,6 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-
-logger = logging.getLogger(__name__)
 
 
 class ModelOptFp4MarlinLinearMethod(ModelOptFp4LinearMethod):
@@ -92,11 +89,7 @@ class ModelOptNvFp4MarlinFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         # Skip parent __init__ which enforces is_blackwell_supported().
-        logger.info(
-            "Loading NVFP4 checkpoint via Marlin fallback for MoE layers "
-            "(non-native FP4 GPU). Note: on non-Blackwell GPUs, INT4 AWQ "
-            "checkpoints may offer comparable or better accuracy."
-        )
+        # User-facing fallback notice is emitted once in prepare_moe_fp4_layer_for_marlin.
         self.quant_config = quant_config
         self.enable_flashinfer_trtllm_moe = False
         self._cache_permute_indices = {}
@@ -119,28 +112,7 @@ class ModelOptNvFp4MarlinFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        moe_runner_config = self.moe_runner_config
-
-        expert_map = None
-        global_num_experts = -1
-        if hasattr(layer, "dispatcher") and hasattr(
-            layer.dispatcher, "local_expert_mapping"
-        ):
-            expert_map = layer.dispatcher.local_expert_mapping
-            if expert_map is not None:
-                global_num_experts = moe_runner_config.num_experts
-
-        quant_info = MarlinMoeQuantInfo(
-            w13_qweight=layer.w13_weight,
-            w2_qweight=layer.w2_weight,
-            w13_scales=layer.w13_weight_scale,
-            w2_scales=layer.w2_weight_scale,
-            w13_g_idx_sort_indices=None,
-            w2_g_idx_sort_indices=None,
-            weight_bits=4,
-            w13_global_scale=layer.w13_weight_scale_2,
-            w2_global_scale=layer.w2_weight_scale_2,
-            expert_map=expert_map,
-            global_num_experts=global_num_experts,
+        quant_info = build_fp4_marlin_moe_quant_info(
+            layer, self.moe_runner_config.num_experts
         )
         return self.runner.run(dispatch_output, quant_info)
