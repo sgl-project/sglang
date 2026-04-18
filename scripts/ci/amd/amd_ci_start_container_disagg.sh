@@ -203,11 +203,12 @@ IMAGE=$(find_latest_image "${GPU_ARCH}")
 # Try the local docker registry first (avoids Docker Hub rate limits and is
 # faster on the LAN); if that fails for any reason, fall back to the
 # public registry with exponential-backoff retries.
-if docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>/dev/null; then
+if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
   echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
   docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
 else
-  echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}"
+  echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+  printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
   retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
