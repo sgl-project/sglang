@@ -411,6 +411,14 @@ MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0},
 )
 
+MODELOPT_LTX23_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=T2V_PROMPT,
+    output_size="640x384",
+    seconds=5,
+    num_frames=17,
+    extras={"num_inference_steps": 4, "seed": 0},
+)
+
 TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
@@ -434,6 +442,10 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
 MODELOPT_FLUX1_FP8_TRANSFORMER = "BBuf/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "BBuf/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_TRANSFORMER = "BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
+MODELOPT_LTX23_FP8_TRANSFORMER = "BBuf/ltx23-modelopt-fp8-sglang-transformer"
+MODELOPT_LTX23_TWO_STAGE_FP8_TRANSFORMER = (
+    "BBuf/ltx23-two-stage-modelopt-fp8-sglang-transformer"
+)
 MODELOPT_FLUX1_NVFP4_TRANSFORMER = "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_WAN22_NVFP4_TRANSFORMER = (

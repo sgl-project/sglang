@@ -67,6 +67,8 @@ DEFAULT_LTX2_KEEP_BF16_PATTERNS = [
     r"^av_ca_(a2v_gate|audio_scale_shift|v2a_gate|video_scale_shift)_adaln_single\.linear$",
     r"^caption_projection\.linear_[12]$",
     r"^patchify_proj$",
+    r"^(audio_)?prompt_adaln_single\.emb\.timestep_embedder\.linear_[12]$",
+    r"^(audio_)?prompt_adaln_single\.linear$",
     r"^proj_out$",
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(attn1|attn2|audio_attn1|audio_attn2|audio_to_video_attn|video_to_audio_attn)\.to_(q|k|v)$",
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(attn1|attn2|audio_attn1|audio_attn2|audio_to_video_attn|video_to_audio_attn)\.to_out\.0$",

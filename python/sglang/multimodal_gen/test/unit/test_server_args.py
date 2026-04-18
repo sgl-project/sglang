@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
@@ -79,6 +80,45 @@ class TestModelIdResolution(unittest.TestCase):
         # with an unresolvable path, expect RuntimeError from the detector step
         with self.assertRaises((RuntimeError, Exception)):
             _get_config_info("/data/no-such-model", model_id="NonExistentModelXYZ")
+
+
+class TestLTX2TwoStageDeviceMode(unittest.TestCase):
+    def _from_dict(self, kwargs):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=LTX2PipelineConfig()
+        ):
+            return ServerArgs.from_dict(kwargs)
+
+    def test_explicit_two_stage_device_mode_is_normalized(self):
+        args = self._from_dict(
+            {
+                "model_path": "Lightricks/LTX-2.3",
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+                "ltx2_two_stage_device_mode": "RESIDENT",
+            }
+        )
+
+        self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
+
+    def test_non_ltx23_two_stage_leaves_device_mode_unset(self):
+        args = self._from_dict(
+            {
+                "model_path": "Lightricks/LTX-2",
+                "pipeline_class_name": "LTX2Pipeline",
+            }
+        )
+
+        self.assertIsNone(args.ltx2_two_stage_device_mode)
+
+    def test_invalid_two_stage_device_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self._from_dict(
+                {
+                    "model_path": "Lightricks/LTX-2.3",
+                    "pipeline_class_name": "LTX2TwoStagePipeline",
+                    "ltx2_two_stage_device_mode": "eager",
+                }
+            )
 
 
 class TestPerRoleParallelism(unittest.TestCase):

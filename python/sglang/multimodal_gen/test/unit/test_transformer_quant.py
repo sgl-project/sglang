@@ -49,6 +49,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp8Config,
+    ModelOptFp8LinearMethod,
     _prepare_nvfp4_weight_bytes,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
@@ -58,6 +60,17 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
+    LTX2TextProjection,
+    LTX2TransformerBlock,
+    _linear_activation_dtype,
+)
+from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
+    _module_uses_modelopt_fp8,
+)
+from sglang.multimodal_gen.tools.build_modelopt_fp8_transformer import (
+    get_default_keep_bf16_patterns,
+)
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
 )
@@ -71,6 +84,16 @@ class _FakeQuantConfig:
     @classmethod
     def get_name(cls):
         return "modelopt_fp4"
+
+
+class _FakeModelOptFp8QuantConfig:
+    @classmethod
+    def get_name(cls):
+        return "modelopt_fp8"
+
+
+class _FakeQuantMethod:
+    quant_config = _FakeModelOptFp8QuantConfig()
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
@@ -326,6 +349,120 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertIsInstance(block.proj_mlp.quant_method, UnquantizedLinearMethod)
         self.assertIsInstance(block.proj_out.quant_method, UnquantizedLinearMethod)
         self.assertIsInstance(block.attn.to_q.quant_method, UnquantizedLinearMethod)
+
+    @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_rank", return_value=0)
+    @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_size", return_value=1)
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.linear.get_tp_group", return_value=None
+    )
+    def test_ltx2_text_projection_modelopt_excludes_use_full_prefix(
+        self,
+        _mock_tp_group,
+        _mock_group_size,
+        _mock_group_rank,
+    ):
+        quant_config = ModelOptFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            exclude_modules=["caption_projection.linear_1"],
+        )
+
+        projection = LTX2TextProjection(
+            in_features=8,
+            hidden_size=16,
+            quant_config=quant_config,
+            prefix="caption_projection",
+        )
+
+        self.assertEqual(projection.linear_1.prefix, "caption_projection.linear_1")
+        self.assertEqual(projection.linear_2.prefix, "caption_projection.linear_2")
+        self.assertIsInstance(projection.linear_1.quant_method, UnquantizedLinearMethod)
+        self.assertIsInstance(projection.linear_2.quant_method, ModelOptFp8LinearMethod)
+
+    @patch(
+        "sglang.multimodal_gen.runtime.models.dits.ltx_2.get_tp_world_size",
+        return_value=1,
+    )
+    @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_rank", return_value=0)
+    @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_size", return_value=1)
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.linear.get_tp_group", return_value=None
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+        return_value=1,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_global_server_args",
+        return_value=SimpleNamespace(attention_backend=None),
+    )
+    def test_ltx2_block_modelopt_excludes_use_full_prefix(
+        self,
+        _mock_server_args,
+        _mock_ring_world_size,
+        _mock_tp_group,
+        _mock_group_size,
+        _mock_group_rank,
+        _mock_tp_world_size,
+    ):
+        quant_config = ModelOptFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            exclude_modules=[
+                "transformer_blocks.0.attn1.to_q",
+                "transformer_blocks.0.ff.proj_in",
+            ],
+        )
+
+        block = LTX2TransformerBlock(
+            idx=0,
+            dim=64,
+            num_attention_heads=4,
+            attention_head_dim=16,
+            cross_attention_dim=64,
+            audio_dim=32,
+            audio_num_attention_heads=4,
+            audio_attention_head_dim=8,
+            audio_cross_attention_dim=32,
+            prefix="transformer_blocks.0",
+            quant_config=quant_config,
+        )
+
+        self.assertEqual(block.attn1.to_q.prefix, "transformer_blocks.0.attn1.to_q")
+        self.assertEqual(block.ff.proj_in.prefix, "transformer_blocks.0.ff.proj_in")
+        self.assertEqual(
+            block.audio_ff.proj_out.prefix,
+            "transformer_blocks.0.audio_ff.proj_out",
+        )
+        self.assertIsInstance(block.attn1.to_q.quant_method, UnquantizedLinearMethod)
+        self.assertIsInstance(block.ff.proj_in.quant_method, UnquantizedLinearMethod)
+        self.assertIsInstance(block.attn1.to_k.quant_method, ModelOptFp8LinearMethod)
+
+    def test_ltx2_two_stage_detects_modelopt_fp8_transformer(self):
+        module = torch.nn.Module()
+        child = torch.nn.Module()
+        child.quant_method = _FakeQuantMethod()
+        module.add_module("child", child)
+
+        self.assertTrue(_module_uses_modelopt_fp8(module))
+        self.assertFalse(_module_uses_modelopt_fp8(torch.nn.Module()))
+
+    def test_ltx2_adaln_keeps_fp8_linear_activation_in_hidden_dtype(self):
+        linear = SimpleNamespace(
+            weight=torch.empty((1,), dtype=torch.float8_e4m3fn, device="cpu")
+        )
+
+        self.assertEqual(_linear_activation_dtype(linear, torch.float16), torch.float16)
+        self.assertEqual(_linear_activation_dtype(linear, None), torch.bfloat16)
+
+    def test_ltx2_default_fp8_fallbacks_include_prompt_adaln(self):
+        patterns = get_default_keep_bf16_patterns(
+            model_type="ltx2", class_name="LTX2VideoTransformer3DModel"
+        )
+
+        self.assertIn(
+            r"^(audio_)?prompt_adaln_single\.emb\.timestep_embedder\.linear_[12]$",
+            patterns,
+        )
+        self.assertIn(r"^(audio_)?prompt_adaln_single\.linear$", patterns)
 
 
 if __name__ == "__main__":

@@ -86,6 +86,20 @@ def _resolve_ltx2_two_stage_component_paths(
     return resolved
 
 
+def _module_uses_modelopt_fp8(module: torch.nn.Module | None) -> bool:
+    if module is None:
+        return False
+
+    for submodule in module.modules():
+        quant_method = getattr(submodule, "quant_method", None)
+        quant_config = getattr(quant_method, "quant_config", None)
+        quant_name_getter = getattr(type(quant_config), "get_name", None)
+        quant_name = quant_name_getter() if callable(quant_name_getter) else None
+        if quant_name == "modelopt_fp8":
+            return True
+    return False
+
+
 def calculate_ltx2_shift(
     image_seq_len: int,
     base_seq_len: int = BASE_SHIFT_ANCHOR,
@@ -681,6 +695,16 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             server_args.pipeline_config.vae_config.arch_config
         )
 
+    def _can_merge_lora_into_transformer(self, module_name: str = "transformer") -> bool:
+        if _module_uses_modelopt_fp8(self.get_module(module_name, None)):
+            logger.warning(
+                "LTX-2 two-stage is using a ModelOpt FP8 transformer; keeping LoRA "
+                "adapters unmerged because the base weights are stored in the FP8 "
+                "runtime layout."
+            )
+            return False
+        return True
+
     def initialize_pipeline(self, server_args: ServerArgs):
         super().initialize_pipeline(server_args)
         server_args.component_paths = _resolve_ltx2_two_stage_component_paths(
@@ -715,8 +739,13 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self._use_premerged_stage2_transformer = False
 
     def _initialize_premerged_stage2_transformer(self, server_args: ServerArgs) -> None:
+        stage2_component_name = (
+            "transformer_2"
+            if "transformer_2" in server_args.component_paths
+            else "transformer"
+        )
         transformer_path = self._resolve_component_path(
-            server_args, "transformer", "transformer"
+            server_args, stage2_component_name, "transformer"
         )
         module, memory_usage = PipelineComponentLoader.load_component(
             component_name="transformer_2",
@@ -727,15 +756,22 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self.modules["transformer_2"] = module
         self.memory_usages["transformer_2"] = memory_usage
 
-        # Reuse the canonical LoRA path used by legacy switching to reduce
-        # precision drift between snapshot mode and origin/main behavior.
-        self.set_lora(
-            lora_nickname="ltx2_stage2_distilled",
-            lora_path=self._distilled_lora_path,
-            target="transformer_2",
-            strength=1.0,
-            merge_weights=True,
-        )
+        if stage2_component_name == "transformer_2":
+            logger.info(
+                "Using prebuilt LTX-2.3 stage-2 transformer override from %s; "
+                "skipping distilled LoRA injection.",
+                transformer_path,
+            )
+        else:
+            # Reuse the canonical LoRA path used by legacy switching to reduce
+            # precision drift between snapshot mode and origin/main behavior.
+            self.set_lora(
+                lora_nickname="ltx2_stage2_distilled",
+                lora_path=self._distilled_lora_path,
+                target="transformer_2",
+                strength=1.0,
+                merge_weights=self._can_merge_lora_into_transformer("transformer_2"),
+            )
 
     def release_premerged_transformers_to_cpu_snapshots(self) -> None:
         """Release inactive premerged DiTs according to the selected device mode."""
@@ -768,6 +804,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                     lora_path=self._stage1_lora_path,
                     target="transformer",
                     strength=self._stage1_lora_scale,
+                    merge_weights=self._can_merge_lora_into_transformer(),
                 )
             else:
                 # Stage 1 must run on the base transformer weights. If stage 2 left the
@@ -796,8 +833,9 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
                 # into the transformer weights. Legacy LTX-2 should keep the
                 # preexisting unmerged behavior to avoid regressing stage 2 quality.
-                merge_weights=self._should_merge_stage2_distilled_lora(
-                    self.server_args
+                merge_weights=(
+                    self._should_merge_stage2_distilled_lora(self.server_args)
+                    and self._can_merge_lora_into_transformer()
                 ),
             )
         else:
