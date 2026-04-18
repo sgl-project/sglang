@@ -312,13 +312,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     module, param, loaded_shard_id
                 )
 
-                if len(loaded_weight.shape) == 0:
-                    # Scalar: broadcast to each logical shard.
-                    chunks = [loaded_weight.reshape(1)] * len(loaded_shard_id)
-                elif loaded_weight.numel() == 1:
-                    # Single-element tensor (e.g. per-tensor scale [1]):
-                    # broadcast to every logical shard.
-                    chunks = [loaded_weight] * len(loaded_shard_id)
+                if loaded_weight.numel() == 1:
+                    # Single-element tensor (scalar or [1]):
+                    # broadcast to each logical shard.
+                    chunks = [loaded_weight.view(-1)] * len(loaded_shard_id)
                 else:
                     split_dim = getattr(param, "output_dim", 0)
                     chunks = loaded_weight.split(split_sizes, dim=split_dim)
