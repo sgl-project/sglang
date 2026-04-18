@@ -503,13 +503,22 @@ def prepare_context_parallel_metadata(
     prefix_sum_list = list(accumulate(split_list))
 
     # TODO Support multi-batch-cp-split, multi-batch-cp support has accuracy issues
-    # NSA reads these as extend-only ints; _get_topk_ragged_with_cp re-adds the
-    # cached-prefix offset from (seq_lens_cpu - extend_seq_lens_cpu). Baking
-    # prefix_len in here would silently drop it whenever the scheduler packs
-    # multiple requests into a single CP extend (len(seqs_len) != 1 -> fallback
-    # to 0), which corrupts the indexer's ke_offset on prefix-cache hits.
-    kv_len_prev = prefix_sum_list[cp_rank]
-    kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
+    # Prefix offset is critical when radix cache hits (prefix_len > 0).
+    # For non-NSA CP (e.g. qwen3-moe), consumers use these values directly as
+    # FlashAttention cache_seqlens, so the prefix must be baked in here.
+    # For NSA CP, `_get_topk_ragged_with_cp` re-adds the cached-prefix offset
+    # from (seq_lens_cpu - extend_seq_lens_cpu); baking prefix_len in here
+    # would silently drop it whenever the scheduler packs multiple requests
+    # into a single CP extend (len(seqs_len) != 1 -> prefix_len falls back
+    # to 0), corrupting the indexer's ke_offset on prefix-cache hits.
+    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+
+    if is_nsa_enable_prefill_cp():
+        kv_len_prev = prefix_sum_list[cp_rank]
+        kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
+    else:
+        kv_len_prev = prefix_len + prefix_sum_list[cp_rank]
+        kv_len_next = prefix_len + prefix_sum_list[cp_size * 2 - cp_rank - 1]
     actual_seq_q_prev = split_list[cp_rank]
     actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
     # Flash Attention expects cache_seqlens to have shape (batch_size,), not scalar
