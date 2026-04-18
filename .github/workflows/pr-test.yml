@@ -454,8 +454,6 @@ jobs:
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
         env:
           USE_CCACHE: 1
-          # Reset buildx builder to clear stale cached layers from previous CUDA versions.
-          RESET_BUILDER: 1
 
       - name: Verify wheel artifacts
         run: |
@@ -508,8 +506,6 @@ jobs:
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
         env:
           USE_CCACHE: 1
-          # Reset buildx builder to clear stale cached layers from previous CUDA versions.
-          RESET_BUILDER: 1
 
       - name: Verify wheel artifacts
         run: |
