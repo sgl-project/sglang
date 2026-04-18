@@ -197,6 +197,7 @@ def _can_use_triton_group_norm_silu(
 ) -> bool:
     return (
         x.is_cuda
+        and not torch.is_grad_enabled()
         and not x.requires_grad
         and x.dtype in _SUPPORTED_DTYPES
         and x.ndim in (2, 3, 4, 5)
