@@ -79,6 +79,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_cuda_version,
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
@@ -96,7 +97,7 @@ _is_tinygemm_supported = (
     and (is_sm90_supported() or is_blackwell_supported())
 )
 
-if _is_tinygemm_supported:
+if _is_tinygemm_supported and get_cuda_version()[0] < 13:
     try:
         from flashinfer.gemm import tinygemm_bf16
     except ImportError:
