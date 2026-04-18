@@ -337,6 +337,42 @@ UNINSTALL_JIT_CACHE="$UNINSTALL_JIT_CACHE" \
 mark_step_done "Download flashinfer artifacts"
 
 # ------------------------------------------------------------------------------
+# Stabilize FlashInfer JIT cache paths
+# ------------------------------------------------------------------------------
+# FlashInfer JIT writes build.ninja with hardcoded -isystem paths pointing to the
+# venv's flashinfer/data/ and tvm_ffi/include/. With per-job venvs each job gets
+# a unique /tmp/sglang-ci-<run>-<job>-<pid>/ path, but the JIT cache is shared
+# on the host mount. When the next job's venv has a different path and the old one
+# is cleaned up, ninja fails because source files no longer exist at the cached path.
+#
+# Fix: copy source files to a stable host-mounted path and symlink each venv's
+# copy there. build.ninja then references the stable path across all jobs.
+STABLE_FI_DIR="${HOME}/.cache/flashinfer-src"
+FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
+TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
+
+FI_VERSION="${FLASHINFER_PYTHON_REQUIRED}"
+if [ ! -d "$STABLE_FI_DIR/flashinfer-data" ] || [ "$(cat "$STABLE_FI_DIR/.version" 2>/dev/null)" != "$FI_VERSION" ]; then
+    rm -rf "$STABLE_FI_DIR"
+    mkdir -p "$STABLE_FI_DIR"
+    cp -a "$FI_DATA" "$STABLE_FI_DIR/flashinfer-data"
+    cp -a "$TVM_INC" "$STABLE_FI_DIR/tvm-ffi-include"
+    echo "$FI_VERSION" > "$STABLE_FI_DIR/.version"
+    echo "Copied flashinfer source files to stable path: $STABLE_FI_DIR (version=$FI_VERSION)"
+else
+    echo "Stable flashinfer source path up to date (version=$FI_VERSION)"
+fi
+
+rm -rf "$FI_DATA"
+ln -s "$STABLE_FI_DIR/flashinfer-data" "$FI_DATA"
+TVM_INC_PARENT=$(dirname "$TVM_INC")
+rm -rf "$TVM_INC_PARENT/include"
+ln -s "$STABLE_FI_DIR/tvm-ffi-include" "$TVM_INC_PARENT/include"
+echo "Symlinked venv flashinfer/tvm_ffi -> $STABLE_FI_DIR"
+
+mark_step_done "Stabilize FlashInfer JIT cache paths"
+
+# ------------------------------------------------------------------------------
 # Install extra dependency
 # ------------------------------------------------------------------------------
 # Install other python dependencies.
