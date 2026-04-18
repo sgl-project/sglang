@@ -2,7 +2,14 @@ from __future__ import annotations
 
 """
 Support attention backend for TRTLLM MHA kernels from flashinfer.
-The kernel supports sm100 only, with sliding window and attention sink features.
+
+Prefill dispatch:
+  - SM90 / SM120: trtllm_fmha_v2_prefill (Q_PAGED_KV_HND layout)
+  - SM100:        trtllm_batch_context_with_kv_cache (HND layout)
+
+Decode: uses XQA on SM90 and SM120, TRTLLM-GEN on SM100.
+
+Sliding window and attention sink features are supported.
 """
 
 import logging
@@ -148,6 +155,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+
+        # fmha_v2 prefill kernel supports SM90 and SM120
+        self.use_fmha_v2 = is_sm90_supported() or is_sm120_supported()
 
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
@@ -779,6 +789,90 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def _forward_extend_fmha_v2(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        page_table: torch.Tensor,
+        bmm1_scale: float,
+        attention_sink,
+    ) -> torch.Tensor:
+        """Prefill via trtllm_fmha_v2_prefill with Q_PAGED_KV_HND layout (SM90/SM120)."""
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        # HND view: [num_pages, num_kv_heads, page_size, head_dim]
+        k_view = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        ).permute(0, 2, 1, 3)
+        v_view = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+        ).permute(0, 2, 1, 3)
+        # Interleave into [num_pages, 2, num_kv_heads, page_size, head_dim]
+        paged_kv = torch.stack([k_view, v_view], dim=1)
+
+        return flashinfer.prefill.trtllm_fmha_v2_prefill(
+            (q, paged_kv),
+            input_layout="Q_PAGED_KV_HND",
+            workspace_buffer=self.workspace_buffer,
+            seq_lens=self.forward_metadata.cache_seqlens_int32,
+            max_q_len=self.forward_metadata.max_seq_len_q,
+            max_kv_len=self.forward_metadata.max_seq_len_k,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=1.0,
+            batch_size=forward_batch.batch_size,
+            cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+            cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+            block_tables=page_table,
+            out_dtype=self.q_data_type,
+            mask_mode="causal",
+            window_left=layer.sliding_window_size,
+            sinks=attention_sink,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+        )
+
+    def _forward_extend_trtllm_gen(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        page_table: torch.Tensor,
+        bmm1_scale: float,
+        attention_sink,
+    ) -> torch.Tensor:
+        """Prefill via trtllm_batch_context_with_kv_cache with HND layout (SM100)."""
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        # HND view: [num_pages, num_kv_heads, page_size, head_dim]
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        ).permute(0, 2, 1, 3)
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+        ).permute(0, 2, 1, 3)
+
+        if layer.tp_k_head_num == 1:
+            k_cache = canonicalize_stride(k_cache)
+        if layer.tp_v_head_num == 1:
+            v_cache = canonicalize_stride(v_cache)
+
+        return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            query=q,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=self.workspace_buffer,
+            block_tables=page_table,
+            seq_lens=self.forward_metadata.cache_seqlens_int32,
+            max_q_len=self.forward_metadata.max_seq_len_q,
+            max_kv_len=self.max_context_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=1.0,
+            batch_size=forward_batch.batch_size,
+            cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+            cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+            window_left=layer.sliding_window_size,
+            sinks=attention_sink,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+            out_dtype=self.q_data_type, # model_runner.dtype
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -813,22 +907,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if self.data_type == torch.float8_e4m3fn:
             q = q.to(torch.float8_e4m3fn)
-        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
-
-        kv_cache = (k_cache, v_cache)
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
@@ -840,44 +919,47 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else 1.0
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
         if forward_batch.forward_mode.is_target_verify():
+            # target_verify always uses the decode kernel
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            k_cache = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            v_cache = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            if layer.tp_k_head_num == 1:
+                k_cache = canonicalize_stride(k_cache)
+            if layer.tp_v_head_num == 1:
+                v_cache = canonicalize_stride(v_cache)
+
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
-                kv_cache=kv_cache,
+                kv_cache=(k_cache, v_cache),
                 workspace_buffer=self.workspace_buffer,
                 block_tables=page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_seq_len=self.max_context_len,
                 bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
+                bmm2_scale=1.0,
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
+                out_dtype=self.q_data_type, # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
             )
+        elif self.use_fmha_v2:
+            o = self._forward_extend_fmha_v2(
+                q, layer, forward_batch, page_table, bmm1_scale, attention_sink
+            )
         else:
-            o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-                query=q,
-                kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_q_len=self.forward_metadata.max_seq_len_q,
-                max_kv_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
-                batch_size=self.forward_metadata.cu_seqlens_q.shape[0] - 1,
-                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
-                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                window_left=layer.sliding_window_size,
-                sinks=attention_sink,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
+            o = self._forward_extend_trtllm_gen(
+                q, layer, forward_batch, page_table, bmm1_scale, attention_sink
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

@@ -2466,9 +2466,12 @@ class ServerArgs:
                 if self.prefill_attention_backend is not None
                 else self.attention_backend
             )
-            if prefill_backend == "trtllm_mha" and not is_sm100_supported():
+            if prefill_backend == "trtllm_mha" and not (
+                is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+            ):
                 raise ValueError(
-                    "TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100). Please use a different prefill backend."
+                    "TRTLLM MHA backend for prefill requires Hopper (SM90), Blackwell (SM100), or SM120 GPUs. "
+                    "Please use a different prefill backend."
                 )
 
             # Check decode backend
