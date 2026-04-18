@@ -23,21 +23,25 @@ from sglang.srt.environ import envs
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 MODEL = "deepseek-ai/DeepSeek-V3"
+# Keep n_routed_experts/hidden_size/n_shared_experts at original values because
+# DSV3/DSR1 code paths have hardcoded checks (router GEMM, shared expert fusion,
+# MLA projections). moe_intermediate_size and intermediate_size are safe to
+# reduce — they're only used as dimension parameters, never compared to literals.
 MODEL_OVERRIDE_ARGS = {
-    "num_hidden_layers": 2,
-    "first_k_dense_replace": 1,  # First layer is dense, second is MoE
-    "n_routed_experts": 8,
-    "num_experts_per_tok": 2, 
-    "n_group": 1,
-    "topk_group": 1,
+    "num_hidden_layers": 4,
+    "first_k_dense_replace": 2,
+    "moe_intermediate_size": 1024,  # original 2048; must be >= 128 * max_tp_size for FP8
+    "intermediate_size": 2048,  # original 18432, smaller dense FFN
 }
 RANDOM_SEED = 42
 
-# Default values sanity tests.
+# Default values for sanity tests.
 DEFAULTS = {
     "tp_size": 4,
     "ep_size": 1,
-    "precision": "fp8",
+    "dtype": "auto",
+    "quantization": "fp8",
+    "kv_cache_dtype": None,
     "attention_backend": None,
     "chunked_prefill": False,
     "cuda_graph": False,
@@ -48,7 +52,9 @@ DEFAULTS = {
 ALLCLOSE_DEFAULTS = {
     "tp_size": 1,
     "ep_size": 1,
-    "precision": "bf16",
+    "dtype": "bfloat16",
+    "quantization": None,
+    "kv_cache_dtype": None,
     "attention_backend": None,
     "chunked_prefill": False,
     "cuda_graph": False,
@@ -66,6 +72,8 @@ ALLCLOSE_CONFIGS = [
     {},
     {"tp_size": 2},
     {"tp_size": 2, "moe_dense_tp_size": 1},
+    {"tp_size": 2, "kv_cache_dtype": "fp8_e4m3"},
+    {"tp_size": 2, "moe_dense_tp_size": 1, "kv_cache_dtype": "fp8_e4m3"},
 ]
 
 
@@ -101,15 +109,17 @@ def build_server_args(cfg, dummy_weights=True):
     if dummy_weights:
         args.extend(["--load-format", "dummy"])
 
-    precision = cfg["precision"]
-    if precision == "bf16":
-        args.extend(["--dtype", "bfloat16"])
-    elif precision == "fp8":
-        args.extend(["--quantization", "fp8"])
-    elif precision == "fp4":
-        args.extend(["--quantization", "modelopt_fp4"])
-    else:
-        args.extend(["--dtype", precision])
+    # dtype controls the high-precision part (linear op output, etc.)
+    if cfg["dtype"] != "auto":
+        args.extend(["--dtype", cfg["dtype"]])
+
+    # quantization controls the low-precision part (linear op input, etc.)
+    if cfg["quantization"] is not None:
+        args.extend(["--quantization", cfg["quantization"]])
+
+    # KV cache dtype
+    if cfg.get("kv_cache_dtype") is not None:
+        args.extend(["--kv-cache-dtype", cfg["kv_cache_dtype"]])
 
     if cfg["tp_size"] > 1:
         args.extend(["--tp-size", str(cfg["tp_size"])])
@@ -190,46 +200,53 @@ def _get_shared_checkpoint():
 
 
 def _get_hf_reference():
-    """Compute HF prefill forward pass once, cache the result.
+    """Compute HF prefill + 1 decode step, cache all logits, then free the model.
 
-    Also keeps the HF model loaded so decode logits can be computed per-test
-    (each SGLang config may generate a different token).
+    Runs on the last GPU to avoid conflict with SGLang (which starts from GPU 0).
+    The model is deleted after computation so it doesn't occupy GPU memory
+    while SGLang servers are running.
+
+    For decode, we use HF's own greedy token. If SGLang picks a different
+    decode token (likely with random weights), the decode logits are conditioned
+    on a different prefix — but we still cache the full vocab logit vector so
+    we can look up any token's score.
     """
     global _hf_reference
     if _hf_reference is not None:
         return _hf_reference
 
+    device = torch.device(f"cuda:{torch.cuda.device_count() - 1}")
     ckpt = _get_shared_checkpoint()
     tokenizer = AutoTokenizer.from_pretrained(ckpt)
     hf_model = DeepseekV3ForCausalLM.from_pretrained(
         ckpt, torch_dtype=torch.bfloat16
-    ).cuda()
+    ).to(device)
 
-    input_ids = tokenizer(TEST_INPUT, return_tensors="pt").input_ids.cuda()
+    input_ids = tokenizer(TEST_INPUT, return_tensors="pt").input_ids.to(device)
+
     with torch.no_grad():
-        hf_logits = hf_model(input_ids).logits[0].cpu()  # (seq_len, vocab)
+        # Prefill
+        hf_prefill_logits = hf_model(input_ids).logits[0].cpu()  # (seq_len, vocab)
+
+        # Decode: append HF's greedy token and run one more step
+        hf_greedy_token = hf_prefill_logits[-1].argmax().item()
+        decode_ids = torch.cat(
+            [input_ids, torch.tensor([[hf_greedy_token]], device=device)], dim=1
+        )
+        hf_decode_logits = hf_model(decode_ids).logits[0, -1].cpu()  # (vocab,)
+
+    # Free GPU memory before SGLang servers start
+    del hf_model
+    torch.cuda.empty_cache()
 
     _hf_reference = {
-        "logits": hf_logits,
+        "prefill_logits": hf_prefill_logits,
+        "decode_logits": hf_decode_logits,
+        "decode_token": hf_greedy_token,
         "input_ids": input_ids.cpu(),
         "tokenizer": tokenizer,
-        "model": hf_model,  # keep alive for decode
     }
     return _hf_reference
-
-
-def _get_hf_decode_logits(generated_token_id: int):
-    """Run HF forward on [input_ids + generated_token] and return decode logits."""
-    ref = _get_hf_reference()
-    hf_model = ref["model"]
-    input_ids = ref["input_ids"].cuda()
-    decode_ids = torch.cat(
-        [input_ids, torch.tensor([[generated_token_id]], device=input_ids.device)],
-        dim=1,
-    )
-    with torch.no_grad():
-        logits = hf_model(decode_ids).logits[0, -1].cpu()  # (vocab,)
-    return logits
 
 
 # ---------------------------------------------------------------------------
@@ -339,42 +356,68 @@ class TestDeepSeekV3AllcloseToHF(DefaultServerBase):
 
     def test_allclose_to_hf(self):
         ref = _get_hf_reference()
-        hf_logits = ref["logits"]
+        hf_prefill_logits = ref["prefill_logits"]
+        hf_decode_logits = ref["decode_logits"]
+        hf_decode_token = ref["decode_token"]
         input_ids = ref["input_ids"]
-        seq_len = input_ids.shape[1]
+        prefill_len = input_ids.shape[1]
 
-        response = requests.post(
+        # Extend input with HF's greedy token so both HF and SGLang
+        # condition decode on the same prefix.
+        extended_ids = input_ids[0].tolist() + [hf_decode_token]
+
+        # --- Request 1: Prefill ---
+        # Prefill [input + X] with max_new_tokens=0. This populates the
+        # radix cache and returns input logprobs from the prefill path.
+        prefill_resp = requests.post(
             f"{self.base_url}/generate",
             json={
-                "text": TEST_INPUT,
+                "input_ids": extended_ids,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+                "return_logprob": True,
+                "logprob_start_len": 0,
+                "top_logprobs_num": 20,
+            },
+        )
+        self.assertEqual(prefill_resp.status_code, 200)
+        prefill_result = prefill_resp.json()
+
+        # --- Request 2: Decode ---
+        # Same input, max_new_tokens=1. Radix cache hit on [input + X],
+        # so SGLang skips prefill and runs only the decode path
+        # (single-token attention with KV cache).
+        decode_resp = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "input_ids": extended_ids,
                 "sampling_params": {"temperature": 0, "max_new_tokens": 1},
                 "return_logprob": True,
                 "logprob_start_len": 0,
                 "top_logprobs_num": 20,
             },
         )
-        self.assertEqual(response.status_code, 200)
-        result = response.json()
+        self.assertEqual(decode_resp.status_code, 200)
+        decode_result = decode_resp.json()
 
         cfg = {k: getattr(self, k) for k in ALLCLOSE_DEFAULTS}
         cfg_name = _config_suffix(cfg, ALLCLOSE_DEFAULTS)
         print(f"\n{'='*70}")
         print(f"Config: {cfg_name}")
-        print(f"Input: {TEST_INPUT!r}  tokens: {input_ids[0].tolist()}")
+        print(f"Input tokens: {extended_ids}")
 
         # --- Prefill comparison ---
         print(f"\n  PREFILL:")
-        sg_input_logprobs = result["meta_info"]["input_token_logprobs"]
-        sg_input_top = result["meta_info"]["input_top_logprobs"]
+        sg_input_logprobs = prefill_result["meta_info"]["input_token_logprobs"]
+        sg_input_top = prefill_result["meta_info"]["input_top_logprobs"]
         prefill_input_diffs = []
         prefill_topk_diffs = []
 
-        for i in range(1, seq_len):
+        for i in range(1, prefill_len):
             actual_token = input_ids[0, i].item()
             sg_top = sg_input_top[i] if i < len(sg_input_top) else []
             sg_lp = sg_input_logprobs[i] if i < len(sg_input_logprobs) else None
             stats = self._compare_logprobs(
-                hf_logits[i - 1], sg_lp, sg_top,
+                hf_prefill_logits[i - 1], sg_lp, sg_top,
                 actual_token=actual_token, label=f"Pos {i}:",
             )
             if stats["input_diff"] is not None:
@@ -382,17 +425,17 @@ class TestDeepSeekV3AllcloseToHF(DefaultServerBase):
             prefill_topk_diffs.extend(stats["topk_diffs"])
 
         # --- Decode comparison ---
+        # output_token_logprobs from request 2 comes from the actual decode
+        # path (single-token attention with KV cache). Both HF and SGLang
+        # decode are conditioned on the same prefix [input + X].
         print(f"\n  DECODE:")
-        sg_output_logprobs = result["meta_info"]["output_token_logprobs"]
-        sg_output_top = result["meta_info"]["output_top_logprobs"]
-
-        # The generated token is what SGLang decoded
-        generated_token_id = sg_output_logprobs[0][1]
-        hf_decode_logits = _get_hf_decode_logits(generated_token_id)
+        sg_output_logprobs = decode_result["meta_info"]["output_token_logprobs"]
+        sg_output_top = decode_result["meta_info"]["output_top_logprobs"]
+        sg_decode_token = sg_output_logprobs[0][1]
 
         decode_stats = self._compare_logprobs(
             hf_decode_logits, sg_output_logprobs[0], sg_output_top[0],
-            actual_token=generated_token_id, label="Gen:",
+            actual_token=sg_decode_token, label="Dec:",
         )
         decode_input_diff = decode_stats["input_diff"]
         decode_topk_diffs = decode_stats["topk_diffs"]
