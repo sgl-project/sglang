@@ -258,6 +258,12 @@ $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX ||
 
 mark_step_done "Uninstall Flashinfer"
 
+FLASHINFER_CLEAR_CACHE=true
+if [ -d "${HOME}/.cache/flashinfer" ] && [ "$FLASHINFER_CLEAR_CACHE" = true ]; then
+    rm -rf ${HOME}/.cache/flashinfer
+    echo "Cleared stale FlashInfer JIT cached_ops"
+fi
+
 # ------------------------------------------------------------------------------
 # Install main package
 # ------------------------------------------------------------------------------
