@@ -2351,7 +2351,10 @@ class ServerArgs:
             elif is_mps():
                 return "torch_native"
             else:
-                return "flashinfer" if is_flashinfer_available() else "triton"
+                # FlashInfer does not support attention sinks.
+                if is_flashinfer_available() and not model_config.has_attention_sinks:
+                    return "flashinfer"
+                return "triton"
         else:
             # MLA architecture
             if is_hopper_with_cuda_12_3():
@@ -3084,10 +3087,13 @@ class ServerArgs:
             return True
 
         # If decode backend is implicit, pick a safe backend without changing io backend.
+        model_config = self.get_model_config()
         if not self.use_mla_backend():
-            self.decode_attention_backend = (
-                "flashinfer" if is_flashinfer_available() else "triton"
-            )
+            # FlashInfer does not support attention sinks.
+            if is_flashinfer_available() and not model_config.has_attention_sinks:
+                self.decode_attention_backend = "flashinfer"
+            else:
+                self.decode_attention_backend = "triton"
         else:
             self.decode_attention_backend = (
                 "flashinfer" if is_sm100_supported() else "triton"
