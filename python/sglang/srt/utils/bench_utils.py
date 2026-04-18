@@ -106,22 +106,6 @@ def bench_kineto(
     )
     kernel_names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
-    # Check if profiler captured any events (can be empty with some CUDA versions)
-    non_empty_lines = [l for l in prof_lines if l.strip() and not l.startswith("-")]
-    if len(non_empty_lines) <= 1:
-        print(
-            "WARNING: Profiler returned empty table — falling back to wall-clock timing"
-        )
-        import time
-
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(num_tests):
-            fn()
-        torch.cuda.synchronize()
-        elapsed = (time.perf_counter() - start) / num_tests
-        return tuple([elapsed] * len(kernel_names)) if is_tuple else elapsed
-
     if not with_multiple_kernels:
         for name in kernel_names:
             assert (
