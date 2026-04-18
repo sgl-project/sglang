@@ -23,7 +23,7 @@ set -euxo pipefail
 # Configuration & timing
 # ------------------------------------------------------------------------------
 # Set up environment variables
-CU_VERSION="cu129"
+CU_VERSION="cu130"
 
 # Nvidia package versions we override (torch pins older versions).
 # Used both as pip constraints during install and for post-install verification.
@@ -255,7 +255,15 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
     else
         WHEEL_ARCH="x86_64"
     fi
-    $PIP_CMD install sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
+    # Wheel may have +cuXYZ suffix (e.g. sglang_kernel-0.4.0+cu130-...) depending on CUDA version
+    KERNEL_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}*-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1)
+    if [ -z "$KERNEL_WHL" ]; then
+        echo "ERROR: No matching sgl-kernel wheel found in sgl-kernel/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH}"
+        ls -alh sgl-kernel/dist/
+        exit 1
+    fi
+    echo "Installing sgl-kernel wheel: $KERNEL_WHL"
+    $PIP_CMD install "$KERNEL_WHL" --force-reinstall $PIP_INSTALL_SUFFIX
 elif [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; then
     # CUSTOM_BUILD_SGL_KERNEL was set but artifacts not available (e.g., stage rerun without wheel build)
     # Fail instead of falling back to PyPI - we need to test the built kernel, not PyPI version
@@ -328,36 +336,32 @@ mark_step_done "Install extra dependency"
 # ------------------------------------------------------------------------------
 # Fix other dependencies
 # ------------------------------------------------------------------------------
-# Fix CUDA version mismatch between torch and torchaudio.
-# PyPI's torch 2.9.1 bundles cu128 but torchaudio from pytorch.org/cu129 uses cu129.
-# This mismatch causes torchaudio's C extension to fail loading, producing:
-#   "partially initialized module 'torchaudio' has no attribute 'lib'"
-# We cannot replace torch with cu129 (breaks sgl_kernel ABI), so instead we reinstall
-# torchaudio/torchvision from an index matching torch's CUDA version.
+# Now we are running torch with cuda13 in CI environment, so the torch packages will be reinstalled if they are still at CU129 version
+# TODO: Remove this part after torch has been upgraded to 2.11, where cu13 is enabled by default
 TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
 echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
 if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
-    # Pin versions to match what was installed by pyproject.toml (strip +cuXYZ suffix)
+    TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
     TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
     TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-    echo "Reinstalling torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${TORCH_CUDA_VER} index to match torch..."
-    $PIP_CMD install "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
+    $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 fi
 
 # Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
-INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu13 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
 if [ "$INSTALLED_NVSHMEM" = "$NVIDIA_NVSHMEM_VERSION" ]; then
-    echo "nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} already installed, skipping reinstall"
+    echo "nvidia-nvshmem-cu13==${NVIDIA_NVSHMEM_VERSION} already installed, skipping reinstall"
 else
-    $PIP_CMD install nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} $PIP_INSTALL_SUFFIX
+    $PIP_CMD install nvidia-nvshmem-cu13==${NVIDIA_NVSHMEM_VERSION} $PIP_INSTALL_SUFFIX
 fi
 
 # Fix dependencies: Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu13 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
 if [ "$INSTALLED_CUDNN" = "$NVIDIA_CUDNN_VERSION" ]; then
-    echo "nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} already installed, skipping reinstall"
+    echo "nvidia-cudnn-cu13==${NVIDIA_CUDNN_VERSION} already installed, skipping reinstall"
 else
-    $PIP_CMD install nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} $PIP_INSTALL_SUFFIX
+    $PIP_CMD install nvidia-cudnn-cu13==${NVIDIA_CUDNN_VERSION} $PIP_INSTALL_SUFFIX
 fi
 
 mark_step_done "Fix other dependencies"
