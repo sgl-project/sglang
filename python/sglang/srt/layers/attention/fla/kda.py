@@ -4,7 +4,6 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import os
 from typing import Optional
 
 import torch
@@ -21,10 +20,8 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
-from sglang.srt.layers.attention.fla.utils import check_shared_mem, is_amd
+from sglang.srt.layers.attention.fla.utils import check_shared_mem
 
-BT_LIST_AUTOTUNE = [32, 64, 128]
-NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
@@ -945,7 +942,7 @@ def kda_gate_chunk_cumsum_vector_kernel(
         # Standard gate: -exp(A_log) * softplus(g + bias)
         b_gate = -exp(b_A) * softplus_fwd(b_s)
     else:
-        # Safe gate: lower_bound * sigmoid(exp(A_log) * g)
+        # Safe gate: lower_bound * sigmoid(exp(A_log) * (g + bias))
         b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)
 
     # Chunk-local cumulative sum
@@ -1039,16 +1036,16 @@ def chunk_kda_fwd(
     lower_bound: Optional[float] = None,
 ):
     chunk_size = 64
+    # Pre-compute chunk indices once and thread through all downstream kernels.
+    # Without this, each of the 4 callees would recompute independently.
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, chunk_size)
         if cu_seqlens is not None
         else None
     )
 
-    _use_fused = os.environ.get("SGLANG_DISABLE_FUSED_GATE_CUMSUM", "0") != "1"
-
-    if A_log is not None and _use_fused:
-        # Fused path: gate activation + chunk-local cumsum in one kernel.
+    if A_log is not None:
+        # Fused: gate activation + chunk-local cumsum in one kernel.
         # g is raw gate (before activation); A_log, dt_bias drive the activation.
         g = kda_gate_chunk_cumsum(
             g,
@@ -1060,13 +1057,7 @@ def chunk_kda_fwd(
             lower_bound=lower_bound,
         )
     else:
-        if A_log is not None:
-            # Separate path (for A/B benchmarking): gate then cumsum.
-            B_dim, T_dim, H_dim, K_dim = g.shape
-            g = fused_kda_gate(
-                g.reshape(-1, H_dim * K_dim), A_log, K_dim, g_bias=dt_bias
-            ).reshape(B_dim, T_dim, H_dim, K_dim)
-        # cumsum only (g is already gate-activated or was just activated above).
+        # g is already gate-activated by caller; just do cumsum.
         g = chunk_local_cumsum(
             g,
             chunk_size=chunk_size,
@@ -1152,122 +1143,3 @@ def chunk_kda(
         lower_bound=lower_bound,
     )
     return o
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
-        for bt in BT_LIST_AUTOTUNE
-        for nw in NUM_WARPS_AUTOTUNE
-        for ns in [2, 3]
-    ],
-    key=["H", "D"],
-)
-@triton.jit
-def kda_gate_fwd_kernel(
-    g,
-    A,
-    y,
-    g_bias,
-    beta: tl.constexpr,
-    threshold: tl.constexpr,
-    T,
-    H,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-):
-    i_t, i_h = tl.program_id(0), tl.program_id(1)
-    n_t = i_t * BT
-
-    b_a = tl.load(A + i_h).to(tl.float32)
-    b_a = -tl.exp(b_a)
-
-    stride_row = H * D
-    stride_col = 1
-
-    g_ptr = tl.make_block_ptr(
-        base=g + i_h * D,
-        shape=(T, D),
-        strides=(stride_row, stride_col),
-        offsets=(n_t, 0),
-        block_shape=(BT, BD),
-        order=(1, 0),
-    )
-
-    y_ptr = tl.make_block_ptr(
-        base=y + i_h * D,
-        shape=(T, D),
-        strides=(stride_row, stride_col),
-        offsets=(n_t, 0),
-        block_shape=(BT, BD),
-        order=(1, 0),
-    )
-
-    b_g = tl.load(g_ptr, boundary_check=(0, 1)).to(tl.float32)
-
-    if HAS_BIAS:
-        n_d = tl.arange(0, BD)
-        bias_mask = n_d < D
-        b_bias = tl.load(g_bias + i_h * D + n_d, mask=bias_mask, other=0.0).to(
-            tl.float32
-        )
-        b_g = b_g + b_bias[None, :]
-
-    # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
-    # When beta * x > threshold, use linear approximation x
-    # Use threshold to switch to linear when beta*x > threshold
-    g_scaled = b_g * beta
-    use_linear = g_scaled > threshold
-    sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
-    b_y = b_a * sp
-
-    tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
-
-
-def fused_kda_gate(
-    g: torch.Tensor,
-    A: torch.Tensor,
-    head_k_dim: int,
-    g_bias: torch.Tensor | None = None,
-    beta: float = 1.0,
-    threshold: float = 20.0,
-) -> torch.Tensor:
-    """
-    Forward pass for KDA gate:
-      input g: [..., H*D]
-      param A: [H] or [1, 1, H, 1]
-      beta: softplus beta parameter
-      threshold: softplus threshold parameter
-      return  : [..., H, D]
-    """
-    orig_shape = g.shape[:-1]
-
-    g = g.view(-1, g.shape[-1])
-    T = g.shape[0]
-    HD = g.shape[1]
-    H = A.numel()
-    assert H * head_k_dim == HD
-
-    y = torch.empty_like(g, dtype=torch.float32)
-
-    def grid(meta):
-        return (cdiv(T, meta["BT"]), H)
-
-    kda_gate_fwd_kernel[grid](
-        g,
-        A,
-        y,
-        g_bias,
-        beta,
-        threshold,
-        T,
-        H,
-        head_k_dim,
-        BD=next_power_of_2(head_k_dim),
-        HAS_BIAS=g_bias is not None,
-    )
-
-    y = y.view(*orig_shape, H, head_k_dim)
-    return y

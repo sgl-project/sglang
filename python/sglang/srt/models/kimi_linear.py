@@ -381,8 +381,8 @@ class KimiDeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # For prefill: skip fused_kda_gate here; gate activation is fused
-        # with chunk_local_cumsum inside chunk_kda_fwd (kda_gate_chunk_cumsum).
+        # For prefill: raw gate is passed to chunk_kda_fwd, which fuses gate
+        # activation with chunk_local_cumsum (kda_gate_chunk_cumsum kernel).
         # For decode: gate activation is handled inside fused_recurrent kernel.
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(
