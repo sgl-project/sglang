@@ -6,7 +6,7 @@ register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import unittest
 
-from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
+from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.test.test_utils import CustomTestCase
 
@@ -66,7 +66,9 @@ class TestCalculateResponseUsage(CustomTestCase):
     """Tests for UsageProcessor.calculate_response_usage."""
 
     @staticmethod
-    def _make_response(prompt_tokens, completion_tokens, cached_tokens=0, reasoning_tokens=0):
+    def _make_response(
+        prompt_tokens, completion_tokens, cached_tokens=0, reasoning_tokens=0
+    ):
         return {
             "meta_info": {
                 "prompt_tokens": prompt_tokens,
@@ -97,8 +99,8 @@ class TestCalculateResponseUsage(CustomTestCase):
     def test_multiple_choices_per_prompt(self):
         """With n_choices=2, only every other response contributes to prompt_tokens."""
         responses = [
-            self._make_response(10, 5),   # choice 0 of prompt 0 -> prompt counted
-            self._make_response(10, 8),   # choice 1 of prompt 0 -> prompt NOT counted
+            self._make_response(10, 5),  # choice 0 of prompt 0 -> prompt counted
+            self._make_response(10, 8),  # choice 1 of prompt 0 -> prompt NOT counted
         ]
         usage = UsageProcessor.calculate_response_usage(responses, n_choices=2)
         self.assertEqual(usage.prompt_tokens, 10)
