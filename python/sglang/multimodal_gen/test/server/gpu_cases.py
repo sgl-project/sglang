@@ -361,53 +361,58 @@ if not current_platform.is_hip():
             T2V_sampling_params,
         )
     )
-ONE_GPU_CASES_C = [
-    _make_modelopt_ci_case(
-        "flux1_modelopt_fp8_t2i",
-        model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
-        modality="image",
-        sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
-    ),
-    _make_modelopt_ci_case(
-        "flux2_modelopt_fp8_t2i",
-        model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-        modality="image",
-        sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
-    ),
-    _make_modelopt_ci_case(
-        "wan22_modelopt_fp8_t2v",
-        model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
-        modality="video",
-        sampling_params=MODELOPT_T2V_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
-    ),
-    _make_modelopt_ci_case(
-        "flux1_modelopt_nvfp4_t2i",
-        model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
-        modality="image",
-        sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
-        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-    ),
-    _make_modelopt_ci_case(
-        "flux2_modelopt_nvfp4_t2i",
-        model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-        modality="image",
-        sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
-        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-    ),
-    _make_modelopt_ci_case(
-        "wan22_modelopt_nvfp4_t2v",
-        model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
-        modality="video",
-        sampling_params=MODELOPT_T2V_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
-        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-    ),
-]
+# Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
+# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only)
+if current_platform.is_hip():
+    ONE_GPU_CASES_C = []
+else:
+    ONE_GPU_CASES_C = [
+        _make_modelopt_ci_case(
+            "flux1_modelopt_fp8_t2i",
+            model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "flux2_modelopt_fp8_t2i",
+            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "wan22_modelopt_fp8_t2v",
+            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            modality="video",
+            sampling_params=MODELOPT_T2V_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "flux1_modelopt_nvfp4_t2i",
+            model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+        ),
+        _make_modelopt_ci_case(
+            "flux2_modelopt_nvfp4_t2i",
+            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+        ),
+        _make_modelopt_ci_case(
+            "wan22_modelopt_nvfp4_t2v",
+            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            modality="video",
+            sampling_params=MODELOPT_T2V_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+        ),
+    ]
 
 TWO_GPU_CASES_A = [
     DiffusionTestCase(

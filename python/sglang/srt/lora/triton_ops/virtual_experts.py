@@ -417,7 +417,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         weight: torch.Tensor,
         stage_top_k: int,
     ) -> dict[str, Any]:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
             get_config_dtype_str,
             try_get_optimal_moe_config,
         )
@@ -459,7 +459,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         # The native align kernel consumes num_experts + 1 internally for its
         # sentinel bucket, so the 1024-expert boundary must use the fallback path.
         if num_experts < 1024:
-            from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+            from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
                 moe_align_block_size as native_moe_align_block_size,
             )
 
@@ -513,7 +513,7 @@ def _merged_experts_fused_moe_lora_add_impl(
 
         return result
 
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
         invoke_fused_moe_kernel,
     )
 
