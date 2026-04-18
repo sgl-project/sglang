@@ -171,6 +171,16 @@ mark_step_done "Install apt packages"
 # Clear torch compilation cache
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
+# Clear stale FlashInfer JIT cache. The cached build.ninja files hardcode the
+# Python site-packages path where FlashInfer source files live. After switching
+# to per-job venvs, the path changes from /usr/local/lib/... to /tmp/sglang-ci-
+# .../lib/..., causing ninja to fail with "missing source file". Clearing the
+# compiled ops forces a fresh JIT compile with the correct venv paths.
+if [ -d "${HOME}/.cache/flashinfer" ]; then
+    find "${HOME}/.cache/flashinfer" -name "cached_ops" -type d -exec rm -rf {} + 2>/dev/null || true
+    echo "Cleared stale FlashInfer JIT cached_ops"
+fi
+
 # Remove broken dist-info directories (missing METADATA per PEP 376)
 SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
 if [ -d "$SITE_PACKAGES" ]; then
