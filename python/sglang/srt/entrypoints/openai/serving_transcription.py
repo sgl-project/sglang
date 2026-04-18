@@ -287,17 +287,26 @@ class OpenAIServingTranscription(OpenAIServingBase):
                 if fused_mode:
                     lang, visible = self._adapter.parse_fused_output(cumulative_text)
                     if visible is None:
-                        # Prefix not yet locatable. Keep buffering unless
-                        # the stream has ended, in which case do a
-                        # best-effort scrub of whatever we have.
+                        # Prefix not yet locatable. Keep buffering until the
+                        # stream ends.
                         if not finish_reason_type:
                             continue
+                        # Stream ended before the forced prefix was parseable —
+                        # emit an SSE error frame so the client can distinguish
+                        # this from "silent audio, zero transcription" and raise
+                        # a real error instead of quietly succeeding.
                         logger.warning(
                             "Fused auto-detect stream finished before prefix "
-                            "was parseable; emitting scrubbed raw tail."
+                            "was parseable; returning detection-failed error."
                         )
-                        visible = self._adapter.strip_special_tokens(cumulative_text)
-                    elif lang is not None and request.language is None:
+                        error = self.create_streaming_error_response(
+                            "language auto-detect failed: forced-prefix sentinel "
+                            "was not produced before stream end"
+                        )
+                        yield f"data: {error}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    if lang is not None and request.language is None:
                         request.language = lang
                         logger.info("Auto-detected language: '%s'", lang)
                 else:

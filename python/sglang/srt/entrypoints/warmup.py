@@ -53,18 +53,16 @@ async def whisper_autodetect(
     )
 
     logger.info("Compiling Whisper auto-detect regex FSM (one-time, ~15-20s)...")
-    # A short silent audio encoded as base64 WAV (0.1s, 16kHz, mono)
+    # A short silent audio encoded as base64 WAV (0.1s, 16kHz, mono) —
+    # soundfile produces the WAV header + PCM data from a list of floats.
     import base64
     import io
-    import struct
+
+    import soundfile as sf
 
     sr, dur = 16000, 0.1
     n = int(sr * dur)
-    # Minimal WAV: RIFF header + fmt chunk + data chunk with silence
-    data = struct.pack("<h", 0) * n
     buf = io.BytesIO()
-    import soundfile as sf
-
     sf.write(buf, [0.0] * n, sr, format="WAV")
     audio_b64 = base64.b64encode(buf.getvalue()).decode()
 

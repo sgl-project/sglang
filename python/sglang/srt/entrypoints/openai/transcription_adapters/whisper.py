@@ -26,10 +26,11 @@ logger = logging.getLogger(__name__)
 # model *can* detect but the input dict doesn't list (yue/Cantonese,
 # jw/Javanese, haw/Hawaiian, ba/Bashkir, su/Sundanese, ...).
 #
-# Source: ``WhisperTokenizer.LANGUAGE_CODES`` in ``transformers``. Covers
-# Whisper v1/v2 (98 codes) plus ``yue`` added in v3; harmless on older
-# models where the ``<|yue|>`` token isn't in the vocab — xgrammar simply
-# leaves that regex branch with no admissible tokens.
+# Source: the ``LANGUAGES`` dict in
+# ``transformers.models.whisper.tokenization_whisper``. Includes ``yue``
+# (Cantonese), added in Whisper v3; harmless on older models where the
+# ``<|yue|>`` token isn't in the vocab — xgrammar simply leaves that
+# regex branch with no admissible tokens.
 WHISPER_LANG_TOKEN_CODES: frozenset[str] = frozenset(
     {
         "af",
@@ -213,9 +214,11 @@ class WhisperAdapter(TranscriptionAdapter):
         use_ts = bool(request.timestamp_granularities)
         params: dict = {
             "temperature": request.temperature,
-            # Whisper's max_target_positions is 448 — 3 forced prefix tokens
-            # + up to 445 transcription tokens stays under the position-embed cap.
-            "max_new_tokens": 448,
+            # Fused auto-detect decoder prompt is just <|startoftranscript|>
+            # (1 token, see processors/whisper.py). Whisper's
+            # max_target_positions is 448, so max_new_tokens caps at 447:
+            # 1 prompt + 3 forced prefix + up to 444 free transcription = 448.
+            "max_new_tokens": 447,
             "regex": (
                 WHISPER_AUTODETECT_TS_REGEX if use_ts else WHISPER_AUTODETECT_REGEX
             ),
@@ -289,40 +292,6 @@ class WhisperAdapter(TranscriptionAdapter):
         """
         return _SPECIAL_TOKEN_RE.sub("", text)
 
-    # -- Standalone detection (for external callers) -------------------------
-
-    def build_language_detection_params(self, tokenizer) -> dict:
-        """Build sampling params for a language-detection-only request.
-
-        Uses SGLang's native structured generation (``regex``) to constrain
-        the single output token to a valid Whisper language token.
-        Can be sent via the ``/generate`` endpoint independently of
-        transcription.
-        """
-        lang_regex = r"<\|(" + _LANG_ALT + r")\|>"
-        return {
-            "max_new_tokens": 1,
-            "temperature": 0,
-            "regex": lang_regex,
-            "skip_special_tokens": False,
-            "_detect_language": True,
-        }
-
-    @staticmethod
-    def parse_language_detection_output(
-        output_ids: List[int], tokenizer
-    ) -> Optional[str]:
-        """Decode the predicted token and extract the Whisper language code."""
-        if not output_ids:
-            return None
-        decoded = tokenizer.decode([output_ids[0]], skip_special_tokens=False)
-        # Whisper language tokens have the form <|xx|> or <|xxx|>.
-        if decoded.startswith("<|") and decoded.endswith("|>"):
-            lang_code = decoded[2:-2]
-            if lang_code in WHISPER_LANG_TOKEN_CODES:
-                return lang_code
-        return None
-
     # -- end language detection --------------------------------------------
 
     def build_verbose_response(
@@ -336,7 +305,11 @@ class WhisperAdapter(TranscriptionAdapter):
         output_ids = ret.get("output_ids", [])
         parsed_text, segments = self._parse_segments(output_ids, tokenizer)
         return TranscriptionVerboseResponse(
-            language=request.language or "en",
+            # Pass None through when fused auto-detect failed to parse a
+            # language — the client should see detection-failed, not a silent
+            # English default. For explicit-language requests request.language
+            # is already set by the caller.
+            language=request.language,
             duration=round(request.audio_duration_s, 2),
             text=parsed_text or text,
             segments=segments,

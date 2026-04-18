@@ -18,11 +18,12 @@ from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
     WhisperAdapter,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
-class TestWhisperParseFusedOutput(unittest.TestCase):
+class TestWhisperParseFusedOutput(CustomTestCase):
     """parse_fused_output: (language, visible) where visible=None means defer."""
 
     def test_happy_english(self):
@@ -108,7 +109,7 @@ class TestWhisperParseFusedOutput(unittest.TestCase):
             self.assertTrue(b.startswith(a), f"monotonicity broken: {a!r} -> {b!r}")
 
 
-class TestWhisperLangTokenCoverage(unittest.TestCase):
+class TestWhisperLangTokenCoverage(CustomTestCase):
     """The FSM regex must cover every Whisper language token, not just the
     narrower ISO639_1_SUPPORTED_LANGS set used for input validation."""
 
@@ -136,7 +137,7 @@ class TestWhisperLangTokenCoverage(unittest.TestCase):
             self.assertIn(re.escape(code), WHISPER_AUTODETECT_TS_REGEX)
 
 
-class TestWhisperStripSpecialTokens(unittest.TestCase):
+class TestWhisperStripSpecialTokens(CustomTestCase):
     """Fallback scrub used when parse_fused_output defers."""
 
     def test_strips_all_whisper_specials(self):
@@ -154,7 +155,7 @@ class TestWhisperStripSpecialTokens(unittest.TestCase):
         self.assertEqual(WhisperAdapter.strip_special_tokens(""), "")
 
 
-class TestWhisperBuildFusedAutodetectParams(unittest.TestCase):
+class TestWhisperBuildFusedAutodetectParams(CustomTestCase):
     """build_fused_autodetect_params picks the right regex + propagates ts param."""
 
     def _request(self, **kwargs) -> TranscriptionRequest:

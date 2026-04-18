@@ -69,25 +69,6 @@ class TranscriptionAdapter(ABC):
         """
         return text
 
-    # -- Standalone detection (for external callers) -----------------------
-
-    def build_language_detection_params(self, tokenizer) -> dict:
-        """Return ``sampling_params`` dict for a language-detection-only request.
-
-        Produces a single token (the language), constrained to valid language
-        token IDs.  Callers can send this via the ``/generate`` endpoint.
-        """
-        raise NotImplementedError
-
-    def parse_language_detection_output(
-        self, output_ids: List[int], tokenizer
-    ) -> Optional[str]:
-        """Parse the detected language from a detection-only output.
-
-        Returns an ISO 639-1 language code (e.g. ``"en"``), or None on failure.
-        """
-        raise NotImplementedError
-
     @property
     def supports_chunked_streaming(self) -> bool:
         """Whether this model uses chunk-based streaming instead of token-level streaming."""

@@ -1,13 +1,13 @@
 """Unit tests for OpenAIServingTranscription's streaming fused-autodetect path.
 
-Exercises the new stream-aware fused-prefix stripping added in the Whisper
-auto-detect review response: buffer deltas until the
-``<|notimestamps|>`` sentinel lands, re-anchor ``stream_buffer`` to the
-boundary, and never leak the forced prefix (or its trailing whitespace) to
-the client.
+Exercises the streaming handler: buffer deltas until the forced-prefix
+sentinel lands, emit the scrubbed user-visible text, and never leak
+Whisper special tokens. Covers both streaming modes — cumulative
+(``incremental_streaming_output=False``, the default) and incremental
+(``incremental_streaming_output=True``).
 
-The tests mock ``TokenizerManager.generate_request`` to yield cumulative
-``text`` chunks synthesizing both the happy path and the FSM-abort case.
+The tests mock ``TokenizerManager.generate_request`` to yield synthetic
+``text`` chunks for each of the happy, abort, and boundary cases.
 """
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="stage-a-test-cpu")
 
@@ -87,7 +88,7 @@ def _deltas_from_sse(sse_lines: List[str]) -> List[str]:
     return out
 
 
-class TestStreamingFusedAutodetect(unittest.TestCase):
+class TestStreamingFusedAutodetect(CustomTestCase):
     """_generate_transcription_stream with _fused_autodetect=True."""
 
     def _run_stream(self, chunks: List[dict], fused: bool = True):
@@ -137,18 +138,22 @@ class TestStreamingFusedAutodetect(unittest.TestCase):
         self.assertEqual(request.language, "zh")
         self.assertEqual(_deltas_from_sse(frames), ["你好", "世界"])
 
-    def test_fsm_abort_before_sentinel_flushes_tail(self):
+    def test_fsm_abort_before_sentinel_emits_error_frame(self):
         # Sentinel never arrives; stream terminates on finish_reason. The
-        # handler logs a warning and falls through. After the per-delta
-        # special-token scrub, a tail that contains only forced-prefix
-        # specials collapses to an empty string — no content delta is
-        # emitted, but the warning still surfaces and language stays unset.
+        # handler must surface this as a real SSE error frame so the client
+        # can distinguish "detection failed" from "silent audio with zero
+        # transcription". language stays unset.
         chunks = [
             _chunk("<|en|>"),
             _chunk("<|en|><|transcribe|>", finish="length"),
         ]
         request, frames = self._run_stream(chunks)
         self.assertEqual(_deltas_from_sse(frames), [])
+        error_frames = [f for f in frames if f.startswith("data: ") and '"error"' in f]
+        self.assertTrue(
+            error_frames, f"expected an SSE error frame, got frames={frames!r}"
+        )
+        self.assertIn("language auto-detect failed", error_frames[0])
         self.assertIsNone(request.language)
 
     def test_non_fused_stream_passes_through(self):
@@ -259,15 +264,14 @@ class TestStreamingFusedAutodetect(unittest.TestCase):
         self.assertFalse(any("<|" in d for d in deltas))
 
 
-class TestStreamingIncrementalOutputMode(unittest.TestCase):
-    """incremental_streaming_output=True: ``content["text"]`` is the per-chunk
-    delta, not cumulative. The handler must accumulate locally.
+class TestStreamingIncrementalOutputMode(CustomTestCase):
+    """Server runs with ``incremental_streaming_output=True``.
 
-    Without that, the slice ``current_text[len(stream_buffer):]`` double-strips
-    every chunk (consumed by e.g. sglang.private's sampling client, which
-    overrides the flag to True). Repro from bench_sglang.py at c=64 on
-    whisper-large-v3: detokenizer EMITs ``' The' ' President' ':' ...`` but
-    SSE deltas come out as ``' The' 'sident' 'Thank' ...`` — WER 99%+.
+    In that mode each chunk's ``content["text"]`` is the new delta from the
+    detokenizer, not the cumulative text. The handler must accumulate
+    locally into ``cumulative_text`` — otherwise the subsequent
+    ``visible[len(visible_buffer):]`` slice would strip characters the
+    server already sent as a delta.
     """
 
     def _run_incremental_stream(self, chunk_deltas, fused=False):
