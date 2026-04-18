@@ -106,9 +106,10 @@ jobs:
         run: |
           # Run all tests for scheduled runs and workflow_call (when ref input is provided)
           # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.git_ref
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
+          # TODO(ci-migration): Remove this override after PR #23119 is validated
+          if true; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
-            echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
+            echo "Run mode: ALL TESTS (forced for CI migration validation)"
           else
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
