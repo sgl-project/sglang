@@ -341,10 +341,9 @@ jobs:
 
   wait-for-stage-a:
     needs: [check-changes, call-gate]
-    # Only run for PRs (not scheduled) and when not targeting a specific stage
-    # Skip if call-gate failed (stage-a jobs will be skipped, nothing to wait for)
-    # !cancelled() ensures this job respects workflow cancellation from concurrency group
+    # TODO(ci-migration): Remove 'false &&' after PR #23119 is validated
     if: |
+      false &&
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
@@ -369,9 +368,9 @@ jobs:
 
   wait-for-stage-b:
     needs: [check-changes, call-gate, wait-for-stage-a]
-    # Only run for PRs (not scheduled) and when not targeting a specific stage
-    # Skip if call-gate failed (stage-b jobs will be skipped, nothing to wait for)
+    # TODO(ci-migration): Remove 'false &&' after PR #23119 is validated
     if: |
+      false &&
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
