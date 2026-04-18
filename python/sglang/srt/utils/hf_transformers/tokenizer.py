@@ -436,15 +436,40 @@ def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
 # ---------------------------------------------------------------------------
 
 
+_fastokens_patched = False
+
+
+def _ensure_fastokens_patched():
+    """Monkey-patch transformers to use the fastokens backend (once)."""
+    global _fastokens_patched
+    if _fastokens_patched:
+        return
+    try:
+        import fastokens
+
+        fastokens.patch_transformers()
+        _fastokens_patched = True
+        logger.info("fastokens backend enabled — transformers patched successfully")
+    except ImportError:
+        raise ImportError(
+            "The fastokens package is required when --tokenizer-backend=fastokens. "
+            "Install it with: pip install fastokens"
+        )
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
+    tokenizer_backend: str = "huggingface",
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    if tokenizer_backend == "fastokens":
+        _ensure_fastokens_patched()
+
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 
@@ -472,7 +497,13 @@ def get_tokenizer(
 
     tokenizer = _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs)
 
-    if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
+    # With fastokens, the patched TokenizersBackend.from_pretrained already
+    # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
+    # the declared class (e.g. Qwen2Tokenizer) would discard that work.
+    if (
+        type(tokenizer).__name__ == _TOKENIZERS_BACKEND
+        and tokenizer_backend != "fastokens"
+    ):
         tokenizer = _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs)
 
     return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
