@@ -364,7 +364,7 @@ T2I_sampling_params = DiffusionSamplingParams(
 MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="768x768",
-    extras={"num_inference_steps": 12},
+    extras={"num_inference_steps": 12, "seed": 0},
 )
 
 TI2I_sampling_params = DiffusionSamplingParams(
@@ -406,8 +406,9 @@ T2V_sampling_params = DiffusionSamplingParams(
 MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
+    seconds=5,
     num_frames=17,
-    extras={"num_inference_steps": 12},
+    extras={"num_inference_steps": 12, "seed": 0},
 )
 
 TI2V_sampling_params = DiffusionSamplingParams(
@@ -434,7 +435,7 @@ MODELOPT_FLUX1_FP8_TRANSFORMER = "BBuf/flux1-dev-modelopt-fp8-sglang-transformer
 MODELOPT_FLUX2_FP8_TRANSFORMER = "BBuf/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_TRANSFORMER = "BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX1_NVFP4_TRANSFORMER = "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
-MODELOPT_FLUX2_NVFP4_MODEL = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_WAN22_NVFP4_TRANSFORMER = (
     "BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
 )
