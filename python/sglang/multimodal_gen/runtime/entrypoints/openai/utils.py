@@ -171,16 +171,16 @@ async def _maybe_url_image(
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # Reuse srt-style in-memory loading path when input persistence is disabled.
+        # reuse srt-style in-memory loading path when input persistence is disabled
         if prefer_remote_source:
             return img_url
-        # Download image from URL and persist on disk.
+        # download image from URL and persist on disk
         input_path = await _save_url_image_to_path(img_url, target_path)
         return input_path
     elif img_url.startswith("data:image"):
         if prefer_remote_source:
             return img_url
-        # encode image base64 url and persist on disk.
+        # encode image base64 url and persist on disk
         input_path = await _save_base64_image_to_path(img_url, target_path)
         return input_path
     else:

@@ -15,6 +15,7 @@ import PIL.ImageOps
 import requests
 import torch
 from packaging import version
+from sglang.srt.utils.common import get_image_bytes as srt_get_image_bytes
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -107,10 +108,7 @@ def load_image(
         if isinstance(image, str) and os.path.isfile(image):
             image = PIL.Image.open(image)
         else:
-            # Reuse SRT image-source normalization (URL / data URL / base64 / bytes)
-            # so multimodal_gen can follow the same in-memory loading path.
-            from sglang.srt.utils.common import get_image_bytes as srt_get_image_bytes
-
+            # in-memory loading path
             image = PIL.Image.open(BytesIO(srt_get_image_bytes(image)))
     elif isinstance(image, PIL.Image.Image):
         image = image
