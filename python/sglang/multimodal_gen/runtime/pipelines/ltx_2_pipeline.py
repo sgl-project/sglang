@@ -310,7 +310,7 @@ class LTX2TwoStageDeviceManager:
         self._snapshot_low_vram_mode = self._resolve_snapshot_low_vram_mode()
         self._snapshot_release_empty_cache = get_bool_env_var(
             "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE",
-            default='false',
+            default="false",
         )
 
     def _resolve_snapshot_low_vram_mode(self) -> bool:
