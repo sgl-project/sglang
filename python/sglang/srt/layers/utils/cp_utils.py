@@ -503,11 +503,13 @@ def prepare_context_parallel_metadata(
     prefix_sum_list = list(accumulate(split_list))
 
     # TODO Support multi-batch-cp-split, multi-batch-cp support has accuracy issues
-    # Prefix offset is critical when radix cache hits (prefix_len > 0).
-    # These "cache_seqlens" values represent how many KV tokens are visible to
-    # each query segment during CP attention.
-    kv_len_prev = prefix_len + prefix_sum_list[cp_rank]
-    kv_len_next = prefix_len + prefix_sum_list[cp_size * 2 - cp_rank - 1]
+    # NSA reads these as extend-only ints; _get_topk_ragged_with_cp re-adds the
+    # cached-prefix offset from (seq_lens_cpu - extend_seq_lens_cpu). Baking
+    # prefix_len in here would silently drop it whenever the scheduler packs
+    # multiple requests into a single CP extend (len(seqs_len) != 1 -> fallback
+    # to 0), which corrupts the indexer's ke_offset on prefix-cache hits.
+    kv_len_prev = prefix_sum_list[cp_rank]
+    kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
     actual_seq_q_prev = split_list[cp_rank]
     actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
     # Flash Attention expects cache_seqlens to have shape (batch_size,), not scalar

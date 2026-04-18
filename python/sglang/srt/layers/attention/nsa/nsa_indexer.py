@@ -858,10 +858,11 @@ class Indexer(MultiPlatformOp):
                 batch_idx_list=batch_idx_list,
             )
         else:
-            # kv_len already includes the prefix offset
-            # (prepare_context_parallel_metadata sums prefix_len into kv_len_prev/next).
-            # Do NOT add (seq_lens_cpu - extend_seq_lens_cpu) again here, or the prefix
-            # would be double-counted and get_index_k_continuous reads past the block table.
+            kv_len = (
+                forward_batch.seq_lens_cpu[0].item()
+                - forward_batch.extend_seq_lens_cpu[0]
+                + kv_len
+            )
             k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
                 layer_id,
                 kv_len,
