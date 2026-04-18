@@ -1322,19 +1322,18 @@ class Indexer(MultiPlatformOp):
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
         if _is_cuda or _is_hip:
-            assert forward_batch.seq_lens_cpu is not None
-            if len(forward_batch.seq_lens_cpu) == 0:
-                # this seems b/c max-pad, no worries?
-                # if x.shape[0] != 0:
-                #     print(
-                #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
-                #     )
-                return torch.full(
-                    (x_meta.shape[0], self.index_topk),
-                    -1,
-                    dtype=torch.int,
-                    device=x_meta.device,
-                )
+            # In PCG, any access to seq_lens_cpu creates a Dynamo shape guard on
+            # seq_lens_cpu.shape[0] == batch_size, which fails when serving batches
+            # larger than the bs=1 used during capture. PCG never has empty batches.
+            if not is_in_piecewise_cuda_graph():
+                assert forward_batch.seq_lens_cpu is not None
+                if len(forward_batch.seq_lens_cpu) == 0:
+                    return torch.full(
+                        (x_meta.shape[0], self.index_topk),
+                        -1,
+                        dtype=torch.int,
+                        device=x_meta.device,
+                    )
 
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
