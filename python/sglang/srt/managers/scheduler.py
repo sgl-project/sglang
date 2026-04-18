@@ -1439,7 +1439,12 @@ class Scheduler(
         def run_one_overlap_step(
             current_batch: Optional[ScheduleBatch],
         ) -> None:
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(current_batch)
+            if current_batch is None:
+                disable_overlap_for_batch = False
+            else:
+                disable_overlap_for_batch = self.is_disable_overlap_for_batch(
+                    current_batch
+                )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -1513,7 +1518,7 @@ class Scheduler(
             return False
         return True
 
-    def is_disable_overlap_for_batch(self, batch: Optional[ScheduleBatch]) -> bool:
+    def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
         # In DP attention mode, use the globally synchronized is_extend_in_batch
