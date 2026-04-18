@@ -1,3 +1,4 @@
+# this is the reimplemented version...
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -8,41 +9,32 @@ if TYPE_CHECKING:
 
 
 class EvictionStrategy(ABC):
+    """Base interface for eviction strategies."""
+
     @abstractmethod
     def get_priority(self, node: "TreeNode") -> Union[float, Tuple]:
-        pass
+        """Return a comparable priority. Smaller values are evicted first."""
+        raise NotImplementedError
 
 
 class LRUStrategy(EvictionStrategy):
+    """Least Recently Used (default strategy)."""
+
     def get_priority(self, node: "TreeNode") -> float:
         return node.last_access_time
 
 
 class LFUStrategy(EvictionStrategy):
+    """Least Frequently Used with LRU tie-break."""
+
     def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
         return (node.hit_count, node.last_access_time)
 
 
-class FIFOStrategy(EvictionStrategy):
-    def get_priority(self, node: "TreeNode") -> float:
-        return node.creation_time
-
-
-class MRUStrategy(EvictionStrategy):
-    def get_priority(self, node: "TreeNode") -> float:
-        return -node.last_access_time
-
-
-class FILOStrategy(EvictionStrategy):
-    def get_priority(self, node: "TreeNode") -> float:
-        return -node.creation_time
-
-
 class PriorityStrategy(EvictionStrategy):
-    """Priority-aware eviction: lower priority values evicted first, then LRU within same priority."""
+    """Priority-based eviction (lower priority evicted first)."""
 
     def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
-        # Return (priority, last_access_time) so lower priority nodes are evicted first
         return (node.priority, node.last_access_time)
 
 
