@@ -75,7 +75,9 @@ def bench_kineto(
         )
         profiler = (
             torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule
+                activities=[torch.profiler.ProfilerActivity.CUDA],
+                schedule=schedule,
+                acc_events=True,
             )
             if not using_nsys
             else nullcontext()
@@ -88,8 +90,8 @@ def bench_kineto(
                             flush_l2_size, dtype=torch.int, device="cuda"
                         ).zero_()
                     fn()
-
                 if not using_nsys:
+                    torch.cuda.synchronize()
                     profiler.step()
 
     # Return 1 if using Nsight Systems
