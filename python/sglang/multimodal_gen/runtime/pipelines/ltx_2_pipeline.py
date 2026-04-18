@@ -294,13 +294,9 @@ class LTX2TwoStageDeviceManager:
         GPUs, and stays disabled by default on higher-memory GPUs. It can be
         overridden with `SGLANG_LTX2_SNAPSHOT_LOW_VRAM_MODE`.
     - original: official two-stage semantics without premerged stage-2.
-      (legacy alias is still accepted for compatibility)
     """
 
     VALID_MODES = ("original", "snapshot", "resident")
-    MODE_ALIASES = {
-        "legacy": "original",
-    }
 
     def __init__(self, pipeline: "LTX2TwoStagePipeline", server_args: ServerArgs):
         self.pipeline = pipeline
@@ -350,7 +346,6 @@ class LTX2TwoStageDeviceManager:
         if mode is None:
             env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
             mode = env_mode.lower() if env_mode else "snapshot"
-        mode = cls.MODE_ALIASES.get(mode, mode)
         if mode not in cls.VALID_MODES:
             raise ValueError(
                 f"Invalid ltx2_two_stage_device_mode={mode!r}. "
