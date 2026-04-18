@@ -104,6 +104,14 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, shape (batch_size, hidden_size).
     """
+    # torch.compiler.is_dynamo_compiling(): FlashInfer norm paths are not safe under
+    # torch.compile(..., fullgraph=True). Dynamo traces into FlashInfer's JIT module
+    # loading path, which calls Path.exists() / os.stat() — both untraceable — causing
+    # the entire compilation to fail. We fall back to the internal implementation while
+    # tracing as a temporary workaround. Once the upstream fix is merged and we upgrade
+    # FlashInfer, this check can be removed.
+    # See: https://github.com/flashinfer-ai/flashinfer/issues/2734
+    #      https://github.com/flashinfer-ai/flashinfer/pull/2733
     if (
         _has_flashinfer
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
