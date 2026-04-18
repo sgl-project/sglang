@@ -146,9 +146,15 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             )
 
         self.assertEqual(res["successful_requests"], res["total_requests"])
-        self.assertLess(res["avg_latency_ms"], 20)
-        self.assertLess(res["p95_latency_ms"], 25)
-        self.assertGreater(res["throughput"], 60)
+        # relax for mi300x
+        if is_in_amd_ci():
+            self.assertLess(res["avg_latency_ms"], 35)
+            self.assertLess(res["p95_latency_ms"], 40)
+            self.assertGreater(res["throughput"], 45)
+        else:
+            self.assertLess(res["avg_latency_ms"], 20)
+            self.assertLess(res["p95_latency_ms"], 25)
+            self.assertGreater(res["throughput"], 60)
 
     def test_embeddings_api_batch_scaling(self):
         """Test embeddings API performance with different batch sizes"""
