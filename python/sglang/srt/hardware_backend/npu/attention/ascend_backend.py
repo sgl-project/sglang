@@ -25,7 +25,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 import logging
 
 import numpy as np
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 
 
 def _reshape_kv_for_fia_nz(
@@ -845,6 +846,95 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    def forward_prefill_david(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer: RadixAttention,
+    ):
+        num_token_padding = q.shape[0]
+        # current chunk q, k, v
+        q, k, v = [
+            data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
+        ]
+        q_nope, q_rope = q.split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        k_nope, k_rope = k.split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        num_tokens = q_nope.size(0)
+        attn_output = torch.empty(
+            num_tokens,
+            layer.tp_q_head_num,
+            layer.v_head_dim,
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+        attn_lse = torch.empty(
+            layer.tp_q_head_num,
+            num_tokens,
+            dtype=torch.float32,
+            device=q_nope.device,
+        )
+
+        actual_seq_lengths = np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
+
+        common_kwargs = {
+            "query_rope": q_rope,
+            "key_rope": k_rope,
+            "num_heads": layer.tp_q_head_num,
+            "num_key_value_heads": layer.tp_k_head_num,
+            "input_layout": "TND",
+            "atten_mask": self.fia_mask,
+            "sparse_mode": 3,
+            "scale": layer.scaling,
+            "antiquant_mode": 0,
+            "antiquant_scale": None,
+            "block_table": None,
+            "block_size": 0,
+            "softmax_lse_flag": True,
+            "actual_seq_lengths": actual_seq_lengths,
+            "actual_seq_lengths_kv": actual_seq_lengths,
+        }
+        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(q_nope, k_nope, v, **common_kwargs)
+        attn_lse = attn_lse.to(torch.float32)
+        out_list = [attn_output.reshape(num_tokens * layer.tp_q_head_num, layer.v_head_dim)]
+        lse_list = [attn_lse.reshape(num_tokens * layer.tp_q_head_num)]
+
+        # current chunk q, historial k, v
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(
+            layer.layer_id
+        )
+        kv_cached = torch.index_select(
+            k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+        )
+        k_rope_cached = torch.index_select(
+            v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
+        ).flatten(0, 1)
+
+        assert layer.kv_b_proj is not None
+        kv = layer.kv_b_proj(kv_cached)[0].view(
+            -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
+        )
+        k_nope, v = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
+
+        k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
+
+        actual_seq_lengths_kv = np.array(self.forward_metadata.prefix_lens).cumsum().tolist()
+        common_kwargs["actual_seq_lengths_kv"] = actual_seq_lengths_kv
+        common_kwargs["key_rope"] = k_rope
+        prefix_attn_output, prefix_attn_lse = torch_npu.npu_fused_infer_attention_score(q_nope, k_nope, v, **common_kwargs)
+        prefix_attn_lse = prefix_attn_lse.to(torch.float32)
+
+        out_list.append(prefix_attn_output.reshape(num_tokens * layer.tp_q_head_num, layer.v_head_dim))
+        lse_list.append(prefix_attn_lse.reshape(num_tokens * layer.tp_q_head_num))
+        output, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
+        output = output.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
+
     def forward_extend(
         self,
         q,
@@ -1123,6 +1213,9 @@ class AscendAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
             else:
+                if not _is_npu_before_atlas_a5:
+                    attn_output = self.forward_prefill_david(q, k, v, forward_batch, layer)
+                    return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 num_token_padding = q.shape[0]
                 q, k, v = [
                     data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
