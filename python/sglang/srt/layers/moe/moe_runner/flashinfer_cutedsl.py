@@ -214,17 +214,20 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
-def _create_cutedsl_wrapper(
-    layer: torch.nn.Module,
-    num_local_experts: int,
-    local_expert_offset: int,
-) -> "CuteDslMoEWrapper":
-    """Create a CuteDslMoEWrapper with the given expert configuration.
+def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
+    """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
-    Wraps creation in inference_mode(False) so pre-allocated CUDA-graph
-    buffers are normal tensors (inference tensors cannot be inplace-updated
-    during later CUDA graph capture).
+    The wrapper is created lazily (not in __init__ / create_weights) because
+    it depends on final weight shapes and EP configuration.  The wrapper's
+    CUDA-graph buffers are allocated inside CuteDslMoEWrapper.__init__, which
+    typically runs during the autotune dummy forward under inference_mode().
+    We wrap the creation in inference_mode(False) so that those pre-allocated
+    buffers are normal tensors -- inference tensors cannot be inplace-updated
+    during later CUDA graph capture, which runs outside inference_mode.
     """
+    if getattr(layer, "_cutedsl_wrapper", None) is not None:
+        return
+
     try:
         from flashinfer import CuteDslMoEWrapper
     except ImportError as e:
@@ -247,62 +250,42 @@ def _create_cutedsl_wrapper(
         getattr(server_args, "chunked_prefill_size", None) or 8192,
     )
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
+    # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
+    # buffers are normal tensors.  This call typically happens inside
+    # _dummy_run which runs under inference_mode(); inference tensors cannot
+    # be inplace-updated during later CUDA graph capture (which runs outside
+    # inference_mode), so we must opt out here.
+    from sglang.srt.layers.moe.dwdp import enable_dwdp
+
+    if enable_dwdp():
+        # DWDP: wrapper sees all routed experts, offset=0
+        num_local_experts_for_wrapper = layer._num_global_routed
+        local_expert_offset_for_wrapper = 0
+    else:
+        num_local_experts_for_wrapper = layer.num_local_experts
+        local_expert_offset_for_wrapper = (
+            layer.moe_ep_rank * layer.num_local_experts
+        )
 
     with torch.inference_mode(False):
-        wrapper = CuteDslMoEWrapper(
+        layer._cutedsl_wrapper = CuteDslMoEWrapper(
             num_experts=layer.num_experts,
             top_k=top_k,
             hidden_size=layer.hidden_size,
             intermediate_size=layer.intermediate_size_per_partition,
             use_cuda_graph=use_cuda_graph,
             max_num_tokens=max_num_tokens,
-            num_local_experts=num_local_experts,
-            local_expert_offset=local_expert_offset,
+            num_local_experts=num_local_experts_for_wrapper,
+            local_expert_offset=local_expert_offset_for_wrapper,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
         )
-    return wrapper
-
-
-def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
-    """Lazily create CuteDslMoEWrapper for EP (local experts) and resolve scales.
-
-    Creates the wrapper for local experts with the EP-appropriate offset.
-    For DWDP hybrid mode, use ensure_cutedsl_wrapper_dwdp() separately
-    to create a second wrapper that covers all routed experts.
-    """
-    if getattr(layer, "_cutedsl_wrapper", None) is not None:
-        return
-
-    layer._cutedsl_wrapper = _create_cutedsl_wrapper(
-        layer,
-        num_local_experts=layer.num_local_experts,
-        local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-    )
 
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
         resolve_cutedsl_standard_scales(layer)
     )
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
-
-
-def ensure_cutedsl_wrapper_dwdp(layer: torch.nn.Module) -> None:
-    """Lazily create CuteDslMoEWrapper for DWDP (all routed experts, offset=0).
-
-    Also ensures the EP wrapper and scales exist (via ensure_cutedsl_wrapper).
-    """
-    if getattr(layer, "_cutedsl_wrapper_dwdp", None) is not None:
-        return
-
-    # Ensure EP wrapper + scales are created first
-    ensure_cutedsl_wrapper(layer)
-
-    layer._cutedsl_wrapper_dwdp = _create_cutedsl_wrapper(
-        layer,
-        num_local_experts=layer._num_global_routed,
-        local_expert_offset=0,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -341,18 +324,21 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     input_scale: torch.Tensor
 
 
-def _cutedsl_fp4_core(
-    hidden_states: torch.Tensor,
-    topk_output,
+@register_fused_func("none", "flashinfer_cutedsl")
+def fused_experts_none_to_flashinfer_cutedsl_fp4(
+    dispatch_output: StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> torch.Tensor:
-    """Core CuteDSL FP4 compute: quantize activations + run CuteDSL wrapper."""
+) -> StandardCombineInput:
     from flashinfer import fp4_quantize
 
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
     assert runner_config.activation == "silu", "Only silu is supported for CuteDSL MoE."
+
+    hidden_states = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
     assert TopKOutputChecker.format_is_standard(topk_output)
 
     topk_ids = topk_output.topk_ids
@@ -368,7 +354,7 @@ def _cutedsl_fp4_core(
     )
 
     # CuteDSL multi-B API accepts List[Tensor] natively for DWDP
-    return quant_info.wrapper.run(
+    output = quant_info.wrapper.run(
         x=x_fp4,
         x_sf=x_sf,
         token_selected_experts=topk_ids,
@@ -382,36 +368,4 @@ def _cutedsl_fp4_core(
         w2_alpha=quant_info.w2_alpha,
     )
 
-
-@register_fused_func("none", "flashinfer_cutedsl")
-def fused_experts_none_to_flashinfer_cutedsl_fp4(
-    dispatch_output: StandardDispatchOutput,
-    quant_info: CuteDslFp4MoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-) -> StandardCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-
-    output = _cutedsl_fp4_core(
-        dispatch_output.hidden_states,
-        dispatch_output.topk_output,
-        quant_info,
-        runner_config,
-    )
     return StandardCombineInput(hidden_states=output)
-
-
-@register_fused_func("flashinfer", "flashinfer_cutedsl")
-def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
-    dispatch_output,
-    quant_info: CuteDslFp4MoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-):
-    from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferCombineInput
-
-    output = _cutedsl_fp4_core(
-        dispatch_output.hidden_states,
-        dispatch_output.topk_output,
-        quant_info,
-        runner_config,
-    )
-    return FlashinferCombineInput(hidden_states=output)
