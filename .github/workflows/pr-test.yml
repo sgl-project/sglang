@@ -1079,6 +1079,7 @@ jobs:
     timeout-minutes: 240
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
+      CU_VERSION: cu129
     strategy:
       fail-fast: false
       matrix:

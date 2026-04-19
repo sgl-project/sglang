@@ -29,7 +29,7 @@ set -euxo pipefail
 #   - FlashInfer JIT cache index (flashinfer.ai/whl/${CU_VERSION})
 #   - nvrtc variant selection (cu12 vs cu13)
 
-CU_VERSION="cu130"
+CU_VERSION="${CU_VERSION:-cu130}"
 
 # Nvidia package versions we override (torch pins older versions).
 # Used both as pip constraints during install and for post-install verification.
@@ -431,20 +431,29 @@ if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
     $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 fi
 
-# Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
-INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu13 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-if [ "$INSTALLED_NVSHMEM" = "$NVIDIA_NVSHMEM_VERSION" ]; then
-    echo "nvidia-nvshmem-cu13==${NVIDIA_NVSHMEM_VERSION} already installed, skipping reinstall"
+# Pick cu12 vs cu13 variants of nvshmem / cudnn based on CU_VERSION
+if [ "$CU_MAJOR" = "13" ]; then
+    NVSHMEM_PKG="nvidia-nvshmem-cu13"
+    CUDNN_PKG="nvidia-cudnn-cu13"
 else
-    $PIP_CMD install nvidia-nvshmem-cu13==${NVIDIA_NVSHMEM_VERSION} $PIP_INSTALL_SUFFIX
+    NVSHMEM_PKG="nvidia-nvshmem-cu12"
+    CUDNN_PKG="nvidia-cudnn-cu12"
+fi
+
+# Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
+INSTALLED_NVSHMEM=$(pip show ${NVSHMEM_PKG} 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+if [ "$INSTALLED_NVSHMEM" = "$NVIDIA_NVSHMEM_VERSION" ]; then
+    echo "${NVSHMEM_PKG}==${NVIDIA_NVSHMEM_VERSION} already installed, skipping reinstall"
+else
+    $PIP_CMD install ${NVSHMEM_PKG}==${NVIDIA_NVSHMEM_VERSION} $PIP_INSTALL_SUFFIX
 fi
 
 # Fix dependencies: Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu13 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+INSTALLED_CUDNN=$(pip show ${CUDNN_PKG} 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
 if [ "$INSTALLED_CUDNN" = "$NVIDIA_CUDNN_VERSION" ]; then
-    echo "nvidia-cudnn-cu13==${NVIDIA_CUDNN_VERSION} already installed, skipping reinstall"
+    echo "${CUDNN_PKG}==${NVIDIA_CUDNN_VERSION} already installed, skipping reinstall"
 else
-    $PIP_CMD install nvidia-cudnn-cu13==${NVIDIA_CUDNN_VERSION} $PIP_INSTALL_SUFFIX
+    $PIP_CMD install ${CUDNN_PKG}==${NVIDIA_CUDNN_VERSION} $PIP_INSTALL_SUFFIX
 fi
 
 mark_step_done "Fix other dependencies"
