@@ -102,16 +102,25 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         # dt * model_output` (after the shared ``sample.to(fp32)`` cast).
         non_rollout_prev = sample + dt * model_output
 
-        self.assertEqual(rollout_prev.dtype, non_rollout_prev.dtype)
-        self.assertTrue(torch.equal(rollout_prev, non_rollout_prev))
-        # Also verify the post-cast to model_output.dtype (what scheduler.step
-        # returns downstream) is bit-exact.
-        self.assertTrue(
-            torch.equal(
-                rollout_prev.to(model_output.dtype),
-                non_rollout_prev.to(model_output.dtype),
+        pre_cast_max_abs_diff = (rollout_prev - non_rollout_prev).abs().max().item()
+        post_cast_max_abs_diff = (
+            (
+                rollout_prev.to(model_output.dtype)
+                - non_rollout_prev.to(model_output.dtype)
             )
+            .abs()
+            .max()
+            .item()
         )
+        print(
+            f"\n[ODE rollout vs non-rollout, bf16 model_output] "
+            f"max |diff| pre-cast={pre_cast_max_abs_diff}, "
+            f"post-cast={post_cast_max_abs_diff}"
+        )
+
+        self.assertEqual(rollout_prev.dtype, non_rollout_prev.dtype)
+        self.assertEqual(pre_cast_max_abs_diff, 0.0)
+        self.assertEqual(post_cast_max_abs_diff, 0.0)
 
     def test_ode_debug_tensors_have_shape_safe_noise_std(self):
         scheduler = _DummyScheduler()
