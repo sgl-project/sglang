@@ -1887,6 +1887,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
@@ -1898,6 +1900,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
@@ -1922,6 +1926,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
                  k_fp8: (seq_len, index_head_dim), uint8
                  k_scale: (seq_len, 4), uint8
         """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetKAndS.execute(
             self,
@@ -1961,96 +1967,6 @@ class NSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
-
-
-class DoubleSparseTokenToKVPool(KVCache):
-    def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        layer_num: int,
-        device: str,
-        heavy_channel_num: int,
-        enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-    ):
-        super().__init__(
-            size,
-            page_size,
-            dtype,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
-        )
-
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                self.k_buffer = [
-                    torch.zeros(
-                        (size + page_size, head_num, head_dim),
-                        dtype=dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (size + page_size, head_num, head_dim),
-                        dtype=dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
-
-                # [size, head_num, heavy_channel_num] for each layer
-                self.label_buffer = [
-                    torch.zeros(
-                        (size + 1, head_num, heavy_channel_num),
-                        dtype=dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
-
-    def get_key_buffer(self, layer_id: int):
-        return self.k_buffer[layer_id - self.start_layer]
-
-    def get_value_buffer(self, layer_id: int):
-        return self.v_buffer[layer_id - self.start_layer]
-
-    def get_label_buffer(self, layer_id: int):
-        return self.label_buffer[layer_id - self.start_layer]
-
-    def get_kv_buffer(self, layer_id: int):
-        return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
-        )
-
-    def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        cache_label: torch.Tensor,
-    ):
-        # NOTE(Andy): ignore the dtype check
-        layer_id = layer.layer_id
-        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-        self.label_buffer[layer_id - self.start_layer][loc] = cache_label
 
 
 def move_kv_cache_native(
