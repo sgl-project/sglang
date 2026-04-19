@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -19,6 +22,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
+    is_gfx95_supported,
     next_power_of_2,
 )
 
@@ -54,6 +58,13 @@ class ForwardMetadata:
     window_kv_offsets: torch.Tensor
     # Separate attn_logits for SWA layers when v_head_dim differs
     swa_attn_logits: Optional[torch.Tensor] = None
+    # Gluon extend-attention dispatch hints -- O(B) CPU reduction in
+    # init_forward_metadata, forwarded as kwargs to the kernel launcher
+    # only when the Gluon wrapper is active. Ignored by the Triton
+    # reference (which does not accept these kwargs).
+    total_prefix_len: Optional[int] = None
+    total_extend_len: Optional[int] = None
+    min_len_extend: Optional[int] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -76,7 +87,52 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
-        self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        # Auto-enable the Gluon extend-attention kernel on MI350X
+        # (gfx950); user can opt out with --disable-gluon-extend-attention.
+        # The wrapper gates on supported head-dim and transparently falls
+        # back to the Triton reference on unsupported shapes or any
+        # runtime exception, so enabling is always safe.
+        self._gluon_extend_enabled = False
+        _extend_fwd = extend_attention_fwd
+        if (
+            is_gfx95_supported()
+            and not model_runner.server_args.disable_gluon_extend_attention
+        ):
+            from sglang.srt.layers.attention.gluon_extend_attention import (
+                make_extend_attention_fwd,
+                prewarm_for_model,
+            )
+            _gluon_fwd = make_extend_attention_fwd(extend_attention_fwd)
+            if _gluon_fwd is not extend_attention_fwd:
+                self._gluon_extend_enabled = True
+                _extend_fwd = _gluon_fwd
+                logger.info(
+                    "Gluon extend attention enabled (gfx950 auto-opt-in; "
+                    "set --disable-gluon-extend-attention to fall back to "
+                    "the Triton reference)."
+                )
+                try:
+                    prewarm_for_model(
+                        head_dim=int(model_runner.model_config.head_dim),
+                        num_q_heads=int(
+                            model_runner.model_config.num_attention_heads
+                            // get_attention_tp_size()
+                        ),
+                        num_kv_heads=int(
+                            model_runner.model_config.get_num_kv_heads(
+                                get_attention_tp_size()
+                            )
+                        ),
+                        is_causal_modes=(True,),
+                        hf_config=getattr(
+                            model_runner.model_config, "hf_config", None
+                        ),
+                    )
+                except Exception:
+                    # Prewarm is best-effort; first live calls will JIT
+                    # as normal if this fails.
+                    pass
+        self.extend_attention_fwd = torch.compiler.disable(_extend_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
         )
@@ -448,6 +504,23 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             num_kv_splits = None
 
+        # Gluon dispatch hints: O(B) CPU reduction, no GPU sync. Input
+        # is either List[int] or cpu Tensor (piecewise-cuda-graph runner).
+        _pfx_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        _ext_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if _pfx_cpu is not None and _ext_cpu is not None:
+            if isinstance(_pfx_cpu, torch.Tensor):
+                _pfx_cpu = _pfx_cpu.tolist()
+            if isinstance(_ext_cpu, torch.Tensor):
+                _ext_cpu = _ext_cpu.tolist()
+            _total_prefix_len = int(sum(_pfx_cpu)) if _pfx_cpu else 0
+            _total_extend_len = int(sum(_ext_cpu)) if _ext_cpu else 0
+            _min_len_extend = int(min(_ext_cpu)) if _ext_cpu else None
+        else:
+            _total_prefix_len = None
+            _total_extend_len = None
+            _min_len_extend = None
+
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -463,6 +536,9 @@ class TritonAttnBackend(AttentionBackend):
             window_num_kv_splits,
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
+            total_prefix_len=_total_prefix_len,
+            total_extend_len=_total_extend_len,
+            min_len_extend=_min_len_extend,
         )
 
     def init_cuda_graph_state(
@@ -946,6 +1022,17 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        # Gluon-only keyword-only hints; the Triton reference does not
+        # accept these so we only pass them when Gluon is active.
+        _gluon_hints = (
+            dict(
+                total_prefix_len=self.forward_metadata.total_prefix_len,
+                total_extend_len=self.forward_metadata.total_extend_len,
+                min_len_extend=self.forward_metadata.min_len_extend,
+            )
+            if self._gluon_extend_enabled
+            else {}
+        )
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -968,6 +1055,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
+            **_gluon_hints,
         )
         return o
 
