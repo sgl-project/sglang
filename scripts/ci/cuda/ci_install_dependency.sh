@@ -431,6 +431,21 @@ if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
     $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 fi
 
+# sglang-kernel wheels carry a +cuXYZ local version tag (e.g. 0.4.1+cu130).
+# If it doesn't match CU_VERSION, reinstall from the matching index.
+SGL_KERNEL_FULL_VER=$(pip show sglang-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+SGL_KERNEL_CUDA_VER=$(printf '%s' "$SGL_KERNEL_FULL_VER" | sed -n 's/.*+//p')
+echo "Detected sglang-kernel version: ${SGL_KERNEL_FULL_VER} (CUDA tag: ${SGL_KERNEL_CUDA_VER:-none})"
+if [ -n "$SGL_KERNEL_CUDA_VER" ] && [ "$SGL_KERNEL_CUDA_VER" != "$CU_VERSION" ]; then
+    SGL_KERNEL_VER="${SGL_KERNEL_FULL_VER%+*}"
+    echo "Reinstalling sglang-kernel==${SGL_KERNEL_VER} from ${CU_VERSION} index to match torch..."
+    if [ "$CU_MAJOR" = "13" ]; then
+        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    else
+        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    fi
+fi
+
 # Pick cu12 vs cu13 variants of nvshmem / cudnn based on CU_VERSION
 if [ "$CU_MAJOR" = "13" ]; then
     NVSHMEM_PKG="nvidia-nvshmem-cu13"
