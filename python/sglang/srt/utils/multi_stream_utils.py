@@ -94,10 +94,8 @@ class Singleton(type):
 class MultiStreamUtils(metaclass=Singleton):
     def __init__(self):
         if get_global_server_args().enable_longcat_double_stream:
-            self.stream_8 = torch.npu.Stream()
-            self.stream_16 = torch.npu.Stream()
-            torch.npu.set_stream_limit(self.stream_8, 8, 16)
-            torch.npu.set_stream_limit(self.stream_16, AICORE_NUM-8, (AICORE_NUM-8)*2)
+            self.stream_moe = torch.npu.Stream()
+            torch.npu.set_stream_limit(self.stream_moe, 16, 32)
             self.main_stream = None
             self.forward_moe_func = None
 

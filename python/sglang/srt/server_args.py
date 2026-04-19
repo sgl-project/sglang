@@ -2876,9 +2876,6 @@ class ServerArgs:
                 raise RuntimeError(
                     "--enable-longcat-double-stream is not supported in prefill disaggregation mode, only available in decode and hybrid modes."
                 )
-            if self.moe_a2a_backend != "deepep":
-                self.enable_longcat_double_stream = False
-                logger.warning("Use --enable-longcat-double-stream when deepep moe is enabled.")
 
     def _handle_pipeline_parallelism(self):
         if self.pp_size > 1:
