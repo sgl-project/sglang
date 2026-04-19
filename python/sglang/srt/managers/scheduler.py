@@ -1932,6 +1932,7 @@ class Scheduler(
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
+                http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
