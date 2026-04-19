@@ -35,6 +35,11 @@ class _NegotiateOutput(NamedTuple):
 
 
 class PrefillDelayer:
+    # Number of int64 fields packed into the cross-rank all-gather tensor.
+    # Fields (in order): prefillable, token_watermark_force_allow, running_batch,
+    # max_prefill_bs, waiting_queue_len.
+    _GATHER_FIELDS = 5
+
     def __init__(
         self,
         dp_size: int,
@@ -48,18 +53,30 @@ class PrefillDelayer:
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
+        # Adaptive queue-based trigger (optional, additive on top of the
+        # slot-based trigger). Active only when BOTH ratio and max_delay_ms are
+        # set; ServerArgs auto-fills tuned defaults when enable_prefill_delayer
+        # is True, so users typically get this without extra flags.
+        self._queue_min_ratio = getattr(
+            server_args, "prefill_delayer_queue_min_ratio", None
+        )
+        self._max_delay_ms = getattr(server_args, "prefill_delayer_max_delay_ms", None)
+        self._queue_trigger_enabled = (
+            self._queue_min_ratio is not None and self._max_delay_ms is not None
+        )
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
-            f"token_usage_low_watermark={self._token_usage_low_watermark}"
+            f"token_usage_low_watermark={self._token_usage_low_watermark} "
+            f"queue_min_ratio={self._queue_min_ratio} "
+            f"max_delay_ms={self._max_delay_ms} "
+            f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
-        # The global_info contains four pieces of information:
-        # prefillable, token_watermark_force_allow, running_batch, and max_prefill_bs.
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 4),
+            (dp_size_dim, attn_tp_size, self._GATHER_FIELDS),
             dtype=torch.int64,
             device=device,
         )
@@ -117,6 +134,7 @@ class PrefillDelayer:
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
+        global_waiting_queue_len = tp0_info[:, 4]
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -150,15 +168,59 @@ class PrefillDelayer:
                 max_running_requests = (
                     max_running_requests + self.dp_size - 1
                 ) // self.dp_size
-            if (
-                max_running_requests - global_running_batch.max().item()
-                < global_max_prefill_bs.max().item()
-            ):
-                # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
-                # the first merge_batch causes the decoding to fail to reach the maximum batch size.
+
+            # Aggregate across ranks. max_prefill_bs / running_batch are
+            # expected to agree across ranks under normal operation; .max() is
+            # a defensive choice for slot_trigger (lets the largest threshold
+            # win, i.e. conservative w.r.t. over-delaying) and is reused here
+            # for queue_trigger to stay consistent.
+            global_running_batch_max = int(global_running_batch.max().item())
+            global_max_prefill_bs_max = int(global_max_prefill_bs.max().item())
+            global_waiting_queue_max = int(global_waiting_queue_len.max().item())
+
+            slot_trigger = (
+                max_running_requests - global_running_batch_max
+                < global_max_prefill_bs_max
+            )
+
+            # Queue-based trigger (opt-in, adaptive; additive on top of
+            # slot_trigger).
+            #
+            # Motivation: at high OSL variability (large random_range_ratio),
+            # decode requests finish asynchronously and trickle into the queue
+            # one-at-a-time, causing repeated 1-request prefill "interruptions"
+            # to the decode pipeline -> severe throughput collapse.
+            #
+            # Fix: delay prefill until the queue has accumulated at least
+            # `queue_min = min(running_req * ratio, max_prefill_bs)` requests.
+            #     - scales with load (no-op at low running_req)
+            #     - capped by max_prefill_bs (no benefit trying to batch larger
+            #       than what chunked prefill can consume in one step)
+            # Absolute wall-clock cap `max_delay_ms` bounds worst-case TTFT if
+            # the queue stays permanently below target (e.g. arrival rate lower
+            # than queue_min). Applied only to the queue_trigger path because
+            # the slot_trigger is self-healing (running_batch eventually drops).
+            queue_trigger = False
+            if self._queue_trigger_enabled and global_running_batch_max > 0:
+                queue_min_effective = min(
+                    int(global_running_batch_max * self._queue_min_ratio),
+                    global_max_prefill_bs_max,
+                )
+                queue_trigger = (
+                    queue_min_effective > 0
+                    and global_waiting_queue_max < queue_min_effective
+                )
+
+            timeout_triggered = False
+            if queue_trigger and prev_state is not None:
+                elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
+                # self._max_delay_ms is guaranteed not None when queue_trigger
+                # is True (see _queue_trigger_enabled).
+                timeout_triggered = elapsed_ms >= self._max_delay_ms
+
+            if (slot_trigger or queue_trigger) and not timeout_triggered:
                 if self.skip_first_delayer:
                     self.skip_first_delayer = False
-                    pass
                 else:
                     next_state = prev_state or _State()
                     next_state = next_state.bump_delayed_count()
@@ -221,10 +283,12 @@ class PrefillDelayer:
                 int(local_token_watermark_force_allow),
                 kwargs.get("running_batch", 0),
                 kwargs.get("max_prefill_bs", 0),
+                kwargs.get("waiting_queue_len", 0),
             ],
             device="cpu",
             dtype=torch.int64,
         )
+        assert local_info.shape[0] == self._GATHER_FIELDS
         torch.distributed.all_gather_into_tensor(
             self._global_info_buffer.flatten(),
             local_info,

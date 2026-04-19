@@ -364,6 +364,24 @@ class ServerArgs:
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
+    # Queue-based trigger (optional). Only active when BOTH are set; complements
+    # the original slot-based trigger. Intent: at high OSL variability (e.g. large
+    # random_range_ratio) decode drains one-at-a-time into tiny prefills that
+    # interrupt the pipeline; we delay prefill so fragments accumulate into a
+    # bigger batch.
+    #
+    # prefill_delayer_queue_min_ratio: target prefill batch size as a fraction of
+    #   running batch; effective queue_min = min(running_req * ratio, max_prefill_bs).
+    #   Adapts to load: low running_req -> small queue_min -> no harmful delay in
+    #   light workloads; high running_req -> larger queue_min -> aggressive
+    #   batching where fragmentation hurts.
+    # prefill_delayer_max_delay_ms: absolute wall-clock cap on how long a single
+    #   queue-trigger delay can last. Protects TTFT from unbounded starvation.
+    # Defaults of None are interpreted as "user did not specify"; when
+    # enable_prefill_delayer is True, _handle_prefill_delayer_env_compat auto-fills
+    # empirically validated defaults (ratio=0.1, max_delay_ms=5000).
+    prefill_delayer_queue_min_ratio: Optional[float] = None
+    prefill_delayer_max_delay_ms: Optional[float] = None
 
     # Runtime options
     device: Optional[str] = None
@@ -1001,6 +1019,27 @@ class ServerArgs:
             self.prefill_delayer_max_delay_passes = x
         if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
             self.prefill_delayer_token_usage_low_watermark = x
+
+        # When --enable-prefill-delayer is on but the queue-trigger knobs are
+        # not explicitly set, apply empirically validated defaults. This keeps
+        # the flag a single-switch UX: slot-trigger alone was ineffective on
+        # 1K/1K random-range-ratio=0.8 workloads at conc>=128; the adaptive
+        # queue trigger with ratio=0.1 / max_delay_ms=5000 recovered ~2x
+        # throughput in TEP4 benchmarks.
+        if self.enable_prefill_delayer:
+            applied = []
+            if self.prefill_delayer_queue_min_ratio is None:
+                self.prefill_delayer_queue_min_ratio = 0.1
+                applied.append("queue_min_ratio=0.1")
+            if self.prefill_delayer_max_delay_ms is None:
+                self.prefill_delayer_max_delay_ms = 5000.0
+                applied.append("max_delay_ms=5000")
+            if applied:
+                logger.info(
+                    "enable_prefill_delayer=True without explicit queue-trigger "
+                    "tuning; applying defaults: %s",
+                    ", ".join(applied),
+                )
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -4392,6 +4431,33 @@ class ServerArgs:
             nargs="+",
             default=None,
             help="Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-queue-min-ratio",
+            type=float,
+            default=None,
+            help=(
+                "Enable adaptive queue-based delay trigger. Effective queue_min is computed as "
+                "min(running_req * ratio, max_prefill_bs): prefill is delayed until the waiting "
+                "queue reaches this size, so small fragments accumulate into a larger batch. "
+                "Scales naturally with load (no-op at low running_req; aggressive batching at "
+                "high load). Requires --prefill-delayer-max-delay-ms to also be set. "
+                "Typical value: 0.1 ~ 0.5. "
+                "If left unset while --enable-prefill-delayer is on, defaults to 0.1 "
+                "(empirically best on 1K/1K rr=0.8 aggregated benchmarks)."
+            ),
+        )
+        parser.add_argument(
+            "--prefill-delayer-max-delay-ms",
+            type=float,
+            default=None,
+            help=(
+                "Absolute wall-clock cap (in milliseconds) on a single queue-trigger delay. "
+                "Once exceeded, prefill is force-released regardless of queue size, bounding "
+                "worst-case TTFT. Required for --prefill-delayer-queue-min-ratio to take effect. "
+                "Typical value: 1000 ~ 5000. "
+                "If left unset while --enable-prefill-delayer is on, defaults to 5000 ms."
+            ),
         )
 
         # Runtime options
