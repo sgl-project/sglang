@@ -51,7 +51,27 @@ configure_environment() {
     SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
     if [ "$USE_VENV" = "1" ]; then
-        UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
+        # Stable path (no run/job id). Rationale: deep_gemm bakes the
+        # site-packages include path into nvcc flags, which then get MD5'd into
+        # the JIT cache key (DeepGEMM/csrc/jit/compiler.hpp:
+        # `-I{library_include_path}` is part of `flags` in the
+        # `{name}$${signature}$${flags}$${code}` signature). A per-job path
+        # would change every run, so the host-mounted cache at
+        # ~/.cache/deep_gemm/cache/ would accumulate unreachable entries.
+        # Holding the path constant lets cached kernels carry across runs.
+        #
+        # Freshness is guaranteed by wiping and recreating the dir at the start
+        # of each job — equivalent isolation to a per-job path, minus the cache
+        # churn. Assumes one job per runner container at a time (current SGLang
+        # CI); a second concurrent job here would have its `rm -rf` pull the
+        # venv out from under the first.
+        UV_VENV="/tmp/sglang-ci-venv"
+        rm -rf "$UV_VENV"
+        # `rm -rf` can exit 0 while leaving contents behind in edge cases (bind
+        # mounts, chattr +i, busy files on distributed fs). If the wipe is
+        # incomplete, `uv venv --seed` would layer onto stale files and the job
+        # would fail obscurely later. Assert cleanliness up front.
+        [ ! -e "$UV_VENV" ] || { echo "FATAL: $UV_VENV still exists after rm -rf"; ls -la "$UV_VENV" || true; exit 1; }
         uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
         # shellcheck disable=SC1091
         source "$UV_VENV/bin/activate"

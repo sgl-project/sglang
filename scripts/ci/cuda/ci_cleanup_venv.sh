@@ -1,10 +1,13 @@
 #!/bin/bash
-# Remove the per-job uv venv created by ci_install_dependency.sh.
+# Remove the uv venv created by ci_install_dependency.sh.
 #
-# Meant to run in a post-job workflow step with `if: always()` so the venv is
-# destroyed even on job failure/cancel. Runner-level safety net: a cron or
-# startup task should also purge stale /tmp/sglang-ci-* directories to catch
-# cancelled or crashed jobs that never reached this cleanup.
+# The venv lives at a stable path (/tmp/sglang-ci-venv) so cached JIT kernels
+# keyed on include paths (deep_gemm, flashinfer) stay valid across runs.
+# Freshness comes from a wipe-and-recreate at the start of each job's install
+# step, not from this cleanup — so this script is purely for disk hygiene.
+#
+# Meant to run in a post-job workflow step with `if: always()` so the venv
+# doesn't outlive a failed/cancelled job any longer than necessary.
 
 # Best-effort cleanup: never fail the job.
 set +e
@@ -22,37 +25,18 @@ case "$(printf '%s' "$USE_VENV_RAW" | tr '[:upper:]' '[:lower:]')" in
         ;;
 esac
 
-# Prefer the path propagated via GITHUB_ENV. Fallback: glob for any venv from
-# this run+job (covers the case where install crashed before exporting the path).
-if [ -n "${SGLANG_CI_VENV_PATH:-}" ] && [ -d "$SGLANG_CI_VENV_PATH" ]; then
-    if rm -rf "$SGLANG_CI_VENV_PATH"; then
-        echo "Cleaned up venv: $SGLANG_CI_VENV_PATH"
+# Target the stable venv path. Prefer SGLANG_CI_VENV_PATH (set by install),
+# fall back to the hardcoded default so cleanup still works even if GITHUB_ENV
+# propagation dropped the export (e.g., install crashed very early).
+VENV_PATH="${SGLANG_CI_VENV_PATH:-/tmp/sglang-ci-venv}"
+if [ -d "$VENV_PATH" ]; then
+    if rm -rf "$VENV_PATH"; then
+        echo "Cleaned up venv: $VENV_PATH"
     else
-        echo "::warning::Failed to remove $SGLANG_CI_VENV_PATH — runner cron should sweep /tmp/sglang-ci-*"
+        echo "::warning::Failed to remove $VENV_PATH"
     fi
 else
-    matched=0
-    for venv in /tmp/sglang-ci-${GITHUB_RUN_ID:-unknownrun}-${GITHUB_JOB:-unknownjob}-*; do
-        [ -d "$venv" ] || continue
-        matched=1
-        if rm -rf "$venv"; then
-            echo "Cleaned up venv (via glob): $venv"
-        else
-            echo "::warning::Failed to remove $venv — runner cron should sweep /tmp/sglang-ci-*"
-        fi
-    done
-    [ "$matched" -eq 0 ] && echo "No venv to clean for run=${GITHUB_RUN_ID:-?} job=${GITHUB_JOB:-?}"
+    echo "No venv to clean at $VENV_PATH"
 fi
-
-# Sweep stale venvs from cancelled/crashed jobs that never reached cleanup.
-# Any /tmp/sglang-ci-* dir older than 4 hours is considered orphaned.
-stale_count=0
-for venv in /tmp/sglang-ci-*; do
-    [ -d "$venv" ] || continue
-    if find "$venv" -maxdepth 0 -mmin +240 -print -quit | grep -q .; then
-        rm -rf "$venv" && stale_count=$((stale_count + 1))
-    fi
-done
-[ "$stale_count" -gt 0 ] && echo "Swept $stale_count stale venv(s) older than 4h"
 
 exit 0
