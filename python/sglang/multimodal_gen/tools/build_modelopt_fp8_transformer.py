@@ -471,9 +471,10 @@ def build_modelopt_fp8_transformer(
     effective_quant_config = json.loads(json.dumps(quant_config))
     if not quant_algo:
         effective_quant_config["quant_algo"] = "FP8"
-    effective_quant_config = normalize_flat_modelopt_quant_config(
-        effective_quant_config
-    ) or effective_quant_config
+    effective_quant_config = (
+        normalize_flat_modelopt_quant_config(effective_quant_config)
+        or effective_quant_config
+    )
 
     auto_ignore_modules = sorted(
         {
