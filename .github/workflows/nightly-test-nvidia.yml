@@ -71,6 +71,8 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-1-gpu --nightly --continue-on-error

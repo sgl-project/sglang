@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 # Sliding window attention with Triton backend (Gemma-3 model)
-register_cuda_ci(est_time=100, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=95, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 

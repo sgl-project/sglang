@@ -5,6 +5,9 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
+from sglang.srt.utils import get_device_capability, is_musa
+
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
@@ -95,16 +98,9 @@ def create_triton_backend(runner):
         "Cross attention is not supported in the triton attention backend. "
         "Please use `--attention-backend flashinfer`."
     )
-    if runner.server_args.enable_double_sparsity:
-        from sglang.srt.layers.attention.double_sparsity_backend import (
-            DoubleSparseAttnBackend,
-        )
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
-        return DoubleSparseAttnBackend(runner)
-    else:
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-        return TritonAttnBackend(runner)
+    return TritonAttnBackend(runner)
 
 
 @register_attention_backend("torch_native")
@@ -130,17 +126,28 @@ def create_flashmla_backend(runner):
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):
-    import torch
 
-    assert (
-        torch.cuda.get_device_capability()[0] == 8 and not runner.use_mla_backend
-    ) or torch.cuda.get_device_capability()[0] == 9, (
-        "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
-        "Please use `--attention-backend flashinfer`."
-    )
-    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+    major, minor = get_device_capability()
+    if not _is_musa:
+        assert (major == 8 and not runner.use_mla_backend) or major == 9, (
+            "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
+            "Please use `--attention-backend flashinfer`."
+        )
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
 
-    return FlashAttentionBackend(runner)
+        return FlashAttentionBackend(runner)
+    else:
+        assert major == 3 and minor >= 1, (
+            "FlashAttention v3 Backend requires MP>=31. "
+            "Please use `--attention-backend triton`."
+        )
+        from sglang.srt.hardware_backend.musa.attention import (
+            MusaFlashAttentionBackend,
+        )
+
+        return MusaFlashAttentionBackend(runner)
 
 
 @register_attention_backend("fa4")

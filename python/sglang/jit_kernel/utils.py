@@ -52,7 +52,7 @@ def cache_once(fn: F) -> F:
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        key = (args, tuple(sorted(kwargs.items())))
         if key not in result_map:
             result_map[key] = fn(*args, **kwargs)
         return result_map[key]
@@ -305,6 +305,7 @@ def get_jit_cuda_arch() -> ArchInfo:
     return _CUDA_ARCH
 
 
+@cache_once
 def is_arch_support_pdl() -> bool:
     if is_hip_runtime():
         return False

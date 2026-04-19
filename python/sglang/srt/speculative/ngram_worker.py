@@ -9,6 +9,8 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_info_v2 import (
@@ -104,7 +106,7 @@ class NGRAMWorker:
     def remove_external_corpus(self, corpus_id: str) -> None:
         self.ngram_corpus.remove_external_corpus(corpus_id)
 
-    def list_external_corpora(self) -> list[str]:
+    def list_external_corpora(self) -> dict[str, int]:
         return self.ngram_corpus.list_external_corpora()
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
@@ -312,7 +314,11 @@ class NGRAMWorker:
             torch.get_device_module(self.device).current_stream()
         )
         bs = len(model_worker_batch.seq_lens)
+        
+        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
         self._prepare_for_speculative_decoding(model_worker_batch)
+        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+        
         verify_input: NgramVerifyInput = model_worker_batch.spec_info
         accept_length = torch.tensor([1] * bs, dtype=torch.int32, device=self.device)
 
@@ -324,6 +330,8 @@ class NGRAMWorker:
                 draft_tokens_cpu = verify_input.draft_token.view(
                     verify_input.retrive_next_token.shape
                 ).cpu()
+
+            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
@@ -380,6 +388,14 @@ class NGRAMWorker:
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
 
+            if get_global_tracing_enabled():
+                for idx, req in enumerate(batch.reqs):
+                    accepted = (
+                        verify_input.accept_length[idx].item()
+                        if verify_input.accept_length is not None
+                        else 0
+                    )
+                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
             self._update_ngram_corpus(model_worker_batch)
             # Clean up per-request match state for finished/retracted requests.
             finished_req_ids = []

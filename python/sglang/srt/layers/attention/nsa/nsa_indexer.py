@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
@@ -14,20 +14,33 @@ from sglang.jit_kernel.fused_store_index_cache import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    ceil_align,
+    get_bool_env_var,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+)
 
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_gfx95_supported = is_gfx95_supported()
 if _is_cuda:
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
+
+if _use_aiter:
+    from aiter.ops.cache import indexer_k_quant_and_cache
 
 if is_npu():
     import torch_npu
@@ -209,10 +222,12 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.bfloat16 if _is_cuda else torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
-        self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
+        self.k_norm = LayerNorm(
+            self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+        )
         self.rotary_emb = get_rope_wrapper(
             rope_head_dim,
             rotary_dim=rope_head_dim,
@@ -241,7 +256,14 @@ class Indexer(MultiPlatformOp):
         else:
             yield
 
-    def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
+    def _weights_proj_bf16_in_fp32_out(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    ) -> torch.Tensor:
+        # aiter (ROCm gfx95): extract the passthrough bf16 tensor from the
+        # 3-tuple (fp8, scale, bf16) produced by fused_rms_fp8_group_quant,
+        # avoiding an expensive FP8-to-bf16 dequantization.
+        if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
+            x = x[2]
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             weight = self.weights_proj.weight
             out = torch.empty(
@@ -252,19 +274,24 @@ class Indexer(MultiPlatformOp):
             deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
             return out
 
-        if _is_hip:
-            x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
+        if _is_hip:
+            # Return bf16; multiplying with q_scale promotes back to fp32.
+            return weights
         return weights.float()
 
     @torch.compile(dynamic=True)
-    def _project_and_scale_head_gates(self, x: torch.Tensor):
+    def _project_and_scale_head_gates(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    ):
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         return weights
 
     @torch.compile(dynamic=True)
-    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
+    def _get_logits_head_gate(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
+    ):
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
@@ -472,9 +499,6 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 Preshuffle=False,
                 KVBlockSize=block_kv,
-                ChunkK=128,
-                TotalCuCount=256,
-                WavePerEU=5,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
@@ -1007,6 +1031,22 @@ class Indexer(MultiPlatformOp):
             )
             return
 
+        # Fast path: AITER fused quant + cache store (HIP, page_size=1)
+        if _use_aiter:
+            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
+            # Reshape from (num_pages, 132) uint8 to (num_pages, 1, 132) fp8
+            # to match kernel's (num_blocks, block_size, head_dim + scale_bytes) layout
+            kv_cache = buf.unsqueeze(1).view(fp8_dtype)
+            out_loc = forward_batch.out_cache_loc
+            if not out_loc.is_contiguous():
+                out_loc = out_loc.contiguous()
+            indexer_k_quant_and_cache(
+                key, kv_cache, out_loc, self.block_size, self.scale_fmt
+            )
+            return
+
         # Fallback: original path
         assert act_quant is not None
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
@@ -1123,9 +1163,18 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
 
-            # `_get_logits_head_gate` expects a Tensor. For tuple activations, dequantize
-            # to a float tensor here (callsite), keeping `_get_logits_head_gate` backend-agnostic.
-            if isinstance(x, tuple):
+            # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
+            # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
+            # which extracts the bf16 tensor via _weights_proj_bf16_in_fp32_out,
+            # completely skipping the FP8 dequantization path below.
+            if (
+                _use_aiter
+                and _is_gfx95_supported
+                and isinstance(x, tuple)
+                and len(x) == 3
+            ):
+                x_for_gate = x
+            elif isinstance(x, tuple):
                 assert len(x) in (
                     2,
                     3,
