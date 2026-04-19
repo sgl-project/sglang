@@ -672,8 +672,7 @@ def create_multiple_batch_test_samples(
     prompts: List[str], lora_adapter_paths: List[str]
 ):
     random.seed(42)
-    from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
-    from sglang.srt.utils.common import is_hip
+    from sglang.srt.utils.common import get_bool_env_var, is_hip
 
     _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
