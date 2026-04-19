@@ -707,31 +707,63 @@ class TestFlashInferCascadeBackend(CustomTestCase):
             else:
                 self.assertIsNotNone(backend.forward_metadata.cascade_decode_wrapper)
 
-    def test_cascade_output_matches_regular_decode(self):
-        seq_len = self.prefix_len + self.unique_len
-        seq_lens = [seq_len] * self.batch_size
+    def _make_shared_prefix_batch(self, runner, backend, prefix_len, unique_len):
+        bs = self.batch_size
+        seq_len = prefix_len + unique_len
+        total_kv = prefix_len + bs * unique_len
+        req_to_token = runner.req_to_token_pool.req_to_token
+        for i in range(bs):
+            req_to_token[i, :prefix_len] = torch.arange(
+                prefix_len, dtype=torch.int32, device=self.device
+            )
+            req_to_token[i, prefix_len:seq_len] = torch.arange(
+                prefix_len + i * unique_len,
+                prefix_len + (i + 1) * unique_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        seq_lens_t = torch.tensor([seq_len] * bs, dtype=torch.int32, device=self.device)
+        batch = ForwardBatch(
+            batch_size=bs,
+            input_ids=torch.zeros(bs, dtype=torch.int64, device=self.device),
+            out_cache_loc=torch.zeros(bs, dtype=torch.int32, device=self.device),
+            seq_lens_sum=bs * seq_len,
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=torch.arange(bs, dtype=torch.int32, device=self.device),
+            seq_lens=seq_lens_t,
+            seq_lens_cpu=torch.tensor([seq_len] * bs, dtype=torch.int32),
+            attn_backend=backend,
+        )
+        batch.req_to_token_pool = runner.req_to_token_pool
+        batch.token_to_kv_pool = runner.token_to_kv_pool
+        return batch, total_kv
 
-        runner_ref = self._make_runner()
-        backend_ref = FlashInferAttnBackend(runner_ref, enable_cascade=False)
-        layer_ref = self._make_layer()
-        batch_ref = self._make_decode_batch(runner_ref, backend_ref, seq_lens)
-        self._fill_kv_cache(batch_ref, layer_ref, self.batch_size * seq_len)
+    def test_cascade_output_matches_regular_decode(self):
+        bs = self.batch_size
+        prefix_len = self.prefix_len
+        unique_len = self.unique_len
+
+        runner = self._make_runner()
+        layer = self._make_layer()
+
+        backend_ref = FlashInferAttnBackend(runner, enable_cascade=False)
+        batch_ref, total_kv = self._make_shared_prefix_batch(runner, backend_ref, prefix_len, unique_len)
+
+        k = torch.randn(total_kv, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        v = torch.randn(total_kv, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        runner.token_to_kv_pool.set_kv_buffer(
+            layer, torch.arange(total_kv, device=self.device), k, v, layer.k_scale, layer.v_scale
+        )
         backend_ref.init_forward_metadata(batch_ref)
 
-        runner_cas = self._make_runner()
-        runner_cas.token_to_kv_pool.k_buffer[0].copy_(runner_ref.token_to_kv_pool.k_buffer[0])
-        runner_cas.token_to_kv_pool.v_buffer[0].copy_(runner_ref.token_to_kv_pool.v_buffer[0])
-        runner_cas.req_to_token_pool.req_to_token.copy_(runner_ref.req_to_token_pool.req_to_token)
-        backend_cas = FlashInferAttnBackend(runner_cas, enable_cascade=True)
-        layer_cas = self._make_layer()
-        layer_cas.scaling = layer_ref.scaling
-        batch_cas = self._make_decode_batch(runner_cas, backend_cas, seq_lens)
-        prefix_lens = torch.tensor([self.prefix_len] * self.batch_size, dtype=torch.int32, device=self.device)
+        backend_cas = FlashInferAttnBackend(runner, enable_cascade=True)
+        batch_cas, _ = self._make_shared_prefix_batch(runner, backend_cas, prefix_len, unique_len)
+        prefix_lens = torch.tensor([prefix_len] * bs, dtype=torch.int32, device=self.device)
         backend_cas.init_forward_metadata(batch_cas, prefix_lens=prefix_lens)
 
-        q = torch.randn(self.batch_size, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
-        out_ref = backend_ref.forward_decode(q, None, None, layer_ref, batch_ref, save_kv_cache=False)
-        out_cas = backend_cas.forward_decode(q, None, None, layer_cas, batch_cas, save_kv_cache=False)
+        q = torch.randn(bs, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        out_ref = backend_ref.forward_decode(q, None, None, layer, batch_ref, save_kv_cache=False)
+        out_cas = backend_cas.forward_decode(q, None, None, layer, batch_cas, save_kv_cache=False)
 
         self.assertTrue(
             torch.allclose(out_ref, out_cas, atol=1e-2, rtol=0),
@@ -739,23 +771,51 @@ class TestFlashInferCascadeBackend(CustomTestCase):
         )
 
     def test_cascade_variable_unique_lengths(self):
-        seq_lens = [
-            self.prefix_len + self.unique_len,
-            self.prefix_len + self.unique_len * 2,
-            self.prefix_len + self.unique_len,
-            self.prefix_len + self.unique_len * 3,
-        ]
+        unique_lens = [self.unique_len, self.unique_len * 2, self.unique_len, self.unique_len * 3]
+        bs = self.batch_size
+        prefix_len = self.prefix_len
+        total_kv = prefix_len + sum(unique_lens)
+
         runner = self._make_runner()
+        req_to_token = runner.req_to_token_pool.req_to_token
+        offset = prefix_len
+        for i, ul in enumerate(unique_lens):
+            req_to_token[i, :prefix_len] = torch.arange(prefix_len, dtype=torch.int32, device=self.device)
+            req_to_token[i, prefix_len : prefix_len + ul] = torch.arange(
+                offset, offset + ul, dtype=torch.int32, device=self.device
+            )
+            offset += ul
+
         backend = FlashInferAttnBackend(runner, enable_cascade=True)
         layer = self._make_layer()
-        batch = self._make_decode_batch(runner, backend, seq_lens)
-        self._fill_kv_cache(batch, layer, max(seq_lens) * self.batch_size)
-        prefix_lens = torch.tensor([self.prefix_len] * self.batch_size, dtype=torch.int32, device=self.device)
-        backend.init_forward_metadata(batch, prefix_lens=prefix_lens)
+        k = torch.randn(total_kv, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        v = torch.randn(total_kv, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        runner.token_to_kv_pool.set_kv_buffer(
+            layer, torch.arange(total_kv, device=self.device), k, v, layer.k_scale, layer.v_scale
+        )
 
-        q = torch.randn(self.batch_size, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        seq_lens_list = [prefix_len + ul for ul in unique_lens]
+        seq_lens_t = torch.tensor(seq_lens_list, dtype=torch.int32, device=self.device)
+        batch = ForwardBatch(
+            batch_size=bs,
+            input_ids=torch.zeros(bs, dtype=torch.int64, device=self.device),
+            out_cache_loc=torch.zeros(bs, dtype=torch.int32, device=self.device),
+            seq_lens_sum=sum(seq_lens_list),
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=torch.arange(bs, dtype=torch.int32, device=self.device),
+            seq_lens=seq_lens_t,
+            seq_lens_cpu=torch.tensor(seq_lens_list, dtype=torch.int32),
+            attn_backend=backend,
+        )
+        batch.req_to_token_pool = runner.req_to_token_pool
+        batch.token_to_kv_pool = runner.token_to_kv_pool
+
+        prefix_lens_t = torch.tensor([prefix_len] * bs, dtype=torch.int32, device=self.device)
+        backend.init_forward_metadata(batch, prefix_lens=prefix_lens_t)
+
+        q = torch.randn(bs, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
         out = backend.forward_decode(q, None, None, layer, batch, save_kv_cache=False)
-        self.assertEqual(out.shape, (self.batch_size, self.num_heads * self.head_dim))
+        self.assertEqual(out.shape, (bs, self.num_heads * self.head_dim))
         self.assertFalse(torch.isnan(out).any())
 
 
