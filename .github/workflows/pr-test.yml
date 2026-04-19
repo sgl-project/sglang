@@ -62,7 +62,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: 'true'  # TEMP: force-skip on cu13 venv migration branch to fan out all stages
+  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -107,10 +107,9 @@ jobs:
         run: |
           # Run all tests for scheduled runs and workflow_call (when ref input is provided)
           # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.git_ref
-          # TODO(ci-migration): Remove this override after PR #23119 is validated
-          if true; then
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
-            echo "Run mode: ALL TESTS (forced for CI migration validation)"
+            echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
           else
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
@@ -342,9 +341,7 @@ jobs:
 
   wait-for-stage-a:
     needs: [check-changes, call-gate]
-    # TODO(ci-migration): Remove 'false &&' after PR #23119 is validated
     if: |
-      false &&
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
@@ -369,9 +366,7 @@ jobs:
 
   wait-for-stage-b:
     needs: [check-changes, call-gate, wait-for-stage-a]
-    # TODO(ci-migration): Remove 'false &&' after PR #23119 is validated
     if: |
-      false &&
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
