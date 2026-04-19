@@ -2792,10 +2792,8 @@ class ServerArgs:
         if self.disaggregation_mode == "prefill":
             self.moe_a2a_backend = "none"
         else:
-            # Hybrid mode: extend→DWDP, decode→EP
+            # Hybrid mode: extend→DWDP, decode→a2a=none with all-reduce
             self.enable_mixed_chunk = False
-            if self.moe_a2a_backend == "none":
-                self.moe_a2a_backend = "deepep"
 
         logger.info(
             f"DWDP enabled: dwdp_size={self.dwdp_size}, dp_size={self.dp_size}, "
