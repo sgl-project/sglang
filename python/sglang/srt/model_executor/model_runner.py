@@ -740,6 +740,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
+        # TRAIL: enable layer capture for embedding-based scheduling
+        if server_args.trail_collect_embeddings or server_args.trail_classifier_path:
+            if hasattr(self.model, "set_trail_layer_to_capture"):
+                self.model.set_trail_layer_to_capture(server_args.trail_capture_layer)
+                logger.info(
+                    f"TRAIL: Enabled layer {server_args.trail_capture_layer} capture for embedding extraction"
+                )
+            else:
+                logger.warning(
+                    f"TRAIL: Model {self.model.__class__.__name__} does not implement set_trail_layer_to_capture"
+                )
+
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
 

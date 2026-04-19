@@ -360,6 +360,15 @@ class ServerArgs:
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
+
+    # TRAIL scheduling (embedding-based SRPT)
+    trail_collect_embeddings: bool = False
+    trail_capture_layer: int = 11
+    trail_embedding_save_dir: str = "/tmp/trail_embeddings"
+    trail_classifier_path: Optional[str] = None
+    trail_num_bins: int = 32
+    trail_max_output_len: int = 512
+    trail_preemption_threshold: float = 0.8
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
@@ -4278,6 +4287,11 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "trail-sjf",
+                "trail-sprpt",
+                "trail-lsprpt",
+                "trail-rpsprpt",
+                "trail-lrpsprpt",
             ],
             help="The scheduling policy of the requests.",
         )
@@ -4322,6 +4336,49 @@ class ServerArgs:
             type=float,
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
+        )
+        # TRAIL scheduling arguments
+        parser.add_argument(
+            "--trail-collect-embeddings",
+            action="store_true",
+            default=ServerArgs.trail_collect_embeddings,
+            help="Enable TRAIL embedding collection mode. Saves per-request layer embeddings to disk during decode for classifier training.",
+        )
+        parser.add_argument(
+            "--trail-capture-layer",
+            type=int,
+            default=ServerArgs.trail_capture_layer,
+            help="Transformer layer index to capture embeddings from for TRAIL (default: 11).",
+        )
+        parser.add_argument(
+            "--trail-embedding-save-dir",
+            type=str,
+            default=ServerArgs.trail_embedding_save_dir,
+            help="Directory to save TRAIL embeddings during collection mode.",
+        )
+        parser.add_argument(
+            "--trail-classifier-path",
+            type=str,
+            default=ServerArgs.trail_classifier_path,
+            help="Path to trained TRAIL classifier (.pt file) for online prediction.",
+        )
+        parser.add_argument(
+            "--trail-num-bins",
+            type=int,
+            default=ServerArgs.trail_num_bins,
+            help="Number of output length bins for TRAIL classifier (default: 32).",
+        )
+        parser.add_argument(
+            "--trail-max-output-len",
+            type=int,
+            default=ServerArgs.trail_max_output_len,
+            help="Maximum output length for TRAIL bin computation (default: 512).",
+        )
+        parser.add_argument(
+            "--trail-preemption-threshold",
+            type=float,
+            default=ServerArgs.trail_preemption_threshold,
+            help="TRAIL preemption threshold: requests past this fraction of initial prediction become un-preemptable (default: 0.8).",
         )
         parser.add_argument(
             "--page-size",
@@ -6543,6 +6600,30 @@ class ServerArgs:
             if self.default_priority_value is not None:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
+                )
+
+        # Check TRAIL scheduling
+        if self.schedule_policy.startswith("trail-"):
+            assert self.trail_classifier_path is not None or self.trail_collect_embeddings, (
+                f"TRAIL scheduling policy '{self.schedule_policy}' requires "
+                "--trail-classifier-path or --trail-collect-embeddings"
+            )
+            if self.trail_classifier_path is not None:
+                import os
+                assert os.path.isfile(self.trail_classifier_path), (
+                    f"TRAIL classifier not found: {self.trail_classifier_path}"
+                )
+            assert 0.0 < self.trail_preemption_threshold <= 1.0, (
+                f"--trail-preemption-threshold must be in (0, 1], got {self.trail_preemption_threshold}"
+            )
+            assert self.trail_capture_layer >= 0, (
+                f"--trail-capture-layer must be non-negative, got {self.trail_capture_layer}"
+            )
+        else:
+            if self.trail_classifier_path is not None:
+                logger.warning(
+                    "--trail-classifier-path has no effect without a TRAIL scheduling policy "
+                    "(trail-sjf, trail-sprpt, trail-lsprpt, trail-rpsprpt, trail-lrpsprpt)"
                 )
 
         # Check multi-item scoring
