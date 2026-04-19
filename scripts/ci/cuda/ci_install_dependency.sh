@@ -438,7 +438,7 @@ DG_PKG=$(python3 -c "import deep_gemm, os; print(os.path.dirname(deep_gemm.__fil
 if [ -n "$DG_PKG" ] && [ -d "$DG_PKG" ] && [ ! -L "$DG_PKG" ]; then
     DG_VERSION=$(python3 -c "import deep_gemm; print(getattr(deep_gemm, '__version__', 'unknown'))" 2>/dev/null || echo "unknown")
     if [ ! -d "$STABLE_DG_PKG/deep_gemm" ] || [ "$(cat "$STABLE_DG_PKG/.version" 2>/dev/null)" != "$DG_VERSION" ]; then
-        rm -rf "$STABLE_DG_PKG"
+        rm -rf "$STABLE_DG_PKG" 2>/dev/null || { chmod -R u+w "$STABLE_DG_PKG" 2>/dev/null; rm -rf "$STABLE_DG_PKG"; }
         mkdir -p "$STABLE_DG_PKG"
         cp -a "$DG_PKG" "$STABLE_DG_PKG/deep_gemm"
         echo "$DG_VERSION" > "$STABLE_DG_PKG/.version"
