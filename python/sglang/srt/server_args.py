@@ -2983,6 +2983,8 @@ class ServerArgs:
                     "elasticity_aware_hierarchical",
                 ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
+            assert self.pp_size == 1, "PP size should be set to 1 under elastic EP"
+
             if self.elastic_ep_backend == "mooncake":
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
