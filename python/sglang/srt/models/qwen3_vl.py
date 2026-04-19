@@ -1130,8 +1130,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 if (
                     self.pp_group.world_size == 1
                     and self.config.tie_word_embeddings
-                    and not _is_cpu
-                    and not _is_cpu_amx_available
+                    and not (_is_cpu and _is_cpu_amx_available)
                 ):
                     self.lm_head = self.model.embed_tokens
                 else:

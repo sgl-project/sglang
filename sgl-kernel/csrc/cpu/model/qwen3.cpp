@@ -119,6 +119,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
   CHECK_EQ(mixed_qkvz.size(1), expected_dim);
   CHECK_EQ(mixed_ba.size(0), batch);
   CHECK_EQ(mixed_ba.size(1), ba_dim);
+  TORCH_CHECK(mixed_ba.scalar_type() == mixed_qkvz.scalar_type(), "mixed_ba and mixed_qkvz must share same dtype")
   CHECK_EQ(num_heads_v % num_heads_qk, 0);
   at::Tensor mixed_qkv = at::empty({batch, qkv_dim}, mixed_qkvz.options());
   at::Tensor z = at::empty({batch, num_heads_v, head_v}, mixed_qkvz.options());
@@ -173,6 +174,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
   CHECK_EQ(mixed_qkvz.size(1), expected_dim);
   CHECK_EQ(mixed_ba.size(0), batch);
   CHECK_EQ(mixed_ba.size(1), ba_dim);
+  TORCH_CHECK(mixed_ba.scalar_type() == mixed_qkvz.scalar_type(), "mixed_ba and mixed_qkvz must share same dtype")
   at::Tensor mixed_qkv = at::empty({batch, qkv_dim}, mixed_qkvz.options());
   at::Tensor z = at::empty({batch, num_heads_v, head_v}, mixed_qkvz.options());
   at::Tensor b = at::empty({batch, num_heads_v}, mixed_ba.options());

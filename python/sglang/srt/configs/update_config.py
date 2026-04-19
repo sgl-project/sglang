@@ -276,8 +276,13 @@ def adjust_config_with_unaligned_cpu_tp(
             if num_heads % tp_size != 0:
                 from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
+                multimodal_head_dim = getattr(
+                    getattr(m_config, config_name),
+                    "head_dim",
+                    getattr(m_config, config_name).hidden_size // num_heads,
+                )
                 pad_size = get_num_heads_padding_size(
-                    tp_size, weight_block_size, head_dim
+                    tp_size, weight_block_size, multimodal_head_dim
                 )
                 new_num_heads = pad_vocab_size(num_heads, pad_size)
                 update_config(

@@ -2719,8 +2719,8 @@ def log_info_on_rank0(logger, msg):
     try:
         if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
             logger.info(msg)
-    except:
-        logger.info(msg)
+    except RuntimeError as e:
+        logger.info(msg + f", and meeting Error with {e}")
 
 
 def log_debug_on_rank0(logger, msg):
@@ -2733,8 +2733,8 @@ def log_debug_on_rank0(logger, msg):
     try:
         if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
             logger.debug(msg)
-    except:
-        logger.debug(msg)
+    except RuntimeError as e:
+        logger.debug(msg + f", and meeting Error with {e}")
 
 
 def load_json_config(data: str):

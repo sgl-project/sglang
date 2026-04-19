@@ -1577,6 +1577,10 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
             int(output_size / total_output_size * raw_output_size)
             for output_size in output_sizes
         ]
+        assert (
+            sum(weight_split_size) == raw_output_size,
+            f"Padding the loaded weight failed due to sizes are not dividable cleanly from {output_sizes} to {raw_output_size}",
+        )
         split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
         for i, output_size in enumerate(output_sizes):
             pad_size = output_size - weight_split_size[i]
