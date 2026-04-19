@@ -521,6 +521,62 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             )
         self.assertEqual(len(traj_all._rollout_denoising_env_state["step_latents"]), 3)
 
+        # Filter excludes step_index=T (the final/(T+1)-th latent appended by
+        # _postprocess_rollout_outputs). Simulate T=3 loop steps + final append.
+        traj_exclude_final = types.SimpleNamespace(
+            rollout=True,
+            rollout_return_dit_trajectory=True,
+            rollout_return_step_indices=[0, 1, 2],  # excludes T=3
+            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+        )
+        for i in range(3):
+            dit._maybe_append_dit_trajectory_step(
+                batch=traj_exclude_final,
+                latents=lat,
+                timestep_value=ts,
+                step_index=i,
+            )
+        # Mimic the final append routed through the same filter.
+        dit._maybe_append_dit_trajectory_step(
+            batch=traj_exclude_final,
+            latents=lat,
+            timestep_value=torch.zeros(()),
+            step_index=3,
+        )
+        self.assertEqual(
+            len(traj_exclude_final._rollout_denoising_env_state["step_latents"]), 3
+        )
+        self.assertEqual(
+            len(traj_exclude_final._rollout_denoising_env_state["step_timesteps"]), 3
+        )
+
+        # Filter includes only step_index=T → only the final latent survives.
+        traj_only_final = types.SimpleNamespace(
+            rollout=True,
+            rollout_return_dit_trajectory=True,
+            rollout_return_step_indices=[3],
+            _rollout_denoising_env_state={"step_latents": [], "step_timesteps": []},
+        )
+        for i in range(3):
+            dit._maybe_append_dit_trajectory_step(
+                batch=traj_only_final,
+                latents=lat,
+                timestep_value=ts,
+                step_index=i,
+            )
+        dit._maybe_append_dit_trajectory_step(
+            batch=traj_only_final,
+            latents=lat,
+            timestep_value=torch.zeros(()),
+            step_index=3,
+        )
+        self.assertEqual(
+            len(traj_only_final._rollout_denoising_env_state["step_latents"]), 1
+        )
+        self.assertEqual(
+            len(traj_only_final._rollout_denoising_env_state["step_timesteps"]), 1
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

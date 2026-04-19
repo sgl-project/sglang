@@ -78,6 +78,8 @@ class RolloutDenoisingMixin:
         self,
         batch: Req,
         latents: torch.Tensor,
+        num_inference_steps: int,
+        final_timestep: torch.Tensor,
         server_args: ServerArgs,
     ) -> None:
         """Finalize rollout-only outputs.
@@ -87,11 +89,15 @@ class RolloutDenoisingMixin:
         uniformly with the per-step trajectory latents.
         """
         self._maybe_collect_rollout_log_probs(batch)
-        # Append the final denoised latent as the (T+1)-th entry of the
-        # dit-trajectory latents list.
-        state = getattr(batch, "_rollout_denoising_env_state", None)
-        if state is not None and batch.rollout and batch.rollout_return_dit_trajectory:
-            state["step_latents"].append(latents.detach())
+        # Append final denoised latent as the (T+1)-th entry (step_index=T),
+        # routed through the same filter so rollout_return_step_indices can
+        # include/exclude it.
+        self._maybe_append_dit_trajectory_step(
+            batch=batch,
+            latents=latents,
+            timestep_value=final_timestep,
+            step_index=num_inference_steps,
+        )
         self._maybe_finalize_denoising_env_collection(
             batch=batch,
             pipeline_config=server_args.pipeline_config,
