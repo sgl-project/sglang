@@ -282,5 +282,34 @@ class TestMooncakeBackendAccuracy(
         run_eval_accuracy_test(self)
 
 
+class TestMooncakeBackendHybridLinearModel(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
+    """Hybrid Model tests for HiCache-Mooncake backend"""
+
+    @classmethod
+    def _get_model_name(cls):
+        """Use hybrid linear model for testing"""
+        return "Qwen/Qwen3.5-35B-A3B-FP8"
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args["--hicache-mem-layout"] = "page_first_direct"
+        server_args["--hicache-io-backend"] = "direct"
+        server_args["--tp-size"] = 2
+        server_args["--mamba-scheduler-strategy"] = "extra_buffer"
+        server_args["--page-size"] = 64
+
+        return server_args, env_vars
+
+    def test_eval_accuracy(self):
+        """Test eval accuracy with cache persistence across cache flushes"""
+        from test_hicache_storage_file_backend import run_eval_accuracy_test
+
+        run_eval_accuracy_test(self)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
