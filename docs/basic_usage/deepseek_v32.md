@@ -1,10 +1,9 @@
-# DeepSeek V3.2 Usage
+# DeepSeek V3.2/GLM-5 Usage
 
 DeepSeek-V3.2 model family equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
 
-For reporting issues or tracking upcoming features, please refer to this [Roadmap](https://github.com/sgl-project/sglang/issues/11060).
 
-Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser.
+Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser. [GLM-5](https://huggingface.co/zai-org/GLM-5) model also applies DSA (DeepSeek Sparse Attention) structure, so it can share most of the usage here, except for the reasoning parser and tool call parser.
 
 
 ## Installation
@@ -38,7 +37,8 @@ cd sglang
 pip3 install pip --upgrade
 pip3 install -e "python"
 ```
-## Launch DeepSeek V3.2 with SGLang
+
+## Launch DeepSeek V3.2/GLM-5 with SGLang
 
 To serve [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) on 8xH200/B200 GPUs:
 
@@ -56,23 +56,25 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
 ```
 
+To serve GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
+
 ### Configuration Tips
-- **DP Attention (Recommended)**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`, so DP attention (`--dp 8 --enable-dp-attention`) is the recommended configuration for better stability and performance. All test cases use this configuration by default.
-- **Pure TP Mode**: Launching with pure TP (without `--dp` and `--enable-dp-attention`) is also supported. Note that this mode has not been fully validated in PD disaggregation scenarios.
-- **Short-sequence MHA prefill (adaptive)**: For short prefill sequences (default threshold: **2048 tokens**), the NSA backend uses standard MHA automatically (no extra flags). On H200 (SM90) this path uses the FlashAttention variable-length kernel; on B200 (SM100) it uses TRT-LLM ragged MHA. MHA uses `MHA_ONE_SHOT` for best performance. `MHA_ONE_SHOT` computes multi-head attention over all tokens (both cached prefix and newly extended tokens) in a single kernel invocation, avoiding the overhead of chunked KV cache processing. This achieves optimal throughput for short sequences where total sequence length fits within the chunk capacity limit.
+- **DP Attention**: To enable [DP Attention](../advanced_features/dp_dpa_smg_guide.md), please include `--enable-dp-attention --dp <dp-size>` in command. DP Attention is better for large concurrency scenarios.
+- **TP Attention**: Launching with TP attention is also supported. TP attention is better for low latency scenarios.
+- **Short-sequence MHA prefill (adaptive)**: For short prefill sequences (default threshold: **2048 tokens**), the NSA backend uses standard MHA automatically (no extra flags). On H200 (SM90) this path uses the FlashAttention variable-length kernel; on B200 (SM100) it uses TRT-LLM ragged MHA. MHA uses `MHA_ONE_SHOT` for best performance, which computes multi-head attention over all tokens (both cached prefix and newly extended tokens) in a single kernel invocation, avoiding the overhead of chunked KV cache processing. This achieves optimal throughput for short sequences where total sequence length fits within the chunk capacity limit.
+- **MHA prefill threshold relaxation**: To apply MHA attention to requests longer than 2048 tokens, please set the flag `SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` to a value larger than 2048. As threshold grows larger, the prefill performance can be improved, but at the cost of potential accuracy drop.
 - **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill-backend` and `--nsa-decode-backend` server arguments. The choices of nsa prefill/decode attention kernels include:
   - `flashmla_sparse`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, kv inputs.
   - `flashmla_kv`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, fp8 k_cache inputs.
+  - `flashmla_auto`: enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. With BF16 KV cache, `flashmla_sparse` is always used on both Hopper and Blackwell. With FP8 KV cache: On Hopper (SM90), it unconditionally uses `flashmla_kv`; On Blackwell (SM100), it uses `flashmla_sparse` when `total_kv_tokens < total_q_tokens * 512`, otherwise falls back to `flashmla_kv`. The heuristics may need to be tuned if the performance of either kernel changes significantly.
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs. It requires bf16 q, kv inputs.
   - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
   - `aiter`: Aiter kernel on AMD HPUs. Can only be used as decode kernel.
-  - `trtllm`: `trtllm-mla` sparse kernel from flashinfer library. Only run on blackwell GPUs. It requires QKV bf16 or QKV fp8.
-- On the basis of performance benchmarks, the default configuration on H200 and B200 are set as follows :
-  - H200: `flashmla_sparse` prefill attention (short-seq prefill uses MHA via FlashAttention varlen), `fa3` decode attention, `bf16` kv cache dtype.
-  - B200: `flashmla_auto` prefill attention (short-seq prefill uses MHA via TRT-LLM ragged), `flashmla_kv` decode attention, `fp8_e4m3` kv cache dtype. `flashmla_auto` enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. When FP8 KV cache is enabled and `total_kv_tokens < total_q_tokens * 512`, it uses the `flashmla_sparse` kernel; otherwise, it falls back to the `flashmla_kv` kernel. The heuristics may need to be tuned if the performance of either the `flashmla_sparse` or `flashmla_kv` kernel changes significantly.
-- On Blackwell platform, with slightly accuracy drop, the performance can boost up to 3x-5x
-  - B200: by choosing `trtllm` for both `--nsa-prefill-backend` and `--nsa-decode-backend`, the prefill attention use MHA via TRT-LLM ragged for both short and long sequence (**accuracy impact**). Combine the `trtllm` with `fp8_e4m3` kv cache, the kv cache dim is `576` (kv_lora_rank + qk_rope_head_dim) (**accuracy impact**), compare to the combination of `flashmla_auto` and `fp8_e4m` kv cache dim is `656` (kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage).
-
+  - `trtllm`: `trtllm-mla` sparse kernel from flashinfer library. Only run on blackwell GPUs. It requires q,k,v to be uniformly bf16 or fp8_e4m3 format.
+  - On the basis of performance benchmarks, the default configuration of DSA kernels on Hopper and Blackwell are set as follows :
+    - Bfloat 16 kv cache: On Hopper, `flashmla_sparse` prefill attention, `fa3` decode attention; On Blackwell, `flashmla_sparse` prefill attention, `trtllm` decode attention
+    - Float8_e4m3fn KV cache: On Hopper, `flashmla_kv` prefill attention, `flashmla_kv` decode attention; On Blackwell, `trtllm` prefill attention and `trtllm` decode attention.
+- **Index Cache**: Introduce in [this paper](https://arxiv.org/abs/2603.12201), IndexCache improves speed by reusing the result of indexer across different layers, only at cost of negligible accuracy loss.  For **GLM-5** model, we recommend appending `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to command for better tradeoff between speedup and performance.
 
 ## Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
@@ -91,7 +93,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --sp
 - The default value of  `--max-running-requests` is set to `48` for MTP. For larger batch sizes, this value should be increased beyond the default value.
 
 ```{tip}
-To enable the experimental overlap scheduler for EAGLE speculative decoding, set the environment variable `SGLANG_ENABLE_SPEC_V2=1`. This can improve performance by enabling overlap scheduling between draft and verification stages.
+To enable overlap scheduler for EAGLE speculative decoding, we recommend setting the environment variable `SGLANG_ENABLE_SPEC_V2=1`. This can improve performance by enabling overlap scheduling between draft and verification stages.
 ```
 
 
@@ -120,13 +122,22 @@ python3 -m sglang.launch_server \
   --reasoning-parser deepseek-v3
 ```
 
-`DeepSeek-V3.2-Speciale` doesn't support tool calling, so can only be launched with reasoning parser:
+`DeepSeek-V3.2-Speciale` does not support tool calling, so it can only be launched with the reasoning parser:
 ```bash
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V3.2-Speciale \
   --trust-remote-code \
   --tp-size 8 --dp-size 8 --enable-dp-attention \
   --reasoning-parser deepseek-v3
+```
+
+To launch `GLM-5` with function calling and reasoning parser:
+```bash
+python -m sglang.launch_server \
+  --model zai-org/GLM-5-FP8 \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
 ```
 
 ## NVFP4 Checkpoint
@@ -221,7 +232,7 @@ Repeat: 8, mean: 0.797
 Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
 
-For Deepseek V3.2, Deepseek recommends setting the sampling parameters to temperature = 1.0, top_p = 0.95:
+For DeepSeek V3.2, DeepSeek recommends setting the sampling parameters to temperature = 1.0, top_p = 0.95:
 
 ```bash
 python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --top-p 0.95 --temperature 1.0 --thinking-mode deepseek-v3
@@ -229,7 +240,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198
 Repeat: 8, mean: 0.840
 Scores: ['0.848', '0.808', '0.848', '0.838', '0.879', '0.813', '0.838', '0.848']
 ```
-which matches the official score, 0.824, as reported in the [Deepseek-V3.2 technical report](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/assets/paper.pdf).
+which matches the official score, 0.824, as reported in the [DeepSeek-V3.2 technical report](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/assets/paper.pdf).
 
 ### Accuracy Test with `aime 2025`
 
@@ -278,7 +289,7 @@ ns eval \
 
 Test results (8*B200):
 
-DeepSeek-V3.2-Exp：
+DeepSeek-V3.2-Exp:
 
 | evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
 |--------------------|-------------|------------|-------------|-----------------------|-----------|
@@ -314,7 +325,7 @@ For context parallel in DeepSeek V3.2 model, we provide two different modes of s
 
 The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator. Add `attn_cp_size` for communication group for context parallel.
 
-Note that in sequence splitting mode has the following restrictions:
+Note that the in-sequence splitting mode has the following restrictions:
 - The batch size is restricted to 1 for prefill batches
 - `moe_dense_tp_size=1`, `moe_a2a_backend = "deepep"`
 - To ensure `cp_size > 1`, the passed in `tp_size` must be larger than `dp_size`
@@ -331,7 +342,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --e
 
 This mode can be enabled by specifying the parameter `--nsa-prefill-cp-mode round-robin-split`, which distributes tokens across ranks based on `token_idx % cp_size`.
 
-In this scenario, compared with the aforementioned method, it additionally supports the fused MoE backend (the fused MoE backend may deliver better performance than DeepEP in single-machine scenarios), FP8 KV-cache, and multi-batch prefill inference. But it cannot be enabled with dp attention together.
+In this scenario, compared to the in-sequence splitting method, it additionally supports the fused MoE backend (the fused MoE backend may deliver better performance than DeepEP in single-machine scenarios), FP8 KV-cache, and multi-batch prefill inference. However, it cannot be enabled with DP attention together.
 
 For more details, please refer to PR https://github.com/sgl-project/sglang/pull/13959.
 
@@ -457,3 +468,9 @@ python -m sglang.launch_server \
 ```
 
 For the Decode nodes, it is recommended to use the **EP mode**.
+
+## HiSparse: Hierarchical Sparse Attention for DSA (experimental)
+
+HiSparse reduces per-request GPU memory during decode by keeping only a small "hot" KV buffer on GPU while storing complete KV data in CPU pinned memory. A CUDA kernel dynamically swaps in the top-k most relevant KV entries from host memory on each decode step. This enables significantly higher decode concurrency for long-context DSA models.
+
+HiSparse currently requires PD disaggregation mode and is enabled on the decode instance only. For detailed design, configuration, and deployment instructions, see the [HiSparse Guide](../advanced_features/hisparse_guide.md).

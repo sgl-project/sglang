@@ -13,8 +13,10 @@ When using the diffusers backend, `--attention-backend` is passed through to dif
 
 - **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA.
 - **ROCm**: uses FlashAttention when available; otherwise falls back to PyTorch SDPA.
+- **Intel XPU**: uses XPU Flash Attention backend (fp16/bf16, head sizes 64/96/128/192/256); otherwise falls back to PyTorch SDPA.
+- **MUSA**: uses FlashAttention when available; otherwise falls back to PyTorch SDPA.
 - **MPS**: always uses PyTorch SDPA.
-- **NPU**: always uses PyTorch SDPA.
+- **NPU**: for ring attention uses FA otherwise uses PyTorch SDPA.
 
 ## Backend options
 
@@ -31,6 +33,8 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 | `vmoba_attn` | `VMOBA_ATTN` | Requires `kernel.attn.vmoba_attn.vmoba`. Configure via `--attention-backend-config`. |
 | `aiter` | `AITER` | Requires `aiter`. |
 | `aiter_sage` | `AITER_SAGE` | Requires `aiter`. |
+| `sla_attn` | `SLA_ATTN` | Sparse Linear Attention. Requires `SpargeAttn`. Install with `pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation`. |
+| `sage_sla_attn` | `SAGE_SLA_ATTN` | SageAttention + Sparse Linear Attention. Requires `SpargeAttn` (same install as SLA). |
 | `sparse_video_gen_2_attn` | `SPARSE_VIDEO_GEN_2_ATTN` | Requires `svg`. See installation instructions at https://github.com/svg-project/Sparse-VideoGen. |
 
 ## Selection priority
@@ -85,18 +89,20 @@ Some backends require additional configuration. You can pass these parameters vi
 
 ## Platform support matrix
 
-| Backend | CUDA | ROCm | MPS | NPU | Notes |
-|---|---:|---:|---:|---:|---|
-| `fa` | ✅ | ✅ | ❌ | ❌ | CUDA requires SM80+ and fp16/bf16. FlashAttention is only used when the required runtime is installed; otherwise it falls back to `torch_sdpa`. |
-| `torch_sdpa` | ✅ | ✅ | ✅ | ✅ | Most compatible option across platforms. |
-| `sliding_tile_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only. Requires `st_attn`. Configure via `--attention-backend-config`. |
-| `sage_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only (optional dependency). |
-| `sage_attn_3` | ✅ | ❌ | ❌ | ❌ | CUDA-only (optional dependency). |
-| `video_sparse_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only. Requires `vsa`. Configure `sparsity` via `--attention-backend-config`. |
-| `vmoba_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only. Requires `kernel.attn.vmoba_attn.vmoba`. Configure via `--attention-backend-config`. |
-| `aiter` | ❌ | ✅ | ❌ | ❌ | Requires `aiter`. |
-| `aiter_sage` | ❌ | ✅ | ❌ | ❌ | Requires `aiter`. |
-| `sparse_video_gen_2_attn` | ✅ | ❌ | ❌ | ❌ | CUDA-only. Requires `svg`. |
+| Backend | CUDA | ROCm | XPU | MUSA | MPS | NPU | Notes |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `fa` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | CUDA requires SM80+ and fp16/bf16. XPU uses its own flash attention backend. FlashAttention is only used when the required runtime is installed; otherwise it falls back to `torch_sdpa`. No extra installations are required for NPU |
+| `torch_sdpa` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Most compatible option across platforms. |
+| `sliding_tile_attn` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only. Requires `st_attn`. Configure via `--attention-backend-config`. |
+| `sage_attn` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only (optional dependency). |
+| `sage_attn_3` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only (optional dependency). |
+| `video_sparse_attn` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only. Requires `vsa`. Configure `sparsity` via `--attention-backend-config`. |
+| `sla_attn` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only. Requires `SpargeAttn`. |
+| `sage_sla_attn` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only. Requires `SpargeAttn`. |
+| `vmoba_attn` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only. Requires `kernel.attn.vmoba_attn.vmoba`. Configure via `--attention-backend-config`. |
+| `aiter` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | Requires `aiter`. |
+| `aiter_sage` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | Requires `aiter`. |
+| `sparse_video_gen_2_attn` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only. Requires `svg`. |
 
 ## Usage
 

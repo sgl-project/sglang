@@ -76,7 +76,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
-            is_aiter_moe=True,
+            is_aiter_moe=_use_aiter,
             is_concat=True,
             is_packed=True,
         )
@@ -130,17 +130,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             requires_grad=False,
         )
 
-        W2_SCALE_DIVIDEND = w2_down_dim * 2
-        W2_SCALE_DIVISOR = intermediate_size_per_partition
-        scaling_up = lambda dividend, divisor: (dividend * W2_SCALE_DIVIDEND) // (
-            divisor * W2_SCALE_DIVISOR
-        )
-
+        # 1. w2 scale is floor division of inter_dim by blockscale.
+        # 2. w2 scale needs to scale up just as w2.
+        # We combine 1. and 2. to keep the integer precision.
         w2_weight_scale = torch.nn.Parameter(
             torch.ones(
                 num_experts,
                 hidden_size,
-                scaling_up(intermediate_size_per_partition, OCP_MX_BLOCK_SIZE),
+                (w2_down_dim * 2) // OCP_MX_BLOCK_SIZE,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -177,6 +174,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             )
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+
+        if hasattr(layer, "dispatcher"):
+            # Weights are stored as torch.uint8 but semantically MXFP4
+            layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

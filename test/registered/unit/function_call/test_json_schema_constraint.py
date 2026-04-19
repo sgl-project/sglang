@@ -18,7 +18,7 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "stage-a-cpu-only")
+register_cpu_ci(5, "stage-a-test-cpu")
 
 
 class TestJsonSchemaConstraint(unittest.TestCase):
@@ -102,7 +102,7 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
-        self.assertEqual(schema["maxItems"], 1)
+        self.assertNotIn("maxItems", schema)
 
         # Should only have schema for the specific tool
         item_schema = schema["items"]
@@ -121,12 +121,71 @@ class TestJsonSchemaConstraint(unittest.TestCase):
 
         self.assertEqual(schema["type"], "array")
         self.assertEqual(schema["minItems"], 1)
-        self.assertEqual(schema["maxItems"], 1)
+        self.assertNotIn("maxItems", schema)
 
         # Should only have schema for the specific tool
         item_schema = schema["items"]
         self.assertEqual(item_schema["properties"]["name"]["enum"], ["search"])
         self.assertIn("parameters", item_schema["properties"])
+
+    def test_specific_tool_choice_allows_multiple_calls(self):
+        """Test that specific tool choice schema allows multiple calls.
+
+        Regression test for https://github.com/sgl-project/sglang/issues/17998:
+        maxItems: 1 caused the model to stall on whitespace when the prompt
+        implied multiple calls to the same function.
+        """
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="get_weather")
+        )
+        schema = get_json_schema_constraint(self.tools, tool_choice)
+
+        single_call = [
+            {"name": "get_weather", "parameters": {"location": "NYC"}},
+        ]
+        multi_call = [
+            {"name": "get_weather", "parameters": {"location": "NYC"}},
+            {"name": "get_weather", "parameters": {"location": "LA"}},
+            {"name": "get_weather", "parameters": {"location": "Chicago"}},
+        ]
+
+        validator = jsonschema.Draft202012Validator(schema)
+        validator.validate(single_call)
+        validator.validate(multi_call)
+
+    def test_specific_tool_choice_no_parallel(self):
+        """Test that parallel_tool_calls=False sets maxItems=1"""
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="get_weather")
+        )
+        schema = get_json_schema_constraint(
+            self.tools, tool_choice, parallel_tool_calls=False
+        )
+
+        self.assertIsNotNone(schema)
+        self.assertEqual(schema["maxItems"], 1)
+
+        single_call = [
+            {"name": "get_weather", "parameters": {"location": "NYC"}},
+        ]
+        multi_call = [
+            {"name": "get_weather", "parameters": {"location": "NYC"}},
+            {"name": "get_weather", "parameters": {"location": "LA"}},
+        ]
+
+        validator = jsonschema.Draft202012Validator(schema)
+        validator.validate(single_call)
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate(multi_call)
+
+    def test_required_tool_choice_no_parallel(self):
+        """Test that required + parallel_tool_calls=False sets maxItems=1"""
+        schema = get_json_schema_constraint(
+            self.tools, "required", parallel_tool_calls=False
+        )
+
+        self.assertIsNotNone(schema)
+        self.assertEqual(schema["maxItems"], 1)
 
     def test_nonexistent_tool_choice(self):
         """Test schema generation for nonexistent tool"""
