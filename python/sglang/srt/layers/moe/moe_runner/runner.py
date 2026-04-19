@@ -71,10 +71,16 @@ class MoeRunner:
             )
 
             if self.runner_core is None and self.fused_func is None:
-                raise NotImplementedError(
-                    f"Runner backend {runner_backend} requires a fused func for a2a backend "
-                    f"{a2a_backend_name}, but none is registered."
-                )
+                # deepep + flashinfer_cutedsl is handled directly by EPMoE.forward_flashinfer_cutedsl
+                # without going through MoeRunner, so no fused func is needed here.
+                if not (
+                    a2a_backend_name == "deepep"
+                    and runner_backend.is_flashinfer_cutedsl()
+                ):
+                    raise NotImplementedError(
+                        f"Runner backend {runner_backend} requires a fused func for a2a backend "
+                        f"{a2a_backend_name}, but none is registered."
+                    )
 
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
