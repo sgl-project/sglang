@@ -8,6 +8,12 @@ import torch
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.hardware_backend.xpu.eagle_draft_extend_xpu_graph_runner import (
+    EAGLEDraftExtendXpuGraphRunner,
+)
+from sglang.srt.hardware_backend.xpu.eagle_draft_xpu_graph_runner import (
+    EAGLEDraftXpuGraphRunner,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
@@ -273,10 +279,16 @@ class EAGLEWorker(TpModelWorker):
             return
 
         Device2DraftCudaGraphRunner = {
+            "xpu": EAGLEDraftXpuGraphRunner,
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
+        Device2DraftExtendCudaGraphRunner = {
+            "xpu": EAGLEDraftExtendXpuGraphRunner,
+            "cuda": EAGLEDraftExtendCudaGraphRunner,
+        }
+
         # Capture draft
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
@@ -302,9 +314,9 @@ class EAGLEWorker(TpModelWorker):
                 logger,
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB",
             )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self
-            )
+            self.cuda_graph_runner_for_draft_extend = Device2DraftExtendCudaGraphRunner[
+                self.target_worker.device
+            ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
                 logger,

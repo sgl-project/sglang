@@ -5,7 +5,7 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
 from sglang.srt.speculative.spec_utils import assign_draft_cache_locs
-from sglang.srt.utils import next_power_of_2
+from sglang.srt.utils import get_device, next_power_of_2
 
 BYTES_PER_TILE = 128
 
@@ -13,8 +13,8 @@ BYTES_PER_TILE = 128
 class TestSpecUtils(unittest.TestCase):
 
     def setUp(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.data_ptrs = torch.zeros(2, 1, dtype=torch.uint64, device=self.device)
+        self.device = get_device()
+        self.data_ptrs_np = np.zeros((2, 1), dtype=np.uint64)
         self.k_cache = [
             torch.zeros((100, 1, 1), dtype=torch.float32, device=self.device)
         ]
@@ -31,8 +31,11 @@ class TestSpecUtils(unittest.TestCase):
             dtype=torch.float32,
             device=self.device,
         )
-        self.data_ptrs[0, 0] = self.k_cache[0].data_ptr()
-        self.data_ptrs[1, 0] = self.v_cache[0].data_ptr()
+        self.data_ptrs_np[0, 0] = self.k_cache[0].data_ptr()
+        self.data_ptrs_np[1, 0] = self.v_cache[0].data_ptr()
+        self.data_ptrs = torch.tensor(
+            self.data_ptrs_np, device=self.device, dtype=torch.uint64
+        )
 
         self.data_strides = torch.tensor(
             [
