@@ -593,6 +593,7 @@ class MockModelRunnerFlashInfer:
             {
                 "multi_item_scoring_delimiter": None,
                 "enable_deterministic_inference": False,
+                "dllm_algorithm": None,
             },
         )()
 
