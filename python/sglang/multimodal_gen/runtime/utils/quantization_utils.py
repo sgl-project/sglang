@@ -3,7 +3,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from safetensors import safe_open
 
@@ -16,7 +16,28 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def normalize_flat_modelopt_quant_config(
+    quant_cfg: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Fill required diffusers fields for flat ModelOpt component configs."""
+    if not isinstance(quant_cfg, dict) or quant_cfg.get("quant_method") != "modelopt":
+        return quant_cfg
+
+    quant_algo = str(
+        quant_cfg.get("quant_algo")
+        or quant_cfg.get("quantization", {}).get("quant_algo")
+        or ""
+    ).upper()
+    if not quant_algo:
+        return quant_cfg
+
+    normalized = dict(quant_cfg)
+    normalized.setdefault("quant_type", quant_algo)
+    return normalized
+
+
 def _resolve_quant_method_name(quant_cfg: dict) -> str:
+    quant_cfg = normalize_flat_modelopt_quant_config(quant_cfg) or quant_cfg
     quant_method = quant_cfg.get("quant_method")
     if quant_method != "modelopt":
         return quant_method
@@ -78,7 +99,9 @@ def get_quant_config(
     if "quantization_config" not in model_config:
         return None
 
-    hf_quant_config = model_config["quantization_config"]
+    hf_quant_config = normalize_flat_modelopt_quant_config(
+        model_config["quantization_config"]
+    )
     if hf_quant_config is not None and not isinstance(hf_quant_config, dict):
         hf_quant_config = hf_quant_config.to_dict()
     quant_cls = _load_quant_cls(hf_quant_config)
