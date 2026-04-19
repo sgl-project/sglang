@@ -389,10 +389,13 @@ STABLE_FI_DIR="${HOME}/.cache/flashinfer/_stable_src"
 if [ -d "${HOME}/.cache/flashinfer" ]; then
     STALE_COUNT=0
     while IFS= read -r ninja_file; do
-        FIRST_ISYSTEM=$(grep -o '/tmp/sglang-ci-[^ ]*' "$ninja_file" 2>/dev/null | head -1 || true)
-        if [ -n "$FIRST_ISYSTEM" ] && [ ! -d "$FIRST_ISYSTEM" ]; then
-            rm -rf "$(dirname "$ninja_file")"
-            STALE_COUNT=$((STALE_COUNT + 1))
+        # Check for stale venv paths (/tmp/sglang-ci-*) or old stable path (flashinfer-src)
+        STALE_PATH=$(grep -o '/tmp/sglang-ci-[^ ]*\|flashinfer-src' "$ninja_file" 2>/dev/null | head -1 || true)
+        if [ -n "$STALE_PATH" ]; then
+            if echo "$STALE_PATH" | grep -q "flashinfer-src" || [ ! -d "$STALE_PATH" ]; then
+                rm -rf "$(dirname "$ninja_file")"
+                STALE_COUNT=$((STALE_COUNT + 1))
+            fi
         fi
     done < <(find "${HOME}/.cache/flashinfer" -name "build.ninja" -type f 2>/dev/null)
     echo "Cleaned $STALE_COUNT stale FlashInfer cached_ops (kept valid ones)"

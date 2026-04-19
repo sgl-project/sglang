@@ -1035,6 +1035,9 @@ jobs:
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 25
         run: |
+          # Activate venv if available (GITHUB_ENV may have failed to propagate)
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             deepseek-ai/DeepSeek-V3.2-Exp:8
@@ -1042,6 +1045,8 @@ jobs:
       - name: Warmup Server CUDA Graphs
         timeout-minutes: 25
         run: |
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             inclusionAI/Ring-2.5-1T:8
@@ -1164,12 +1169,17 @@ jobs:
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 25
         run: |
+          # Activate venv if available (GITHUB_ENV may have failed to propagate)
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             lmsys/sglang-ci-dsv3-test:4
 
       - name: Warmup Server CUDA Graphs
         timeout-minutes: 25
         run: |
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py \
             lmsys/sglang-ci-dsv3-test:4
 
@@ -1228,6 +1238,9 @@ jobs:
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 25
         run: |
+          # Activate venv if available (GITHUB_ENV may have failed to propagate)
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             deepseek-ai/DeepSeek-V3.2-Exp:8
@@ -1235,6 +1248,8 @@ jobs:
       - name: Warmup Server CUDA Graphs
         timeout-minutes: 25
         run: |
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py \
             deepseek-ai/DeepSeek-V3-0324:8
 
