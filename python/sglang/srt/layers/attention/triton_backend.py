@@ -92,11 +92,19 @@ class TritonAttnBackend(AttentionBackend):
         # The wrapper gates on supported head-dim and transparently falls
         # back to the Triton reference on unsupported shapes or any
         # runtime exception, so enabling is always safe.
+        #
+        # MLA models (Lq != Lv) are short-circuited here -- the Gluon
+        # extend kernel only supports symmetric heads, so wrapping would
+        # just pay an extra dispatch check per call for no benefit.
         self._gluon_extend_enabled = False
         _extend_fwd = extend_attention_fwd
+        _mla_model = (
+            model_runner.model_config.attention_arch == AttentionArch.MLA
+        )
         if (
             is_gfx95_supported()
             and not model_runner.server_args.disable_gluon_extend_attention
+            and not _mla_model
         ):
             from sglang.srt.layers.attention.gluon_extend_attention import (
                 make_extend_attention_fwd,

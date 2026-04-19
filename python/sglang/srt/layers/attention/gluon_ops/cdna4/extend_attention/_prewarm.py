@@ -1131,16 +1131,19 @@ def spec_qwen3(
     return patterns
 
 
-def spec_llama4(num_layers: int = 32, sliding_window: int = 8192) -> list[dict]:
-    """Llama 4 (iRoPE): alternating full / windowed layers.
+def spec_llama4(num_layers: int = 48, sliding_window: int = 8191) -> list[dict]:
+    """Llama 4 (iRoPE): chunked-window + every-4th NoPE global layer.
 
-    Even-indexed layers use RoPE with the chunked window; odd-indexed use
-    NoPE global attention (or vice versa -- for KV-cache purposes the
-    mask shape is what matters, so both variants must be warmed).
+    Matches ``llama4.py`` exactly: ``use_rope = (layer_id + 1) % 4 != 0``,
+    i.e. 3/4 of layers use the chunked window (SWA-style for
+    mask-shape purposes) and every 4th layer is full-attention NoPE.
+    ``sliding_window`` here is the SGLang exclusive value (HF's
+    ``attention_chunk_size`` minus 1; the default 8192 chunk -> 8191
+    exclusive).
     """
     return [
         {
-            "sliding_window_size": sliding_window if (i % 2 == 0) else -1,
+            "sliding_window_size": sliding_window if ((i + 1) % 4 != 0) else -1,
             "has_sink": False,
             "logit_cap": 0.0,
             "xai_temperature_len": -1,
@@ -1150,8 +1153,88 @@ def spec_llama4(num_layers: int = 32, sliding_window: int = 8192) -> list[dict]:
     ]
 
 
+def spec_gemma2(num_layers: int = 42, sliding_window: int = 4095) -> list[dict]:
+    """Gemma 2 (9B/27B): alternating sliding/full layers (SWA on even ids).
+
+    Matches ``gemma2.py`` exactly: ``use_sliding_window = (layer_id % 2 == 0)
+    and hasattr(config, "sliding_window")``. Both 9B (42 layers) and 27B
+    (46 layers) use attn_logit_softcapping=50.0.
+    """
+    return [
+        {
+            "sliding_window_size": sliding_window if (i % 2 == 0) else -1,
+            "has_sink": False,
+            "logit_cap": 50.0,
+            "xai_temperature_len": -1,
+            "is_causal": True,
+        }
+        for i in range(num_layers)
+    ]
+
+
+def spec_cohere2(
+    num_layers: int = 40,
+    sliding_window: int = 4096,
+    layer_types: Optional[Sequence[str]] = None,
+) -> list[dict]:
+    """Cohere Command R+ v2 (Cohere2Config): explicit layer_types.
+
+    Every 4th layer is ``full_attention`` (NoPE global), the rest
+    ``sliding_attention``. If ``layer_types`` is None we use the stock
+    Command R+ v2 pattern (``[sliding]*3 + [full]``). Cohere v2 passes
+    the raw HF ``sliding_window`` (no -1 off-by-one) - we follow that
+    convention here.
+    """
+    if layer_types is None:
+        layer_types = [
+            "full_attention" if ((i + 1) % 4 == 0) else "sliding_attention"
+            for i in range(num_layers)
+        ]
+    out = []
+    for lt in layer_types:
+        out.append({
+            "sliding_window_size": sliding_window if lt == "sliding_attention" else -1,
+            "has_sink": False,
+            "logit_cap": 0.0,
+            "xai_temperature_len": -1,
+            "is_causal": True,
+        })
+    return out
+
+
+def spec_grok(
+    num_layers: int = 64,
+    logit_cap: float = 30.0,
+    xai_temperature_len: int = -1,
+) -> list[dict]:
+    """Grok-1 style: uniform full attention with attn_logit_softcapping=30.
+
+    ``grok.py`` sets ``self.attn.xai_temperature_len`` from HF's
+    ``attn_temperature_len`` and applies ``attn_logit_softcapping``
+    (default 30.0) as the LOGIT_CAP kernel constexpr. No sinks. Pass
+    ``xai_temperature_len>0`` to prewarm the Grok-1 temperature-routing
+    variant.
+    """
+    return [
+        {
+            "sliding_window_size": -1,
+            "has_sink": False,
+            "logit_cap": logit_cap,
+            "xai_temperature_len": xai_temperature_len,
+            "is_causal": True,
+        }
+        for _ in range(num_layers)
+    ]
+
+
 def spec_llama3(num_layers: int = 32) -> list[dict]:
-    """Llama 3 / Qwen 2.5 / Mistral-style: uniform full-attention."""
+    """Uniform full-attention, no sinks, no caps, no sliding.
+
+    Covers Llama 3 / 3.1 / 3.3, Qwen 2 / 2.5, Mistral 7B (sliding_window
+    config field is present but ignored by the SGLang Mistral class),
+    Mixtral, DBRX, OLMo 2 (for configs with no ``layer_types``), Arcee,
+    and the general dense-decoder family.
+    """
     return [
         {
             "sliding_window_size": -1,
@@ -1165,17 +1248,57 @@ def spec_llama3(num_layers: int = 32) -> list[dict]:
 
 
 # Named preset dispatch for convenience.
+#
+# Tuples are ``(head_dim, num_q_heads, num_kv_heads, layer_spec)``. Values
+# taken from the public HF config for each model. Keep alphabetised within
+# each family block for easy diffing.
 MODEL_PRESETS = {
-    "gpt-oss-20b":  lambda: (64, 64, 8, spec_gpt_oss(num_layers=24)),
-    "gpt-oss-120b": lambda: (64, 64, 8, spec_gpt_oss(num_layers=36)),
-    "gemma3-27b":   lambda: (256, 32, 16, spec_gemma3(num_layers=62)),
-    "qwen3-8b":     lambda: (128, 32, 8, spec_qwen3(num_layers=36)),
-    "qwen3-32b":    lambda: (128, 64, 8, spec_qwen3(num_layers=64)),
-    "llama4-maverick": lambda: (128, 128, 8, spec_llama4(num_layers=48)),
-    "llama4-scout":    lambda: (128, 48, 8, spec_llama4(num_layers=48)),
-    "llama3-70b":   lambda: (128, 64, 8, spec_llama3(num_layers=80)),
-    "llama3-8b":    lambda: (128, 32, 8, spec_llama3(num_layers=32)),
-    "qwen2.5-72b":  lambda: (128, 64, 8, spec_llama3(num_layers=80)),
+    # Cohere Command R+ v2 (interleaved SWA, D=128, GQA 96->8)
+    "cohere-command-r-plus": lambda: (128, 96, 8, spec_cohere2(num_layers=64)),
+
+    # DBRX (Mosaic, dense full attention, D=128, 40 heads MHA -> 8 KV GQA)
+    "dbrx-instruct":         lambda: (128, 48, 8, spec_llama3(num_layers=40)),
+
+    # Gemma 2 (alternating SWA, attn_logit_softcap=50)
+    "gemma2-9b":             lambda: (256, 16, 8, spec_gemma2(num_layers=42)),
+    "gemma2-27b":            lambda: (128, 32, 16, spec_gemma2(num_layers=46)),
+
+    # Gemma 3 (5:1 local:global, attn_logit_softcap=0; model uses final_logit_softcap)
+    "gemma3-27b":            lambda: (256, 32, 16, spec_gemma3(num_layers=62)),
+
+    # GPT-OSS (alternating SWA, attention sinks)
+    "gpt-oss-20b":           lambda: (64, 64, 8, spec_gpt_oss(num_layers=24)),
+    "gpt-oss-120b":          lambda: (64, 64, 8, spec_gpt_oss(num_layers=36)),
+
+    # Grok-1 (uniform full, attn_logit_softcap=30, optional temperature_len)
+    "grok-1":                lambda: (128, 48, 8, spec_grok(num_layers=64)),
+
+    # Llama 3 family (uniform full attention)
+    "llama3-8b":             lambda: (128, 32, 8, spec_llama3(num_layers=32)),
+    "llama3-70b":            lambda: (128, 64, 8, spec_llama3(num_layers=80)),
+    "llama3.1-405b":         lambda: (128, 128, 8, spec_llama3(num_layers=126)),
+
+    # Llama 4 iRoPE (every 4th layer NoPE global, the rest chunked-window)
+    "llama4-maverick":       lambda: (128, 128, 8, spec_llama4(num_layers=48)),
+    "llama4-scout":          lambda: (128, 48, 8, spec_llama4(num_layers=48)),
+
+    # Mistral (sliding_window is defined in HF config but ignored by sglang)
+    "mistral-7b-v0.3":       lambda: (128, 32, 8, spec_llama3(num_layers=32)),
+    "mistral-nemo-12b":      lambda: (128, 32, 8, spec_llama3(num_layers=40)),
+    "mistral-small-24b":     lambda: (128, 32, 8, spec_llama3(num_layers=40)),
+
+    # Mixtral (MoE, dense full attention per layer)
+    "mixtral-8x7b":          lambda: (128, 32, 8, spec_llama3(num_layers=32)),
+    "mixtral-8x22b":         lambda: (128, 48, 8, spec_llama3(num_layers=56)),
+
+    # OLMo 2 (uniform full; 7B/13B both have `layer_types` but uniformly full)
+    "olmo2-7b":              lambda: (128, 32, 32, spec_llama3(num_layers=32)),
+    "olmo2-13b":             lambda: (128, 40, 40, spec_llama3(num_layers=40)),
+
+    # Qwen 2.5 / Qwen 3 (Qwen3 ignores use_sliding_window in sglang; treat as uniform)
+    "qwen2.5-72b":           lambda: (128, 64, 8, spec_llama3(num_layers=80)),
+    "qwen3-8b":              lambda: (128, 32, 8, spec_qwen3(num_layers=36)),
+    "qwen3-32b":             lambda: (128, 64, 8, spec_qwen3(num_layers=64)),
 }
 
 

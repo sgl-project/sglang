@@ -22,8 +22,6 @@ from ._layouts import (
     make_padded_smem, make_dll, make_offset_bases,
     make_kt_offset_bases, make_kt_dll, make_v_offset_bases, make_v_dll,
 )
-from ._prefix_direct import attn_fwd_inner_prefix_pipelined_rfidx
-
 # ===-----------------------------------------------------------------------===#
 # Basic Kernel (non-persistent, 3D grid)
 # ===-----------------------------------------------------------------------===#
@@ -73,10 +71,9 @@ def gluon_extend_attn_fwd(
     v_scale,  #
 ):
     # Experimental flags that are always False in production after tuning.
-    # Kept as constexprs here so dead-code elimination removes the unused
-    # branches without bloating the kernel signature passed on every launch.
+    # Kept as constexprs so dead-code elimination removes the unused branches
+    # without bloating the kernel signature passed on every launch.
     V_PRELOAD: gl.constexpr = False
-    USE_RFIDX_PREFIX: gl.constexpr = False
     UNIFY_CAUSAL_PATH: gl.constexpr = False
 
     num_warps: gl.constexpr = gl.num_warps()
@@ -244,59 +241,7 @@ def gluon_extend_attn_fwd(
                 use_pipe_prefix = n_full_prefix >= NUM_STAGES
                 if LOGIT_CAP > 0:
                     use_pipe_prefix = use_pipe_prefix and (n_extend_est < NUM_STAGES)
-                if use_pipe_prefix and USE_RFIDX_PREFIX:
-                    acc, l_i, m_i = attn_fwd_inner_prefix_pipelined_rfidx(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        qpe_dot,
-                        K_Buffer,
-                        V_Buffer,
-                        kv_indices,
-                        pfx_kv_start,
-                        cur_kv_head,
-                        pfx_full_len,
-                        stride_buf_kbs,
-                        stride_buf_kh,
-                        stride_buf_vbs,
-                        stride_buf_vh,
-                        kt_smem,
-                        kpe_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        pfx_q_abs_pos,
-                        SLIDING_WINDOW_SIZE,
-                        Mask,
-                        pfx_mask_base,
-                        mask_row_stride,
-                        q_extend_offs,
-                        USE_CUSTOM_MASK,
-                        SKIP_PREFIX_CUSTOM_MASK,
-                        ENABLE_PREFIX_UNMASKED,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
-                        BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        kpe_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        False,
-                    )
-                elif use_pipe_prefix:
+                if use_pipe_prefix:
                     acc, l_i, m_i = attn_fwd_inner_prefix_dma_simple(
                         acc,
                         l_i,
@@ -1001,58 +946,6 @@ def gluon_extend_attn_fwd(
                         mma_offs_n_col,
                         False,
                     )
-                elif USE_RFIDX_PREFIX:
-                    acc, l_i, m_i = attn_fwd_inner_prefix_pipelined_rfidx(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        qpe_dot,
-                        K_Buffer,
-                        V_Buffer,
-                        kv_indices,
-                        pfx_kv_start,
-                        cur_kv_head,
-                        pfx_full_len,
-                        stride_buf_kbs,
-                        stride_buf_kh,
-                        stride_buf_vbs,
-                        stride_buf_vh,
-                        kt_smem,
-                        kpe_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        pfx_q_abs_pos,
-                        SLIDING_WINDOW_SIZE,
-                        Mask,
-                        pfx_mask_base,
-                        mask_row_stride,
-                        q_extend_offs,
-                        USE_CUSTOM_MASK,
-                        SKIP_PREFIX_CUSTOM_MASK,
-                        ENABLE_PREFIX_UNMASKED,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
-                        BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        kpe_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        False,
-                    )
                 else:
                     acc, l_i, m_i = attn_fwd_inner_prefix_pipelined(
                         acc,
@@ -1482,59 +1375,7 @@ def gluon_extend_attn_fwd(
             # prefix -- split unmasked bulk + masked tail.
             pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
             n_full_prefix = pfx_seq_len // BLOCK_N
-            if n_full_prefix >= NUM_STAGES and USE_RFIDX_PREFIX:
-                acc, l_i, m_i = attn_fwd_inner_prefix_pipelined_rfidx(
-                    acc,
-                    l_i,
-                    m_i,
-                    q_dot,
-                    qpe_dot,
-                    K_Buffer,
-                    V_Buffer,
-                    kv_indices,
-                    pfx_kv_start,
-                    cur_kv_head,
-                    pfx_full_len,
-                    stride_buf_kbs,
-                    stride_buf_kh,
-                    stride_buf_vbs,
-                    stride_buf_vh,
-                    kt_smem,
-                    kpe_smem,
-                    v_smem,
-                    qk_scale,
-                    LOGIT_CAP,
-                    xai_temperature_reg,
-                    XAI_TEMPERATURE_LEN,
-                    pfx_q_abs_pos,
-                    SLIDING_WINDOW_SIZE,
-                    Mask,
-                    pfx_mask_base,
-                    mask_row_stride,
-                    q_extend_offs,
-                    USE_CUSTOM_MASK,
-                    SKIP_PREFIX_CUSTOM_MASK,
-                    ENABLE_PREFIX_UNMASKED,
-                    BLOCK_M,
-                    BLOCK_N,
-                    BLOCK_DMODEL,
-                    ACTUAL_BLOCK_DMODEL,
-                    BLOCK_DPE,
-                    ACTUAL_BLOCK_DPE,
-                    BLOCK_DV,
-                    ACTUAL_BLOCK_DV,
-                    NUM_STAGES,
-                    kt_async_layout,
-                    kpe_async_layout,
-                    v_async_layout,
-                    kt_dot_layout,
-                    p_dot_layout,
-                    v_dot_layout,
-                    mma_layout,
-                    mma_offs_n_col,
-                    False,
-                )
-            elif n_full_prefix >= NUM_STAGES:
+            if n_full_prefix >= NUM_STAGES:
                 acc, l_i, m_i = attn_fwd_inner_prefix_pipelined(
                     acc,
                     l_i,

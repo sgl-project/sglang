@@ -1398,10 +1398,9 @@ def gluon_extend_attention_fwd(
             "BLOCK_DV": _BLOCK_DMODEL, "ACTUAL_BLOCK_DV": Lq,
             "ASYNC_PAD_K": _PAD_K, "ASYNC_PAD_V": _PAD_V,
         } if _kv_is_fp8 else {}
-        # V_PRELOAD / USE_RFIDX_PREFIX / UNIFY_CAUSAL_PATH are no longer
-        # kernel-signature constexprs -- they are hardcoded to False inside
-        # the BF16 kernel body. This trims 3 constexprs off the cache key
-        # and the per-launch arg list.
+        # V_PRELOAD / UNIFY_CAUSAL_PATH are hardcoded to False inside the
+        # kernel body (dead-code eliminated at Gluon JIT time), so they are
+        # not kernel-signature constexprs anymore.
 
         _frozen_kw = dict(
             IS_CAUSAL=is_causal,

@@ -27,8 +27,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-VENV_PYTHON = os.environ.get("VENV_PYTHON", "/home/tussingh/venv/bin/python")
-SGLANG_DIR = os.environ.get("SGLANG_DIR", "/home/tussingh/sglang")
+VENV_PYTHON = os.environ.get("VENV_PYTHON", sys.executable)
+# Default to the branch this script ships with (sglang-extend). Override via
+# SGLANG_DIR if running against a different worktree.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_SGLANG_DIR = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
+SGLANG_DIR = os.environ.get("SGLANG_DIR", _DEFAULT_SGLANG_DIR)
+# Allow running under a Docker/CI Python that doesn't pip-install this
+# worktree by prepending the branch's python/ dir to PYTHONPATH. User can
+# override via BENCH_EXTRA_PYTHONPATH="" to disable.
+_DEFAULT_EXTRA_PYPATH = os.path.join(SGLANG_DIR, "python")
+EXTRA_PYPATH = os.environ.get("BENCH_EXTRA_PYTHONPATH", _DEFAULT_EXTRA_PYPATH)
 RESULTS_DIR = os.environ.get(
     "GLUON_BENCH_RESULTS_DIR",
     os.path.join(SGLANG_DIR, "benchmark", "gluon_extend_ttft", "results"),
@@ -45,7 +54,9 @@ MODELS = {
         # on kernel perf, not weight values — is fully representative.
         # 120B bf16 weights fit on a single MI350X (~252GB), so tp=1 lets us
         # run all three backends in parallel on separate GPUs.
-        "path": "/data/models/openai/gpt-oss-120b",
+        "path": os.environ.get(
+            "GPTOSS_PATH", "/raid/models/gpt-oss-120b-config"
+        ),
         "label": "D=64 GPT-OSS 120B (dummy bf16)",
         # bf16 dummy weights = 217GB — doesn't fit on a single 252GB MI350X
         # with enough room for KV cache. TP=2 splits to ~109GB per GPU, leaving
@@ -64,13 +75,20 @@ MODELS = {
         ],
     },
     "d128-llama70b": {
-        "path": "/data/models/meta-llama/Llama-3.1-70B-Instruct",
-        "label": "D=128 Llama-3.1-70B",
+        # Llama-3.1-70B config-only copy under /home/tussingh/models/ is
+        # sufficient for TTFT benchmarking (kernel perf is weight-value
+        # independent). Real weights live at /data/models/ but aren't
+        # guaranteed on every host; bench_ttft_matrix.py auto-uses dummy
+        # weights for speed. Override via LLAMA70B_PATH if you have them.
+        "path": os.environ.get(
+            "LLAMA70B_PATH", "/home/tussingh/models/Llama-3.1-70B-config"
+        ),
+        "label": "D=128 Llama-3.1-70B (dummy bf16)",
         "tp": 2,
         "num_gpus": 2,
         "max_ctx": 16384,
         "max_total_tokens": 32768,
-        "extra_args": [],
+        "extra_args": ["--load-format", "dummy", "--trust-remote-code"],
     },
     "d128-qwen7b": {
         "path": "Qwen/Qwen2.5-7B-Instruct",
@@ -84,29 +102,26 @@ MODELS = {
 }
 
 BACKENDS = {
+    # `triton` = the vanilla Triton extend kernel. We opt OUT of Gluon
+    # (which auto-opts-in on gfx950) via `--disable-gluon-extend-attention`
+    # in the server launch args.
     "triton": {
-        "env": {"SGLANG_USE_GLUON_EXTEND_ATTENTION": "0"},
+        "env": {},
         "attn_backend": "triton",
+        "extra_cmd": ["--disable-gluon-extend-attention"],
     },
+    # `gluon` = the Triton attention backend with the Gluon extend kernel
+    # auto-opted-in on gfx950 (default behaviour on this branch). No env
+    # vars needed -- the wrapper detects gfx950 and installs itself.
     "gluon": {
-        "env": {"SGLANG_USE_GLUON_EXTEND_ATTENTION": "1"},
+        "env": {},
         "attn_backend": "triton",
+        "extra_cmd": [],
     },
     "ck": {
-        "env": {
-            "SGLANG_USE_GLUON_EXTEND_ATTENTION": "0",
-            "SGLANG_AITER_USE_GLUON_EXTEND": "0",
-        },
+        "env": {},
         "attn_backend": "aiter",
-    },
-    # AITER backend with Gluon extend swapped in for mha_batch_prefill_func.
-    # Lets us test whether Gluon can beat CK even on CK's own dispatch path.
-    "ck-gluon": {
-        "env": {
-            "SGLANG_USE_GLUON_EXTEND_ATTENTION": "0",
-            "SGLANG_AITER_USE_GLUON_EXTEND": "1",
-        },
-        "attn_backend": "aiter",
+        "extra_cmd": [],
     },
 }
 
@@ -389,6 +404,9 @@ def launch_server(model_key, backend_key, gpus, port, extra_env=None,
     # startup on ROCm (torch.mem_get_info disagrees across ranks for a few
     # seconds during NCCL init). mem-fraction-static still caps real usage.
     env["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] = "0"
+    if EXTRA_PYPATH:
+        # Prepend so an editable/site-packages sglang can't shadow our branch.
+        env["PYTHONPATH"] = EXTRA_PYPATH + ":" + env.get("PYTHONPATH", "")
     env.update(bk["env"])
     if extra_env:
         env.update(extra_env)
@@ -401,7 +419,7 @@ def launch_server(model_key, backend_key, gpus, port, extra_env=None,
         "--max-total-tokens", str(cfg["max_total_tokens"]),
         "--attention-backend", bk["attn_backend"],
         "--disable-cuda-graph",
-    ] + cfg["extra_args"]
+    ] + bk.get("extra_cmd", []) + cfg["extra_args"]
     if kv_cache_dtype and kv_cache_dtype != "auto":
         cmd += ["--kv-cache-dtype", kv_cache_dtype]
     label = f"{model_key}/{backend_key}"

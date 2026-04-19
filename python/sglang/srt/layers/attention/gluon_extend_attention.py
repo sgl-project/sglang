@@ -56,10 +56,27 @@ def _try_import_gluon() -> bool:
         return False
 
 
+# Architectures whose SGLang model class passes ``sinks=...`` into the
+# attention backend (i.e. the HAS_SINK=True kernel constexpr path).
+#
+# Grok1ForCausalLM is intentionally absent: grok.py does not pass sinks
+# into RadixAttention (only attn_temperature_len); including it here
+# would prewarm the wrong kernel family and miss the live variant on
+# first Grok-1 prefill.
 _HAS_SINK_ARCHS = {
     "GptOssForCausalLM",
     "GptOssMoeForCausalLM",
-    "Grok1ForCausalLM",
+}
+
+# Architectures whose SGLang model class *does not* use ``config.layer_types``
+# to spell out sliding layers, and instead pattern-matches on layer_id.
+# We replicate the exact runtime convention so the prewarm cache hits the
+# same SLIDING_WINDOW_SIZE constexpr the runtime will ask for.
+_GEMMA2_ARCHS = {"Gemma2ForCausalLM", "Gemma2Model"}
+_LLAMA4_ARCHS = {
+    "Llama4ForCausalLM",
+    "Llama4ForConditionalGeneration",
+    "Llama4TextModel",
 }
 
 
@@ -72,7 +89,28 @@ def _build_layer_spec_from_hf_config(hf_config) -> Optional[list]:
 
     SGLang uses exclusive sliding windows while HF uses inclusive, so
     the runtime ``layer.sliding_window_size`` is ``config.sliding_window
-    - 1``; we must prewarm with that same off-by-one value.
+    - 1`` for most families; we must prewarm with that same off-by-one
+    value. (Cohere v2 passes the raw value, but that's just one extra
+    JIT-compile on the first real call, not a correctness hazard.)
+
+    Pattern inference order for deciding which layers are sliding vs
+    full:
+      1. ``hf_config.layer_types`` (explicit per-layer labels, e.g.
+         GPT-OSS, Gemma 3, Cohere v2, OLMo 2). Authoritative when
+         present.
+      2. Family-specific rules from the SGLang model code:
+           * Gemma 2: even layer_ids are sliding, odd are full.
+           * Llama 4 iRoPE: layers where ``(id+1) % 4 != 0`` use the
+             chunked window, every 4th layer is global NoPE.
+      3. Fallback: uniform full attention.
+
+    Note we intentionally do *not* fall back to "treat every layer as
+    sliding" when ``sliding_window > 0``. Many HF configs (Mistral v0.3,
+    Mixtral, older Llama) ship a non-zero ``sliding_window`` that the
+    SGLang model class ignores; treating it as globally sliding would
+    compile an SWA kernel variant the runtime never uses and, in
+    kernels that special-case the SWA path, produce the wrong cache
+    entry.
     """
     if hf_config is None:
         return None
@@ -87,16 +125,29 @@ def _build_layer_spec_from_hf_config(hf_config) -> Optional[list]:
     raw_sliding_window = getattr(hf_config, "sliding_window", None) or -1
     sliding_window = raw_sliding_window - 1 if raw_sliding_window > 0 else -1
     logit_cap = float(getattr(hf_config, "attn_logit_softcapping", None) or 0.0)
-    xai_temp_len = int(getattr(hf_config, "xai_temperature_len", None) or -1)
+    # Grok sets the runtime ``xai_temperature_len`` attribute from HF's
+    # ``attn_temperature_len`` config field. Accept either key so older
+    # pinned configs also match.
+    xai_temp_len = int(
+        getattr(hf_config, "attn_temperature_len", None)
+        or getattr(hf_config, "xai_temperature_len", None)
+        or -1
+    )
     layer_types = getattr(hf_config, "layer_types", None)
+    is_gemma2 = arch in _GEMMA2_ARCHS
+    is_llama4 = arch in _LLAMA4_ARCHS
 
     layers = []
     for i in range(num_layers):
         if layer_types is not None and i < len(layer_types):
             is_sliding = layer_types[i] in ("sliding_attention", "sliding")
             sw = sliding_window if is_sliding else -1
+        elif is_gemma2 and raw_sliding_window > 0:
+            sw = sliding_window if (i % 2 == 0) else -1
+        elif is_llama4 and raw_sliding_window > 0:
+            sw = sliding_window if ((i + 1) % 4 != 0) else -1
         else:
-            sw = sliding_window if sliding_window > 0 else -1
+            sw = -1
         layers.append({
             "sliding_window_size": sw,
             "has_sink": has_sink,
@@ -183,6 +234,38 @@ def is_gluon_extend_available() -> bool:
     return _try_import_gluon()
 
 
+_FP8_KV_DTYPES = {torch.float8_e4m3fn, torch.float8_e4m3fnuz}
+
+
+def _gluon_supports(
+    q_extend: torch.Tensor,
+    v_extend: torch.Tensor,
+    k_buffer: torch.Tensor,
+    custom_mask,
+) -> bool:
+    """Quick upfront check for shape / feature combos the Gluon kernel
+    does not implement yet.
+
+    Keep in sync with the guards at the top of
+    ``gluon_extend_attention_fwd`` in ``extend_attention_gfx950``; the
+    goal is to short-circuit to Triton without paying the cost of a
+    raised ``ValueError`` on every MLA / unsupported-shape call.
+    """
+    Lq = q_extend.shape[-1]
+    Lv = v_extend.shape[-1]
+    if Lq not in _GLUON_SUPPORTED_HEAD_DIMS:
+        return False
+    if Lq != Lv:
+        # Mixed-dim / DeepSeek MLA heads live in gluon_ops/mla_prefill/.
+        return False
+    kv_is_fp8 = k_buffer.dtype in _FP8_KV_DTYPES
+    if kv_is_fp8 and custom_mask is not None and Lq <= 128:
+        # Spec-decode verify with FP8 KV is not yet supported (see the
+        # matching guard in extend_attention_gfx950.py for details).
+        return False
+    return True
+
+
 def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
     """Return a drop-in replacement for ``extend_attention_fwd``.
 
@@ -192,8 +275,9 @@ def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
     that :class:`TritonAttnBackend` fills from CPU tensors in
     :class:`ForwardMetadata`.
 
-    Head-dims not in ``{64, 128, 256}`` and any runtime exception route
-    to ``triton_fallback``.
+    Unsupported shapes (``Lq != Lv``, head-dims outside ``{64, 128,
+    256}``, FP8 KV + custom_mask on D<=128) and any runtime exception
+    route to ``triton_fallback`` -- never silent wrong output.
     """
     if not _try_import_gluon():
         return triton_fallback
@@ -227,8 +311,7 @@ def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
         total_extend_len=None,
         min_len_extend=None,
     ):
-        Lq = q_extend.shape[-1]
-        if Lq not in _GLUON_SUPPORTED_HEAD_DIMS:
+        if not _gluon_supports(q_extend, v_extend, k_buffer, custom_mask):
             return triton_fallback(
                 q_extend, k_extend, v_extend, o_extend,
                 k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
