@@ -23,7 +23,10 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_hf_config,
+    prepare_diffusers_component_path_for_loading,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -164,6 +167,9 @@ class ComponentLoader(ABC):
         elif transformers_or_diffusers == "diffusers":
             from diffusers import AutoModel
 
+            component_model_path = prepare_diffusers_component_path_for_loading(
+                component_model_path
+            )
             return AutoModel.from_pretrained(
                 component_model_path,
                 revision=server_args.revision,
