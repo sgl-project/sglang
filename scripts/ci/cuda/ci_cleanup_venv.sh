@@ -10,6 +10,18 @@
 set +e
 set -u
 
+# Skip entirely when venv mode is disabled — no /tmp/sglang-ci-* dir exists
+# and there's nothing to sweep. Matches the USE_VENV parsing in
+# ci_install_dependency.sh (accepts 1/true/yes, case-insensitive).
+USE_VENV_RAW="${USE_VENV:-true}"
+case "$(printf '%s' "$USE_VENV_RAW" | tr '[:upper:]' '[:lower:]')" in
+    1 | true | yes) ;;
+    *)
+        echo "USE_VENV=${USE_VENV_RAW}: skipping venv cleanup"
+        exit 0
+        ;;
+esac
+
 # Prefer the path propagated via GITHUB_ENV. Fallback: glob for any venv from
 # this run+job (covers the case where install crashed before exporting the path).
 if [ -n "${SGLANG_CI_VENV_PATH:-}" ] && [ -d "$SGLANG_CI_VENV_PATH" ]; then

@@ -39,41 +39,53 @@ NVIDIA_CUDNN_VERSION="9.16.0.29"
 NVIDIA_NVSHMEM_VERSION="3.4.5"
 OPTIONAL_DEPS="${1:-}"
 
-# uv must be available on system Python to create the venv. Install if missing.
+# Whether to create a uv venv. Default false; set USE_VENV=false to install
+# directly into system Python (useful for runners where uv venv misbehaves).
+USE_VENV="${USE_VENV:-0}"
+echo "USE_VENV=${USE_VENV}"
+
+# uv must be available on system Python (to create the venv, or to run
+# `uv pip install --system` when venv mode is disabled). Install if missing.
 python3 -m pip install --upgrade pip
 if ! command -v uv >/dev/null 2>&1; then
     pip install uv
 fi
 
-# Per-job unique path. Include $$ (shell PID) so concurrent/back-to-back jobs
-# on the same runner never target the same directory even if GITHUB_JOB
-# doesn't differentiate matrix partitions.
-UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
 SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-# --seed installs pip/setuptools into the venv so bare `pip` calls in
-# cache_nvidia_wheels.sh and the human-eval setup resolve to the venv's
-# pip (rather than silently falling back to system Python).
-uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
-# shellcheck disable=SC1091
-source "$UV_VENV/bin/activate"
-# Assert activation actually took effect. A misconfigured activate script
-# would otherwise leave us silently running against system Python.
-[ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
-[ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
-# Propagate to subsequent workflow steps. GITHUB_ENV/GITHUB_PATH only
-# affect *later* steps, never the current one.
-if [ -n "${GITHUB_ENV:-}" ]; then
-    echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
-    echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
-    # Set BASH_ENV early so subsequent steps auto-source the venv's env script.
-    # LD_LIBRARY_PATH is written to this file later (after packages are installed)
-    # and gets picked up even if GITHUB_ENV becomes unavailable at that point.
-    echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV"
-    touch "$UV_VENV/env.sh"
-fi
-if [ -n "${GITHUB_PATH:-}" ]; then
-    echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+if [ "$USE_VENV" = "1" ]; then
+    # Per-job unique path. Include $$ (shell PID) so concurrent/back-to-back jobs
+    # on the same runner never target the same directory even if GITHUB_JOB
+    # doesn't differentiate matrix partitions.
+    UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
+    # --seed installs pip/setuptools into the venv so bare `pip` calls in
+    # cache_nvidia_wheels.sh and the human-eval setup resolve to the venv's
+    # pip (rather than silently falling back to system Python).
+    uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
+    # shellcheck disable=SC1091
+    source "$UV_VENV/bin/activate"
+    # Assert activation actually took effect. A misconfigured activate script
+    # would otherwise leave us silently running against system Python.
+    [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
+    [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
+
+    # Propagate to subsequent workflow steps. GITHUB_ENV/GITHUB_PATH only
+    # affect *later* steps, never the current one.
+    if [ -n "${GITHUB_ENV:-}" ]; then
+        echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
+        echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
+        # Set BASH_ENV early so subsequent steps auto-source the venv's env script.
+        # LD_LIBRARY_PATH is written to this file later (after packages are installed)
+        # and gets picked up even if GITHUB_ENV becomes unavailable at that point.
+        echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV"
+        touch "$UV_VENV/env.sh"
+    fi
+    if [ -n "${GITHUB_PATH:-}" ]; then
+        echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+    fi
+else
+    echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
+    UV_VENV=""
 fi
 
 SECONDS=0
@@ -209,8 +221,13 @@ mark_step_done "Python package site hygiene & install protoc + rust"
 # already upgraded system pip before `uv venv`).
 python3 -m pip install --upgrade pip
 
-# uv is already installed on system Python (above) and the venv is active.
-# Do NOT set UV_SYSTEM_PYTHON — that would redirect uv back to system Python.
+# uv is already installed on system Python (above).
+# - Venv mode: the venv is active and `uv pip` targets it automatically.
+# - Non-venv mode: UV_SYSTEM_PYTHON=1 makes `uv pip` operate on system Python
+#   (otherwise uv refuses to run outside a venv).
+if [ "$USE_VENV" != "1" ]; then
+    export UV_SYSTEM_PYTHON=1
+fi
 PIP_CMD="uv pip"
 PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease allow"
 PIP_UNINSTALL_CMD="uv pip uninstall"
@@ -512,13 +529,14 @@ bash "${SCRIPT_DIR}/prepare_runner.sh"
 mark_step_done "Prepare runner"
 
 # ------------------------------------------------------------------------------
-# Venv LD_LIBRARY_PATH discovery (venv mode only)
+# LD_LIBRARY_PATH discovery
 # ------------------------------------------------------------------------------
 # NVIDIA pip packages (cublas, cudnn, nccl, nvrtc, ...) and torch ship .so files
 # under site-packages. In venv mode these are NOT on the default LD_LIBRARY_PATH,
 # so dlopen('libcublas.so.12') from torch would fail. Prepend them here.
-# $UV_VENV and $SYS_PYTHON_VER were set in the venv-bootstrap block near the top.
-SITE_PACKAGES="$UV_VENV/lib/python${SYS_PYTHON_VER}/site-packages"
+# In non-venv mode, system site-packages may also need this if the runner's
+# default ld config doesn't cover the NVIDIA pip layout.
+SITE_PACKAGES=$(python3 -c "import site, sys; print(site.getsitepackages()[0])")
 # Glob matches NVIDIA pip-package layout:
 # site-packages/nvidia/<component>/lib/lib*.so. If NVIDIA restructures
 # packaging, this may need updating.
@@ -526,9 +544,12 @@ NVIDIA_LIBS=$(find "$SITE_PACKAGES" -path "*/nvidia/*/lib" -type d 2>/dev/null |
 TORCH_LIB="$SITE_PACKAGES/torch/lib"
 VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
 export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# Write LD_LIBRARY_PATH to the venv's env.sh (always succeeds — local file).
-# This is sourced by subsequent steps via BASH_ENV set early in the script.
-echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
+# Write LD_LIBRARY_PATH to the venv's env.sh (always succeeds — local file)
+# so subsequent steps auto-source it via BASH_ENV. In non-venv mode, skip the
+# env.sh write and rely on GITHUB_ENV propagation.
+if [ "$USE_VENV" = "1" ] && [ -n "$UV_VENV" ]; then
+    echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
+fi
 # Also try GITHUB_ENV (may fail if runner temp file was cleaned up during long installs).
 if [ -n "${GITHUB_ENV:-}" ]; then
     echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV" || echo "WARNING: GITHUB_ENV write failed; LD_LIBRARY_PATH will be set via BASH_ENV instead"
