@@ -345,8 +345,18 @@ mark_step_done "Download flashinfer artifacts"
 # on the host mount. When the next job's venv has a different path and the old one
 # is cleaned up, ninja fails because source files no longer exist at the cached path.
 #
-# Fix: copy source files to a stable host-mounted path and symlink each venv's
-# copy there. build.ninja then references the stable path across all jobs.
+# Fix (two parts):
+# 1. Clear stale cached_ops that reference old venv paths (one-time migration)
+# 2. Copy source files to a stable host-mounted path and symlink each venv's
+#    copy there. build.ninja then references the stable path across all jobs.
+#
+# Part 1: Clear stale cached_ops from prior runs
+if [ -d "${HOME}/.cache/flashinfer" ]; then
+    find "${HOME}/.cache/flashinfer" -name "cached_ops" -type d -exec rm -rf {} + 2>/dev/null || true
+    echo "Cleared stale FlashInfer JIT cached_ops"
+fi
+
+# Part 2: Stabilize paths
 STABLE_FI_DIR="${HOME}/.cache/flashinfer-src"
 FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
 TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
