@@ -402,48 +402,46 @@ mark_step_done "Download flashinfer artifacts"
 #    copy there. build.ninja then references the stable path across all jobs.
 #
 # Part 1: Clear stale cached_ops (keep valid compiled kernels)
-if [ "$USE_VENV" = "1" ]; then
-    STABLE_FI_DIR="${HOME}/.cache/flashinfer/_stable_src"
-    if [ -d "${HOME}/.cache/flashinfer" ]; then
-        STALE_COUNT=0
-        while IFS= read -r ninja_file; do
-            # Check for stale venv paths (/tmp/sglang-ci-*) or old stable path (flashinfer-src)
-            STALE_PATH=$(grep -o '/tmp/sglang-ci-[^ ]*\|flashinfer-src' "$ninja_file" 2>/dev/null | head -1 || true)
-            if [ -n "$STALE_PATH" ]; then
-                if echo "$STALE_PATH" | grep -q "flashinfer-src" || [ ! -d "$STALE_PATH" ]; then
-                    rm -rf "$(dirname "$ninja_file")"
-                    STALE_COUNT=$((STALE_COUNT + 1))
-                fi
+STABLE_FI_DIR="${HOME}/.cache/flashinfer/_stable_src"
+if [ -d "${HOME}/.cache/flashinfer" ]; then
+    STALE_COUNT=0
+    while IFS= read -r ninja_file; do
+        # Check for stale venv paths (/tmp/sglang-ci-*) or old stable path (flashinfer-src)
+        STALE_PATH=$(grep -o '/tmp/sglang-ci-[^ ]*\|flashinfer-src' "$ninja_file" 2>/dev/null | head -1 || true)
+        if [ -n "$STALE_PATH" ]; then
+            if echo "$STALE_PATH" | grep -q "flashinfer-src" || [ ! -d "$STALE_PATH" ]; then
+                rm -rf "$(dirname "$ninja_file")"
+                STALE_COUNT=$((STALE_COUNT + 1))
             fi
-        done < <(find "${HOME}/.cache/flashinfer" -name "build.ninja" -type f 2>/dev/null)
-        echo "Cleaned $STALE_COUNT stale FlashInfer cached_ops (kept valid ones)"
-    fi
-
-    # Part 2: Stabilize paths (STABLE_FI_DIR set above in Part 1)
-    FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
-    TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
-
-    FI_VERSION="${FLASHINFER_PYTHON_REQUIRED}"
-    if [ ! -d "$STABLE_FI_DIR/flashinfer-data" ] || [ "$(cat "$STABLE_FI_DIR/.version" 2>/dev/null)" != "$FI_VERSION" ]; then
-        rm -rf "$STABLE_FI_DIR"
-        mkdir -p "$STABLE_FI_DIR"
-        cp -a "$FI_DATA" "$STABLE_FI_DIR/flashinfer-data"
-        cp -a "$TVM_INC" "$STABLE_FI_DIR/tvm-ffi-include"
-        echo "$FI_VERSION" > "$STABLE_FI_DIR/.version"
-        echo "Copied flashinfer source files to stable path: $STABLE_FI_DIR (version=$FI_VERSION)"
-    else
-        echo "Stable flashinfer source path up to date (version=$FI_VERSION)"
-    fi
-
-    rm -rf "$FI_DATA"
-    ln -s "$STABLE_FI_DIR/flashinfer-data" "$FI_DATA"
-    TVM_INC_PARENT=$(dirname "$TVM_INC")
-    rm -rf "$TVM_INC_PARENT/include"
-    ln -s "$STABLE_FI_DIR/tvm-ffi-include" "$TVM_INC_PARENT/include"
-    echo "Symlinked venv flashinfer/tvm_ffi -> $STABLE_FI_DIR"
-
-    mark_step_done "Stabilize FlashInfer JIT cache paths"
+        fi
+    done < <(find "${HOME}/.cache/flashinfer" -name "build.ninja" -type f 2>/dev/null)
+    echo "Cleaned $STALE_COUNT stale FlashInfer cached_ops (kept valid ones)"
 fi
+
+# Part 2: Stabilize paths (STABLE_FI_DIR set above in Part 1)
+FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
+TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
+
+FI_VERSION="${FLASHINFER_PYTHON_REQUIRED}"
+if [ ! -d "$STABLE_FI_DIR/flashinfer-data" ] || [ "$(cat "$STABLE_FI_DIR/.version" 2>/dev/null)" != "$FI_VERSION" ]; then
+    rm -rf "$STABLE_FI_DIR"
+    mkdir -p "$STABLE_FI_DIR"
+    cp -a "$FI_DATA" "$STABLE_FI_DIR/flashinfer-data"
+    cp -a "$TVM_INC" "$STABLE_FI_DIR/tvm-ffi-include"
+    echo "$FI_VERSION" > "$STABLE_FI_DIR/.version"
+    echo "Copied flashinfer source files to stable path: $STABLE_FI_DIR (version=$FI_VERSION)"
+else
+    echo "Stable flashinfer source path up to date (version=$FI_VERSION)"
+fi
+
+rm -rf "$FI_DATA"
+ln -s "$STABLE_FI_DIR/flashinfer-data" "$FI_DATA"
+TVM_INC_PARENT=$(dirname "$TVM_INC")
+rm -rf "$TVM_INC_PARENT/include"
+ln -s "$STABLE_FI_DIR/tvm-ffi-include" "$TVM_INC_PARENT/include"
+echo "Symlinked venv flashinfer/tvm_ffi -> $STABLE_FI_DIR"
+
+mark_step_done "Stabilize FlashInfer JIT cache paths"
 
 
 # ------------------------------------------------------------------------------
