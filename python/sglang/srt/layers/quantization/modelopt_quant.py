@@ -46,7 +46,6 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     per_tensor_dequantize,
     requantize_with_max_scale,
-    round_up_to_multiple,
     swizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -169,6 +168,11 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
 FP4_GEMM_ALIGNMENT = 32
+
+
+def round_up_to_multiple(x: int, m: int) -> int:
+    """Round up x to the nearest multiple of m."""
+    return (x + m - 1) // m * m
 
 
 def pad_nvfp4_weight(
@@ -1002,7 +1006,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             topk_config = topk_output.topk_config
 
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                _get_activation_type,
+                get_activation_type,
             )
 
             _SUPPORTED_FP8_ACTIVATIONS = {"silu", "relu2"}
@@ -1029,7 +1033,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
                 output2_scales_scalar=layer.output2_scales_scalar,
                 use_routing_scales_on_input=True,
-                activation_type=_get_activation_type(self.moe_runner_config.activation),
+                activation_type=get_activation_type(self.moe_runner_config.activation),
             )
 
             return fused_experts_none_to_flashinfer_trtllm_fp8(

@@ -399,10 +399,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
             if self.use_flashinfer_trtllm:
                 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                    _get_activation_type,
+                    get_activation_type,
                 )
 
-                activation_type = _get_activation_type(moe_runner_config.activation)
+                activation_type = get_activation_type(moe_runner_config.activation)
                 quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,

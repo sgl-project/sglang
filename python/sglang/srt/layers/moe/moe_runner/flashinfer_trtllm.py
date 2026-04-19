@@ -27,7 +27,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
-from sglang.srt.layers.quantization.utils import round_up_to_multiple
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
@@ -36,6 +35,12 @@ from sglang.srt.utils.common import (
 )
 
 logger = __import__("logging").getLogger(__name__)
+
+
+def round_up_to_multiple(x: int, m: int) -> int:
+    """Round up *x* to the nearest multiple of *m*."""
+    return (x + m - 1) // m * m
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -500,7 +505,7 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     layer.intermediate_size_per_partition = intermediate_size
 
 
-def _get_activation_type(activation: str) -> int:
+def get_activation_type(activation: str) -> int:
     """Map SGLang activation string to FlashInfer ActivationType int value."""
     from flashinfer.fused_moe.core import ActivationType
 
@@ -871,7 +876,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     hs_scale = hs_scale_linear.view(torch.float8_e4m3fn).reshape(
         *hs_scale_linear.shape[:-1], -1
     )
-    activation_type = _get_activation_type(runner_config.activation)
+    activation_type = get_activation_type(runner_config.activation)
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
         num_tokens = hs_fp4.shape[0]

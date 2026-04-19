@@ -1665,10 +1665,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
 
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                _get_activation_type,
+                get_activation_type,
             )
 
-            activation_type = _get_activation_type(self.moe_runner_config.activation)
+            activation_type = get_activation_type(self.moe_runner_config.activation)
 
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,

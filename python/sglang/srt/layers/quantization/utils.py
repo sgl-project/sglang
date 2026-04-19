@@ -565,11 +565,6 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
     )
 
 
-def round_up_to_multiple(x: int, m: int) -> int:
-    """Round up *x* to the nearest multiple of *m*."""
-    return (x + m - 1) // m * m
-
-
 def swizzle_blockscale(scale: torch.Tensor):
     """
     Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
@@ -581,8 +576,9 @@ def swizzle_blockscale(scale: torch.Tensor):
         scale = scale.unsqueeze(0)
     assert scale.ndim == 3
     B, M, K = scale.shape
-    M_padded = round_up_to_multiple(M, 128)
-    K_padded = round_up_to_multiple(K, 4)
+    round_up_multiple = lambda x, m: (x + m - 1) // m * m
+    M_padded = round_up_multiple(M, 128)
+    K_padded = round_up_multiple(K, 4)
     padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
     padded_scale[:B, :M, :K] = scale
     batches, rows, cols = padded_scale.shape
