@@ -22,11 +22,19 @@ DTYPES = [torch.float16, torch.bfloat16]
 
 
 def hf_rmsnorm_reference(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    """HF LlamaRMSNorm: normalize fp32, cast to dtype, multiply weight in dtype."""
+    """HF LlamaRMSNorm: normalize fp32, cast normalized x to dtype, then multiply weight."""
     x_fp32 = x.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim=True)
     x_normed = x_fp32 * torch.rsqrt(variance + eps)
     return w * x_normed.to(x.dtype)
+
+
+def sgl_rmsnorm_reference(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """Old sgl_kernel.rmsnorm semantics — weight multiply in fp32, cast at the end."""
+    x_fp32 = x.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim=True)
+    x_normed = x_fp32 * torch.rsqrt(variance + eps)
+    return (x_normed * w.to(torch.float32)).to(x.dtype)
 
 
 BS_LIST = get_ci_test_range(
@@ -34,8 +42,9 @@ BS_LIST = get_ci_test_range(
     [1, 16, 1024],
 )
 HIDDEN_SIZE_LIST = get_ci_test_range(
-    [512, 1024, 2048, 3072, 4096, 8192, 16384],
-    [512, 4096, 16384],
+    # Warp-kernel shapes (q/k RMSNorm head dims) + CTA-kernel shapes.
+    [32, 64, 96, 128, 256, 512, 1024, 2048, 3072, 4096, 8192, 16384],
+    [128, 512, 4096, 16384],
 )
 
 
@@ -52,6 +61,10 @@ def test_rmsnorm_hf_correctness(
     w = torch.randn(hidden_size, device=DEVICE, dtype=dtype)
     out = rmsnorm_hf(x, w, EPS)
     ref = hf_rmsnorm_reference(x, w, EPS)
+    # Loose atol — the kernel's block-reduce order differs from PyTorch's
+    # `mean`, producing ~1 fp16 ULP of drift on some shapes.
+    # The SGL-semantics regression guard below is what catches the cast-order
+    # bug this PR fixes; it's reduction-order-invariant.
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
@@ -68,10 +81,46 @@ def test_rmsnorm_hf_out_param(dtype: torch.dtype) -> None:
     )
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_rmsnorm_hf_matches_hf_not_sgl(dtype: torch.dtype) -> None:
+    """Regression guard: kernel must follow HF (cast-before-mul), not the old
+    sgl_kernel.rmsnorm semantics (fp32-mul-then-cast). Reduction-order drift
+    prevents a bit-exact assert against HF, so instead assert the kernel is
+    strictly closer to HF than to the SGL reference."""
+    torch.manual_seed(0)
+    x = torch.randn(64, 4096, device=DEVICE, dtype=dtype)
+    w = torch.randn(4096, device=DEVICE, dtype=dtype)
+    out = rmsnorm_hf(x, w, EPS).float()
+    hf_ref = hf_rmsnorm_reference(x, w, EPS).float()
+    sgl_ref = sgl_rmsnorm_reference(x, w, EPS).float()
+    assert (sgl_ref - hf_ref).abs().max() > 0, "inputs don't exercise the difference"
+    diff_hf = (out - hf_ref).abs().max().item()
+    diff_sgl = (out - sgl_ref).abs().max().item()
+    assert (
+        diff_hf < diff_sgl
+    ), f"kernel closer to SGL than HF (hf={diff_hf}, sgl={diff_sgl})"
+
+
+def test_rmsnorm_hf_empty_input() -> None:
+    """Empty input must short-circuit: the C++ launcher rejects num_tokens=0."""
+    x = torch.empty(0, 4096, device=DEVICE, dtype=torch.float16)
+    w = torch.randn(4096, device=DEVICE, dtype=torch.float16)
+    out = rmsnorm_hf(x, w, EPS)
+    assert out.shape == x.shape and out.numel() == 0
+
+
 @pytest.mark.parametrize(
     ("hidden_size", "expected"),
     [
-        (128, False),
+        (16, False),
+        (32, True),
+        (64, True),
+        (96, True),
+        (128, True),
+        (256, True),
+        (288, True),
+        (384, True),
+        (500, False),
         (512, True),
         (3072, True),
         (4096, True),

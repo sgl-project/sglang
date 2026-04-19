@@ -220,6 +220,7 @@ class RMSNorm(MultiPlatformOp):
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
+                or self.cast_x_before_out_mul
                 or get_global_server_args().rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
@@ -233,6 +234,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 _jit_rmsnorm_hf_available
                 and x.dtype in (torch.float16, torch.bfloat16)
+                and self.weight.data.dtype == x.dtype
                 and is_supported_rmsnorm_hf_hidden_size(x.shape[-1])
             ):
                 out = _jit_rmsnorm_hf(
