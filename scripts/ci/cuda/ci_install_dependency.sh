@@ -48,7 +48,7 @@ fi
 # Per-job unique path. Include $$ (shell PID) so concurrent/back-to-back jobs
 # on the same runner never target the same directory even if GITHUB_JOB
 # doesn't differentiate matrix partitions.
-UV_VENV="/tmp/sglang-ci-venv$$"
+UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
 SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 # --seed installs pip/setuptools into the venv so bare `pip` calls in
 # cache_nvidia_wheels.sh and the human-eval setup resolve to the venv's
@@ -425,6 +425,33 @@ ln -s "$STABLE_FI_DIR/tvm-ffi-include" "$TVM_INC_PARENT/include"
 echo "Symlinked venv flashinfer/tvm_ffi -> $STABLE_FI_DIR"
 
 mark_step_done "Stabilize FlashInfer JIT cache paths"
+
+# ------------------------------------------------------------------------------
+# Stabilize deep_gemm package path for NVRTC cache reuse
+# ------------------------------------------------------------------------------
+# deep_gemm uses NVRTC to JIT-compile bf16 kernels. The NVRTC cache key includes
+# library_root (the package install path). With per-job venvs, each job gets a
+# unique path → different cache key → full recompile (2s/kernel × hundreds).
+# Fix: copy the package to a stable host-mounted path and symlink.
+STABLE_DG_PKG="${HOME}/.cache/deep_gemm/_stable_pkg"
+DG_PKG=$(python3 -c "import deep_gemm, os; print(os.path.dirname(deep_gemm.__file__))" 2>/dev/null || true)
+if [ -n "$DG_PKG" ] && [ -d "$DG_PKG" ] && [ ! -L "$DG_PKG" ]; then
+    DG_VERSION=$(python3 -c "import deep_gemm; print(getattr(deep_gemm, '__version__', 'unknown'))" 2>/dev/null || echo "unknown")
+    if [ ! -d "$STABLE_DG_PKG/deep_gemm" ] || [ "$(cat "$STABLE_DG_PKG/.version" 2>/dev/null)" != "$DG_VERSION" ]; then
+        rm -rf "$STABLE_DG_PKG" 2>/dev/null || { chmod -R u+w "$STABLE_DG_PKG" 2>/dev/null; rm -rf "$STABLE_DG_PKG"; }
+        mkdir -p "$STABLE_DG_PKG"
+        cp -a "$DG_PKG" "$STABLE_DG_PKG/deep_gemm"
+        echo "$DG_VERSION" > "$STABLE_DG_PKG/.version"
+        echo "Copied deep_gemm package to stable path (version=$DG_VERSION)"
+    else
+        echo "Stable deep_gemm package up to date (version=$DG_VERSION)"
+    fi
+    rm -rf "$DG_PKG"
+    ln -s "$STABLE_DG_PKG/deep_gemm" "$DG_PKG"
+    echo "Symlinked venv deep_gemm -> $STABLE_DG_PKG"
+fi
+
+mark_step_done "Stabilize deep_gemm package path"
 
 # ------------------------------------------------------------------------------
 # Install extra dependency

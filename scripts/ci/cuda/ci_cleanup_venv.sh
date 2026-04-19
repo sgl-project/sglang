@@ -20,7 +20,7 @@ if [ -n "${SGLANG_CI_VENV_PATH:-}" ] && [ -d "$SGLANG_CI_VENV_PATH" ]; then
     fi
 else
     matched=0
-    for venv in /tmp/sglang-ci-*; do
+    for venv in /tmp/sglang-ci-${GITHUB_RUN_ID:-unknownrun}-${GITHUB_JOB:-unknownjob}-*; do
         [ -d "$venv" ] || continue
         matched=1
         if rm -rf "$venv"; then
