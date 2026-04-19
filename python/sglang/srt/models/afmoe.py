@@ -235,7 +235,9 @@ class AfmoeMoE(nn.Module):
                 expert_bias=self.expert_bias,
             )
 
-        renormalize = self.route_norm if self.score_func == "sigmoid" and not _is_npu else False
+        renormalize = (
+            self.route_norm if self.score_func == "sigmoid" and not _is_npu else False
+        )
         self.topk = TopK(
             top_k=self.top_k,
             renormalize=renormalize,
