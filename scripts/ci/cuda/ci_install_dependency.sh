@@ -378,18 +378,27 @@ mark_step_done "Download flashinfer artifacts"
 # is cleaned up, ninja fails because source files no longer exist at the cached path.
 #
 # Fix (two parts):
-# 1. Clear stale cached_ops that reference old venv paths (one-time migration)
+# 1. Clear only STALE cached_ops (build.ninja referencing non-existent venv paths).
+#    Do NOT clear all cached_ops — they contain compiled .so files that take 10-20 min
+#    to recompile. Only remove entries where the source paths no longer exist.
 # 2. Copy source files to a stable host-mounted path and symlink each venv's
 #    copy there. build.ninja then references the stable path across all jobs.
 #
-# Part 1: Clear stale cached_ops from prior runs
+# Part 1: Clear stale cached_ops (keep valid compiled kernels)
+STABLE_FI_DIR="${HOME}/.cache/flashinfer/_stable_src"
 if [ -d "${HOME}/.cache/flashinfer" ]; then
-    find "${HOME}/.cache/flashinfer" -name "cached_ops" -type d -exec rm -rf {} + 2>/dev/null || true
-    echo "Cleared stale FlashInfer JIT cached_ops"
+    STALE_COUNT=0
+    while IFS= read -r ninja_file; do
+        FIRST_ISYSTEM=$(grep -oP -- '-isystem \K/tmp/sglang-ci-[^ ]+' "$ninja_file" 2>/dev/null | head -1)
+        if [ -n "$FIRST_ISYSTEM" ] && [ ! -d "$FIRST_ISYSTEM" ]; then
+            rm -rf "$(dirname "$ninja_file")"
+            STALE_COUNT=$((STALE_COUNT + 1))
+        fi
+    done < <(find "${HOME}/.cache/flashinfer" -name "build.ninja" -type f 2>/dev/null)
+    echo "Cleaned $STALE_COUNT stale FlashInfer cached_ops (kept valid ones)"
 fi
 
-# Part 2: Stabilize paths
-STABLE_FI_DIR="${HOME}/.cache/flashinfer-src"
+# Part 2: Stabilize paths (STABLE_FI_DIR set above in Part 1)
 FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
 TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
 
