@@ -64,6 +64,11 @@ source "$UV_VENV/bin/activate"
 if [ -n "${GITHUB_ENV:-}" ]; then
     echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
     echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
+    # Set BASH_ENV early so subsequent steps auto-source the venv's env script.
+    # LD_LIBRARY_PATH is written to this file later (after packages are installed)
+    # and gets picked up even if GITHUB_ENV becomes unavailable at that point.
+    echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV"
+    touch "$UV_VENV/env.sh"
 fi
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$UV_VENV/bin" >> "$GITHUB_PATH"
@@ -489,8 +494,12 @@ NVIDIA_LIBS=$(find "$SITE_PACKAGES" -path "*/nvidia/*/lib" -type d 2>/dev/null |
 TORCH_LIB="$SITE_PACKAGES/torch/lib"
 VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
 export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Write LD_LIBRARY_PATH to the venv's env.sh (always succeeds — local file).
+# This is sourced by subsequent steps via BASH_ENV set early in the script.
+echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
+# Also try GITHUB_ENV (may fail if runner temp file was cleaned up during long installs).
 if [ -n "${GITHUB_ENV:-}" ]; then
-    echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV" || echo "WARNING: Failed to write LD_LIBRARY_PATH to GITHUB_ENV (runner temp file missing)"
+    echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV" || echo "WARNING: GITHUB_ENV write failed; LD_LIBRARY_PATH will be set via BASH_ENV instead"
 fi
 echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 

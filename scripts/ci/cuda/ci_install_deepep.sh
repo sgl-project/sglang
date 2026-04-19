@@ -141,5 +141,12 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
     fi
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" ${PIP_CMD:-pip} install --no-build-isolation . ${PIP_INSTALL_SUFFIX:-}
 else
+    # CUDA 13.0 puts CCCL headers in /usr/local/cuda/include/cccl/ but nvshmem
+    # includes them as <cuda/__cccl_config> expecting /usr/local/cuda/include/cuda/.
+    # Add the cccl path to setup.py include_dirs so the compiler finds them.
+    NVCC_MAJOR=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+' || echo "0")
+    if [ "$NVCC_MAJOR" = "13" ]; then
+        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME:-/usr/local/cuda}/include/cccl')" setup.py
+    fi
     python3 setup.py install
 fi
