@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -626,6 +627,11 @@ class MockModelRunnerFlashInfer:
 @unittest.skipIf(not is_flashinfer_available(), "Test requires flashinfer")
 class TestFlashInferCascadeBackend(CustomTestCase):
     def setUp(self):
+        self._tp_patch = patch(
+            "sglang.srt.layers.attention.flashinfer_backend.get_attention_tp_size",
+            return_value=1,
+        )
+        self._tp_patch.start()
         self.batch_size = 4
         self.prefix_len = 64
         self.unique_len = 32
@@ -633,6 +639,9 @@ class TestFlashInferCascadeBackend(CustomTestCase):
         self.head_dim = 64
         self.device = "cuda"
         self.dtype = torch.float16
+
+    def tearDown(self):
+        self._tp_patch.stop()
 
     def _make_runner(self):
         return MockModelRunnerFlashInfer(self.num_heads, self.head_dim)
