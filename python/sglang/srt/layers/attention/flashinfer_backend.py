@@ -1259,18 +1259,18 @@ class FlashInferIndicesUpdaterDecode:
         # Shared level: all bs decode tokens attend to the same prefix pages.
         # Pages are identical across requests (radix cache), so we read from req 0.
         shared_qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
-        shared_kv_indptr = self.cascade_shared_kv_indptr
-        shared_kv_indptr[1] = shared_prefix_len
+        shared_kv_indptr = torch.tensor(
+            [0, int(shared_prefix_len)], dtype=torch.int32, device="cuda"
+        )
         shared_kv_indices = self.req_to_token[
             req_pool_indices[0], :shared_prefix_len
         ].int()
         shared_kv_last_page_len = torch.ones(1, dtype=torch.int32, device="cuda")
 
         # Unique level: each request attends to its own tail (seq_len - prefix_len tokens).
-        unique_qo_indptr = self.cascade_unique_qo_indptr[: bs + 1]
-        unique_kv_indptr = self.cascade_unique_kv_indptr
-        unique_kv_indptr[1 : bs + 1] = torch.cumsum(unique_lens, dim=0)
-        unique_kv_indptr = unique_kv_indptr[: bs + 1]
+        unique_qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+        unique_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
+        unique_kv_indptr[1:] = torch.cumsum(unique_lens, dim=0).to(torch.int32)
         unique_kv_indices = torch.empty(
             unique_lens.sum().item(), dtype=torch.int32, device="cuda"
         )
