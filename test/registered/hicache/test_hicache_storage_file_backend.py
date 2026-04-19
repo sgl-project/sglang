@@ -284,6 +284,29 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
         run_eval_accuracy_test(self)
 
 
+class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
+    """Accuracy tests for HiCache Storage functionality"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args = {
+            "--tp-size": 2,
+            "--hicache-ratio": 1.5,
+            "--hicache-mem-layout": "page_first_direct",
+            "--hicache-io-backend": "direct",
+            "--tp-size": 2,
+            "--mamba-scheduler-strategy": "extra_buffer",
+            "--page-size": 64,
+        }
+
+        return server_args, {}
+
+    def test_eval_accuracy(self):
+        """Test eval accuracy with cache persistence across cache flushes"""
+        run_eval_accuracy_test(self)
+
+
 def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     """Generic eval accuracy test with configurable accuracy threshold
 
