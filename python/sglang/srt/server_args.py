@@ -4228,7 +4228,12 @@ class ServerArgs:
             "--mem-fraction-static",
             type=float,
             default=ServerArgs.mem_fraction_static,
-            help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+            help=(
+                "Fraction of GPU memory for model weights + KV cache pool. "
+                "The remainder (1 - value) is reserved for activations and CUDA graphs. "
+                "Decrease if OOM during forward pass or CUDA graph capture; "
+                "increase if KV cache is too small at startup."
+            ),
         )
         parser.add_argument(
             "--max-running-requests",
