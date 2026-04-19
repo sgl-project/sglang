@@ -30,6 +30,8 @@ set -euxo pipefail
 #   - nvrtc variant selection (cu12 vs cu13)
 
 CU_VERSION="${CU_VERSION:-cu130}"
+CU_STRIP="${CU_VERSION#cu}"
+CU_MAJOR="${CU_STRIP:0:2}"
 
 # Nvidia package versions we override (torch pins older versions).
 # Used both as pip constraints during install and for post-install verification.
@@ -278,9 +280,8 @@ $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
 mark_step_done "Install main package"
 
 # ------------------------------------------------------------------------------
-# Install sglang-kernel
+# Install torch/sglang-kernel
 # ------------------------------------------------------------------------------
-# Install sgl-kernel
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
 SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sglang-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
 echo "SGL_KERNEL_VERSION_FROM_KERNEL=${SGL_KERNEL_VERSION_FROM_KERNEL} SGL_KERNEL_VERSION_FROM_SRT=${SGL_KERNEL_VERSION_FROM_SRT}"
@@ -314,6 +315,32 @@ else
     fi
 fi
 
+# Now we are running torch with cuda13 in CI environment, so the torch packages will be reinstalled if they are still at CU129 version
+# TODO: Remove this part after torch has been upgraded to 2.11, where cu13 is enabled by default
+TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
+echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
+    TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+    TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+    TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+    echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
+    $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+fi
+
+# sglang-kernel wheels carry a +cuXYZ local version tag (e.g. 0.4.1+cu130).
+# If it doesn't match CU_VERSION, reinstall from the matching index.
+SGL_KERNEL_FULL_VER=$(pip show sglang-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+SGL_KERNEL_CUDA_VER=$(printf '%s' "$SGL_KERNEL_FULL_VER" | sed -n 's/.*+//p')
+echo "Detected sglang-kernel version: ${SGL_KERNEL_FULL_VER} (CUDA tag: ${SGL_KERNEL_CUDA_VER:-none})"
+if [ -n "$SGL_KERNEL_CUDA_VER" ] && [ "$SGL_KERNEL_CUDA_VER" != "$CU_VERSION" ]; then
+    SGL_KERNEL_VER="${SGL_KERNEL_FULL_VER%+*}"
+    echo "Reinstalling sglang-kernel==${SGL_KERNEL_VER} from ${CU_VERSION} index to match torch..."
+    if [ "$CU_MAJOR" = "13" ]; then
+        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    else
+        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    fi
+fi
 
 mark_step_done "Install sglang-kernel"
 
@@ -395,8 +422,6 @@ mark_step_done "Stabilize FlashInfer JIT cache paths"
 # through to the wrong branch. Prefer NVCC_VER (set in the venv path); otherwise
 # parse the first two digits of CU_VERSION (pytorch convention is cu{major}{minor}
 # with a single-digit minor, e.g. cu126, cu129, cu130).
-CU_STRIP="${CU_VERSION#cu}"
-CU_MAJOR="${CU_STRIP:0:2}"
 if [ "$CU_MAJOR" = "13" ]; then
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post1"
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
@@ -419,32 +444,6 @@ mark_step_done "Install extra dependency"
 # ------------------------------------------------------------------------------
 # Fix other dependencies
 # ------------------------------------------------------------------------------
-# Now we are running torch with cuda13 in CI environment, so the torch packages will be reinstalled if they are still at CU129 version
-# TODO: Remove this part after torch has been upgraded to 2.11, where cu13 is enabled by default
-TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
-echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
-if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
-    TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-    TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-    TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-    echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
-    $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-fi
-
-# sglang-kernel wheels carry a +cuXYZ local version tag (e.g. 0.4.1+cu130).
-# If it doesn't match CU_VERSION, reinstall from the matching index.
-SGL_KERNEL_FULL_VER=$(pip show sglang-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-SGL_KERNEL_CUDA_VER=$(printf '%s' "$SGL_KERNEL_FULL_VER" | sed -n 's/.*+//p')
-echo "Detected sglang-kernel version: ${SGL_KERNEL_FULL_VER} (CUDA tag: ${SGL_KERNEL_CUDA_VER:-none})"
-if [ -n "$SGL_KERNEL_CUDA_VER" ] && [ "$SGL_KERNEL_CUDA_VER" != "$CU_VERSION" ]; then
-    SGL_KERNEL_VER="${SGL_KERNEL_FULL_VER%+*}"
-    echo "Reinstalling sglang-kernel==${SGL_KERNEL_VER} from ${CU_VERSION} index to match torch..."
-    if [ "$CU_MAJOR" = "13" ]; then
-        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-    else
-        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-    fi
-fi
 
 # Pick cu12 vs cu13 variants of nvshmem / cudnn based on CU_VERSION
 if [ "$CU_MAJOR" = "13" ]; then
