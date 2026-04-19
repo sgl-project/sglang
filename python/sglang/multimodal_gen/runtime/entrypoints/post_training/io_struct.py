@@ -51,6 +51,10 @@ class RolloutRequest(BaseModel):
     rollout_return_denoising_env: bool = False
     rollout_return_dit_trajectory: bool = False
 
+    # 0-indexed denoising-loop step filters. None = all steps.
+    rollout_sde_step_indices: Optional[list[int]] = None
+    rollout_return_step_indices: Optional[list[int]] = None
+
     image_path: Optional[list[str]] = None
 
     # suppress verbose per-request logging (also gates peak_memory_mb collection)

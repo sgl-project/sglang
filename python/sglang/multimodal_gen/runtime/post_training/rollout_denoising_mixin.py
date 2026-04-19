@@ -89,10 +89,10 @@ class RolloutDenoisingMixin:
         self._maybe_collect_rollout_log_probs(batch)
         # Append the final denoised latent as the (T+1)-th entry of the
         # dit-trajectory latents list.
-        state = getattr(batch, "_rollout_dit_env_state", None)
+        state = getattr(batch, "_rollout_denoising_env_state", None)
         if state is not None and batch.rollout and batch.rollout_return_dit_trajectory:
             state["step_latents"].append(latents.detach())
-        self._maybe_finalize_dit_env_collection(
+        self._maybe_finalize_denoising_env_collection(
             batch=batch,
             pipeline_config=server_args.pipeline_config,
         )
@@ -109,18 +109,15 @@ class RolloutDenoisingMixin:
         collect_env = batch.rollout_return_denoising_env
         collect_traj = batch.rollout_return_dit_trajectory
         if not (collect_env or collect_traj):
-            batch._rollout_dit_env_state = None
+            batch._rollout_denoising_env_state = None
             return
 
-        sanitize = getattr(pipeline_config, "sanitize_dit_env_kwargs", lambda x: x)
         if collect_env:
             env = RolloutDenoisingEnv(
-                image_kwargs=_kwargs_to_cpu(sanitize(image_kwargs)),
-                pos_cond_kwargs=_kwargs_to_cpu(sanitize(pos_cond_kwargs)),
+                image_kwargs=_kwargs_to_cpu(image_kwargs),
+                pos_cond_kwargs=_kwargs_to_cpu(pos_cond_kwargs),
                 neg_cond_kwargs=(
-                    _kwargs_to_cpu(sanitize(neg_cond_kwargs))
-                    if neg_cond_kwargs
-                    else None
+                    _kwargs_to_cpu(neg_cond_kwargs) if neg_cond_kwargs else None
                 ),
                 guidance=guidance.detach().cpu() if guidance is not None else None,
             )
@@ -131,7 +128,7 @@ class RolloutDenoisingMixin:
             pos_src = None
             neg_src = None
 
-        batch._rollout_dit_env_state = {
+        batch._rollout_denoising_env_state = {
             "env": env,
             "step_latents": [],
             "step_timesteps": [],
@@ -144,18 +141,23 @@ class RolloutDenoisingMixin:
         batch,
         latents: torch.Tensor,
         timestep_value: torch.Tensor,
+        step_index: int,
     ) -> None:
         if not batch.rollout or not batch.rollout_return_dit_trajectory:
             return
-        state = getattr(batch, "_rollout_dit_env_state", None)
+        state = getattr(batch, "_rollout_denoising_env_state", None)
         if state is None:
+            return
+
+        return_step_indices = getattr(batch, "rollout_return_step_indices", None)
+        if return_step_indices is not None and step_index not in return_step_indices:
             return
 
         state["step_latents"].append(latents.detach())
         state["step_timesteps"].append(timestep_value.detach().cpu())
 
-    def _maybe_finalize_dit_env_collection(self, batch, pipeline_config) -> None:
-        state = getattr(batch, "_rollout_dit_env_state", None)
+    def _maybe_finalize_denoising_env_collection(self, batch, pipeline_config) -> None:
+        state = getattr(batch, "_rollout_denoising_env_state", None)
         if state is None:
             return
 
@@ -179,19 +181,20 @@ class RolloutDenoisingMixin:
             )
 
         if env is not None and batch.rollout_return_denoising_env:
-            sanitize = getattr(pipeline_config, "sanitize_dit_env_kwargs", lambda x: x)
-            gather_fn = getattr(pipeline_config, "gather_dit_env_static_for_sp", None)
+            gather_fn = getattr(
+                pipeline_config, "gather_denoising_env_static_for_sp", None
+            )
 
             pos_src = state.get("pos_cond_kwargs_src")
             if pos_src is not None and env.pos_cond_kwargs is not None:
                 gathered_pos = gather_fn(batch, pos_src) if gather_fn else pos_src
-                env.pos_cond_kwargs = _kwargs_to_cpu(sanitize(gathered_pos))
+                env.pos_cond_kwargs = _kwargs_to_cpu(gathered_pos)
 
             neg_src = state.get("neg_cond_kwargs_src")
             if neg_src is not None and env.neg_cond_kwargs is not None:
                 gathered_neg = gather_fn(batch, neg_src) if gather_fn else neg_src
-                env.neg_cond_kwargs = _kwargs_to_cpu(sanitize(gathered_neg))
+                env.neg_cond_kwargs = _kwargs_to_cpu(gathered_neg)
 
             batch.rollout_trajectory_data.denoising_env = env
 
-        batch._rollout_dit_env_state = None
+        batch._rollout_denoising_env_state = None
