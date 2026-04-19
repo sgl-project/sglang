@@ -100,7 +100,6 @@ class DeepGemmKernelType(IntEnum):
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
-_WARMUP_CACHE_PATH_LOGGED = False
 
 
 # TODO improve code
@@ -112,7 +111,6 @@ def _maybe_compile_deep_gemm_one_type_all(
 ) -> None:
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
-    global _WARMUP_CACHE_PATH_LOGGED
 
     query_key = (kernel_type, n, k, num_groups)
     if (
@@ -121,12 +119,6 @@ def _maybe_compile_deep_gemm_one_type_all(
         and _INITIALIZATION_DICT.get(query_key) is None
     ):
         _INITIALIZATION_DICT[query_key] = True
-
-        if not _WARMUP_CACHE_PATH_LOGGED:
-            _WARMUP_CACHE_PATH_LOGGED = True
-            logger.info(
-                f"Entering DeepGEMM JIT warmup. Cache dir: {os.environ.get('DG_JIT_CACHE_DIR')}"
-            )
 
         # TODO maybe improve logs
         if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
