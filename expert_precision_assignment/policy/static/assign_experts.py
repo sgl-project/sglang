@@ -236,6 +236,8 @@ def main() -> int:
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--gpu_vram_bytes", type=int, default=-1,
                     help="Override detected GPU VRAM (for testing / planning).")
+    ap.add_argument("--force_k", type=int, default=-1,
+                    help="Force K heter experts (override VRAM-budget K).")
     ap.add_argument("--out_dir", required=True)
     args = ap.parse_args()
 
@@ -286,7 +288,10 @@ def main() -> int:
         args.layer_sensitivity, args.expert_sensitivity, num_layers, num_experts
     )
     scores = _composite_scores(ppl, l2, num_experts)
-    heter, int4_only = _assign(scores, budget.k_heter_experts)
+    k = args.force_k if args.force_k >= 0 else budget.k_heter_experts
+    if args.force_k >= 0:
+        logger.info("Forcing K=%d (VRAM-budget K was %d)", k, budget.k_heter_experts)
+    heter, int4_only = _assign(scores, k)
 
     out_dir = Path(args.out_dir)
     int4_path, cfg_path, report_path = _write_outputs(
