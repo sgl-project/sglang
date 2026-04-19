@@ -78,7 +78,7 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
     #
     # NOTE: This is NOT used in normal online serving. It exists as a VRAM
     # optimization for the per-layer INT4 sensitivity sweep
-    # (expert_precision_assignment/per_moe_layer_sensitivity/), where only
+    # (expert_precision_assignment/sensitivity/per_moe_layer/), where only
     # one layer at a time is tested with INT4. Marking all other layers as
     # bf16-only avoids loading ~16 GB of unused INT4 weights.
     # Online serving uses {int4-only, heter(dual BF16+INT4)} experts only.
