@@ -424,7 +424,7 @@ class DeepseekMHAForwardMixin:
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
-            latent_cache[:, :, self.kv_lora_rank :] = k_pe
+            latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
 
             # Save latent cache
             forward_batch.token_to_kv_pool.set_kv_buffer(

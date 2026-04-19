@@ -1,3 +1,6 @@
+import dataclasses
+from typing import List, Optional, Tuple
+
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
@@ -8,7 +11,11 @@ from sglang.srt.lora.triton_ops import (
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import (
+    LoRABatchInfo,
+    get_lm_head_pruned_lens,
+    merge_and_chunk_segments,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -41,20 +48,37 @@ class TritonLoRABackend(BaseLoRABackend):
             extra_embeddings=extra_embeddings,
         )
 
+    def _sgemm_info(self, pruned_batch_info=None):
+        """Return the sgemm batch_info (merged segments when available)."""
+        if pruned_batch_info is not None:
+            return pruned_batch_info
+        return getattr(self, "sgemm_batch_info", None) or self.batch_info
+
     def run_lora_a_sgemm(
-        self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        pruned_batch_info: LoRABatchInfo = None,
+        stack_num: int = 1,
+        *args,
+        **kwargs,
     ) -> torch.Tensor:
-        return sgemm_lora_a_fwd(x, weights, self.batch_info)
+        return sgemm_lora_a_fwd(
+            x, weights, self._sgemm_info(pruned_batch_info), stack_num=stack_num
+        )
 
     def run_lora_b_sgemm(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         base_output: torch.Tensor = None,
+        pruned_batch_info: LoRABatchInfo = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        return sgemm_lora_b_fwd(x, weights, self.batch_info, base_output)
+        return sgemm_lora_b_fwd(
+            x, weights, self._sgemm_info(pruned_batch_info), base_output
+        )
 
     def run_qkv_lora(
         self,
@@ -73,11 +97,12 @@ class TritonLoRABackend(BaseLoRABackend):
         # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
-        lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, self.batch_info, stack_num=3)
+        sgemm_info = self._sgemm_info()
+        lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, sgemm_info, stack_num=3)
         lora_output = qkv_lora_b_fwd(
             lora_a_output,
             qkv_lora_b,
-            self.batch_info,
+            sgemm_info,
             output_offset,
             max_qkv_out_dim,
             base_output,
@@ -100,14 +125,13 @@ class TritonLoRABackend(BaseLoRABackend):
         assert isinstance(gate_up_lora_b, torch.Tensor)
         output_dim = gate_up_lora_b.shape[-2] // 2
 
+        sgemm_info = self._sgemm_info()
         # lora_a_output: (s, 2 * r)
-        lora_a_output = sgemm_lora_a_fwd(
-            x, gate_up_lora_a, self.batch_info, stack_num=2
-        )
+        lora_a_output = sgemm_lora_a_fwd(x, gate_up_lora_a, sgemm_info, stack_num=2)
         lora_output = gate_up_lora_b_fwd(
             lora_a_output,
             gate_up_lora_b,
-            self.batch_info,
+            sgemm_info,
             output_dim,
             base_output,
         )
@@ -118,6 +142,8 @@ class TritonLoRABackend(BaseLoRABackend):
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
     ):
+        max_tokens = max_bs_in_cuda_graph * num_tokens_per_bs
+        mlpb = self.max_loras_per_batch
         with torch.device("cuda"):
             self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
@@ -129,18 +155,74 @@ class TritonLoRABackend(BaseLoRABackend):
                 seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
                 max_len=num_tokens_per_bs,
                 weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
-                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+                lora_ranks=torch.zeros(mlpb, dtype=torch.int32),
+                scalings=torch.zeros(mlpb, dtype=torch.float),
                 permutation=None,
             )
 
-            # Initialize seg_indptr for CUDA graph as they remain constant
-            # across batches.
             torch.cumsum(
                 self.cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
                 dim=0,
                 out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
             )
+
+            # Sgemm batch_info with segments merged by adapter.
+            # Updated each batch by compute_sgemm_routing().
+            self.cuda_graph_sgemm_batch_info = LoRABatchInfo(
+                bs=mlpb,
+                use_cuda_graph=True,
+                num_segments=mlpb,
+                seg_lens=torch.zeros(mlpb, dtype=torch.int32),
+                seg_indptr=torch.zeros(mlpb + 1, dtype=torch.int32),
+                max_len=max_tokens,
+                weight_indices=torch.arange(mlpb, dtype=torch.int32),
+                lora_ranks=torch.zeros(mlpb, dtype=torch.int32),
+                scalings=torch.zeros(mlpb, dtype=torch.float),
+                permutation=torch.zeros(max_tokens, dtype=torch.int32),
+            )
+
+    def compute_sgemm_routing(self, use_cuda_graph: bool):
+        """Sort tokens by adapter and build merged segments for sgemm LoRA."""
+        bi = self.batch_info
+        bs = bi.bs
+        mlpb = self.max_loras_per_batch
+        wi = bi.weight_indices[:bs]
+
+        perm = torch.argsort(wi, stable=True).to(torch.int32)
+        sorted_wi = wi[perm]
+        adapter_ids = torch.arange(mlpb, device=wi.device, dtype=torch.int32)
+        seg_starts = torch.searchsorted(sorted_wi, adapter_ids)
+        seg_ends = torch.searchsorted(sorted_wi, adapter_ids, right=True)
+        seg_lens = seg_ends - seg_starts
+
+        if use_cuda_graph:
+            sgemm = getattr(self, "cuda_graph_sgemm_batch_info", None)
+            if sgemm is None:
+                return
+            sgemm.permutation[:bs] = perm
+            sgemm.seg_lens[:] = seg_lens
+            sgemm.seg_indptr[0] = 0
+            torch.cumsum(sgemm.seg_lens, dim=0, out=sgemm.seg_indptr[1:])
+            sgemm.max_len = bs
+            sgemm.lora_ranks[:mlpb] = bi.lora_ranks[:mlpb]
+            sgemm.scalings[:mlpb] = bi.scalings[:mlpb]
+        else:
+            seg_indptr = torch.zeros(mlpb + 1, dtype=torch.int32, device=wi.device)
+            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+            sgemm = LoRABatchInfo(
+                bs=mlpb,
+                use_cuda_graph=False,
+                num_segments=mlpb,
+                seg_lens=seg_lens,
+                seg_indptr=seg_indptr,
+                max_len=bs,
+                weight_indices=adapter_ids,
+                lora_ranks=bi.lora_ranks[:mlpb].clone(),
+                scalings=bi.scalings[:mlpb].clone(),
+                permutation=perm,
+            )
+
+        self.sgemm_batch_info = sgemm
 
     def prepare_lora_batch(
         self,
@@ -214,3 +296,80 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
         self.batch_info = batch_info
+
+        # Biggest win is in decode.
+        is_decode = not forward_batch.forward_mode.is_extend()
+        if is_decode:
+            self.compute_sgemm_routing(use_cuda_graph)
+        else:
+            self.sgemm_batch_info = None
+
+        self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
+            self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)
+        )
+
+    def _prepare_lm_head_batch_info(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        batch_info: LoRABatchInfo,
+    ) -> Tuple[Optional[LoRABatchInfo], Optional[List[LoRABatchInfo]]]:
+
+        # Precompute lm_head_batch_info for pruned lm_head LoRA
+        pruned_lens = get_lm_head_pruned_lens(forward_batch)
+        lm_head_batch_info = None
+        lm_head_pass_batch_infos = None
+
+        if pruned_lens is not None:
+            pruned_total = sum(pruned_lens)
+            lm_head_segments = merge_and_chunk_segments(
+                weight_indices, pruned_lens, chunk_size=pruned_total
+            )
+            lm_head_batch_info = self._build_lm_head_batch_info(
+                lm_head_segments, batch_info, pruned_total
+            )
+
+            # Precompute per-pass batch_infos for logprobs chunking
+            pass_segments = self._get_lm_head_pass_segments(weight_indices, pruned_lens)
+            if pass_segments is not None:
+                lm_head_pass_batch_infos = []
+                for seg_wi, seg_lens_list in pass_segments:
+                    pass_total = sum(seg_lens_list)
+                    merged_segments = merge_and_chunk_segments(
+                        seg_wi, seg_lens_list, chunk_size=pass_total
+                    )
+                    self.lm_head_pass_batch_infos.append(
+                        self._build_lm_head_batch_info(
+                            merged_segments, batch_info, pass_total
+                        )
+                    )
+
+        return lm_head_batch_info, lm_head_pass_batch_infos
+
+    def _build_lm_head_batch_info(
+        self,
+        lm_head_segments: Tuple[List[int], List[int]],
+        batch_info: LoRABatchInfo,
+        expected_tokens: int,
+    ) -> LoRABatchInfo:
+        seg_weight_indices_cpu, seg_lens_cpu = lm_head_segments
+        num_segments = len(seg_weight_indices_cpu)
+
+        seg_lens = torch.tensor(seg_lens_cpu, dtype=torch.int32, device=self.device)
+        seg_indptr = torch.zeros(
+            (num_segments + 1,), dtype=torch.int32, device=self.device
+        )
+        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+
+        return dataclasses.replace(
+            batch_info,
+            bs=num_segments,
+            num_segments=num_segments,
+            max_len=max(seg_lens_cpu),
+            seg_lens=seg_lens,
+            seg_indptr=seg_indptr,
+            weight_indices=torch.tensor(
+                seg_weight_indices_cpu, dtype=torch.int32, device=self.device
+            ),
+            expected_tokens=expected_tokens,
+        )

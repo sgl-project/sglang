@@ -11,8 +11,10 @@ in a functional manner, reducing the need for explicit parameter passing.
 
 from __future__ import annotations
 
+import logging
 import os
 import pprint
+from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional
 
@@ -20,15 +22,14 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.configs.sample.teacache import (
-    TeaCacheParams,
-    WanTeaCacheParams,
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
 )
-from sglang.multimodal_gen.runtime.server_args import (
-    ServerArgs,
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _sanitize_for_logging,
+    init_logger,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.utils import align_to
 
@@ -101,11 +102,16 @@ class Req:
     audio_latents: torch.Tensor | None = None
     audio_noise: torch.Tensor | None = None
     raw_audio_latent_shape: tuple[int, ...] | None = None
+    did_sp_shard_audio_latents: bool = False
+    sp_audio_start_frame: int = 0
+    sp_audio_orig_num_frames: int = 0
 
     # Audio Parameters
     generate_audio: bool = True
 
     raw_latent_shape: torch.Tensor | None = None
+    did_sp_shard_latents: bool = False
+    sp_video_start_frame: int = 0
     noise_pred: torch.Tensor | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
@@ -133,17 +139,15 @@ class Req:
     # Component modules (populated by the pipeline)
     modules: dict[str, Any] = field(default_factory=dict)
 
-    trajectory_timesteps: list[torch.Tensor] | None = None
+    trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
+    rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_audio_latents: torch.Tensor | None = None
 
-    # Extra parameters that might be needed by specific pipeline implementations
+    # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
 
     is_warmup: bool = False
-
-    # TeaCache parameters
-    teacache_params: TeaCacheParams | WanTeaCacheParams | None = None
 
     # STA parameters
     STA_param: list | None = None
@@ -247,23 +251,31 @@ class Req:
             base, ext = os.path.splitext(output_file_name)
             output_file_name = f"{base}_{output_idx}{ext}"
 
-        return (
-            os.path.join(self.output_path, output_file_name)
-            if output_file_name
-            else None
-        )
+        if self.output_path is None or not output_file_name:
+            return None
+        return os.path.join(self.output_path, output_file_name)
 
-    def set_as_warmup(self):
+    def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
         self.save_output = False
         self.suppress_logs = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
-        self.num_inference_steps = 1
+        self.num_inference_steps = warmup_steps
+
+    def copy_as_warmup(self, warmup_steps: int = 1) -> "Req":
+        req = deepcopy(self)
+        req.set_as_warmup(warmup_steps)
+        return req
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
-        # Set do_classifier_free_guidance based on guidance scale and negative prompt
-        if self.guidance_scale > 1.0 and self.negative_prompt is not None:
+        # Prefer true_cfg_scale when it is explicitly provided.
+        cfg_scale = (
+            self.true_cfg_scale
+            if self.true_cfg_scale is not None
+            else self.guidance_scale
+        )
+        if cfg_scale > 1.0 and self.negative_prompt is not None:
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []
@@ -271,9 +283,6 @@ class Req:
             self.guidance_scale_2 = self.guidance_scale
 
         self.metrics = RequestMetrics(request_id=self.request_id)
-
-        if self.is_warmup:
-            self.set_as_warmup()
 
     def adjust_size(self, server_args: ServerArgs):
         pass
@@ -294,20 +303,22 @@ class Req:
         else:
             target_width = -1
 
-        # sanitize prompts for info-level logging
-        sanitized_prompt = _sanitize_for_logging(self.prompt, key_hint="prompt")
-        sanitized_neg_prompt = _sanitize_for_logging(
-            self.negative_prompt, key_hint="negative_prompt"
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            display_prompt = self.prompt
+            display_neg_prompt = self.negative_prompt
+        else:
+            display_prompt = _sanitize_for_logging(self.prompt, key_hint="prompt")
+            display_neg_prompt = _sanitize_for_logging(
+                self.negative_prompt, key_hint="negative_prompt"
+            )
 
-        # Log sampling parameters
         debug_str = f"""Sampling params:
                        width: {target_width}
                       height: {target_height}
                   num_frames: {self.num_frames}
                          fps: {self.fps}
-                      prompt: {sanitized_prompt}
-                  neg_prompt: {sanitized_neg_prompt}
+                      prompt: {display_prompt}
+                  neg_prompt: {display_neg_prompt}
                         seed: {self.seed}
                  infer_steps: {self.num_inference_steps}
       num_outputs_per_prompt: {self.num_outputs_per_prompt}
@@ -319,7 +330,7 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-        logger.debug(debug_str)
+        logger.info(debug_str)
 
 
 @dataclass
@@ -331,8 +342,9 @@ class OutputBatch:
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
-    trajectory_timesteps: list[torch.Tensor] | None = None
+    trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
+    rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None

@@ -46,8 +46,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton import fused_moe
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils import fused_moe
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -314,8 +314,8 @@ class AfmoeAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.rotary_dim = int(self.head_dim * partial_rotary_factor)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)

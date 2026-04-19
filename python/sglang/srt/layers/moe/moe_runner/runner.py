@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.layers.moe.moe_runner.base import (
     FusedOpPool,
@@ -19,15 +19,21 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
+    from sglang.srt.lora.lora_moe_runners import LoRAHooks
 
 logger = logging.getLogger(__name__)
 
 
 class MoeRunner:
-
-    def __init__(self, runner_backend: MoeRunnerBackend, config: MoeRunnerConfig):
+    def __init__(
+        self,
+        runner_backend: MoeRunnerBackend,
+        config: MoeRunnerConfig,
+        lora_enabled: bool = False,
+    ):
         self.runner_backend = runner_backend
         self.config = config
+        self.lora_enabled = lora_enabled
 
         self.fused_func = None
 
@@ -38,25 +44,37 @@ class MoeRunner:
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_marlin():
-            self.runner_core = None  # Marlin only supports fused path
-        elif runner_backend.is_flashinfer_trtllm():
+            if lora_enabled:
+                from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore
+
+                self.runner_core = MarlinLoraRunnerCore(config)
+            else:
+                self.runner_core = None  # Marlin only supports fused path
+        elif (
+            runner_backend.is_flashinfer_trtllm()
+            or runner_backend.is_flashinfer_trtllm_routed()
+        ):
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
+        elif runner_backend.is_flashinfer_cutedsl():
+            self.runner_core = None  # FlashInfer CuteDSL only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
-        a2a_backend_name = get_moe_a2a_backend().value
-        runner_backend_name = runner_backend.value
+        # Skip fused func if LoRA is enabled (LoRA requires non-fused path)
+        if not lora_enabled:
+            a2a_backend_name = get_moe_a2a_backend().value
+            runner_backend_name = runner_backend.value
 
-        # TODO(cwan): add a server argument to disable fused func
-        self.fused_func = FusedOpPool.get_fused_func(
-            a2a_backend_name, runner_backend_name
-        )
-
-        if self.runner_core is None and self.fused_func is None:
-            raise NotImplementedError(
-                f"Runner backend {runner_backend} requires a fused func for a2a backend "
-                f"{a2a_backend_name}, but none is registered."
+            # TODO(cwan): add a server argument to disable fused func
+            self.fused_func = FusedOpPool.get_fused_func(
+                a2a_backend_name, runner_backend_name
             )
+
+            if self.runner_core is None and self.fused_func is None:
+                raise NotImplementedError(
+                    f"Runner backend {runner_backend} requires a fused func for a2a backend "
+                    f"{a2a_backend_name}, but none is registered."
+                )
 
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
@@ -71,13 +89,41 @@ class MoeRunner:
             self.fused_func = None
 
     def run(
-        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo
+        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
-
-        if self.fused_func is not None:
+        if self.fused_func is not None and not self.lora_enabled:
             return self.fused_func(dispatch_output, quant_info, self.config)
 
         assert self.runner_core is not None
+
+        def _maybe_build_lora_hooks(_runner_input: Any) -> LoRAHooks:
+            from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
+            from sglang.srt.lora.lora_moe_runners import build_lora_hooks
+
+            if isinstance(_runner_input, DispatchOutput):
+                hidden_states, topk_ids = (
+                    _runner_input.hidden_states,
+                    _runner_input.topk_output.topk_ids,
+                )
+            else:
+                hidden_states = _runner_input.hidden_states
+                topk_ids = getattr(_runner_input, "topk_ids", None)
+            if self.lora_enabled and lora_info is not None:
+                return build_lora_hooks(
+                    hidden_states,
+                    lora_info,
+                    topk_ids,
+                )
+            return None
+
+        # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
+        # bypass the pre-permute step and do their own alignment internally.
+        if hasattr(self.runner_core, "run_from_dispatch"):
+            hooks = _maybe_build_lora_hooks(dispatch_output)
+            return self.runner_core.run_from_dispatch(
+                dispatch_output, quant_info, self.config, hooks=hooks
+            )
+
         dispatch_format = dispatch_output.format.value
         runner_format = self.runner_core.runner_backend.value
         self.pre_permute_func = PermuteMethodPool.get_pre_permute(
@@ -93,8 +139,12 @@ class MoeRunner:
         runner_input = self.pre_permute_func(
             dispatch_output, quant_info, self.config, running_state
         )
-        runner_output = self.runner_core.run(runner_input, quant_info, running_state)
 
+        hooks = _maybe_build_lora_hooks(runner_input)
+
+        runner_output = self.runner_core.run(
+            runner_input, quant_info, running_state, hooks=hooks
+        )
         runner_format = self.runner_core.runner_backend.value
         combine_format = dispatch_output.format.value
         self.post_permute_func = PermuteMethodPool.get_post_permute(

@@ -3,21 +3,18 @@ import os
 
 import torch
 import triton
-from sgl_kernel import FusedSetKVBufferArg
 from sgl_kernel.testing.rotary_embedding import (
     FlashInferRotaryEmbedding,
+    FusedSetKVBufferArg,
     MHATokenToKVPool,
     RotaryEmbedding,
     create_inputs,
 )
 
 from sglang.srt.utils.bench_utils import bench_kineto
+from sglang.utils import is_in_ci
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 # CI environment uses simplified parameters
 if IS_CI:

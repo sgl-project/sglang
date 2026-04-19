@@ -35,19 +35,19 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
-    BatchMultimodalOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_process_tree
+from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
@@ -146,6 +146,7 @@ def _handle_output_by_index(output, i):
             no_stop_trim=_extract_field_by_index(output, "no_stop_trim", i),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+            reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
@@ -224,6 +225,7 @@ def _handle_output_by_index(output, i):
             output_ids=_extract_field_by_index(output, "output_ids", i),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+            reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
@@ -280,17 +282,6 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
-        )
-    elif isinstance(output, BatchMultimodalOutput):
-        new_output = BatchMultimodalOutput(
-            rids=[output.rids[i]],
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            outputs=_extract_field_by_index(output, "outputs", i),
-            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
-            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
-            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
         )
     else:
         new_output = output
@@ -409,7 +400,7 @@ class TokenizerWorker(TokenizerManager):
             self.server_args.disaggregation_transfer_backend
         )
         # Communicator
-        self.register_multi_tokenizer_communicator = _Communicator(
+        self.register_multi_tokenizer_communicator = FanOutCommunicator(
             self.send_to_scheduler, 2
         )
 
@@ -442,7 +433,16 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """Get the main process ID"""
+    """Get the main process ID.
+
+    Supports override via SGLANG_GRANIAN_PARENT_PID for workers whose
+    multiprocessing parent PID differs from the shared-memory owner.
+    """
+    from sglang.srt.environ import envs
+
+    override = envs.SGLANG_GRANIAN_PARENT_PID.get()
+    if override is not None:
+        return override
     return multiprocessing.current_process()._parent_pid
 
 

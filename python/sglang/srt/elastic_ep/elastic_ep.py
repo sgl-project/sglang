@@ -56,7 +56,6 @@ class ElasticEPStateManager:
     def _build_state(
         cls, *, ep_size: Optional[int] = None, device: Optional[torch.device] = None
     ) -> ElasticEPState:
-
         active = cls.healthy_rank_state(ep_size=ep_size, device=device)
         return ElasticEPState(
             active_ranks=active,

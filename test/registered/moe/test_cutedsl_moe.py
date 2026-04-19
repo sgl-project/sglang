@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
-from typing import Callable
 
 import torch
 from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
-from sgl_kernel import scaled_fp4_quant
 from torch.nn import functional as F
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-b200")
+try:
+    from flashinfer import CuteDslMoEWrapper
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+except ImportError:
+    CuteDslMoEWrapper = None
+    convert_sf_to_mma_layout = None
+
+register_cuda_ci(est_time=590, suite="stage-c-test-4-gpu-b200")
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
@@ -78,6 +82,312 @@ def break_fp4_bytes(a, dtype):
     return values.reshape(m, n * 2).to(dtype=dtype)
 
 
+def _interleave_w13_halves(
+    x: torch.Tensor, group_size: int = 64, dim: int = -1
+) -> torch.Tensor:
+    """Interleave the two logical W13 halves for the CuteDSL wrapper layout."""
+    sizes = x.size()
+    dim = dim % x.dim()
+    assert sizes[dim] % (group_size * 2) == 0
+    prev_sizes = sizes[:dim]
+    post_sizes = sizes[dim + 1 :]
+    x = x.view(*prev_sizes, 2, sizes[dim] // (group_size * 2), group_size, *post_sizes)
+    x = x.transpose(dim, dim + 1).contiguous().view(*sizes)
+    return x
+
+
+def _create_cutedsl_wrapper_tensors(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    device: str = "cuda",
+    seed: int = 42,
+):
+    """Create quantized tensors for CuteDslMoEWrapper.run() (MMA layout, same as production).
+
+    Returns quantized inputs for the wrapper **and** the original bf16 weights
+    needed to compute a numerical reference.  Scale values (w1_alpha, w2_alpha,
+    fc2_input_scale) are derived from weight magnitudes so that scale-contract
+    bugs are caught.
+    """
+    assert CuteDslMoEWrapper is not None and convert_sf_to_mma_layout is not None
+    torch.manual_seed(seed)
+    sf_vec_size = 16
+
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+    a1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+    x_quantized, x_sf = fp4_quantize(
+        x_bf16,
+        global_scale=a1_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=False,
+    )
+    x_sf = x_sf.unsqueeze(-1)
+
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.float()
+    selected_experts = selected_experts.to(torch.int32)
+
+    # --- GEMM1 weights ---
+    w1_bf16 = (
+        torch.randn(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w1_bf16_interleaved = _interleave_w13_halves(w1_bf16, group_size=64, dim=1)
+    w1_amax = w1_bf16.abs().amax(dim=(1, 2)).to(torch.float32)
+    w1_gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax.mean()
+    w1_gs = w1_gs.unsqueeze(0)
+    w1_flat = w1_bf16_interleaved.view(num_experts * 2 * intermediate_size, hidden_size)
+    w1_q_flat, w1_sf_flat = fp4_quantize(
+        w1_flat,
+        global_scale=w1_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=True,
+    )
+    w1_q = w1_q_flat.view(num_experts, 2 * intermediate_size, hidden_size // 2)
+    w1_weight_sf = convert_sf_to_mma_layout(
+        w1_sf_flat,
+        m=2 * intermediate_size,
+        k=hidden_size,
+        num_groups=num_experts,
+        sf_vec_size=sf_vec_size,
+    )
+    w1_alpha = 1.0 / (a1_gs * w1_gs).expand(num_experts)
+
+    # --- GEMM2 weights ---
+    w2_bf16 = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / 10
+    )
+    w2_amax = w2_bf16.abs().amax(dim=(1, 2)).to(torch.float32)
+    w2_gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax.mean()
+    w2_gs = w2_gs.unsqueeze(0)
+    w2_flat = w2_bf16.view(num_experts * hidden_size, intermediate_size)
+    w2_q_flat, w2_sf_flat = fp4_quantize(
+        w2_flat,
+        global_scale=w2_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=True,
+    )
+    w2_q = w2_q_flat.view(num_experts, hidden_size, intermediate_size // 2)
+    w2_weight_sf = convert_sf_to_mma_layout(
+        w2_sf_flat,
+        m=hidden_size,
+        k=intermediate_size,
+        num_groups=num_experts,
+        sf_vec_size=sf_vec_size,
+    )
+    fc2_input_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax.mean()
+    fc2_input_scale = fc2_input_scale.unsqueeze(0)
+    w2_alpha = 1.0 / (fc2_input_scale * w2_gs).expand(num_experts)
+
+    return {
+        "x": x_quantized,
+        "x_sf": x_sf,
+        "x_bf16": x_bf16,
+        "token_selected_experts": selected_experts,
+        "token_final_scales": routing_weights,
+        "w1_weight": w1_q,
+        "w1_weight_sf": w1_weight_sf,
+        "w1_weight_bf16": w1_bf16,
+        "w1_alpha": w1_alpha,
+        "fc2_input_scale": fc2_input_scale,
+        "w2_weight": w2_q,
+        "w2_weight_sf": w2_weight_sf,
+        "w2_weight_bf16": w2_bf16,
+        "w2_alpha": w2_alpha,
+        # Global scales needed by _quantize_local_expert_weights
+        "a1_gs": a1_gs,
+        "w1_gs": w1_gs,
+        "w2_gs": w2_gs,
+    }
+
+
+def _quantize_local_expert_weights(
+    w1_bf16_local: torch.Tensor,
+    w2_bf16_local: torch.Tensor,
+    a1_gs: torch.Tensor,
+    w1_gs: torch.Tensor,
+    w2_gs: torch.Tensor,
+    fc2_input_scale: torch.Tensor,
+):
+    """Independently quantize and MMA-convert a local expert weight shard.
+
+    Mirrors the per-rank weight preprocessing that happens during model loading
+    in production (each rank holds [num_local_experts, ...] bf16 weights,
+    quantizes them, and calls convert_sf_to_mma_layout with
+    num_groups=num_local_experts).
+    """
+    sf_vec_size = 16
+    num_local_experts = w1_bf16_local.shape[0]
+    intermediate_size_2x = w1_bf16_local.shape[1]
+    hidden_size = w1_bf16_local.shape[2]
+    intermediate_size = w2_bf16_local.shape[2]
+
+    # GEMM1: interleave -> quantize -> MMA layout
+    w1_interleaved = _interleave_w13_halves(w1_bf16_local, group_size=64, dim=1)
+    w1_flat = w1_interleaved.view(num_local_experts * intermediate_size_2x, hidden_size)
+    w1_q_flat, w1_sf_flat = fp4_quantize(
+        w1_flat,
+        global_scale=w1_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=True,
+    )
+    w1_q = w1_q_flat.view(num_local_experts, intermediate_size_2x, hidden_size // 2)
+    w1_sf = convert_sf_to_mma_layout(
+        w1_sf_flat,
+        m=intermediate_size_2x,
+        k=hidden_size,
+        num_groups=num_local_experts,
+        sf_vec_size=sf_vec_size,
+    )
+    w1_alpha = 1.0 / (a1_gs * w1_gs).expand(num_local_experts)
+
+    # GEMM2: quantize -> MMA layout
+    w2_flat = w2_bf16_local.view(num_local_experts * hidden_size, intermediate_size)
+    w2_q_flat, w2_sf_flat = fp4_quantize(
+        w2_flat,
+        global_scale=w2_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=True,
+    )
+    w2_q = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2)
+    w2_sf = convert_sf_to_mma_layout(
+        w2_sf_flat,
+        m=hidden_size,
+        k=intermediate_size,
+        num_groups=num_local_experts,
+        sf_vec_size=sf_vec_size,
+    )
+    w2_alpha = 1.0 / (fc2_input_scale * w2_gs).expand(num_local_experts)
+
+    return {
+        "w1_weight": w1_q,
+        "w1_weight_sf": w1_sf,
+        "w1_alpha": w1_alpha,
+        "w2_weight": w2_q,
+        "w2_weight_sf": w2_sf,
+        "w2_alpha": w2_alpha,
+    }
+
+
+def _run_wrapper(wrapper, tensors, **overrides):
+    """Call wrapper.run() with the standard 11-arg dict from _create_cutedsl_wrapper_tensors."""
+    kwargs = dict(
+        x=tensors["x"],
+        x_sf=tensors["x_sf"],
+        token_selected_experts=tensors["token_selected_experts"],
+        token_final_scales=tensors["token_final_scales"],
+        w1_weight=tensors["w1_weight"],
+        w1_weight_sf=tensors["w1_weight_sf"],
+        w1_alpha=tensors["w1_alpha"],
+        fc2_input_scale=tensors["fc2_input_scale"],
+        w2_weight=tensors["w2_weight"],
+        w2_weight_sf=tensors["w2_weight_sf"],
+        w2_alpha=tensors["w2_alpha"],
+    )
+    kwargs.update(overrides)
+    return wrapper.run(**kwargs)
+
+
+def _quant_dequant_fp4_reference(
+    tensor: torch.Tensor,
+    global_scale: torch.Tensor,
+    sf_vec_size: int = 16,
+) -> torch.Tensor:
+    """Simulate FP4 quant-dequant roundtrip for reference computation."""
+    from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
+
+    tensor_bf16 = tensor.to(torch.bfloat16)
+    fp4_packed, sf = fp4_quantize(
+        tensor_bf16,
+        global_scale=global_scale,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=False,
+    )
+    sf_uint8 = sf.view(torch.uint8).reshape(-1)
+    dequantized = e2m1_and_ufp8sf_scale_to_float(
+        fp4_packed.cpu(),
+        sf_uint8.cpu(),
+        (1.0 / global_scale).cpu(),
+        sf_vec_size=sf_vec_size,
+        ufp8_type=1,
+        is_sf_swizzled_layout=False,
+    ).to(tensor.device)
+    return dequantized.float()
+
+
+def _compute_reference_moe_fp4(
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    fc2_input_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Pure-PyTorch MoE reference using bf16 weights (pre-interleave layout).
+
+    gemm1_weights is [num_experts, 2*intermediate_size, hidden_size] with the
+    *original* (un-interleaved) layout: first half = linear, second half = gate.
+    """
+    device = hidden_states.device
+    num_tokens = hidden_states.shape[0]
+    hidden_states = hidden_states.float()
+    gemm1_weights = gemm1_weights.float()
+    gemm2_weights = gemm2_weights.float()
+
+    output = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device=device)
+
+    for token_idx in range(num_tokens):
+        token_input = hidden_states[token_idx : token_idx + 1]
+        for k in range(top_k):
+            expert_idx = token_selected_experts[token_idx, k].item()
+            scale = token_final_scales[token_idx, k].item()
+            if expert_idx < 0 or expert_idx >= num_experts:
+                continue
+
+            w1 = gemm1_weights[expert_idx]
+            gemm1_out = token_input @ w1.T
+
+            linear = gemm1_out[:, :intermediate_size]
+            gate = gemm1_out[:, intermediate_size:]
+            swiglu_out = F.silu(gate) * linear
+
+            if fc2_input_scale is not None:
+                swiglu_out = _quant_dequant_fp4_reference(
+                    swiglu_out, fc2_input_scale, sf_vec_size=16
+                )
+
+            w2 = gemm2_weights[expert_idx]
+            gemm2_out = swiglu_out @ w2.T
+            output[token_idx] += scale * gemm2_out.squeeze(0)
+
+    return output
+
+
 def compute_routing(router_logits: torch.Tensor, top_k: int):
     routing_weights = torch.softmax(router_logits, dim=1, dtype=torch.float)
     routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
@@ -107,20 +417,6 @@ def prepare_inputs(
         hidden_states_3d[i, : masked_m[i], :] = hidden_states[topk_idx.view(-1) == i]
 
     return hidden_states_3d, masked_m, topk_idx, routing_weights
-
-
-MNK_FACTORS = [
-    (2, 1024, 1024),
-    (2, 1024, 1536),
-    (2, 3072, 1024),
-    (2, 3072, 1536),
-    (64, 1024, 1024),
-    (64, 1024, 1536),
-    (64, 3072, 1024),
-    (64, 2048, 1024),
-    (224, 1024, 1024),
-    (224, 1024, 1536),
-]
 
 
 # Reference implementation of torch_moe
@@ -158,7 +454,7 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
         if mask.sum():
             m = w1[i].shape[0]
             assert m % 2 == 0
-            # Note: w1 and w3 are swapped!
+            # The first and second W13 halves feed the two SwiGLU branches.
             w3_expert, w1_expert = w1[i][m // 2 :, :], w1[i][: m // 2, :]
             inter = F.silu(a[mask] @ w1_expert.t()) * (a[mask] @ w3_expert.t())
             inter_gs = torch.tensor(1.0).cuda()
@@ -175,128 +471,6 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
     return (
         out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
     ).sum(dim=1)
-
-
-def check_moe(
-    m: int,
-    n: int,
-    k: int,
-    e: int,
-    topk: int,
-    dtype: torch.dtype,
-    moe_impl: Callable,
-    flip_w13: bool,
-):
-    torch.manual_seed(7)
-    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
-    quant_blocksize = 16
-    round_up = lambda x, y: (x + y - 1) // y * y
-    sf_w1_2n = round_up(2 * n, 128)
-    sf_w1_k = round_up(k // quant_blocksize, 4)
-    w1_blockscale = torch.empty(
-        (e, sf_w1_2n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
-    )
-
-    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
-    sf_w2_k = round_up(k, 128)
-    sf_w2_n = round_up(n // quant_blocksize, 4)
-    w2_blockscale = torch.empty(
-        (e, sf_w2_k, sf_w2_n), device="cuda", dtype=torch.float8_e4m3fn
-    )
-
-    w1_q = torch.empty((e, 2 * n, k // 2), device="cuda", dtype=torch.uint8)
-    w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
-    w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
-    w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
-
-    for expert in range(e):
-        w1_amax = torch.abs(w1).max().to(torch.float32)
-        w2_amax = torch.abs(w2).max().to(torch.float32)
-        w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
-        w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
-
-        w1_q[expert], w1_blockscale[expert] = scaled_fp4_quant(
-            w1[expert], w1_gs[expert]
-        )
-
-        w2_q[expert], w2_blockscale[expert] = scaled_fp4_quant(
-            w2[expert], w2_gs[expert]
-        )
-
-    score = torch.randn((m, e), device="cuda", dtype=dtype)
-
-    topk_output = select_experts(
-        hidden_states=a,
-        router_logits=score,
-        topk_config=TopKConfig(top_k=topk, renormalize=False),
-    )
-    topk_weights, topk_ids, _ = topk_output
-
-    a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
-    a2_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
-    test_output = moe_impl(
-        a=a,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        w1_q=w1_q,
-        w2_q=w2_q,
-        a1_gs=a1_gs,
-        w1_blockscale=w1_blockscale,
-        w1_alphas=(1 / w1_gs),
-        a2_gs=a2_gs,
-        w2_blockscale=w2_blockscale,
-        w2_alphas=(1 / w2_gs),
-    )
-
-    # Reference check:
-    a_global_scale = (
-        (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(a.flatten(), dim=-1)
-    ).to(torch.float32)
-    a_fp4, a_scale_interleaved = scaled_fp4_quant(a, a_global_scale)
-    _, m_k = a_fp4.shape
-    a_in_dtype = dequantize_nvfp4_to_dtype(
-        a_fp4,
-        a_scale_interleaved,
-        a_global_scale,
-        dtype=a.dtype,
-        device=a.device,
-        block_size=quant_blocksize,
-    )
-
-    w1_d = torch.empty((e, 2 * n, k), device="cuda", dtype=dtype)
-    w2_d = torch.empty((e, k, n), device="cuda", dtype=dtype)
-
-    for idx in range(0, e):
-        w1_d[idx] = dequantize_nvfp4_to_dtype(
-            w1_q[idx],
-            w1_blockscale[idx],
-            w1_gs[idx],
-            dtype=w1.dtype,
-            device=w1.device,
-            block_size=quant_blocksize,
-        )
-        w2_d[idx] = dequantize_nvfp4_to_dtype(
-            w2_q[idx],
-            w2_blockscale[idx],
-            w2_gs[idx],
-            dtype=w2.dtype,
-            device=w2.device,
-            block_size=quant_blocksize,
-        )
-
-    if flip_w13:
-        dim = -2
-        size = w1_d.size(dim)
-        assert size % 2 == 0, f"Expected even size in dim {dim}, got {size}"
-        half = size // 2
-        # Reorder weight
-        w1, w3 = w1_d.split(half, dim=dim)
-        w1_d = torch.cat([w3, w1], dim=dim).contiguous()
-
-    torch_output = torch_moe(a_in_dtype, w1_d, w2_d, score, topk, None)
-
-    torch.testing.assert_close(torch_output, test_output, atol=1e-1, rtol=1e-1)
 
 
 class TestFlashinferCutedslMoe(unittest.TestCase):
@@ -316,9 +490,6 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
             with self.subTest(
                 bs=bs, hidden_dim=hidden_dim, inter_dim=inter_dim, topk=topk
             ):
-                print(
-                    f"Testing with bs={bs}, hidden_dim={hidden_dim}, inter_dim={inter_dim}, topk={topk}"
-                )
                 with torch.inference_mode():
                     torch.manual_seed(42)
                     device = "cuda"
@@ -476,8 +647,296 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                     torch.testing.assert_close(
                         out_weighted.cpu(), ref_output.cpu(), atol=5e-2, rtol=5e-2
                     )
-                print(
-                    f"Test passed with bs={bs}, hidden_dim={hidden_dim}, inter_dim={inter_dim}, topk={topk}"
+
+    @unittest.skipIf(SKIP_TEST, SKIP_REASON)
+    @unittest.skipIf(
+        CuteDslMoEWrapper is None or convert_sf_to_mma_layout is None,
+        "CuteDslMoEWrapper / convert_sf_to_mma_layout not available",
+    )
+    def test_cutedsl_moe_wrapper_run(self):
+        """Call CuteDslMoEWrapper.run() with MMA-layout tensors and verify against reference."""
+        test_cases = [
+            # (num_tokens, hidden_size, intermediate_size, num_experts, top_k)
+            # Minimum dimensions match FlashInfer's test_wrapper_accuracy:
+            # num_experts >= 256, hidden_size >= 256, intermediate_size >= 512,
+            # num_tokens >= 128. The CuteDSL GEMM kernels have tile-size
+            # constraints that make smaller dimensions unreliable.
+            (128, 256, 512, 256, 2),
+            (128, 256, 512, 256, 8),
+            (256, 256, 512, 256, 4),
+        ]
+
+        for (
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            top_k,
+        ) in test_cases:
+            with self.subTest(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                top_k=top_k,
+            ):
+                tensors = _create_cutedsl_wrapper_tensors(
+                    num_tokens=num_tokens,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                )
+
+                wrapper = CuteDslMoEWrapper(
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    use_cuda_graph=False,
+                )
+
+                with torch.no_grad():
+                    out = _run_wrapper(wrapper, tensors)
+
+                self.assertEqual(out.shape, (num_tokens, hidden_size))
+                self.assertEqual(out.dtype, torch.bfloat16)
+                self.assertFalse(
+                    torch.isnan(out).any().item() or torch.isinf(out).any().item(),
+                    "Output contains NaN or Inf",
+                )
+
+                ref_output = _compute_reference_moe_fp4(
+                    hidden_states=tensors["x_bf16"].float().cuda(),
+                    gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                    gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                    token_selected_experts=tensors["token_selected_experts"],
+                    token_final_scales=tensors["token_final_scales"],
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    fc2_input_scale=tensors["fc2_input_scale"],
+                )
+
+                out_f32 = out.float()
+                ref_f32 = ref_output.float()
+                output_scale = max(ref_f32.std().item(), 0.01)
+                atol = max(0.1, 3.0 * output_scale)
+                rtol = 0.85
+                abs_diff = torch.abs(out_f32 - ref_f32)
+                rel_diff = abs_diff / (torch.abs(ref_f32) + 1e-8)
+                within_tol = (abs_diff < atol) | (rel_diff < rtol)
+                pct_within = within_tol.float().mean().item()
+                self.assertGreaterEqual(
+                    pct_within,
+                    0.925,
+                    f"Only {pct_within * 100:.2f}% of elements within tolerance "
+                    f"(atol={atol:.4f})",
+                )
+
+    @unittest.skipIf(SKIP_TEST, SKIP_REASON)
+    @unittest.skipIf(
+        CuteDslMoEWrapper is None or convert_sf_to_mma_layout is None,
+        "CuteDslMoEWrapper / convert_sf_to_mma_layout not available",
+    )
+    def test_cutedsl_cuda_graph_parity(self):
+        """Verify non-graph and cuda_graph wrappers produce identical results.
+
+        Also checks both match the pure-PyTorch reference, and that a second
+        cuda_graph pass reuses buffers deterministically (subsumes the former
+        cuda_graph_smoke test).
+        """
+        test_cases = [
+            # (num_tokens, hidden_size, intermediate_size, num_experts, top_k)
+            (128, 256, 512, 256, 2),
+            (256, 256, 512, 256, 4),
+        ]
+
+        for (
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            top_k,
+        ) in test_cases:
+            with self.subTest(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                top_k=top_k,
+            ):
+                tensors = _create_cutedsl_wrapper_tensors(
+                    num_tokens=num_tokens,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                )
+
+                wrapper_args = dict(
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                )
+                wrapper_no_graph = CuteDslMoEWrapper(
+                    **wrapper_args, use_cuda_graph=False
+                )
+                wrapper_graph = CuteDslMoEWrapper(
+                    **wrapper_args,
+                    use_cuda_graph=True,
+                    max_num_tokens=num_tokens,
+                )
+
+                with torch.no_grad():
+                    out_no_graph = _run_wrapper(wrapper_no_graph, tensors)
+                    out_graph = _run_wrapper(wrapper_graph, tensors)
+                    out_graph2 = _run_wrapper(wrapper_graph, tensors)
+
+                torch.testing.assert_close(
+                    out_no_graph,
+                    out_graph,
+                    atol=1e-2,
+                    rtol=1e-2,
+                    msg="non-graph vs cuda_graph wrapper outputs diverge",
+                )
+                torch.testing.assert_close(
+                    out_graph,
+                    out_graph2,
+                    atol=1e-5,
+                    rtol=1e-5,
+                    msg="second cuda_graph pass should reuse buffers identically",
+                )
+
+                ref_output = _compute_reference_moe_fp4(
+                    hidden_states=tensors["x_bf16"].float().cuda(),
+                    gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                    gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                    token_selected_experts=tensors["token_selected_experts"],
+                    token_final_scales=tensors["token_final_scales"],
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    fc2_input_scale=tensors["fc2_input_scale"],
+                )
+
+                out_f32 = out_graph.float()
+                ref_f32 = ref_output.float()
+                output_scale = max(ref_f32.std().item(), 0.01)
+                atol = max(0.1, 3.0 * output_scale)
+                rtol = 0.85
+                abs_diff = torch.abs(out_f32 - ref_f32)
+                rel_diff = abs_diff / (torch.abs(ref_f32) + 1e-8)
+                within_tol = (abs_diff < atol) | (rel_diff < rtol)
+                pct_within = within_tol.float().mean().item()
+                self.assertGreaterEqual(
+                    pct_within,
+                    0.925,
+                    f"graph vs reference: only {pct_within * 100:.2f}% within tol",
+                )
+
+    @unittest.skipIf(SKIP_TEST, SKIP_REASON)
+    @unittest.skipIf(
+        CuteDslMoEWrapper is None or convert_sf_to_mma_layout is None,
+        "CuteDslMoEWrapper / convert_sf_to_mma_layout not available",
+    )
+    def test_cutedsl_ep_sharded_allreduce(self):
+        """Verify EP-sharded execution: partial outputs from EP ranks sum to full result.
+
+        Simulates the EP=TP all-reduce pattern used by the CuteDSL moe_runner when
+        ep_size > 1 and moe_a2a_backend=none. Each "rank" runs a wrapper with
+        num_local_experts < num_experts and a corresponding local_expert_offset,
+        receiving only the local slice of weights/scales/alphas — matching the
+        real runtime contract where each rank holds only its own expert partition.
+        The partial outputs are summed (simulating tensor_model_parallel_all_reduce)
+        and compared against a single wrapper processing all experts.
+        """
+        test_cases = [
+            # (num_tokens, hidden_size, intermediate_size, num_experts, top_k, ep_size)
+            # Dimensions match FlashInfer's minimum wrapper requirements.
+            (128, 256, 512, 256, 2, 2),
+            (128, 256, 512, 256, 2, 4),
+            (128, 256, 512, 256, 8, 8),
+        ]
+
+        for (
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            num_experts,
+            top_k,
+            ep_size,
+        ) in test_cases:
+            with self.subTest(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                top_k=top_k,
+                ep_size=ep_size,
+            ):
+                assert num_experts % ep_size == 0
+                num_local_experts = num_experts // ep_size
+
+                tensors = _create_cutedsl_wrapper_tensors(
+                    num_tokens=num_tokens,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                )
+
+                # Full-expert baseline (EP=1): all experts on one "rank"
+                wrapper_full = CuteDslMoEWrapper(
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                    use_cuda_graph=False,
+                )
+                with torch.no_grad():
+                    out_full = _run_wrapper(wrapper_full, tensors)
+
+                # EP-sharded: each rank independently quantizes its local
+                # bf16 weight shard and calls convert_sf_to_mma_layout with
+                # num_groups=num_local_experts — matching the real per-rank
+                # weight preprocessing in the CuteDSL moe_runner path.
+                accumulated = torch.zeros_like(out_full)
+                for rank in range(ep_size):
+                    lo = rank * num_local_experts
+                    hi = lo + num_local_experts
+
+                    local_tensors = _quantize_local_expert_weights(
+                        w1_bf16_local=tensors["w1_weight_bf16"][lo:hi],
+                        w2_bf16_local=tensors["w2_weight_bf16"][lo:hi],
+                        a1_gs=tensors["a1_gs"],
+                        w1_gs=tensors["w1_gs"],
+                        w2_gs=tensors["w2_gs"],
+                        fc2_input_scale=tensors["fc2_input_scale"],
+                    )
+
+                    wrapper_shard = CuteDslMoEWrapper(
+                        num_experts=num_experts,
+                        top_k=top_k,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        use_cuda_graph=False,
+                        num_local_experts=num_local_experts,
+                        local_expert_offset=lo,
+                    )
+                    with torch.no_grad():
+                        partial = _run_wrapper(wrapper_shard, tensors, **local_tensors)
+                    accumulated += partial
+
+                torch.testing.assert_close(
+                    out_full,
+                    accumulated,
+                    atol=1e-2,
+                    rtol=1e-2,
+                    msg=(
+                        f"EP-sharded all-reduce mismatch "
+                        f"(ep_size={ep_size}, tokens={num_tokens})"
+                    ),
                 )
 
 

@@ -1,4 +1,4 @@
-# TeaCache Acceleration
+# TeaCache
 
 > **Note**: This is one of two caching strategies available in SGLang.
 > For an overview of all caching options, see [caching](../index.md).

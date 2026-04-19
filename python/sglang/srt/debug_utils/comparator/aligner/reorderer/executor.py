@@ -7,7 +7,7 @@ from sglang.srt.debug_utils.comparator.aligner.reorderer.types import (
     ZigzagToNaturalParams,
     ZigzagToNaturalThdParams,
 )
-from sglang.srt.debug_utils.comparator.dims import (
+from sglang.srt.debug_utils.comparator.dims_spec import (
     resolve_dim_by_name,
     strip_dim_names,
 )

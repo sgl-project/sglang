@@ -6,7 +6,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
@@ -17,23 +17,23 @@ from sglang.test.test_utils import (
 )
 
 # EAGLE with DP attention on B200 (tp=2, dp=2, requires 4 B200 GPUs)
-register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=136, suite="stage-c-test-4-gpu-b200")
 
 
-def test_gsm8k(base_url: str):
+def test_gsm8k(base_url: str, model: str):
     requests.get(base_url + "/flush_cache")
 
     args = SimpleNamespace(
-        num_shots=5,
-        data_path=None,
-        num_questions=200,
-        max_new_tokens=512,
-        parallel=128,
-        host="http://127.0.0.1",
-        port=int(base_url.split(":")[-1]),
+        base_url=base_url,
+        model=model,
+        eval_name="gsm8k",
+        api="completion",
+        max_tokens=512,
+        num_examples=200,
+        num_threads=128,
     )
-    metrics = run_eval_few_shot_gsm8k(args)
-    server_info = requests.get(base_url + "/get_server_info")
+    metrics = run_eval(args)
+    server_info = requests.get(base_url + "/server_info")
     avg_spec_accept_length = server_info.json()["internal_states"][0][
         "avg_spec_accept_length"
     ]
@@ -65,7 +65,13 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(
+            True
+        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
+            True
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
+            True
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -78,8 +84,8 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_a_gsm8k(self):
-        metrics, avg_spec_accept_length = test_gsm8k(self.base_url)
-        self.assertGreater(metrics["accuracy"], 0.64)
+        metrics, avg_spec_accept_length = test_gsm8k(self.base_url, self.model)
+        self.assertGreater(metrics["score"], 0.62)
         self.assertGreater(avg_spec_accept_length, 2.7)
 
 

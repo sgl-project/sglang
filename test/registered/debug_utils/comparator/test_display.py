@@ -1,15 +1,18 @@
 import sys
+from io import StringIO
 from pathlib import Path
 from typing import Any, Optional
 
 import polars as pl
 import pytest
 import torch
+from rich.console import Console
 
 from sglang.srt.debug_utils.comparator.display import (
     _collect_input_ids_and_positions,
     _collect_rank_info,
     _extract_parallel_info,
+    _render_polars_as_rich_table,
     _render_polars_as_text,
 )
 from sglang.srt.debug_utils.comparator.output_types import (
@@ -18,7 +21,13 @@ from sglang.srt.debug_utils.comparator.output_types import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="default", nightly=True)
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu", nightly=True)
+
+
+def _render_rich(renderable: object) -> str:
+    buf: StringIO = StringIO()
+    Console(file=buf, force_terminal=False, width=120).print(renderable)
+    return buf.getvalue().rstrip("\n")
 
 
 def _save_dump_file(
@@ -276,6 +285,24 @@ class TestRankInfoRecordSnapshot:
         assert "1/2" in text
         assert "0/1" in text
 
+    def test_to_rich_snapshot(self) -> None:
+        from rich.table import Table
+
+        record = RankInfoRecord(
+            label="baseline",
+            rows=[
+                {"rank": 0, "tp": "0/2", "pp": "0/1"},
+                {"rank": 1, "tp": "1/2", "pp": "0/1"},
+            ],
+        )
+        body = record._format_rich_body()
+
+        assert isinstance(body, Table)
+        rendered: str = _render_rich(body)
+        assert "baseline ranks" in rendered
+        assert "0/2" in rendered
+        assert "1/2" in rendered
+
     def test_json_roundtrip(self) -> None:
         record = RankInfoRecord(
             label="target",
@@ -309,6 +336,29 @@ class TestInputIdsRecordSnapshot:
         assert "num_tokens" in text
         assert "10, 20, 30" in text
         assert "0, 1, 2" in text
+
+    def test_to_rich_snapshot(self) -> None:
+        from rich.table import Table
+
+        record = InputIdsRecord(
+            label="target",
+            rows=[
+                {
+                    "step": 0,
+                    "rank": 0,
+                    "num_tokens": 3,
+                    "input_ids": "[10, 20, 30]",
+                    "positions": "[0, 1, 2]",
+                },
+            ],
+        )
+        body = record._format_rich_body()
+
+        assert isinstance(body, Table)
+        rendered: str = _render_rich(body)
+        assert "target input_ids & positions" in rendered
+        assert "10, 20, 30" in rendered
+        assert "0, 1, 2" in rendered
 
     def test_json_roundtrip(self) -> None:
         record = InputIdsRecord(
@@ -380,6 +430,70 @@ class TestExtractParallelInfo:
         row_data: dict = {}
         _extract_parallel_info(row_data=row_data, info={"tp_rank": 0})
         assert "tp" not in row_data
+
+
+class TestRenderPolarsAsRichTable:
+    def test_basic_dataframe_renders_table(self) -> None:
+        df = pl.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+        table = _render_polars_as_rich_table(df)
+        assert len(table.columns) == 2
+        assert table.row_count == 2
+
+    def test_empty_dataframe_returns_table_with_no_rows(self) -> None:
+        df = pl.DataFrame(
+            {"a": pl.Series([], dtype=pl.Int64), "b": pl.Series([], dtype=pl.Utf8)}
+        )
+        table = _render_polars_as_rich_table(df)
+        assert len(table.columns) == 2
+        assert table.row_count == 0
+
+    def test_title_passed_to_table(self) -> None:
+        df = pl.DataFrame({"a": [1]})
+        table = _render_polars_as_rich_table(df, title="My Title")
+        assert table.title == "My Title"
+
+    def test_no_title_defaults_to_none(self) -> None:
+        df = pl.DataFrame({"x": [1]})
+        table = _render_polars_as_rich_table(df)
+        assert table.title is None
+
+    def test_column_names_match_dataframe(self) -> None:
+        df = pl.DataFrame({"alpha": [1], "beta": [2], "gamma": [3]})
+        table = _render_polars_as_rich_table(df)
+        column_headers: list[str] = [col.header for col in table.columns]
+        assert column_headers == ["alpha", "beta", "gamma"]
+
+    def test_values_converted_to_strings(self) -> None:
+        """Numeric and None values should be stringified in the rendered output."""
+        df = pl.DataFrame({"num": [42], "text": ["hello"]})
+        table = _render_polars_as_rich_table(df)
+        rendered: str = _render_rich(table)
+        assert "42" in rendered
+        assert "hello" in rendered
+
+    def test_single_column_dataframe(self) -> None:
+        df = pl.DataFrame({"only_col": [10, 20, 30]})
+        table = _render_polars_as_rich_table(df)
+        assert len(table.columns) == 1
+        assert table.row_count == 3
+
+    def test_many_rows_all_present(self) -> None:
+        """All rows from the dataframe appear in the rich table."""
+        df = pl.DataFrame({"val": list(range(50))})
+        table = _render_polars_as_rich_table(df)
+        assert table.row_count == 50
+
+    def test_null_values_rendered_as_string(self) -> None:
+        """Null values should be converted to their string representation."""
+        df = pl.DataFrame({"a": [1, None, 3]})
+        table = _render_polars_as_rich_table(df)
+        assert table.row_count == 3
+        rendered: str = _render_rich(table)
+        assert (
+            "null" in rendered.lower()
+            or "none" in rendered.lower()
+            or "None" in rendered
+        )
 
 
 if __name__ == "__main__":

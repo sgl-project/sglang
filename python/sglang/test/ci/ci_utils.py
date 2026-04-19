@@ -160,10 +160,12 @@ def run_unittest_files(
             )
             file_tic = time.perf_counter()
 
+            cmd = ["python3", full_path, "-f"]
+
             if capture_output:
                 # Capture output for retry decision
                 process = subprocess.Popen(
-                    ["python3", full_path],
+                    cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -175,9 +177,7 @@ def run_unittest_files(
                     output_lines.append(line)
                 process.wait()
             else:
-                process = subprocess.Popen(
-                    ["python3", full_path], stdout=None, stderr=None
-                )
+                process = subprocess.Popen(cmd, stdout=None, stderr=None)
                 process.wait()
 
             elapsed = time.perf_counter() - file_tic

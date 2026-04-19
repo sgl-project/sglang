@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -7,13 +9,19 @@ from sglang.jit_kernel.awq_marlin_repack import (
     awq_marlin_moe_repack as jit_awq_marlin_moe_repack,
 )
 from sglang.srt.layers.quantization.utils import pack_cols, quantize_weights
+from sglang.test.ci.ci_register import register_cuda_ci
 
-try:
-    from sgl_kernel import awq_marlin_moe_repack as aot_awq_marlin_moe_repack
+register_cuda_ci(est_time=10, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
+
+def _has_aot_awq_marlin_moe_repack() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "awq_marlin_moe_repack") and hasattr(
+        torch.ops.sgl_kernel.awq_marlin_moe_repack, "default"
+    )
+
+
+AOT_AVAILABLE = _has_aot_awq_marlin_moe_repack()
 
 
 def awq_pack(
@@ -68,7 +76,9 @@ def test_awq_marlin_moe_repack_jit_vs_aot(
     perm = torch.empty((num_experts, 0), dtype=torch.int32, device="cuda")
 
     out_jit = jit_awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)
-    out_aot = aot_awq_marlin_moe_repack(b_q_weight, perm, size_k, size_n, num_bits)
+    out_aot = torch.ops.sgl_kernel.awq_marlin_moe_repack.default(
+        b_q_weight, perm, size_k, size_n, num_bits
+    )
 
     torch.cuda.synchronize()
 
@@ -112,6 +122,4 @@ def test_awq_marlin_moe_repack_shape(
 
 
 if __name__ == "__main__":
-    import subprocess
-
-    subprocess.call(["pytest", "--tb=short", str(__file__)])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -4,7 +4,16 @@ import logging
 import os
 from typing import Dict, List, Optional
 
-from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+try:
+    from sglang_router.sglang_router_rs import get_available_tool_call_parsers
+except ModuleNotFoundError:
+    logging.warning(
+        "sglang_router_rs is not available, get_available_tool_call_parsers will return empty list"
+    )
+
+    def get_available_tool_call_parsers() -> List[str]:
+        return []
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +54,7 @@ class RouterArgs:
     api_key: Optional[str] = None
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
+    json_log: bool = False
     # Service discovery configuration
     service_discovery: bool = False
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -412,6 +422,11 @@ class RouterArgs:
             default="info",
             choices=["debug", "info", "warn", "error"],
             help="Set the logging level. If not specified, defaults to INFO.",
+        )
+        logging_group.add_argument(
+            f"--{prefix}json-log",
+            action="store_true",
+            help="Enable structured JSON log output instead of plain text.",
         )
 
         # Service discovery configuration

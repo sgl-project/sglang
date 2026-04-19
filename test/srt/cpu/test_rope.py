@@ -4,8 +4,12 @@ import torch
 from utils import precision
 
 from sglang.srt.layers.rotary_embedding import (
-    DeepseekScalingRotaryEmbedding,
+    MRotaryEmbedding,
     RotaryEmbedding,
+)
+from sglang.srt.layers.rotary_embedding.rope_variant import (
+    DeepseekScalingRotaryEmbedding,
+    apply_rotary_pos_emb_native,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
@@ -14,6 +18,78 @@ torch.manual_seed(1234)
 
 
 class TestROPE(CustomTestCase):
+    def test_mrope(self):
+        torch.manual_seed(100)
+        head_size = 128
+        seq_len = 512
+        num_heads = 16
+        num_kv_heads = 1
+        rotary_dim = 128
+        max_pos = 262144
+        base = 5000000
+        is_neox_style = True
+        dtype = torch.bfloat16
+        mrope_section = [24, 20, 20]
+        mrope_interleaved = True
+        positions_mrope = torch.randint(0, max_pos, (3, seq_len))
+        positions_text = torch.randint(0, max_pos, (seq_len,))
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+        test_config = [
+            # (dtype, is_neox_stype, mrope_interleaved, positions, mrope_section)
+            (torch.bfloat16, False, True, positions_mrope, mrope_section),
+            (torch.bfloat16, False, False, positions_mrope, mrope_section),
+            (torch.bfloat16, False, False, positions_text, None),
+            (torch.bfloat16, True, True, positions_mrope, mrope_section),
+            (torch.bfloat16, True, False, positions_mrope, mrope_section),
+            (torch.bfloat16, True, False, positions_text, None),
+        ]
+        for (
+            dtype,
+            is_neox_style,
+            mrope_interleaved,
+            positions,
+            mrope_section,
+        ) in test_config:
+            rope = MRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_pos,
+                base,
+                is_neox_style,
+                dtype,
+                mrope_section,
+                mrope_interleaved,
+            )
+            enable_autocast = True
+
+            with torch.no_grad(), torch.amp.autocast("cpu", enabled=enable_autocast):
+                q = torch.randn(seq_len, num_heads * head_size, dtype=dtype)
+                q_clone = q.clone()
+                k = torch.randn(seq_len, num_kv_heads * head_size, dtype=dtype)
+                k_clone = k.clone()
+
+                # ref kernel
+                q_ref, k_ref = rope.forward_native(
+                    query=q,
+                    key=k,
+                    positions=positions,
+                )
+                # fused rope kernel
+                q_sgl, k_sgl = torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+                    positions,
+                    q_clone,
+                    k_clone,
+                    rope.head_size,
+                    rope.cos_sin_cache,
+                    rope.mrope_section,
+                    rope.mrope_interleaved,
+                    is_neox_style,
+                )
+                atol = rtol = precision[q_ref.dtype]
+                torch.testing.assert_close(q_ref, q_sgl, atol=atol, rtol=rtol)
+                torch.testing.assert_close(k_ref, k_sgl, atol=atol, rtol=rtol)
+
     def test_deepseek_v2_rope(self):
         num_head = 16
         seq_len = 1024
@@ -179,6 +255,27 @@ class TestROPE(CustomTestCase):
                     num_q_heads,
                     num_kv_heads,
                 )
+
+    def test_apply_rotary_pos_emb(self):
+        num_tokens = 1024
+        num_heads = 8
+        head_size = 72
+        qkv = torch.randn(num_tokens, num_heads * head_size * 3).to(torch.bfloat16)
+        query, key, _ = qkv.split(
+            [num_heads * head_size, num_heads * head_size, num_heads * head_size],
+            dim=-1,
+        )
+        query = query.view(num_tokens, num_heads, head_size)
+        key = key.view(num_tokens, num_heads, head_size)
+        for sincos_dtype in [torch.float32, torch.bfloat16]:
+            cos = torch.rand(num_tokens, head_size).to(sincos_dtype)
+            sin = torch.rand(num_tokens, head_size).to(sincos_dtype)
+            q_out_ref, k_out_ref = apply_rotary_pos_emb_native(query, key, cos, sin)
+            q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
+                query, key, cos, sin
+            )
+            torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
