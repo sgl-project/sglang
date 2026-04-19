@@ -2,7 +2,6 @@
 from functools import lru_cache
 from typing import Any
 
-import psutil
 import torch
 
 from sglang.multimodal_gen.runtime.platforms import (
@@ -55,8 +54,7 @@ class MpsPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-
-        return psutil.virtual_memory().total
+        return torch.mps.recommended_max_memory()
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -73,7 +71,7 @@ class MpsPlatform(Platform):
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
-        return 0.0
+        return float(torch.mps.driver_allocated_memory())
 
     @classmethod
     def get_available_gpu_memory(
@@ -87,8 +85,9 @@ class MpsPlatform(Platform):
         if empty_cache:
             torch.mps.empty_cache()
 
-        # For MPS, available memory is essentially the system available memory
-        free_memory = psutil.virtual_memory().available
+        from sglang._mps_stub import _get_available_metal_memory
+
+        free_memory = _get_available_metal_memory()
 
         if distributed:
             import torch.distributed as dist

@@ -14,6 +14,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def _get_available_metal_memory() -> int:
+    """Return remaining MPS budget under Metal's recommended working set size."""
+    import torch
+
+    return max(
+        0,
+        torch.mps.recommended_max_memory() - torch.mps.driver_allocated_memory(),
+    )
+
+
 class Stream:
     """Minimal stand-in for ``torch.cuda.Stream``.
 
@@ -139,10 +149,10 @@ def get_device_properties(device: Any = 0) -> _MPSDeviceProperties:  # noqa: ARG
     """Return the properties of the MPS device. Results are cached after first call."""
     global _cached_props
     if _cached_props is None:
-        import psutil
+        import torch
 
         _cached_props = _MPSDeviceProperties(
-            total_memory=psutil.virtual_memory().total,
+            total_memory=torch.mps.recommended_max_memory(),
         )
     return _cached_props
 
