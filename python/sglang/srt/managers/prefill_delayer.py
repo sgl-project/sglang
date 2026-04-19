@@ -163,6 +163,18 @@ class PrefillDelayer:
                     **debug_info,
                 )
 
+            # Safety valve: if KV cache usage is below the low watermark, the
+            # GPU is underutilized - short-circuit any further delay logic
+            # (slot_trigger / queue_trigger) and release prefill immediately.
+            # Mirrors the equivalent check in the "mixed" branch below.
+            if global_exists_token_watermark_force_allow:
+                return _NegotiateOutput(
+                    next_state=None,
+                    output_allow=True,
+                    output_reason="token_watermark",
+                    **debug_info,
+                )
+
             max_running_requests = kwargs.get("max_running_requests", 0)
             if not self.enable_dp_attention:
                 max_running_requests = (
