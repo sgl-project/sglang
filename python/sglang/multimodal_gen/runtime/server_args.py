@@ -739,10 +739,6 @@ class ServerArgs(DisaggArgsMixin):
             return False
         default_params = model_info.sampling_param_cls()
 
-        # for ltx2.3, cfg-parallel performs worse than ulysses-sp
-        is_ltx = "ltx" in type(default_params).__name__.lower()
-        if is_ltx:
-            return False
         return (
             getattr(default_params, "negative_prompt", None) is not None
             and getattr(default_params, "guidance_scale", 0) > 1.0

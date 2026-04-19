@@ -9,11 +9,20 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    cfg_model_parallel_all_reduce,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_classifier_free_guidance_rank,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
@@ -142,6 +151,36 @@ class LTX2DenoisingStage(DenoisingStage):
             generator=generator,
             device=reference_tensor.device,
             dtype=reference_tensor.dtype,
+        )
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        if self.server_args.enable_cfg_parallel:
+            return StageParallelismType.CFG_PARALLEL
+        return StageParallelismType.REPLICATED
+
+    @staticmethod
+    def _combine_cfg_parallel_av(
+        video: torch.Tensor,
+        audio: torch.Tensor,
+        guidance_scale: float,
+        cfg_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-reduce video and audio predictions across CFG ranks.
+
+        Rank 0 (cond) contributes ``guidance_scale * pred``.
+        Rank 1 (uncond) contributes ``(1 - guidance_scale) * pred``.
+        The sum reconstructs ``uncond + guidance_scale * (cond - uncond)``.
+        """
+        if cfg_rank == 0:
+            video_partial = guidance_scale * video
+            audio_partial = guidance_scale * audio
+        else:
+            video_partial = (1.0 - guidance_scale) * video
+            audio_partial = (1.0 - guidance_scale) * audio
+        return (
+            cfg_model_parallel_all_reduce(video_partial),
+            cfg_model_parallel_all_reduce(audio_partial),
         )
 
     @staticmethod
@@ -1346,53 +1385,88 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         use_official_cfg_path = stage1_guider_params is None
         if use_official_cfg_path:
-            model_kwargs = self._build_ltx2_model_kwargs(
-                ctx,
-                base_model_kwargs,
-                encoder_hidden_states=batch.prompt_embeds[0],
-                audio_encoder_hidden_states=batch.audio_prompt_embeds[0],
-                encoder_attention_mask=prompt_attention_mask,
+            cfg_parallel = (
+                server_args.enable_cfg_parallel and batch.do_classifier_free_guidance
             )
-            if batch.do_classifier_free_guidance:
-                cfg_batch_size = batch_size * 2
-                model_kwargs = self._repeat_ltx2_model_kwargs_batch(
-                    model_kwargs, cfg_batch_size
+            cfg_rank = get_classifier_free_guidance_rank() if cfg_parallel else 0
+
+            if cfg_parallel:
+                if cfg_rank == 0:
+                    encoder_hidden_states = batch.prompt_embeds[0]
+                    audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
+                    encoder_attention_mask = prompt_attention_mask
+                else:
+                    encoder_hidden_states = batch.negative_prompt_embeds[0]
+                    audio_encoder_hidden_states = batch.negative_audio_prompt_embeds[0]
+                    encoder_attention_mask = self._get_ltx_prompt_attention_mask(
+                        batch,
+                        is_ltx23_variant=(
+                            ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage
+                        ),
+                        negative=True,
+                    )
+                model_kwargs = self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=encoder_hidden_states,
+                    audio_encoder_hidden_states=audio_encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
                 )
-                model_kwargs["encoder_hidden_states"] = torch.cat(
-                    [batch.negative_prompt_embeds[0], batch.prompt_embeds[0]], dim=0
+            else:
+                model_kwargs = self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=batch.prompt_embeds[0],
+                    audio_encoder_hidden_states=batch.audio_prompt_embeds[0],
+                    encoder_attention_mask=prompt_attention_mask,
                 )
-                model_kwargs["audio_encoder_hidden_states"] = torch.cat(
-                    [
-                        batch.negative_audio_prompt_embeds[0],
-                        batch.audio_prompt_embeds[0],
-                    ],
-                    dim=0,
-                )
-                if self._should_pass_ltx2_text_attention_mask(ctx):
-                    repeated_attention_mask = self._cat_or_none(
+                if batch.do_classifier_free_guidance:
+                    cfg_batch_size = batch_size * 2
+                    model_kwargs = self._repeat_ltx2_model_kwargs_batch(
+                        model_kwargs, cfg_batch_size
+                    )
+                    model_kwargs["encoder_hidden_states"] = torch.cat(
+                        [batch.negative_prompt_embeds[0], batch.prompt_embeds[0]],
+                        dim=0,
+                    )
+                    model_kwargs["audio_encoder_hidden_states"] = torch.cat(
                         [
-                            self._get_ltx_prompt_attention_mask(
-                                batch,
-                                is_ltx23_variant=(
-                                    ctx.is_ltx23_variant
-                                    and not ctx.use_ltx23_legacy_one_stage
+                            batch.negative_audio_prompt_embeds[0],
+                            batch.audio_prompt_embeds[0],
+                        ],
+                        dim=0,
+                    )
+                    if self._should_pass_ltx2_text_attention_mask(ctx):
+                        repeated_attention_mask = self._cat_or_none(
+                            [
+                                self._get_ltx_prompt_attention_mask(
+                                    batch,
+                                    is_ltx23_variant=(
+                                        ctx.is_ltx23_variant
+                                        and not ctx.use_ltx23_legacy_one_stage
+                                    ),
+                                    negative=True,
                                 ),
-                                negative=True,
-                            ),
-                            prompt_attention_mask,
-                        ]
-                    )
-                    model_kwargs["encoder_attention_mask"] = repeated_attention_mask
-                    model_kwargs["audio_encoder_attention_mask"] = (
-                        repeated_attention_mask
-                    )
+                                prompt_attention_mask,
+                            ]
+                        )
+                        model_kwargs["encoder_attention_mask"] = (
+                            repeated_attention_mask
+                        )
+                        model_kwargs["audio_encoder_attention_mask"] = (
+                            repeated_attention_mask
+                        )
 
             with self._ltx2_model_forward_context(ctx, step):
                 model_video, model_audio = step.current_model(**model_kwargs)
 
             model_video = model_video.float()
             model_audio = model_audio.float()
-            if batch.do_classifier_free_guidance:
+            if cfg_parallel:
+                model_video, model_audio = self._combine_cfg_parallel_av(
+                    model_video, model_audio, float(batch.guidance_scale), cfg_rank
+                )
+            elif batch.do_classifier_free_guidance:
                 model_video_uncond, model_video_text = model_video.chunk(2)
                 model_audio_uncond, model_audio_text = model_audio.chunk(2)
                 model_video = model_video_uncond + (
