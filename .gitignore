@@ -194,6 +194,8 @@ work_dirs/
 *.csv
 
 !logo.png
+!expert_precision_assignment/**/*.png
+!expert_precision_assignment/**/*.pdf
 
 # Prerequisites
 *.d
