@@ -440,7 +440,11 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        prefix_lens: Optional[torch.Tensor] = None,
+    ):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -453,6 +457,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
+                prefix_lens=prefix_lens,
             )
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers,
@@ -1009,6 +1014,7 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        prefix_lens: Optional[torch.Tensor] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
