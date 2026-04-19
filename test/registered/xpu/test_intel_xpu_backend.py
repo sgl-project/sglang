@@ -7,6 +7,7 @@ import gc
 import unittest
 from functools import wraps
 
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -14,6 +15,11 @@ from sglang.test.test_utils import (
     is_in_ci,
     run_bench_one_batch,
 )
+
+# Register for per-commit XPU tests
+register_xpu_ci(est_time=120, suite="per-commit-xpu")
+# Register for nightly XPU tests
+register_xpu_ci(est_time=120, suite="nightly-xpu", nightly=True)
 
 
 def _cleanup_xpu_memory():

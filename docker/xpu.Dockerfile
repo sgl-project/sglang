@@ -20,6 +20,16 @@ ARG SG_LANG_KERNEL_BRANCH=main
 RUN useradd -m -d /home/sdp -s /bin/bash sdp && \
     chown -R sdp:sdp /home/sdp
 
+USER root
+
+# Install the latest UMD driver for SYCL-TLA
+RUN apt-get install -y software-properties-common && \
+    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
+    apt-get update  && \
+    apt-get install -y libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc && \
+    apt-get install -y intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo && \
+    apt-get install -y libze-dev intel-ocloc
+
 # Switch to non-root user 'sdp'
 USER sdp
 
@@ -37,12 +47,6 @@ RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/re
     conda install pip && \
     # Append environment activation to .bashrc for interactive shells
     echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; . /opt/intel/oneapi/setvars.sh; cd /home/sdp" >> /home/sdp/.bashrc
-
-USER root
-RUN apt-get update && apt install -y intel-ocloc
-
-# Switch back to user sdp
-USER sdp
 
 RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \

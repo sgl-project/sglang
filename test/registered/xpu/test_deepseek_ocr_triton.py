@@ -6,17 +6,26 @@ import os
 import unittest
 from pathlib import Path
 
-import test_deepseek_ocr as deepseek_ocr
 from transformers import AutoTokenizer
 
+from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
 
+# Import base test class
+from test_deepseek_ocr import TestDeepSeekOCR
 
-class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
+# Register for per-commit XPU tests (higher est_time to run before test_deepseek_ocr.py)
+register_xpu_ci(est_time=400, suite="per-commit-xpu")
+# Register for nightly XPU tests
+register_xpu_ci(est_time=400, suite="nightly-xpu", nightly=True)
+
+
+class TestDeepSeekOCRTriton(TestDeepSeekOCR):
     @classmethod
     def setUpClass(cls):
         cls._cleanup_xpu_memory()
@@ -24,7 +33,7 @@ class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model, use_fast=False, trust_remote_code=True
         )
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = "http://127.0.0.1:21002"
         cls.image_path = str(
             (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
         )
@@ -35,6 +44,8 @@ class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
             "xpu",
             "--attention-backend",
             "intel_xpu",
+            "--mem-fraction-static",
+            "0.7",
         ]
         os.environ["SGLANG_USE_SGL_XPU"] = "0"
         cls.process = popen_launch_server(
@@ -46,6 +57,16 @@ class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
             ],
         )
 
+    @classmethod
+    def tearDownClass(cls):
+        """Ensure server process is killed after tests."""
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+        cls._cleanup_xpu_memory()
+
+
+# Avoid pytest collecting the imported base test class in this module.
+del TestDeepSeekOCR
 
 if __name__ == "__main__":
     unittest.main()

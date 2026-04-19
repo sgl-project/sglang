@@ -2,12 +2,14 @@ name: Nightly Test (Intel)
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    # Nightly test at 23:00 Beijing Time (UTC+8) = 15:00 UTC
+    - cron: '0 15 * * *'
   push:
     branches:
       - main
     paths:
       - "python/sglang/version.py"
+      - ".github/workflows/nightly-test-intel.yml"
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -18,16 +20,178 @@ on:
         default: ""
 
 concurrency:
-  group: nightly-test-intel-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  # Nightly has its own group, won't be cancelled by PR tests
+  group: nightly-xpu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # Placeholder for Intel GPU tests
-  # Add Intel-specific nightly test workflows here when available
+  # ==================== XPU Nightly Test ==================== #
+  nightly-test-xpu:
+    runs-on: sglang-bmg
+    env:
+      HF_HOME: /home/sdp/.cache/huggingface
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
 
-  placeholder:
-    if: github.repository == 'sgl-project/sglang'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          REPO="https://github.com/${{ github.repository }}.git"
+          BRANCH="${{ inputs.ref || github.ref_name }}"
+          echo "Building with REPO=$REPO, BRANCH=$BRANCH"
+          docker build \
+            --build-arg SG_LANG_REPO=$REPO \
+            --build-arg SG_LANG_BRANCH=$BRANCH \
+            --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_nightly:bmg .
+
+      - name: Run container
+        id: start_container
+        run: |
+          container_id=$(docker run -dt \
+            --group-add 992 \
+            --group-add $(getent group video | cut -d: -f3) \
+            --group-add $(getent group render | cut -d: -f3) \
+            -v ${HF_HOME}:/home/sdp/.cache/huggingface \
+            --device /dev/dri \
+            -v /dev/dri/by-path:/dev/dri/by-path \
+            --ipc=host \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
+            xpu_sglang_nightly:bmg)
+          echo "Started container: $container_id"
+          echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
+
+      - name: Install Dependency
+        timeout-minutes: 20
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
+          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN}'
+
+      - name: Clone sgl-kernel-xpu
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "cd /home/sdp && git clone https://github.com/sgl-project/sgl-kernel-xpu.git"
+
+      - name: Run Sglang Kernel Cases
+        timeout-minutes: 20
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && cd /home/sdp/sgl-kernel-xpu/tests && python3 run_suite.py --suite per-commit"
+
+      - name: Run Sglang Kernel Benchmarks
+        timeout-minutes: 30
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && \
+            cd /home/sdp/sgl-kernel-xpu/benchmark && \
+            python3 bench_flash_attn.py 2>&1 | tee flash.log && \
+            python3 bench_flash_mla_decode.py 2>&1 | tee mla.log && \
+            python3 bench_moe_topk_softmax.py 2>&1 | tee moe.log && \
+            python3 bench_fused_moe.py 2>&1 | tee fused_moe.log && \
+            python3 bench_moe_sum_reduce.py 2>&1 | tee moe_sum_reduce.log && \
+            python3 bench_moe_fused_gate.py 2>&1 | tee moe_fused_gate.log && \
+            python3 bench_merge_states_v2.py 2>&1 | tee merge_states.log && \
+            python3 bench_swiglu_alpha_limit.py 2>&1 | tee swiglu_alpha_limit.log && \
+            python3 bench_fused_qk_norm_rope.py 2>&1 | tee fused_qk_norm_rope.log && \
+            python3 bench_per_token_group_quant_8bit.py 2>&1 | tee per_token_group_quant_8bit.log && \
+            python3 bench_per_token_group_quant_mxfp4.py 2>&1 | tee per_token_group_quant_mxfp4.log && \
+            python3 bench_per_token_group_quant_8bit_v2.py 2>&1 | tee per_token_group_quant_8bit_v2.log"
+
+      - name: Run Nightly E2E tests
+        timeout-minutes: 60
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && cd /home/sdp/sglang/test && python3 run_suite.py --hw xpu --nightly --suite nightly-xpu --continue-on-error"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker rm -f "$cid" || true
+
+  # ==================== CPU (Xeon) Nightly Test ==================== #
+  nightly-test-cpu:
+    runs-on: xeon-gnr
+    env:
+      HF_HOME: /home/sdp/.cache/huggingface
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          REPO="https://github.com/${{ github.repository }}.git"
+          BRANCH="${{ inputs.ref || github.ref_name }}"
+          echo "Building with REPO=$REPO, BRANCH=$BRANCH"
+          docker build \
+            --build-arg SGLANG_REPO=$REPO \
+            --build-arg VER_SGLANG=$BRANCH \
+            --no-cache --progress=plain -f docker/xeon.Dockerfile -t sglang_xeon_nightly .
+
+      - name: Run container
+        id: start_container
+        run: |
+          container_id=$(docker run -dt \
+            -v ${HF_HOME}:/root/.cache/huggingface \
+            --ipc=host \
+            sglang_xeon_nightly)
+          echo "Started container: $container_id"
+          echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
+
+      - name: Install Dependency
+        timeout-minutes: 10
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /opt/.venv/bin/activate && pip install pytest expecttest tabulate"
+
+      - name: Run Nightly CPU tests
+        timeout-minutes: 60
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker exec "$cid" bash -c "source /opt/.venv/bin/activate && cd /sgl-workspace/sglang/test/srt && python3 run_suite.py --suite per-commit-cpu --timeout-per-file 1500"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          cid="${{ steps.start_container.outputs.container_id }}"
+          docker rm -f "$cid" || true
+
+  finish:
+    if: always()
+    needs: [nightly-test-xpu, nightly-test-cpu]
     runs-on: ubuntu-latest
     steps:
-      - name: Placeholder
-        run: echo "Intel nightly tests will be added here"
+      - name: Check job status
+        run: |
+          xpu_result="${{ needs.nightly-test-xpu.result }}"
+          cpu_result="${{ needs.nightly-test-cpu.result }}"
+
+          failed=false
+          if [ "$xpu_result" != "success" ] && [ "$xpu_result" != "skipped" ]; then
+            echo "XPU job failed with result: $xpu_result"
+            failed=true
+          fi
+          if [ "$cpu_result" != "success" ] && [ "$cpu_result" != "skipped" ]; then
+            echo "CPU job failed with result: $cpu_result"
+            failed=true
+          fi
+
+          if [ "$failed" = true ]; then
+            exit 1
+          fi
+          echo "All jobs completed successfully (XPU: $xpu_result, CPU: $cpu_result)"
+          exit 0

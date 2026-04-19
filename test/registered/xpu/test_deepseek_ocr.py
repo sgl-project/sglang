@@ -12,12 +12,18 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
+
+# Register for per-commit XPU tests
+register_xpu_ci(est_time=360, suite="per-commit-xpu")
+# Register for nightly XPU tests
+register_xpu_ci(est_time=360, suite="nightly-xpu", nightly=True)
 
 
 class TestDeepSeekOCR(CustomTestCase):
@@ -41,7 +47,7 @@ class TestDeepSeekOCR(CustomTestCase):
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model, use_fast=False, trust_remote_code=True
         )
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = "http://127.0.0.1:21001"
         cls.image_path = str(
             (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
         )
@@ -52,6 +58,8 @@ class TestDeepSeekOCR(CustomTestCase):
             "xpu",
             "--attention-backend",
             "intel_xpu",
+            "--mem-fraction-static",
+            "0.7",
         ]
         os.environ["SGLANG_USE_SGL_XPU"] = "1"
         cls.process = popen_launch_server(
