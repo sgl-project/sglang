@@ -5,7 +5,6 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import torch
 from safetensors import safe_open
 
 from sglang.multimodal_gen.runtime.layers.quantization import (
@@ -320,7 +319,9 @@ def _build_nvfp4_config_from_safetensors_files(
         if param_names_mapping_dict:
             mapping_fn = get_param_names_mapping(param_names_mapping_dict)
         if reverse_param_names_mapping_dict:
-            reverse_mapping_fn = get_param_names_mapping(reverse_param_names_mapping_dict)
+            reverse_mapping_fn = get_param_names_mapping(
+                reverse_param_names_mapping_dict
+            )
 
     for module_bfl in exclude_bfl_modules:
         raw_weight_name = f"{module_bfl}.weight"
