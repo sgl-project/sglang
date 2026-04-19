@@ -36,6 +36,37 @@ def normalize_flat_modelopt_quant_config(
     return normalized
 
 
+def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
+    """Infer NVFP4 group_size from serialized weight/scale tensor shapes."""
+    weight_shape = tuple(getattr(weight, "shape", ()))
+    scale_shape = tuple(getattr(scale, "shape", ()))
+    if len(weight_shape) < 2:
+        return None
+
+    input_size = int(weight_shape[1]) * 2
+    if input_size <= 0:
+        return None
+
+    candidate_num_groups: list[int] = []
+    if len(scale_shape) >= 2:
+        candidate_num_groups.append(int(scale_shape[-1]))
+    elif len(scale_shape) == 1:
+        scale_len = int(scale_shape[0])
+        if scale_len == int(weight_shape[0]):
+            candidate_num_groups.append(1)
+        candidate_num_groups.append(scale_len)
+    else:
+        candidate_num_groups.append(1)
+
+    for num_groups in candidate_num_groups:
+        if num_groups <= 0:
+            continue
+        if input_size % num_groups == 0:
+            return input_size // num_groups
+
+    return None
+
+
 def _resolve_quant_method_name(quant_cfg: dict) -> str:
     quant_cfg = normalize_flat_modelopt_quant_config(quant_cfg) or quant_cfg
     quant_method = quant_cfg.get("quant_method")
@@ -233,6 +264,7 @@ def _build_nvfp4_config_from_safetensors_files(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,
     reverse_param_names_mapping_dict: Optional[dict] = None,
+    fallback_group_size: Optional[int] = None,
 ) -> Optional[QuantizationConfig]:
     """Build a single NVFP4 config by aggregating metadata across multiple files.
 
@@ -310,9 +342,9 @@ def _build_nvfp4_config_from_safetensors_files(
                     if weight_key in all_keys and scale_key in all_keys:
                         w = f.get_tensor(weight_key)
                         s = f.get_tensor(scale_key)
-                        input_size = w.shape[1] * 2
-                        group_size = input_size // s.shape[1]
-                        break
+                        group_size = _infer_nvfp4_group_size_from_tensors(w, s)
+                        if group_size is not None:
+                            break
 
             for k in sorted(all_keys):
                 if not k.endswith(".weight"):
@@ -323,6 +355,26 @@ def _build_nvfp4_config_from_safetensors_files(
 
     if not files_with_nvfp4_signal:
         return None
+
+    if (
+        group_size is not None
+        and fallback_group_size is not None
+        and group_size != fallback_group_size
+    ):
+        logger.warning(
+            "NVFP4 group_size inferred from safetensors (%d) does not match config (%d); "
+            "preferring safetensors.",
+            group_size,
+            fallback_group_size,
+        )
+
+    if group_size is None and fallback_group_size is not None:
+        logger.info(
+            "Falling back to config-derived NVFP4 group_size=%d for %s",
+            fallback_group_size,
+            ", ".join(files_with_nvfp4_signal),
+        )
+        group_size = fallback_group_size
 
     if group_size is None:
         logger.warning(
@@ -399,10 +451,14 @@ def build_nvfp4_config_from_safetensors(
     file_path: str,
     param_names_mapping_dict: Optional[dict] = None,
     reverse_param_names_mapping_dict: Optional[dict] = None,
+    fallback_group_size: Optional[int] = None,
 ) -> Optional[QuantizationConfig]:
     """Backward-compatible wrapper for a single safetensors file."""
     return _build_nvfp4_config_from_safetensors_files(
-        [file_path], param_names_mapping_dict, reverse_param_names_mapping_dict
+        [file_path],
+        param_names_mapping_dict,
+        reverse_param_names_mapping_dict,
+        fallback_group_size,
     )
 
 
@@ -410,7 +466,11 @@ def build_nvfp4_config_from_safetensors_list(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,
     reverse_param_names_mapping_dict: Optional[dict] = None,
+    fallback_group_size: Optional[int] = None,
 ) -> Optional[QuantizationConfig]:
     return _build_nvfp4_config_from_safetensors_files(
-        file_paths, param_names_mapping_dict, reverse_param_names_mapping_dict
+        file_paths,
+        param_names_mapping_dict,
+        reverse_param_names_mapping_dict,
+        fallback_group_size,
     )

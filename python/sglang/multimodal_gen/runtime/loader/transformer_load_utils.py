@@ -486,11 +486,18 @@ def _resolve_quant_config(
     )
 
     quant_config = get_quant_config(hf_config, component_model_path)
-    inferred_nvfp4_config = build_nvfp4_config_from_safetensors_list(
-        safetensors_list,
-        param_names_mapping_dict,
-        reverse_param_names_mapping_dict,
-    )
+    quant_config_name = _get_quant_config_name(quant_config)
+    inferred_nvfp4_config = None
+    if quant_config is None or quant_config_name == "modelopt_fp4":
+        fallback_group_size = None
+        if quant_config_name == "modelopt_fp4":
+            fallback_group_size = getattr(quant_config, "group_size", None)
+        inferred_nvfp4_config = build_nvfp4_config_from_safetensors_list(
+            safetensors_list,
+            param_names_mapping_dict,
+            reverse_param_names_mapping_dict,
+            fallback_group_size,
+        )
     quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
     if quant_config is not None or not server_args.transformer_weights_path:
         return quant_config
