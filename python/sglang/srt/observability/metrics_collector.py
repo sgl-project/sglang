@@ -686,7 +686,7 @@ class SchedulerMetricsCollector:
         if self.enable_streaming_session:
             self.num_streaming_sessions = Gauge(
                 name="sglang:num_streaming_sessions",
-                documentation="The number of active streaming sessions.",
+                documentation="The number of streaming sessions.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )

@@ -187,6 +187,12 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
+    rollout_return_denoising_env: bool = (
+        False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
+    )
+    rollout_return_dit_trajectory: bool = (
+        False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
+    )
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
@@ -609,6 +615,7 @@ class SamplingParams:
 
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
+
         user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(
@@ -793,7 +800,7 @@ class SamplingParams:
             "--cfg-normalization",
             type=float,
             dest="cfg_normalization",
-            help=("CFG renormalization factor (for Z-Image). "),
+            help="CFG renormalization factor (for Z-Image). ",
         )
         add_argument(
             "--boundary-ratio",
