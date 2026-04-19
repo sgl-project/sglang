@@ -368,7 +368,91 @@ UNINSTALL_JIT_CACHE="$UNINSTALL_JIT_CACHE" \
 
 mark_step_done "Download flashinfer artifacts"
 
-export SGLANG_ENABLE_JIT_DEEPGEMM=0
+# ------------------------------------------------------------------------------
+# Stabilize FlashInfer JIT cache paths
+# ------------------------------------------------------------------------------
+# FlashInfer JIT writes build.ninja with hardcoded -isystem paths pointing to the
+# venv's flashinfer/data/ and tvm_ffi/include/. With per-job venvs each job gets
+# a unique /tmp/sglang-ci-<run>-<job>-<pid>/ path, but the JIT cache is shared
+# on the host mount. When the next job's venv has a different path and the old one
+# is cleaned up, ninja fails because source files no longer exist at the cached path.
+#
+# Fix (two parts):
+# 1. Clear only STALE cached_ops (build.ninja referencing non-existent venv paths).
+#    Do NOT clear all cached_ops — they contain compiled .so files that take 10-20 min
+#    to recompile. Only remove entries where the source paths no longer exist.
+# 2. Copy source files to a stable host-mounted path and symlink each venv's
+#    copy there. build.ninja then references the stable path across all jobs.
+#
+# Part 1: Clear stale cached_ops (keep valid compiled kernels)
+STABLE_FI_DIR="${HOME}/.cache/flashinfer/_stable_src"
+if [ -d "${HOME}/.cache/flashinfer" ]; then
+    STALE_COUNT=0
+    while IFS= read -r ninja_file; do
+        # Check for stale venv paths (/tmp/sglang-ci-*) or old stable path (flashinfer-src)
+        STALE_PATH=$(grep -o '/tmp/sglang-ci-[^ ]*\|flashinfer-src' "$ninja_file" 2>/dev/null | head -1 || true)
+        if [ -n "$STALE_PATH" ]; then
+            if echo "$STALE_PATH" | grep -q "flashinfer-src" || [ ! -d "$STALE_PATH" ]; then
+                rm -rf "$(dirname "$ninja_file")"
+                STALE_COUNT=$((STALE_COUNT + 1))
+            fi
+        fi
+    done < <(find "${HOME}/.cache/flashinfer" -name "build.ninja" -type f 2>/dev/null)
+    echo "Cleaned $STALE_COUNT stale FlashInfer cached_ops (kept valid ones)"
+fi
+
+# Part 2: Stabilize paths (STABLE_FI_DIR set above in Part 1)
+FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
+TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
+
+FI_VERSION="${FLASHINFER_PYTHON_REQUIRED}"
+if [ ! -d "$STABLE_FI_DIR/flashinfer-data" ] || [ "$(cat "$STABLE_FI_DIR/.version" 2>/dev/null)" != "$FI_VERSION" ]; then
+    rm -rf "$STABLE_FI_DIR"
+    mkdir -p "$STABLE_FI_DIR"
+    cp -a "$FI_DATA" "$STABLE_FI_DIR/flashinfer-data"
+    cp -a "$TVM_INC" "$STABLE_FI_DIR/tvm-ffi-include"
+    echo "$FI_VERSION" > "$STABLE_FI_DIR/.version"
+    echo "Copied flashinfer source files to stable path: $STABLE_FI_DIR (version=$FI_VERSION)"
+else
+    echo "Stable flashinfer source path up to date (version=$FI_VERSION)"
+fi
+
+rm -rf "$FI_DATA"
+ln -s "$STABLE_FI_DIR/flashinfer-data" "$FI_DATA"
+TVM_INC_PARENT=$(dirname "$TVM_INC")
+rm -rf "$TVM_INC_PARENT/include"
+ln -s "$STABLE_FI_DIR/tvm-ffi-include" "$TVM_INC_PARENT/include"
+echo "Symlinked venv flashinfer/tvm_ffi -> $STABLE_FI_DIR"
+
+mark_step_done "Stabilize FlashInfer JIT cache paths"
+
+# ------------------------------------------------------------------------------
+# Stabilize deep_gemm package path for NVRTC cache reuse
+# ------------------------------------------------------------------------------
+# deep_gemm uses NVRTC to JIT-compile bf16 kernels. The NVRTC cache key includes
+# library_root (the package install path). With per-job venvs, each job gets a
+# unique path → different cache key → full recompile (2s/kernel × hundreds).
+# Fix: copy the package to a stable host-mounted path and symlink.
+STABLE_DG_PKG="${HOME}/.cache/deep_gemm/_stable_pkg"
+DG_PKG=$(python3 -c "import deep_gemm, os; print(os.path.dirname(deep_gemm.__file__))" 2>/dev/null || true)
+if [ -n "$DG_PKG" ] && [ -d "$DG_PKG" ] && [ ! -L "$DG_PKG" ]; then
+    DG_VERSION=$(python3 -c "import deep_gemm; print(getattr(deep_gemm, '__version__', 'unknown'))" 2>/dev/null || echo "unknown")
+    if [ ! -d "$STABLE_DG_PKG/deep_gemm" ] || [ "$(cat "$STABLE_DG_PKG/.version" 2>/dev/null)" != "$DG_VERSION" ]; then
+        rm -rf "$STABLE_DG_PKG" 2>/dev/null || { chmod -R u+w "$STABLE_DG_PKG" 2>/dev/null; rm -rf "$STABLE_DG_PKG"; }
+        mkdir -p "$STABLE_DG_PKG"
+        cp -a "$DG_PKG" "$STABLE_DG_PKG/deep_gemm"
+        echo "$DG_VERSION" > "$STABLE_DG_PKG/.version"
+        echo "Copied deep_gemm package to stable path (version=$DG_VERSION)"
+    else
+        echo "Stable deep_gemm package up to date (version=$DG_VERSION)"
+    fi
+    rm -rf "$DG_PKG"
+    ln -s "$STABLE_DG_PKG/deep_gemm" "$DG_PKG"
+    echo "Symlinked venv deep_gemm -> $STABLE_DG_PKG"
+fi
+
+mark_step_done "Stabilize deep_gemm package path"
+
 # ------------------------------------------------------------------------------
 # Install extra dependency
 # ------------------------------------------------------------------------------
@@ -445,6 +529,9 @@ $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
     cd human-eval
     $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
 )
+
+# Enable deepgemm fast warmup to avoid deepgemm timeout in CI
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
 
 # ------------------------------------------------------------------------------
 # Prepare runner
