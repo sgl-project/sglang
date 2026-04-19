@@ -530,6 +530,9 @@ $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
     $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
 )
 
+# Enable deepgemm fast warmup to avoid deepgemm timeout in CI
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+
 # ------------------------------------------------------------------------------
 # Prepare runner
 # ------------------------------------------------------------------------------
