@@ -719,7 +719,8 @@ class TestFlashInferCascadeBackend(CustomTestCase):
         backend_ref.init_forward_metadata(batch_ref)
 
         runner_cas = self._make_runner()
-        runner_cas.token_to_kv_pool.kv_buffer[0].copy_(runner_ref.token_to_kv_pool.kv_buffer[0])
+        runner_cas.token_to_kv_pool.k_buffer[0].copy_(runner_ref.token_to_kv_pool.k_buffer[0])
+        runner_cas.token_to_kv_pool.v_buffer[0].copy_(runner_ref.token_to_kv_pool.v_buffer[0])
         runner_cas.req_to_token_pool.req_to_token.copy_(runner_ref.req_to_token_pool.req_to_token)
         backend_cas = FlashInferAttnBackend(runner_cas, enable_cascade=True)
         layer_cas = self._make_layer()
