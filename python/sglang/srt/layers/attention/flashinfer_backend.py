@@ -294,7 +294,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.cascade_decode_wrapper: Optional[MultiLevelCascadeAttentionWrapper] = (
             MultiLevelCascadeAttentionWrapper(
-                2,  # num_levels: shared + unique
+                2,
                 self.workspace_buffer,
                 "NHD",
             )
@@ -1033,8 +1033,9 @@ class FlashInferIndicesUpdaterDecode:
         disable_split_kv: Optional[bool] = None,
         prefix_lens: Optional[torch.Tensor] = None,
     ):
+        decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
-            (decode_wrappers or self.decode_wrappers)[0],
+            decode_wrappers[0],
             req_pool_indices,
             seq_lens,
             seq_lens_sum,
@@ -1256,8 +1257,6 @@ class FlashInferIndicesUpdaterDecode:
         unique_lens = seq_lens - prefix_lens
         shared_prefix_len = prefix_lens[0].item()
 
-        # Shared level: all bs decode tokens attend to the same prefix pages as one
-        # group — qo_indptr is [0, bs], not per-request, matching the single KV group.
         shared_qo_indptr = torch.tensor([0, bs], dtype=torch.int32, device="cuda")
         shared_kv_indptr = torch.tensor(
             [0, int(shared_prefix_len)], dtype=torch.int32, device="cuda"
@@ -1267,7 +1266,6 @@ class FlashInferIndicesUpdaterDecode:
         ].int()
         shared_kv_last_page_len = torch.ones(1, dtype=torch.int32, device="cuda")
 
-        # Unique level: each request attends to its own tail (seq_len - prefix_len tokens).
         unique_qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
         unique_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
         unique_kv_indptr[1:] = torch.cumsum(unique_lens, dim=0).to(torch.int32)
@@ -1279,7 +1277,7 @@ class FlashInferIndicesUpdaterDecode:
             req_pool_indices,
             unique_lens,
             unique_kv_indptr,
-            prefix_lens,  # kv_start_idx: start reading after the shared prefix
+            prefix_lens,
             unique_kv_indices,
             self.req_to_token.shape[1],
         )
@@ -1422,7 +1420,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
                 prefill_wrappers[wrapper_id],
-                  req_pool_indices,
+                req_pool_indices,
                 paged_kernel_lens,
                 paged_kernel_lens_sum,
                 seq_lens,

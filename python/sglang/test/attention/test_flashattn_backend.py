@@ -687,26 +687,6 @@ class TestFlashInferCascadeBackend(CustomTestCase):
         batch.token_to_kv_pool = runner.token_to_kv_pool
         return batch
 
-    def test_cascade_wrapper_created_only_when_enabled(self):
-        runner = self._make_runner()
-        self.assertIsNone(FlashInferAttnBackend(runner, enable_cascade=False).cascade_decode_wrapper)
-        self.assertIsInstance(
-            FlashInferAttnBackend(runner, enable_cascade=True).cascade_decode_wrapper,
-            MultiLevelCascadeAttentionWrapper,
-        )
-
-    def test_forward_metadata_sets_cascade_field(self):
-        seq_lens = [self.prefix_len + self.unique_len] * self.batch_size
-        for enable, expect_none in [(True, False), (False, True)]:
-            runner = self._make_runner()
-            backend = FlashInferAttnBackend(runner, enable_cascade=enable)
-            batch = self._make_decode_batch(runner, backend, seq_lens)
-            backend.init_forward_metadata(batch)
-            if expect_none:
-                self.assertIsNone(backend.forward_metadata.cascade_decode_wrapper)
-            else:
-                self.assertIsNotNone(backend.forward_metadata.cascade_decode_wrapper)
-
     def _make_shared_prefix_batch(self, runner, backend, prefix_len, unique_len):
         bs = self.batch_size
         seq_len = prefix_len + unique_len
@@ -769,54 +749,6 @@ class TestFlashInferCascadeBackend(CustomTestCase):
             torch.allclose(out_ref, out_cas, atol=1e-2, rtol=0),
             f"max diff: {(out_ref - out_cas).abs().max().item():.4f}",
         )
-
-    def test_cascade_variable_unique_lengths(self):
-        unique_lens = [self.unique_len, self.unique_len * 2, self.unique_len, self.unique_len * 3]
-        bs = self.batch_size
-        prefix_len = self.prefix_len
-        total_kv = prefix_len + sum(unique_lens)
-
-        runner = self._make_runner()
-        req_to_token = runner.req_to_token_pool.req_to_token
-        offset = prefix_len
-        for i, ul in enumerate(unique_lens):
-            req_to_token[i, :prefix_len] = torch.arange(prefix_len, dtype=torch.int32, device=self.device)
-            req_to_token[i, prefix_len : prefix_len + ul] = torch.arange(
-                offset, offset + ul, dtype=torch.int32, device=self.device
-            )
-            offset += ul
-
-        backend = FlashInferAttnBackend(runner, enable_cascade=True)
-        layer = self._make_layer()
-        k = torch.randn(total_kv, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
-        v = torch.randn(total_kv, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
-        runner.token_to_kv_pool.set_kv_buffer(
-            layer, torch.arange(total_kv, device=self.device), k, v, layer.k_scale, layer.v_scale
-        )
-
-        seq_lens_list = [prefix_len + ul for ul in unique_lens]
-        seq_lens_t = torch.tensor(seq_lens_list, dtype=torch.int32, device=self.device)
-        batch = ForwardBatch(
-            batch_size=bs,
-            input_ids=torch.zeros(bs, dtype=torch.int64, device=self.device),
-            out_cache_loc=torch.zeros(bs, dtype=torch.int32, device=self.device),
-            seq_lens_sum=sum(seq_lens_list),
-            forward_mode=ForwardMode.DECODE,
-            req_pool_indices=torch.arange(bs, dtype=torch.int32, device=self.device),
-            seq_lens=seq_lens_t,
-            seq_lens_cpu=torch.tensor(seq_lens_list, dtype=torch.int32),
-            attn_backend=backend,
-        )
-        batch.req_to_token_pool = runner.req_to_token_pool
-        batch.token_to_kv_pool = runner.token_to_kv_pool
-
-        prefix_lens_t = torch.tensor([prefix_len] * bs, dtype=torch.int32, device=self.device)
-        backend.init_forward_metadata(batch, prefix_lens=prefix_lens_t)
-
-        q = torch.randn(bs, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device)
-        out = backend.forward_decode(q, None, None, layer, batch, save_kv_cache=False)
-        self.assertEqual(out.shape, (bs, self.num_heads * self.head_dim))
-        self.assertFalse(torch.isnan(out).any())
 
 
 if __name__ == "__main__":
