@@ -63,6 +63,55 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
 ]
 
 
+def gptq_dequantize_4bit(
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    sym: bool = True,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize GPTQ 4-bit weights to ``out_dtype``.
+
+    Args:
+        qweight: ``[K // 8, N]`` int32 (8 × int4 packed along input dim).
+        qzeros:  ``[G, N // 8]`` int32 (8 × int4 packed along output dim).
+        scales:  ``[G, N]`` floating point.
+        group_size: group size (input-dim groups).
+        sym: If True, use a fixed zero-point of 8 (matches the ``uint4b8``
+            convention used by the GPTQ-Marlin kernel for symmetric quant,
+            regardless of what ``qzeros`` packs).
+
+    Returns:
+        ``[K, N]`` tensor in ``out_dtype``.
+    """
+    pack_factor = 8
+    Kp, N = qweight.shape
+    K = Kp * pack_factor
+    device = qweight.device
+
+    shifts = torch.arange(pack_factor, device=device, dtype=torch.int32) * 4
+    unpacked_q = ((qweight.unsqueeze(1) >> shifts.view(1, -1, 1)) & 0xF).to(
+        torch.int32
+    )
+    unpacked_q = unpacked_q.reshape(K, N)
+
+    group_ids = torch.arange(K, device=device) // group_size
+    scales_f = scales[group_ids].to(torch.float32)
+
+    if sym:
+        zeros_f = torch.full_like(scales_f, 8.0)
+    else:
+        unpacked_z = ((qzeros.unsqueeze(-1) >> shifts.view(1, 1, -1)) & 0xF).to(
+            torch.int32
+        )
+        unpacked_z = unpacked_z.reshape(qzeros.shape[0], N) + 1
+        zeros_f = unpacked_z[group_ids].to(torch.float32)
+
+    w = (unpacked_q.to(torch.float32) - zeros_f) * scales_f
+    return w.to(out_dtype)
+
+
 def awq_dequantize_func():
     """
     Get the AWQ dequantize function for the current device

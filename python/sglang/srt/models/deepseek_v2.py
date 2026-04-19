@@ -1349,7 +1349,7 @@ class DeepseekV2AttentionMLA(
             self.has_fused_proj
             and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+            in {"awq", "awq_marlin", "moe_wna16", "gptq", "gptq_marlin"}
         )
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj

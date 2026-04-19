@@ -23,6 +23,21 @@ from lm_eval.api.model import LM
 
 from sglang.benchmark.datasets.common import DatasetRow
 
+def _strip_think(text: str) -> str:
+    """Remove the leading <think>…</think> block from generated text.
+
+    Mirrors Qwen3's official parsing: split on the LAST </think> tag so
+    that only the content after it is scored. If </think> is absent (model
+    truncated mid-reasoning), return the full text — matching the official
+    fallback of index=0 (treat everything as the answer portion).
+    """
+    if "<think>" not in text:
+        return text
+    idx = text.rfind("</think>")
+    if idx == -1:
+        return text  # truncated: no </think> found, return as-is
+    return text[idx + len("</think>"):].lstrip()
+
 
 class BenchServingLM(LM):
     def __init__(
@@ -98,7 +113,7 @@ class BenchServingLM(LM):
             max_gen_toks = gen_kwargs.get("max_gen_toks") or 2048
             temperature = gen_kwargs.get("temperature")
 
-            per_req_extra: Dict[str, Any] = {}
+            per_req_extra: Dict[str, Any] = {"ignore_eos": False}
             if stop:
                 per_req_extra["stop"] = list(stop)
             if temperature is not None:
@@ -172,4 +187,7 @@ class BenchServingLM(LM):
             warmup_requests=self.warmup_requests,
         ))
         self.last_perf = perf
-        return list(perf["generated_texts"])
+        texts = list(perf["generated_texts"])
+        if self.enable_thinking:
+            texts = [_strip_think(t) for t in texts]
+        return texts

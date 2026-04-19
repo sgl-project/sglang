@@ -54,6 +54,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    gptq_dequantize_4bit,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
@@ -433,18 +434,37 @@ class DeepseekV2WeightLoaderMixin:
             )
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
-                # awq compatible, dequantize the weight if supported
-                awq_dequantize_f = awq_dequantize_func()
-                if awq_dequantize_f is not None:
-                    w = awq_dequantize_f(
+                qmethod = getattr(self_attn.kv_b_proj, "quant_method", None)
+                qname = ""
+                if qmethod is not None and hasattr(qmethod, "quant_config"):
+                    qname = qmethod.quant_config.get_name()
+
+                if qname in ("gptq", "gptq_marlin", "auto-round"):
+                    qcfg = qmethod.quant_config
+                    group_size = qcfg.group_size
+                    sym = bool(
+                        getattr(qcfg, "sym", getattr(qcfg, "is_sym", True))
+                    )
+                    w = gptq_dequantize_4bit(
                         self_attn.kv_b_proj.qweight,
-                        self_attn.kv_b_proj.scales,
                         self_attn.kv_b_proj.qzeros,
+                        self_attn.kv_b_proj.scales,
+                        group_size,
+                        sym=sym,
                     ).T
                 else:
-                    raise ValueError(
-                        "AWQ dequantize function is not supported for the current device"
-                    )
+                    # awq compatible, dequantize the weight if supported
+                    awq_dequantize_f = awq_dequantize_func()
+                    if awq_dequantize_f is not None:
+                        w = awq_dequantize_f(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                        ).T
+                    else:
+                        raise ValueError(
+                            "AWQ dequantize function is not supported for the current device"
+                        )
             else:
                 w = self_attn.kv_b_proj.weight
 

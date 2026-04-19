@@ -137,15 +137,23 @@ class Glm4MoeLiteMLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        # Some quantization wrappers store the underlying parameter as `weight_packed`.
-        if not hasattr(self.gate_up_proj, "weight"):
-            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
-        if not hasattr(self.down_proj, "weight"):
-            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+        # Some quantization wrappers (e.g. quark) store the underlying parameter as
+        # `weight_packed`; alias it so downstream dtype checks still work. Other
+        # quantizers (GPTQ/AWQ) expose `qweight`/`qzeros`/`scales` instead and have
+        # no plain `weight`/`weight_packed` — skip the alias in that case.
+        if not hasattr(self.gate_up_proj, "weight") and hasattr(
+            self.gate_up_proj, "weight_packed"
+        ):
+            self.gate_up_proj.weight = self.gate_up_proj.weight_packed
+        if not hasattr(self.down_proj, "weight") and hasattr(
+            self.down_proj, "weight_packed"
+        ):
+            self.down_proj.weight = self.down_proj.weight_packed
 
         if (
             gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
+            and getattr(self.gate_up_proj, "weight", None) is not None
             and self.gate_up_proj.weight.dtype == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
@@ -403,6 +411,8 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        self._gfx95_quant_format = self._detect_gfx95_quant_format()
+
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -465,6 +475,16 @@ class Glm4MoeLiteModel(DeepseekV2Model):
 
 
 class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
+    # Declared at class level so the quant-config loader (which reads
+    # `model_class.packed_modules_mapping` before __init__ runs) sees the
+    # fusions. The parent only populates `fused_qkv_a_proj_with_mqa` inside
+    # its own __init__, and this subclass does not call super().__init__, so
+    # both entries need to live here.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -731,9 +751,24 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
-                            )
+                            if name.endswith((".qweight", ".qzeros", ".scales")):
+                                # GPTQ stores qweight/qzeros/scales in [in, out]
+                                # layout; fuse along the output dim (=1).
+                                fused_weight = torch.cat(
+                                    [q_a_proj_weight, kv_a_proj_weight], dim=1
+                                )
+                            elif name.endswith(".g_idx"):
+                                # GPTQ g_idx is shape [in_features] and identical
+                                # for two layers that share the same input. Take
+                                # the q_a_proj copy so the fused tensor stays
+                                # length=in_features (concat would double it).
+                                fused_weight = q_a_proj_weight
+                            else:
+                                # Unquantized nn.Linear weight is [out, in]; fuse
+                                # along the output dim (=0).
+                                fused_weight = torch.cat(
+                                    [q_a_proj_weight, kv_a_proj_weight], dim=0
+                                )
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
                                 if "q_a_proj" in name

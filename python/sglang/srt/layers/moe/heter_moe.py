@@ -713,6 +713,11 @@ class HeterFusedMoE(nn.Module):
                     group_ids,
                 )
             elif num_bits == 4:
+                # Skip INT4 kernel if every expert in this layer is BF16-only
+                # (layer-level sensitivity/invariance sweeps hit this when a
+                # layer is 100% BF16 — no INT4 params were created).
+                if self._all_bf16_only:
+                    continue
                 # expert_map enables is_ep=True inside fused_marlin_moe,
                 # which makes the Marlin GEMM kernel skip expert_id=-1
                 # blocks (marlin_template.h:380) and zeros cache3 for
@@ -816,6 +821,8 @@ def apply_heter_precision(
     if layers_module is None:
         raise ValueError("Cannot find model layers for heter precision application")
 
+    import gc
+
     num_swapped = 0
     for layer_id, layer in enumerate(layers_module):
         # Find the FusedMoE experts module
@@ -847,15 +854,18 @@ def apply_heter_precision(
             heter_moe.load_int4_weights(int4_checkpoint, layer_id)
             heter_moe.repack_int4_to_marlin()
 
-        # Swap
+        # Swap, then drop local/module refs to the old FusedMoE and release
+        # its VRAM before moving on — otherwise all 48 layers' original BF16
+        # weights stay pinned while we clone compact BF16 per layer, which
+        # OOMs on 80 GB for vertical/random at n≥32.
         setattr(moe_parent, moe_attr, heter_moe)
+        del fused_moe, candidate
+        gc.collect()
+        torch.cuda.empty_cache()
         num_swapped += 1
 
         if layer_id % 10 == 0:
             logger.info(f"Swapped layer {layer_id} FusedMoE → HeterFusedMoE")
-
-    # Free memory from the old FusedMoE modules
-    import gc
 
     gc.collect()
     torch.cuda.empty_cache()

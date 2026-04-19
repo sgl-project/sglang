@@ -100,7 +100,7 @@ class AutoRoundConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AutoRoundConfig":
-        return cls(
+        instance = cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
             group_size=cls.get_from_keys(config, ["group_size"]),
             sym=cls.get_from_keys(config, ["sym"]),
@@ -118,6 +118,14 @@ class AutoRoundConfig(QuantizationConfig):
                 config, ["backend", "vllm_backend", "sglang_backend"], "auto"
             ),
         )
+        # Carry over the model's packed-module fusion map so that
+        # per-sub-module extra_config overrides (e.g. an FP16 layer-0
+        # gate/up/down pair for a fused gate_up_proj) resolve correctly in
+        # get_layer_config.
+        packed = config.get("packed_modules_mapping")
+        if packed:
+            instance.packed_modules_mapping = dict(packed)
+        return instance
 
     def get_scaled_act_names(self) -> list[str]:
         """Returns the activation function names that should be post-scaled.

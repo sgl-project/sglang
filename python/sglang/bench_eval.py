@@ -34,6 +34,7 @@ def run_bench_eval(
     fewshot_as_multiturn: bool = False,
     flush_cache: bool = False,
     extra_request_body: Optional[Dict[str, Any]] = None,
+    system_instruction: Optional[str] = None,
 ) -> Dict[str, Any]:
     import lm_eval
     from transformers import AutoTokenizer
@@ -65,6 +66,7 @@ def run_bench_eval(
         limit=limit,
         apply_chat_template=apply_chat_template,
         fewshot_as_multiturn=fewshot_as_multiturn,
+        system_instruction=system_instruction,
         gen_kwargs=gen_kwargs,
         batch_size=max_concurrency or "auto",
     )
@@ -91,6 +93,8 @@ def run_bench_eval(
             "apply_chat_template": apply_chat_template,
             "enable_thinking": enable_thinking,
             "limit": limit,
+            "sampling": extra_request_body or {},
+            "system_instruction": system_instruction,
         },
     )
 
@@ -125,7 +129,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-fewshot", type=int, default=0)
     p.add_argument("--limit", type=int, default=None,
                    help="Cap number of eval docs (None = full task).")
-    p.add_argument("--max-gen-toks", type=int, default=2048)
+    p.add_argument("--max-gen-toks", type=int, default=32768,
+                   help="Max output tokens per request. Default 32768 (Qwen3 recommendation). "
+                        "Use 38912 for competition math/code.")
     p.add_argument("--request-rate", type=float, default=float("inf"),
                    help="Requests per second. 'inf' = unlimited (default).")
     p.add_argument("--max-concurrency", type=int, default=None)
@@ -133,11 +139,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--enable-thinking", action="store_true",
                    help="Adds enable_thinking=True to apply_chat_template.")
     p.add_argument("--fewshot-as-multiturn", action="store_true")
+    # Sampling parameters (Qwen3 recommended defaults applied automatically).
+    p.add_argument("--temperature", type=float, default=None,
+                   help="Sampling temperature. Default: 0.6 (thinking) or 0.7 (non-thinking).")
+    p.add_argument("--top-p", type=float, default=None,
+                   help="Top-p sampling. Default: 0.95 (thinking) or 0.8 (non-thinking).")
+    p.add_argument("--top-k", type=int, default=20)
+    p.add_argument("--min-p", type=float, default=0.0)
+    p.add_argument("--presence-penalty", type=float, default=0.0,
+                   help="Presence penalty. Recommended 1.5 for quantized models.")
     p.add_argument("--output-file", default=None,
                    help="Append-mode JSONL path for the merged report.")
     p.add_argument("--include-per-doc", action="store_true")
     p.add_argument("--flush-cache", action="store_true",
                    help="Flush KV cache before the run (CI parity).")
+    p.add_argument("--system-instruction", default=None,
+                   help="System message prepended to every prompt. "
+                        "Math: 'Please reason step by step, and put your final answer within \\boxed{}.' "
+                        "MCQ: 'Please show your choice in the answer field with only the choice letter, e.g., \"answer\": \"C\".'")
     return p
 
 
@@ -147,6 +166,17 @@ def main(argv=None) -> int:
 
     if args.enable_thinking and not args.apply_chat_template:
         parser.error("--enable-thinking requires --apply-chat-template")
+
+    temperature = args.temperature if args.temperature is not None else (0.6 if args.enable_thinking else 0.7)
+    top_p = args.top_p if args.top_p is not None else (0.95 if args.enable_thinking else 0.8)
+    sampling: Dict[str, Any] = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+    }
+    if args.presence_penalty != 0.0:
+        sampling["presence_penalty"] = args.presence_penalty
 
     report = run_bench_eval(
         task=args.task,
@@ -165,6 +195,8 @@ def main(argv=None) -> int:
         output_file=args.output_file,
         include_per_doc=args.include_per_doc,
         flush_cache=args.flush_cache,
+        extra_request_body=sampling,
+        system_instruction=args.system_instruction,
     )
 
     print("=" * 60)
