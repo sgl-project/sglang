@@ -211,7 +211,7 @@ def try_get_optimal_moe_config(
     per_channel_quant: bool = False,
     return_down_config: bool = False,
 ):
-    from sglang.srt.layers.moe.fused_moe_triton import get_config
+    from sglang.srt.layers.moe.moe_runner.triton_utils import get_config
 
     down_config = None
     max_block_m = None
