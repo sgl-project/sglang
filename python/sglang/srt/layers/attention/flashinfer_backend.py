@@ -237,6 +237,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.cascade_unique_kv_indptr = torch.zeros((max_bs + 1,), dtype=torch.int32, device=model_runner.device)
         self.cascade_shared_kv_indptr = torch.zeros(2, dtype=torch.int32, device=model_runner.device)
         self.cascade_unique_qo_indptr = torch.arange(max_bs + 1, dtype=torch.int32, device=model_runner.device)
+        self.cascade_shared_qo_indptr = torch.zeros(2, dtype=torch.int32, device=model_runner.device)
 
         if not self.skip_prefill:
             self.qo_indptr = [
@@ -943,7 +944,14 @@ class FlashInferAttnBackend(AttentionBackend):
 
         cascade_wrapper = self.forward_metadata.cascade_decode_wrapper
         if cascade_wrapper is not None:
-            o = cascade_wrapper.run(q_view, kv_cache)
+            o = cascade_wrapper.run(
+                q_view,
+                kv_cache,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )        
         else:
             o = decode_wrapper.forward(
                 q_view,
@@ -992,6 +1000,7 @@ class FlashInferIndicesUpdaterDecode:
         self.cascade_unique_kv_indptr = attn_backend.cascade_unique_kv_indptr
         self.cascade_shared_kv_indptr = attn_backend.cascade_shared_kv_indptr
         self.cascade_unique_qo_indptr = attn_backend.cascade_unique_qo_indptr
+        self.cascade_shared_qo_indptr = attn_backend.cascade_shared_qo_indptr
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1255,20 +1264,26 @@ class FlashInferIndicesUpdaterDecode:
     ):
         bs = len(req_pool_indices)
         unique_lens = seq_lens - prefix_lens
-        shared_prefix_len = prefix_lens[0].item()
 
-        shared_qo_indptr = torch.tensor([0, bs], dtype=torch.int32, device="cuda")
-        shared_kv_indptr = torch.tensor(
-            [0, int(shared_prefix_len)], dtype=torch.int32, device="cuda"
-        )
-        shared_kv_indices = self.req_to_token[
-            req_pool_indices[0], :shared_prefix_len
-        ].int()
+        shared_qo_indptr = self.cascade_shared_qo_indptr   # [0, 0] pre-allocated
+        shared_qo_indptr[1] = bs                            # in-place, no CPU sync
+
+        shared_kv_indptr = self.cascade_shared_kv_indptr   # [0, 0] pre-allocated
+        shared_kv_indptr[1] = prefix_lens[0]               # in-place, no CPU sync
+
+        # CPU sync: Python slice notation requires an int, not a GPU tensor.
+        shared_prefix_len = prefix_lens[0].item()
+        shared_kv_indices = self.req_to_token[req_pool_indices[0], :shared_prefix_len].int()
         shared_kv_last_page_len = torch.ones(1, dtype=torch.int32, device="cuda")
 
-        unique_qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
-        unique_kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
-        unique_kv_indptr[1:] = torch.cumsum(unique_lens, dim=0).to(torch.int32)
+        # Unique level: each request attends to its own tail tokens.
+        unique_qo_indptr = self.cascade_unique_qo_indptr[: bs + 1]    # pre-allocated arange slice
+        unique_kv_indptr = self.cascade_unique_kv_indptr              # pre-allocated, update in-place
+        unique_kv_indptr[0] = 0
+        unique_kv_indptr[1 : bs + 1] = torch.cumsum(unique_lens, dim=0).to(torch.int32)
+        unique_kv_indptr_view = unique_kv_indptr[: bs + 1]
+
+        # CPU sync: tensor allocation size must be a Python int.
         unique_kv_indices = torch.empty(
             unique_lens.sum().item(), dtype=torch.int32, device="cuda"
         )
@@ -1276,7 +1291,7 @@ class FlashInferIndicesUpdaterDecode:
             self.req_to_token,
             req_pool_indices,
             unique_lens,
-            unique_kv_indptr,
+            unique_kv_indptr_view,
             prefix_lens,
             unique_kv_indices,
             self.req_to_token.shape[1],
@@ -1285,7 +1300,7 @@ class FlashInferIndicesUpdaterDecode:
 
         wrapper.plan(
             qo_indptr_arr=[shared_qo_indptr, unique_qo_indptr],
-            paged_kv_indptr_arr=[shared_kv_indptr, unique_kv_indptr],
+            paged_kv_indptr_arr=[shared_kv_indptr, unique_kv_indptr_view],
             paged_kv_indices_arr=[shared_kv_indices, unique_kv_indices],
             paged_kv_last_page_len=[shared_kv_last_page_len, unique_kv_last_page_len],
             num_qo_heads=self.num_qo_heads,
