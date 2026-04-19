@@ -61,7 +61,7 @@ concurrency:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  SGLANG_ENABLE_JIT_DEEPGEMM: false
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SKIP_STAGE_HEALTH_CHECK: 'true'  # TEMP: force-skip on cu13 venv migration branch to fan out all stages
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}

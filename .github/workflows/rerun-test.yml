@@ -42,7 +42,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  SGLANG_ENABLE_JIT_DEEPGEMM: false
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
 
 permissions:
   actions: write
