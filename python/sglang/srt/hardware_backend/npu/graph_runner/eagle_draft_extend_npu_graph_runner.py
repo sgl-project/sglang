@@ -28,11 +28,37 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
+import queue
 
 class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
     def __init__(self, eagle_worker: EAGLEWorker):
         super().__init__(eagle_worker)
+        self._replay_update_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._replay_update_done = threading.Event()
+        self._replay_update_done.set()
+        self._replay_update_error: BaseException | None = None
+        self._replay_update_thread = threading.Thread(
+            target=self._replay_update_worker_loop,
+            name="eagle-draft-extend-graph-update",
+            daemon=True,
+        )
+        self._replay_update_thread.start()
+
+    def _replay_update_worker_loop(self):
+        while True:
+            item = self._replay_update_queue.get()
+            if item is None:
+                self._replay_update_done.set()
+                break
+
+            seq_lens = item
+            self._replay_update_error = None
+            try:
+                self._replay_update(seq_lens)
+            except BaseException as exc:
+                self._replay_update_error = exc
+            finally:
+                self._replay_update_done.set()
 
     def _create_graph(self):
         return torch.npu.NPUGraph()
@@ -63,9 +89,13 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
                 self.bs - self.raw_bs
             )
-            thread = threading.Thread(target=self._replay_update, args=(seq_lens,))
-            thread.start()
+            self._replay_update_done.clear()
+            self._replay_update_queue.put(seq_lens)
             self.graphs[self.bs].replay()
-            thread.join()
+            self._replay_update_done.wait()
+            if self._replay_update_error is not None:
+                raise RuntimeError(
+                    "Failed to update eagle draft extend graph replay inputs"
+                ) from self._replay_update_error
         else:
             self.graphs[self.bs].replay()
