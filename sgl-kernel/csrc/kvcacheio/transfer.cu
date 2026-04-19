@@ -812,9 +812,19 @@ inline void transfer_kv_page_first_direct_impl(
     return;
   }
 
-  // CUDA 13.0 removed the failIdx parameter from cudaMemcpyBatchAsync.
-  // Use runtime version to select the correct signature for binary portability.
-  const bool use_v13_signature = driver_version >= 13000;
+  // CUDA 13.0 removed the failIdx parameter from cudaMemcpyBatchAsync. The ABI
+  // of the dlsym'd symbol is determined by the libcudart loaded in this process,
+  // not the host driver — a cu12 runtime on a cu13 driver host (common in
+  // containers) still exposes the 9-param v12 signature. Dispatching on the
+  // driver version here would segfault in that case (verified empirically).
+  // Use cudaRuntimeGetVersion so the signature follows the runtime.
+  int runtime_version = 0;
+  cudaError_t runtime_version_err = cudaRuntimeGetVersion(&runtime_version);
+  if (runtime_version_err != cudaSuccess) {
+    fallback_to_page_copy();
+    return;
+  }
+  const bool use_v13_signature = runtime_version >= 13000;
 
   size_t num_copies = 0;
   std::vector<void*> batch_srcs;
