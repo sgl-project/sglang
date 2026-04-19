@@ -1135,6 +1135,23 @@ class DeepseekV2AttentionMLA(
     DeepseekMLACpuForwardMixin,
 ):
 
+    def _get_fused_qkv_a_proj_weight(self):
+        if not getattr(self, "has_fused_proj", False):
+            return None
+        return getattr(self.fused_qkv_a_proj_with_mqa, "weight", None)
+
+    def _can_use_min_latency_fused_a_gemm(self) -> bool:
+        fused_weight = self._get_fused_qkv_a_proj_weight()
+        return (
+            fused_weight is not None
+            and not self.is_packed_weight
+            and fused_weight.dtype == torch.bfloat16
+            and fused_weight.shape[0] == 2112
+            and fused_weight.shape[1] == 7168
+            and _is_cuda
+            and 90 <= _device_sm < 120
+        )
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1351,15 +1368,7 @@ class DeepseekV2AttentionMLA(
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "awq_marlin", "moe_wna16"}
         )
-        self.use_min_latency_fused_a_gemm = (
-            self.has_fused_proj
-            and not self.is_packed_weight
-            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
-            and _is_cuda
-            and 90 <= _device_sm < 120
-        )
+        self.use_min_latency_fused_a_gemm = self._can_use_min_latency_fused_a_gemm()
 
         self.init_mha_forward()
         self.init_mla_forward()
