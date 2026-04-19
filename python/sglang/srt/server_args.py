@@ -2792,10 +2792,10 @@ class ServerArgs:
         if self.disaggregation_mode == "prefill":
             self.moe_a2a_backend = "none"
         else:
-            # Hybrid mode: extend→DWDP, decode→EP with DeepEP A2A
+            # Hybrid mode: extend→DWDP, decode→EP with flashinfer A2A
             self.enable_mixed_chunk = False
             if self.moe_a2a_backend == "none":
-                self.moe_a2a_backend = "deepep"
+                self.moe_a2a_backend = "flashinfer"
 
         logger.info(
             f"DWDP enabled: dwdp_size={self.dwdp_size}, dp_size={self.dp_size}, "
