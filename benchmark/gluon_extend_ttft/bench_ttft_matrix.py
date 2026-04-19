@@ -102,21 +102,22 @@ MODELS = {
 }
 
 BACKENDS = {
-    # `triton` = the vanilla Triton extend kernel. We opt OUT of Gluon
-    # (which auto-opts-in on gfx950) via `--disable-gluon-extend-attention`
-    # in the server launch args.
+    # `triton` = the vanilla Triton extend kernel. No extra flags needed:
+    # Gluon is opt-in on this branch, so the default Triton backend stays
+    # on the Triton reference path.
     "triton": {
         "env": {},
         "attn_backend": "triton",
-        "extra_cmd": ["--disable-gluon-extend-attention"],
+        "extra_cmd": [],
     },
     # `gluon` = the Triton attention backend with the Gluon extend kernel
-    # auto-opted-in on gfx950 (default behaviour on this branch). No env
-    # vars needed -- the wrapper detects gfx950 and installs itself.
+    # opted in via `--enable-gluon-extend-attention`. The server refuses
+    # to enable Gluon on non-gfx950 hardware, so this flag is a no-op
+    # outside MI350/MI355.
     "gluon": {
         "env": {},
         "attn_backend": "triton",
-        "extra_cmd": [],
+        "extra_cmd": ["--enable-gluon-extend-attention"],
     },
     "ck": {
         "env": {},

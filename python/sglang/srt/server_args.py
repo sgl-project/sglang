@@ -490,11 +490,11 @@ class ServerArgs:
     )
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
-    # Opt out of the Gluon extend-attention kernel on MI350X (gfx950).
-    # Gluon is auto-enabled under the Triton attention backend when the
-    # hardware is gfx950; this flag forces the Triton reference kernel.
-    # No effect on non-gfx950 hardware or non-Triton backends.
-    disable_gluon_extend_attention: bool = False
+    # Opt in to the Gluon extend-attention kernel on MI350/MI355 (gfx950).
+    # Only effective under the Triton attention backend; no effect on
+    # non-gfx950 hardware or non-Triton backends. Off by default to keep
+    # main-line behaviour bit-identical to the Triton reference path.
+    enable_gluon_extend_attention: bool = False
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -5124,14 +5124,16 @@ class ServerArgs:
             help="Disable FlashInfer autotuning.",
         )
         parser.add_argument(
-            "--disable-gluon-extend-attention",
-            default=ServerArgs.disable_gluon_extend_attention,
+            "--enable-gluon-extend-attention",
+            default=ServerArgs.enable_gluon_extend_attention,
             action="store_true",
             help=(
-                "Disable the Gluon extend-attention kernel on MI350X "
-                "(gfx950) and fall back to the Triton reference. Gluon "
-                "is auto-enabled on gfx950 under the Triton attention "
-                "backend; this flag is a no-op on other hardware."
+                "Enable the Gluon extend-attention kernel on MI350/MI355 "
+                "(gfx950) under the Triton attention backend. No-op on "
+                "other hardware or other attention backends. Falls back "
+                "to the Triton reference on unsupported shapes (head-dim "
+                "not in {64,128,256}, Lq != Lv, FP8 KV with a custom "
+                "mask on D<=128)."
             ),
         )
 

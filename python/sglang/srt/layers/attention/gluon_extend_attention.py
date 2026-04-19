@@ -1,8 +1,8 @@
-"""Gluon extend-attention wrapper for MI350X (gfx950 / CDNA 4).
+"""Gluon extend-attention wrapper for MI350/MI355 (gfx950 / CDNA 4).
 
 Drop-in replacement for ``triton_ops.extend_attention.extend_attention_fwd``,
-auto-enabled on gfx950 by :class:`TritonAttnBackend` when the user has
-not passed ``--disable-gluon-extend-attention``. Kernel sources are
+installed by :class:`TritonAttnBackend` when the user passes
+``--enable-gluon-extend-attention`` on gfx950. Kernel sources are
 vendored under
 ``sglang.srt.layers.attention.gluon_ops.cdna4.extend_attention``; no
 external paths or imports required.

@@ -87,11 +87,11 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
-        # Auto-enable the Gluon extend-attention kernel on MI350X
-        # (gfx950); user can opt out with --disable-gluon-extend-attention.
-        # The wrapper gates on supported head-dim and transparently falls
-        # back to the Triton reference on unsupported shapes or any
-        # runtime exception, so enabling is always safe.
+        # Opt-in Gluon extend-attention kernel for MI350/MI355 (gfx950).
+        # Gated behind --enable-gluon-extend-attention and a gfx950 check;
+        # no effect on other hardware or attention backends. The wrapper
+        # transparently falls back to the Triton reference on unsupported
+        # shapes or any runtime exception, so enabling is always safe.
         #
         # MLA models (Lq != Lv) are short-circuited here -- the Gluon
         # extend kernel only supports symmetric heads, so wrapping would
@@ -102,8 +102,8 @@ class TritonAttnBackend(AttentionBackend):
             model_runner.model_config.attention_arch == AttentionArch.MLA
         )
         if (
-            is_gfx95_supported()
-            and not model_runner.server_args.disable_gluon_extend_attention
+            model_runner.server_args.enable_gluon_extend_attention
+            and is_gfx95_supported()
             and not _mla_model
         ):
             from sglang.srt.layers.attention.gluon_extend_attention import (
@@ -115,9 +115,8 @@ class TritonAttnBackend(AttentionBackend):
                 self._gluon_extend_enabled = True
                 _extend_fwd = _gluon_fwd
                 logger.info(
-                    "Gluon extend attention enabled (gfx950 auto-opt-in; "
-                    "set --disable-gluon-extend-attention to fall back to "
-                    "the Triton reference)."
+                    "Gluon extend attention enabled on gfx950 "
+                    "(--enable-gluon-extend-attention)."
                 )
                 try:
                     prewarm_for_model(
