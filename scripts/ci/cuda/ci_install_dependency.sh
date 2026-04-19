@@ -490,7 +490,7 @@ TORCH_LIB="$SITE_PACKAGES/torch/lib"
 VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
 export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 if [ -n "${GITHUB_ENV:-}" ]; then
-    echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+    echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV" || echo "WARNING: Failed to write LD_LIBRARY_PATH to GITHUB_ENV (runner temp file missing)"
 fi
 echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 
