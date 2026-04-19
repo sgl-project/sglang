@@ -99,7 +99,7 @@ Same per-GPU worker pattern as `serving_profile/dynamic/run_dynamic_sweep.sh` (G
   ```
   python -m sglang.bench_eval \
     --base-url http://127.0.0.1:$PORT --backend sglang \
-    --model $BF16_MODEL --tokenizer-path $BF16_MODEL \
+    --model $BF16_MODEL --tokenizer $BF16_MODEL \
     --task gsm8k --num-fewshot 5 --max-gen-toks 512 \
     --apply-chat-template \
     --max-concurrency 256 \
