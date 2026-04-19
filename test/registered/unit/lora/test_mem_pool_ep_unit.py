@@ -107,15 +107,19 @@ class TestNumExpertHelpers(unittest.TestCase):
         model = _make_fake_base_model(num_experts=8)
         self.assertEqual(pool._get_num_local_experts(model), 8)
 
-    def test_num_local_experts_falls_back_when_not_divisible(self):
+    def test_uneven_split_disables_local_mapping(self):
         """Shouldn't happen in practice (base MoE requires even split), but
-        the helper must not silently truncate.
+        `__init__` must fold uneven splits into `moe_use_local_expert_ids ==
+        False` so `_get_num_local_experts` returns the global count and no
+        remapping happens anywhere downstream.
         """
+        # Simulate what `LoRAMemoryPool.__init__` would set for an uneven
+        # split: the divisibility guard there forces the flag to False.
         pool = _make_pool(
             num_experts_global=7,
             moe_ep_size=4,
             moe_ep_rank=0,
-            moe_use_local_expert_ids=True,
+            moe_use_local_expert_ids=False,
         )
         model = _make_fake_base_model(num_experts=7)
         self.assertEqual(pool._get_num_local_experts(model), 7)
@@ -329,6 +333,7 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
         ep_size: int,
         ep_rank: int,
         keeps_global: bool,
+        num_experts: int = 8,
     ) -> LoRAMemoryPool:
         """Construct a pool with `__init__` called, but stop before
         `init_buffers` — we only care about the EP-context state.
@@ -348,6 +353,7 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 num_hidden_layers=1,
                 hidden_size=8,
                 vocab_size=32,
+                num_experts=num_experts,
             )
             base_model = torch.nn.Linear(8, 8, bias=False)
             base_model.config = hf_cfg
@@ -383,6 +389,19 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
         pool = self._new_pool_with_ep(ep_size=4, ep_rank=2, keeps_global=True)
         self.assertEqual(pool.moe_ep_size, 4)
         self.assertEqual(pool.moe_ep_rank, 2)
+        self.assertFalse(pool.moe_use_local_expert_ids)
+
+    def test_ep_with_uneven_split_falls_back_to_global_ids(self):
+        """If `num_experts % ep_size != 0` (shouldn't happen in practice,
+        base MoE requires even split) `__init__` must fall back to
+        globally-keyed buffers rather than silently truncating the local
+        slice — otherwise non-zero ranks drop every LoRA weight.
+        """
+        pool = self._new_pool_with_ep(
+            ep_size=4, ep_rank=1, keeps_global=False, num_experts=7
+        )
+        self.assertEqual(pool.moe_ep_size, 4)
+        self.assertEqual(pool.moe_ep_rank, 1)
         self.assertFalse(pool.moe_use_local_expert_ids)
 
 

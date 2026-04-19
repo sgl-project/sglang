@@ -109,11 +109,16 @@ class LoRAMemoryPool:
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
         # global `topk_ids` -> local expert IDs before the MoE kernel, so
         # per-expert LoRA buffers must be sized and keyed by the local slice.
-        # FlashInfer CUTLASS/CuteDSL/TRTLLM-routed keep global IDs, so buffers
-        # remain globally-keyed there.
+        # FlashInfer CUTLASS/CuteDSL/TRTLLM-routed keep global IDs, and an
+        # uneven expert split (`num_experts % moe_ep_size != 0`, shouldn't
+        # happen in practice) is also treated as globally-keyed so we don't
+        # silently truncate experts.
         self.moe_ep_size, self.moe_ep_rank = _get_moe_ep_context()
+        num_experts_global = self._get_num_experts(base_model)
         self.moe_use_local_expert_ids = (
-            self.moe_ep_size > 1 and not _moe_runner_keeps_global_expert_ids()
+            self.moe_ep_size > 1
+            and not _moe_runner_keeps_global_expert_ids()
+            and num_experts_global % self.moe_ep_size == 0
         )
 
         # Initialize eviction policy
@@ -199,9 +204,10 @@ class LoRAMemoryPool:
 
     def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
         """Experts owned by this rank. Equals the global count when EP is
-        off, the runner keeps global IDs, or the split isn't even."""
+        off, the runner keeps global IDs, or the split isn't even (all
+        three cases fold into `moe_use_local_expert_ids == False`)."""
         total = self._get_num_experts(base_model)
-        if not self.moe_use_local_expert_ids or total % self.moe_ep_size:
+        if not self.moe_use_local_expert_ids:
             return total
         return total // self.moe_ep_size
 
