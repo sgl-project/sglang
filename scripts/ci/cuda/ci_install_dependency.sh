@@ -389,7 +389,7 @@ STABLE_FI_DIR="${HOME}/.cache/flashinfer/_stable_src"
 if [ -d "${HOME}/.cache/flashinfer" ]; then
     STALE_COUNT=0
     while IFS= read -r ninja_file; do
-        FIRST_ISYSTEM=$(grep -oP -- '-isystem \K/tmp/sglang-ci-[^ ]+' "$ninja_file" 2>/dev/null | head -1)
+        FIRST_ISYSTEM=$(grep -o '/tmp/sglang-ci-[^ ]*' "$ninja_file" 2>/dev/null | head -1 || true)
         if [ -n "$FIRST_ISYSTEM" ] && [ ! -d "$FIRST_ISYSTEM" ]; then
             rm -rf "$(dirname "$ninja_file")"
             STALE_COUNT=$((STALE_COUNT + 1))
