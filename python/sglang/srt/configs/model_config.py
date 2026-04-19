@@ -887,7 +887,7 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
-        if self.is_draft_model and self.speculative_draft_model_quantization == "unquant":
+        if self.is_draft_model and self.quantization == "unquant":
             return None
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is not None and not isinstance(quant_cfg, dict):
@@ -987,7 +987,7 @@ class ModelConfig:
         return quant_cfg
 
     def _find_quant_modelslim_config(self):
-        if self.is_draft_model and self.speculative_draft_model_quantization == "unquant":
+        if self.is_draft_model:
             return None
         quant_config_file = Path(self.model_path, "quant_model_description.json")
         quant_cfg = None
@@ -1239,7 +1239,8 @@ class ModelConfig:
                 logger.warning(
                     "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
                 )
-
+        if self.quantization == "unquant":
+            self.quantization = None
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
                 raise ValueError(

@@ -1160,8 +1160,6 @@ class ServerArgs:
             self.mamba_scheduler_strategy = "no_buffer"
 
         # In speculative scenario:
-        # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
-        # - Otherwise, the draft model defaults to the same quantization as the target model.
         if self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
 
