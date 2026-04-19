@@ -120,7 +120,7 @@ jobs:
     timeout-minutes: 240
     env:
       SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
-      SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+      SGLANG_ENABLE_JIT_DEEPGEMM: false
       SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
     steps:
       - name: Checkout code
