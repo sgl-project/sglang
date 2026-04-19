@@ -22,6 +22,9 @@ import yaml
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    is_ltx23_native_variant,
+)
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
     DisaggArgsMixin,
@@ -69,6 +72,16 @@ logger = init_logger(__name__)
 # our validated Wan/MOVA workloads, so use a 130 GiB cutoff to keep H200-class
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
+LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+# H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
+LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+
+
+def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    mode = mode.lower()
+    return mode
 
 
 class Backend(str, Enum):
@@ -175,6 +188,7 @@ class ServerArgs(DisaggArgsMixin):
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
+    ltx2_two_stage_device_mode: str | None = None
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -283,6 +297,7 @@ class ServerArgs(DisaggArgsMixin):
     def _adjust_parameters(self):
         """set defaults and normalize values."""
         self._adjust_offload()
+        self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
         self._adjust_quant_config()
         self._adjust_warmup()
@@ -377,6 +392,62 @@ class ServerArgs(DisaggArgsMixin):
                 self.image_encoder_cpu_offload = True
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = True
+
+    def _adjust_ltx2_two_stage_device_mode(self):
+        is_ltx23_two_stage = self.pipeline_class_name == "LTX2TwoStagePipeline" and (
+            self._is_ltx23_model_path(self.model_path)
+            or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
+        )
+        if not is_ltx23_two_stage:
+            return
+
+        mode = self.ltx2_two_stage_device_mode
+        if mode is None:
+            env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
+            mode = (
+                _normalize_ltx2_two_stage_device_mode(env_mode)
+                if env_mode
+                else self._resolve_default_ltx2_two_stage_device_mode()
+            )
+        else:
+            mode = _normalize_ltx2_two_stage_device_mode(mode)
+
+        if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
+            raise ValueError(
+                f"Invalid ltx2_two_stage_device_mode={mode!r}. "
+                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODES}."
+            )
+
+        self.ltx2_two_stage_device_mode = mode
+
+    def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
+        if not current_platform.is_cuda():
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=snapshot on non-CUDA platform"
+            )
+            return "snapshot"
+
+        device_name = str(current_platform.get_device_name(0)).upper()
+        device_total_memory_gb = (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+        )
+        if (
+            "H200" in device_name
+            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+        ):
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
+                device_name,
+                device_total_memory_gb,
+            )
+            return "resident"
+
+        logger.info(
+            "Automatically set ltx2_two_stage_device_mode=snapshot for CUDA GPU (%s, %.2f GiB total)",
+            device_name,
+            device_total_memory_gb,
+        )
+        return "snapshot"
 
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
@@ -893,6 +964,19 @@ class ServerArgs(DisaggArgsMixin):
             action=StoreBoolean,
             help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
             "Should be enabled in almost all cases",
+        )
+        parser.add_argument(
+            "--ltx2-two-stage-device-mode",
+            type=str,
+            choices=LTX2_TWO_STAGE_DEVICE_MODES,
+            default=ServerArgs.ltx2_two_stage_device_mode,
+            help=(
+                "LTX-2.3 two-stage device residency mode: "
+                "'original' keeps official two-stage semantics without premerged stage2, "
+                "'snapshot' keeps premerged stage2 with snapshot-based release, "
+                "'resident' keeps both transformers resident on GPU. "
+                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
+            ),
         )
         parser.add_argument(
             "--disable-autocast",
