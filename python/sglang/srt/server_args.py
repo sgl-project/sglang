@@ -345,6 +345,11 @@ class ServerArgs:
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
+    # Adaptive prefill reserve. Per-step token budget carved out of the
+    # chunked-prefill budget so that waiting requests whose uncached-prefill
+    # length fits can interleave into the same forward pass as an in-flight
+    # chunked (cold) request. 0 disables the feature.
+    prefill_reserve_budget: int = 0
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
@@ -4257,6 +4262,16 @@ class ServerArgs:
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
+            "--prefill-reserve-budget",
+            type=int,
+            default=ServerArgs.prefill_reserve_budget,
+            help="Per-step token budget reserved from chunked prefill for waiting "
+            "requests that fit. 0 disables the feature. When > 0, the scheduler "
+            "caps the per-step chunk of an in-flight chunked request to leave this "
+            "much budget for small uncached-prefill-length waiters (typical of "
+            "multi-turn agentic workloads with high cache hit).",
+        )
+        parser.add_argument(
             "--prefill-max-requests",
             type=int,
             default=ServerArgs.prefill_max_requests,
@@ -6480,6 +6495,18 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+
+        # Check prefill adaptive reserve tunable
+        assert self.prefill_reserve_budget >= 0, "--prefill-reserve-budget must be >= 0"
+        if (
+            self.prefill_reserve_budget > 0
+            and self.chunked_prefill_size is not None
+            and self.chunked_prefill_size > 0
+        ):
+            assert self.prefill_reserve_budget < self.chunked_prefill_size, (
+                "--prefill-reserve-budget must be < --chunked-prefill-size so the "
+                "chunked request retains budget"
+            )
 
         # Check pdmux
         if self.enable_pdmux:

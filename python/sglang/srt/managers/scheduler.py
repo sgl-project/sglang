@@ -313,6 +313,9 @@ def validate_dflash_request(req: Req) -> Optional[str]:
     return None
 
 
+_PREFILL_RESERVE_PEEK_K = 8
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
@@ -2409,6 +2412,36 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _compute_prefill_reserve(self, chunked_prefill_size: int) -> int:
+        """Return page-aligned total extend of top-K waiting reqs that fit in the reserve budget.
+
+        Uses prefix_indices populated by SchedulePolicy.calc_priority, so no extra
+        radix lookup. A waiting req contributes its ceil-page-aligned extend if,
+        together with prior contributions, it fits in --prefill-reserve-budget
+        (and in chunked_prefill_size minus one page, so the chunked req keeps
+        forward progress). Returns 0 when the feature is disabled or no req fits.
+        """
+        budget = self.server_args.prefill_reserve_budget
+        if budget <= 0:
+            return 0
+
+        page_size = self.page_size
+        budget = min(budget, max(0, chunked_prefill_size - page_size))
+        if budget <= 0:
+            return 0
+
+        reserve = 0
+        for req in self.waiting_queue[:_PREFILL_RESERVE_PEEK_K]:
+            extend = len(req.origin_input_ids) - len(req.prefix_indices)
+            if extend <= 0:
+                continue
+            page_aligned = -(-extend // page_size) * page_size
+            if reserve + page_aligned > budget:
+                continue
+            reserve += page_aligned
+
+        return reserve
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2500,7 +2533,11 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            reserve = self._compute_prefill_reserve(chunked_prefill_size)
+            max_chunk_tokens = chunked_prefill_size - reserve if reserve > 0 else None
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req, max_chunk_tokens=max_chunk_tokens
+            )
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}

@@ -625,7 +625,17 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(self, req: Req, max_chunk_tokens: Optional[int] = None):
+        """Admit the next chunk of an in-flight chunked-prefill request.
+
+        Args:
+            req: the in-flight chunked request.
+            max_chunk_tokens: optional cap on how many tokens this chunk may
+                consume. When set, it takes effect only if strictly smaller
+                than the natural chunk budget (rem_chunk_tokens / rem_total /
+                rem_swa). Used by the adaptive warm-reserve feature to leave
+                budget for waiting warm requests.
+        """
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -636,6 +646,13 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
+
+        if max_chunk_tokens is not None:
+            # Floor at 1 so the chunked_req always makes forward progress even
+            # if the caller asked for an aggressive cap. Callers are expected
+            # to respect page alignment; we do not enforce it here because the
+            # remaining paths already page-align via _update_prefill_budget.
+            _rem_tokens = min(_rem_tokens, max(1, max_chunk_tokens))
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
@@ -669,7 +686,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         paged_input = self.ceil_paged_tokens(req.extend_input_len)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
@@ -743,6 +760,12 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
+            # Same chunked_req singleton invariant protection as add_one_req.
+            # The scheduler asserts at most one chunked_req per step; creating a
+            # second would trip the assertion in get_new_batch_prefill.
+            if has_chunked_req:
+                return AddReqResult.OTHER
+
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
@@ -781,7 +804,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req=has_chunked_req)
 
         # Reserve page_size for page-alignment overhead. The paged allocator
         # may consume up to one extra page per request (see alloc_extend), and
@@ -862,6 +885,14 @@ class PrefillAdder:
                     ),
                 )
             else:
+                # Enforce the chunked_req singleton invariant. The scheduler assumes
+                # at most one chunked_req per step; creating a second would trip the
+                # assertion in get_new_batch_prefill. Historically this was guaranteed
+                # by add_chunked_req consuming the full rem_chunk_tokens, but with the
+                # adaptive warm-reserve feature there can be leftover budget here.
+                if has_chunked_req:
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
