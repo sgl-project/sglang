@@ -3,8 +3,8 @@ from typing import Dict, List, TypedDict
 
 import torch
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import get_config_dtype_str
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
 from sglang.srt.utils import is_hip

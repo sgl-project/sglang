@@ -37,9 +37,14 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils.common import copy_or_rebind_param
-from sglang.srt.utils.common import round_up
+from sglang.srt.utils.common import is_flashinfer_available, round_up
 
 logger = logging.getLogger(__name__)
+
+if is_flashinfer_available():
+    import flashinfer
+else:
+    flashinfer = None
 
 
 @lru_cache(maxsize=1)
@@ -59,6 +64,14 @@ def _prepare_nvfp4_weight_bytes(
     if not swap_weight_nibbles:
         return weight.contiguous()
     return ((weight >> 4) | (weight << 4)).contiguous()
+
+
+def _require_flashinfer():
+    if flashinfer is None:
+        raise RuntimeError(
+            "flashinfer is required for the diffusion NVFP4 FlashInfer path."
+        )
+    return flashinfer
 
 
 class ModelOptQuantConfig(QuantizationConfig):
@@ -479,8 +492,51 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         w = layer.weight.data
         w_swapped = _prepare_nvfp4_weight_bytes(
-            w, swap_weight_nibbles=self.quant_config.swap_weight_nibbles
+            w,
+            swap_weight_nibbles=getattr(self.quant_config, "swap_weight_nibbles", True),
         )
+
+        _, flashinfer_backend = _get_fp4_gemm_op()
+        if flashinfer_backend == "trtllm":
+            flashinfer_ops = _require_flashinfer()
+
+            weight, _ = pad_nvfp4_weight(w_swapped, n_alignment=128, k_alignment=0)
+            scales = layer.weight_scale
+            if scales.shape[0] != weight.shape[0]:
+                pad_n = weight.shape[0] - scales.shape[0]
+                scales = torch.nn.functional.pad(scales, (0, 0, 0, pad_n))
+
+            scale_k = scales.shape[1]
+            weights_padding_cols = 0
+            if scale_k % 4 != 0:
+                padded_scale_k = round_up(scale_k, 4)
+                pad_scale_k = padded_scale_k - scale_k
+                scales = torch.nn.functional.pad(scales, (0, pad_scale_k, 0, 0))
+                pad_weight_k = pad_scale_k * 8
+                weight = torch.nn.functional.pad(weight, (0, pad_weight_k, 0, 0))
+                weights_padding_cols = pad_weight_k
+
+            epilogue_tile_m = 128
+            shuffled_scale_shape = scales.shape
+            if not weight.is_cuda:
+                weight = weight.cuda()
+            if scales.device != weight.device:
+                scales = scales.to(device=weight.device)
+            weight = flashinfer_ops.shuffle_matrix_a(
+                weight.view(torch.uint8), epilogue_tile_m
+            )
+            scales = (
+                flashinfer_ops.shuffle_matrix_sf_a(
+                    scales.view(torch.uint8), epilogue_tile_m
+                )
+                .reshape(shuffled_scale_shape)
+                .view(torch.float8_e4m3fn)
+            )
+
+            layer.weights_padding_cols = weights_padding_cols
+            copy_or_rebind_param(layer, "weight", weight)
+            copy_or_rebind_param(layer, "weight_scale_interleaved", scales)
+            return
         weight, weights_padding_cols = pad_nvfp4_weight(w_swapped)
         layer.weights_padding_cols = weights_padding_cols
         copy_or_rebind_param(layer, "weight", weight)

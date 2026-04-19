@@ -729,11 +729,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Track finish_reason for each index
                 if finish_reason_type:
-                    # If the abort is from scheduler.
-                    if finish_reason_type == "abort":
-                        code = finish_reason.get(
-                            "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
-                        )
+                    # Abort with an explicit error status_code is a system error
+                    # (timeout, OOM, validation): emit a streaming error chunk.
+                    # A graceful abort (no status_code, e.g. user-initiated via
+                    # /abort_request or session lifecycle cleanup) falls through
+                    # to the normal chunk path, matching the non-stream behavior
+                    # in tokenizer_manager._handle_abort_finish_reason.
+                    if finish_reason_type == "abort" and isinstance(
+                        finish_reason.get("status_code"), HTTPStatus
+                    ):
+                        code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
                             code.name,
@@ -741,8 +746,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {error}\n\n"
                         break
-                    else:
-                        finish_reasons[index] = finish_reason
+                    finish_reasons[index] = finish_reason
 
                 # First chunk with role
                 if is_firsts.get(index, True):
