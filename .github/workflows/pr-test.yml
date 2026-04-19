@@ -65,6 +65,7 @@ env:
   SKIP_STAGE_HEALTH_CHECK: 'true'  # TEMP: force-skip on cu13 venv migration branch to fan out all stages
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
 
 permissions:
   actions: write
