@@ -731,7 +731,7 @@ jobs:
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
         runner: [linux-mi325-2gpu-sglang]
-        part: [0, 1]  # 2 partitions: 9 tests ÷ 2 = ~4-5 tests each
+        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (test_disagg_server.py)
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -836,7 +836,7 @@ jobs:
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2 \
+              --total-partitions 3 \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
           # Post-test diagnostics
