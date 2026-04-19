@@ -149,9 +149,12 @@ void flash_attn_kernel_impl(
             /* C     */ s_i);
 
         // apply causal mask
-        if (causal && num_keys - n <= BLOCK_N) {
+        // See [Note] condition to apply causal mask.
+        if (causal && n + n_size - 1 > m) {
           for (int row = 0; row < m_size; ++row) {
             int last_col = m + row - n;
+            // See [Note] mask the entire row if last_col < 0.
+            last_col = std::max(last_col, -1);
             // fill [last_col + 1, n_size) to -inf
             float* row_ptr = s_i + row * BLOCK_N;
             fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
@@ -329,9 +332,12 @@ void flash_attn_varlen_kernel_impl(
             /* C     */ s_i);
 
         // apply causal mask
-        if (causal && num_keys - n <= BLOCK_N) {
+        // See [Note] condition to apply causal mask.
+        if (causal && n + n_size - 1 > m) {
           for (int row = 0; row < m_size; ++row) {
             int last_col = m + row - n;
+            // See [Note] mask the entire row if last_col < 0.
+            last_col = std::max(last_col, -1);
             // fill [last_col + 1, n_size) to -inf
             float* row_ptr = s_i + row * BLOCK_N;
             fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);

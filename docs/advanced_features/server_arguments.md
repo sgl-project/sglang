@@ -382,16 +382,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--dllm-algorithm` | The diffusion LLM algorithm, such as LowConfidence. | `None` | Type: str |
 | `--dllm-algorithm-config` | The diffusion LLM algorithm configurations. Must be a YAML file. | `None` | Type: str |
 
-## Double Sparsity
-| Argument | Description | Defaults | Options |
-| --- | --- | --- | --- |
-| `--enable-double-sparsity` | Enable double sparsity attention | `False` | bool flag (set to enable) |
-| `--ds-channel-config-path` | The path of the double sparsity channel config | `None` | Type: str |
-| `--ds-heavy-channel-num` | The number of heavy channels in double sparsity attention | `32` | Type: int |
-| `--ds-heavy-token-num` | The number of heavy tokens in double sparsity attention | `256` | Type: int |
-| `--ds-heavy-channel-type` | The type of heavy channels in double sparsity attention | `qk` | Type: str |
-| `--ds-sparse-decode-threshold` | The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel. | `4096` | Type: int |
-
 ## Offloading
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
@@ -510,6 +500,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | --- | --- | --- | --- |
 | `--custom-weight-loader` | The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func | `None` | List[str] |
 | `--weight-loader-disable-mmap` | Disable mmap while loading weight using safetensors. | `False` | bool flag (set to enable) |
+| `--weight-loader-prefetch-checkpoints` | Prefetch checkpoint files into OS page cache before loading. Each rank prefetches a fraction of the shards in a background thread, reducing total network I/O on shared filesystems (NFS/Lustre) from N\*checkpoint to 1\*checkpoint. Recommended for models on network storage. | `False` | bool flag (set to enable) |
+| `--weight-loader-prefetch-num-threads` | Number of threads per rank for checkpoint prefetching. | `4` | Type: int |
 | `--remote-instance-weight-loader-seed-instance-ip` | The ip of the seed instance for loading weights from remote instance. | `None` | Type: str |
 | `--remote-instance-weight-loader-seed-instance-service-port` | The service port of the seed instance for loading weights from remote instance. | `None` | Type: int |
 | `--remote-instance-weight-loader-send-weights-group-ports` | The communication group ports for loading weights from remote instance. | `None` | Type: JSON list |

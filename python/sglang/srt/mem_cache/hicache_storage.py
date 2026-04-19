@@ -41,12 +41,16 @@ class PoolName(str, Enum):
 
     KV = "kv"
     MAMBA = "mamba"
+    INDEXER = "indexer"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
-    ALL_PAGES      : every page in [0, kv_hit) must exist (default).
+    ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
     TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
     """
 

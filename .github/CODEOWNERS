@@ -23,6 +23,8 @@
 /python/sglang/srt/eplb @fzyzcjy @ch-wan
 /python/sglang/srt/function_call @CatherineSue @JustinTong0323
 /python/sglang/srt/grpc @CatherineSue @slin1237
+/python/sglang/srt/hardware_backend/mlx @yeahdongcn
+/python/sglang/srt/hardware_backend/musa @yeahdongcn
 /python/sglang/srt/hardware_backend/npu @ping1jing2 @iforgetmyname
 /python/sglang/srt/hardware_backend/npu/quantization @OrangeRedeng @TamirBaydasov @iforgetmyname
 /python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1
@@ -47,7 +49,7 @@
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
 /python/sglang/srt/observability @merrymercy @fzyzcjy @sufeng-buaa
 /python/sglang/srt/ray @Qiaolin-Yu @xyuzh
-/python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
+/python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu
 /sgl-kernel @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237

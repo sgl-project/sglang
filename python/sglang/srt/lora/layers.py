@@ -39,6 +39,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_backend: BaseLoRABackend = lora_backend
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
+        if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
+            self.bias = self.base_layer.bias
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -70,6 +72,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
+        self.num_embeddings = base_layer.num_embeddings
 
         # Embedding LoRA with TP > 1 keeps weights fully replicated
         # (unsharded) on every rank.  This works correctly because the
@@ -797,6 +800,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_backend)
 
         self.experts_shared_outer_loras: bool = False
+        self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
@@ -808,13 +812,20 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
         )
 
-        # initialize triton_lora moe runner for batches with lora enabled
+        # Initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
-        qm = base_layer.quant_method
-        if hasattr(qm, "runner") and qm.runner is not None:
-            runner_backend = qm.runner.runner_backend
+        # Determine runner backend: prefer server arg, fall back to quant method's runner
+        global_backend = get_moe_runner_backend()
+        if not global_backend.is_auto():
+            runner_backend = global_backend
+        elif (
+            hasattr(base_layer.quant_method, "runner")
+            and base_layer.quant_method.runner is not None
+        ):
+            runner_backend = base_layer.quant_method.runner.runner_backend
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
@@ -824,8 +835,25 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             lora_enabled=True,
         )
 
-        # Pre-compute quant info for efficiency (weights don't change during inference)
-        self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+        if runner_backend.is_marlin():
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsFusedMoEMethod,
+            )
+
+            assert isinstance(
+                base_layer.quant_method, CompressedTensorsFusedMoEMethod
+            ), (
+                f"Marlin MoE backend requires CompressedTensorsFusedMoEMethod, "
+                f"got {type(base_layer.quant_method).__name__}"
+            )
+            self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
+        elif runner_backend.is_triton():
+            assert base_layer.quant_method is not None, "Quant method must be set"
+            self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+        else:
+            raise NotImplementedError(
+                f"LoRA MoE not supported for backend {runner_backend}"
+            )
 
     def set_lora_info(
         self,
@@ -876,10 +904,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             num_experts=self.base_layer.num_experts,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
-            has_active_lora=batch_info.has_active_lora,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
+            lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
