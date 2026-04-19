@@ -48,7 +48,7 @@ fi
 # Per-job unique path. Include $$ (shell PID) so concurrent/back-to-back jobs
 # on the same runner never target the same directory even if GITHUB_JOB
 # doesn't differentiate matrix partitions.
-UV_VENV="/tmp/sglang-ci-venv$$"
+UV_VENV="/tmp/sglang-ci-venv"
 SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 # --seed installs pip/setuptools into the venv so bare `pip` calls in
 # cache_nvidia_wheels.sh and the human-eval setup resolve to the venv's
