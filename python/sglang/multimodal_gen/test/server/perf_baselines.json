@@ -1378,26 +1378,27 @@
         },
         "fast_hunyuan_video": {
             "stages_ms": {
-                "DecodingStage": 4586.75,
                 "InputValidationStage": 0.06,
-                "DenoisingStage": 5828.43,
-                "TextEncodingStage": 310.35,
-                "LatentPreparationStage": 0.14,
-                "TimestepPreparationStage": 32.2
+                "TextEncodingStage": 321.95,
+                "TimestepPreparationStage": 28.98,
+                "LatentPreparationStage": 0.13,
+                "DenoisingStage": 5898.72,
+                "DecodingStage": 4736.19,
+                "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 296.26,
-                "1": 853.35,
-                "2": 853.4,
-                "3": 852.1,
-                "4": 853.82,
-                "5": 854.99
+                "0": 286.89,
+                "1": 1115.43,
+                "2": 1118.06,
+                "3": 1124.53,
+                "4": 1130.91,
+                "5": 1119.61
             },
-            "expected_e2e_ms": 11636.47,
-            "expected_avg_denoise_ms": 970.56,
-            "expected_median_denoise_ms": 1104.44,
-            "estimated_full_test_time_s": 131.6
+            "expected_e2e_ms": 11816.27,
+            "expected_avg_denoise_ms": 982.57,
+            "expected_median_denoise_ms": 1118.83
         },
+
         "wan2_2_i2v_a14b_2gpu": {
             "stages_ms": {
                 "InputValidationStage": 18.1,
