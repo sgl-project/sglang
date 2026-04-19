@@ -944,14 +944,22 @@ class FlashInferAttnBackend(AttentionBackend):
 
         cascade_wrapper = self.forward_metadata.cascade_decode_wrapper
         if cascade_wrapper is not None:
-            o = cascade_wrapper.run(
-                q_view,
-                kv_cache,
-                sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
+            prefill_wrappers = cascade_wrapper._batch_prefill_wrappers
+            o, lse = prefill_wrappers[-1].run(
+                q_view, kv_cache,
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
-            )        
+                return_lse=True,
+            )
+            for w in prefill_wrappers[:-1]:
+                o_i, lse_i = w.run(
+                    q_view, kv_cache,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                    return_lse=True,
+                )
+                o, lse = merge_state(o, lse, o_i, lse_i)
+
         else:
             o = decode_wrapper.forward(
                 q_view,
@@ -991,6 +999,7 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.sm_scale = 1.0 / (self.head_dim ** 0.5)
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1308,6 +1317,8 @@ class FlashInferIndicesUpdaterDecode:
             head_dim=self.head_dim,
             page_size=1,
             causal=False,
+            sm_scale=self.sm_scale,
+            logits_soft_cap=None,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
         )
