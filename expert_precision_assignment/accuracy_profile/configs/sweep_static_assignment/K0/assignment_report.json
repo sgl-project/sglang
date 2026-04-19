@@ -1,0 +1,233 @@
+{
+  "slo": {
+    "max_concurrency": 256,
+    "max_prompt_len": 2048,
+    "max_output_len": 2048
+  },
+  "knobs": {
+    "kv_reserve_frac": 0.5,
+    "headroom_gb": 2.0,
+    "headroom_frac": 0.05,
+    "prefill_budget_tokens": 16384,
+    "group_size": 128
+  },
+  "vram_breakdown_bytes": {
+    "total_bytes": 85899345920,
+    "non_moe_bytes": 3082186752,
+    "int4_weights_bytes": 15061745664,
+    "headroom_bytes": 4294967296,
+    "kv_bytes": 51539607552,
+    "activations_bytes": 100663296,
+    "bf16_budget_bytes": 11820175360,
+    "bf16_expert_size_bytes": 9437184,
+    "k_heter_experts": 1252,
+    "k_total_experts": 6144
+  },
+  "K_heter_experts": 0,
+  "num_int4_only": 6144,
+  "per_layer_counts": {
+    "0": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "1": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "2": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "3": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "4": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "5": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "6": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "7": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "8": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "9": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "10": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "11": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "12": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "13": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "14": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "15": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "16": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "17": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "18": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "19": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "20": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "21": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "22": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "23": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "24": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "25": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "26": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "27": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "28": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "29": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "30": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "31": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "32": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "33": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "34": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "35": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "36": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "37": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "38": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "39": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "40": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "41": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "42": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "43": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "44": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "45": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "46": {
+      "heter": 0,
+      "int4_only": 128
+    },
+    "47": {
+      "heter": 0,
+      "int4_only": 128
+    }
+  },
+  "top_scores": [],
+  "zero_layers": [
+    1,
+    21,
+    23,
+    25,
+    27,
+    32,
+    39,
+    46
+  ]
+}
