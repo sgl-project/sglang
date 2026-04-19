@@ -111,7 +111,7 @@ retry_with_backoff() {
 # Authenticate to Docker Hub to avoid anonymous pull rate limits.
 # Credentials are optional; when absent we fall back to unauthenticated pulls.
 if [[ -n "${DOCKERHUB_AMD_USERNAME:-}" && -n "${DOCKERHUB_AMD_TOKEN:-}" ]]; then
-  echo "Logging in to Docker Hub..."
+  echo "Logging in to Docker Hub…"
   if retry_with_backoff 6 sh -c 'echo "${DOCKERHUB_AMD_TOKEN}" | docker login -u "${DOCKERHUB_AMD_USERNAME}" --password-stdin >/dev/null 2>&1'; then
     echo "Docker Hub login successful"
   else
@@ -122,7 +122,7 @@ fi
 # Find the latest image
 find_latest_image() {
   local gpu_arch=$1
-  local base_tag days_back image_tag
+  local base_tag days_back image_tag image_id remote_tags
 
   case "${gpu_arch}" in
       mi30x) base_tag="${MI30X_BASE_TAG}" ;;
@@ -130,19 +130,22 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache
+  # First, check local cache on the runner.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
-    local local_image="rocm/sgl-dev:${image_tag}"
-    image_id=$(docker images -q "${local_image}")
+    image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
     if [[ -n "$image_id" ]]; then
-        echo "Found cached image locally: ${local_image}" >&2
-        echo "${local_image}"
-        return 0
+      echo "Found cached image locally: rocm/sgl-dev:${image_tag}" >&2
+      echo "rocm/sgl-dev:${image_tag}"
+      return 0
     fi
   done
 
-  # If not found locally, fall back to pulling from public registry
+  # If not found locally, fall back to pulling from public registry.
+  # See amd_ci_start_container.sh for why we don't probe
+  # ${LOCAL_DOCKER_REGISTRY} with `docker manifest inspect --insecure` from
+  # the runner pod's network namespace; the actual local-registry pull
+  # happens at the call site below via the docker daemon on the host.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
@@ -157,7 +160,7 @@ find_latest_image() {
   echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    local remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1)
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
     if [[ -n "$remote_tags" ]]; then
       echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
       echo "rocm/sgl-dev:${remote_tags}"
@@ -202,7 +205,9 @@ find_latest_image() {
 IMAGE=$(find_latest_image "${GPU_ARCH}")
 # Try the local docker registry first (avoids Docker Hub rate limits and is
 # faster on the LAN); if that fails for any reason, fall back to the
-# public registry with exponential-backoff retries.
+# public registry with exponential-backoff retries. Capture stderr so the
+# real failure reason (TLS handshake, 404, connection refused, etc.) is
+# visible in the job log instead of being silently swallowed.
 if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
   echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
   docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"

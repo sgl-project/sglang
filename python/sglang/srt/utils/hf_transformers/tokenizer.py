@@ -30,12 +30,12 @@ from sglang.srt.utils import is_remote_url, logger
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
+from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
 )
-from .compat import _ensure_gguf_version, patch_is_base_mistral_in_ci
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
     patch_mistral_common_tokenizer,
@@ -462,7 +462,6 @@ def get_tokenizer(
             kwargs["use_fast"] = True
 
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
-    patch_is_base_mistral_in_ci()
 
     common_kwargs = dict(
         trust_remote_code=trust_remote_code,
