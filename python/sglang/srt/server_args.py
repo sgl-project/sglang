@@ -1896,40 +1896,6 @@ class ServerArgs:
                 logger.warning(
                     "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model with hierarchical cache"
                 )
-                full_kv_heads = getattr(
-                    hf_config,
-                    "num_key_value_heads",
-                    getattr(hf_config, "num_attention_heads", None),
-                )
-                swa_kv_heads = getattr(
-                    hf_config, "swa_num_key_value_heads", full_kv_heads
-                )
-                full_head_dim = getattr(hf_config, "head_dim", None)
-                swa_head_dim = getattr(hf_config, "swa_head_dim", full_head_dim)
-                full_v_head_dim = getattr(hf_config, "v_head_dim", full_head_dim)
-                swa_v_head_dim = getattr(hf_config, "swa_v_head_dim", swa_head_dim)
-
-                def local_kv_heads(num_kv_heads):
-                    if num_kv_heads is None:
-                        return None
-                    if num_kv_heads >= self.tp_size:
-                        return num_kv_heads // self.tp_size
-                    return 1
-
-                if (
-                    local_kv_heads(full_kv_heads) != local_kv_heads(swa_kv_heads)
-                    or full_head_dim != swa_head_dim
-                    or full_v_head_dim != swa_v_head_dim
-                ):
-                    raise ValueError(
-                        "Hierarchical cache is not supported for "
-                        "MiMoV2FlashForCausalLM when hybrid SWA memory must be "
-                        "disabled and the full/SWA KV geometry differs. "
-                        f"full=(local_kv_heads={local_kv_heads(full_kv_heads)}, "
-                        f"head_dim={full_head_dim}, v_head_dim={full_v_head_dim}), "
-                        f"swa=(local_kv_heads={local_kv_heads(swa_kv_heads)}, "
-                        f"head_dim={swa_head_dim}, v_head_dim={swa_v_head_dim})."
-                    )
                 self.disable_hybrid_swa_memory = True
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
