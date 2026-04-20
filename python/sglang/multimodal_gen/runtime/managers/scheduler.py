@@ -4,12 +4,17 @@
 import asyncio
 import os
 import pickle
+import tempfile
 from collections import deque
 from typing import Any, List
 
 import zmq
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
+    SchedulerDisaggMixin,
+)
+from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     save_image_to_path,
@@ -19,6 +24,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -42,7 +48,7 @@ logger = init_logger(__name__)
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
-class Scheduler:
+class Scheduler(SchedulerDisaggMixin):
     """
     Runs the main event loop for the rank 0 worker.
     It listens for external requests via ZMQ and coordinates with other workers.
@@ -56,9 +62,16 @@ class Scheduler:
         port_args: PortArgs,
         task_pipes_to_slaves: list = None,
         result_pipes_from_slaves: list = None,
+        local_rank: int | None = None,
     ):
         self.server_args = server_args
         self.port_args = port_args
+
+        # local_rank is the physical GPU index for torch.cuda.set_device.
+        # In non-disagg mode, it equals gpu_id. In disagg mode, it may differ
+        # (e.g., denoiser rank 0 on physical GPU 1).
+        if local_rank is None:
+            local_rank = gpu_id
 
         set_global_server_args(server_args=server_args)
 
@@ -75,7 +88,7 @@ class Scheduler:
             self.receiver = None
 
         worker = GPUWorker(
-            local_rank=gpu_id,
+            local_rank=local_rank,
             master_port=port_args.master_port,
             rank=gpu_id,
             server_args=server_args,
@@ -94,6 +107,7 @@ class Scheduler:
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
+            GetDisaggStatsReq: self._handle_get_disagg_stats,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
@@ -112,6 +126,21 @@ class Scheduler:
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
+
+        self._init_disagg_state(server_args, local_rank)
+
+    def get_disagg_metrics(self) -> dict | None:
+        """Return disagg role metrics snapshot, or None if not in disagg mode."""
+        if self._disagg_metrics is None:
+            return None
+        return self._disagg_metrics.snapshot().to_dict()
+
+    def _handle_get_disagg_stats(self, _reqs: List[Any]) -> OutputBatch:
+        """Handle stats request — return disagg metrics via OutputBatch.output."""
+        stats = self.get_disagg_metrics()
+        return OutputBatch(
+            output=stats or {"role": "monolithic", "message": "not in disagg mode"}
+        )
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
@@ -165,6 +194,7 @@ class Scheduler:
                 )
             else:
                 logger.info("Processing warmup req...")
+
         return self.worker.execute_forward(reqs)
 
     def return_result(
@@ -198,32 +228,24 @@ class Scheduler:
             # insert warmup reqs constructed with each warmup-resolution
             self._warmup_total = len(self.server_args.warmup_resolutions)
             self._warmup_processed = 0
+            task_type = self.server_args.pipeline_config.task_type
+
+            requires_warmup_image = task_type.accepts_image_input()
+            warmup_input_path = None
+            if requires_warmup_image:
+                warmup_input_path = self._prepare_shared_warmup_image_path()
 
             for resolution in self.server_args.warmup_resolutions:
                 width, height = _parse_size(resolution)
-                task_type = self.server_args.pipeline_config.task_type
 
-                if task_type in (
-                    ModelTaskType.I2I,
-                    ModelTaskType.TI2I,
-                    ModelTaskType.I2V,
-                    ModelTaskType.TI2V,
-                ):
-                    uploads_dir = os.path.join("outputs", "uploads")
-                    os.makedirs(uploads_dir, exist_ok=True)
-                    input_path = asyncio.run(
-                        save_image_to_path(
-                            MINIMUM_PICTURE_BASE64_FOR_WARMUP,
-                            os.path.join(uploads_dir, "warmup_image.jpg"),
-                        )
-                    )
+                if requires_warmup_image:
                     req = Req(
                         data_type=task_type.data_type(),
                         width=width,
                         height=height,
                         prompt="",
                         negative_prompt="",
-                        image_path=[input_path],
+                        image_path=[warmup_input_path],
                     )
                 else:
                     req = Req(
@@ -236,6 +258,53 @@ class Scheduler:
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
+
+    def _prepare_shared_warmup_image_path(self) -> str:
+        world_group = get_world_group()
+        src_rank = world_group.ranks[0]
+
+        warmup_sync: dict[str, str | None]
+        if world_group.rank == src_rank:
+            try:
+                if self.server_args.input_save_path is not None:
+                    uploads_dir = self.server_args.input_save_path
+                    os.makedirs(uploads_dir, exist_ok=True)
+                else:
+                    uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
+                warmup_image_base = os.path.join(uploads_dir, "warmup_image")
+                input_path = asyncio.run(
+                    save_image_to_path(
+                        MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+                        warmup_image_base,
+                    )
+                )
+                warmup_sync = {"input_path": input_path, "error": None}
+            except Exception as e:
+                warmup_sync = {"input_path": None, "error": str(e)}
+        else:
+            warmup_sync = {}
+
+        # Sync rank 0's warmup-image write result (path or error) to all ranks.
+        warmup_sync = broadcast_pyobj(
+            warmup_sync,
+            world_group.rank,
+            world_group.cpu_group,
+            src=src_rank,
+        )
+        if not isinstance(warmup_sync, dict):
+            raise RuntimeError("Invalid warmup sync payload received across ranks")
+
+        error = warmup_sync.get("error")
+        if error is not None:
+            raise RuntimeError(
+                f"Warmup image preparation failed on rank {src_rank}: {error}"
+            )
+
+        input_path = warmup_sync.get("input_path")
+        if not isinstance(input_path, str) or not input_path:
+            raise RuntimeError("Warmup image preparation returned empty input path")
+
+        return input_path
 
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: List[tuple[bytes, Any]]
@@ -322,12 +391,20 @@ class Scheduler:
         The main event loop that listens for ZMQ requests.
         Handles abortion
         """
+        # Pool mode: all roles use the pool event loop
+        if self._disagg_role != RoleType.MONOLITHIC:
+            self._disagg_event_loop()
+            return
 
         logger.debug(
             f"Rank 0 scheduler listening on tcp://*:{self.server_args.scheduler_port}"
         )
 
         while self._running:
+            # Update queue depth for metrics
+            if self._disagg_metrics:
+                self._disagg_metrics.update_queue_depth(len(self.waiting_queue))
+
             # 1: receive requests
             try:
                 new_reqs = self.recv_reqs()
@@ -363,6 +440,10 @@ class Scheduler:
 
             try:
                 processed_req = reqs[0]
+                is_warmup = (
+                    processed_req.is_warmup if isinstance(processed_req, Req) else False
+                )
+
                 handler = self.request_handlers.get(type(processed_req))
                 if handler:
                     output_batch = handler(reqs)
@@ -375,16 +456,10 @@ class Scheduler:
                     f"Error executing request in scheduler event loop: {e}",
                     exc_info=True,
                 )
-                # Determine appropriate error response format
-                output_batch = (
-                    OutputBatch(error=str(e))
-                    if reqs and isinstance(reqs[0], Req)
-                    else OutputBatch(error=str(e))
-                )
+                output_batch = OutputBatch(error=str(e))
 
             # 3. return results
             try:
-                # log warmup info
                 is_warmup = (
                     processed_req.is_warmup if isinstance(processed_req, Req) else False
                 )
@@ -406,7 +481,7 @@ class Scheduler:
                                 f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processing failed"
                             )
                         else:
-                            logger.info(f"Warmup req processing failed")
+                            logger.info("Warmup req processing failed")
 
                 # TODO: Support sending back to multiple identities if batched
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
@@ -417,6 +492,7 @@ class Scheduler:
 
         if self.receiver is not None:
             self.receiver.close()
+        self._cleanup_disagg()
         self.context.destroy(linger=0)
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:

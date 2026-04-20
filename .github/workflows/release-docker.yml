@@ -32,6 +32,9 @@ jobs:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
 
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -83,7 +86,7 @@ jobs:
           version=${{ steps.version.outputs.version }}
 
           docker buildx build \
-            --target framework \
+            --target framework_final \
             --platform linux/amd64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
@@ -106,7 +109,7 @@ jobs:
           version=${{ steps.version.outputs.version }}
 
           docker buildx build \
-            --target framework \
+            --target framework_final \
             --platform linux/amd64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
@@ -139,6 +142,9 @@ jobs:
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -180,7 +186,7 @@ jobs:
           version=${{ steps.version.outputs.version }}
 
           docker buildx build \
-            --target framework \
+            --target framework_final \
             --platform linux/arm64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
@@ -203,7 +209,7 @@ jobs:
           version=${{ steps.version.outputs.version }}
 
           docker buildx build \
-            --target framework \
+            --target framework_final \
             --platform linux/arm64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \

@@ -18,6 +18,9 @@ jobs:
   publish-x86:
     if: github.repository == 'sgl-project/sglang'
     environment: "prod"
+    outputs:
+      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
+      digest-cu130: ${{ steps.build-cu130.outputs.digest }}
     strategy:
       matrix:
         variant:
@@ -28,6 +31,9 @@ jobs:
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -75,6 +81,7 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Build and Push AMD64 Runtime
+        id: build-cu129
         run: |
           version=${{ steps.version.outputs.version }}
 
@@ -94,9 +101,10 @@ jobs:
 
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-runtime.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest-cu129-amd64-runtime.txt
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
       - name: Build and Push AMD64 Runtime (CUDA 13)
+        id: build-cu130
         run: |
           version=${{ steps.version.outputs.version }}
 
@@ -116,18 +124,14 @@ jobs:
 
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-runtime.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest-cu130-amd64-runtime.txt
-
-      - name: Upload digests
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-amd64
-          path: /tmp/digest-*.txt
-          retention-days: 1
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
   publish-arm64:
     if: github.repository == 'sgl-project/sglang'
     environment: "prod"
+    outputs:
+      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
+      digest-cu130: ${{ steps.build-cu130.outputs.digest }}
     strategy:
       matrix:
         variant:
@@ -138,6 +142,9 @@ jobs:
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -174,6 +181,7 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Build and Push ARM64 Runtime
+        id: build-cu129
         run: |
           version=${{ steps.version.outputs.version }}
 
@@ -193,9 +201,10 @@ jobs:
 
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-runtime.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest-cu129-arm64-runtime.txt
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
       - name: Build and Push ARM64 Runtime (CUDA 13)
+        id: build-cu130
         run: |
           version=${{ steps.version.outputs.version }}
 
@@ -214,14 +223,7 @@ jobs:
 
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-runtime.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest-cu130-arm64-runtime.txt
-
-      - name: Upload digests
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-arm64
-          path: /tmp/digest-*.txt
-          retention-days: 1
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
   create-manifests:
     runs-on: ubuntu-22.04
@@ -263,26 +265,14 @@ jobs:
 
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Download amd64 digests
-        uses: actions/download-artifact@v4
-        with:
-          name: digests-amd64
-          path: /tmp/digests/amd64
-
-      - name: Download arm64 digests
-        uses: actions/download-artifact@v4
-        with:
-          name: digests-arm64
-          path: /tmp/digests/arm64
-
       - name: Create multi-arch manifests
         run: |
           version=${{ steps.version.outputs.version }}
 
-          CU129_AMD64_RT=$(cat /tmp/digests/amd64/digest-cu129-amd64-runtime.txt)
-          CU130_AMD64_RT=$(cat /tmp/digests/amd64/digest-cu130-amd64-runtime.txt)
-          CU129_ARM64_RT=$(cat /tmp/digests/arm64/digest-cu129-arm64-runtime.txt)
-          CU130_ARM64_RT=$(cat /tmp/digests/arm64/digest-cu130-arm64-runtime.txt)
+          CU129_AMD64_RT=${{ needs.publish-x86.outputs.digest-cu129 }}
+          CU130_AMD64_RT=${{ needs.publish-x86.outputs.digest-cu130 }}
+          CU129_ARM64_RT=${{ needs.publish-arm64.outputs.digest-cu129 }}
+          CU130_ARM64_RT=${{ needs.publish-arm64.outputs.digest-cu130 }}
 
           # Create versioned runtime manifest
           docker buildx imagetools create \

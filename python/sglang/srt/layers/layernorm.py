@@ -65,11 +65,14 @@ if _is_cuda or _is_xpu:
         gemma_rmsnorm,
         rmsnorm,
     )
+_has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 if _use_aiter:
+    from aiter import layernorm2d_fwd as layer_norm
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
+    _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
 elif _is_hip:
     try:
@@ -181,6 +184,10 @@ class RMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if x.numel() == 0:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return x, residual
             return x
         # sgl_kernel rmsnorm requires 2D input; reshape higher-rank tensors
         needs_reshape = x.dim() != 2 and residual is None
@@ -428,7 +435,18 @@ class LayerNorm(MultiPlatformOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        if (
+            _has_aiter_layer_norm
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.dtype == self.dtype
+        ):
+            orig_shape = x.shape
+            x = x.reshape(-1, self.hidden_size)
+            return layer_norm(x, self.weight, self.bias, self.variance_epsilon).view(
+                orig_shape
+            )
+        else:
+            return self.forward_native(x)
 
     def forward_npu(
         self,
@@ -458,6 +476,16 @@ class GemmaRMSNorm(MultiPlatformOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        self.register_buffer("gemma_weight", self.weight.data + 1.0, persistent=False)
+        # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
+        # If TRTLLM allreduce fusion ever provides gemma-style norm
+        # natively, this can be removed.
+        self.weight.weight_loader = self._weight_loader
+
+    def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        assert param.size() == loaded_weight.size()
+        param.data.copy_(loaded_weight)
+        self.gemma_weight = param.data + 1.0
 
     def _forward_impl(
         self,
@@ -518,7 +546,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
-        w = self.weight.data + 1.0
+        w = self.gemma_weight
         if _use_aiter:
             # aiter API: rms_norm(input, weight, eps) -> output
             #            fused_add_rms_norm(output, input, residual, residual_out, weight, eps)
@@ -602,13 +630,12 @@ class GemmaRMSNorm(MultiPlatformOp):
         use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
-        # TODO(brayden): we can see if TRTLLM allreduce fusion can provide gemma-style norm
         return _forward_with_allreduce_fusion(
             self,
             x,
             residual,
             post_residual_addition,
-            self.weight + 1.0,
+            self.gemma_weight,
             use_attn_tp_group=True,
         )
 
@@ -681,6 +708,13 @@ class Gemma4RMSNorm(MultiPlatformOp):
         if self.with_scale:
             normed_output = normed_output * (self.weight.float() + self.scale_shift)
         return normed_output.type_as(x)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
+                x, self.weight.data, self.eps, self.scale_shift, self.with_scale
+            )
+        return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() == 0:
