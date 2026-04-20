@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    build_nsa_hybrid_stack,
+    attach_hybrid_nsa_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -80,7 +80,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
-            # Filled by build_nsa_hybrid_stack after storage extra_config is parsed.
+            # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -121,7 +121,7 @@ class HiRadixCache(RadixCache):
 
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, NSATokenToKVPool):
-            build_nsa_hybrid_stack(
+            attach_hybrid_nsa_pool_to_hiradix_cache(
                 self,
                 params,
                 server_args,
