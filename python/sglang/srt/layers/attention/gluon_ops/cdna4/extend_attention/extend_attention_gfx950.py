@@ -895,23 +895,40 @@ def gluon_extend_attention_fwd(
         )
 
     def _run_config_cache_entry(_cc_entry):
-        """Execute a cache hit. Returns nothing; caller must `return` after."""
+        """Execute a cache hit. Returns nothing; caller must `return` after.
+         
+        CRITICAL: we MUST recompute strides from the current call's tensors
+        rather than reusing `_cc_entry`'s cached strides. The cached
+        CompiledKernel closure is correct for ANY tensor shape that matches
+        the cache-key tuple, but strides are per-call runtime args (passed
+        through HIPLauncher's arg list, not baked as constexprs). Using the
+        FIRST install's strides for layer N!=0 silently reads the wrong
+        memory when e.g. the caller's per-layer k_buffer allocation reports
+        a different stride(0) / stride(1) than the prewarm tensors did.
+        That was the root cause of the Llama-70B BF16 quality regression
+        (Apr 2026): per-layer error compounded from ~0.1 at layer 0 to
+        ~3.0 at layer 79, producing garbled text.
+        """
         _mi_n = q_extend.shape[0] + 1
         _wkvo_n = max(1, batch_size)
         if _dummy_mi_size < _mi_n or _dummy_wkvo_size < _wkvo_n or _dummy_sinks is None:
             _ensure_dummies(q_extend.device, _mi_n, _wkvo_n)
-        # Route real tensor pointers through to the kernel. When caller
-        # didn't supply sinks / window_kv_offsets, pass the dummy; the kernel
-        # body ignores them under HAS_SINK=False / SLIDING_WINDOW_SIZE<0.
         _sinks_arg = sinks if sinks is not None else _dummy_sinks
         _wkvo_arg = (
             window_kv_offsets
             if window_kv_offsets is not None
             else _dummy_wkvo[:_wkvo_n]
         )
+        _live_strides = (
+            q_extend.stride(0), q_extend.stride(1),
+            k_extend.stride(0), k_extend.stride(1),
+            v_extend.stride(0), v_extend.stride(1),
+            o_extend.stride(0), o_extend.stride(1),
+            k_buffer.stride(0), k_buffer.stride(1),
+            v_buffer.stride(0), v_buffer.stride(1),
+        )
         _tag = _cc_entry[0]
         if _tag == "fast":
-            # Fast path: CompiledKernel direct-call, ~8us launch vs ~55us via JITFunction.run.
             _, _cc_run, _cc_sm, _cc_strides, _cc_BM = _cc_entry
             _cc_run(
                 q_extend, k_extend, v_extend, o_extend,
@@ -919,15 +936,15 @@ def gluon_extend_attention_fwd(
                 qo_indptr, kv_indptr, kv_indices,
                 _dummy_cm, _dummy_mi[:_mi_n],
                 _wkvo_arg, _sinks_arg,
-                _cc_sm, _cc_strides,
+                _cc_sm, _live_strides,
                 (batch_size, head_num,
                  (max_len_extend + _cc_BM - 1) // _cc_BM),
             )
         else:
-            # Legacy path (FP8): still goes through JITFunction.run with baked kwargs.
-            # FP8 still bakes Sinks/WindowKvOffsets in frozen_kw, so per-call
-            # dispatch must mutate those fields before the launch (rare path,
-            # FP8 KV is small surface area and not used by GPT-OSS).
+            # Legacy path (FP8): still goes through JITFunction.run with
+            # baked kwargs. The strides are still fresh per call (passed
+            # positionally below), so this path was never affected by the
+            # stale-stride bug above.
             _, _cc_run, _cc_sm, _cc_gn, _cc_strides, _cc_kw, _cc_BM = _cc_entry
             if "Sinks" in _cc_kw:
                 _cc_kw = {**_cc_kw, "Sinks": _sinks_arg}
@@ -937,7 +954,7 @@ def gluon_extend_attention_fwd(
                 qo_indptr, kv_indptr, kv_indices,
                 _dummy_cm, _dummy_mi[:_mi_n],
                 _wkvo_arg,
-                _cc_sm, _cc_gn, *_cc_strides,
+                _cc_sm, _cc_gn, *_live_strides,
                 grid=(batch_size, head_num,
                       (max_len_extend + _cc_BM - 1) // _cc_BM),
                 **_cc_kw,
@@ -1005,18 +1022,56 @@ def gluon_extend_attention_fwd(
     # WCA's scheduler overhead. The per-head-dim gates below are calibrated
     # against bench_real_het.py. D256 keeps the basic dispatch (the tuned
     # tree already handles ragged well enough and WCA BM=256 has LDS issues).
-    if _is_ragged and Lq <= 128:
+    #
+    # Fast short-circuit: for Lq=128/BF16 and B<=4 (not _is_ragged_pfx),
+    # every WCA clause requires B>=5 or B>=8 -- we can skip the entire
+    # waste_frac / _use_wca computation and fall straight through to the
+    # late cache. This trims ~10us of per-call Python overhead on the
+    # hot Llama-70B BF16 prefill shapes (B in {2,3}) that dominate
+    # production traffic. FP8 and D=64 paths still need the full block.
+    _skip_wca_check = (
+        Lq == 128
+        and not _kv_is_fp8
+        and not _is_ragged_pfx
+        and batch_size <= 4
+    )
+    if _is_ragged and Lq <= 128 and not _skip_wca_check:
         _total_ext = q_extend.shape[0]
         _grid_est = batch_size * max_len_extend
         _waste_frac = 1.0 - _total_ext / max(1, _grid_est)
         _total_pfx_est = _total_pfx_est_pre
         if Lq == 128:
+            # B<=4 het prefill: the basic fast_run closure (BM=64 NW=4 NS=2)
+            # beats the WCA persistent launcher across the (max_ext in
+            # [1024, 4096], waste in {mild, strong}) surface. Per
+            # bench_wca_vs_basic_smallB.py (N=50 per point, Apr 2026):
+            #
+            #   geomean(WCA/basic)      basic wins ~ 1.22x
+            #   B=2: 1.22x              basic wins ~ 1.25x
+            #   B=3: 1.25x              basic wins ~ 1.09x
+            #   B=4: 1.09x
+            #   B=5: 0.99x (tie)
+            #   B=6: 1.11x              mixed, tie or basic
+            #   B=7: 0.96x (WCA wins)
+            #   B=8: 1.05x (tie)
+            #
+            # B=5+ is where WCA's cross-sequence tile rebalancing
+            # reliably dominates its ~25us Python-side setup (cum_tiles
+            # buffer prep, persistent grid sizing, WCA inline-scan
+            # slot accounting). Below B=5 basic wins on both the CPU
+            # (one kernel launch via fast_run -- no slot-scan, no
+            # reshape) and the GPU (per-seq tile grid is already
+            # balanced when there are few seqs). Keeping B<=4 on basic
+            # is the single biggest serving-side win on real Llama-70B
+            # BF16 prefill traffic, which is dominated by B in
+            # {1, 2, 3, 7, 9, 10} (see the profiler dump referenced in
+            # bench_serving_shapes.py).
             _use_wca = (
                 _is_ragged_pfx
-                or (max_len_extend >= 1024 and _waste_frac > 0.05)
+                or (max_len_extend >= 1024 and _waste_frac > 0.05 and batch_size >= 5)
                 or (batch_size >= 8 and _total_pfx_est >= batch_size * 1024)
                 or (batch_size >= 8 and max_len_extend >= 768 and _waste_frac >= 0.4)
-                or (max_len_extend >= 768 and _waste_frac >= 0.2 and batch_size >= 4)
+                or (max_len_extend >= 768 and _waste_frac >= 0.2 and batch_size >= 5)
                 or (batch_size >= 16 and _waste_frac >= 0.2)
             )
         else:

@@ -251,7 +251,9 @@ class TestGluonSupports(CustomTestCase):
             q = self._mktensor((4, 8, D))
             v = self._mktensor((4, 4, D))
             kb = self._mktensor((16, 4, D))
-            self.assertFalse(_gluon_supports(q, v, kb, custom_mask=None))
+            self.assertFalse(
+                _gluon_supports(q, v, kb, custom_mask=None, is_causal=True)
+            )
 
     def test_mismatched_lq_lv_falls_back(self):
         """MLA / mixed-dim shapes (Lq != Lv) route to Triton instead
@@ -260,7 +262,9 @@ class TestGluonSupports(CustomTestCase):
         q = self._mktensor((4, 8, 192))
         v = self._mktensor((4, 4, 128))
         kb = self._mktensor((16, 4, 192))
-        self.assertFalse(_gluon_supports(q, v, kb, custom_mask=None))
+        self.assertFalse(
+            _gluon_supports(q, v, kb, custom_mask=None, is_causal=True)
+        )
 
     def test_fp8_kv_with_custom_mask_on_d128_falls_back(self):
         from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
@@ -268,7 +272,22 @@ class TestGluonSupports(CustomTestCase):
         v = self._mktensor((4, 4, 128), dtype=torch.bfloat16)
         kb = self._mktensor((16, 4, 128), dtype=torch.float8_e4m3fnuz)
         self.assertFalse(
-            _gluon_supports(q, v, kb, custom_mask=torch.empty(1, device="meta"))
+            _gluon_supports(
+                q, v, kb,
+                custom_mask=torch.empty(1, device="meta"),
+                is_causal=True,
+            )
+        )
+
+    def test_non_causal_falls_back(self):
+        """Non-causal extend (encoder / vision tower) is not supported by
+        the Gluon kernel family yet -- ensure we fall back to Triton."""
+        from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
+        q = self._mktensor((4, 8, 128))
+        v = self._mktensor((4, 4, 128))
+        kb = self._mktensor((16, 4, 128))
+        self.assertFalse(
+            _gluon_supports(q, v, kb, custom_mask=None, is_causal=False)
         )
 
     def test_supported_combos_pass(self):
@@ -277,7 +296,9 @@ class TestGluonSupports(CustomTestCase):
             q = self._mktensor((4, 8, D))
             v = self._mktensor((4, 4, D))
             kb = self._mktensor((16, 4, D))
-            self.assertTrue(_gluon_supports(q, v, kb, custom_mask=None))
+            self.assertTrue(
+                _gluon_supports(q, v, kb, custom_mask=None, is_causal=True)
+            )
 
     def test_make_extend_attention_fwd_returns_fallback_on_import_failure(self):
         """If Gluon fails to import, make_extend_attention_fwd must return
