@@ -539,39 +539,37 @@ def _launch_persistent(
 
     device = q_extend.device
     n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
-    # Uniform upper bound -- used for SPLIT_K heuristic and as a fallback
-    # grid sizer. For mode 0 (cum_tiles binary search) the kernel honors
-    # the exact count via cum_tiles_per_batch, so over-provisioning the
-    # grid is safe. For mode 1 (WCA) we decide upper-bound vs exact count
-    # based on batch skew: uniform/near-uniform -> upper bound (sync-free),
-    # highly-skewed -> exact (pays ~15us CPU sync but avoids many invalid
-    # CTAs doing WCA scans to find no work).
+    # Loose upper bound: batch_size * n_m_tiles (each seq gets at most
+    # n_m_tiles independent tiles). Used for SPLIT_K decision.
     total_output_tiles_upper = batch_size * head_num * n_m_tiles
     if total_output_tiles_upper == 0:
         return
 
+    # Tight sync-free upper bound on sum(ceil(ext_i / BM)):
+    #   sum(ceil(ext_i/BM)) <= (sum(ext_i) + batch*(BM-1)) / BM
+    #                       = (q_extend.shape[0] + batch*(BM-1)) / BM
+    # This is at most `batch + floor(total_ext/BM)` tiles, vs the loose
+    # bound `batch * ceil(max_ext/BM)`. For heterogeneous batches the
+    # tight bound can be 3-4x smaller, cutting the WCA kernel's empty-
+    # slot scans proportionally. Replaces the old `_wca_total_seq_tiles`
+    # path (which did a 35us .item() sync) with a pure-Python int
+    # calculation that costs ~200 ns.
+    total_extend_rows = q_extend.shape[0]
+    total_output_tiles_tight = (
+        (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
+    ) * head_num
+
     TILE_MAP_MODE = _effective_tile_map_mode(_force_tile_map_mode)
     if TILE_MAP_MODE == 1:
-        # The WCA kernel's inline scan tolerates over-provisioned slots
-        # (is_valid_tile=False). For near-uniform batches the upper bound
-        # is essentially exact, so skip the 15-30us .item() sync. Only
-        # pay the sync when the batch is skewed enough that empty-slot
-        # scanning would waste meaningful CU cycles.
-        #
-        # Uniformity proxy: min_len_extend / max_len_extend. We already
-        # computed min_len_extend (defaulted to max when SGLang didn't
-        # thread it, so uniform-looking by default). Threshold 0.5 keeps
-        # the sync for batches where >=50% of CTAs would scan empty slots.
-        _uniformity = min_len_extend / max(1, max_len_extend)
-        if _uniformity >= 0.5:
-            total_output_tiles = total_output_tiles_upper
-            cum_tiles_per_batch = _ensure_splitk_dummy(device)
-        else:
-            _total_seq_tiles = _wca_total_seq_tiles(qo_indptr, BLOCK_M, batch_size)
-            total_output_tiles = _total_seq_tiles * head_num
-            cum_tiles_per_batch = _ensure_splitk_dummy(device)
+        # WCA's inline scan tolerates empty slots. Pass the tight bound
+        # so the grid size and CTA loop are tuned to within ~0-15% of
+        # the exact count, with zero CPU sync cost.
+        total_output_tiles = total_output_tiles_tight
+        cum_tiles_per_batch = _ensure_splitk_dummy(device)
     else:
-        total_output_tiles = total_output_tiles_upper
+        # cum_tiles path (mode 0) uses the exact GPU-computed per-seq
+        # counts; total_output_tiles just sets the grid-size fallback.
+        total_output_tiles = total_output_tiles_tight
         cum_tiles_per_batch = _ensure_cum_tiles(qo_indptr, BLOCK_M, head_num, batch_size)
 
     num_CUs = _get_num_CUs(device)
@@ -633,13 +631,14 @@ def _launch_persistent(
         'TILE_MAP_MODE': TILE_MAP_MODE,
         '_num_warps': num_warps,
     }
+    # Single .stride() call per tensor (6 calls -> 12 int unpacks) is
+    # ~2x faster than 12 .stride(i) calls on the hot path. See microbench
+    # in bench_stride_calls.py: 636 ns vs 1410 ns per block.
+    _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
+    _os = o_extend.stride(); _kbs = k_buffer.stride(); _vbs = v_buffer.stride()
     _strides = (
-        q_extend.stride(0), q_extend.stride(1),
-        k_extend.stride(0), k_extend.stride(1),
-        v_extend.stride(0), v_extend.stride(1),
-        o_extend.stride(0), o_extend.stride(1),
-        k_buffer.stride(0), k_buffer.stride(1),
-        v_buffer.stride(0), v_buffer.stride(1),
+        _qs[0], _qs[1], _ks[0], _ks[1], _vs[0], _vs[1],
+        _os[0], _os[1], _kbs[0], _kbs[1], _vbs[0], _vbs[1],
     )
     _dtypes = (qo_indptr.dtype, kv_indptr.dtype, kv_indices.dtype)
     _cache_key = _persistent_cache_key(Lq, _frozen_kw, _dtypes)
@@ -800,15 +799,17 @@ def _launch_splitk(
 
     # n_m_tiles may have shifted if we forced a different BLOCK_M above.
     n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
-    total_output_tiles_upper = batch_size * head_num * n_m_tiles
+    # Tight upper bound matches `_launch_persistent`: see comment there.
+    # Split-K only routes here when total grid is small, so batches tend
+    # toward uniform; the tight bound is essentially the exact count.
+    total_output_tiles = (
+        (q_extend.shape[0] + batch_size * (BLOCK_M - 1)) // BLOCK_M
+    ) * head_num
 
     TILE_MAP_MODE = _effective_tile_map_mode(_force_tile_map_mode)
     if TILE_MAP_MODE == 1:
-        _total_seq_tiles = _wca_total_seq_tiles(qo_indptr, BLOCK_M, batch_size)
-        total_output_tiles = _total_seq_tiles * head_num
         cum_tiles_per_batch = _ensure_splitk_dummy(device)
     else:
-        total_output_tiles = total_output_tiles_upper
         cum_tiles_per_batch = _ensure_cum_tiles(qo_indptr, BLOCK_M, head_num, batch_size)
 
     total_splits = total_output_tiles * SPLIT_K
@@ -841,13 +842,12 @@ def _launch_splitk(
         'TILE_MAP_MODE': TILE_MAP_MODE,
         '_num_warps': num_warps,
     }
+    # Batched stride extraction (see matching block above in _launch_persistent).
+    _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
+    _os = o_extend.stride(); _kbs = k_buffer.stride(); _vbs = v_buffer.stride()
     _strides = (
-        q_extend.stride(0), q_extend.stride(1),
-        k_extend.stride(0), k_extend.stride(1),
-        v_extend.stride(0), v_extend.stride(1),
-        o_extend.stride(0), o_extend.stride(1),
-        k_buffer.stride(0), k_buffer.stride(1),
-        v_buffer.stride(0), v_buffer.stride(1),
+        _qs[0], _qs[1], _ks[0], _ks[1], _vs[0], _vs[1],
+        _os[0], _os[1], _kbs[0], _kbs[1], _vbs[0], _vbs[1],
     )
     _dtypes = (qo_indptr.dtype, kv_indptr.dtype, kv_indices.dtype)
     _cache_key = _persistent_cache_key(Lq, _frozen_kw, _dtypes)

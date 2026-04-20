@@ -91,12 +91,12 @@ logger = logging.getLogger(__name__)
 #   grid = (batch_size, head_num, ceildiv(max_len_extend, BM))
 # which is one integer division (~10ns).
 # ---------------------------------------------------------------------------
-# config_key -> either:
-#   ("fast", fast_run_closure, sm, strides, BM)    # BF16: direct CompiledKernel invoke
-#   ("legacy", kernel_fn.run, sm, kv_gn, strides, frozen_kwargs, BM)  # FP8: via JITFunction.run
-# The "fast" path bypasses ~55us/call of JITFunction.run specialization overhead
-# (see profile_fast_path.py) by capturing the CompiledKernel from the first call
-# and invoking it directly via CompiledKernel[grid](...).
+# config_key -> ("fast", fast_run_closure, sm, strides, BM)
+# All paths (BF16 and FP8) now invoke HIPLauncher directly via
+# _make_fast_runner / _make_fast_runner_fp8, bypassing ~40-60us/call of
+# JITFunction.run specialization overhead (see profile_fast_path.py). The
+# "legacy" tag is still handled in _run_config_cache_entry as a forward-
+# compat fallback but is no longer inserted into the cache.
 _config_cache = {}
 
 # Dispatch-path counters. Incremented on every call so we can prove whether
@@ -327,6 +327,83 @@ def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
         )
 
     return _fast_run
+
+
+def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
+    """FP8 twin of `_make_fast_runner`. The FP8 kernel has more constexprs
+    than BF16 (SKIP_PREFIX_CUSTOM_MASK, ENABLE_MASK_SPLIT, BLOCK_DPE/DV,
+    EXT_BLOCK_N/NUM_STAGES, ASYNC_PAD_K/V) so the HIPLauncher positional
+    arg list is longer. Signature order here must match the `@gluon.jit`
+    definition in `_fp8_kv_extend_basic_gfx950.py`.
+    
+    Before this existed, the FP8 path fell back to `JITFunction.run` every
+    call (~40-60 us of Python overhead), which swamped the GPU work on
+    small-batch ShareGPT shapes. With the fast path in place, the FP8
+    hot path is cut to a single direct HIPLauncher call (~5-10 us).
+    """
+    from triton.runtime import driver as _triton_driver
+    from triton import knobs as _triton_knobs
+
+    compiled_kernel._init_handles()
+    _hip_launcher = compiled_kernel.run
+    _fn_handle = compiled_kernel.function
+    _packed_md = compiled_kernel.packed_metadata
+    _active = _triton_driver.active
+    _get_dev = _active.get_current_device
+    _get_stream = _active.get_current_stream
+    _enter_hook = _triton_knobs.runtime.launch_enter_hook
+    _exit_hook = _triton_knobs.runtime.launch_exit_hook
+
+    IS_CAUSAL = frozen_kw['IS_CAUSAL']
+    USE_CUSTOM_MASK = frozen_kw['USE_CUSTOM_MASK']
+    SKIP_PREFIX_CUSTOM_MASK = frozen_kw['SKIP_PREFIX_CUSTOM_MASK']
+    ENABLE_PREFIX_UNMASKED = frozen_kw['ENABLE_PREFIX_UNMASKED']
+    ENABLE_MASK_SPLIT = frozen_kw['ENABLE_MASK_SPLIT']
+    BLOCK_M = frozen_kw['BLOCK_M']
+    BLOCK_N = frozen_kw['BLOCK_N']
+    BLOCK_DMODEL = frozen_kw['BLOCK_DMODEL']
+    ACTUAL_BLOCK_DMODEL = frozen_kw['ACTUAL_BLOCK_DMODEL']
+    BLOCK_DPE = frozen_kw['BLOCK_DPE']
+    ACTUAL_BLOCK_DPE = frozen_kw['ACTUAL_BLOCK_DPE']
+    BLOCK_DV = frozen_kw['BLOCK_DV']
+    ACTUAL_BLOCK_DV = frozen_kw['ACTUAL_BLOCK_DV']
+    NUM_STAGES = frozen_kw['NUM_STAGES']
+    EXT_BLOCK_N = frozen_kw['EXT_BLOCK_N']
+    EXT_NUM_STAGES = frozen_kw['EXT_NUM_STAGES']
+    ASYNC_PAD_K = frozen_kw['ASYNC_PAD_K']
+    ASYNC_PAD_V = frozen_kw['ASYNC_PAD_V']
+    HAS_SINK = frozen_kw['HAS_SINK']
+    LOGIT_CAP = frozen_kw['LOGIT_CAP']
+    XAI_TEMPERATURE_LEN = frozen_kw['XAI_TEMPERATURE_LEN']
+    SLIDING_WINDOW_SIZE = frozen_kw['SLIDING_WINDOW_SIZE']
+    v_scale = frozen_kw['v_scale']
+
+    def _fast_run_fp8(q, k, v, o, kb, vb, qo_i, kv_i, kv_x,
+                      mask, mi, wkvo, sinks, sm_scale, strides, grid):
+        dev = _get_dev()
+        stream = _get_stream(dev)
+        _hip_launcher(
+            grid[0], grid[1], grid[2], stream, _fn_handle, _packed_md, None,
+            _enter_hook, _exit_hook,
+            q, k, v, o, kb, vb,
+            qo_i, kv_i, kv_x,
+            mask, mi, wkvo,
+            sm_scale, kv_gn,
+            strides[0], strides[1], strides[2], strides[3],
+            strides[4], strides[5], strides[6], strides[7],
+            strides[8], strides[9], strides[10], strides[11],
+            IS_CAUSAL, USE_CUSTOM_MASK, SKIP_PREFIX_CUSTOM_MASK,
+            ENABLE_PREFIX_UNMASKED, ENABLE_MASK_SPLIT,
+            BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            BLOCK_DPE, ACTUAL_BLOCK_DPE, BLOCK_DV, ACTUAL_BLOCK_DV,
+            NUM_STAGES, EXT_BLOCK_N, EXT_NUM_STAGES,
+            ASYNC_PAD_K, ASYNC_PAD_V,
+            sinks, HAS_SINK,
+            LOGIT_CAP, XAI_TEMPERATURE_LEN, SLIDING_WINDOW_SIZE,
+            v_scale,
+        )
+
+    return _fast_run_fp8
 
 
 def _get_num_xcds(device):
@@ -919,13 +996,15 @@ def gluon_extend_attention_fwd(
             if window_kv_offsets is not None
             else _dummy_wkvo[:_wkvo_n]
         )
+        # Single .stride() tuple-pull per tensor saves ~54% of this block's
+        # Python overhead vs 12 individual .stride(i) calls (microbench:
+        # 636 ns/call vs 1410 ns/call). At 80 layers x ~3 calls/token on
+        # Llama-70B that's ~190 us/token of avoided CPU work.
+        _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
+        _os = o_extend.stride(); _kbs = k_buffer.stride(); _vbs = v_buffer.stride()
         _live_strides = (
-            q_extend.stride(0), q_extend.stride(1),
-            k_extend.stride(0), k_extend.stride(1),
-            v_extend.stride(0), v_extend.stride(1),
-            o_extend.stride(0), o_extend.stride(1),
-            k_buffer.stride(0), k_buffer.stride(1),
-            v_buffer.stride(0), v_buffer.stride(1),
+            _qs[0], _qs[1], _ks[0], _ks[1], _vs[0], _vs[1],
+            _os[0], _os[1], _kbs[0], _kbs[1], _vbs[0], _vbs[1],
         )
         _tag = _cc_entry[0]
         if _tag == "fast":
@@ -1405,21 +1484,19 @@ def gluon_extend_attention_fwd(
                        head_num, k_extend.shape[1], _has_sink_w,
                        qo_indptr.dtype, kv_indptr.dtype, kv_indices.dtype)
             if _cc_key not in _config_cache:
-                if _kv_is_fp8:
-                    # FP8 has extra _kernel_extra constexprs not handled by
-                    # _make_fast_runner yet — keep the legacy JITFunction.run
-                    # path with baked kwargs for FP8.
-                    _config_cache[_cc_key] = (
-                        "legacy",
-                        _kernel_fn.run,
-                        _sm, _kv_gn, _frozen_strides, _frozen_kw, _BM,
-                    )
-                else:
-                    _config_cache[_cc_key] = (
-                        "fast",
-                        _make_fast_runner(_compiled, _frozen_kw, _kv_gn),
-                        _sm, _frozen_strides, _BM,
-                    )
+                # Both BF16 and FP8 go through the direct HIPLauncher "fast"
+                # path now. FP8 uses a specialized runner that matches the
+                # wider FP8 kernel signature (SKIP_PREFIX_CUSTOM_MASK,
+                # ENABLE_MASK_SPLIT, BLOCK_DPE/DV, EXT_BLOCK_N/NS, ASYNC_PAD_*
+                # constexprs). This eliminates the ~40-60us Triton
+                # JITFunction.run overhead on every FP8 call, which was
+                # dominating the CPU cost on small-batch ShareGPT shapes.
+                _runner_factory = _make_fast_runner_fp8 if _kv_is_fp8 else _make_fast_runner
+                _config_cache[_cc_key] = (
+                    "fast",
+                    _runner_factory(_compiled, _frozen_kw, _kv_gn),
+                    _sm, _frozen_strides, _BM,
+                )
         return
 
     # -- Full dispatch path (heterogeneous batches, custom mask, test overrides) --
