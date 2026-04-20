@@ -137,9 +137,6 @@ class TreeNode:
         self.host_ref_counter = 0
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
-        # True once the node has been persisted to external storage (L3);
-        # used in buffer_only mode where host_value is transient.
-        self.persisted: Optional[bool] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
@@ -154,7 +151,7 @@ class TreeNode:
 
     @property
     def backuped(self):
-        return self.persisted or self.host_value is not None
+        return self.host_value is not None
 
     def protect_host(self):
         """Protect the host value from eviction."""

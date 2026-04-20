@@ -454,6 +454,14 @@ class HiRadixCache(RadixCache):
                     )
 
                 try:
+                    if self.host_memory_mode == "buffer_only":
+                        self.dec_lock_ref(last_host_node)
+                except Exception:
+                    logger.exception(
+                        "Failed to dec_lock_ref for prefetch anchor %s", req_id
+                    )
+
+                try:
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
@@ -526,6 +534,8 @@ class HiRadixCache(RadixCache):
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
                     last_host_node.release_host()
+                    if self.host_memory_mode == "buffer_only":
+                        self.dec_lock_ref(last_host_node)
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
@@ -539,8 +549,6 @@ class HiRadixCache(RadixCache):
                     node.release_host()
                     if host_indices is not None:
                         cc.mem_pool_host.free(host_indices)
-                    if self.host_memory_mode == "buffer_only":
-                        node.persisted = True
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -710,7 +718,6 @@ class HiRadixCache(RadixCache):
                 and node.id not in self.ongoing_write_through
                 and node.id not in self.pending_write_node_ids
             ):
-                node.persisted = False
                 self.pending_write_queue.append(node)
                 self.pending_write_node_ids.add(node.id)
             return 0
@@ -971,12 +978,7 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
-        # GPU -> host demotion: block is still locally reachable via load_back,
-        # so no BlockRemoved in cache mode.  In buffer_only mode the host tier
-        # is transient and data lives in shared storage — this worker has no
-        # local advantage, so we notify the router.
-        if self.host_memory_mode == "buffer_only":
-            self._record_remove_event(node)
+        # GPU -> CPU demotion: no BlockRemoved since block is still reachable via load_back
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
@@ -1324,6 +1326,8 @@ class HiRadixCache(RadixCache):
                 host_indices[min_completed_tokens:completed_tokens]
             )
         last_host_node.release_host()
+        if self.host_memory_mode == "buffer_only":
+            self.dec_lock_ref(last_host_node)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
@@ -1422,11 +1426,17 @@ class HiRadixCache(RadixCache):
             return
 
         last_host_node.protect_host()
+        # In buffer_only mode the anchor is a device node; protect it (and
+        # all ancestors) from GPU eviction while the prefetch is in flight.
+        if self.host_memory_mode == "buffer_only":
+            self.inc_lock_ref(last_host_node)
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
+            if self.host_memory_mode == "buffer_only":
+                self.dec_lock_ref(last_host_node)
             last_host_node.release_host()
             # no sufficient host memory for prefetch
             return
@@ -1571,8 +1581,7 @@ class HiRadixCache(RadixCache):
         else:
             new_node.value = child.value[:split_len].clone()
             child.value = child.value[split_len:].clone()
-        # In buffer_only mode backuped may be True while host value is None
-        if child.backuped and child.host_value is not None:
+        if child.host_value is not None:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
 
@@ -1684,6 +1693,8 @@ class HiRadixCache(RadixCache):
         if self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
         last_host_node.release_host()
+        if self.host_memory_mode == "buffer_only":
+            self.dec_lock_ref(last_host_node)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
