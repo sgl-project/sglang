@@ -114,8 +114,11 @@ def _scatter_ragged_to_page_table_kernel(
     kv_indptr_ptr,
     dest_ptr,
     dest_stride,
+    sw_page_table_ptr,
+    swa_slot_mapping_ptr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_SWA: tl.constexpr,
 ):
     """Scatter ragged token-level kv_indices into a 2D block-level page table.
     Output columns store block indices (token_id // PAGE_SIZE); per-request
@@ -141,6 +144,15 @@ def _scatter_ragged_to_page_table_kernel(
         block_vals,
         mask=mask,
     )
+
+    if HAS_SWA:
+        sw_vals = tl.load(swa_slot_mapping_ptr + vals)
+        block_vals = sw_vals // PAGE_SIZE
+        tl.store(
+            sw_page_table_ptr + pid.to(tl.int64) * dest_stride + offsets,
+            block_vals,
+            mask=mask,
+        )
 
 
 @triton.jit
@@ -598,6 +610,7 @@ class AiterAttnBackend(AttentionBackend):
         spec_info,
         bs: int,
         dest_buf: Optional[torch.Tensor] = None,
+        swa_dest_buf: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Convert ragged (token-level) kv_indices from spec_info into a 2D
         block-level page_table of shape (bs, max_num_blocks_per_seq).
@@ -610,6 +623,9 @@ class AiterAttnBackend(AttentionBackend):
         page_size = self.page_size
         max_blocks = (self.max_context_len + page_size - 1) // page_size
 
+        swa_slot_mapping = None
+        swa_page_table = None
+
         if dest_buf is not None:
             # The scatter kernel fills [0, num_blocks) and loads past that use
             # other=0, so the tail is 0-filled. Under graph replay rows > bs
@@ -620,6 +636,16 @@ class AiterAttnBackend(AttentionBackend):
                 bs, max_blocks, dtype=torch.int32, device=self.device
             )
 
+        if self.use_sliding_window_kv_pool:
+            swa_slot_mapping = self.token_to_kv_pool.full_to_swa_index_mapping.long()
+
+            if swa_dest_buf is not None:
+                swa_page_table = swa_dest_buf
+            else:
+                swa_page_table = torch.zeros(
+                    bs, max_blocks, dtype=torch.int32, device=self.device
+                )
+
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
         _scatter_ragged_to_page_table_kernel[grid](
@@ -627,11 +653,14 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr,
             page_table,
             page_table.stride(0),
+            swa_page_table,
+            swa_slot_mapping,
             PAGE_SIZE=page_size,
             BLOCK_SIZE=BLOCK_SIZE,
+            HAS_SWA=(swa_slot_mapping is not None),
         )
 
-        return page_table
+        return page_table, swa_page_table
 
     def _build_verify_unified_metadata(
         self,
@@ -947,13 +976,27 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 if self.use_triton_unified_attention and not self.use_mla:
                     bs = spec_info.kv_indptr.shape[0] - 1
-                    kv_indices = self._build_unified_page_table_from_spec(spec_info, bs)
+                    kv_indices, swa_page_table = (
+                        self._build_unified_page_table_from_spec(spec_info, bs)
+                    )
                     max_q_len = 1
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
                     kv_indptr = None
                 else:
                     kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                     bs = kv_indptr.shape[0] - 1
+
+                    if self.use_sliding_window_kv_pool:
+                        swa_page_table = (
+                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                kv_indices
+                            )
+                        )
+
+                        kv_indices = self._transform_table_1_to_real(kv_indices)
+                        swa_page_table = self._transform_table_1_to_real(swa_page_table)
+                    else:
+                        kv_indices = self._transform_table_1_to_real(kv_indices)
 
             if self.use_mla:
                 qo_indptr = self.qo_indptr_[: bs + 1]
@@ -1563,9 +1606,15 @@ class AiterAttnBackend(AttentionBackend):
                         -1, max_num_blocks_per_seq
                     )
 
+                    if self.use_sliding_window_kv_pool:
+                        swa_page_table = self.cuda_graph_swa_page_table
+
                     if spec_info is not None:
                         self._build_unified_page_table_from_spec(
-                            spec_info, bs, dest_buf=kv_indices
+                            spec_info,
+                            bs,
+                            dest_buf=kv_indices,
+                            swa_dest_buf=swa_page_table,
                         )
                     else:
                         page_indices = self.req_to_token[
@@ -1991,9 +2040,15 @@ class AiterAttnBackend(AttentionBackend):
                         -1, max_num_blocks_per_seq
                     )
 
+                    if self.use_sliding_window_kv_pool:
+                        swa_page_table = self.cuda_graph_swa_page_table
+
                     if spec_info is not None:
                         self._build_unified_page_table_from_spec(
-                            spec_info, bs, dest_buf=kv_indices
+                            spec_info,
+                            bs,
+                            dest_buf=kv_indices,
+                            swa_dest_buf=swa_page_table,
                         )
                     else:
                         page_indices = self.req_to_token[
