@@ -82,3 +82,20 @@ html.dark table tbody tr:nth-child(even) td,
 [data-theme="dark"] table tbody tr:nth-child(even) td {
   background-color: rgba(255,255,255,0.05);
 }
+
+/* Bold text (**text**) */
+.prose strong, .prose b {
+  font-weight: 600;
+}
+
+/* Inline code (single backtick) */
+:not(pre) > code {
+  background-color: rgba(0, 0, 0, 0.07);
+  font-weight: 600;
+}
+
+html.dark :not(pre) > code,
+[data-theme="dark"] :not(pre) > code {
+  background-color: rgba(255, 255, 255, 0.13);
+  font-weight: 600;
+}
