@@ -5,6 +5,7 @@ from typing import Callable, List
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -50,19 +51,38 @@ def is_prefill_cp_in_seq_split():
     )
 
 
+def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
+    """Runtime gate for MLA prefill-CP attention-internal sites.
+
+    Mirrors ``nsa_use_prefill_cp`` (layers/attention/nsa/utils.py). Use at
+    MLA-only call sites (``rebuild_cp_kv_cache``, FA3 absorbed-MLA CP
+    wrapper, MLA dispatcher).
+    """
+    if mla_enable_prefill_cp is None:
+        mla_enable_prefill_cp = is_prefill_context_parallel_enabled()
+    return (
+        forward_batch.attn_cp_metadata is not None
+        and mla_enable_prefill_cp
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    )
+
+
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # CP metadata (zigzag split) only supports batch=1 for now.
     cur_cp_seq_len = seq_len // (cp_size * 2)
-    if (
+    return (
         cur_cp_seq_len != 0
         and cp_size > 1
+        # prepare_context_parallel_metadata hard-codes bs_per_cp_group = 1;
+        # guard explicitly to avoid silent mis-partitioning under continuous batching.
+        # TODO: remove this guard once we support multi-batch-cp-split
+        and forward_batch.batch_size == 1
         and forward_batch.forward_mode.is_context_parallel_extend()
+        # is_context_parallel_extend() returns True for MIXED (prefill+decode
+        # in one step), but the zigzag split only makes sense on pure extend.
+        and forward_batch.forward_mode != ForwardMode.MIXED
         and is_prefill_context_parallel_enabled()
-        and forward_batch.seq_lens_cpu.shape[0] == 1
-    ):
-        return True
-    else:
-        return False
+    )
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
