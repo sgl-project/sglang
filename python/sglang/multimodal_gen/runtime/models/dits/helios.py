@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_c
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 
@@ -239,6 +240,7 @@ class HeliosSelfAttention(nn.Module):
         is_amplify_history: bool = False,
         history_scale_mode: str = "per_head",
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
@@ -248,16 +250,36 @@ class HeliosSelfAttention(nn.Module):
         self.local_num_heads = divide(num_heads, tp_size)
 
         self.to_q = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_q", prefix),
         )
         self.to_k = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_k", prefix),
         )
         self.to_v = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_v", prefix),
         )
         self.to_out = RowParallelLinear(
-            dim, dim, bias=True, reduce_results=True, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            reduce_results=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_out.0", prefix),
         )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
@@ -339,6 +361,7 @@ class HeliosCrossAttention(nn.Module):
         num_heads: int,
         eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
@@ -348,16 +371,36 @@ class HeliosCrossAttention(nn.Module):
         self.local_num_heads = divide(num_heads, tp_size)
 
         self.to_q = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_q", prefix),
         )
         self.to_k = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_k", prefix),
         )
         self.to_v = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=False, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("to_v", prefix),
         )
         self.to_out = RowParallelLinear(
-            dim, dim, bias=True, reduce_results=True, quant_config=quant_config
+            dim,
+            dim,
+            bias=True,
+            reduce_results=True,
+            quant_config=quant_config,
+            prefix=add_prefix("to_out.0", prefix),
         )
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
@@ -414,6 +457,7 @@ class HeliosTransformerBlock(nn.Module):
         is_amplify_history: bool = False,
         history_scale_mode: str = "per_head",
         quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -426,6 +470,7 @@ class HeliosTransformerBlock(nn.Module):
             is_amplify_history=is_amplify_history,
             history_scale_mode=history_scale_mode,
             quant_config=quant_config,
+            prefix=add_prefix("attn1", prefix),
         )
 
         # 2. Cross-attention
@@ -434,6 +479,7 @@ class HeliosTransformerBlock(nn.Module):
             num_heads=num_heads,
             eps=eps,
             quant_config=quant_config,
+            prefix=add_prefix("attn2", prefix),
         )
         self.self_attn_residual_norm = (
             FP32LayerNorm(dim, eps, elementwise_affine=True)
@@ -443,7 +489,11 @@ class HeliosTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(
-            dim, ffn_dim, act_type="gelu_pytorch_tanh", quant_config=quant_config
+            dim,
+            ffn_dim,
+            act_type="gelu_pytorch_tanh",
+            quant_config=quant_config,
+            prefix=add_prefix("ffn.net", prefix),
         )
         self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
 
@@ -617,8 +667,9 @@ class HeliosTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     is_amplify_history=config.is_amplify_history,
                     history_scale_mode=config.history_scale_mode,
                     quant_config=quant_config,
+                    prefix=f"blocks.{i}",
                 )
-                for _ in range(config.num_layers)
+                for i in range(config.num_layers)
             ]
         )
 
@@ -630,6 +681,7 @@ class HeliosTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
+            prefix="proj_out",
         )
 
         self.cnt = 0
@@ -652,7 +704,6 @@ class HeliosTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         latents_history_long=None,
         **kwargs,
     ) -> torch.Tensor:
-        orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
 

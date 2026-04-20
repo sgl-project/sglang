@@ -43,21 +43,21 @@ backend.
 | quant_family      | checkpoint form                                                                            | canonical CLI                                                          | supported models                        | extra dependency                      | platform / notes                                                                                                                       |
 |-------------------|--------------------------------------------------------------------------------------------|------------------------------------------------------------------------|-----------------------------------------|---------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
 | `fp8`             | Quantized transformer component folder, or safetensors with `quantization_config` metadata | `--transformer-path` or `--transformer-weights-path`                   | ALL                                     | None                                  | Component-folder and single-file flows are both supported                                                                              |
-| `modelopt-fp8`    | Converted ModelOpt FP8 transformer directory or repo with `config.json`                    | `--transformer-path`                                                    | FLUX.1, FLUX.2, Wan2.2                  | None                                  | Serialized config stays `quant_method=modelopt` with `quant_algo=FP8`; `dit_layerwise_offload` is supported and `dit_cpu_offload` stays disabled |
+| `modelopt-fp8`    | Converted ModelOpt FP8 transformer directory or repo with `config.json`                    | `--transformer-path`                                                    | FLUX.1, FLUX.2, Wan2.2, Helios          | None                                  | Serialized config stays `quant_method=modelopt` with `quant_algo=FP8`; `dit_layerwise_offload` is supported and `dit_cpu_offload` stays disabled |
 | `modelopt-nvfp4`  | Mixed transformer directory/repo with `config.json`, or raw NVFP4 safetensors export/repo | `--transformer-path` for mixed overrides; `--transformer-weights-path` for raw exports | FLUX.1, FLUX.2, Wan2.2                  | None                                  | Mixed override repos keep the base model separate; raw exports such as `black-forest-labs/FLUX.2-dev-NVFP4` still use the weights-path flow |
 | `nunchaku-svdq`   | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`   | `--transformer-weights-path`                                           | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                                             |
 | `msmodelslim`     | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                                         | Wan2.2 family                           | None                                  | Currently only compatible with the Ascend NPU family and supports both `w8a8` and `w4a4`                                               |
 
 ## Validated ModelOpt Checkpoints
 
-This section is the canonical support matrix for the six diffusion ModelOpt
+This section is the canonical support matrix for the seven diffusion ModelOpt
 checkpoints currently wired up in SGLang docs and B200 CI coverage.
 
 Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Five of the six repos live under `BBuf/*`. The FLUX.2 NVFP4 entry keeps the
+Six of the seven repos live under `BBuf/*`. The FLUX.2 NVFP4 entry keeps the
 official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 
 | Quant Algo | Base Model | Preferred CLI | HF Repo | Current Scope | Notes |
@@ -65,11 +65,12 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 | `FP8` | `black-forest-labs/FLUX.1-dev` | `--transformer-path` | `BBuf/flux1-dev-modelopt-fp8-sglang-transformer` | single-transformer override, deterministic latent/image comparison, H100 benchmark, torch-profiler trace | SGLang converter keeps a validated BF16 fallback set for modulation and FF projection layers; use `--model-id FLUX.1-dev` for local mirrors |
 | `FP8` | `black-forest-labs/FLUX.2-dev` | `--transformer-path` | `BBuf/flux2-dev-modelopt-fp8-sglang-transformer` | single-transformer override load and generation path | published SGLang-ready transformer override |
 | `FP8` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer` | primary `transformer` quantized, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint, and do not describe this as dual-transformer full-model FP8 unless that path is validated separately |
+| `FP8` | `BestWishYsh/Helios-Base` | `--transformer-path` | `BBuf/helios-base-modelopt-fp8-sglang-transformer` | single-transformer override, 640x384 33-frame video comparison, H100 benchmark, torch-profiler trace | SGLang converter keeps patch embeddings, conditioning/output projections, and the first/last three transformer blocks in BF16 for quality stability; use `--model-id Helios-Base` for local mirrors |
 | `NVFP4` | `black-forest-labs/FLUX.1-dev` | `--transformer-path` | `BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer` | mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace | use `build_modelopt_nvfp4_transformer.py`; validated builder keeps selected FLUX.1 modules in BF16 and sets `swap_weight_nibbles=false` |
 | `NVFP4` | `black-forest-labs/FLUX.2-dev` | `--transformer-weights-path` | `black-forest-labs/FLUX.2-dev-NVFP4` | packed-QKV load path | official raw export repo; validated packed export detection and runtime layout handling |
 | `NVFP4` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer` | primary `transformer` quantized with ModelOpt NVFP4, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint, and current B200/Blackwell bring-up uses `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn` |
 
-These six checkpoints are also the intended case set for the B200 diffusion CI
+These seven checkpoints are also the intended case set for the B200 diffusion CI
 job (`multimodal-gen-test-1-b200`).
 
 ## ModelOpt FP8
@@ -93,6 +94,18 @@ sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --transformer-path BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
   --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path BestWishYsh/Helios-Base \
+  --model-id Helios-Base \
+  --transformer-path BBuf/helios-base-modelopt-fp8-sglang-transformer \
+  --prompt "A curious raccoon" \
+  --width 640 \
+  --height 384 \
+  --num-frames 33 \
   --save-output
 ```
 

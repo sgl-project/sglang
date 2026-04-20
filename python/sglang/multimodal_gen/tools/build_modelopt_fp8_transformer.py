@@ -76,6 +76,16 @@ DEFAULT_LTX2_KEEP_BF16_PATTERNS = [
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(attn1|attn2|audio_attn1|audio_attn2|audio_to_video_attn|video_to_audio_attn)\.to_out\.0$",
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(ff|audio_ff)\.proj_(in|out)$",
 ]
+DEFAULT_HELIOS_KEEP_BF16_PATTERNS = [
+    r"^patch_embedding$",
+    r"^patch_(short|mid|long)$",
+    r"^condition_embedder\.(text_embedder\.linear_[12]|time_embedder\.linear_[12]|time_proj)$",
+    r"^proj_out$",
+    r"^blocks\.(0|1|2|37|38|39)\.(attn1|attn2)\.to_(q|k|v)$",
+    r"^blocks\.(0|1|2|37|38|39)\.(attn1|attn2)\.to_out\.0$",
+    r"^blocks\.(0|1|2|37|38|39)\.ffn\.net\.0\.proj$",
+    r"^blocks\.(0|1|2|37|38|39)\.ffn\.net\.2$",
+]
 
 
 def _resolve_transformer_dir(path: str) -> str:
@@ -259,12 +269,16 @@ def get_default_keep_bf16_patterns(
         return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if model_type == "flux2":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
+    if model_type == "helios":
+        return list(DEFAULT_HELIOS_KEEP_BF16_PATTERNS)
     if model_type == "none":
         return []
     if class_name == "FluxTransformer2DModel":
         return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if class_name == "Flux2Transformer2DModel":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
+    if class_name == "HeliosTransformer3DModel":
+        return list(DEFAULT_HELIOS_KEEP_BF16_PATTERNS)
     return []
 
 
@@ -552,13 +566,14 @@ def build_modelopt_fp8_transformer(
             if name in fallback_scale_names:
                 del shard_tensors[name]
                 continue
+            if name in fallback_tensors:
+                shard_tensors[name] = fallback_tensors[name]
+                continue
             if name.endswith(".weight") and is_ignored_by_modelopt(
                 name, ignore_patterns
             ):
                 preserved_ignored_weight_count += 1
                 continue
-            if name in fallback_tensors:
-                shard_tensors[name] = fallback_tensors[name]
             scale_key = _resolve_scale_key(name, fp8_scale_map)
             if (
                 name.endswith(".weight")
@@ -645,11 +660,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-type",
-        choices=["auto", "flux1", "flux2", "ltx2", "none"],
+        choices=["auto", "flux1", "flux2", "ltx2", "helios", "none"],
         default="auto",
         help=(
             "Optional model-family BF16 fallback profile. 'none' uses the generic "
-            "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 / LTX-2 "
+            "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 / LTX-2 / Helios "
             "fallback set when the export config matches those transformer classes."
         ),
     )
