@@ -314,8 +314,6 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
-                self.running_batch.batch_is_full = False
-
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.on_idle()
@@ -496,8 +494,6 @@ class SchedulerPPMixin:
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
 
-                self.running_batch.batch_is_full = False
-
             # When the server is idle, self-check and re-init some states
             queue_size = (
                 len(self.waiting_queue)
@@ -518,10 +514,7 @@ class SchedulerPPMixin:
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
-        self.running_mbs = [
-            ScheduleBatch(reqs=[], batch_is_full=False)
-            for _ in range(self.pp_loop_size)
-        ]
+        self.running_mbs = [ScheduleBatch(reqs=[]) for _ in range(self.pp_loop_size)]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]] = (

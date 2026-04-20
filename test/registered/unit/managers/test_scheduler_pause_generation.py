@@ -25,7 +25,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
-        scheduler.running_batch.batch_is_full = False
+        scheduler.running_batch.is_full.return_value = False
         scheduler.tree_cache = MagicMock()
         scheduler.tree_cache.protected_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock()

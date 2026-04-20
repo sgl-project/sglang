@@ -3,7 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    compute_available_token_budget,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
@@ -33,6 +37,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.full_evictable_size.return_value = full_evictable_size
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
+        tree_cache.supports_mamba.return_value = False
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
@@ -55,7 +60,12 @@ class TestPrefillAdder(CustomTestCase):
         batch = MagicMock()
         batch.reqs = list(reqs or [])
         batch.release_req.return_value = None
-        batch.filter_batch.return_value = None
+
+        def _filter_batch(keep_indices=None, **kwargs):
+            if keep_indices is not None:
+                batch.reqs[:] = [batch.reqs[i] for i in keep_indices]
+
+        batch.filter_batch.side_effect = _filter_batch
         return batch
 
     def create_server_args(
@@ -110,7 +120,7 @@ class TestPrefillAdder(CustomTestCase):
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
-        self.assertEqual(adder.rem_total_token_offset, 225)
+        self.assertEqual(adder.rem_total_tokens, -225)  # 0 - (50+75+100)
 
         self.mock_token_allocator.full_available_size.return_value = (
             225  # full occupation of GRam
@@ -123,7 +133,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertTrue(success)
         self.assertIn(running_reqs[0], adder.preempt_list)
-        self.assertEqual(adder.rem_total_token_offset, 175)  # 50 + 75 + 100 - 50 = 175
+        self.assertEqual(adder.rem_total_tokens, 50)  # 225 - (75+100)
         running_batch.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first(self):
@@ -142,7 +152,7 @@ class TestPrefillAdder(CustomTestCase):
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
-        self.assertEqual(adder.rem_total_token_offset, 225)
+        self.assertEqual(adder.rem_total_tokens, -225)  # 0 - (50+75+100)
 
         self.mock_token_allocator.full_available_size.return_value = (
             225  # full occupation of GRam
@@ -155,7 +165,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
-        self.assertEqual(adder.rem_total_token_offset, 125)  # 50 + 75 + 100 - 100 = 125
+        self.assertEqual(adder.rem_total_tokens, 100)  # 225 - (50+75)
         running_batch.release_req.assert_called_once()
 
     def test_preempt_fail_low_priority_values_first(self):
@@ -174,7 +184,7 @@ class TestPrefillAdder(CustomTestCase):
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
-        self.assertEqual(adder.rem_total_token_offset, 225)
+        self.assertEqual(adder.rem_total_tokens, -225)  # 0 - (50+75+100)
 
         self.mock_token_allocator.full_available_size.return_value = (
             225  # full occupation of GRam
@@ -214,7 +224,7 @@ class TestPrefillAdder(CustomTestCase):
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
-        self.assertEqual(adder.rem_total_token_offset, 225)
+        self.assertEqual(adder.rem_total_tokens, -225)  # 0 - (50+75+100)
 
         self.mock_token_allocator.full_available_size.return_value = (
             225  # full occupation of GRam
@@ -254,7 +264,7 @@ class TestPrefillAdder(CustomTestCase):
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
-        self.assertEqual(adder.rem_total_token_offset, 225)
+        self.assertEqual(adder.rem_total_tokens, -225)  # 0 - (50+75+100)
 
         self.mock_token_allocator.full_available_size.return_value = 225
         self.mock_token_allocator.available_size.return_value = 225
@@ -266,7 +276,7 @@ class TestPrefillAdder(CustomTestCase):
         first_success = adder.preempt_to_schedule(first_req, mock_server_args)
         self.assertTrue(first_success)
         self.assertIn(running_reqs[0], adder.preempt_list)
-        self.assertEqual(adder.rem_total_token_offset, 175)
+        self.assertEqual(adder.rem_total_tokens, 50)  # 225 - (75+100)
         running_batch.release_req.assert_called_once()
 
         # Second call needs more tokens than currently free, so it would need to
@@ -277,7 +287,7 @@ class TestPrefillAdder(CustomTestCase):
         second_success = adder.preempt_to_schedule(second_req, mock_server_args)
 
         self.assertFalse(second_success)
-        self.assertEqual(adder.rem_total_token_offset, 175)
+        self.assertEqual(adder.rem_total_tokens, 50)  # unchanged, preemption failed
         self.assertEqual(adder.preempt_list.count(running_reqs[0]), 1)
         running_batch.release_req.assert_called_once()
 
@@ -299,7 +309,7 @@ class TestPrefillAdder(CustomTestCase):
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
-        self.assertEqual(adder.rem_total_token_offset, 475)
+        self.assertEqual(adder.rem_total_tokens, -475)  # 0 - (50+75+100+125+125)
 
         self.mock_token_allocator.full_available_size.return_value = (
             475  # full occupation of GRam
@@ -311,9 +321,7 @@ class TestPrefillAdder(CustomTestCase):
         success = adder.preempt_to_schedule(new_req, mock_server_args)
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
-        self.assertEqual(
-            adder.rem_total_token_offset, 375
-        )  # 50 + 75 + 100 + 125 + 125 - 100 = 375
+        self.assertEqual(adder.rem_total_tokens, 100)  # 475 - (50+75+125+125)
         running_batch.release_req.assert_called_once()
 
     def test_preempt_success_low_priority_values_first_exact_twice(self):
@@ -334,7 +342,7 @@ class TestPrefillAdder(CustomTestCase):
         running_batch = self.create_running_batch(running_reqs)
         adder = self.create_adder(running_batch)
 
-        self.assertEqual(adder.rem_total_token_offset, 475)
+        self.assertEqual(adder.rem_total_tokens, -475)  # 0 - (50+75+100+125+125)
 
         self.mock_token_allocator.full_available_size.return_value = (
             475  # full occupation of GRam
@@ -347,9 +355,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(success)
         self.assertIn(running_reqs[2], adder.preempt_list)
         self.assertIn(running_reqs[3], adder.preempt_list)
-        self.assertEqual(
-            adder.rem_total_token_offset, 250
-        )  # 50 + 75 + 100 + 125 + 125 - 100 - 125 = 250
+        self.assertEqual(adder.rem_total_tokens, 225)  # 475 - (50+75+125)
         self.assertEqual(running_batch.release_req.call_count, 2)
 
     def test_mixed_chunk_prefill_budgets(self):
@@ -370,7 +376,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(adder.rem_input_tokens, 192)  # 200 - 8
         self.assertEqual(adder.rem_chunk_tokens, 56)  # 64 - 8
-        self.assertEqual(adder.rem_total_token_offset, 408)  # 8 + 8 * 50
+        self.assertEqual(adder.rem_total_tokens, 592)  # 1000 - 8*50 - 8
         self.assertEqual(adder.cur_rem_token_offset, 8)
         self.assertEqual(adder.budget_state(), AddReqResult.CONTINUE)
 
@@ -405,7 +411,7 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(adder2.rem_input_tokens, 195)  # 200 - 5
         self.assertEqual(adder2.rem_chunk_tokens, 59)  # 64 - 5
-        self.assertEqual(adder2.rem_total_token_offset, 255)  # 5 + 5 * 50
+        self.assertEqual(adder2.rem_total_tokens, 745)  # 1000 - 5*50 - 5
         self.assertEqual(adder2.budget_state(), AddReqResult.CONTINUE)
 
         # Same prefill no longer exhausts the chunk budget
@@ -441,6 +447,41 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    def test_compute_available_token_budget(self):
+        """Test the shared token budget computation used by both
+        the scheduler watermark and PrefillAdder."""
+        reqs = [
+            self.create_mock_req("r1", 0, max_new_tokens=100),
+            self.create_mock_req("r2", 0, max_new_tokens=200, output_len=50),
+        ]
+        self.mock_token_allocator.available_size.return_value = 500
+
+        budget = compute_available_token_budget(
+            self.mock_token_allocator, self.mock_tree_cache, reqs, new_token_ratio=1.0
+        )
+        # 500 + 0(evictable) - 100 - 150(200-50) = 250
+        self.assertEqual(budget, 250)
+
+        # Evictable cache contributes to budget
+        cache = self.create_tree_cache(evictable_size=100)
+        budget2 = compute_available_token_budget(
+            self.mock_token_allocator, cache, reqs, new_token_ratio=1.0
+        )
+        self.assertEqual(budget2, 350)
+
+        # new_token_ratio scales the offset
+        budget3 = compute_available_token_budget(
+            self.mock_token_allocator, self.mock_tree_cache, reqs, new_token_ratio=0.5
+        )
+        # 500 - (100*0.5 + 150*0.5) = 500 - 125 = 375
+        self.assertEqual(budget3, 375)
+
+        # Empty running batch = no offset
+        budget4 = compute_available_token_budget(
+            self.mock_token_allocator, self.mock_tree_cache, [], new_token_ratio=1.0
+        )
+        self.assertEqual(budget4, 500)
 
 
 if __name__ == "__main__":

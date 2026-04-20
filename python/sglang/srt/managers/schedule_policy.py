@@ -58,6 +58,45 @@ CLIP_MAX_NEW_TOKENS = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
 
+
+def compute_available_token_budget(
+    token_to_kv_pool_allocator,
+    tree_cache: BasePrefixCache,
+    running_reqs: list,
+    new_token_ratio: float,
+) -> int:
+    """Compute the effective token budget for prefill admission.
+
+    Returns available + evictable tokens minus the running batch's future
+    generation reservation.  This is the same value as
+    ``PrefillAdder.rem_total_tokens`` (before ``mixed_with_decode_tokens``
+    is applied)."""
+    if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+        available_and_evictable = (
+            token_to_kv_pool_allocator.full_available_size()
+            + tree_cache.full_evictable_size()
+        )
+    elif tree_cache.supports_mamba():
+        available_and_evictable = (
+            token_to_kv_pool_allocator.available_size()
+            + tree_cache.full_evictable_size()
+        )
+    else:
+        available_and_evictable = (
+            token_to_kv_pool_allocator.available_size() + tree_cache.evictable_size()
+        )
+
+    offset = sum(
+        min(
+            r.sampling_params.max_new_tokens - len(r.output_ids),
+            CLIP_MAX_NEW_TOKENS,
+        )
+        * new_token_ratio
+        for r in running_reqs
+    )
+    return available_and_evictable - int(offset)
+
+
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -415,14 +454,6 @@ class PrefillAdder:
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
 
-        if running_batch is not None:
-            self.rem_total_token_offset += sum(
-                [
-                    self._get_running_request_total_token_offset(r)
-                    for r in running_batch.reqs
-                ]
-            )
-
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
@@ -457,22 +488,15 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        if self.is_hybrid_swa:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size()
+        return (
+            compute_available_token_budget(
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.running_batch.reqs if self.running_batch is not None else [],
+                self.new_token_ratio,
             )
-        elif self.is_hybrid_ssm_cache:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
-        return available_and_evictable - self.rem_total_token_offset
+            - self.rem_total_token_offset
+        )
 
     @property
     def rem_swa_tokens(self):
@@ -949,9 +973,6 @@ class PrefillAdder:
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
-                self.rem_total_token_offset -= (
-                    self._get_running_request_total_token_offset(running_req)
-                )
                 release_counter += 1
                 self.running_batch.release_req(
                     i, len(self.running_batch.reqs) - release_counter, server_args
