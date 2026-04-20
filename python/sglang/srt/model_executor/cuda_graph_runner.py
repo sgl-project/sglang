@@ -661,7 +661,6 @@ class CudaGraphRunner:
                 torch._dynamo.config.capture_scalar_outputs = True
             except Exception:
                 self.compile_replay_prepare = False
-        self.compiled_replay_prepare = None
 
         # Capture
         try:

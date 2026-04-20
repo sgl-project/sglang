@@ -97,19 +97,6 @@ def _fake_get_mla_decoding_metadata(
     return [tile_scheduler_metadata, num_splits]
 
 
-@register_fake_if_exists("sgl_kernel::get_mla_decoding_metadata_dense_fp8")
-def _fake_get_mla_decoding_metadata_dense_fp8(
-    seqlens_k, num_heads_per_head_k, num_heads_k
-):
-    num_sms = torch.cuda.get_device_properties(seqlens_k.device).multi_processor_count
-    batch_size = seqlens_k.shape[0]
-    tile_scheduler_metadata = seqlens_k.new_empty(
-        (num_sms // num_heads_k, 8), dtype=torch.int32
-    )
-    num_splits = seqlens_k.new_empty((batch_size + 1,), dtype=torch.int32)
-    return [tile_scheduler_metadata, num_splits]
-
-
 @dataclass(frozen=True)
 class NSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
