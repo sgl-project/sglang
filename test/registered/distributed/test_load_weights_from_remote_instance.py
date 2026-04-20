@@ -39,7 +39,7 @@ from sglang.utils import terminate_process
 mp.set_start_method("spawn", force=True)
 
 register_cuda_ci(est_time=110, suite="stage-b-test-2-gpu-large")
-register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
+register_amd_ci(est_time=200, suite="stage-b-test-2-gpu-large-amd")
 
 
 def verify_params_close(params1, params2, error_msg):

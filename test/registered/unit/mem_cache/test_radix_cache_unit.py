@@ -22,7 +22,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-based unit test, runs quickly on any GPU runner
 register_cuda_ci(est_time=16, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 
 import random
 import time

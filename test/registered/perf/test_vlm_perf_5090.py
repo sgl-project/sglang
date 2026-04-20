@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=410, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=500, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=1500, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestVLMPerf5090(CustomTestCase):
