@@ -1,34 +1,29 @@
-"""Static expert precision assignment for HeterFusedMoE.
+"""Static expert precision assignment helpers for HeterFusedMoE.
 
-Given per-layer PPL sensitivity and per-expert L2 sensitivity plus an SLO
-(max concurrency / prompt len / output len), pick which experts are heter
-(dual BF16+INT4) vs INT4-only so the resulting deployment fits on one GPU.
+Pure library module: given per-layer PPL sensitivity and per-expert L2
+sensitivity plus a VRAM budget, pick which experts are heter (dual
+BF16+INT4) vs INT4-only and write out the three config files sglang
+needs.
 
-Writes three files to --out_dir:
-  int4_only_experts.json  -- per-layer expert-id lists for --heter-precision-config
-  heter_config.json       -- complete config ready to pass to sglang.launch_server
+Called by ``profile/gen_heter_configs.py`` (the only entry point).
+Writes to ``out_dir``:
+  int4_only_experts.json  -- per-layer expert-id lists
+  heter_config.json       -- ready for ``--heter-precision-config``
   assignment_report.json  -- VRAM breakdown, K, per-layer counts, top scores
 
 See docs/superpowers/specs/2026-04-19-static-expert-assignment-design.md.
 """
 from __future__ import annotations
 
-import argparse
 import json
-import logging
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
-import torch
-
-# Allow running from anywhere.
 sys.path.insert(0, str(Path(__file__).parent))
-import vram_estimator as vest
-
-logger = logging.getLogger(__name__)
+import vram_estimator as vest  # noqa: E402
 
 
 def _resolve_hf_path(path: str) -> str:
@@ -142,8 +137,6 @@ def _write_outputs(
 ) -> Tuple[Path, Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # int4_only_experts.json: {layer_id: [expert_ids...]} (layer-id string,
-    # expert ids sorted)
     by_layer: Dict[str, List[int]] = {}
     for L, E in int4_only:
         by_layer.setdefault(str(L), []).append(E)
@@ -153,7 +146,6 @@ def _write_outputs(
     with open(int4_path, "w") as f:
         json.dump(by_layer, f, indent=2)
 
-    # heter_config.json: ready for --heter-precision-config.
     heter_config = {
         "groups": [
             {
@@ -172,7 +164,6 @@ def _write_outputs(
     with open(config_path, "w") as f:
         json.dump(heter_config, f, indent=2)
 
-    # assignment_report.json
     heter_by_layer: Dict[str, int] = {}
     int4_by_layer: Dict[str, int] = {}
     for L, _ in heter:
@@ -202,8 +193,12 @@ def _write_outputs(
             "kv_reserve_frac": knobs.kv_reserve_frac,
             "headroom_gb": knobs.headroom_gb,
             "headroom_frac": knobs.headroom_frac,
-            "prefill_budget_tokens": knobs.prefill_budget_tokens,
             "group_size": knobs.group_size,
+            "chunked_prefill_size": knobs.chunked_prefill_size,
+            "cuda_graph_max_bs": knobs.cuda_graph_max_bs,
+            "tp_size": knobs.tp_size,
+            "pp_size": knobs.pp_size,
+            "num_piecewise_tokens": knobs.num_piecewise_tokens,
         },
         "vram_breakdown_bytes": budget.as_breakdown(),
         "K_heter_experts": len(heter),
@@ -217,106 +212,3 @@ def _write_outputs(
         json.dump(report, f, indent=2)
 
     return int4_path, config_path, report_path
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--layer_sensitivity", required=True)
-    ap.add_argument("--expert_sensitivity", required=True)
-    ap.add_argument("--model_path", required=True)
-    ap.add_argument("--int4_checkpoint", required=True)
-    ap.add_argument("--max_concurrency", type=int, required=True)
-    ap.add_argument("--max_prompt_len", type=int, required=True)
-    ap.add_argument("--max_output_len", type=int, required=True)
-    ap.add_argument("--kv_reserve_frac", type=float, default=0.5)
-    ap.add_argument("--headroom_gb", type=float, default=2.0)
-    ap.add_argument("--headroom_frac", type=float, default=0.05)
-    ap.add_argument("--prefill_budget_tokens", type=int, default=16384)
-    ap.add_argument("--group_size", type=int, default=128)
-    ap.add_argument("--gpu", type=int, default=0)
-    ap.add_argument("--gpu_vram_bytes", type=int, default=-1,
-                    help="Override detected GPU VRAM (for testing / planning).")
-    ap.add_argument("--force_k", type=int, default=-1,
-                    help="Force K heter experts (override VRAM-budget K).")
-    ap.add_argument("--out_dir", required=True)
-    args = ap.parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-    )
-
-    config = _load_model_config(args.model_path)
-    num_layers = config.num_hidden_layers
-    num_experts = config.num_experts
-
-    if args.gpu_vram_bytes > 0:
-        gpu_vram = args.gpu_vram_bytes
-    else:
-        gpu_vram = torch.cuda.get_device_properties(args.gpu).total_memory
-
-    slo = vest.SLO(
-        max_concurrency=args.max_concurrency,
-        max_prompt_len=args.max_prompt_len,
-        max_output_len=args.max_output_len,
-    )
-    knobs = vest.BudgetKnobs(
-        kv_reserve_frac=args.kv_reserve_frac,
-        headroom_gb=args.headroom_gb,
-        headroom_frac=args.headroom_frac,
-        prefill_budget_tokens=args.prefill_budget_tokens,
-        group_size=args.group_size,
-    )
-    budget = vest.compute_budget(config, gpu_vram, slo, knobs)
-
-    logger.info(
-        "Model: H=%d I=%d L=%d num_experts=%d  (%d total experts)",
-        config.hidden_size, config.moe_intermediate_size,
-        num_layers, num_experts, num_experts * num_layers,
-    )
-    logger.info("VRAM budget:\n%s", vest.format_budget(budget))
-
-    if budget.k_heter_experts == 0:
-        logger.error(
-            "No BF16 budget available (bf16_budget_bytes=%d). "
-            "Either relax SLO (lower max_concurrency / seq-len) or lower "
-            "--kv_reserve_frac.",
-            budget.bf16_budget,
-        )
-        # Still emit outputs so the operator can see the breakdown.
-
-    ppl, l2 = _load_sensitivity_inputs(
-        args.layer_sensitivity, args.expert_sensitivity, num_layers, num_experts
-    )
-    scores = _composite_scores(ppl, l2, num_experts)
-    k = args.force_k if args.force_k >= 0 else budget.k_heter_experts
-    if args.force_k >= 0:
-        logger.info("Forcing K=%d (VRAM-budget K was %d)", k, budget.k_heter_experts)
-    heter, int4_only = _assign(scores, k)
-
-    out_dir = Path(args.out_dir)
-    int4_path, cfg_path, report_path = _write_outputs(
-        out_dir=out_dir,
-        int4_only=int4_only,
-        heter=heter,
-        int4_checkpoint=args.int4_checkpoint,
-        group_size=args.group_size,
-        budget=budget,
-        slo=slo,
-        knobs=knobs,
-        scores=scores,
-        ppl=ppl,
-        num_layers=num_layers,
-    )
-    logger.info(
-        "Wrote:\n  %s\n  %s\n  %s",
-        int4_path, cfg_path, report_path,
-    )
-    logger.info(
-        "Assigned %d heter / %d int4-only (of %d total)",
-        len(heter), len(int4_only), num_experts * num_layers,
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

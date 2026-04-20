@@ -1,0 +1,13 @@
+configs/
+output/
+
+# Generated sweep artifacts
+profile/results/
+profile/full_sweep.log
+profile/smoke.log
+profile/kv_calib/*.jsonl
+profile/kv_calib/server_*.log
+
+# Python caches
+__pycache__/
+*.pyc

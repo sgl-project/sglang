@@ -1,0 +1,40 @@
+{
+  "bench_details": {
+    "source": "/data/huanchen/sglang/expert_precision_assignment/profile/kv_calib/calib_mc128_thr128_n256.jsonl",
+    "input_len": {
+      "n": 256,
+      "min": 5,
+      "mean": 286.67,
+      "std": 378.22,
+      "p50": 178,
+      "p95": 804,
+      "p99": 2136,
+      "max": 2897
+    },
+    "output_len": {
+      "n": 256,
+      "min": 2,
+      "mean": 199.77,
+      "std": 220.93,
+      "p50": 124,
+      "p95": 658,
+      "p99": 800,
+      "max": 1642
+    },
+    "total_len": {
+      "n": 256,
+      "min": 13,
+      "mean": 486.45,
+      "std": 422.04,
+      "p50": 370,
+      "p95": 1328,
+      "p99": 2384,
+      "max": 3248
+    }
+  },
+  "recommended_slo": {
+    "mean_total_len": 486.45,
+    "std_total_len": 422.04,
+    "kv_headroom_sigmas": 2.0
+  }
+}
