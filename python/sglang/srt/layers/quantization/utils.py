@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
+from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 
@@ -43,6 +44,17 @@ def get_scalar_types():
 ScalarType, scalar_types = get_scalar_types()
 
 
+def _ignored_layer_matches(prefix: str, ignored: str) -> bool:
+    """Check if a layer prefix matches an ignored-layer pattern.
+
+    Supports glob wildcards (*, ?, [) via fnmatch when the pattern contains
+    glob characters, otherwise falls back to the original substring semantics.
+    """
+    if any(c in ignored for c in "*?["):
+        return fnmatchcase(prefix, ignored)
+    return ignored in prefix
+
+
 def is_layer_skipped(
     prefix: str,
     ignored_layers: List[str],
@@ -65,7 +77,8 @@ def is_layer_skipped(
         is_skipped = None
         for shard_prefix in shard_prefixes:
             is_shard_skipped = any(
-                ignored in shard_prefix for ignored in ignored_layers
+                _ignored_layer_matches(shard_prefix, ignored)
+                for ignored in ignored_layers
             )
 
             if is_skipped is None:
@@ -77,7 +90,9 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = any(ignored in prefix for ignored in ignored_layers)
+        is_skipped = any(
+            _ignored_layer_matches(prefix, ignored) for ignored in ignored_layers
+        )
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")
