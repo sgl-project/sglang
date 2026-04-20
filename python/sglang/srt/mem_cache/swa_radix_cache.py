@@ -521,6 +521,7 @@ class SWARadixCache(BasePrefixCache):
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len
