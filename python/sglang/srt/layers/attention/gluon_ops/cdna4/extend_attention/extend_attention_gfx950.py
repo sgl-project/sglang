@@ -986,6 +986,14 @@ def gluon_extend_attention_fwd(
         That was the root cause of the Llama-70B BF16 quality regression
         (Apr 2026): per-layer error compounded from ~0.1 at layer 0 to
         ~3.0 at layer 79, producing garbled text.
+
+        Same story for sm_scale: SGLang may pass different k_scale values
+        per layer (some quantization schemes use per-layer KV scales), and
+        sm_scale is a HIPLauncher runtime arg (not a constexpr). Recompute
+        `_sm_live` from the CURRENT call's sm_scale+k_scale so the cached
+        kernel sees the right softmax scaling even when an earlier layer's
+        install wrote a different value into `_cc_sm`. The arithmetic is a
+        single multiply (~20 ns) so the defensive recompute is free.
         """
         _mi_n = _total_extend_rows + 1
         _wkvo_n = batch_size if batch_size > 0 else 1
@@ -1007,6 +1015,9 @@ def gluon_extend_attention_fwd(
             _qs[0], _qs[1], _ks[0], _ks[1], _vs[0], _vs[1],
             _os[0], _os[1], _kbs[0], _kbs[1], _vbs[0], _vbs[1],
         )
+        # Recompute sm_scale from THIS call's values (not the cached install).
+        # k_scale may vary per layer under per-layer FP8 quantization schemes.
+        _sm_live = (sm_scale if sm_scale is not None else Lq**-0.5) * k_scale
         _tag = _cc_entry[0]
         if _tag == "fast":
             _, _cc_run, _cc_sm, _cc_strides, _cc_BM = _cc_entry
@@ -1016,7 +1027,7 @@ def gluon_extend_attention_fwd(
                 qo_indptr, kv_indptr, kv_indices,
                 _dummy_cm, _dummy_mi[:_mi_n],
                 _wkvo_arg, _sinks_arg,
-                _cc_sm, _live_strides,
+                _sm_live, _live_strides,
                 (batch_size, head_num,
                  (max_len_extend + _cc_BM - 1) // _cc_BM),
             )
@@ -1034,7 +1045,7 @@ def gluon_extend_attention_fwd(
                 qo_indptr, kv_indptr, kv_indices,
                 _dummy_cm, _dummy_mi[:_mi_n],
                 _wkvo_arg,
-                _cc_sm, _cc_gn, *_live_strides,
+                _sm_live, _cc_gn, *_live_strides,
                 grid=(batch_size, head_num,
                       (max_len_extend + _cc_BM - 1) // _cc_BM),
                 **_cc_kw,
