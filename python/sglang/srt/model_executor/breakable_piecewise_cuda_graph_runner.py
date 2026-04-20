@@ -122,15 +122,18 @@ class BridgeBuffers:
             self.mamba_output = None
 
 
-class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
+class BreakablePiecewiseCudaGraphRunner:
     """Piecewise CUDA graph runner using breakable CUDA graph.
 
     Captures the model forward as a breakable CUDA graph with graph breaks
     at attention layers. Much simpler than the torch.compile-based approach.
     """
 
+    # Reuse replay_prepare from PiecewiseCudaGraphRunner (no inheritance needed
+    # since __init__ and capture are completely different).
+    replay_prepare = PiecewiseCudaGraphRunner.replay_prepare
+
     def __init__(self, model_runner: ModelRunner):
-        # Skip parent __init__ (which does torch.compile) — set up shared state directly
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
@@ -394,7 +397,19 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
         # caller falls back to the eager extend path.
         if forward_batch.batch_size > 1:
             return False
-        return super().can_run(forward_batch)
+        if forward_batch.input_embeds is not None:
+            return False
+        if forward_batch.replace_embeds is not None:
+            return False
+        num_tokens = len(forward_batch.input_ids)
+        if forward_batch.return_logprob:
+            for start_len, seq_len in zip(
+                forward_batch.extend_logprob_start_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            ):
+                if start_len is not None and start_len < seq_len:
+                    return False
+        return num_tokens <= self.max_num_tokens
 
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
