@@ -333,6 +333,7 @@ class EagleVerifyInputV2Mixin:
                 next_token_logits,
                 sampling_info,
                 num_tokens_in_batch=self.draft_token_num,
+            )
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.
         if sampling_info.acc_additive_penalties is not None:
