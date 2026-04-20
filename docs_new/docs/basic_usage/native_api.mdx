@@ -1,0 +1,450 @@
+---
+title: "SGLang Native APIs"
+metatags:
+    description: "SGLang native server APIs for text generation, embedding, reranking, model info, cache management, and more."
+---
+Apart from the OpenAI compatible APIs, the SGLang Runtime also provides its native server APIs. We introduce the following APIs:
+
+- `/generate` (text generation model)
+- `/get_model_info`
+- `/get_server_info`
+- `/health`
+- `/health_generate`
+- `/flush_cache`
+- `/update_weights`
+- `/encode`(embedding model)
+- `/v1/rerank`(cross encoder rerank model)
+- `/v1/score`(decoder-only scoring)
+- `/classify`(reward model)
+- `/start_expert_distribution_record`
+- `/stop_expert_distribution_record`
+- `/dump_expert_distribution_record`
+- `/tokenize`
+- `/detokenize`
+- A full list of these APIs can be found at [http_server.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py)
+
+We mainly use `requests` to test these APIs in the following examples. You can also use `curl`.
+
+## Launch A Server
+
+```python Example
+from sglang.test.doc_patch import launch_server_cmd
+from sglang.utils import wait_for_server, print_highlight, terminate_process
+
+server_process, port = launch_server_cmd(
+    "python3 -m sglang.launch_server --model-path qwen/qwen2.5-0.5b-instruct --host 0.0.0.0 --log-level warning"
+)
+
+wait_for_server(f"http://localhost:{port}")
+```
+
+## Generate (text generation model)
+Generate completions. This is similar to the `/v1/completions` in OpenAI API. Detailed parameters can be found in the [sampling parameters](./sampling_params).
+
+```python Example
+import requests
+
+url = f"http://localhost:{port}/generate"
+data = {"text": "What is the capital of France?"}
+
+response = requests.post(url, json=data)
+print_highlight(response.json())
+```
+
+## Get Model Info
+
+Get the information of the model.
+
+- `model_path`: The path/name of the model.
+- `is_generation`: Whether the model is used as generation model or embedding model.
+- `tokenizer_path`: The path/name of the tokenizer.
+- `preferred_sampling_params`: The default sampling params specified via `--preferred-sampling-params`. `None` is returned in this example as we did not explicitly configure it in server args.
+- `weight_version`: This field contains the version of the model weights. This is often used to track changes or updates to the model’s trained parameters.
+- `has_image_understanding`: Whether the model has image-understanding capability.
+- `has_audio_understanding`: Whether the model has audio-understanding capability.
+- `model_type`: The model type from the HuggingFace config (e.g., "qwen2", "llama").
+- `architectures`: The model architectures from the HuggingFace config (e.g., ["Qwen2ForCausalLM"]).
+
+```python Example
+url = f"http://localhost:{port}/get_model_info"
+
+response = requests.get(url)
+response_json = response.json()
+print_highlight(response_json)
+assert response_json["model_path"] == "qwen/qwen2.5-0.5b-instruct"
+assert response_json["is_generation"] is True
+assert response_json["tokenizer_path"] == "qwen/qwen2.5-0.5b-instruct"
+assert response_json["preferred_sampling_params"] is None
+assert response_json.keys() == {
+    "model_path",
+    "is_generation",
+    "tokenizer_path",
+    "preferred_sampling_params",
+    "weight_version",
+    "has_image_understanding",
+    "has_audio_understanding",
+    "model_type",
+    "architectures",
+}
+```
+
+## Get Server Info
+Gets the server information including CLI arguments, token limits, and memory pool sizes.
+- Note: `get_server_info` merges the following deprecated endpoints:
+  - `get_server_args`
+  - `get_memory_pool_size`
+  - `get_max_total_num_tokens`
+
+```python Example
+url = f"http://localhost:{port}/get_server_info"
+
+response = requests.get(url)
+print_highlight(response.text)
+```
+
+## Health Check
+- `/health`: Check the health of the server.
+- `/health_generate`: Check the health of the server by generating one token.
+
+```python Example
+url = f"http://localhost:{port}/health_generate"
+
+response = requests.get(url)
+print_highlight(response.text)
+```
+
+```python Example
+url = f"http://localhost:{port}/health"
+
+response = requests.get(url)
+print_highlight(response.text)
+```
+
+## Flush Cache
+
+Flush the radix cache. It will be automatically triggered when the model weights are updated by the `/update_weights` API.
+
+```python Example
+url = f"http://localhost:{port}/flush_cache"
+
+response = requests.post(url)
+print_highlight(response.text)
+```
+
+## Update Weights From Disk
+
+Update model weights from disk without restarting the server. Only applicable for models with the same architecture and parameter size.
+
+SGLang support `update_weights_from_disk` API for continuous evaluation during training (save checkpoint to disk and update weights from disk).
+
+```python Example
+# successful update with same architecture and size
+
+url = f"http://localhost:{port}/update_weights_from_disk"
+data = {"model_path": "qwen/qwen2.5-0.5b-instruct"}
+
+response = requests.post(url, json=data)
+print_highlight(response.text)
+assert response.json()["success"] is True
+assert response.json()["message"] == "Succeeded to update model weights."
+```
+
+```python Example
+# failed update with different parameter size or wrong name
+
+url = f"http://localhost:{port}/update_weights_from_disk"
+data = {"model_path": "qwen/qwen2.5-0.5b-instruct-wrong"}
+
+response = requests.post(url, json=data)
+response_json = response.json()
+print_highlight(response_json)
+assert response_json["success"] is False
+assert response_json["message"] == (
+    "Failed to get weights iterator: "
+    "qwen/qwen2.5-0.5b-instruct-wrong"
+    " (repository not found)."
+)
+```
+
+```python Example
+terminate_process(server_process)
+```
+
+## Encode (embedding model)
+
+Encode text into embeddings. Note that this API is only available for [embedding models](./openai_api_embeddings) and will raise an error for generation models.
+Therefore, we launch a new server to server an embedding model.
+
+```python Example
+embedding_process, port = launch_server_cmd(
+    """
+python3 -m sglang.launch_server --model-path Alibaba-NLP/gte-Qwen2-1.5B-instruct \
+    --host 0.0.0.0 --is-embedding --log-level warning
+"""
+)
+
+wait_for_server(f"http://localhost:{port}")
+```
+
+```python Example
+# successful encode for embedding model
+
+url = f"http://localhost:{port}/encode"
+data = {"model": "Alibaba-NLP/gte-Qwen2-1.5B-instruct", "text": "Once upon a time"}
+
+response = requests.post(url, json=data)
+response_json = response.json()
+print_highlight(f"Text embedding (first 10): {response_json['embedding'][:10]}")
+```
+
+```python Example
+terminate_process(embedding_process)
+```
+
+## v1/rerank (cross encoder rerank model)
+Rerank a list of documents given a query using a cross-encoder model. Note that this API is only available for cross encoder model like [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) with `attention-backend` `triton` and `torch_native`.
+
+```python Example
+reranker_process, port = launch_server_cmd(
+    """
+python3 -m sglang.launch_server --model-path BAAI/bge-reranker-v2-m3 \
+    --host 0.0.0.0 --disable-radix-cache --chunked-prefill-size -1 --attention-backend triton --is-embedding --log-level warning
+"""
+)
+
+wait_for_server(f"http://localhost:{port}")
+```
+
+```python Example
+# compute rerank scores for query and documents
+
+url = f"http://localhost:{port}/v1/rerank"
+data = {
+    "model": "BAAI/bge-reranker-v2-m3",
+    "query": "what is panda?",
+    "documents": [
+        "hi",
+        "The giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China.",
+    ],
+}
+
+response = requests.post(url, json=data)
+response_json = response.json()
+for item in response_json:
+    print_highlight(f"Score: {item['score']:.2f} - Document: '{item['document']}'")
+```
+
+```python Example
+terminate_process(reranker_process)
+```
+
+## v1/score (decoder-only scoring)
+
+Compute token probabilities for specified tokens given a query and items. This is useful for classification tasks, scoring responses, or computing log-probabilities.
+
+Parameters:
+- `query`: Query text
+- `items`: Item text(s) to score
+- `label_token_ids`: Token IDs to compute probabilities for
+- `apply_softmax`: Whether to apply softmax to get normalized probabilities (default: False)
+- `item_first`: Whether items come first in concatenation order (default: False)
+- `model`: Model name
+
+The response contains `scores` - a list of probability lists, one per item, each in the order of `label_token_ids`.
+
+```python Example
+score_process, port = launch_server_cmd(
+    """
+python3 -m sglang.launch_server --model-path qwen/qwen2.5-0.5b-instruct \
+    --host 0.0.0.0 --log-level warning
+"""
+)
+
+wait_for_server(f"http://localhost:{port}")
+```
+
+```python Example
+# Score the probability of different completions given a query
+query = "The capital of France is"
+items = ["Paris", "London", "Berlin"]
+
+url = f"http://localhost:{port}/v1/score"
+data = {
+    "model": "qwen/qwen2.5-0.5b-instruct",
+    "query": query,
+    "items": items,
+    "label_token_ids": [9454, 2753],  # e.g. "Yes" and "No" token ids
+    "apply_softmax": True,  # Normalize probabilities to sum to 1
+}
+
+response = requests.post(url, json=data)
+response_json = response.json()
+
+# Display scores for each item
+for item, scores in zip(items, response_json["scores"]):
+    print_highlight(f"Item '{item}': probabilities = {[f'{s:.4f}' for s in scores]}")
+```
+
+```python Example
+terminate_process(score_process)
+```
+
+## Classify (reward model)
+
+SGLang Runtime also supports reward models. Here we use a reward model to classify the quality of pairwise generations.
+
+```python Example
+# Note that SGLang now treats embedding models and reward models as the same type of models.
+# This will be updated in the future.
+
+reward_process, port = launch_server_cmd(
+    """
+python3 -m sglang.launch_server --model-path Skywork/Skywork-Reward-Llama-3.1-8B-v0.2 --host 0.0.0.0 --is-embedding --log-level warning
+"""
+)
+
+wait_for_server(f"http://localhost:{port}")
+```
+
+```python Example
+from transformers import AutoTokenizer
+
+PROMPT = (
+    "What is the range of the numeric output of a sigmoid node in a neural network?"
+)
+
+RESPONSE1 = "The output of a sigmoid node is bounded between -1 and 1."
+RESPONSE2 = "The output of a sigmoid node is bounded between 0 and 1."
+
+CONVS = [
+    [{"role": "user", "content": PROMPT}, {"role": "assistant", "content": RESPONSE1}],
+    [{"role": "user", "content": PROMPT}, {"role": "assistant", "content": RESPONSE2}],
+]
+
+tokenizer = AutoTokenizer.from_pretrained("Skywork/Skywork-Reward-Llama-3.1-8B-v0.2")
+prompts = tokenizer.apply_chat_template(CONVS, tokenize=False, return_dict=False)
+
+url = f"http://localhost:{port}/classify"
+data = {"model": "Skywork/Skywork-Reward-Llama-3.1-8B-v0.2", "text": prompts}
+
+responses = requests.post(url, json=data).json()
+for response in responses:
+    print_highlight(f"reward: {response['embedding'][0]}")
+```
+
+```python Example
+terminate_process(reward_process)
+```
+
+## Capture expert selection distribution in MoE models
+
+SGLang Runtime supports recording the number of times an expert is selected in a MoE model run for each expert in the model. This is useful when analyzing the throughput of the model and plan for optimization.
+
+*Note: We only print out the first 10 lines of the csv below for better readability. Please adjust accordingly if you want to analyze the results more deeply.*
+
+```python Example
+expert_record_server_process, port = launch_server_cmd(
+    "python3 -m sglang.launch_server --model-path Qwen/Qwen1.5-MoE-A2.7B --host 0.0.0.0 --expert-distribution-recorder-mode stat --log-level warning"
+)
+
+wait_for_server(f"http://localhost:{port}")
+```
+
+```python Example
+response = requests.post(f"http://localhost:{port}/start_expert_distribution_record")
+print_highlight(response)
+
+url = f"http://localhost:{port}/generate"
+data = {"text": "What is the capital of France?"}
+
+response = requests.post(url, json=data)
+print_highlight(response.json())
+
+response = requests.post(f"http://localhost:{port}/stop_expert_distribution_record")
+print_highlight(response)
+
+response = requests.post(f"http://localhost:{port}/dump_expert_distribution_record")
+print_highlight(response)
+```
+
+```python Example
+terminate_process(expert_record_server_process)
+```
+
+## Tokenize/Detokenize Example (Round Trip)
+
+This example demonstrates how to use the /tokenize and /detokenize endpoints together. We first tokenize a string, then detokenize the resulting IDs to reconstruct the original text. This workflow is useful when you need to handle tokenization externally but still leverage the server for detokenization.
+
+```python Example
+tokenizer_free_server_process, port = launch_server_cmd(
+    """
+python3 -m sglang.launch_server --model-path qwen/qwen2.5-0.5b-instruct
+"""
+)
+
+wait_for_server(f"http://localhost:{port}")
+```
+
+```python Example
+import requests
+from sglang.utils import print_highlight
+
+base_url = f"http://localhost:{port}"
+tokenize_url = f"{base_url}/tokenize"
+detokenize_url = f"{base_url}/detokenize"
+
+model_name = "qwen/qwen2.5-0.5b-instruct"
+input_text = "SGLang provides efficient tokenization endpoints."
+print_highlight(f"Original Input Text:\n'{input_text}'")
+
+# --- tokenize the input text ---
+tokenize_payload = {
+    "model": model_name,
+    "prompt": input_text,
+    "add_special_tokens": False,
+}
+try:
+    tokenize_response = requests.post(tokenize_url, json=tokenize_payload)
+    tokenize_response.raise_for_status()
+    tokenization_result = tokenize_response.json()
+    token_ids = tokenization_result.get("tokens")
+
+    if not token_ids:
+        raise ValueError("Tokenization returned empty tokens.")
+
+    print_highlight(f"\nTokenized Output (IDs):\n{token_ids}")
+    print_highlight(f"Token Count: {tokenization_result.get('count')}")
+    print_highlight(f"Max Model Length: {tokenization_result.get('max_model_len')}")
+
+    # --- detokenize the obtained token IDs ---
+    detokenize_payload = {
+        "model": model_name,
+        "tokens": token_ids,
+        "skip_special_tokens": True,
+    }
+
+    detokenize_response = requests.post(detokenize_url, json=detokenize_payload)
+    detokenize_response.raise_for_status()
+    detokenization_result = detokenize_response.json()
+    reconstructed_text = detokenization_result.get("text")
+
+    print_highlight(f"\nDetokenized Output (Text):\n'{reconstructed_text}'")
+
+    if input_text == reconstructed_text:
+        print_highlight(
+            "\nRound Trip Successful: Original and reconstructed text match."
+        )
+    else:
+        print_highlight(
+            "\nRound Trip Mismatch: Original and reconstructed text differ."
+        )
+
+except requests.exceptions.RequestException as e:
+    print_highlight(f"\nHTTP Request Error: {e}")
+except Exception as e:
+    print_highlight(f"\nAn error occurred: {e}")
+```
+
+```python Example
+terminate_process(tokenizer_free_server_process)
+```
