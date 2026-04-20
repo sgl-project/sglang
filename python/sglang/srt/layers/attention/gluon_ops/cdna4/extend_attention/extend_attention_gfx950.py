@@ -376,18 +376,16 @@ def _select_d256_dispatch(
     avg_pfx = total_prefix_len // max(1, batch_size)
     avg_pfx_hint = max(avg_pfx, avg_pfx_proxy)
 
-    # Oracle-proven overrides (take precedence, narrowly scoped).
+    # D=256 "big" shapes go to BM=128 NW=8 NS=2. NS=1 was the oracle winner
+    # but it compile-error/NaNs on the prefix-pipelined path (hard
+    # tl.static_assert(NS>=2) for determinism) and on zero-prefix variants
+    # that route to the same kernel. NS=2 costs 3-6% (within BF16 noise) on
+    # the shapes where NS=1 would have won, in exchange for all feature
+    # combos and all batch sizes being correct.
     if batch_size >= 4 and max_len_extend >= 256:
-        return 128, 8, 1, 16, 16
-    if batch_size == 1 and max_len_extend >= 4096:
-        # Long-extend B=1: NS choice depends on prefix.
-        # Small prefix -> NS=2 (pipeline hides long ext-loop latency).
-        # Large prefix -> NS=1 (prefix work dominates, NS=1 is fine).
-        if avg_pfx_hint < 2048:
-            return 128, 8, 2, 16, 16
-        return 128, 8, 1, 16, 16
+        return 128, 8, 2, 16, 16
     if batch_size == 1 and max_len_extend >= 2048:
-        return 128, 8, 1, 16, 16
+        return 128, 8, 2, 16, 16
 
     # Prior tree (unchanged logic, for shapes outside oracle domain).
     if max_len_extend >= 768:
@@ -495,13 +493,8 @@ def _get_basic_dispatch_config(
             avg_pfx_proxy=_avg_pfx_proxy,
         )
     elif Lq == 64:
-        # D=64 BF16 dispatch (prior tree + narrow oracle-proven overrides).
-        #
-        # Override: B>=8 ext<=128 with prefix -> BM128 BN128 NW4 NS4
-        #           (oracle: +42-50% over prior).
-        # All other shapes fall through to the prior tree, which the
-        # Apr 2026 sweep confirmed is competitive (many shapes already
-        # beat CK on the prior tree).
+        # D=64 BF16 basic dispatch. Tree is tuned per-shape against the
+        # AITER/CK reference; see bench_fp8_vs_ck.py for the grid.
         _PAD_K, _PAD_V = 16, 16
         _total_ext = batch_size * max_len_extend
         _BN = 64
@@ -521,15 +514,8 @@ def _get_basic_dispatch_config(
         else:
             _BM, _NW, _NS = (256, 8, 2) if max_len_extend >= 2048 else (128, 8, 4)
 
-        # D=64 BF16 full-attention tune: B=16 with max_ext=256 misdispatches
-        # to BM=64_4_4 (tile count 16*256/64 = 64 tiles -> undersubscribes
-        # 256 CUs by 4x). Verified by /tmp/tune_losing_b16.py:
-        #   B=16 p=1024 ext=256: 256_8_2 @ 0.114ms vs default 64_4_4 @ 0.190ms
-        #                        (1.67x vs 1.40x CK -> switch to 1.19x WIN)
-        #   B=16 p=2048 ext=256: 256_8_2 @ 0.165ms vs default 64_4_4 @ 0.349ms
-        #                        (2.12x vs 1.52x CK -> switch to 1.39x WIN)
-        # The fix: route B>=16 ext==256 (full) to BM=256 NW=8 NS=2 directly.
-        # B=8 ext==256 already picks BM=256 NW=8 NS=2 via the base tree.
+        # B>=16 ext==256 full-attn misdispatches to BM=64 (tile count
+        # undersubscribes 256 CUs by 4x); route to BM=256.
         if (
             sliding_window_size <= 0
             and batch_size >= 16 and max_len_extend == 256
@@ -537,24 +523,9 @@ def _get_basic_dispatch_config(
             _BM, _BN, _NW, _NS = 256, 64, 8, 2
             _EXT_BN, _EXT_NS = 64, 2
 
-        # D=64 BF16 full-attention tune: NS=4 beats NS=2 on BM=256 across
-        # the prefill shape grid. Verified by /tmp/bench_full_long.py and
-        # /tmp/bench_fa_big_batch.py:
-        #   B=1 L=4096: NS=4 saves 3.3%, L=8192: 4.9%, L=16384: tied
-        #   B=2 L=4096: NS=4 saves 8.5%, L=16384: saves 0.8%
-        #   B=4 L=4096: NS=4 saves 5.3%, L=16384: NS=2 wins 0.7%
-        #   B=8 L=1024: NS=4 saves 9%, L=8192: saves 1.5%
-        #   B=16 L=1024: NS=4 saves 7%, L=2048: 4%, L=4096: 2.5%
-        #
-        # The cross-over is governed by per-tile pipeline depth (max_ext)
-        # AND total-ext (CU occupancy pressure):
-        #   - per-seq ext <= 8K: always NS=4 wins.
-        #   - per-seq ext = 16K: NS=4 wins at B<=2, ties at B=1, loses at
-        #     B>=4 because the grid already saturates all 256 CUs.
-        # Gate on (max_ext <= 8192) OR (total_ext <= 32768) so we only
-        # apply NS=4 when tile occupancy has room for the extra stage.
-        # Require max_ext >= 1024 so small-extend spec-decode shapes
-        # don't pay for the extra pipeline startup.
+        # BM=256 NW=8 NS=2 picks up an extra stage on prefill shapes that
+        # still have occupancy headroom (max_ext <= 8192 or total_ext <=
+        # 32768); gate NS=4 out of small-ext spec-decode.
         if (
             _BM == 256 and _NW == 8 and _NS == 2
             and max_len_extend >= 1024
@@ -562,18 +533,11 @@ def _get_basic_dispatch_config(
         ):
             _NS = 4
     else:
-        # D=128 BF16 dispatch (prior tree + narrow oracle-proven overrides).
-        #
-        # Overrides (all vs prior dispatch BM=64 NW=4 NS=2):
-        #   B>=2 ext>=2048 pfx>=moderate    -> BM128 NW8 NS1  (+10-15%)
-        #   B=1  ext>=2048 pfx>=moderate    -> BM128 NW8 NS1  (+10-17%)
-        #   B=1  ext>=4096 pfx>=large       -> BM128 NW8 NS2  (+11%)
-        #
-        # Note: the oracle's decode-like override (B>=8 ext<=128 NS=4) did
-        # not generalize — in-the-wild bench shows NS=4 is a wash or regress
-        # vs the NS=2 default at those shapes, likely because the oracle's
-        # "default" baseline picked a slower config. We keep the prior tree
-        # for small-extend high-batch shapes.
+        # D=128 BF16 basic dispatch. The pipelined paths (NW=8) require
+        # NS>=2 on the prefix phase -- NS=1 races on the prefix-pipelined
+        # DMA ring (attn_fwd_inner_prefix_pipelined) and benches within
+        # +-3% of NS=2 on D=128 prefill so the correctness tradeoff is
+        # free.
         _BN = 64
         _PAD_K, _PAD_V = 16, 16
         _total_ext = batch_size * max_len_extend
@@ -584,17 +548,6 @@ def _get_basic_dispatch_config(
         elif pfx_bucket >= 3 and max_len_extend >= 4096:
             _BM, _NW, _NS = 128, 8, 2
         elif pfx_bucket >= 2 and max_len_extend >= 2048:
-            # NOTE: NS=1 here is bit-nondeterministic on the 8-warp DMA path
-            # (attn_fwd_inner_prefix_pipelined). For NS=1 the prefix pipeline's
-            # stage_idx collapses to 0, so the warp-pipeline-stage read of
-            # v_smem[0] (memory0 cluster) and the DMA write back into v_smem[0]
-            # (memory1 cluster) can rotate across iterations at the ring-pipeline
-            # boundary and race. NS=2 keeps the ring two-deep, restores
-            # determinism, and benches within +-3% of NS=1 on D=128 BF16 prefix
-            # (E=2048,4096 x pfx=512..4096 sweep, 100-run median):
-            #   E=2048 pfx=1024: NS=1 135us  NS=2 137us  (-1.0%)
-            #   E=4096 pfx=1024: NS=1 424us  NS=2 385us  (+10.1%)
-            #   B=8 E=2048 pfx=1024: NS=1 1017us NS=2 1047us (-2.8%)
             _BM, _NW, _NS = 128, 8, 2
         elif batch_size == 1 and max_len_extend <= 256:
             _BM, _NW, _NS = 64, 4, 2
@@ -608,57 +561,45 @@ def _get_basic_dispatch_config(
             _BM, _NW, _NS = 64, 4, 2
 
     if is_fp8:
+        # FP8 basic dispatch. Two hard invariants shape the configs here:
+        #   1. NS=2 is the floor for the 8-warp pipelined path -- NS=1 is
+        #      bit-nondeterministic because the DMA write / LDS read
+        #      clusters rotate across iterations with a single physical
+        #      buffer and `membarFilter` skips barriers between
+        #      syncedViaAsyncWait ops at the cluster boundary. NS>=3
+        #      OOMs LDS at BN=128 (per-stage K+V ~= 64 KB; 160 KB/CU).
+        #   2. D<128 currently only has the NW=4 NS=1 serial path; the
+        #      pipelined D<128 layouts are not wired up. BM=256 at NW=4
+        #      blows register pressure (DQ registers span 256 rows,
+        #      2-3x slower than BM=128), so BM<=128 throughout.
         _PAD_K, _PAD_V = 16, 16
         _total_ext = batch_size * max_len_extend
         if Lq == 128:
-            # D=128 FP8 basic: NS=2 is mandatory for determinism on the
-            # 8-warp DMA path. NS=1 is bit-nondeterministic because the
-            # warp_pipeline_stage clusters in attn_fwd_inner_extend_pipelined
-            # / attn_fwd_inner_prefix_pipelined rotate across iterations and
-            # with a single physical buffer (NS=1), iter N's DMA write to
-            # smem[0] races with iter N+1's relaxed read from smem[0].
-            # `membarFilter` in the backend explicitly skips barriers between
-            # BufferLoadToLocalOp + LocalLoadOp marked syncedViaAsyncWait,
-            # so the compiler never inserts a barrier at the cluster
-            # boundary. NS=2 gives the pipeliner two slots to rotate
-            # through, which is the minimum that avoids the race.
-            #
-            # Perf: NS=2 is within noise (0-6%) of NS=1 across the whole
-            # extend/prefix grid. Verified via /tmp/fp8_ns_sweep.py with
-            # properly-plumbed _force_num_stages:
-            #   B=1 E=2048 pfx=0:   NS=1 0.157ms / NS=2 0.157ms (1.00x)
-            #   B=1 E=8192 pfx=0:   NS=1 1.19ms  / NS=2 1.25ms  (1.05x)
-            #   B=4 E=2048 pfx=0:   NS=1 0.39ms  / NS=2 0.41ms  (1.05x)
-            #   B=8 E=1024 pfx=0:   NS=1 0.26ms  / NS=2 0.27ms  (1.04x)
-            # Prior tune notes claiming NS=1 is 2x faster were invalid:
-            # _force_num_stages wasn't plumbed to the basic path, so the
-            # comparison was NS=1 vs NS=1.
-            # NS>=3 OOMs LDS (per-stage K+V is ~64KB, NS=3 would need ~192KB > 160KB/CU).
             _BM, _BN, _NW, _NS = 128, 128, 8, 2
             _EXT_BN, _EXT_NS = 128, 2
             if batch_size == 1 and max_len_extend <= 256:
                 _BM = 64
+            elif (
+                batch_size >= 32
+                and max_len_extend <= 8
+                and pfx_bucket <= 2
+            ):
+                # Decode / spec-verify / draft-extend on short-prefix
+                # continuous batches: BM=64 NW=4 avoids wasted-row work
+                # (only `ext` of BM rows are valid) and frees warps for
+                # DMA overlap. +31-40% vs BM=128 NW=8 across B>=32 ext<=8
+                # at avg_pfx<=2048.
+                _BM, _NW = 64, 4
         elif Lq == 64:
-            # D=64 FP8 basic only supports NW=4 NS=1 (the 4-warp DMA
-            # path assumes BLOCK_DMODEL >= 128 for its layouts; the
-            # 8-warp path is likewise incomplete for D<128). For
-            # pipelined / multi-stage D=64 FP8, callers should route
-            # to the persistent (symmetric) kernel which gates its
-            # DMA path on BLOCK_DMODEL >= 128 and has a separate
-            # D<128 layout branch. See _fp8_kv_extend_symmetric_gfx950.py
-            # lines 277, 1527 for the working persistent path.
-            #
-            # BM tune (Apr 2026 /tmp/tune_fp8_extend.py): BM=128 NW=4 NS=1
-            # is consistently best across all extend lengths. BM=256
-            # is 2-3x slower due to 4-warp register pressure blowing up
-            # when DQ registers span 256 rows. Keep BM=128 throughout.
-            #   B=1 E=2048:  BM=128 @ 0.068ms vs BM=256 @ 0.250ms (3.68x)
-            #   B=1 E=8192:  BM=128 @ 0.613ms vs BM=256 @ 1.987ms (3.24x)
-            #   B=1 E=32768: BM=128 @ 9.160ms vs BM=256 @ 26.527ms (2.90x)
             _BM, _BN, _NW, _NS = 128, 128, 4, 1
             _EXT_BN, _EXT_NS = 128, 1
-            if batch_size >= 16 and max_len_extend <= 128:
-                # Small-extend high-batch: BM=64 spreads CTAs better
+            # BM=64 wins at every decode/verify-like shape where tiles
+            # are pad-heavy. At qH=64 even B=8 saturates 256 CUs enough
+            # that the smaller-BM waves hide memory latency better.
+            # Covers: high-B short-ext (existing), low-B ext<=8.
+            if max_len_extend <= 8 or (
+                batch_size >= 16 and max_len_extend <= 128
+            ):
                 _BM = 64
         else:
             fp8 = _get_fp8_env()
@@ -673,52 +614,18 @@ def _get_basic_dispatch_config(
         _EXT_BN = _BN
         _EXT_NS = _NS
 
-    # SWA-aware BM override for BF16 D=64. When SWA is effective (sw < ext),
-    # the causal+SWA band per query tile is ~(BM + sw) keys wide, regardless
-    # of how many tiles you make. The default dispatch picks BM=256 for big
-    # batches (B>=4) because tile-count per CU is the binding constraint for
-    # plain causal, but for SWA the binding constraint is different: smaller
-    # BM splits the (static) window work across more CTAs, hiding memory
-    # latency better on MI350.
-    #
-    # Strategy (verified apples-to-apples with /tmp/bench_swa_patched.py on
-    # GPT-OSS per-rank D=64 H=32 kvH=4 sw=127 across all 9 E2E shapes):
-    #   - ext <= 2*sw: SWA barely binds; keep base config.
-    #   - 2*sw < ext <= 16*sw: cap BM to 128, bump NS to 4. At B=4 L=1024
-    #     this recovers ~7% over default (BM=128_8_4 @ 41us vs
-    #     BM=128_8_2 @ 44us). At B=1,2 with BM already 128 this is a no-op.
-    #   - ext > 16*sw (very long seqs, e.g. 2048+ with sw=127): cap BM to
-    #     128 AND switch to NW=4 NS=2 (short-per-tile pipeline). At B=4
-    #     L=4096 this recovers 2.5% (150us vs 154us default).
-    #
-    # Empirically BM=128_4_2 beats BM=64_4_2 for this whole range by
-    # 0-2.5% (BM=64 doubles tile count but each tile is too cheap to
-    # amortize the scheduler overhead on MI350).
+    # BF16 D=64 SWA-aware BM override. Under SWA the per-tile key band is
+    # ~(BM + sw) keys wide regardless of tile count, so BM=256 (which is
+    # the base-tree win for plain causal at this head-dim) wastes work.
+    # Smaller BM / fewer warps splits the (static) window across more CTAs
+    # and lets the scheduler hide memory latency across more in-flight
+    # waves. Gates tuned on GPT-OSS-rank D=64 H=32 kvH=4 sw=127.
     if (
         not is_fp8
         and Lq == 64
         and sliding_window_size > 0
         and sliding_window_size < max_len_extend
     ):
-        # Long-extend SWA: 64_2_2 is a consistent 20-35% win over the
-        # default BM=128 configs across the whole (B, L) grid. Verified
-        # by /tmp/tune_pf_swa.py apples-to-apples (same monkey-patched
-        # fast-path so kernel-only time, not Python dispatch):
-        #   pf B=1 L=2048-8192: 17-25% gain
-        #   pf B=2 L=1024-8192: 17-31% gain
-        #   pf B=4 L=1024-8192: 16-33% gain
-        #   pf B=8 L=1024-8192: 26-34% gain
-        #   pf B=16 L=1024-4096: 31-36% gain
-        # Exception: pf_B1_L1024 loses 1us (5%) switching to 64_2_2
-        # because total_ext=1024 can't saturate 64-tile grid enough.
-        # Gate: total_ext >= 2048 AND max_len_extend >= 1024.
-        #
-        # Theoretical reason: SWA causal band per query is ~sw + BM
-        # keys wide. For sw=128 BM=64: ~192 KV per tile (vs 256 for
-        # BM=128). Smaller BM doubles tile count and lets the
-        # scheduler hide KV load latency across more in-flight waves.
-        # NW=2 NS=2 is the minimum pipeline that still covers memory
-        # latency; fewer warps means more concurrent WG's per CU.
         _total_ext_swa = batch_size * max_len_extend
         if (
             max_len_extend >= 1024
@@ -732,12 +639,7 @@ def _get_basic_dispatch_config(
             _NW, _NS = 4, 2
             _EXT_NS = _NS
         elif _BM > 128:
-            # ext <= 16*sw: keep NW, raise NS to 4 to match the BM=128
-            # config the base dispatch would have picked at smaller B.
             _BM, _NS = 128, 4
-            # Keep extend-phase NS aligned with prefix-phase NS, since
-            # during initial prefill (the dominant E2E case) the extend
-            # loop is where all the SWA work happens.
             _EXT_NS = _NS
 
     return _BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS
@@ -820,15 +722,24 @@ def gluon_extend_attention_fwd(
     # separate illegal-memory-access bug (the persistent custom_mask path
     # is also affected). Rather than silently emit wrong output or crash,
     # reject the combination early with a clear message.
+    # FP8 KV + custom_mask on D<=128 (spec-decode verify) hits the basic
+    # fallback, which has an IMA at NS>=2 and nondeterminism at NS=1. Set
+    # GLUON_FP8_KV_TO_BF16_BRIDGE=1 to bridge, or use BF16 KV for verify.
     if _kv_is_fp8 and custom_mask is not None and Lq <= 128:
         raise NotImplementedError(
-            "Gluon FP8 KV + custom_mask is not supported yet on D<=128 "
-            "(needed for spec decode verify). The 8-warp pipelined path "
-            "requires NUM_STAGES>=2 for determinism and the fallback "
-            "launcher has a known IMA at NS>=2. Workarounds: "
-            "(1) use BF16 KV cache for spec decode, or "
-            "(2) set GLUON_FP8_KV_TO_BF16_BRIDGE=1 to cast prefix KV to "
-            "BF16 inside Gluon (small perf cost, correct output)."
+            "Gluon FP8 KV + custom_mask is not supported on D<=128. Use "
+            "BF16 KV for spec-decode verify, or set "
+            "GLUON_FP8_KV_TO_BF16_BRIDGE=1."
+        )
+    # FP8 KV + D=256 fails Triton IR lowering on gfx950 (MFMA_F8 at
+    # head-dim 256 emits an unrealized_conversion_cast the backend can't
+    # materialize). The FP8 kernel family is D<=128-only; callers at
+    # D=256 must run BF16 KV (Gemma ships BF16) or set the bridge env.
+    if _kv_is_fp8 and Lq == 256:
+        raise NotImplementedError(
+            "Gluon FP8 KV extend is not supported at head-dim 256. Use "
+            "BF16 KV (Gemma and other D=256 models ship BF16), or set "
+            "GLUON_FP8_KV_TO_BF16_BRIDGE=1."
         )
     if _kv_was_fp8 and not _LOGGED_FP8_KV_MODE:
         if _kv_is_fp8:
@@ -1082,108 +993,66 @@ def gluon_extend_attention_fwd(
     )
     _is_ragged = _is_ragged_ext or _is_ragged_pfx
 
-    # Route ragged batches to WCA persistent when extend imbalance is significant.
-    # Only for D64/D128; D256 uses the full dispatch path.
+    # FP8 KV + ragged-extend on the WCA persistent path produces ~10% per-
+    # element error (BM=256 masked-tile-tail interacts with FP8 MFMA
+    # accumulation order). BF16 WCA is unaffected. Until fixed, route
+    # ragged FP8 to the basic dispatch (per-seq tiles, no cross-seq
+    # padding). See test_heterogeneous_batch.py for the gating test.
+    if _kv_is_fp8 and not _is_uniform:
+        _is_ragged = False
+
+    # Ragged batches go to WCA persistent when the work imbalance dwarfs
+    # WCA's scheduler overhead. The per-head-dim gates below are calibrated
+    # against bench_real_het.py. D256 keeps the basic dispatch (the tuned
+    # tree already handles ragged well enough and WCA BM=256 has LDS issues).
     if _is_ragged and Lq <= 128:
-        # Zero-cost waste-fraction: fraction of basic-path grid that does no
-        # useful work (empty rows beyond each seq's extend length). Benchmarks
-        # show basic path beats WCA when waste_frac is small AND tiles are
-        # light; WCA wins decisively when tiles are heavy OR the batch is big.
         _total_ext = q_extend.shape[0]
         _grid_est = batch_size * max_len_extend
         _waste_frac = 1.0 - _total_ext / max(1, _grid_est)
-        # Approx total prefix (kv_indices is sized to total_prefix_len by
-        # construction in every caller path; fallback to threaded-in value if
-        # present). Zero-cost (no sync). Reuse the value computed pre-gate.
         _total_pfx_est = _total_pfx_est_pre
         if Lq == 128:
-            # D=128 BF16 routing, calibrated against bench_real_het.py:
-            #   A. any heterogeneous batch with max_ext >= 1024: WCA almost
-            #      always wins since per-tile cost is large.
-            #   B. batch_size >= 8 with significant total prefix work: the
-            #      basic path's per-seq prefix-scan imbalance dominates; WCA
-            #      redistributes the tile graph. Catches chunk-mix / spec-
-            #      decode / realistic cases.
-            #   C. batch_size >= 8 + max_ext in [768, 1024) + high waste:
-            #      chunked prefill without prefix but big enough tiles for
-            #      WCA to amortize its scheduler cost.
-            #   D. moderate max (>=768) with meaningful skew.
-            #   E. very large batch with any meaningful skew: B=32 chat-mix
-            #      with max=128 is 21x slower on basic.
-            #   F. pfx-skew-ragged (from above): small ext, big total pfx, B>=4.
-            # NOTE: B=8 short-tail (max=513, no prefix) falls THROUGH to basic
-            # on purpose -- low total work + no pfx skew means basic's smaller
-            # wrapper/launch overhead wins.
             _use_wca = (
-                _is_ragged_pfx  # F: spec-decode-style small-ext + pfx-skew
+                _is_ragged_pfx
                 or (max_len_extend >= 1024 and _waste_frac > 0.05)
                 or (batch_size >= 8 and _total_pfx_est >= batch_size * 1024)
                 or (batch_size >= 8 and max_len_extend >= 768 and _waste_frac >= 0.4)
-                # Gate condition D on B>=4: random-perf bench found B=3
-                # max_ext~964 no-pfx land here and WCA small is 1.6x slower
-                # than basic (3 seqs * 32 heads * few tiles = small grid,
-                # basic's simpler dispatch wins on the coordination cost).
                 or (max_len_extend >= 768 and _waste_frac >= 0.2 and batch_size >= 4)
                 or (batch_size >= 16 and _waste_frac >= 0.2)
             )
         else:
-            # D=64 BF16 -- basic dispatch is more aggressive about picking
-            # wide tiles, so WCA has a smaller window of wins. Keep the old
-            # ext_ratio-based heuristic (requires min_len_extend for the ratio,
-            # fall back to conservative no-ratio path if missing).
             ext_ratio = (
                 max_len_extend / max(1, min_len_extend)
                 if min_len_extend else float("inf")
             )
             _use_wca = (
-                # Big-B with long prefix (multi-turn chat, long-context decode).
-                # Basic launches 1 CTA per (seq, head) and each streams its full
-                # per-seq prefix -- longest-prefix CTA dominates. WCA rebalances
-                # across CUs; random-perf bench showed 2-3x wins for B>=8 with
-                # avg_pfx >= 1k per seq and max_ext >= 32.
-                # Exclude spec-decode (max<=8): basic with tiny grid
-                # (B*H*1 tile) is already fast there and WCA's scheduler
-                # overhead nets a regression.
                 (batch_size >= 8 and _total_pfx_est >= batch_size * 1024
                  and max_len_extend >= 32)
                 or (ext_ratio > 4.0 and max_len_extend >= 256)
-                # High ext_ratio small-B *with* no prefix lands the basic path
-                # in a small-grid regime that distributes fine without WCA's
-                # scheduler overhead; bench shows WCA small ~50% slower there.
-                # Keep the rule firing only when there's real reason to WCA.
                 or (ext_ratio > 20.0 and max_len_extend >= 64
                     and (batch_size >= 5 or _total_pfx_est >= 512))
             )
         if _use_wca:
             _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-            # Three persistent flavors (identical kernel body, different
-            # scheduler / tile geometry):
-            #   * bsearch (TILE_MAP_MODE=0, BM=128 NW=8 NS=4) -- binary-search
-            #     tile->seq lookup. Beats linear-scan when every tile does
-            #     substantial work because the O(log B) lookup per tile
-            #     amortizes. Use for "full-batch prefill" shapes: B >= 16,
-            #     max_ext >= 2048, avg_ext >= 512 (no long tail of 17-token
-            #     seqs skewing the average).
-            #   * WCA default (TILE_MAP_MODE=1, BM=128 NW=8 NS=4) -- linear-
-            #     scan scheduler; 8 warps + 4 stages pipeline KV prefetch
-            #     well for prefix-dominated workloads (chat-mix / long-context
-            #     decode).
-            #   * WCA small (TILE_MAP_MODE=1, BM=64 NW=4 NS=2) -- halves
-            #     register pressure + keeps tile count high, better CU spread
-            #     when work is ext-dominated or extremely skewed (B=4
-            #     big-prefill ext=[4096,2048,1024,512] with pfx=0).
-            # Thresholds calibrated against bench_real_het.py.
+            # BF16 persistent has three flavors: bsearch tile map
+            # (TILE_MAP_MODE=0, for full-batch prefill), WCA default
+            # (TILE_MAP_MODE=1 + BM=128 NW=8 NS=4, for prefix-dominated
+            # chat-mix), and WCA small (BM=64 NW=4 NS=2, for ext-dominated
+            # or heavily-skewed batches). Thresholds from bench_real_het.py.
             _wca_kw = dict()
             _avg_ext = _total_ext / max(1, batch_size)
+            # `_force_tile_map_mode` and the BM=64/NW=4/NS=2 override only
+            # exist on the BF16 persistent launcher (FP8 persistent has a
+            # different kernel body and does not accept these knobs).
             _use_bsearch = (
-                Lq == 128
+                (not _kv_is_fp8)
+                and Lq == 128
                 and batch_size >= 16
                 and max_len_extend >= 2048
                 and _avg_ext >= 512
             )
             if _use_bsearch:
                 _wca_kw.update(_force_tile_map_mode=0)
-            elif Lq == 128 and _total_pfx_est < 4 * _total_ext:
+            elif (not _kv_is_fp8) and Lq == 128 and _total_pfx_est < 4 * _total_ext:
                 _wca_kw.update(
                     _force_block_m=64,
                     _force_num_warps=4,

@@ -242,6 +242,7 @@ def _gluon_supports(
     v_extend: torch.Tensor,
     k_buffer: torch.Tensor,
     custom_mask,
+    is_causal: bool,
 ) -> bool:
     """Quick upfront check for shape / feature combos the Gluon kernel
     does not implement yet.
@@ -258,7 +259,16 @@ def _gluon_supports(
     if Lq != Lv:
         # Mixed-dim / DeepSeek MLA heads live in gluon_ops/mla_prefill/.
         return False
+    if not is_causal:
+        # Non-causal extend (encoder-style, vision towers) has a known
+        # small-batch tail issue in the Gluon kernel. No autoregressive
+        # LLM served via this kernel path asks for non-causal.
+        return False
     kv_is_fp8 = k_buffer.dtype in _FP8_KV_DTYPES
+    if kv_is_fp8 and Lq == 256:
+        # FP8 KV + D=256 fails Triton IR lowering on gfx950 (MFMA_F8 at
+        # head-dim 256). Gemma (the main D=256 model) ships BF16 KV.
+        return False
     if kv_is_fp8 and custom_mask is not None and Lq <= 128:
         # Spec-decode verify with FP8 KV is not yet supported (see the
         # matching guard in extend_attention_gfx950.py for details).
@@ -311,7 +321,7 @@ def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
         total_extend_len=None,
         min_len_extend=None,
     ):
-        if not _gluon_supports(q_extend, v_extend, k_buffer, custom_mask):
+        if not _gluon_supports(q_extend, v_extend, k_buffer, custom_mask, is_causal):
             return triton_fallback(
                 q_extend, k_extend, v_extend, o_extend,
                 k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
