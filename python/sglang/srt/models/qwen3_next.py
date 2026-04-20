@@ -245,14 +245,23 @@ class Qwen3GatedDeltaNet(nn.Module):
                 if output_dim is not None and module.tp_size > 1:
                     shard_size = param.data.shape[output_dim]
                     start_idx = module.tp_rank * shard_size
+                    if (
+                        _is_cpu and _is_amx_available
+                    ) and start_idx + shard_size > loaded_weight.shape[output_dim]:
+                        shard_size = loaded_weight.shape[output_dim] - start_idx
                     loaded_weight = loaded_weight.narrow(
                         output_dim, start_idx, shard_size
                     )
-                assert param.data.shape == loaded_weight.shape, (
-                    f"Shape mismatch: param {param.data.shape} vs "
-                    f"loaded {loaded_weight.shape}"
-                )
-                param.data.copy_(loaded_weight)
+                if _is_cpu and _is_amx_available:
+                    slices = tuple(slice(0, s) for s in loaded_weight.shape)
+                    param.data.zero_()
+                    param.data[slices].copy_(loaded_weight)
+                else:
+                    assert param.data.shape == loaded_weight.shape, (
+                        f"Shape mismatch: param {param.data.shape} vs "
+                        f"loaded {loaded_weight.shape}"
+                    )
+                    param.data.copy_(loaded_weight)
             else:
                 # Split checkpoint (int or tuple shard_id) → standard path
                 original_loader(param, loaded_weight, loaded_shard_id)
