@@ -20,19 +20,22 @@ Public re-exports consumed by
   GPT-OSS, Gemma 3, Qwen 3, Llama 3 / 4, etc.
 """
 
-from .extend_attention_gfx950 import gluon_extend_attention_fwd  # noqa: F401
-from .extend_attention_gfx950 import _get_num_CUs  # noqa: F401
 from ._prewarm import (  # noqa: F401
+    MODEL_PRESETS,
+    enumerate_basic_configs,
+    enumerate_layer_patterns,
+    enumerate_persistent_configs,
     prewarm_extend_attention,
     prewarm_for_model,
     prewarm_preset,
-    enumerate_basic_configs,
-    enumerate_persistent_configs,
-    enumerate_layer_patterns,
-    spec_gpt_oss,
+    spec_cohere2,
+    spec_gemma2,
     spec_gemma3,
-    spec_qwen3,
-    spec_llama4,
+    spec_gpt_oss,
+    spec_grok,
     spec_llama3,
-    MODEL_PRESETS,
+    spec_llama4,
+    spec_qwen3,
 )
+from .extend_attention_gfx950 import _get_num_CUs  # noqa: F401
+from .extend_attention_gfx950 import gluon_extend_attention_fwd  # noqa: F401
