@@ -128,6 +128,7 @@ int nccl_allocator_register_segments_with_comm(uintptr_t comm_ptr) {
         ncclWindow_t win;
         ncclResult_t res = ncclCommWindowRegister(comm, seg.ptr, seg.size, &win, NCCL_WIN_COLL_SYMMETRIC);
         if (res != ncclSuccess) {
+            fprintf(stderr, "ERROR: NCCL symmetric memory registration failed. '%s'\\n", ncclGetErrorString(res));
             return res;
         }
     }
@@ -147,8 +148,8 @@ _graph_pool_id = None
 _cur_device = None
 _active_symmetric_memory_context = None
 
-# Reference to the loaded library
-_nccl_allocator_lib = None
+# Reference to the C registration function (with arg types set)
+_register_func = None
 
 
 def is_symmetric_memory_enabled():
@@ -183,7 +184,7 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     All groups share the same pool to avoid memory fragmentation.
     Comm registration is handled at context exit time.
     """
-    global _allocator, _mem_pool, _cur_device, _nccl_allocator_lib
+    global _allocator, _mem_pool, _cur_device, _register_func
     if _allocator is None:
         import torch.utils.cpp_extension
 
@@ -208,7 +209,7 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
             is_python_module=False,
             build_directory=out_dir,
         )
-        _nccl_allocator_lib = ctypes.CDLL(lib_path)
+        nccl_allocator_lib = ctypes.CDLL(lib_path)
         _allocator = CUDAPluggableAllocator(
             f"{out_dir}/{nccl_allocator_libname}.so",
             "nccl_alloc_plug",
@@ -216,6 +217,11 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
         ).allocator()
         _mem_pool = torch.cuda.MemPool(_allocator)
         _cur_device = torch.cuda.current_device()
+
+        # Setup the C function for registration with correct arg types
+        _register_func = nccl_allocator_lib.nccl_allocator_register_segments_with_comm
+        _register_func.restype = ctypes.c_int
+        _register_func.argtypes = [ctypes.c_uint64]
 
     return _mem_pool
 
@@ -308,14 +314,9 @@ class SymmetricMemoryContext:
         3. Thread-safe access to the segment registry
         """
 
-        # Setup the C function signature
-        register_func = _nccl_allocator_lib.nccl_allocator_register_segments_with_comm
-        register_func.restype = ctypes.c_int
-        register_func.argtypes = [ctypes.c_uint64]
-
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
-        result = register_func(self._comm_ptr)
+        result = _register_func(self._comm_ptr)
         assert (
             result == 0
         ), f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
