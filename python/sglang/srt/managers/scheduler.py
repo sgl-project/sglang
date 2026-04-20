@@ -3317,6 +3317,10 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        cleanup_request_state = getattr(
+            getattr(self, "draft_worker", None), "cleanup_request_state", None
+        )
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -3324,11 +3328,13 @@ class Scheduler(
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
+        aborted_waiting_req_ids = []
         for i in reversed(to_del):
             # Abort method 1: directly pop from the queue
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            aborted_waiting_req_ids.append(req.rid)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
@@ -3351,6 +3357,8 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+        if cleanup_request_state is not None and aborted_waiting_req_ids:
+            cleanup_request_state(aborted_waiting_req_ids)
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
@@ -3390,16 +3398,20 @@ class Scheduler(
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
                 remaining_retracted = []
+                aborted_retracted_req_ids = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
                         assert hasattr(decode_req, "kv_cache_cpu")
                         del decode_req.kv_cache_cpu
+                        aborted_retracted_req_ids.append(decode_req.rid)
                         self.send_to_tokenizer.send_output(
                             AbortReq(rid=decode_req.rid), decode_req
                         )
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+                if cleanup_request_state is not None and aborted_retracted_req_ids:
+                    cleanup_request_state(aborted_retracted_req_ids)
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:

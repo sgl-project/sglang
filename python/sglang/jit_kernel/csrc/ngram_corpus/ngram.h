@@ -17,24 +17,32 @@
 
 namespace ngram {
 
+struct InsertWorkItem {
+  int64_t state_id = -1;
+  std::vector<int32_t> tokens;
+};
+
 class Ngram {
-  std::unique_ptr<Trie> trie_;
+  size_t trie_capacity_;
+  std::unique_ptr<Trie> global_trie_;
+  std::unordered_map<int64_t, std::unique_ptr<Trie>> request_tries_;
   std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
   // FIXME: single staging slot — only one corpus can be loaded at a time.
   // To support concurrent loads, move staging into a per-load local variable.
   std::unique_ptr<SuffixAutomaton> staging_sam_;
   Param param_;
 
-  // NOTE: protects trie_, sams_, and pending_count_. staging_sam_ is NOT
+  // NOTE: protects global_trie_, request_tries_, sams_, and
+  // pending_count_. staging_sam_ is NOT
   // protected by mutex_ — it is only accessed from the corpus loading thread.
   // finishExternalCorpusLoad briefly acquires mutex_ to move the completed
   // SAM into sams_.
   mutable std::mutex mutex_;
   mutable std::condition_variable sync_cv_;
-  // NOTE: tracks inserts from enqueue through trie_->insert() completion,
+  // NOTE: tracks inserts from enqueue through trie insert completion,
   // not just queue occupancy. A dequeued item may still be mid-insert.
   size_t pending_count_ = 0;
-  utils::Queue<std::vector<int32_t>> insert_queue_;
+  utils::Queue<InsertWorkItem> insert_queue_;
   std::thread insert_worker_;
   std::unordered_map<int64_t, MatchState> match_state_;
 
@@ -44,7 +52,7 @@ class Ngram {
 
   void synchronize() const;
 
-  void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
+  void asyncInsert(std::vector<InsertWorkItem>&& items);
 
   void startExternalCorpusLoad();
 
@@ -68,16 +76,12 @@ class Ngram {
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 
+  void eraseRequestState(const std::vector<int64_t>& state_ids);
+
   // Resets the online trie and match state but preserves external corpora
   // (sams_). External corpora are user-managed via add/remove APIs and
   // should not be affected by cache flushes.
-  void reset() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (trie_) {
-      trie_->reset();
-    }
-    match_state_.clear();
-  }
+  void reset();
 
   const Param& param() const {
     return param_;
@@ -85,6 +89,8 @@ class Ngram {
 
  private:
   void insertWorker();
+  Trie* getTrieForMatch_(int64_t state_id);
+  Trie* getOrCreateTrieForInsert_(int64_t state_id);
 };
 
 }  // namespace ngram

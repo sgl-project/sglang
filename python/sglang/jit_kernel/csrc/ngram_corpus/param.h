@@ -12,6 +12,12 @@
 
 namespace ngram {
 
+struct MatchQuality {
+  bool has_match = false;
+  double specificity = 0.0;
+  double confidence = 0.0;
+};
+
 struct Param {
   bool enable;
   bool enable_router_mode;
@@ -19,8 +25,11 @@ struct Param {
   size_t max_bfs_breadth;
   size_t max_trie_depth;
   size_t draft_token_num;
-  size_t external_sam_budget = 0;
   size_t external_corpus_max_tokens = 10000000;
+  double trie_source_prior = 0.0;
+  double match_specificity_weight = 0.7;
+  double match_confidence_weight = 0.3;
+  bool request_trie_mode = false;
   std::string match_type;
 
   std::vector<size_t> batch_draft_token_num;
@@ -94,8 +103,10 @@ struct Param {
     ss << "enable = " << enable << ", enable_router_mode = " << enable_router_mode
        << ", min_bfs_breadth = " << min_bfs_breadth << ", max_bfs_breadth = " << max_bfs_breadth
        << ", max_trie_depth = " << max_trie_depth << ", draft_token_num = " << draft_token_num
-       << ", external_sam_budget = " << external_sam_budget
-       << ", external_corpus_max_tokens = " << external_corpus_max_tokens << ", match_type = " << match_type;
+       << ", external_corpus_max_tokens = " << external_corpus_max_tokens
+       << ", trie_source_prior = " << trie_source_prior << ", match_specificity_weight = " << match_specificity_weight
+       << ", match_confidence_weight = " << match_confidence_weight << ", request_trie_mode = " << request_trie_mode
+       << ", match_type = " << match_type;
     ss << ", batch_draft_token_num(" << batch_draft_token_num.size() << ") = ";
     for (int i = 0; i < batch_draft_token_num.size(); ++i) {
       ss << i << "|" << batch_draft_token_num[i] << ",";

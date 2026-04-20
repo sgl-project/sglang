@@ -59,35 +59,35 @@ class Trie {
 
   void insert(const int32_t* tokens, size_t len);
 
-  Result buildRecency(
-      const int32_t* context,
-      size_t len,
-      int32_t last_token,
-      size_t draft_token_num,
-      const Param& param,
-      MatchState& state,
-      size_t total_len) const;
-
-  Result buildFrequency(
-      const int32_t* context,
-      size_t len,
-      int32_t last_token,
-      size_t draft_token_num,
-      const Param& param,
-      MatchState& state,
-      size_t total_len) const;
-
-  void squeeze(size_t count);
-
-  void reset();
-
- private:
   // Stateful suffix matcher. If `state` still represents the previous step for
   // this request, infer the newly appended suffix from (`context`, `total_len`)
   // and advance anchors incrementally; otherwise rebuild the cached anchors from
   // `context`. Returns only the suffix matches that are currently expandable.
   std::vector<std::pair<const TrieNode*, int32_t>>
   match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
+
+  MatchQuality
+  summarizeMatchQuality(const std::vector<std::pair<const TrieNode*, int32_t>>& anchors, const Param& param) const;
+
+  Result buildRecencyFromAnchors(
+      const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
+      int32_t last_token,
+      size_t draft_token_num,
+      const Param& param) const;
+
+  Result buildFrequencyFromAnchors(
+      const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
+      int32_t last_token,
+      size_t draft_token_num,
+      const Param& param) const;
+
+  void squeeze(size_t count);
+
+  void reset();
+
+ private:
+  TrieNode* getNode();
+
   // Recompute all cached anchors from the current tail. After this, for every
   // d in [1, min(len, max_trie_depth)], anchors[d - 1] represents the suffix of
   // length d ending at context[len - 1].
@@ -108,11 +108,11 @@ class Trie {
   NodeRef rootRef() const {
     return NodeRef{root_, root_->version};
   }
-  NodeRef capture(TrieNode* node) const {
+  NodeRef capture(const TrieNode* node) const {
     if (node == nullptr) {
       return {};
     }
-    return NodeRef{node, node->version};
+    return NodeRef{const_cast<TrieNode*>(node), node->version};
   }
   void retireNode(TrieNode* node) {
     if (node != nullptr) {
@@ -120,20 +120,12 @@ class Trie {
     }
   }
 
-  TrieNode* getNode() {
-    auto node = node_pool_[--free_node_count_];
-    auto version = node->version;
-    node->~TrieNode();
-    new (node) TrieNode();
-    node->version = version;
-    return node;
-  }
-
+  size_t capacity_;
   std::vector<TrieNode> nodes_;
   std::vector<TrieNode*> node_pool_;
-  size_t free_node_count_;
+  size_t free_node_count_ = 0;
   std::list<TrieNode*> global_lru_;
-  TrieNode* root_;
+  TrieNode* root_ = nullptr;
   std::vector<TrieNode*> path_;
   Param param_;
   uint64_t trie_epoch_ = 1;

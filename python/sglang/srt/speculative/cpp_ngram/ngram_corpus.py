@@ -19,9 +19,12 @@ class NgramCorpus:
         max_bfs_breadth=8,
         draft_token_num=8,
         match_type="BFS",
+        trie_mode="global",
         capacity=1000000,
-        external_sam_budget=0,
         external_corpus_max_tokens=10000000,
+        trie_source_prior=0.0,
+        match_specificity_weight=0.7,
+        match_confidence_weight=0.3,
     ) -> None:
         cls = get_ngram_corpus_cls()
         self._obj = cls(
@@ -31,11 +34,15 @@ class NgramCorpus:
             max_bfs_breadth=max_bfs_breadth,
             draft_token_num=draft_token_num,
             match_type=match_type,
-            external_sam_budget=external_sam_budget,
+            trie_mode=trie_mode,
             external_corpus_max_tokens=external_corpus_max_tokens,
+            trie_source_prior=trie_source_prior,
+            match_specificity_weight=match_specificity_weight,
+            match_confidence_weight=match_confidence_weight,
         )
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
+        self.trie_mode = trie_mode
         self.external_corpus_max_tokens = external_corpus_max_tokens
         self._req_id_to_state_id: Dict[str, int] = {}
         self._next_state_id: int = 0
@@ -50,8 +57,17 @@ class NgramCorpus:
             self._req_id_to_state_id[req_id] = sid
         return sid
 
-    def batch_put(self, batch_tokens: List[List[int]]):
-        self._obj.insert(batch_tokens)
+    def batch_put(
+        self, batch_tokens: List[List[int]], req_ids: List[str] | None = None
+    ):
+        if req_ids is None:
+            if self.trie_mode == "request":
+                raise ValueError("request trie mode requires req_ids for batch_put")
+            self._obj.insert(batch_tokens)
+            return
+
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        self._obj.insert(batch_tokens, state_ids)
 
     def synchronize(self):
         self._obj.synchronize()  # type: ignore
@@ -110,11 +126,18 @@ class NgramCorpus:
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []
         for rid in req_ids:
+            sid = self._req_id_to_state_id.get(rid)
+            if sid is not None:
+                state_ids.append(sid)
+        self._obj.erase_states(state_ids)
+
+    def erase_request_state(self, req_ids: List[str]):
+        state_ids = []
+        for rid in req_ids:
             sid = self._req_id_to_state_id.pop(rid, None)
             if sid is not None:
                 state_ids.append(sid)
-        if state_ids:
-            self._obj.erase_states(state_ids)
+        self._obj.erase_request_states(state_ids)
 
     def leaf_paths_from_mask(
         self, tokens: List[int], tree_mask: List[List[int]]

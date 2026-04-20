@@ -24,8 +24,11 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       int64_t max_bfs_breadth,
       int64_t draft_token_num,
       int64_t match_type,
-      int64_t external_sam_budget,
-      int64_t external_corpus_max_tokens) {
+      int64_t trie_mode,
+      int64_t external_corpus_max_tokens,
+      double trie_source_prior,
+      double match_specificity_weight,
+      double match_confidence_weight) {
     ngram::Param param;
     param.enable = true;
     param.enable_router_mode = false;
@@ -34,21 +37,35 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     param.max_bfs_breadth = static_cast<size_t>(max_bfs_breadth);
     param.draft_token_num = static_cast<size_t>(draft_token_num);
     param.match_type = (match_type == 0) ? "BFS" : "PROB";
-    param.external_sam_budget = static_cast<size_t>(external_sam_budget);
     param.external_corpus_max_tokens = static_cast<size_t>(external_corpus_max_tokens);
+    param.trie_source_prior = trie_source_prior;
+    param.match_specificity_weight = match_specificity_weight;
+    param.match_confidence_weight = match_confidence_weight;
+    param.request_trie_mode = trie_mode != 0;
     ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
   }
 
-  void async_insert(const tvm::ffi::TensorView tokens_flat, const tvm::ffi::TensorView offsets) {
+  void async_insert(
+      const tvm::ffi::TensorView state_ids_tv,
+      const tvm::ffi::TensorView tokens_flat,
+      const tvm::ffi::TensorView offsets) {
+    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
     auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
     auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
     int64_t batch_size = offsets.size(0) - 1;
-
-    std::vector<std::vector<int32_t>> tokens(batch_size);
-    for (int64_t i = 0; i < batch_size; ++i) {
-      tokens[i].assign(data + offs[i], data + offs[i + 1]);
+    if (state_ids_tv.size(0) != batch_size) {
+      throw std::runtime_error("state_ids must have the same length as batch tokens");
     }
-    ngram_->asyncInsert(std::move(tokens));
+
+    std::vector<ngram::InsertWorkItem> items;
+    items.reserve(batch_size);
+    for (int64_t i = 0; i < batch_size; ++i) {
+      ngram::InsertWorkItem item;
+      item.state_id = sid[i];
+      item.tokens.assign(data + offs[i], data + offs[i + 1]);
+      items.push_back(std::move(item));
+    }
+    ngram_->asyncInsert(std::move(items));
   }
 
   void batch_match_stateful(
@@ -81,6 +98,13 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     int64_t n = state_ids_tv.size(0);
     std::vector<int64_t> state_ids(sid, sid + n);
     ngram_->eraseMatchState(state_ids);
+  }
+
+  void erase_request_state(const tvm::ffi::TensorView state_ids_tv) {
+    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
+    int64_t n = state_ids_tv.size(0);
+    std::vector<int64_t> state_ids(sid, sid + n);
+    ngram_->eraseRequestState(state_ids);
   }
 
   void start_external_corpus_load() {
@@ -153,10 +177,13 @@ struct NgramCorpusObj : public tvm::ffi::Object {
 void register_ngram_corpus() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<NgramCorpusObj>()
-      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
+      .def(
+          refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, double, double, double>(),
+          "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
+      .def("erase_request_state", &NgramCorpusObj::erase_request_state)
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
       .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
       .def("finish_external_corpus_load", &NgramCorpusObj::finish_external_corpus_load)

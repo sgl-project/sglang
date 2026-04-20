@@ -4,13 +4,16 @@
 #include <cstring>
 #include <list>
 #include <queue>
+#include <stdexcept>
 #include <tuple>
 #include <vector>
 
 namespace ngram {
 
-Trie::Trie(size_t capacity, const Param& param) : param_(param) {
-  nodes_.resize(capacity);
+Trie::Trie(size_t capacity, const Param& param) : capacity_(capacity), param_(param) {
+  // Root allocation is outside the visible capacity budget so the configured
+  // capacity reflects evictable payload nodes only.
+  nodes_.resize(capacity_ + 1);
   for (auto& node : nodes_) {
     node_pool_.emplace_back(&node);
   }
@@ -18,11 +21,23 @@ Trie::Trie(size_t capacity, const Param& param) : param_(param) {
   root_ = getNode();
 }
 
+TrieNode* Trie::getNode() {
+  if (free_node_count_ == 0) {
+    throw std::runtime_error("Failed to allocate trie node");
+  }
+
+  auto node = node_pool_[--free_node_count_];
+  auto version = node->version;
+  node->~TrieNode();
+  new (node) TrieNode();
+  node->version = version;
+  return node;
+}
+
 void Trie::insert(const int32_t* tokens, size_t len) {
   for (size_t i = 0; i < len; ++i) {
     auto start = tokens + i;
     auto end = start + std::min(len - i, param_.max_trie_depth);
-
     if (static_cast<size_t>(end - start) > free_node_count_) {
       squeeze(end - start - free_node_count_);
     }
@@ -65,11 +80,11 @@ void Trie::insert(const int32_t* tokens, size_t len) {
 }
 
 void Trie::squeeze(size_t count) {
-  if (!(node_pool_.size() >= free_node_count_ + count)) {
+  if (global_lru_.size() < count) {
     throw std::runtime_error(
         "Insufficient node size to release required nodes. "
         "available to release: " +
-        std::to_string(node_pool_.size() - free_node_count_) + ", required to release: " + std::to_string(count));
+        std::to_string(global_lru_.size()) + ", required to release: " + std::to_string(count));
   }
   while (count--) {
     auto last = global_lru_.back();
@@ -85,19 +100,21 @@ void Trie::squeeze(size_t count) {
     last->parent->sorted_children.erase(last);
     last->parent->child.erase(last->token);
     retireNode(last);
-
     node_pool_[free_node_count_++] = last;
   }
 }
 
 void Trie::reset() {
-  // Epoch bump invalidates all cached MatchState objects, so we do not need to
-  // retireNode() on every node individually.
   ++trie_epoch_;
   global_lru_.clear();
   path_.clear();
   node_pool_.clear();
+  node_pool_.reserve(nodes_.size());
   for (auto& node : nodes_) {
+    auto version = node.version;
+    node.~TrieNode();
+    new (&node) TrieNode();
+    node.version = version;
     node_pool_.emplace_back(&node);
   }
   free_node_count_ = node_pool_.size();
@@ -215,15 +232,42 @@ Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_
   return getExpandableAnchors_(state);
 }
 
-Result Trie::buildRecency(
-    const int32_t* context,
-    size_t len,
+MatchQuality
+Trie::summarizeMatchQuality(const std::vector<std::pair<const TrieNode*, int32_t>>& anchors, const Param& param) const {
+  MatchQuality quality;
+  if (anchors.empty()) {
+    return quality;
+  }
+
+  const auto& [best_node, best_depth] = anchors.front();
+  quality.has_match = true;
+  quality.specificity = std::min(1.0, static_cast<double>(best_depth) / std::max<size_t>(1, param.max_trie_depth));
+
+  const int top_k = std::max(1, static_cast<int>(param.max_bfs_breadth));
+  double top_mass = 0.0;
+  double total_mass = 0.0;
+  int count = 0;
+  for (auto* child : best_node->sorted_children) {
+    const auto mass = static_cast<double>(child->freq);
+    if (count == 0) {
+      top_mass = mass;
+    }
+    total_mass += mass;
+    if (++count >= top_k) {
+      break;
+    }
+  }
+  if (total_mass > 0.0) {
+    quality.confidence = top_mass / total_mass;
+  }
+  return quality;
+}
+
+Result Trie::buildRecencyFromAnchors(
+    const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
     int32_t last_token,
     size_t draft_token_num,
-    const Param& param,
-    MatchState& state,
-    size_t total_len) const {
-  auto anchors = match(context, len, state, total_len);
+    const Param& param) const {
   const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
   double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
 
@@ -261,15 +305,11 @@ Result Trie::buildRecency(
   return fillResult(last_token, draft_token_num + 1, tree, root);
 }
 
-Result Trie::buildFrequency(
-    const int32_t* context,
-    size_t len,
+Result Trie::buildFrequencyFromAnchors(
+    const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
     int32_t last_token,
     size_t draft_token_num,
-    const Param& param,
-    MatchState& state,
-    size_t total_len) const {
-  auto anchors = match(context, len, state, total_len);
+    const Param& param) const {
   struct CompareByLastDouble {
     bool operator()(
         const std::tuple<double, const TrieNode*, double>& a,

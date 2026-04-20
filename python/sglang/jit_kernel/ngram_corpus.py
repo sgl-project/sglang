@@ -10,6 +10,7 @@ import tvm_ffi
 from sglang.jit_kernel.utils import cache_once, load_jit
 
 _MATCH_TYPE_MAP = {"BFS": 0, "PROB": 1}
+_TRIE_MODE_MAP = {"global": 0, "request": 1}
 
 
 def _to_csr(batch_tokens: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -50,13 +51,21 @@ def get_ngram_corpus_cls():
             max_bfs_breadth: int,
             draft_token_num: int,
             match_type: str,
-            external_sam_budget: int = 0,
+            trie_mode: str = "global",
             external_corpus_max_tokens: int = 10000000,
+            trie_source_prior: float = 0.0,
+            match_specificity_weight: float = 0.7,
+            match_confidence_weight: float = 0.3,
         ) -> None:
             mt = _MATCH_TYPE_MAP.get(match_type)
             if mt is None:
                 raise ValueError(
                     f"Unknown match_type: '{match_type}'. Must be 'BFS' or 'PROB'."
+                )
+            tm = _TRIE_MODE_MAP.get(trie_mode)
+            if tm is None:
+                raise ValueError(
+                    f"Unknown trie_mode: '{trie_mode}'. Must be 'global' or 'request'."
                 )
             self.__ffi_init__(
                 capacity,
@@ -65,14 +74,26 @@ def get_ngram_corpus_cls():
                 max_bfs_breadth,
                 draft_token_num,
                 mt,
-                external_sam_budget,
+                tm,
                 external_corpus_max_tokens,
+                trie_source_prior,
+                match_specificity_weight,
+                match_confidence_weight,
             )
             self._draft_token_num = draft_token_num
+            self._trie_mode = trie_mode
 
-        def insert(self, batch_tokens: List[List[int]]) -> None:
+        def insert(
+            self, batch_tokens: List[List[int]], state_ids: List[int] | None = None
+        ) -> None:
             tokens_flat, offsets = _to_csr(batch_tokens)
-            self.async_insert(tokens_flat, offsets)  # type: ignore
+            if state_ids is None:
+                if self._trie_mode == "request":
+                    raise ValueError("request trie mode requires state_ids for insert")
+                state_ids_t = torch.full((len(batch_tokens),), -1, dtype=torch.int64)
+            else:
+                state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
+            self.async_insert(state_ids_t, tokens_flat, offsets)  # type: ignore
 
         def match_stateful(
             self,
@@ -100,6 +121,10 @@ def get_ngram_corpus_cls():
         def erase_states(self, state_ids: List[int]) -> None:
             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
             self.erase_match_state(state_ids_t)  # type: ignore
+
+        def erase_request_states(self, state_ids: List[int]) -> None:
+            state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
+            self.erase_request_state(state_ids_t)  # type: ignore
 
         def load_external_corpus_named(
             self, corpus_id: str, chunks: Iterable[Sequence[int]], max_tokens: int

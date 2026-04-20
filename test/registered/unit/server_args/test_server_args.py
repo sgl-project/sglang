@@ -427,54 +427,105 @@ class TestHiCacheArgs(unittest.TestCase):
 
 
 class TestNgramExternalSamArgs(CustomTestCase):
-    def test_prepare_server_args_parses_external_sam_args(self):
+    def test_prepare_server_args_parses_external_corpus_args(self):
         server_args = prepare_server_args(
             [
                 "--model-path",
                 "dummy",
                 "--speculative-algorithm",
                 "NGRAM",
+                "--speculative-ngram-trie-mode",
+                "request",
+                "--speculative-ngram-trie-capacity",
+                "256",
+                "--speculative-ngram-trie-capacity-per-request",
+                "32",
                 "--speculative-ngram-external-corpus-path",
                 "/tmp/ngram-corpus.jsonl",
-                "--speculative-ngram-external-sam-budget",
-                "4",
                 "--speculative-ngram-external-corpus-max-tokens",
                 "128",
+                "--speculative-ngram-trie-source-prior",
+                "1.5",
+                "--speculative-ngram-match-specificity-weight",
+                "0.6",
+                "--speculative-ngram-match-confidence-weight",
+                "0.4",
             ]
         )
         self.assertEqual(
             server_args.speculative_ngram_external_corpus_path,
             "/tmp/ngram-corpus.jsonl",
         )
-        self.assertEqual(server_args.speculative_ngram_external_sam_budget, 4)
+        self.assertEqual(server_args.speculative_ngram_trie_mode, "request")
+        self.assertEqual(server_args.speculative_ngram_trie_capacity, 256)
+        self.assertEqual(server_args.speculative_ngram_trie_capacity_per_request, 32)
         self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
+        self.assertEqual(server_args.speculative_ngram_trie_source_prior, 1.5)
+        self.assertEqual(server_args.speculative_ngram_match_specificity_weight, 0.6)
+        self.assertEqual(server_args.speculative_ngram_match_confidence_weight, 0.4)
 
     def _make_dummy_ngram_args(self, **overrides):
         args = ServerArgs(model_path="dummy")
         args.speculative_algorithm = "NGRAM"
         args.speculative_num_draft_tokens = 12
         args.device = "cuda"
+        args.page_size = 1
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
 
-    def test_external_sam_budget_must_fit_draft_budget(self):
-        with self.assertRaises(ValueError) as context:
-            self._make_dummy_ngram_args(
-                speculative_num_draft_tokens=4,
-                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
-                speculative_ngram_external_sam_budget=4,
-            )._handle_speculative_decoding()
-        self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
+    def test_external_corpus_path_does_not_require_budget_flag(self):
+        self._make_dummy_ngram_args(
+            speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+            speculative_ngram_external_corpus_max_tokens=128,
+        )._handle_speculative_decoding()
 
     def test_external_corpus_max_tokens_must_be_positive(self):
         with self.assertRaises(ValueError) as context:
             self._make_dummy_ngram_args(
                 speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
-                speculative_ngram_external_sam_budget=2,
                 speculative_ngram_external_corpus_max_tokens=0,
             )._handle_speculative_decoding()
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+    def test_match_weights_must_sum_positive(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_match_specificity_weight=0.0,
+                speculative_ngram_match_confidence_weight=0.0,
+            )._handle_speculative_decoding()
+        self.assertIn("match weights", str(context.exception))
+
+    def test_trie_source_prior_must_be_non_negative(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_trie_source_prior=-0.1,
+            )._handle_speculative_decoding()
+        self.assertIn("trie-source-prior", str(context.exception))
+
+    def test_trie_capacity_must_be_positive(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_trie_capacity=0,
+            )._handle_speculative_decoding()
+        self.assertIn("trie-capacity", str(context.exception))
+
+    def test_request_trie_capacity_must_be_positive_in_request_mode(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_trie_mode="request",
+                speculative_ngram_trie_capacity_per_request=0,
+            )._handle_speculative_decoding()
+        self.assertIn("trie-capacity-per-request", str(context.exception))
+
+    def test_request_trie_capacity_must_cover_max_trie_depth(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_trie_mode="request",
+                speculative_ngram_max_trie_depth=18,
+                speculative_ngram_trie_capacity_per_request=17,
+            )._handle_speculative_decoding()
+        self.assertIn("max-trie-depth", str(context.exception))
 
 
 if __name__ == "__main__":
