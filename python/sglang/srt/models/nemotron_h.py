@@ -435,11 +435,8 @@ class NemotronHMambaDecoderLayer(nn.Module):
             )
 
             bridges = get_bridge_buffers()
-            if (
-                bridges is not None
-                and bridges.mamba_hidden is not None
-                and get_forward_context() is not None
-            ):
+            if bridges is not None and get_forward_context() is not None:
+                bridges.ensure_mamba_size(hidden_states.shape[1])
                 # Copy hidden_states into a bridge buffer (stable address
                 # outside the graph pool), run mamba eagerly via a non_graph
                 # break, then return the bridge output so downstream graph

@@ -131,6 +131,7 @@ class RadixAttention(nn.Module):
 
                 bridges = get_bridge_buffers()
                 if bridges is not None and "k_rope" not in kwargs:
+                    bridges.ensure_size(self)
                     bq = bridges.q.flatten()[: q.numel()].view(q.shape)
                     bk = (
                         bridges.k.flatten()[: k.numel()].view(k.shape)

@@ -82,44 +82,59 @@ def set_bridge_buffers(buffers):
 
 
 class BridgeBuffers:
-    """Pre-allocated tensors for q, k, v, output at graph break points.
+    """Shared tensors for q, k, v, output at graph break points.
 
-    During graph capture, the model copies q/k/v into these buffers before
-    the graph break. This makes the original tensors graph-private (freeable),
-    while the bridge buffers persist at fixed addresses outside the graph.
+    Allocated outside graph capture so they're not graph-private. Reused
+    across all layers (sequential execution) and all token sizes.
+    Lazily sized on first use during warmup/capture — each RadixAttention
+    layer calls ensure_size() to grow buffers if its dims are larger than
+    what was previously allocated.
     """
 
-    def __init__(
-        self,
-        max_tokens: int,
-        attention_layers,
-        device,
-        dtype,
-        hidden_size: int = 0,
-    ):
-        q_dim = max(l.tp_q_head_num * l.qk_head_dim for l in attention_layers)
-        k_dim = max(l.tp_k_head_num * l.qk_head_dim for l in attention_layers)
-        v_dim = max(l.tp_v_head_num * l.v_head_dim for l in attention_layers)
-        out_dim = max(l.tp_q_head_num * l.v_head_dim for l in attention_layers)
+    def __init__(self, max_tokens: int, device, dtype):
+        self.max_tokens = max_tokens
+        self.device = device
+        self.dtype = dtype
+        self.q = None
+        self.k = None
+        self.v = None
+        self.output = None
+        self.mamba_hidden = None
+        self.mamba_output = None
 
-        self.q = torch.empty((max_tokens, q_dim), dtype=dtype, device=device)
-        self.k = torch.empty((max_tokens, k_dim), dtype=dtype, device=device)
-        self.v = torch.empty((max_tokens, v_dim), dtype=dtype, device=device)
-        self.output = torch.empty((max_tokens, out_dim), dtype=dtype, device=device)
+    def ensure_size(self, layer: "RadixAttention"):
+        """Grow buffers if needed to fit this layer's dimensions."""
+        q_dim = layer.tp_q_head_num * layer.qk_head_dim
+        k_dim = layer.tp_k_head_num * layer.qk_head_dim
+        v_dim = layer.tp_v_head_num * layer.v_head_dim
+        out_dim = layer.tp_q_head_num * layer.v_head_dim
 
-        # Mamba bridge buffers — used by hybrid-Mamba models (e.g. NemotronH)
-        # to break BCG around the mamba mixer, which has Python-level state
-        # updates that aren't CUDA-graph-replay-safe.
-        if hidden_size > 0:
+        if self.q is None or self.q.shape[1] < q_dim:
+            self.q = torch.empty(
+                (self.max_tokens, q_dim), dtype=self.dtype, device=self.device
+            )
+        if self.k is None or self.k.shape[1] < k_dim:
+            self.k = torch.empty(
+                (self.max_tokens, k_dim), dtype=self.dtype, device=self.device
+            )
+        if self.v is None or self.v.shape[1] < v_dim:
+            self.v = torch.empty(
+                (self.max_tokens, v_dim), dtype=self.dtype, device=self.device
+            )
+        if self.output is None or self.output.shape[1] < out_dim:
+            self.output = torch.empty(
+                (self.max_tokens, out_dim), dtype=self.dtype, device=self.device
+            )
+
+    def ensure_mamba_size(self, hidden_size: int):
+        """Grow mamba buffers if needed."""
+        if self.mamba_hidden is None or self.mamba_hidden.shape[1] < hidden_size:
             self.mamba_hidden = torch.empty(
-                (max_tokens, hidden_size), dtype=dtype, device=device
+                (self.max_tokens, hidden_size), dtype=self.dtype, device=self.device
             )
             self.mamba_output = torch.empty(
-                (max_tokens, hidden_size), dtype=dtype, device=device
+                (self.max_tokens, hidden_size), dtype=self.dtype, device=self.device
             )
-        else:
-            self.mamba_hidden = None
-            self.mamba_output = None
 
 
 class BreakablePiecewiseCudaGraphRunner:
@@ -164,25 +179,11 @@ class BreakablePiecewiseCudaGraphRunner:
         self.moe_layers = model_runner.moe_layers
         self.moe_fusions = model_runner.moe_fusions
 
-        # Bridge buffers — one set, reused across all layers and token sizes.
-        # Scan ALL RadixAttention modules (not just attention_layers) to handle
-        # models like DeepSeek that have multiple attention objects per layer.
-        from sglang.srt.layers.radix_attention import RadixAttention
-
-        all_attn = [
-            m for m in model_runner.model.modules() if isinstance(m, RadixAttention)
-        ]
-        # Provide hidden_size so BridgeBuffers can allocate mamba bridges for
-        # hybrid-Mamba models. Falls back to 0 for non-mamba-bearing configs.
-        hidden_size = getattr(model_runner.model_config, "hidden_size", 0) or 0
+        # Bridge buffers — one shared set, lazily sized on first use per layer
+        # during warmup/capture. Each RadixAttention layer calls ensure_size()
+        # in its forward to grow buffers if needed.
         set_bridge_buffers(
-            BridgeBuffers(
-                self.max_num_tokens,
-                all_attn,
-                self.device,
-                model_runner.dtype,
-                hidden_size=hidden_size,
-            )
+            BridgeBuffers(self.max_num_tokens, self.device, model_runner.dtype)
         )
 
         with torch.device(self.device):
