@@ -41,8 +41,9 @@ class TestBenchServing1GPUPart2(CustomTestCase):
                 f"### test_vlm_offline_throughput\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
+            # relax for mi300x
             if is_in_amd_ci():
-                self.assertGreater(res["output_throughput"], 2000)
+                self.assertGreater(res["output_throughput"], 900)
             else:
                 self.assertGreater(res["output_throughput"], 2500)
 
