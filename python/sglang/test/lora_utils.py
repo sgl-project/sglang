@@ -718,13 +718,6 @@ def create_multiple_batch_test_samples(
         # ),
     ]
 
-    # The all-None (pure base-model) batch is intentionally omitted here:
-    #   - It tests causal-LM parity with HF, not LoRA behavior.
-    #   - It already flakes on AMD (`_use_aiter`) with a >0.95 ROUGE-L drift,
-    #     and the same drift has now been observed on CUDA.
-    #   - Base-model generation parity is already covered by
-    #     `test/registered/models/test_generation_models.py`.
-    # Keeping this batch here just adds CI noise without new coverage.
     return test_cases
 
 
