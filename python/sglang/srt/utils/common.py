@@ -1048,14 +1048,11 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
 
 def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
-    """Block until `procs` exit, warning midway and raising on hard timeout.
+    """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
 
-    SIGKILL is asynchronous: a killed process keeps holding resources (GPU
-    contexts, pinned memory, file descriptors) until the kernel reaps it.
-    Callers that reuse those resources right after kill must wait for reap.
-    This helper warns at ~10s if anything is still alive, then raises at
-    `wait_timeout` so a stuck process surfaces loudly instead of leaving a
-    latent race in place.
+    SIGKILL is asynchronous -- children hold GPU context, pinned memory and
+    fds until the kernel reaps them. Raise on timeout so a stuck process
+    surfaces instead of leaving a latent race.
     """
     warn_at = min(10.0, wait_timeout / 2)
     gone, alive = psutil.wait_procs(procs, timeout=warn_at)
@@ -1087,13 +1084,10 @@ def kill_process_tree(
 ):
     """Kill the process and all its child processes.
 
-    If `wait_timeout` is set, block until every killed process is reaped by
-    the kernel (so its GPU context, pinned memory and fds are actually
-    released). Exceeding `wait_timeout` raises `RuntimeError`. Leave it as
-    `None` for fire-and-forget kills where no resource is reused after.
-    The `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot
-    wait for itself; pass `include_parent=False` in that case if you need
-    child reap to complete first.
+    `wait_timeout` (seconds) blocks until every killed process is reaped and
+    raises `RuntimeError` on timeout; `None` is fire-and-forget. The
+    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
+    for itself -- use `include_parent=False` if child reap must finish first.
     """
     if parent_pid is None:
         parent_pid = os.getpid()

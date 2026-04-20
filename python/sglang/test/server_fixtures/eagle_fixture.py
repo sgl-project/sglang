@@ -57,8 +57,6 @@ class EagleServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        # Wait for the killed server to release its GPU context before the
-        # next test class starts a new one on the same device.
         kill_process_tree(cls.process.pid, wait_timeout=60)
 
     def send_request(self):

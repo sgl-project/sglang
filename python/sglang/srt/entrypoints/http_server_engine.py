@@ -100,8 +100,6 @@ class HttpServerEngineAdapter(EngineBase):
         )
 
     def shutdown(self):
-        # Wait for the server process tree to fully exit so its GPU context
-        # is released before the caller reuses the device.
         kill_process_tree(self.process.pid, wait_timeout=60)
 
     def generate(

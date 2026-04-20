@@ -65,8 +65,6 @@ class DefaultServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        # wait_timeout lets the killed server release its GPU context
-        # before the next test class sets up a new server on the same GPU.
         kill_process_tree(cls.process.pid, wait_timeout=60)
         time.sleep(2)
 
