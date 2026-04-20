@@ -204,6 +204,29 @@ class RadixAttention(nn.Module):
             )
 
 
+def _bcg_need_mha_fixup(
+    forward_batch: "ForwardBatch",
+    save_kv_cache: bool,
+    k_rope: Optional[torch.Tensor],
+    query: torch.Tensor,
+) -> Optional[int]:
+    """Check if this is an MHA layer in BCG replay that needs special handling.
+
+    Returns the number of tokens to slice q/k/v to, or None if no fixup needed.
+    MHA layers (save_kv_cache=False, no k_rope) receive static-sized tensors
+    from graph capture but the attention backend expects real-sized tensors.
+    """
+    n = getattr(forward_batch, "_bcg_mha_slice_n", None)
+    if (
+        n is not None
+        and not save_kv_cache
+        and k_rope is None
+        and (query.shape[0] > n or forward_batch._bcg_mha_has_prefix)
+    ):
+        return n
+    return None
+
+
 def _unified_attention_with_output_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -234,14 +257,8 @@ def _unified_attention_with_output_impl(
     if sinks is not None:
         kwargs["sinks"] = sinks
 
-    # For BCG replay: MHA layers need special handling (see _bcg_mha_attention).
-    _bcg_n = getattr(forward_batch, "_bcg_mha_slice_n", None)
-    if (
-        _bcg_n is not None
-        and not save_kv_cache
-        and k_rope is None
-        and (query.shape[0] > _bcg_n or forward_batch._bcg_mha_has_prefix)
-    ):
+    _bcg_n = _bcg_need_mha_fixup(forward_batch, save_kv_cache, k_rope, query)
+    if _bcg_n is not None:
         ret = _bcg_mha_attention(
             query, key, value, attention_layer, forward_batch,
             save_kv_cache, _bcg_n, kwargs,
