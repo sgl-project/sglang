@@ -325,9 +325,7 @@ class InputValidationStage(PipelineStage):
             neg_prompt_state = (
                 "not set"
                 if batch.negative_prompt is None
-                else "empty"
-                if batch.negative_prompt == ""
-                else "set"
+                else "empty" if batch.negative_prompt == "" else "set"
             )
             raise ValueError(
                 f"Server was launched with --enable-cfg-parallel but this "

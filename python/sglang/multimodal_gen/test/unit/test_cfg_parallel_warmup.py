@@ -177,9 +177,7 @@ class TestInputValidationCfgParallelGuard(unittest.TestCase):
             try:
                 stage.forward(req, server_args)
             except ValueError as e:
-                self.fail(
-                    f"forward() raised ValueError on a valid CFG request: {e}"
-                )
+                self.fail(f"forward() raised ValueError on a valid CFG request: {e}")
 
 
 if __name__ == "__main__":
