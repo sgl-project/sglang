@@ -64,6 +64,8 @@ INFO:     Uvicorn running on http://127.0.0.1:30000 (Press CTRL+C to quit)
 The server is fired up and ready to roll!
 ```
 
+### Send a test request
+
 You can do inference using the server:
 
 ```shell
@@ -79,6 +81,8 @@ curl -X POST http://localhost:30000/generate \
 ```
 
 If the "text" field in the response contains "Paris", the server is working as expected.
+
+### Stop server and exit container
 
 The SGLang server is running as a background process. You can send a `SIGINT` signal to stop it.
 
@@ -96,4 +100,4 @@ INFO:     Application shutdown complete.
 INFO:     Finished server process [25310]
 ```
 
-Now the server is stopped. You can exit the container by pressing `Ctrl+D`.
+The server has now stopped. You can verify it with `ps -ef | grep sglang`, then exit the container by pressing `Ctrl+D`.
