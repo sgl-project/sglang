@@ -50,6 +50,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    aiter_w8a8_block_fp8_linear,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -501,6 +502,15 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+
+        if (
+            _use_aiter
+            and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+        ):
+            # One-time preprocessing for AITER blockscale_bpreshuffle kernels.
+            t = shuffle_weight(layer.weight, (16, 16))
+            layer.weight.copy_(t)
+            del t
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
