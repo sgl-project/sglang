@@ -282,5 +282,29 @@ class TestMooncakeBackendAccuracy(
         run_eval_accuracy_test(self)
 
 
+class TestMooncakeBackendBufferOnly(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
+    """Buffer-only host memory mode: host RAM is a transient staging buffer
+    for L3 storage writes, not a persistent cache tier.  Host buffer size
+    is auto-computed from the prefill budget (4 * chunked_prefill_size)."""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args["--hicache-host-memory-mode"] = "buffer_only"
+        server_args["--hicache-mem-layout"] = "page_first"
+        # Remove explicit ratio so buffer_only auto-sizing kicks in
+        server_args.pop("--hicache-ratio", None)
+        return server_args, env_vars
+
+    @classmethod
+    def _get_base_server_args(cls):
+        args = super()._get_base_server_args()
+        # Base also sets --hicache-ratio; remove it for auto-sizing
+        args.pop("--hicache-ratio", None)
+        return args
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
