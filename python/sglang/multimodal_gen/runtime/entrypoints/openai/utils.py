@@ -1,4 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+import asyncio
 import base64
 import os
 import re
@@ -137,8 +138,15 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     return sampling_params
 
 
-async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
-    input_path = await _maybe_url_image(image, target_path)
+async def save_image_to_path(
+    image: Union[UploadFile, str],
+    target_path: str,
+    *,
+    prefer_remote_source: bool = False,
+) -> str:
+    input_path = await _maybe_url_image(
+        image, target_path, prefer_remote_source=prefer_remote_source
+    )
     if input_path is None:
         input_path = await _save_upload_to_path(image, target_path)
     return input_path
@@ -153,16 +161,27 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
+async def _maybe_url_image(
+    img_url: str,
+    target_path: str,
+    *,
+    prefer_remote_source: bool = False,
+) -> str | None:
     if not isinstance(img_url, str):
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # Download image from URL
+        # Only bypass persistence when the caller explicitly disables input saves.
+        # Otherwise keep the prefetch outside the measured server stages.
+        if prefer_remote_source:
+            return img_url
+        # download image from URL and persist on disk
         input_path = await _save_url_image_to_path(img_url, target_path)
         return input_path
     elif img_url.startswith("data:image"):
-        # encode image base64 url
+        if prefer_remote_source:
+            return img_url
+        # encode image base64 url and persist on disk
         input_path = await _save_base64_image_to_path(img_url, target_path)
         return input_path
     else:
@@ -172,47 +191,92 @@ async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
 async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
     """Download image from URL and save to target path."""
 
+    def _is_retryable_download_error(error: Exception) -> bool:
+        if isinstance(error, httpx.HTTPStatusError):
+            status_code = error.response.status_code
+            # Retry on rate limit and transient server-side failures.
+            return status_code == 429 or 500 <= status_code < 600
+        # Retry on transient network/protocol issues.
+        return isinstance(
+            error,
+            (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ),
+        )
+
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    max_attempts = 3
+    backoff_seconds = 0.2
+    last_error: Exception | None = None
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(image_url, timeout=10.0)
-            response.raise_for_status()
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = await client.get(image_url, timeout=10.0)
+                    response.raise_for_status()
 
-            # Determine file extension from content type or URL after downloading
-            if not os.path.splitext(target_path)[1]:
-                content_type = response.headers.get("content-type", "").lower()
+                    # Determine file extension from content type or URL after downloading
+                    if not os.path.splitext(target_path)[1]:
+                        content_type = response.headers.get("content-type", "").lower()
 
-                url_path = image_url.split("?")[0]
-                _, url_ext = os.path.splitext(url_path)
-                url_ext = url_ext.lower()
+                        url_path = image_url.split("?")[0]
+                        _, url_ext = os.path.splitext(url_path)
+                        url_ext = url_ext.lower()
 
-                if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
-                    ext = ".jpg" if url_ext == ".jpeg" else url_ext
-                elif content_type.startswith("image/"):
-                    if "jpeg" in content_type or "jpg" in content_type:
-                        ext = ".jpg"
-                    elif "png" in content_type:
-                        ext = ".png"
-                    elif "webp" in content_type:
-                        ext = ".webp"
-                    else:
-                        ext = ".jpg"  # Default to jpg
-                elif content_type == "application/octet-stream":
-                    # for octet-stream, if we couldn't get it from URL, default to jpg
-                    ext = ".jpg"
-                else:
-                    raise ValueError(
-                        f"URL does not point to an image. Content-Type: {content_type}"
+                        if url_ext in {
+                            ".jpg",
+                            ".jpeg",
+                            ".png",
+                            ".webp",
+                            ".gif",
+                            ".bmp",
+                        }:
+                            ext = ".jpg" if url_ext == ".jpeg" else url_ext
+                        elif content_type.startswith("image/"):
+                            if "jpeg" in content_type or "jpg" in content_type:
+                                ext = ".jpg"
+                            elif "png" in content_type:
+                                ext = ".png"
+                            elif "webp" in content_type:
+                                ext = ".webp"
+                            else:
+                                ext = ".jpg"  # Default to jpg
+                        elif content_type == "application/octet-stream":
+                            # for octet-stream, if we couldn't get it from URL, default to jpg
+                            ext = ".jpg"
+                        else:
+                            raise ValueError(
+                                f"URL does not point to an image. Content-Type: {content_type}"
+                            )
+                        target_path = f"{target_path}{ext}"
+
+                    with open(target_path, "wb") as f:
+                        f.write(response.content)
+
+                    return target_path
+                except Exception as e:
+                    last_error = e
+                    if attempt == max_attempts or not _is_retryable_download_error(e):
+                        raise
+                    wait_s = backoff_seconds * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Retrying image download (%s/%s) for %s after %.1fs due to: %s",
+                        attempt,
+                        max_attempts,
+                        image_url,
+                        wait_s,
+                        e,
                     )
-                target_path = f"{target_path}{ext}"
-
-            with open(target_path, "wb") as f:
-                f.write(response.content)
-
-            return target_path
+                    await asyncio.sleep(wait_s)
     except Exception as e:
-        raise Exception(f"Failed to download image from URL: {str(e)}")
+        final_error = last_error or e
+        raise Exception(
+            f"Failed to download image from URL {image_url}: {str(final_error)}"
+        )
 
 
 async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:

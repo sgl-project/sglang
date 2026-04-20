@@ -1,0 +1,101 @@
+:where(*) {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+:where(*)::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+:where(pre, code, .code-block, .code-group, #request-example, #response-example),
+:where(pre, code, .code-block, .code-group, #request-example, #response-example) * {
+  scrollbar-width: auto;
+  -ms-overflow-style: auto;
+}
+
+:where(pre, code, .code-block, .code-group, #request-example, #response-example)::-webkit-scrollbar,
+:where(pre, code, .code-block, .code-group, #request-example, #response-example) *::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+/* Global table styling to match vision-language-models.mdx reference */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+table thead tr {
+  border-bottom: 2px solid #d55816;
+}
+
+table thead th {
+  text-align: left;
+  padding: 10px 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+table thead th:nth-child(odd) {
+  background-color: rgba(255,255,255,0.02);
+}
+
+table thead th:nth-child(even) {
+  background-color: rgba(255,255,255,0.05);
+}
+
+table tbody tr:nth-child(odd) td {
+  background-color: rgba(255,255,255,0.02);
+}
+
+table tbody tr:nth-child(even) td {
+  background-color: rgba(255,255,255,0.05);
+}
+
+table tbody td {
+  padding: 9px 12px;
+}
+
+table tbody td:first-child {
+  font-weight: 500;
+}
+
+/* Dark mode support for tables */
+html.dark table thead th:nth-child(odd),
+[data-theme="dark"] table thead th:nth-child(odd) {
+  background-color: rgba(255,255,255,0.02);
+}
+
+html.dark table thead th:nth-child(even),
+[data-theme="dark"] table thead th:nth-child(even) {
+  background-color: rgba(255,255,255,0.05);
+}
+
+html.dark table tbody tr:nth-child(odd) td,
+[data-theme="dark"] table tbody tr:nth-child(odd) td {
+  background-color: rgba(255,255,255,0.02);
+}
+
+html.dark table tbody tr:nth-child(even) td,
+[data-theme="dark"] table tbody tr:nth-child(even) td {
+  background-color: rgba(255,255,255,0.05);
+}
+
+/* Bold text (**text**) */
+.prose strong, .prose b {
+  font-weight: 600;
+}
+
+/* Inline code (single backtick) */
+:not(pre) > code {
+  background-color: rgba(0, 0, 0, 0.07);
+  font-weight: 600;
+}
+
+html.dark :not(pre) > code,
+[data-theme="dark"] :not(pre) > code {
+  background-color: rgba(255, 255, 255, 0.13);
+  font-weight: 600;
+}
