@@ -647,20 +647,7 @@ class CudaGraphRunner:
         self.buffers.share_buffers()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
-
-        # Combo scheduling is needed to have good performance for replay-prepare.
-        self.compile_replay_prepare = (
-            envs.SGLANG_TORCH_COMPILE_REPLAY_PREPARE.get()
-            and hasattr(torch._inductor.config, "combo_kernels")
-        )
-        if self.compile_replay_prepare:
-            # Avoid graph breaks from .item() calls (e.g. seq_lens_cpu.max().item())
-            # by capturing them as unbacked symbolic ints in the FX graph. Without
-            # this, dynamo splits the compiled region into multiple sub-graphs.
-            try:
-                torch._dynamo.config.capture_scalar_outputs = True
-            except Exception:
-                self.compile_replay_prepare = False
+        self._can_compile_replay_prepare_cache: Optional[bool] = None
 
         # Capture
         try:
@@ -1132,9 +1119,23 @@ class CudaGraphRunner:
         return self.model_runner.attn_backend
 
     def _can_compile_replay_prepare(self):
-        if not self.compile_replay_prepare:
-            return False
-        return self._get_replay_attn_backend().supports_compiled_replay_prepare()
+        if self._can_compile_replay_prepare_cache is not None:
+            return self._can_compile_replay_prepare_cache
+        result = (
+            envs.SGLANG_TORCH_COMPILE_REPLAY_PREPARE.get()
+            and hasattr(torch._inductor.config, "combo_kernels")
+            and self._get_replay_attn_backend().supports_compiled_replay_prepare()
+        )
+        if result:
+            # Avoid graph breaks from .item() calls (e.g. seq_lens_cpu.max().item())
+            # by capturing them as unbacked symbolic ints in the FX graph. Without
+            # this, dynamo splits the compiled region into multiple sub-graphs.
+            try:
+                torch._dynamo.config.capture_scalar_outputs = True
+            except Exception:
+                result = False
+        self._can_compile_replay_prepare_cache = result
+        return result
 
     def _populate_from_forward_batch_and_init_attn_backend(
         self,
