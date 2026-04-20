@@ -5,7 +5,7 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.session.session_aware_cache import SessionAwareCache, SessionSlot
+from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
@@ -97,7 +97,7 @@ def test_streaming_release_kv_cache_defers_tail_free(monkeypatch):
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
-    tree_cache = SessionAwareCache(
+    tree_cache = StreamingSession(
         _FakeInnerCache(req_to_token_pool, allocator, page_size)
     )
     req = _FakeReq("session-a", req_pool_idx=0, committed=17, allocated=40)
@@ -137,7 +137,7 @@ def test_preabort_detaches_session_and_preserves_slot():
             )
         ],
     )
-    tree_cache = SessionAwareCache(inner)
+    tree_cache = StreamingSession(inner)
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=48,
@@ -173,7 +173,7 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    tree_cache = SessionAwareCache(inner)
+    tree_cache = StreamingSession(inner)
 
     # No slot exists yet (first request).
     req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=20)
@@ -202,7 +202,7 @@ def test_nth_mid_abort_nukes_session_slot():
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    tree_cache = SessionAwareCache(inner)
+    tree_cache = StreamingSession(inner)
 
     # Session already has a slot from a previous turn.
     tree_cache.slots["session-a"] = SessionSlot(
@@ -249,7 +249,7 @@ def test_trim_overshoot_postcondition():
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
-    tree_cache = SessionAwareCache(
+    tree_cache = StreamingSession(
         _FakeInnerCache(req_to_token_pool, allocator, page_size)
     )
 
