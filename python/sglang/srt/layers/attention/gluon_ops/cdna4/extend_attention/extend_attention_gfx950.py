@@ -182,7 +182,13 @@ def _ensure_dummies(device, mi_size, wkvo_size):
 _CACHED_ENV_FP8_KV_FORCE_BF16 = None
 _CACHED_ENV_D128_EXPERIMENTAL = None
 _CACHED_ENV_UNIFY_CAUSAL_PATH = None
-_CACHED_ENV_DISABLE_CFG_CACHE = None
+# Hot-path env-var caches: resolved once at module import so the hot
+# dispatcher can read these with a plain global load (~50 ns) instead
+# of paying ~370 ns for a function call + `is None` check every call.
+# These are debug-only knobs that never change within a process, so
+# eager evaluation is safe.
+_CFG_CACHE_DISABLED = int(os.getenv("SGLANG_GLUON_DISABLE_CFG_CACHE", "0")) != 0
+_D128_EXPERIMENTAL_ENV = int(os.getenv("SGLANG_GLUON_D128_EXPERIMENTAL", "0")) != 0
 
 
 def _cfg_cache_disabled():
@@ -193,12 +199,7 @@ def _cfg_cache_disabled():
     direct-invoke path. Used to isolate whether fast-path caching is
     responsible for production crashes / correctness issues.
     """
-    global _CACHED_ENV_DISABLE_CFG_CACHE
-    if _CACHED_ENV_DISABLE_CFG_CACHE is None:
-        _CACHED_ENV_DISABLE_CFG_CACHE = (
-            int(os.getenv("SGLANG_GLUON_DISABLE_CFG_CACHE", "0")) != 0
-        )
-    return _CACHED_ENV_DISABLE_CFG_CACHE
+    return _CFG_CACHE_DISABLED
 
 
 def _use_fp8_kv_bf16_bridge():
@@ -218,14 +219,10 @@ def _use_fp8_kv_bf16_bridge():
 
 def _use_d128_experimental_kernel():
     """Whether to route D128 symmetric path to the experimental kernel fork."""
-    if _gluon_extend_attn_fwd_symmetric_d128_experimental is None:
-        return False
-    global _CACHED_ENV_D128_EXPERIMENTAL
-    if _CACHED_ENV_D128_EXPERIMENTAL is None:
-        _CACHED_ENV_D128_EXPERIMENTAL = (
-            int(os.getenv("SGLANG_GLUON_D128_EXPERIMENTAL", "0")) != 0
-        )
-    return _CACHED_ENV_D128_EXPERIMENTAL
+    return (
+        _D128_EXPERIMENTAL_ENV
+        and _gluon_extend_attn_fwd_symmetric_d128_experimental is not None
+    )
 
 
 def _use_unify_causal_path():
@@ -760,91 +757,89 @@ def gluon_extend_attention_fwd(
     use_rfidx_prefix=False,
 ):
     global _LOGGED_FP8_KV_MODE
-    Lq = q_extend.shape[-1]
+    # Pull q/qo shape tuples once: avoids repeated PyObject shape-attr loads
+    # (TensorBase.__getattr__('shape') is ~80 ns; 4-5 of these add up to
+    # ~400 ns/call on the hot path). Cached ints are accessed via tuple
+    # indexing (~20 ns).
+    _q_shape = q_extend.shape
+    Lq = _q_shape[-1]
     Lv = v_extend.shape[-1]
-    _kv_is_fp8 = k_buffer.dtype in (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
+    _kb_dtype = k_buffer.dtype
+    _kv_is_fp8 = _kb_dtype is torch.float8_e4m3fn or _kb_dtype is torch.float8_e4m3fnuz
+    # All FP8 validation + bridge in one block so BF16 calls skip the 4x
+    # `if _kv_is_fp8 and ...` chain (saves ~500 ns/call on BF16 paths).
     _kv_was_fp8 = _kv_is_fp8
-    # gfx950 MFMA expects OCP FP8 (float8_e4m3fn). The kernel's do_mma()
-    # bit-casts between FP8 flavors, which silently doubles values if the
-    # source is FNUZ (bias 8) but MFMA interprets bits as OCP (bias 7).
-    # This produces ~2-4x numerical errors with no compile/runtime failure.
-    # SGLang already resolves to e4m3fn on gfx950 via fp8_kernel.is_fp8_fnuz,
-    # so this guard only trips when external callers pass FNUZ by mistake.
-    if _kv_is_fp8 and k_buffer.dtype == torch.float8_e4m3fnuz:
-        raise ValueError(
-            "Gluon FP8 extend on gfx950 requires OCP FP8 (torch.float8_e4m3fn). "
-            "Got torch.float8_e4m3fnuz which produces 2-4x numerical errors "
-            "because MFMA hardware on gfx950 uses bias=7 but FNUZ uses bias=8. "
-            "Re-quantize KV buffers with torch.float8_e4m3fn, or use "
-            "SGLang's fp8_kernel.fp8_dtype which auto-selects the right format."
-        )
-    # Global escape hatch: bridge fp8 KV to bf16 kernels when requested.
-    _force_bridge = _kv_is_fp8 and _use_fp8_kv_bf16_bridge()
-    if _force_bridge:
-        # Keep fp8 KV cache externally, but bridge to non-fp8 Gluon kernels by
-        # casting prefix KV on entry to the active compute dtype.
-        bridge_dtype = q_extend.dtype
-        k_buffer = k_buffer.to(bridge_dtype)
-        v_buffer = v_buffer.to(bridge_dtype)
-        _kv_is_fp8 = False
+    if _kv_is_fp8:
+        # gfx950 MFMA expects OCP FP8 (float8_e4m3fn); FNUZ would silently
+        # double values because MFMA reads bias=7 but FNUZ is bias=8.
+        if _kb_dtype is torch.float8_e4m3fnuz:
+            raise ValueError(
+                "Gluon FP8 extend on gfx950 requires OCP FP8 (torch.float8_e4m3fn). "
+                "Got torch.float8_e4m3fnuz which produces 2-4x numerical errors "
+                "because MFMA hardware on gfx950 uses bias=7 but FNUZ uses bias=8. "
+                "Re-quantize KV buffers with torch.float8_e4m3fn, or use "
+                "SGLang's fp8_kernel.fp8_dtype which auto-selects the right format."
+            )
+        # FP8 KV + custom_mask on D<=128 hits the 8-warp pipelined fallback
+        # which has IMA at NS>=2 and nondeterminism at NS=1. Use BF16 KV.
+        if custom_mask is not None and Lq <= 128:
+            raise NotImplementedError(
+                "Gluon FP8 KV + custom_mask is not supported on D<=128. Use "
+                "BF16 KV for spec-decode verify, or set "
+                "GLUON_FP8_KV_TO_BF16_BRIDGE=1."
+            )
+        # FP8 KV + D=256 fails Triton IR lowering (MFMA_F8 at head-dim 256
+        # emits unrealized_conversion_cast the backend can't materialize).
+        if Lq == 256:
+            raise NotImplementedError(
+                "Gluon FP8 KV extend is not supported at head-dim 256. Use "
+                "BF16 KV (Gemma and other D=256 models ship BF16), or set "
+                "GLUON_FP8_KV_TO_BF16_BRIDGE=1."
+            )
+        # Global escape hatch: bridge fp8 KV to bf16 kernels when requested.
+        if _use_fp8_kv_bf16_bridge():
+            bridge_dtype = q_extend.dtype
+            k_buffer = k_buffer.to(bridge_dtype)
+            v_buffer = v_buffer.to(bridge_dtype)
+            _kv_is_fp8 = False
+        if not _LOGGED_FP8_KV_MODE:
+            if _kv_is_fp8:
+                logger.info(
+                    "Gluon FP8 KV path active: native fp8 symmetric kernels enabled."
+                )
+            else:
+                logger.warning(
+                    "Gluon FP8 KV bridge enabled: casting fp8 KV buffers to non-fp8 kernels."
+                )
+            _LOGGED_FP8_KV_MODE = True
     if Lq != Lv:
         raise ValueError(
             f"Gluon extend attention only supports symmetric heads (Lq == Lv), "
             f"got Lq={Lq}, Lv={Lv}. Use mla_prefill/ for mixed-dim DeepSeek MLA."
         )
-    # Correctness guard: custom_mask + FP8 KV on D<=128 hits the
-    # full-dispatch basic fallback which routes to the 8-warp pipelined
-    # path. NS=1 there violates the determinism invariant (warp_pipeline_stage
-    # needs >=2 LDS buffers), and NS=2 in the fallback launcher has a
-    # separate illegal-memory-access bug (the persistent custom_mask path
-    # is also affected). Rather than silently emit wrong output or crash,
-    # reject the combination early with a clear message.
-    # FP8 KV + custom_mask on D<=128 (spec-decode verify) hits the basic
-    # fallback, which has an IMA at NS>=2 and nondeterminism at NS=1. Set
-    # GLUON_FP8_KV_TO_BF16_BRIDGE=1 to bridge, or use BF16 KV for verify.
-    if _kv_is_fp8 and custom_mask is not None and Lq <= 128:
-        raise NotImplementedError(
-            "Gluon FP8 KV + custom_mask is not supported on D<=128. Use "
-            "BF16 KV for spec-decode verify, or set "
-            "GLUON_FP8_KV_TO_BF16_BRIDGE=1."
-        )
-    # FP8 KV + D=256 fails Triton IR lowering on gfx950 (MFMA_F8 at
-    # head-dim 256 emits an unrealized_conversion_cast the backend can't
-    # materialize). The FP8 kernel family is D<=128-only; callers at
-    # D=256 must run BF16 KV (Gemma ships BF16) or set the bridge env.
-    if _kv_is_fp8 and Lq == 256:
-        raise NotImplementedError(
-            "Gluon FP8 KV extend is not supported at head-dim 256. Use "
-            "BF16 KV (Gemma and other D=256 models ship BF16), or set "
-            "GLUON_FP8_KV_TO_BF16_BRIDGE=1."
-        )
-    if _kv_was_fp8 and not _LOGGED_FP8_KV_MODE:
-        if _kv_is_fp8:
-            logger.info(
-                "Gluon FP8 KV path active: native fp8 symmetric kernels enabled."
-            )
-        else:
-            logger.warning(
-                "Gluon FP8 KV bridge enabled: casting fp8 KV buffers to non-fp8 kernels."
-            )
-        _LOGGED_FP8_KV_MODE = True
+    # Hoist the d128-experimental env check once. The module-level globals
+    # `_D128_EXPERIMENTAL_ENV` / `_gluon_extend_attn_fwd_symmetric_d128_experimental`
+    # are resolved at import time, so this is a plain bool-AND chain with no
+    # function-call overhead (saves ~600 ns/call vs calling the helper).
+    _d128_experimental = (
+        Lq == 128
+        and _D128_EXPERIMENTAL_ENV
+        and _gluon_extend_attn_fwd_symmetric_d128_experimental is not None
+    )
     if _kv_is_fp8:
         _kernel_fn = _gluon_extend_attn_fwd_fp8_basic
+    elif _d128_experimental:
+        _kernel_fn = _gluon_extend_attn_fwd_symmetric_d128_experimental
     else:
-        if Lq == 128 and _use_d128_experimental_kernel():
-            _kernel_fn = _gluon_extend_attn_fwd_symmetric_d128_experimental
-        else:
-            _kernel_fn = _gluon_extend_attn_fwd_symmetric
+        _kernel_fn = _gluon_extend_attn_fwd_symmetric
     batch_size = qo_indptr.shape[0] - 1
-    head_num = q_extend.shape[1]
+    head_num = _q_shape[1]
 
     # Experimental D128 ext>=1 split/fix-up path:
     # - independent D128 kernel fork
     # - WCA-style partial-state fix-up with host merge + locks
     if (
-        Lq == 128
-        and Lv == 128
-        and _use_d128_experimental_kernel()
+        _d128_experimental
         and (not _kv_is_fp8)
         and custom_mask is None
         and mask_indptr is None
@@ -873,7 +868,8 @@ def gluon_extend_attention_fwd(
     # (monotone sum bound). q_extend.shape[0] IS that sum. This lets the
     # cache fast-path engage even when callers forget to pass min_len_extend,
     # which is a common pattern in benches and some serving paths.
-    _uniform_by_shape = (q_extend.shape[0] == batch_size * max_len_extend)
+    _total_extend_rows = _q_shape[0]
+    _uniform_by_shape = (_total_extend_rows == batch_size * max_len_extend)
     _uniform_like = (batch_size <= 1 or _uniform_by_shape)
 
     # -- Config-keyed dispatch cache --
@@ -928,6 +924,11 @@ def gluon_extend_attention_fwd(
     # supplied: `_fast_run` now accepts both as per-call tensor args
     # (HAS_SINK / SLIDING_WINDOW_SIZE are compile-time constexprs already in
     # the cache key, so distinct variants don't collide).
+    # Direct global read for the debug escape-hatch saves ~300 ns/call vs
+    # calling `_cfg_cache_disabled()` (function-call + is-None + return
+    # vs plain global load). The flag is eager-evaluated at module import
+    # from SGLANG_GLUON_DISABLE_CFG_CACHE, so it never changes within a
+    # process.
     _cfg_cache_eligible = (
         _force_block_m is None
         and _force_block_n is None
@@ -938,7 +939,7 @@ def gluon_extend_attention_fwd(
         and _force_num_stages is None
         and _force_waves_per_eu is None
         and not _cache_exclude_pfx_skew
-        and not _cfg_cache_disabled()
+        and not _CFG_CACHE_DISABLED
     )
     _has_sink = sinks is not None
 
@@ -986,8 +987,8 @@ def gluon_extend_attention_fwd(
         (Apr 2026): per-layer error compounded from ~0.1 at layer 0 to
         ~3.0 at layer 79, producing garbled text.
         """
-        _mi_n = q_extend.shape[0] + 1
-        _wkvo_n = max(1, batch_size)
+        _mi_n = _total_extend_rows + 1
+        _wkvo_n = batch_size if batch_size > 0 else 1
         if _dummy_mi_size < _mi_n or _dummy_wkvo_size < _wkvo_n or _dummy_sinks is None:
             _ensure_dummies(q_extend.device, _mi_n, _wkvo_n)
         _sinks_arg = sinks if sinks is not None else _dummy_sinks
@@ -1115,7 +1116,7 @@ def gluon_extend_attention_fwd(
         and batch_size <= 4
     )
     if _is_ragged and Lq <= 128 and not _skip_wca_check:
-        _total_ext = q_extend.shape[0]
+        _total_ext = _total_extend_rows
         _grid_est = batch_size * max_len_extend
         _waste_frac = 1.0 - _total_ext / max(1, _grid_est)
         _total_pfx_est = _total_pfx_est_pre
