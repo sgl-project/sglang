@@ -71,16 +71,14 @@ class AITerImpl(AttentionImpl):
         Performs attention using aiter.flash_attn_func.
 
         Args:
-            query: Query tensor of shape [batch_size, num_heads, seq_len, head_dim]
-            key: Key tensor of shape [batch_size, num_heads, seq_len, head_dim]
-            value: Value tensor of shape [batch_size, num_heads, seq_len, head_dim]
+            query: Query tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            key: Key tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            value: Value tensor of shape [batch_size, seq_len, num_heads, head_dim]
             attn_metadata: Metadata for the attention operation (unused).
 
         Returns:
-            Output tensor of shape [batch_size, num_heads, seq_len, head_dim]
+            Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
         """
-        # aiter.flash_attn_func expects tensors in [B, H, S, D] layout,
-        # which is what ring_attn provides.
         output, _ = aiter.flash_attn_func(
             query,
             key,
