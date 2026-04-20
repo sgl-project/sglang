@@ -112,7 +112,6 @@ QUANTIZATION_CHOICES = [
     "modelopt_fp4",
     "modelopt_mixed",
     "petit_nvfp4",
-    "petit_mxfp4",
     "w8a8_int8",
     "w8a8_fp8",
     "moe_wna16",
@@ -592,14 +591,6 @@ class ServerArgs:
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
 
-    # Double Sparsity
-    enable_double_sparsity: bool = False
-    ds_channel_config_path: Optional[str] = None
-    ds_heavy_channel_num: int = 32
-    ds_heavy_token_num: int = 256
-    ds_heavy_channel_type: str = "qk"
-    ds_sparse_decode_threshold: int = 4096
-
     # Offloading
     cpu_offload_gb: int = 0
     offload_group_size: int = -1
@@ -798,6 +789,11 @@ class ServerArgs:
         self._handle_npu_backends()
         self._handle_mps_backends()
         self._handle_xpu_backends()
+
+        # Allow OOT platform plugins to apply server args defaults.
+        from sglang.srt.platforms import current_platform
+
+        current_platform.apply_server_args_defaults(self)
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
@@ -1154,56 +1150,59 @@ class ServerArgs:
         # 1. Disable Model Arch
         if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
             self.disable_piecewise_cuda_graph = True
-        # 2. Speculative decoding
-        if self.speculative_algorithm is not None:
-            self.disable_piecewise_cuda_graph = True
-        # 3. DP attention
+        # 2. DP attention
         if self.enable_dp_attention:
             self.disable_piecewise_cuda_graph = True
-        # 4. Torch compile
+        # 3. Torch compile
         if self.enable_torch_compile:
             self.disable_piecewise_cuda_graph = True
-        # 5. Pipeline parallelism
+        # 4. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, XPU, etc.)
+        # 5. Non-CUDA hardware (AMD, NPU, CPU, MPS, XPU, etc.)
         if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
             self.disable_piecewise_cuda_graph = True
-        # 7. MoE A2A backend
+        # 5b. OOT platforms that don't support piecewise cuda graph
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.is_out_of_tree():
+            if not current_platform.support_piecewise_cuda_graph():
+                self.disable_piecewise_cuda_graph = True
+        # 6. MoE A2A backend
         if self.moe_a2a_backend != "none":
             self.disable_piecewise_cuda_graph = True
-        # 8. LoRA
+        # 7. LoRA
         if self.lora_paths or self.enable_lora:
             self.disable_piecewise_cuda_graph = True
-        # 9. Multimodal / VLM models
+        # 8. Multimodal / VLM models
         if self.get_model_config().is_multimodal:
             self.disable_piecewise_cuda_graph = True
-        # 10. GGUF quantized models (custom dequant ops unsupported by torch.compile)
+        # 9. GGUF quantized models (custom dequant ops unsupported by torch.compile)
         if (
             self.load_format == "gguf"
             or self.quantization == "gguf"
             or check_gguf_file(self.model_path)
         ):
             self.disable_piecewise_cuda_graph = True
-        # 11. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
+        # 10. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
         if self.dllm_algorithm is not None:
             self.disable_piecewise_cuda_graph = True
-        # 12. CPU offload (breaks dynamo)
+        # 11. CPU offload (breaks dynamo)
         if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
             self.disable_piecewise_cuda_graph = True
-        # 13. Deterministic inference
+        # 12. Deterministic inference
         if self.enable_deterministic_inference:
             self.disable_piecewise_cuda_graph = True
-        # 14. PD disaggregation
+        # 13. PD disaggregation
         if self.disaggregation_mode != "null":
             self.disable_piecewise_cuda_graph = True
-        # 15. Symmetric memory (torch.cuda.use_mem_pool is untraceable by dynamo)
+        # 14. Symmetric memory (torch.cuda.use_mem_pool is untraceable by dynamo)
         if self.enable_symm_mem:
             self.disable_piecewise_cuda_graph = True
-        # 16. Expert distribution recorder
+        # 15. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
             self.disable_piecewise_cuda_graph = True
-        # 17. Context parallel
+        # 16. Context parallel
         if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
         # 18. CUDA Graph debug mode
@@ -2191,7 +2190,8 @@ class ServerArgs:
             )
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
-        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
+        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
+        # Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
@@ -2209,6 +2209,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
+                "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
@@ -2336,6 +2337,12 @@ class ServerArgs:
             2.2 We will use Flashinfer backend on blackwell.
             2.3 Otherwise, we will use triton backend.
         """
+        # OOT platforms provide their own default attention backend.
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.is_out_of_tree():
+            return current_platform.get_default_attention_backend()
+
         # Whisper requires flashinfer for cross-attention CUDA graph support
         if "WhisperForConditionalGeneration" in (
             model_config.hf_config.architectures or []
@@ -5637,43 +5644,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dllm_algorithm_config,
             help="The diffusion LLM algorithm configurations. Must be a YAML file.",
-        )
-
-        # Double Sparsity
-        parser.add_argument(
-            "--enable-double-sparsity",
-            action="store_true",
-            help="Enable double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-channel-config-path",
-            type=str,
-            default=ServerArgs.ds_channel_config_path,
-            help="The path of the double sparsity channel config",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-num",
-            type=int,
-            default=ServerArgs.ds_heavy_channel_num,
-            help="The number of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-token-num",
-            type=int,
-            default=ServerArgs.ds_heavy_token_num,
-            help="The number of heavy tokens in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-type",
-            type=str,
-            default=ServerArgs.ds_heavy_channel_type,
-            help="The type of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-sparse-decode-threshold",
-            type=int,
-            default=ServerArgs.ds_sparse_decode_threshold,
-            help="The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel.",
         )
 
         # Offloading

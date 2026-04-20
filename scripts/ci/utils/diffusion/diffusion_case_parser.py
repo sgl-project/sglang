@@ -2,14 +2,16 @@
 """
 AST-based parser for diffusion test cases.
 
-This module parses testcase_configs.py and run_suite.py using AST
-to extract test case information without requiring sglang dependencies.
-Designed to run on lightweight CI runners (ubuntu-latest).
+This module parses the diffusion case source and run_suite.py using AST to
+extract test case information without requiring sglang dependencies. The case
+source file is discovered from ONE_GPU_CASES/TWO_GPU_CASES imports in
+run_suite.py so CI keeps a single source of truth.
 
 Usage:
     # From sibling scripts in this directory:
-    from diffusion_case_parser import collect_diffusion_suites
-    suites = collect_diffusion_suites(testcase_config_path, run_suite_path, baseline_path)
+    from diffusion_case_parser import collect_diffusion_suites, resolve_case_config_path
+    case_config_path = resolve_case_config_path(repo_root, run_suite_path)
+    suites = collect_diffusion_suites(case_config_path, run_suite_path, baseline_path)
 """
 
 import ast
@@ -34,9 +36,6 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 
 # Paths relative to repository root
-TESTCASE_CONFIG_REL_PATH = (
-    "python/sglang/multimodal_gen/test/server/testcase_configs.py"
-)
 BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
 
@@ -65,7 +64,7 @@ class DiffusionSuiteInfo:
 
 class DiffusionTestCaseVisitor(ast.NodeVisitor):
     """
-    AST visitor to extract DiffusionTestCase definitions from testcase_configs.py.
+    AST visitor to extract DiffusionTestCase definitions from the case config.
 
     Parses assignments like:
         ONE_GPU_CASES_A: list[DiffusionTestCase] = [
@@ -119,6 +118,50 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
                 return node.args[0].value
 
         return None
+
+
+def resolve_case_config_path(repo_root: Path, run_suite_path: Path) -> Path:
+    """
+    Resolve the diffusion case config path from run_suite imports.
+
+    run_suite.py must import BOTH ONE_GPU_CASES and TWO_GPU_CASES from the same
+    module. That imported module is treated as the single source of truth.
+    """
+    with open(run_suite_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    tree = ast.parse(content, filename=str(run_suite_path))
+    one_gpu_module: Optional[str] = None
+    two_gpu_module: Optional[str] = None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        imported_names = {alias.name for alias in node.names}
+        if "ONE_GPU_CASES" in imported_names:
+            one_gpu_module = node.module
+        if "TWO_GPU_CASES" in imported_names:
+            two_gpu_module = node.module
+
+    if one_gpu_module is None or two_gpu_module is None:
+        raise RuntimeError(
+            "run_suite.py must import BOTH ONE_GPU_CASES and TWO_GPU_CASES."
+        )
+    if one_gpu_module != two_gpu_module:
+        raise RuntimeError(
+            "run_suite.py imports ONE_GPU_CASES and TWO_GPU_CASES from different "
+            f"modules: {one_gpu_module} vs {two_gpu_module}"
+        )
+
+    rel_path = Path(*one_gpu_module.split(".")).with_suffix(".py")
+    candidates = [repo_root / rel_path, repo_root / "python" / rel_path]
+    case_config_path = next((path for path in candidates if path.exists()), None)
+    if case_config_path is None:
+        raise FileNotFoundError(
+            "Resolved case config from run_suite does not exist. Checked: "
+            + ", ".join(str(path) for path in candidates)
+        )
+    return case_config_path
 
 
 class RunSuiteVisitor(ast.NodeVisitor):
@@ -217,7 +260,7 @@ def get_case_est_time(case_id: str, baselines: Dict[str, float]) -> float:
 
 def parse_testcase_configs(config_path: Path) -> Dict[str, List[str]]:
     """
-    Parse testcase_configs.py to extract case IDs.
+    Parse a diffusion case config file to extract case IDs.
 
     Returns:
         Dictionary mapping list name to case IDs.
@@ -272,7 +315,7 @@ def validate_standalone_est_times(
 
 
 def collect_diffusion_suites(
-    testcase_config_path: Path,
+    case_config_path: Path,
     run_suite_path: Path,
     baseline_path: Path,
 ) -> Dict[str, DiffusionSuiteInfo]:
@@ -280,15 +323,15 @@ def collect_diffusion_suites(
     Collect all diffusion test suite information using AST parsing.
 
     Args:
-        testcase_config_path: Path to testcase_configs.py
+        case_config_path: Path to case config (resolved from run_suite.py)
         run_suite_path: Path to run_suite.py
         baseline_path: Path to perf_baselines.json
 
     Returns:
         Dictionary mapping suite name to DiffusionSuiteInfo.
     """
-    # Parse case IDs from testcase_configs.py
-    case_lists = parse_testcase_configs(testcase_config_path)
+    # Parse case IDs from the single source case config.
+    case_lists = parse_testcase_configs(case_config_path)
 
     # Parse standalone files from run_suite.py
     standalone_files, standalone_est_times = parse_run_suite_standalone_data(

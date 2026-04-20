@@ -109,7 +109,6 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -184,12 +183,10 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
-from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -205,8 +202,11 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.session.session_aware_cache import SessionAwareCache
+from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -865,6 +865,7 @@ class Scheduler(
                         ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
                     )
                 params.tree_components = tuple(tree_components)
+                params.enable_streaming_session = server_args.enable_streaming_session
                 self.tree_cache = UnifiedRadixCache(params)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -889,7 +890,10 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
-        if server_args.enable_streaming_session:
+        if (
+            server_args.enable_streaming_session
+            and not self.tree_cache.supports_streaming_session()
+        ):
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
         if self.enable_hisparse:
@@ -1321,7 +1325,6 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
-                (GetLoadReqInput, self.get_load),
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
@@ -1934,6 +1937,7 @@ class Scheduler(
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
+                http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
@@ -2360,7 +2364,7 @@ class Scheduler(
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
-        # for load reporting (num_running_reqs via /get_load).
+        # for load reporting (num_running_reqs via /v1/loads).
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
@@ -2459,7 +2463,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is not None
+            and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -3744,6 +3748,8 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # Load plugins so hooks can override Scheduler and its dependencies.
+    load_plugins()
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,
