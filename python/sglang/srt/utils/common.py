@@ -590,6 +590,18 @@ def get_available_gpu_memory(
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
         free_gpu_memory = psutil.virtual_memory().available
+    else:
+        from sglang.srt.platforms import current_platform
+
+        if not current_platform.is_out_of_tree():
+            raise ValueError(
+                f"Unsupported device type: {device!r}. "
+                "If this is an OOT platform, ensure it is properly registered "
+                "via the 'sglang.platform_plugins' entry point."
+            )
+        total_mem = current_platform.get_device_total_memory(gpu_id)
+        used_mem = current_platform.get_current_memory_usage()
+        free_gpu_memory = total_mem - used_mem
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -1671,6 +1683,14 @@ def get_mtgpu_memory_capacity():
 
 
 def get_device_memory_capacity(device: str = None):
+    # OOT platforms provide their own memory query via the platform class.
+    from sglang.srt.platforms import current_platform
+
+    if current_platform.is_out_of_tree():
+        mem_bytes = current_platform.get_device_total_memory()
+        if mem_bytes:
+            return mem_bytes / (1 << 20)  # bytes -> MiB
+        return None
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
@@ -1913,6 +1933,12 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
 
 def get_compiler_backend(mode=None) -> str:
+    # OOT platforms provide their own compile backend.
+    from sglang.srt.platforms import current_platform
+
+    if current_platform.is_out_of_tree():
+        return current_platform.get_compile_backend(mode)
+
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
