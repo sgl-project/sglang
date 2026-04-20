@@ -563,8 +563,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states = self.mlps[0](hidden_states)
 
         if _is_npu and not get_global_server_args().disable_piecewise_cuda_graph and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-            cache=self._get_attn_weights_decode(0)
-            _ = prepare_weight_cache(hidden_states, cache, 104857600)
+            cache=self._get_attn_weights_decode(1)
+            _ = prepare_weight_cache(hidden_states, cache)
 
         # TP all_reduce
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
