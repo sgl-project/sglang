@@ -104,6 +104,8 @@ class RadixKey:
         if isinstance(idx, int):
             if idx < 0:
                 idx += len(self)
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f"RadixKey index out of range: {idx}")
             idx = slice(idx, idx + 1)
         start, stop, step = idx.indices(len(self))
         if step != 1:
