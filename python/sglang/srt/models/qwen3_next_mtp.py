@@ -47,7 +47,10 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
-        if get_global_server_args().speculative_draft_model_quantization is None:
+        if (
+            is_npu()
+            and get_global_server_args().speculative_draft_model_quantization is None
+        ):
             quant_config = None
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
