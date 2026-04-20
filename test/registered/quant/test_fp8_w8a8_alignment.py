@@ -7,6 +7,7 @@
 
 import unittest
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock
 
 import torch
@@ -38,13 +39,20 @@ def _make_scheme(strategy_str: str) -> CompressedTensorsW8A8Fp8:
     )
 
 
-def _make_layer(weight: torch.Tensor, weight_scale: torch.Tensor) -> SimpleNamespace:
+def _make_layer(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> SimpleNamespace:
     """Build a minimal fake layer that mimics what process_weights_after_loading
     receives from the model loader."""
     layer = SimpleNamespace()
     layer.weight = torch.nn.Parameter(weight, requires_grad=False)
     layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
     layer.logical_widths = [weight.shape[0]]
+    layer.bias = (
+        torch.nn.Parameter(bias, requires_grad=False) if bias is not None else None
+    )
 
     # register_buffer / register_parameter shims
     def _register_buffer(name, tensor, persistent=True):
@@ -118,8 +126,10 @@ class TestTensorStrategyAlignment(CustomTestCase):
         self.assertEqual(k_padded % FP8_ALIGNMENT, 0)
         self.assertEqual(n_padded % FP8_ALIGNMENT, 0)
 
-        # _orig_output_dim must match the original out_dim
+        # Cached padding metadata must be consistent with the padded weight.
         self.assertEqual(layer._orig_output_dim, out_dim)
+        self.assertEqual(layer._pad_input_k, k_padded - in_dim)
+        self.assertEqual(layer._needs_output_slice, n_padded > out_dim)
 
     def test_non_aligned(self):
         # 1368 is 10944/8 — the exact failing case from GLM-4.5 with tp=8
@@ -154,16 +164,20 @@ class TestTensorStrategyAlignment(CustomTestCase):
 
         weight = _make_fp8_weight(out_dim, in_dim)
         weight_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
-        layer = _make_layer(weight, weight_scale)
+        bias = torch.ones(out_dim, dtype=torch.bfloat16, device="cuda")
+        layer = _make_layer(weight, weight_scale, bias=bias)
         layer.logical_widths = [out_dim]
         layer.input_scale = None
 
         scheme.process_weights_after_loading(layer)
 
+        # bias must be pre-padded to N_padded during loading
+        self.assertIsNotNone(layer._padded_bias)
+        self.assertEqual(layer._padded_bias.shape[0], layer.weight.shape[1])
+
         batch = 4
         x = torch.zeros(batch, in_dim, dtype=torch.bfloat16, device="cuda")
-        bias = torch.ones(out_dim, dtype=torch.bfloat16, device="cuda")
-        output = scheme.apply_weights(layer, x, bias=bias)
+        output = scheme.apply_weights(layer, x, bias=layer.bias)
 
         self.assertEqual(output.shape, (batch, out_dim))
 
@@ -197,6 +211,8 @@ class TestChannelStrategyAlignment(CustomTestCase):
         self.assertEqual(layer.weight_scale.shape[0] % FP8_ALIGNMENT, 0)
 
         self.assertEqual(layer._orig_output_dim, out_dim)
+        self.assertEqual(layer._pad_input_k, k_padded - in_dim)
+        self.assertEqual(layer._needs_output_slice, n_padded > out_dim)
 
     def test_non_aligned(self):
         self._run(out_dim=1368, in_dim=2048)
@@ -228,15 +244,19 @@ class TestChannelStrategyAlignment(CustomTestCase):
 
         weight = _make_fp8_weight(out_dim, in_dim)
         weight_scale = torch.ones(out_dim, 1, dtype=torch.float32, device="cuda")
-        layer = _make_layer(weight, weight_scale)
+        bias = torch.ones(out_dim, dtype=torch.bfloat16, device="cuda")
+        layer = _make_layer(weight, weight_scale, bias=bias)
         layer.input_scale = None
 
         scheme.process_weights_after_loading(layer)
 
+        # bias must be pre-padded to N_padded during loading
+        self.assertIsNotNone(layer._padded_bias)
+        self.assertEqual(layer._padded_bias.shape[0], layer.weight.shape[1])
+
         batch = 4
         x = torch.zeros(batch, in_dim, dtype=torch.bfloat16, device="cuda")
-        bias = torch.ones(out_dim, dtype=torch.bfloat16, device="cuda")
-        output = scheme.apply_weights(layer, x, bias=bias)
+        output = scheme.apply_weights(layer, x, bias=layer.bias)
 
         self.assertEqual(output.shape, (batch, out_dim))
 

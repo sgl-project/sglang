@@ -62,14 +62,15 @@ def pad_to_alignment(
 
 def _pad_weight_to_alignment(
     weight: torch.Tensor, weight_scale: Optional[torch.Tensor]
-) -> tuple[torch.Tensor, Optional[torch.Tensor], int]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor], int, int]:
     """Pad weight (N, K) so both dims are multiples of FP8_ALIGNMENT.
 
-    Returns (weight_t, weight_scale, orig_N) where weight_t is transposed.
+    Returns (weight_t, weight_scale, orig_N, orig_K) where weight_t is transposed.
     weight_scale is padded along dim-0 when it is per-channel (shape [N, 1]
     or [N,]).
     """
     orig_n = weight.shape[0]
+    orig_k = weight.shape[1]
     weight = pad_to_alignment(weight, dim=0)
     weight = pad_to_alignment(weight, dim=1)
     if weight_scale is not None and weight.shape[0] > orig_n:
@@ -81,7 +82,32 @@ def _pad_weight_to_alignment(
                 f"got {tuple(weight_scale.shape)}"
             )
         weight_scale = pad_to_alignment(weight_scale, dim=0)
-    return weight.t(), weight_scale, orig_n
+    return weight.t(), weight_scale, orig_n, orig_k
+
+
+def _cache_padding_metadata(
+    layer, weight_t: torch.Tensor, orig_n: int, orig_k: int
+) -> None:
+    """Cache padded shapes on the layer and pre-pad a copy of bias if present.
+
+    Keeps apply_weights branch-light and CUDA-Graph-friendly: no per-forward
+    shape math, no F.pad on bias, no F.pad on input when K is already aligned.
+
+    Bias is stored under `_padded_bias` rather than overwriting `layer.bias`,
+    because callers using `skip_bias_add=True` read `layer.bias` directly and
+    would see the wrong shape if we mutated it in place.
+    """
+    # weight_t is (K_padded, N_padded).
+    k_padded, n_padded = weight_t.shape
+    layer._orig_output_dim = orig_n
+    layer._pad_input_k = k_padded - orig_k
+    layer._needs_output_slice = n_padded > orig_n
+
+    bias = getattr(layer, "bias", None)
+    if bias is not None and layer._needs_output_slice:
+        layer._padded_bias = pad_to_alignment(bias.data, dim=0)
+    else:
+        layer._padded_bias = None
 
 
 strategy_to_parameter_type = {
@@ -205,10 +231,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
 
-            weight_t, _, orig_out = _pad_weight_to_alignment(weight, None)
+            weight_t, _, orig_n, orig_k = _pad_weight_to_alignment(weight, None)
             layer.weight = Parameter(weight_t, requires_grad=False)
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
-            layer._orig_output_dim = orig_out
+            _cache_padding_metadata(layer, weight_t, orig_n, orig_k)
 
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
@@ -234,15 +260,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 )
                 # required by torch.compile to be torch.nn.Parameter
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-                layer._orig_output_dim = weight.shape[0]
             else:
-                weight_t, weight_scale, orig_out = _pad_weight_to_alignment(
+                weight_t, weight_scale, orig_n, orig_k = _pad_weight_to_alignment(
                     weight, weight_scale
                 )
                 layer.weight = Parameter(weight_t, requires_grad=False)
                 # required by torch.compile to be torch.nn.Parameter
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-                layer._orig_output_dim = orig_out
+                _cache_padding_metadata(layer, weight_t, orig_n, orig_k)
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
@@ -253,8 +278,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=weight, weight_scale=weight_scale
                 )
-            layer.weight = Parameter(weight.detach(), requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale.detach(), requires_grad=False)
+            layer.weight = Parameter(weight.data, requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
@@ -292,17 +317,21 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 compressed_tensor_quant=True,
             )
 
-        # weight is stored transposed as (K_padded, N_padded); pad x to match.
-        # TODO: consider padding input activation at graph-capture time instead of per-forward.
-        orig_out = layer._orig_output_dim
-        pad_k = layer.weight.shape[0] - x.shape[-1]
-        if pad_k > 0:
-            x = F.pad(x, (0, pad_k))
+        # weight is stored transposed as (K_padded, N_padded). All shape math
+        # is precomputed in process_weights_after_loading and cached on `layer`
+        # so this path is branch-light and CUDA-Graph-friendly.
+        #
+        # _pad_input_k is typically 0 for column-parallel layers (K == hidden_size
+        # is naturally aligned) and non-zero for row-parallel layers where
+        # K == intermediate_size/tp_size can be misaligned.
+        if layer._pad_input_k:
+            x = F.pad(x, (0, layer._pad_input_k))
 
-        # Pad bias to N_padded so apply_fp8_linear can add it before we slice.
-        pad_n = layer.weight.shape[1] - orig_out
-        if bias is not None and pad_n > 0:
-            bias = F.pad(bias, (0, pad_n))
+        # Swap in the pre-padded bias when N was padded at load time.
+        # `_padded_bias` is None when no padding was needed OR when the layer had
+        # no bias; if the caller passed bias=None (skip_bias_add=True), keep None.
+        if bias is not None:
+            bias = layer._padded_bias if layer._padded_bias is not None else bias
 
         output = apply_fp8_linear(
             input=x,
@@ -314,4 +343,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             compressed_tensor_quant=True,
         )
 
-        return output[..., :orig_out]
+        if layer._needs_output_slice:
+            output = output[..., : layer._orig_output_dim]
+        return output
