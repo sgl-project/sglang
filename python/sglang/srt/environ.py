@@ -516,6 +516,10 @@ class Envs:
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
+    # Native gRPC server (internal, not yet user-facing)
+    SGLANG_GRPC_PORT = EnvInt(None)
+    SGLANG_ENABLE_GRPC = EnvBool(False)
+
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
