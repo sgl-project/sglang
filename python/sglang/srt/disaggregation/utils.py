@@ -306,6 +306,7 @@ class TransferBackend(Enum):
     MORI = "mori"
     NIXL = "nixl"
     ASCEND = "ascend"
+    SHM_PINNED = "shm_pinned"
     FAKE = "fake"
 
 
@@ -410,6 +411,23 @@ def get_kv_class(
             KVClassType.SENDER: NixlKVSender,
             KVClassType.RECEIVER: (NixlKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.SHM_PINNED:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.shm_pinned import (
+            ShmPinnedKVBootstrapServer,
+            ShmPinnedKVManager,
+            ShmPinnedKVReceiver,
+            ShmPinnedKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: ShmPinnedKVManager,
+            KVClassType.SENDER: ShmPinnedKVSender,
+            KVClassType.RECEIVER: ShmPinnedKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: ShmPinnedKVBootstrapServer,
         }
         return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:

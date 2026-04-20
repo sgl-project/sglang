@@ -155,7 +155,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
+DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori", "shm_pinned"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -698,6 +698,8 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
+    disaggregation_shm_slot_count: Optional[int] = 32
+    disaggregation_shm_chunk_tokens: Optional[int] = 512
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
@@ -6142,6 +6144,18 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--disaggregation-shm-slot-count",
+            type=int,
+            default=ServerArgs.disaggregation_shm_slot_count,
+            help="Number of ring-buffer slots for the shm_pinned backend. Default is 32.",
+        )
+        parser.add_argument(
+            "--disaggregation-shm-chunk-tokens",
+            type=int,
+            default=ServerArgs.disaggregation_shm_chunk_tokens,
+            help="Token budget per shm_pinned transfer chunk. Default is 512.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
