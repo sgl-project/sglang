@@ -205,8 +205,8 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
-from sglang.srt.session.session_aware_cache import SessionAwareCache
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -889,8 +889,11 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
-        if server_args.enable_streaming_session:
-            self.tree_cache = SessionAwareCache(self.tree_cache)
+        if (
+            server_args.enable_streaming_session
+            and not self.tree_cache.supports_streaming_session()
+        ):
+            self.tree_cache = StreamingSession(self.tree_cache)
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
@@ -2365,6 +2368,8 @@ class Scheduler(
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
+            if self.running_batch.is_empty():
+                self.running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()

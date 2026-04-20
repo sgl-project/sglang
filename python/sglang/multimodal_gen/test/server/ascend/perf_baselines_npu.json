@@ -143,11 +143,11 @@
                 "LatentPreparationStage": 0.25,
                 "TimestepPreparationStage": 2.9,
                 "DenoisingStage": 26188.0,
-                "DecodingStage": 320.03,
+                "DecodingStage": 650.1,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 103.56,
+                "0": 153.0,
                 "1": 329.59,
                 "2": 545.23,
                 "3": 537.0,
@@ -209,7 +209,7 @@
                 "LatentPreparationStage": 0.2,
                 "TimestepPreparationStage": 2.68,
                 "DenoisingStage": 83661.46,
-                "DecodingStage": 232.94,
+                "DecodingStage": 1080.05,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {

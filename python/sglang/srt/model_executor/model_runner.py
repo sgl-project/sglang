@@ -714,6 +714,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
+            self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
@@ -2166,9 +2167,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
+    def _pre_initialize_flashinfer_allreduce_workspace(self):
+        """Pre-initialize flashinfer allreduce fusion workspaces.
+
+        Must run before CUDA graph capture to avoid collective operations
+        (broadcasts, barriers) inside the graph capture context, which can
+        deadlock with custom_all_reduce.register_graph_buffers.
+        """
+        if not self.server_args.enable_flashinfer_allreduce_fusion:
+            return
+
+        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            pre_initialize_workspaces,
+        )
+
+        pre_initialize_workspaces(
+            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+            hidden_dim=self.model_config.hidden_size,
+            dtype=self.dtype,
+        )
+
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
         if self.server_args.disable_flashinfer_autotune:
+            return False
+
+        # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
+        # be autotuned -- its _dummy_run would dispatch more tokens per rank than
+        # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
+        # Read server_args directly to avoid depending on initialize_moe_config()
+        # having already populated the MoE backend globals.
+        if (
+            self.server_args.moe_runner_backend == "flashinfer_cutedsl"
+            and self.server_args.moe_a2a_backend == "deepep"
+        ):
             return False
 
         backend_str = self.server_args.moe_runner_backend
