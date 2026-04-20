@@ -34,6 +34,11 @@ if _is_hip:
         dynamic_mxfp4_quant = None
         gemm_a4w4 = None
 
+# The gemm_a4w4 ASM kernel has degraded precision when the output
+# dimension (N) is smaller than its minimum tile size.  
+# Layers with output_size falls below this threshold will stay unquantized
+_MXFP4_MIN_OUTPUT_DIM = 256
+
 
 class Mxfp4Config(QuantizationConfig):
     """
@@ -87,6 +92,14 @@ class Mxfp4Config(QuantizationConfig):
             ):
                 logger.debug(
                     f"MXFP4: Keeping layer {prefix} unquantized (in ignored_layers)"
+                )
+                return UnquantizedLinearMethod()
+            # Skip layers whose output dims are too small, see ASM kernel comment above
+            output_size = getattr(layer, "output_size", None)
+            if output_size is not None and output_size < _MXFP4_MIN_OUTPUT_DIM:
+                logger.info(
+                    f"MXFP4: Keeping layer {prefix} unquantized "
+                    f"(output_size={output_size} < {_MXFP4_MIN_OUTPUT_DIM})"
                 )
                 return UnquantizedLinearMethod()
             logger.debug(f"MXFP4: Replacing layer {prefix} with MXFP4 linear method")
