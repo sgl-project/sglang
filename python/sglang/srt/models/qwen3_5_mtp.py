@@ -57,7 +57,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             quant_config = None
         if get_global_server_args().speculative_draft_model_quantization is None:
             quant_config = None
-        self.quant_config = quant_config
 
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
