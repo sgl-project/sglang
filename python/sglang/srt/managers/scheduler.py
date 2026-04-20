@@ -205,8 +205,8 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
-from sglang.srt.session.session_aware_cache import SessionAwareCache
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -893,7 +893,7 @@ class Scheduler(
             server_args.enable_streaming_session
             and not self.tree_cache.supports_streaming_session()
         ):
-            self.tree_cache = SessionAwareCache(self.tree_cache)
+            self.tree_cache = StreamingSession(self.tree_cache)
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
