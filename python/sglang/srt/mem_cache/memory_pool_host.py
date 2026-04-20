@@ -1715,6 +1715,9 @@ class HostPoolGroup:
     def get_ksize_per_token(self):
         return self.anchor_entry.host_pool.get_ksize_per_token()
 
+    def get_pool(self, name: PoolName):
+        return self.entry_map[name].host_pool
+
     def get_page_buffer_meta(self, indices):
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
 
