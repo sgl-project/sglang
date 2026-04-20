@@ -422,8 +422,6 @@ class _ScaleResidualNormScaleShift(CustomOp):
             self.eps,
         )
 
-    _FLYDSL_BLOCK_VEC = 5120  # WARP_SIZE(64) * NUM_WAVES(10) * VEC(8)
-
     def forward_hip(
         self,
         residual: torch.Tensor,
@@ -432,15 +430,15 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        D = x.shape[-1]
-        if D % self._FLYDSL_BLOCK_VEC != 0:
-            return self.forward_native(residual, x, gate, shift, scale)
-
         try:
             from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+                FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_fused_residual_norm_scale_shift,
             )
         except ImportError:
+            return self.forward_native(residual, x, gate, shift, scale)
+
+        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
             return self.forward_native(residual, x, gate, shift, scale)
 
         return flydsl_fused_residual_norm_scale_shift(
@@ -559,23 +557,21 @@ class _NormScaleShift(CustomOp):
             self.eps,
         )
 
-    _FLYDSL_BLOCK_VEC = 5120  # WARP_SIZE(64) * NUM_WAVES(10) * VEC(8)
-
     def forward_hip(
         self,
         x: torch.Tensor,
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> torch.Tensor:
-        D = x.shape[-1]
-        if D % self._FLYDSL_BLOCK_VEC != 0:
-            return self.forward_native(x, shift, scale)
-
         try:
             from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
+                FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_norm_scale_shift,
             )
         except ImportError:
+            return self.forward_native(x, shift, scale)
+
+        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
             return self.forward_native(x, shift, scale)
 
         result = flydsl_norm_scale_shift(

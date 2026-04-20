@@ -5,7 +5,6 @@
 """Custom activation functions."""
 
 import math
-import os
 from typing import Any
 
 import torch
@@ -124,36 +123,35 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
 
-class _FlyDSLGeLUTanh(nn.Module):
-    """FlyDSL-accelerated GeLU(tanh) for ROCm/HIP.
+@CustomOp.register("gelu_pytorch_tanh")
+class GeLUPyTorchTanh(CustomOp):
+    """GeLU with tanh approximation.
 
-    Only used when SGLANG_USE_FLYDSL_GELU=1. Non-bf16 inputs fall back to
-    PyTorch native GeLU to avoid dtype assert in the FlyDSL kernel.
+    On ROCm/HIP with bf16 input, dispatches to a FlyDSL bandwidth-optimized
+    kernel when available; otherwise falls back to PyTorch native.
     """
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != torch.bfloat16:
-            return F.gelu(x, approximate="tanh")
-        from sglang.jit_kernel.diffusion.flydsl.gelu import flydsl_gelu_tanh
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(x, approximate="tanh")
 
-        return flydsl_gelu_tanh(x)
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype == torch.bfloat16:
+            try:
+                from sglang.jit_kernel.diffusion.flydsl.gelu import flydsl_gelu_tanh
 
-def _gelu_pytorch_tanh_factory():
-    if _is_hip and os.environ.get("SGLANG_USE_FLYDSL_GELU", "0") == "1":
-        try:
-            import flydsl  # noqa: F401
-
-            return _FlyDSLGeLUTanh()
-        except ImportError:
-            pass
-    return nn.GELU(approximate="tanh")
+                return flydsl_gelu_tanh(x)
+            except ImportError:
+                pass
+        return self.forward_native(x)
 
 
 _ACTIVATION_REGISTRY = {
     "gelu": nn.GELU,
     "gelu_new": NewGELU,
-    "gelu_pytorch_tanh": _gelu_pytorch_tanh_factory,
+    "gelu_pytorch_tanh": GeLUPyTorchTanh,
     "relu": nn.ReLU,
     "silu": nn.SiLU,
     "quick_gelu": QuickGELU,

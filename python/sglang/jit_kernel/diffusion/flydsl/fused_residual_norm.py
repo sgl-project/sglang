@@ -31,6 +31,9 @@ from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
 
 WARP_SIZE = 64
+_VEC = 8
+_NUM_WAVES = 10
+FLYDSL_NORM_MIN_ALIGNED_DIM = WARP_SIZE * _NUM_WAVES * _VEC  # 5120
 
 
 def _v(x):
@@ -38,12 +41,12 @@ def _v(x):
 
 
 def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: bool):
-    VEC = 8
-    NUM_WAVES = 10
+    VEC = _VEC
+    NUM_WAVES = _NUM_WAVES
     BLOCK = NUM_WAVES * WARP_SIZE
     assert (
-        D % (BLOCK * VEC) == 0
-    ), f"FlyDSL fused_residual_norm requires D % {BLOCK * VEC} == 0, got D={D}"
+        D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0
+    ), f"FlyDSL fused_residual_norm requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
     NUM_ITERS = D // (BLOCK * VEC)
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
@@ -530,12 +533,12 @@ def _fake_flydsl_fused_residual_norm(
 
 
 def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
-    VEC = 8
-    NUM_WAVES = 10
+    VEC = _VEC
+    NUM_WAVES = _NUM_WAVES
     BLOCK = NUM_WAVES * WARP_SIZE
     assert (
-        D % (BLOCK * VEC) == 0
-    ), f"FlyDSL norm_scale_shift requires D % {BLOCK * VEC} == 0, got D={D}"
+        D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0
+    ), f"FlyDSL norm_scale_shift requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
     NUM_ITERS = D // (BLOCK * VEC)
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
