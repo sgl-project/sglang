@@ -340,7 +340,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if shared_weights is None:
             return topk_output
 
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             fused_append_shared_experts_with_weights,
         )
 
