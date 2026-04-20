@@ -1215,7 +1215,10 @@ class HiRadixCache(RadixCache):
                 host_hit_length=0,
             )
 
-        key = key.page_aligned(self.page_size)
+        assert len(key) % self.page_size == 0, (
+            f"match_prefix expects page-aligned key; use make_radix_key(). "
+            f"Got {len(key)=}, {self.page_size=}"
+        )
         page_aligned_len = len(key)
 
         value, last_node = self._match_prefix_helper(self.root_node, key)

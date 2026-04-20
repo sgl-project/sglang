@@ -247,7 +247,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
             )
-        key = key.page_aligned(self.page_size)
+        assert len(key) % self.page_size == 0, (
+            f"match_prefix expects page-aligned key; use make_radix_key(). "
+            f"Got {len(key)=}, {self.page_size=}"
+        )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)

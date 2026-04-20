@@ -839,7 +839,11 @@ class SWARadixCache(BasePrefixCache):
         key = params.key
         if self.disable or len(key) == 0:
             return None
-        return key.page_aligned(self.page_size)
+        assert len(key) % self.page_size == 0, (
+            f"match_prefix expects page-aligned key; use make_radix_key(). "
+            f"Got {len(key)=}, {self.page_size=}"
+        )
+        return key
 
     def _match_post_processor(
         self,
