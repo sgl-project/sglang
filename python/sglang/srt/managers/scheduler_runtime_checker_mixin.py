@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.observability.metrics_collector import QueueCount
+from sglang.srt.session.session_aware_cache import SessionAwareCache
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
