@@ -19,6 +19,7 @@ from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_last_loc,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -151,15 +152,40 @@ class EagleDraftInputV2Mixin:
                 batch.req_pool_indices,
                 cur_kv_lens,
             )
-            out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-            )
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                allocator = batch.tree_cache.token_to_kv_pool_allocator
+                evict_from_tree_cache(
+                    batch.tree_cache,
+                    num_needed_tokens + len(cur_kv_lens_cpu) * allocator.page_size,
+                )
+                device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                    batch.req_pool_indices,
+                    nxt_kv_lens_cpu - cur_kv_lens_cpu,
+                    cur_kv_lens_cpu,
+                )
+                out_cache_loc = allocator.alloc_extend_with_device_mapping(
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    device_slots,
+                )
+            else:
+                out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
 
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
@@ -276,6 +302,17 @@ class EagleVerifyInputV2Mixin:
                 draft_token_num=self.draft_token_num,
                 device=device,
             )
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                hisparse_coordinator.prepare_verify_slots_spec_v2(
+                    req_pool_indices=batch.req_pool_indices,
+                    verify_cache_locs=batch.out_cache_loc,
+                    num_tokens_per_req=self.draft_token_num,
+                    start_positions_cpu=batch.seq_lens_cpu,
+                )
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():

@@ -23,6 +23,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_last_loc,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -677,18 +678,46 @@ class EAGLEWorker(TpModelWorker):
                 )
                 extend_num_tokens = torch.sum((seq_lens_cpu - prefix_lens_cpu)).item()
 
-            out_cache_loc, token_to_kv_pool_state_backup = (
-                alloc_paged_token_slots_extend(
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                allocator = self.token_to_kv_pool_allocator
+                evict_from_tree_cache(
                     batch.tree_cache,
-                    prefix_lens,
-                    prefix_lens_cpu,
-                    seq_lens,
-                    seq_lens_cpu,
-                    last_loc,
-                    extend_num_tokens,
-                    backup_state=True,
+                    extend_num_tokens + len(prefix_lens_cpu) * allocator.page_size,
                 )
-            )
+                device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                    batch.req_pool_indices,
+                    seq_lens_cpu - prefix_lens_cpu,
+                    prefix_lens_cpu,
+                )
+                out_cache_loc, token_to_kv_pool_state_backup = (
+                    allocator.alloc_extend_with_device_mapping(
+                        prefix_lens,
+                        prefix_lens_cpu,
+                        seq_lens,
+                        seq_lens_cpu,
+                        last_loc,
+                        extend_num_tokens,
+                        device_slots,
+                        backup_state=True,
+                    )
+                )
+            else:
+                out_cache_loc, token_to_kv_pool_state_backup = (
+                    alloc_paged_token_slots_extend(
+                        batch.tree_cache,
+                        prefix_lens,
+                        prefix_lens_cpu,
+                        seq_lens,
+                        seq_lens_cpu,
+                        last_loc,
+                        extend_num_tokens,
+                        backup_state=True,
+                    )
+                )
 
         if self.page_size > 1 and self.topk > 1:
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
