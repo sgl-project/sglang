@@ -94,6 +94,7 @@ _PFX_BUCKET_GRID = (0, 1, 2, 3, 4)
 
 def enumerate_basic_configs(
     head_dim: int, is_fp8: bool = False, sliding_window_size: int = -1,
+    head_num: Optional[int] = None,
 ) -> list[tuple]:
     """Return the unique (BM, BN, NW, NS, PAD_K, PAD_V, EXT_BN, EXT_NS)
     tuples the basic-path dispatch can produce for this head dim.
@@ -106,6 +107,11 @@ def enumerate_basic_configs(
     NW=2 NS=2 which is never emitted for full attention). Without this,
     prewarm misses those variants and the first live SWA call pays a
     JIT compile stall.
+
+    `head_num` forwarded because B=1 dispatch forks on H_q (BM=256 NW=8
+    threshold differs for H_q=64 vs H_q=32). Without it, prewarm would
+    miss the B=1 BM=256 variants on TP=1 Llama-70B / GPT-OSS shapes and
+    the first long-prompt request would JIT-stall.
     """
     cfgs: set[tuple] = set()
     for b in _BATCH_GRID:
@@ -115,6 +121,7 @@ def enumerate_basic_configs(
                     _get_basic_dispatch_config(
                         head_dim, b, e, p, is_fp8,
                         sliding_window_size=sliding_window_size,
+                        head_num=head_num,
                     )
                 )
     return sorted(cfgs)
@@ -381,6 +388,7 @@ def _build_work_list(
     include_fp8: bool,
     persistent_tile_map_modes: Sequence[int] = (0, 1),
     sliding_window_size: int = -1,
+    head_num: Optional[int] = None,
 ) -> list[tuple]:
     """Build the list of (path, config, is_causal[, tile_map_mode]) tuples to warm.
 
@@ -394,10 +402,15 @@ def _build_work_list(
     SWA-specific dispatch overrides (BM=64 NW=2 NS=2 for long-extend SWA)
     get prewarmed; otherwise the first live SWA call JIT-compiles that
     variant during serving.
+
+    `head_num` forwarded so the B=1 H-aware BM=256 variants are enumerated
+    for the model's actual H_q. Without it, prewarm would miss those and
+    first long-prompt ShareGPT request would JIT-stall.
     """
     work: list[tuple] = []
     basic_cfgs = enumerate_basic_configs(
         head_dim, is_fp8=False, sliding_window_size=sliding_window_size,
+        head_num=head_num,
     )
     persistent_cfgs = enumerate_persistent_configs(head_dim)
     for is_causal in is_causal_modes:
@@ -411,6 +424,7 @@ def _build_work_list(
     if include_fp8:
         fp8_basic = enumerate_basic_configs(
             head_dim, is_fp8=True, sliding_window_size=sliding_window_size,
+            head_num=head_num,
         )
         for is_causal in is_causal_modes:
             for cfg in fp8_basic:
@@ -484,6 +498,7 @@ def prewarm_extend_attention(
     work = _build_work_list(
         head_dim, is_causal_modes, include_basic, include_persistent, include_fp8,
         sliding_window_size=sliding_window_size,
+        head_num=num_q_heads,
     )
     if verbose:
         logger.info(
@@ -666,6 +681,7 @@ def _make_realistic_tensors(
 def _enumerate_basic_shape_reps(
     head_dim: int,
     sliding_window_size: int = -1,
+    head_num: Optional[int] = None,
 ) -> list[tuple]:
     """Walk the (b, e, p_bucket) grid, collect one representative shape per
     unique dispatch output. Natural dispatch (no _force_*) is required so
@@ -676,6 +692,11 @@ def _enumerate_basic_shape_reps(
     tuple, when dispatched, lands on a distinct basic config AND (by
     virtue of `_uniform_like = True` at B=1 or uniform-shape) hits the
     fast-path cache-install branch.
+
+    `head_num` forwarded because the B=1 dispatch branches on H_q (see
+    `_get_basic_dispatch_config`). Without it, phase-2 `_config_cache`
+    warming would use a different dispatch config than the live call at
+    B=1 H_q=64 and the cache would miss.
     """
     # NB: use the module-scope import rather than a fresh `from
     # extend_attention_gfx950 ...` statement. The bare name only resolves
@@ -693,6 +714,7 @@ def _enumerate_basic_shape_reps(
                 cfg = _gcfg(
                     head_dim, b, e, p, False,
                     sliding_window_size=sliding_window_size,
+                    head_num=head_num,
                 )
                 if cfg in seen:
                     continue
@@ -934,6 +956,7 @@ def _populate_runtime_caches(
         kv_pool_size = 64 * 1024  # realistic pool so indices stay valid
         shape_reps = _enumerate_basic_shape_reps(
             head_dim, sliding_window_size=sliding_window_size,
+            head_num=num_q_heads,
         )
         for qo_dt in qo_indptr_dtypes:
             for is_causal in is_causal_modes:

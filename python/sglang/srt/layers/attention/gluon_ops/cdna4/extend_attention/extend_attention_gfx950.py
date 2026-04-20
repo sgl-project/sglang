@@ -530,6 +530,7 @@ def _pfx_bucket(total_prefix_len, batch_size):
 @functools.lru_cache(maxsize=2048)
 def _get_basic_dispatch_config(
     Lq, batch_size, max_len_extend, pfx_bucket, is_fp8, sliding_window_size=-1,
+    head_num=None,
 ):
     """Return (BLOCK_M, BLOCK_N, num_warps, NUM_STAGES, PAD_K, PAD_V,
               EXT_BLOCK_N, EXT_NUM_STAGES) for the basic (non-persistent) path.
@@ -542,6 +543,12 @@ def _get_basic_dispatch_config(
     is active with sw < max_len_extend, each tile's useful KV range is at
     most ~(BM + sw) columns, so a smaller BM + fewer warps tends to beat the
     large-BM configs we'd pick for plain prefill at the same seqlen.
+
+    head_num is the number of Q heads. B=1 tuning uses it to choose BM:
+    the win from larger BM (256 NW=8) depends on whether the resulting
+    grid (1, H, ceil(S/BM)) fills enough waves across 256 CUs. H=64 hits
+    the sweet-spot at S>=1600 (D=64) / S>=2000 (D=128); H=32 needs larger
+    S before the half-wave penalty stops dominating.
     """
     if Lq == 256:
         _BN = 32
@@ -586,7 +593,25 @@ def _get_basic_dispatch_config(
             else:
                 _BM, _NW, _NS = 64, 4, 4
         else:
-            _BM, _NW, _NS = (256, 8, 2) if max_len_extend >= 2048 else (128, 8, 4)
+            # B=1..3 single/small-seq serving (GPT-OSS 120B, ShareGPT). The
+            # B=1 cross-over from BM=128 NW=8 NS=4 to BM=256 NW=8 depends
+            # on H_q: H_q>=64 (TP=1 GPT-OSS 120B) hits the BM=256 sweet-
+            # spot at S>=1600 (15-20% GPU win at S=2000-4000; BM=128 still
+            # wins by ~4% at S=1500 because ceil(1500/256)*64 = 384 CTAs
+            # = 1.5 waves of BM=256 wastes half a wave). H_q=32 (TP=2)
+            # reaches BM=256 earlier at S>=1500 because the already-low
+            # wave count means BM=256's bigger per-tile work dominates
+            # before the half-wave-waste penalty bites. B=2,3 rare het-
+            # batch tail keeps the conservative S>=2048 boundary.
+            _h = head_num if head_num is not None else 0
+            if batch_size == 1 and _h >= 64 and max_len_extend >= 1600:
+                _BM, _NW, _NS = 256, 8, 2
+            elif batch_size == 1 and _h == 32 and max_len_extend >= 1500:
+                _BM, _NW, _NS = 256, 8, 2
+            elif max_len_extend >= 2048:
+                _BM, _NW, _NS = 256, 8, 2
+            else:
+                _BM, _NW, _NS = 128, 8, 4
 
         # B>=16 ext==256 full-attn misdispatches to BM=64 (tile count
         # undersubscribes 256 CUs by 4x); route to BM=256.
@@ -599,10 +624,15 @@ def _get_basic_dispatch_config(
 
         # BM=256 NW=8 NS=2 picks up an extra stage on prefill shapes that
         # still have occupancy headroom (max_ext <= 8192 or total_ext <=
-        # 32768); gate NS=4 out of small-ext spec-decode.
+        # 32768); gate NS=4 out of small-ext spec-decode. B=1 single-seq
+        # ShareGPT prefill already sits at the occupancy floor (one q-tile
+        # row per wave), so the extra NS=4 stage eats LDS/registers without
+        # overlapping anything: NS=2 benches 1-3% faster at S in [1600, 8192]
+        # for D=64 H_q=64 B=1 (fine sweep). Gate it out.
         if (
             _BM == 256 and _NW == 8 and _NS == 2
             and max_len_extend >= 1024
+            and batch_size != 1
             and (max_len_extend <= 8192 or _total_ext <= 32768)
         ):
             _NS = 4
@@ -623,14 +653,36 @@ def _get_basic_dispatch_config(
             _BM, _NW, _NS = 128, 8, 2
         elif pfx_bucket >= 2 and max_len_extend >= 2048:
             _BM, _NW, _NS = 128, 8, 2
-        elif batch_size == 1 and max_len_extend <= 256:
-            _BM, _NW, _NS = 64, 4, 2
         elif batch_size == 1:
-            _BM, _NW, _NS = 64, 4, 2
+            # Single-seq prefill (ShareGPT median). Head-count-aware:
+            #   H_q=64 (Llama-70B TP=1, Llama-8B TP=1, Qwen-7B TP=1, Mistral
+            #     TP=1, etc.): BM=128 NW=8 wins 3-6% vs BM=64 NW=4 at
+            #     S>=1024. NS=2 at S>=2000 is a further small win.
+            #   H_q=32 (TP=2 of above): halved tile parallelism means BM=64
+            #     NW=4 is the sweet spot end-to-end. BM=128 NW=8 NS=2 is
+            #     2.5% slower at H=32 S>=4000 (cannot fill enough waves to
+            #     hide the bigger tile work), and BM=256 NS=2 is ruled out
+            #     for correctness (see below).
+            # BM=256 NW=8 NS=2 is avoided at D=128 throughout: the pipelined
+            # NS=2 path has a latent reduction-order issue on ~0.1% of output
+            # elements (max_err ~5e-3 to 1.3e-2, concentrated on specific
+            # head-dim lanes like D_idx=23). NS=4 is numerically clean but
+            # ~60% slower than NS=2 at these shapes, so we stay on BM=128
+            # NS=2 at H=64 which is correct AND captures most of the perf
+            # win vs the prior BM=64 NW=4 default.
+            _h = head_num if head_num is not None else 0
+            if _h >= 64 and max_len_extend >= 2000:
+                _BM, _NW, _NS = 128, 8, 2
+            elif _h >= 64 and max_len_extend >= 1024:
+                _BM, _NW, _NS = 128, 8, 4
+            else:
+                _BM, _NW, _NS = 64, 4, 2
         elif batch_size <= 4:
             _BM, _NW, _NS = 64, 4, 2
         elif _total_ext >= 32768:
-            _BM, _NW, _NS = 256, 8, 2
+            # Avoid BM=256 NW=8 NS=2 at D=128 (same pipelined-NS=2 issue as
+            # above); BM=128 NS=2 is within 5-8% and numerically clean.
+            _BM, _NW, _NS = 128, 8, 2
         else:
             _BM, _NW, _NS = 64, 4, 2
 
@@ -952,6 +1004,7 @@ def gluon_extend_attention_fwd(
         _cfg_local = _get_basic_dispatch_config(
             Lq, batch_size, max_len_extend, _pfx_b_local, _kv_is_fp8,
             sliding_window_size=sliding_window_size,
+            head_num=head_num,
         )
         # (head_num, k_head_num) must be in the key: the fast-runner closure
         # bakes kv_group_num, and strides are also model-dependent. Without
@@ -1386,6 +1439,7 @@ def gluon_extend_attention_fwd(
             _get_basic_dispatch_config(
                 Lq, batch_size, max_len_extend, _pfx_b_full, _kv_is_fp8,
                 sliding_window_size=sliding_window_size,
+                head_num=head_num,
             )
         )
         if _force_block_n is not None:
