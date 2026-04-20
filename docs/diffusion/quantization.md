@@ -102,7 +102,6 @@ sglang generate \
 
 Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantizd if its prefix contains any of the given patterns.
 
-## NVFP4
 ## Validated ModelOpt Checkpoints
 
 This section is the canonical support matrix for the six diffusion ModelOpt
