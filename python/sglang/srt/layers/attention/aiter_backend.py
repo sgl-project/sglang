@@ -151,9 +151,12 @@ def _scatter_req_to_token_to_page_table_kernel(
     page_table_ptr,
     req_to_token_stride,
     page_table_stride,
+    sw_page_table_ptr,
+    swa_slot_mapping_ptr,
     DRAFT_NUM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_SWA: tl.constexpr,
 ):
     """Build the 2D block-level page_table for target_verify directly from
     req_to_token by sampling at PAGE_SIZE stride for rows [0, num_blocks).
@@ -184,6 +187,15 @@ def _scatter_req_to_token_to_page_table_kernel(
         block_vals,
         mask=mask,
     )
+
+    if HAS_SWA:
+        sw_vals = tl.load(swa_slot_mapping_ptr + vals)
+        block_vals = sw_vals // PAGE_SIZE
+        tl.store(
+            sw_page_table_ptr + pid.to(tl.int64) * page_table_stride + offsets,
+            block_vals,
+            mask=mask,
+        )
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -628,6 +640,7 @@ class AiterAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         draft_num: int,
         page_table_dest: Optional[torch.Tensor] = None,
+        swa_page_table_dest: Optional[torch.Tensor] = None,
     ):
         """Build the 2D block page_table + qo_indptr for EAGLE target_verify
         through unified_attention. Assumes the new draft K/V have already been
@@ -648,10 +661,23 @@ class AiterAttnBackend(AttentionBackend):
         page_size = self.page_size
         max_blocks = (self.max_context_len + page_size - 1) // page_size
 
+        swa_slot_mapping = None
+        swa_page_table = None
+
         if page_table_dest is not None:
             page_table = page_table_dest
         else:
             page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
+
+        if self.use_sliding_window_kv_pool:
+            swa_slot_mapping = self.token_to_kv_pool.full_to_swa_index_mapping.long()
+
+            if swa_page_table_dest is not None:
+                swa_page_table = swa_page_table_dest
+            else:
+                swa_page_table = torch.zeros(
+                    bs, max_blocks, dtype=torch.int32, device=device
+                )
 
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
@@ -662,12 +688,15 @@ class AiterAttnBackend(AttentionBackend):
             page_table,
             self.req_to_token.stride(0),
             page_table.stride(0),
+            swa_page_table,
+            swa_slot_mapping,
             DRAFT_NUM=draft_num,
             PAGE_SIZE=page_size,
             BLOCK_SIZE=BLOCK_SIZE,
+            HAS_SWA=(swa_slot_mapping is not None),
         )
 
-        return page_table, qo_indptr, draft_num
+        return page_table, qo_indptr, draft_num, swa_page_table
 
     def _resolve_v2_num_draft_tokens(
         self,
@@ -1230,7 +1259,7 @@ class AiterAttnBackend(AttentionBackend):
                 draft_num = spec_info.draft_token_num
 
                 if self._use_unified_verify:
-                    page_table, qo_indptr, max_q_len = (
+                    page_table, qo_indptr, max_q_len, swa_page_table = (
                         self._build_verify_unified_metadata(
                             bs,
                             forward_batch.seq_lens,
@@ -1247,6 +1276,7 @@ class AiterAttnBackend(AttentionBackend):
                         max_q_len,
                         max_kv_len,
                         max_extend_len=max_q_len,
+                        swa_page_table=swa_page_table,
                     )
                 else:
                     qo_indptr = torch.arange(
@@ -1704,13 +1734,22 @@ class AiterAttnBackend(AttentionBackend):
                     page_table = self.cuda_graph_kv_indices.view(
                         -1, max_num_blocks_per_seq
                     )[:bs]
-                    _page_table, _qo_indptr, _max_q_len = (
+
+                    swa_page_table = None
+
+                    if self.use_sliding_window_kv_pool:
+                        swa_page_table = self.cuda_graph_swa_page_table.view(
+                            -1, max_num_blocks_per_seq
+                        )[:bs]
+
+                    _page_table, _qo_indptr, _max_q_len, _swa_page_table = (
                         self._build_verify_unified_metadata(
                             bs,
                             seq_lens,
                             req_pool_indices,
                             self.num_draft_tokens,
                             page_table_dest=page_table,
+                            swa_page_table_dest=swa_page_table,
                         )
                     )
                     max_kv_len = max_num_blocks_per_seq * self.page_size
@@ -1722,6 +1761,7 @@ class AiterAttnBackend(AttentionBackend):
                         _max_q_len,
                         max_kv_len,
                         max_extend_len=_max_q_len,
+                        swa_page_table=_swa_page_table,
                     )
                 else:
                     custom_mask = self.cuda_graph_custom_mask
@@ -2124,15 +2164,25 @@ class AiterAttnBackend(AttentionBackend):
                     page_table = self.cuda_graph_kv_indices.view(
                         -1, max_num_blocks_per_seq
                     )[:bs]
-                    _page_table, _qo_indptr, _max_q_len = (
+
+                    swa_page_table = None
+
+                    if self.use_sliding_window_kv_pool:
+                        swa_page_table = self.cuda_graph_swa_page_table.view(
+                            -1, max_num_blocks_per_seq
+                        )[:bs]
+
+                    _page_table, _qo_indptr, _max_q_len, _swa_page_table = (
                         self._build_verify_unified_metadata(
                             bs,
                             seq_lens,
                             req_pool_indices,
                             self.num_draft_tokens,
                             page_table_dest=page_table,
+                            swa_page_table_dest=swa_page_table,
                         )
                     )
+
                     max_kv_len_unified = max_num_blocks_per_seq * self.page_size
                     self.forward_metadata = ForwardMetadata(
                         None,
@@ -2142,6 +2192,7 @@ class AiterAttnBackend(AttentionBackend):
                         _max_q_len,
                         max_kv_len_unified,
                         max_extend_len=_max_q_len,
+                        swa_page_table=_swa_page_table,
                     )
                 else:
                     custom_mask = self.cuda_graph_custom_mask
@@ -2648,6 +2699,17 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     page_table = self.forward_metadata.kv_indices
                     max_kv_len = page_table.shape[1] * self.page_size
+
+                    window_size = (-1, -1)
+
+                    if (
+                        layer.sliding_window_size is not None
+                        and layer.sliding_window_size > -1
+                    ):
+                        window_size = (layer.sliding_window_size - 1, 0)
+                        if self.forward_metadata.swa_page_table is not None:
+                            page_table = self.forward_metadata.swa_page_table
+
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
                     # each replay and break the captured pointer.
@@ -2666,7 +2728,7 @@ class AiterAttnBackend(AttentionBackend):
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
                         causal=True,
-                        window_size=(-1, -1),
+                        window_size=window_size,
                         block_table=page_table,
                         softcap=layer.logit_cap,
                         q_descale=None,
