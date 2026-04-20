@@ -53,10 +53,9 @@ class PrefillDelayer:
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
-        # Adaptive queue-based trigger (optional, additive on top of the
-        # slot-based trigger). Active only when BOTH ratio and max_delay_ms are
-        # set; ServerArgs auto-fills tuned defaults when enable_prefill_delayer
-        # is True, so users typically get this without extra flags.
+        # Adaptive queue-based trigger (additive on top of slot_trigger).
+        # Active only when both knobs are set; ServerArgs auto-fills defaults
+        # when enable_prefill_delayer is on.
         self._queue_min_ratio = getattr(
             server_args, "prefill_delayer_queue_min_ratio", None
         )
@@ -163,10 +162,8 @@ class PrefillDelayer:
                     **debug_info,
                 )
 
-            # Safety valve: if KV cache usage is below the low watermark, the
-            # GPU is underutilized - short-circuit any further delay logic
-            # (slot_trigger / queue_trigger) and release prefill immediately.
-            # Mirrors the equivalent check in the "mixed" branch below.
+            # Safety valve: low KV usage means GPU is underutilized, skip
+            # delay. Mirrors the check in the "mixed" branch.
             if global_exists_token_watermark_force_allow:
                 return _NegotiateOutput(
                     next_state=None,
@@ -181,11 +178,8 @@ class PrefillDelayer:
                     max_running_requests + self.dp_size - 1
                 ) // self.dp_size
 
-            # Aggregate across ranks. max_prefill_bs / running_batch are
-            # expected to agree across ranks under normal operation; .max() is
-            # a defensive choice for slot_trigger (lets the largest threshold
-            # win, i.e. conservative w.r.t. over-delaying) and is reused here
-            # for queue_trigger to stay consistent.
+            # Aggregate across ranks; .max() is conservative (w.r.t.
+            # over-delaying) and consistent with the original slot_trigger.
             global_running_batch_max = int(global_running_batch.max().item())
             global_max_prefill_bs_max = int(global_max_prefill_bs.max().item())
             global_waiting_queue_max = int(global_waiting_queue_len.max().item())
@@ -195,23 +189,13 @@ class PrefillDelayer:
                 < global_max_prefill_bs_max
             )
 
-            # Queue-based trigger (opt-in, adaptive; additive on top of
-            # slot_trigger).
-            #
-            # Motivation: at high OSL variability (large random_range_ratio),
-            # decode requests finish asynchronously and trickle into the queue
-            # one-at-a-time, causing repeated 1-request prefill "interruptions"
-            # to the decode pipeline -> severe throughput collapse.
-            #
-            # Fix: delay prefill until the queue has accumulated at least
-            # `queue_min = min(running_req * ratio, max_prefill_bs)` requests.
-            #     - scales with load (no-op at low running_req)
-            #     - capped by max_prefill_bs (no benefit trying to batch larger
-            #       than what chunked prefill can consume in one step)
-            # Absolute wall-clock cap `max_delay_ms` bounds worst-case TTFT if
-            # the queue stays permanently below target (e.g. arrival rate lower
-            # than queue_min). Applied only to the queue_trigger path because
-            # the slot_trigger is self-healing (running_batch eventually drops).
+            # Queue-based trigger: delay prefill until the waiting queue
+            # reaches queue_min = min(running_req * ratio, max_prefill_bs).
+            # Scales with load (no-op when running_req is small) and is capped
+            # by max_prefill_bs (batching larger than one chunked prefill step
+            # gives no extra benefit). Targets workloads where decode trickles
+            # finish one-at-a-time and fragment prefill (e.g. large
+            # random_range_ratio).
             queue_trigger = False
             if self._queue_trigger_enabled and global_running_batch_max > 0:
                 queue_min_effective = min(
@@ -223,11 +207,11 @@ class PrefillDelayer:
                     and global_waiting_queue_max < queue_min_effective
                 )
 
+            # Wall-clock cap applies only to queue_trigger; slot_trigger is
+            # self-healing as running_batch drains. Bounds worst-case TTFT.
             timeout_triggered = False
             if queue_trigger and prev_state is not None:
                 elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                # self._max_delay_ms is guaranteed not None when queue_trigger
-                # is True (see _queue_trigger_enabled).
                 timeout_triggered = elapsed_ms >= self._max_delay_ms
 
             if (slot_trigger or queue_trigger) and not timeout_triggered:
