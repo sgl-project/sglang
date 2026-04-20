@@ -128,7 +128,7 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen|jit_kernel/diffusion|jit_kernel/tests/diffusion|jit_kernel/benchmark/diffusion|cli)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
@@ -136,7 +136,7 @@ jobs:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
-              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
+              - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/jit_kernel/diffusion/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
               - "python/sglang/jit_kernel/benchmark/diffusion/**"
@@ -148,7 +148,7 @@ jobs:
               - "python/sglang/jit_kernel/**"
             sgl_kernel:
               - ".github/workflows/pr-test-sgl-kernel.yml"
-              - "sgl-kernel/**/*.!(md|txt)"
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
 
       # For /rerun-stage (workflow_dispatch with target_stage), dorny/paths-filter doesn't work
       # correctly because it falls back to "last commit" detection which breaks for merge commits.
@@ -188,9 +188,9 @@ jobs:
             echo "sgl_kernel=false" >> $GITHUB_OUTPUT
           fi
 
-          # Check for main_package changes (excluding multimodal_gen)
-          # Note: Need to filter out multimodal_gen before checking, not pipe grep -q output
-          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v "^python/sglang/multimodal_gen/" || true)
+          # Check for main_package changes (excluding multimodal_gen, jit_kernel/diffusion, jit_kernel/tests/diffusion, jit_kernel/benchmark/diffusion, cli)
+          # Note: Need to filter out multimodal_gen and diffusion-related paths before checking, not pipe grep -q output
+          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v -E "^(python/sglang/multimodal_gen/|python/sglang/jit_kernel/diffusion/|python/sglang/jit_kernel/tests/diffusion/|python/sglang/jit_kernel/benchmark/diffusion/|python/sglang/cli/)" || true)
           if [ -n "$MAIN_PKG_FILES" ]; then
             echo "main_package=true" >> $GITHUB_OUTPUT
             echo "Detected main_package changes"
@@ -361,7 +361,7 @@ jobs:
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["stage-a-test-1-gpu-small", "stage-a-test-cpu"]'
+          jobs: '["stage-a-test-1-gpu-small", {"prefix": "stage-a-test-cpu", "expected_count": 4}]'
           max-wait-minutes: '240'
 
   wait-for-stage-b:
@@ -616,6 +616,10 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1, 2, 3]
     steps:
       - name: Free disk space
         run: |
@@ -639,6 +643,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      - name: Install Rust toolchain
+        run: bash scripts/ci/utils/install_rustup.sh
+
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
         timeout-minutes: 20
@@ -653,7 +665,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite stage-a-test-cpu $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:

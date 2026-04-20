@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.observability.metrics_collector import QueueCount
-from sglang.srt.session.session_aware_cache import SessionAwareCache
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
@@ -157,24 +156,16 @@ class SchedulerRuntimeCheckerMixin:
         return idxs
 
     def _session_held_tokens(self: Scheduler) -> int:
-        if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_tokens(self._active_pool_idxs())
-        return 0
+        return self.tree_cache.session_held_tokens(self._active_pool_idxs())
 
     def _session_held_full_tokens(self: Scheduler) -> int:
-        if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_full_tokens(self._active_pool_idxs())
-        return 0
+        return self.tree_cache.session_held_full_tokens(self._active_pool_idxs())
 
     def _session_held_swa_tokens(self: Scheduler) -> int:
-        if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs())
-        return 0
+        return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs())
 
     def _session_held_req_count(self: Scheduler) -> int:
-        if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_req_count()
-        return 0
+        return self.tree_cache.session_held_req_count()
 
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:
