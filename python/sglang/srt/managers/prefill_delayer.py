@@ -208,14 +208,17 @@ class PrefillDelayer:
                     and global_waiting_queue_max < queue_min_effective
                 )
 
-            # Wall-clock cap applies only to queue_trigger; slot_trigger is
-            # self-healing as running_batch drains. Bounds worst-case TTFT.
-            timeout_triggered = False
+            # Wall-clock cap bounds worst-case TTFT for queue_trigger only;
+            # slot_trigger is a hard capacity constraint (prefill would
+            # immediately over-subscribe running slots) and must not be
+            # overridden by the timeout.
+            queue_trigger_timed_out = False
             if queue_trigger and prev_state is not None:
                 elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                timeout_triggered = elapsed_ms >= self._max_delay_ms
+                queue_trigger_timed_out = elapsed_ms >= self._max_delay_ms
 
-            if (slot_trigger or queue_trigger) and not timeout_triggered:
+            effective_queue_trigger = queue_trigger and not queue_trigger_timed_out
+            if slot_trigger or effective_queue_trigger:
                 if self.skip_first_delayer:
                     self.skip_first_delayer = False
                 else:
