@@ -21,14 +21,20 @@ NVIDIA_PIP_WHEELS="/root/.cache/nvidia-pip-wheels"
 mkdir -p "$NVIDIA_WHEEL_CACHE"
 
 for url in \
-    "https://pypi.nvidia.com/nvidia-cudnn-cu12/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl" \
-    "https://pypi.nvidia.com/nvidia-nvshmem-cu12/nvidia_nvshmem_cu12-3.3.20-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"; do
+    "https://pypi.nvidia.com/nvidia-cudnn-cu13/nvidia_cudnn_cu13-9.16.0.29-py3-none-manylinux_2_27_x86_64.whl" \
+    "https://pypi.nvidia.com/nvidia-nvshmem-cu13/nvidia_nvshmem_cu13-3.3.20-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"; do
     whl="$NVIDIA_WHEEL_CACHE/$(basename "$url")"
     [ -f "$whl" ] && unzip -tq "$whl" &>/dev/null || curl -fL -o "$whl" "$url"
 done
 
-pip install --no-deps "$NVIDIA_WHEEL_CACHE"/nvidia_cudnn_cu12-*.whl \
-    "$NVIDIA_WHEEL_CACHE"/nvidia_nvshmem_cu12-*.whl 2>/dev/null || true
+# Caller (ci_install_dependency.sh) sets $PIP_CMD/$PIP_INSTALL_SUFFIX to route
+# installs into the active environment (venv or system). The `:-pip` fallback
+# keeps the file runnable ad-hoc for debugging; in CI the caller always sets
+# these. Silent failure here is deliberate — the pinned cudnn/nvshmem installs
+# later in ci_install_dependency.sh are the source of truth; this is only a
+# download optimization.
+${PIP_CMD:-pip} install --no-deps "$NVIDIA_WHEEL_CACHE"/nvidia_cudnn_cu13-*.whl \
+    "$NVIDIA_WHEEL_CACHE"/nvidia_nvshmem_cu13-*.whl ${PIP_INSTALL_SUFFIX:-} 2>/dev/null || true
 
 # If pre-cached NVIDIA pip wheels exist, tell pip to check there first.
 # This avoids re-downloading ~2 GB of cublas/cufft/nvrtc/etc. every run

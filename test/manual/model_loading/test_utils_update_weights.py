@@ -14,6 +14,11 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=32, suite="stage-b-test-1-gpu-large")
 
+"""
+# TODO: torch_memory_saver wheel is built against libcudart.so.12, fails to LD_PRELOAD in Cu13 venv. Ref: https://github.com/sgl-project/sglang/actions/runs/24604424372/job/71968573867
+# Should move back to registered test after it's fixed
+"""
+
 
 class AsyncEngine(Engine):
     def __init__(self, **kwargs):
