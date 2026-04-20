@@ -94,7 +94,7 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
 Launch a server:
 
 ```bash
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --port 30000
+python -m sglang.launch_server --model-path meta-llama/Llama-3.2-1B-Instruct --port 30000
 ```
 
 Send a request:
@@ -206,7 +206,7 @@ SGLang supports two grammar backends:
 If instead you want to initialize the Outlines backend, you can use `--grammar-backend outlines` flag:
 
 ```bash
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+python -m sglang.launch_server --model-path meta-llama/Llama-3.2-1B-Instruct \
 --port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: xgrammar)
 ```
 
@@ -274,7 +274,7 @@ Launch a server with `--enable-custom-logit-processor` flag on.
 
 ```bash
 python -m sglang.launch_server \
-  --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+  --model-path meta-llama/Llama-3.2-1B-Instruct \
   --port 30000 \
   --enable-custom-logit-processor
 ```
@@ -331,7 +331,7 @@ from sglang.utils import print_highlight
 client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
 
 response = client.chat.completions.create(
-    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    model="meta-llama/Llama-3.2-1B-Instruct",
     messages=[
         {"role": "user", "content": "List 3 countries and their capitals."},
     ],

@@ -145,7 +145,7 @@ Example -- FP8 online quantization:
 
 ```bash
 python3 -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --quantization fp8 \
     --port 30000 --host 0.0.0.0
 ```
@@ -183,7 +183,7 @@ drun -p 30000:30000 \
     --env "HF_TOKEN=<secret>" \
     sglang_image \
     python3 -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \ # <- here
+    --model-path meta-llama/Llama-3.2-1B-Instruct \ # <- here
     --tp 8 \
     --trust-remote-code \
     --host 0.0.0.0 \

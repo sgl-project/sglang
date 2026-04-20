@@ -187,7 +187,7 @@ If the `--attention-backend` argument is not specified, SGLang automatically sel
 - FlashInfer (Default for Non-Hopper Machines, e.g., A100, A40)
 ```bash
 python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.2-1B-Instruct \
   --attention-backend flashinfer
 python3 -m sglang.launch_server \
   --tp 8 \
@@ -199,7 +199,7 @@ python3 -m sglang.launch_server \
 - FlashAttention 3 (Default for Hopper Machines, e.g., H100, H200, H20)
 ```bash
 python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.2-1B-Instruct \
   --attention-backend fa3
 python3 -m sglang.launch_server \
   --tp 8 \
@@ -211,7 +211,7 @@ python3 -m sglang.launch_server \
 - Triton
 ```bash
 python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.2-1B-Instruct \
   --attention-backend triton
 python3 -m sglang.launch_server \
   --tp 8 \
@@ -301,28 +301,28 @@ python3 -m sglang.launch_server \
 - Ascend
 ```bash
 python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.2-1B-Instruct \
   --attention-backend ascend
 ```
 
 - Intel XPU
 ```bash
 python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.2-1B-Instruct \
   --attention-backend intel_xpu
 ```
 
 - Wave
 ```bash
 python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.2-1B-Instruct \
   --attention-backend wave
 ```
 
 - FlexAttention
 ```bash
 python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.2-1B-Instruct \
   --attention-backend flex_attention
 ```
 
@@ -336,7 +336,7 @@ python3 -m sglang.launch_server \
 - Torch Native
 ```bash
 python3 -m sglang.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.2-1B-Instruct \
   --attention-backend torch_native
 ```
 

@@ -177,7 +177,7 @@ Launch the router and a fleet of SGLang workers in one process:
 
 ```bash
 python -m sglang_router.launch_server \
-  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --model meta-llama/Llama-3.2-1B-Instruct \
   --dp-size 4 \
   --host 0.0.0.0 \
   --port 30000
@@ -207,8 +207,8 @@ Run workers independently and point the router at their HTTP endpoints:
 
 ```bash
 # Worker nodes
-python -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8000
-python -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8001
+python -m sglang.launch_server --model meta-llama/Llama-3.2-1B-Instruct --port 8000
+python -m sglang.launch_server --model meta-llama/Llama-3.2-1B-Instruct --port 8001
 
 # Router node
 python -m sglang_router.launch_router \

@@ -210,7 +210,7 @@ You can enable EAGLE-3 decoding by setting `--speculative-algorithm EAGLE3` and 
 
 ```bash
 python3 -m sglang.launch_server \
-    --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model meta-llama/Llama-3.2-1B-Instruct \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B \
     --speculative-num-steps 3 \
@@ -230,7 +230,7 @@ import openai
 client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
 
 response = client.chat.completions.create(
-    model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+    model="meta-llama/Llama-3.2-1B-Instruct",
     messages=[
         {"role": "user", "content": "List 3 countries and their capitals."},
     ],

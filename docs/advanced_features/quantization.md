@@ -550,11 +550,11 @@ For more detailed examples of quantization of models, as well as information abo
 
 ## Online Quantization
 
-To enable online quantization, you can simply specify `--quantization` in the command line. For example, you can launch the server with the following command to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`:
+To enable online quantization, you can simply specify `--quantization` in the command line. For example, you can launch the server with the following command to enable `FP8` quantization for model `meta-llama/Llama-3.2-1B-Instruct`:
 
 ```bash
 python3 -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --quantization fp8 \
     --port 30000 --host 0.0.0.0
 ```
@@ -563,11 +563,11 @@ Our team is working on supporting more online quantization methods. SGLang will 
 
 ### torchao online quantization method
 
-SGLang also supports quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
+SGLang also supports quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Llama-3.2-1B-Instruct`, you can launch the server with the following command:
 
 ```bash
 python3 -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --torchao-config int4wo-128 \
     --port 30000 --host 0.0.0.0
 ```
@@ -578,7 +578,7 @@ Note: According to [this issue](https://github.com/sgl-project/sglang/issues/221
 
 ```bash
 python3 -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --torchao-config int8dq \
     --disable-cuda-graph \
     --port 30000 --host 0.0.0.0

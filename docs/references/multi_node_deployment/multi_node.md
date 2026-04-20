@@ -22,7 +22,7 @@ python3 -m sglang.launch_server \
   --node-rank 1
 ```
 
-Note that LLama 405B (fp8) can also be launched on a single node.
+Note that Llama 405B (fp8) can also be launched on a single node.
 
 ```bash
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-405B-Instruct-FP8 --tp 8
@@ -36,7 +36,7 @@ Please refer to [DeepSeek documents for reference](https://docs.sglang.io/basic_
 
 This example showcases how to serve SGLang server across multiple nodes by SLURM. Submit the following job to the SLURM cluster.
 
-```
+```bash
 #!/bin/bash -l
 
 #SBATCH -o SLURM_Logs/%x_%j_master.out
@@ -97,4 +97,4 @@ wait
 
 Then, you can test the server by sending requests following other [documents](https://docs.sglang.io/basic_usage/openai_api_completions.html).
 
-Thanks for [aflah02](https://github.com/aflah02) for providing the example, based on his [blog post](https://aflah02.substack.com/p/multi-node-llm-inference-with-sglang).
+Thanks to [aflah02](https://github.com/aflah02) for providing the example, based on his [blog post](https://aflah02.substack.com/p/multi-node-llm-inference-with-sglang).

@@ -127,7 +127,7 @@ Native DP (built-in Data Parallelism) in SGLang creates multiple worker processe
 ```bash
 # Native DP mode
 python -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --dp-size 4
 ```
 
@@ -152,7 +152,7 @@ Starting from September 2024, SGLang Model Gateway, i.e., SMG, formerly named as
 ```bash
 # SMG-based DP mode (Recommended)
 python -m sglang_router.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --dp-size 4
 ```
 
@@ -217,7 +217,7 @@ This is the easiest way to get started - SMG and workers are launched together:
 
 ```bash
 python -m sglang_router.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --dp-size 4 \
     --host 0.0.0.0 \
     --port 30000
@@ -232,12 +232,12 @@ For distributed deployments across multiple machines:
 ```bash
 # Node 1
 python -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --port 8000
 
 # Node 2
 python -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --port 8000
 ```
 
@@ -315,7 +315,7 @@ python -m sglang_router.launch_router \
 
 ```bash
 python -m sglang_router.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --dp-size 4 \
     --router-policy cache_aware \
     --router-health-check-interval-secs 30 \

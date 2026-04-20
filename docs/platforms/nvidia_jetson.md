@@ -56,7 +56,7 @@ Running quantization with TorchAO
 TorchAO is suggested to NVIDIA Jetson Orin.
 ```bash
 python -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --device cuda \
     --dtype bfloat16 \
     --attention-backend flashinfer \

@@ -22,19 +22,19 @@ Use `bench_serving` by default unless there are specific needs.
 **`bench_one_batch_server`** sends a single batch as one HTTP request to a running server. Due to only having a single batch, the server is never in a steady-state and metrics will be biased. Launch a server with `sglang.launch_server` first.
 
   ```bash
-  python3 -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
+  python3 -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Llama-3.2-1B-Instruct --batch-size 32 --input-len 256 --output-len 32
   ```
 
 **`bench_offline_throughput`** directly instantiates the `Engine` object in-process (no HTTP server) and submits all requests at once via `engine.generate()`. The engine's scheduler handles batching and execution. This measures maximum achievable throughput without any network overhead.
 
   ```bash
-  python3 -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
+  python3 -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.2-1B-Instruct --num-prompts 10
   ```
 
 **`bench_one_batch`** is the lowest-level tool. It directly instantiates a `ModelRunner` and calls `extend()` / `decode()` on a fixed static batch, bypassing the scheduler entirely. The prefill and decode phases are run separately, making profiling easier but rendering the metrics unrealistic. Because there is no dynamic batching, it may run out of memory for batch sizes that a real server can handle (a real server chunks prefill into smaller batches). This is best suited for profiling individual kernel performance.
 
   ```bash
-  python3 -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
+  python3 -m sglang.bench_one_batch --model-path meta-llama/Llama-3.2-1B-Instruct --batch-size 32 --input-len 256 --output-len 32
   ```
 
 ## Profile with PyTorch Profiler
@@ -446,7 +446,7 @@ nsys-ui layerwise_profile.qdrep
 In the Nsight Systems GUI, you'll see:
 - **NVTX ranges**: Each layer appears as a labeled range in the timeline with detailed information in the marker metadata
 - **CUDA kernels**: All GPU kernels are shown alongside the layer annotations
-- **Layer hierarchy**: The full module path (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct.model.layers.0.self_attn.qkv_proj`) helps identify specific layers. The prefix uses the full model path from `--model-path`.
+- **Layer hierarchy**: The full module path (e.g., `meta-llama/Llama-3.2-1B-Instruct.model.layers.0.self_attn.qkv_proj`) helps identify specific layers. The prefix uses the full model path from `--model-path`.
 - **Tensor shapes**: Input/output dimensions and parameter shapes are included in the NVTX marker data
 
 **Benefits of layerwise NVTX profiling:**
@@ -463,7 +463,7 @@ In the Nsight Systems GUI, you'll see:
 2. You can benchmark a model with modified configs (e.g., less layers) by using `--json-model-override-args`. For example, you can benchmark a model with only 2 layers and 2 kv heads using:
 
    ```bash
-   python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32 --load-format dummy --json-model-override-args '{"num_hidden_layers": 1, "num_key_value_heads": 1}'
+   python -m sglang.bench_one_batch --model-path meta-llama/Llama-3.2-1B-Instruct --batch 32 --input-len 256 --output-len 32 --load-format dummy --json-model-override-args '{"num_hidden_layers": 1, "num_key_value_heads": 1}'
    ```
 
 3. You can use `--python-backtrace=cuda` to see python call stack for all CUDA kernels, as in PyTorch Profiler. (Caveat: this can cause inaccurately long kernel runtimes for CUDA event based timing)

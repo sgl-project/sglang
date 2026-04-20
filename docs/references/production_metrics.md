@@ -7,7 +7,7 @@ An example of the monitoring dashboard is available in [examples/monitoring/graf
 Here is an example of the metrics:
 
 ```
-$ curl http://localhost:30000/metrics
+curl http://localhost:30000/metrics
 # HELP sglang:prompt_tokens_total Number of prefill tokens processed.
 # TYPE sglang:prompt_tokens_total counter
 sglang:prompt_tokens_total{model_name="meta-llama/Llama-3.1-8B-Instruct"} 8.128902e+06
@@ -145,7 +145,7 @@ This section describes how to set up the monitoring stack (Prometheus + Grafana)
       --enable-metrics \
       --enable-mfu-metrics
     ```
-    Replace `<your_model_path>` with the actual path to your model (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct`). Ensure the server is accessible from the monitoring stack (you might need `--host 0.0.0.0` if running in Docker). By default, the metrics endpoint will be available at `http://<sglang_server_host>:30000/metrics`.
+    Replace `<your_model_path>` with the actual path to your model (e.g., `meta-llama/Llama-3.2-1B-Instruct`). Ensure the server is accessible from the monitoring stack (you might need `--host 0.0.0.0` if running in Docker). By default, the metrics endpoint will be available at `http://<sglang_server_host>:30000/metrics`.
 
 2.  **Navigate to the monitoring example directory:**
     ```bash
