@@ -264,6 +264,51 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         hisparse_last_locs = self._kvcache._translate_loc_to_hisparse_device(last_locs)
         return hisparse_last_locs
 
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical indices and map them to caller-managed HiSparse slots."""
+        avail = self.logical_attn_allocator.available_size()
+        if avail < extend_num_tokens:
+            raise RuntimeError(
+                f"HiSparse logical alloc: need {extend_num_tokens} tokens but only "
+                f"{avail} are available."
+            )
+
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        out = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if out is None:
+            raise RuntimeError(
+                f"HiSparse logical alloc failed for {extend_num_tokens} tokens. "
+                f"Logical pool available: {self.logical_attn_allocator.available_size()}"
+            )
+
+        self.full_to_hisparse_device_index_mapping[out] = device_slots
+        if backup_state:
+            return out, (logical_state, out.clone())
+        return out
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        """Clear mappings for caller-managed slots before freeing logical indices."""
+        self.full_to_hisparse_device_index_mapping[logical_indices] = 0
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -390,3 +435,17 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
         )
+
+    def backup_state(self):
+        return (
+            self.logical_attn_allocator.backup_state(),
+            self.full_to_hisparse_device_index_mapping.clone(),
+        )
+
+    def restore_state(self, state):
+        logical_state, mapping_info = state
+        self.logical_attn_allocator.restore_state(logical_state)
+        if mapping_info.shape[0] < self.full_to_hisparse_device_index_mapping.shape[0]:
+            self.full_to_hisparse_device_index_mapping[mapping_info] = 0
+        else:
+            self.full_to_hisparse_device_index_mapping.copy_(mapping_info)

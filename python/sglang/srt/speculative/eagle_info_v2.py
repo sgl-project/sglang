@@ -19,6 +19,7 @@ from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_last_loc,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -143,15 +144,40 @@ class EagleDraftInputV2Mixin:
                 batch.req_pool_indices,
                 cur_kv_lens,
             )
-            out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-            )
+            if batch.hisparse_coordinator is not None:
+                allocator = batch.tree_cache.token_to_kv_pool_allocator
+                evict_from_tree_cache(
+                    batch.tree_cache,
+                    num_needed_tokens + len(cur_kv_lens_cpu) * allocator.page_size,
+                )
+                tokens_per_req = (nxt_kv_lens_cpu - cur_kv_lens_cpu).to(
+                    device=batch.device
+                )
+                device_slots = (
+                    batch.hisparse_coordinator.get_draft_device_slots_variable(
+                        batch.req_pool_indices,
+                        tokens_per_req,
+                    )
+                )
+                out_cache_loc = allocator.alloc_extend_with_device_mapping(
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    device_slots,
+                )
+            else:
+                out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
 
         assign_req_to_token_pool_func(
             batch.req_pool_indices,

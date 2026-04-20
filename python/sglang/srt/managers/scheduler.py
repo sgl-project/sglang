@@ -2296,7 +2296,40 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
-        # todo hisparse, maybe other info to contain for the new batch
+
+        if not batch.spec_algorithm.is_none():
+            missing_spec_info_rids = [
+                req.rid
+                for req in reqs
+                if getattr(req, "hisparse_spec_info", None) is None
+            ]
+            if missing_spec_info_rids:
+                raise RuntimeError(
+                    "HiSparse decode batch is missing speculative draft state for requests: "
+                    + ", ".join(missing_spec_info_rids)
+                )
+
+            batch.spec_info = reqs[0].hisparse_spec_info
+            reqs[0].hisparse_spec_info = None
+            for req in reqs[1:]:
+                batch.spec_info.merge_batch(req.hisparse_spec_info)
+                req.hisparse_spec_info = None
+
+            if batch.is_spec_v2:
+                if batch.spec_info.new_seq_lens is None:
+                    raise RuntimeError(
+                        "HiSparse spec-v2 decode batch is missing new_seq_lens for draft state rebuild."
+                    )
+                future_indices = self.future_map.alloc_future_indices(len(reqs))
+                self.future_map.store_to_map_for_new_batch(
+                    future_indices, batch.spec_info
+                )
+                batch.spec_info.future_indices = future_indices
+                batch.spec_info.verify_done = None
+                batch.seq_lens = batch.spec_info.new_seq_lens
+                batch.seq_lens_cpu = batch.seq_lens.cpu()
+                batch.orig_seq_lens = batch.seq_lens.to(dtype=torch.int32)
+                batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:

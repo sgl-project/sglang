@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -129,15 +130,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                prefix_lens,
-                prefix_lens_cpu,
-                end_offset,
-                end_offset_cpu,
-                last_loc,
-                len(batch.input_ids),
-            )
+            if batch.hisparse_coordinator is not None:
+                allocator = batch.tree_cache.token_to_kv_pool_allocator
+                evict_from_tree_cache(
+                    batch.tree_cache,
+                    len(batch.input_ids) + len(prefix_lens_cpu) * allocator.page_size,
+                )
+                device_slots = batch.hisparse_coordinator.get_draft_device_slots(
+                    batch.req_pool_indices,
+                    self.draft_token_num,
+                )
+                batch.out_cache_loc = allocator.alloc_extend_with_device_mapping(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                    device_slots,
+                )
+            else:
+                batch.out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                )
             self.last_loc = last_loc
 
         bs = batch.batch_size()
@@ -468,6 +489,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # try to unify the tensor representation and list representation
         accept_length_list = accept_length_cpu.tolist()
 
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        if hisparse_coordinator is not None:
+            hisparse_coordinator.finalize_accepted_tokens(
+                batch.req_pool_indices,
+                batch.out_cache_loc[accept_index],
+                accept_length,
+                batch.seq_lens + accept_length + 1,
+            )
+            token_to_kv_pool_allocator.clear_device_mapping(batch.out_cache_loc[evict_mask])
+
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
@@ -523,6 +554,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 token_to_kv_pool_allocator.free(to_free_slots)
 
                 # Copy the kv cache
+                if hisparse_coordinator is not None:
+                    raise NotImplementedError(
+                        "HiSparse + speculative topk > 1 + page_size > 1 needs "
+                        "hisparse-aware move_kv_cache translation."
+                    )
                 batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                     tgt_cache_loc, src_cache_loc
                 )
@@ -781,6 +817,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = self.new_seq_lens[new_indices]
+            if self.hidden_states is not None:
+                self.hidden_states = self.hidden_states[new_indices]
+            if self.verified_id is not None:
+                self.verified_id = self.verified_id[new_indices]
+            if self.topk_p is not None:
+                self.topk_p = self.topk_p[new_indices]
+            if self.topk_index is not None:
+                self.topk_index = self.topk_index[new_indices]
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -805,6 +851,44 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
 
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        sli = slice(batch_index, batch_index + 1)
+        future_indices = None
+        if self.future_indices is not None:
+            future_indices = FutureIndices(indices=self.future_indices.indices[sli])
+        accept_length_cpu = None
+        if self.accept_length_cpu is not None:
+            accept_length_cpu = self.accept_length_cpu[batch_index : batch_index + 1]
+        return EagleDraftInput(
+            topk_p=None if self.topk_p is None else self.topk_p[sli],
+            topk_index=None if self.topk_index is None else self.topk_index[sli],
+            hidden_states=None if self.hidden_states is None else self.hidden_states[sli],
+            capture_hidden_mode=self.capture_hidden_mode,
+            verified_id=None if self.verified_id is None else self.verified_id[sli],
+            accept_length=(
+                None if self.accept_length is None else self.accept_length[sli]
+            ),
+            accept_length_cpu=accept_length_cpu,
+            seq_lens_for_draft_extend=(
+                None
+                if self.seq_lens_for_draft_extend is None
+                else self.seq_lens_for_draft_extend[sli]
+            ),
+            seq_lens_for_draft_extend_cpu=(
+                None
+                if self.seq_lens_for_draft_extend_cpu is None
+                else self.seq_lens_for_draft_extend_cpu[sli]
+            ),
+            req_pool_indices_for_draft_extend=(
+                None
+                if self.req_pool_indices_for_draft_extend is None
+                else self.req_pool_indices_for_draft_extend[sli]
+            ),
+            future_indices=future_indices,
+            new_seq_lens=None if self.new_seq_lens is None else self.new_seq_lens[sli],
+            verify_done=self.verify_done,
+        )
+
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
@@ -813,6 +897,34 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
             )
+            if self.new_seq_lens is None:
+                self.new_seq_lens = spec_info.new_seq_lens
+            elif spec_info.new_seq_lens is not None:
+                self.new_seq_lens = torch.cat(
+                    [self.new_seq_lens, spec_info.new_seq_lens], axis=0
+                )
+            if self.hidden_states is None:
+                self.hidden_states = spec_info.hidden_states
+            elif spec_info.hidden_states is not None:
+                self.hidden_states = torch.cat(
+                    [self.hidden_states, spec_info.hidden_states], axis=0
+                )
+            if self.verified_id is None:
+                self.verified_id = spec_info.verified_id
+            elif spec_info.verified_id is not None:
+                self.verified_id = torch.cat(
+                    [self.verified_id, spec_info.verified_id], axis=0
+                )
+            if self.topk_p is None:
+                self.topk_p = spec_info.topk_p
+            elif spec_info.topk_p is not None:
+                self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], axis=0)
+            if self.topk_index is None:
+                self.topk_index = spec_info.topk_index
+            elif spec_info.topk_index is not None:
+                self.topk_index = torch.cat(
+                    [self.topk_index, spec_info.topk_index], axis=0
+                )
             return
 
         if self.hidden_states is None:

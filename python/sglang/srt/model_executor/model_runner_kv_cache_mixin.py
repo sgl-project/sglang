@@ -663,6 +663,14 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
+            if self.enable_hisparse:
+                assert (
+                    self.token_to_kv_pool_allocator.__class__
+                    == HiSparseTokenToKVPoolAllocator
+                )
+                self.token_to_kv_pool.full_to_hisparse_device_index_mapping = (
+                    self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+                )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
