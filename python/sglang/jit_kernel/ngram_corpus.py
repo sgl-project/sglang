@@ -50,8 +50,10 @@ def get_ngram_corpus_cls():
             max_bfs_breadth: int,
             draft_token_num: int,
             match_type: str,
-            external_sam_budget: int = 0,
             external_corpus_max_tokens: int = 10000000,
+            trie_source_prior: float = 0.0,
+            match_specificity_weight: float = 0.7,
+            match_confidence_weight: float = 0.3,
         ) -> None:
             mt = _MATCH_TYPE_MAP.get(match_type)
             if mt is None:
@@ -65,8 +67,10 @@ def get_ngram_corpus_cls():
                 max_bfs_breadth,
                 draft_token_num,
                 mt,
-                external_sam_budget,
                 external_corpus_max_tokens,
+                trie_source_prior,
+                match_specificity_weight,
+                match_confidence_weight,
             )
             self._draft_token_num = draft_token_num
 
