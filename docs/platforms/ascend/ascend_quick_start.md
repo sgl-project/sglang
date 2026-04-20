@@ -1,4 +1,4 @@
-# Quickstart
+# Ascend NPU Quickstart
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@
 __Notice:__ The following commands are based on Atlas 800I A3 machines. If you are using Atlas 800I A2, some changes are needed.
 
 - The image tag needs to be `main-cann8.5.0-a3` for Atlas 800I A3 and `main-cann8.5.0-910b` for Atlas 800I A2.
-- The device mapping in `drun` command needs to be changed to `davinci[0-7]` for Atlas 800I A2.
+- The device mapping in `docker run` command needs to be changed to `davinci[0-7]` for Atlas 800I A2.
 
 ```shell
 # For Atlas 800I A3
@@ -37,22 +37,22 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
 
 ## Usage
 
-The SGLang server has been installed in the container by default, you can use `pip show sglang` to check the version.
+The SGLang server is installed in the container by default. You can use `pip show sglang` to check the version.
 
 ### Start SGLang server
 
-The model can be downloaded from Hugging Face by SGLang and some settings are needed.
+SGLang will automatically download the model from Hugging Face.
 
 ```shell
-# Set HF_ENDPOINT when network is not available
+# Set HF_ENDPOINT to a mirror site if network is not available
 export HF_ENDPOINT=https://hf-mirror.com
 
 # Set your own HF_TOKEN to download restricted models
 export HF_TOKEN=<secret>
 
 # Start SGLang server
-# Several minutes could be cost to download model for the first run
-sglang serve --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend &
+# It may take several minutes to download the model on the first run
+sglang serve --model-path Qwen/Qwen2.5-7B-Instruct --attention-backend ascend &
 ```
 
 If you see output like the following, the server is running.
@@ -67,7 +67,6 @@ The server is fired up and ready to roll!
 You can do inference using the server:
 
 ```shell
-# Test SGLang server using curl
 curl -X POST http://localhost:30000/generate \
     -H "Content-Type: application/json" \
     -d '{
@@ -79,11 +78,11 @@ curl -X POST http://localhost:30000/generate \
     }'
 ```
 
-If "text" field in the response contains "Paris", the server is working as expected.
+If the "text" field in the response contains "Paris", the server is working as expected.
 
-The SGLang server is running as a background process. You can use `ctrl-C` signal to stop it.
+The SGLang server is running as a background process. You can send a `SIGINT` signal to stop it.
 
-```sh
+```shell
 SGLANG_PID=$(pgrep -f "sglang serve")
 kill -SIGINT $SGLANG_PID
 ```
@@ -97,4 +96,4 @@ INFO:     Application shutdown complete.
 INFO:     Finished server process [25310]
 ```
 
-Congratulations! You have successfully started and stopped the SGLang server. Now you can exit the container by using `ctrl-D`.
+Now the server is stopped. You can exit the container by pressing `Ctrl+D`.
