@@ -488,7 +488,6 @@ class GPTQLinearMethod(LinearMethodBase):
         else:
             group_size = input_size
         self.use_shuffle = True
-
         scale_and_zero_size = input_size // group_size
         scale_and_zero_input_dim = None
         if (
