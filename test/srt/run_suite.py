@@ -81,6 +81,7 @@ suite_xpu = {
         TestFile("xpu/test_deepseek_ocr_triton.py", 360),
         # TestFile("xpu/test_internvl.py"),
         TestFile("xpu/test_intel_xpu_backend.py"),
+        TestFile("xpu/test_qwen3.py"),
     ],
 }
 
