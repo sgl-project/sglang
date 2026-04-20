@@ -205,7 +205,7 @@ class RadixAttention(nn.Module):
             )
 
 
-def _bcg_need_mha_fixup(
+def _mla_dispatch_to_mha(
     forward_batch: "ForwardBatch",
     save_kv_cache: bool,
     k_rope: Optional[torch.Tensor],
@@ -258,7 +258,7 @@ def _unified_attention_with_output_impl(
     if sinks is not None:
         kwargs["sinks"] = sinks
 
-    _bcg_n = _bcg_need_mha_fixup(forward_batch, save_kv_cache, k_rope, query)
+    _bcg_n = _mla_dispatch_to_mha(forward_batch, save_kv_cache, k_rope, query)
     if _bcg_n is not None:
         ret = _bcg_mha_attention(
             query, key, value, attention_layer, forward_batch,
