@@ -723,28 +723,32 @@ class HiCacheController:
         )
         return device_indices
 
-    def move_indices(self, op: CacheOperation):
-        host_indices, device_indices = op.host_indices, op.device_indices
-        # move indices to GPU if using kernels, to host if using direct indexing
+    def _normalize_indices(self, host_indices, device_indices, layout=None):
+        """Normalize index tensors for the configured io_backend / layout."""
+        if layout is None:
+            layout = self.mem_pool_host.layout
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
-            if self.mem_pool_host.layout == "layer_first":
+            if layout == "layer_first":
                 device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()
                 return host_indices, device_indices.index_select(0, idx)
-            elif self.mem_pool_host.layout == "page_first_direct":
+            elif layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
             else:
                 raise ValueError(
-                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
+                    f"Unsupported layout {layout!r} for io backend 'direct'"
                 )
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
+
+    def move_indices(self, op: CacheOperation):
+        return self._normalize_indices(op.host_indices, op.device_indices)
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:

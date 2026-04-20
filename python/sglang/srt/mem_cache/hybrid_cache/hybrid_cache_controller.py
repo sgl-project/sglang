@@ -257,6 +257,26 @@ class HybridCacheController(BaseHiCacheController):
         self.start_writing()
         return host_indices
 
+    def move_indices(self, op):
+        host_indices, device_indices = super().move_indices(op)
+        for transfer in op.pool_transfers or []:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None and entry.share_indices_with_anchor:
+                transfer.host_indices = host_indices
+                transfer.device_indices = device_indices
+            elif (
+                transfer.host_indices is not None
+                and transfer.device_indices is not None
+            ):
+                transfer.host_indices, transfer.device_indices = (
+                    self._normalize_indices(
+                        transfer.host_indices,
+                        transfer.device_indices,
+                        layout=entry.host_pool.layout if entry else None,
+                    )
+                )
+        return host_indices, device_indices
+
     def start_writing(self) -> None:
         if not self.write_queue:
             return
