@@ -823,6 +823,18 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     swa_allocator.full_to_swa_index_mapping
                 )
+            if self.enable_hisparse:
+                if isinstance(
+                    self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+                ):
+                    self.token_to_kv_pool.full_to_hisparse_device_index_mapping = (
+                        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+                    )
+                else:
+                    assert isinstance(
+                        self.token_to_kv_pool_allocator,
+                        DeepSeekV4HiSparseTokenToKVPoolAllocator,
+                    )
 
         # Defensive check: the explicit validation above should reject known
         # unsupported pool families before allocation. Keep this guard here so

@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
+    evict_from_tree_cache,
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -68,6 +69,18 @@ def _draft_runner_of(worker):
     )
 
 
+def _slice_optional_tensor(tensor: Optional[torch.Tensor], sli: slice):
+    return None if tensor is None else tensor[sli]
+
+
+def _cat_optional_tensor(left: Optional[torch.Tensor], right: Optional[torch.Tensor]):
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return torch.cat([left, right], axis=0)
+
+
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
@@ -96,6 +109,74 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
 
+    def slice_single(self, batch_index: int) -> "EagleVerifyInput":
+        sli = slice(batch_index, batch_index + 1)
+        token_sli = slice(
+            batch_index * self.draft_token_num,
+            (batch_index + 1) * self.draft_token_num,
+        )
+        if self.custom_mask is not None and self.seq_lens_cpu is not None:
+            mask_start = (
+                int(
+                    (
+                        self.seq_lens_cpu[:batch_index].sum()
+                        + batch_index * self.draft_token_num
+                    ).item()
+                )
+                * self.draft_token_num
+            )
+            mask_len = (
+                int(self.seq_lens_cpu[batch_index].item()) + self.draft_token_num
+            ) * self.draft_token_num
+            custom_mask = self.custom_mask[mask_start : mask_start + mask_len]
+        else:
+            custom_mask = self.custom_mask
+        return EagleVerifyInput(
+            draft_token=self.draft_token[token_sli],
+            custom_mask=custom_mask,
+            positions=self.positions[token_sli],
+            retrieve_index=self.retrieve_index[sli],
+            retrieve_next_token=self.retrieve_next_token[sli],
+            retrieve_next_sibling=self.retrieve_next_sibling[sli],
+            retrieve_cum_len=_slice_optional_tensor(self.retrieve_cum_len, sli),
+            topk=self.topk,
+            draft_token_num=self.draft_token_num,
+            spec_steps=self.spec_steps,
+            capture_hidden_mode=self.capture_hidden_mode,
+            seq_lens_sum=(
+                int(self.seq_lens_cpu[batch_index].item())
+                if self.seq_lens_cpu is not None
+                else None
+            ),
+            seq_lens_cpu=_slice_optional_tensor(self.seq_lens_cpu, sli),
+            grammar=self.grammar,
+            num_tokens_per_req=self.num_tokens_per_req,
+        )
+
+    def merge_batch(self, spec_info: "EagleVerifyInput"):
+        self.draft_token = torch.cat([self.draft_token, spec_info.draft_token], axis=0)
+        self.custom_mask = _cat_optional_tensor(self.custom_mask, spec_info.custom_mask)
+        self.positions = torch.cat([self.positions, spec_info.positions], axis=0)
+        self.retrieve_index = torch.cat(
+            [self.retrieve_index, spec_info.retrieve_index], axis=0
+        )
+        self.retrieve_next_token = torch.cat(
+            [self.retrieve_next_token, spec_info.retrieve_next_token], axis=0
+        )
+        self.retrieve_next_sibling = torch.cat(
+            [self.retrieve_next_sibling, spec_info.retrieve_next_sibling], axis=0
+        )
+        self.retrieve_cum_len = _cat_optional_tensor(
+            self.retrieve_cum_len, spec_info.retrieve_cum_len
+        )
+        self.seq_lens_cpu = _cat_optional_tensor(
+            self.seq_lens_cpu, spec_info.seq_lens_cpu
+        )
+        if self.seq_lens_sum is None:
+            self.seq_lens_sum = spec_info.seq_lens_sum
+        elif spec_info.seq_lens_sum is not None:
+            self.seq_lens_sum += spec_info.seq_lens_sum
+
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
         return cls(
@@ -121,7 +202,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -149,15 +229,41 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                prefix_lens,
-                prefix_lens_cpu,
-                end_offset,
-                end_offset_cpu,
-                last_loc,
-                len(batch.input_ids),
-            )
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                allocator = batch.tree_cache.token_to_kv_pool_allocator
+                evict_from_tree_cache(
+                    batch.tree_cache,
+                    len(batch.input_ids) + len(prefix_lens_cpu) * allocator.page_size,
+                )
+                device_slots = hisparse_coordinator.get_draft_device_slots(
+                    batch.req_pool_indices,
+                    self.draft_token_num,
+                    prefix_lens_cpu,
+                )
+                batch.out_cache_loc = allocator.alloc_extend_with_device_mapping(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                    device_slots,
+                )
+            else:
+                batch.out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                )
+            self.last_loc = last_loc
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
@@ -469,9 +575,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                        )
+                        logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                         raise e
                     req.update_finish_state()
                 if req.finished():
@@ -516,6 +620,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # try to unify the tensor representation and list representation
         num_correct_drafts_list = num_correct_drafts_cpu.tolist()
         num_accept_tokens_list = num_accept_tokens_cpu.tolist()
+
+        hisparse_coordinator = batch.hisparse_coordinator
+        can_filter_draft_extend = (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        )
+        if can_filter_draft_extend:
+            counts = num_correct_drafts.to(torch.int64) + 1
+            offsets = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int64, device=counts.device),
+                    counts.cumsum(0),
+                ]
+            )
+            pos_in_segment = torch.arange(
+                accept_index.numel(), dtype=torch.int64, device=counts.device
+            ) - torch.repeat_interleave(offsets[:-1], counts)
+            accepted_token_positions = (
+                torch.repeat_interleave(batch.seq_lens.to(torch.int64), counts)
+                + pos_in_segment
+            )
+            hisparse_coordinator.finalize_accepted_tokens(
+                batch.req_pool_indices,
+                batch.out_cache_loc[accept_index],
+                batch.out_cache_loc,
+                num_correct_drafts,
+                num_correct_drafts_cpu,
+                accepted_token_positions,
+            )
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
@@ -572,6 +705,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 token_to_kv_pool_allocator.free(to_free_slots)
 
                 # Copy the kv cache
+                if (
+                    hisparse_coordinator is not None
+                    and hisparse_coordinator.supports_hisparse_draft_slots()
+                ):
+                    raise NotImplementedError(
+                        "HiSparse + speculative topk > 1 + page_size > 1 needs "
+                        "hisparse-aware move_kv_cache translation."
+                    )
                 batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                     tgt_cache_loc, src_cache_loc
                 )
@@ -606,6 +747,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 seq_lens=batch.seq_lens,
                 seq_lens_cpu=batch.seq_lens_cpu,
                 req_pool_indices=batch.req_pool_indices,
+                can_filter_batch=can_filter_draft_extend,
             )
 
             return EagleVerifyOutput(
@@ -678,6 +820,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     seq_lens=batch.seq_lens[unfinished_index_device],
                     seq_lens_cpu=batch.seq_lens_cpu[unfinished_index],
                     req_pool_indices=batch.req_pool_indices[unfinished_index_device],
+                    can_filter_batch=can_filter_draft_extend,
                 )
             else:
                 # hidden_size=None: worker fixup rebuilds via
@@ -804,6 +947,24 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
 
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        sli = slice(batch_index, batch_index + 1)
+        future_indices = None
+        if self.future_indices is not None:
+            future_indices = self.future_indices[sli]
+        return EagleDraftInput(
+            topk_p=_slice_optional_tensor(self.topk_p, sli),
+            topk_index=_slice_optional_tensor(self.topk_index, sli),
+            hidden_states=_slice_optional_tensor(self.hidden_states, sli),
+            capture_hidden_mode=self.capture_hidden_mode,
+            bonus_tokens=_slice_optional_tensor(self.bonus_tokens, sli),
+            future_indices=future_indices,
+            new_seq_lens=_slice_optional_tensor(self.new_seq_lens, sli),
+            verify_done=self.verify_done,
+            num_correct_drafts=_slice_optional_tensor(self.num_correct_drafts, sli),
+            num_accept_tokens=_slice_optional_tensor(self.num_accept_tokens, sli),
+        )
+
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
@@ -877,6 +1038,7 @@ class EagleDraftExtendInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
+    can_filter_batch: bool = False
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
@@ -955,10 +1117,10 @@ class EagleDraftExtendInput(SpecInput):
         # the worker reads `self.bonus_tokens` to construct next iter's
         # `EagleDraftInput`.
         batch.input_ids = self.input_ids
-        batch.extend_lens = self.num_accept_tokens_cpu
+        batch.extend_lens = self._get_num_accept_tokens_cpu()
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = self.seq_lens
-        batch.seq_lens_cpu = self.seq_lens_cpu
+        batch.seq_lens_cpu = self._get_seq_lens_cpu()
         batch.req_pool_indices = self.req_pool_indices
         batch.return_logprob = False
         batch.return_hidden_states = False
@@ -1007,6 +1169,114 @@ class EagleDraftExtendInput(SpecInput):
             req_to_token.size(1),
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
+
+    def _get_num_accept_tokens_cpu(self) -> List[int]:
+        if self.num_accept_tokens_cpu is None:
+            self.num_accept_tokens_cpu = self.num_accept_tokens.cpu().tolist()
+        return self.num_accept_tokens_cpu
+
+    def _get_seq_lens_cpu(self) -> torch.Tensor:
+        if self.seq_lens_cpu is None:
+            self.seq_lens_cpu = self.seq_lens.cpu()
+        return self.seq_lens_cpu
+
+    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if not self.can_filter_batch:
+            return
+
+        if has_been_filtered:
+            if len(new_indices) != len(self.num_accept_tokens):
+                logger.warning(
+                    "EagleDraftExtendInput was pre-filtered but batch sizes differ: "
+                    "new_indices=%d, num_accept_tokens=%d",
+                    len(new_indices),
+                    len(self.num_accept_tokens),
+                )
+            return
+
+        req_indices_per_token = torch.repeat_interleave(
+            torch.arange(
+                len(self.num_accept_tokens),
+                dtype=torch.int64,
+                device=new_indices.device,
+            ),
+            self.num_accept_tokens.to(device=new_indices.device, dtype=torch.int64),
+        )
+        keep_req_mask = torch.zeros(
+            (len(self.num_accept_tokens),), dtype=torch.bool, device=new_indices.device
+        )
+        keep_req_mask[new_indices] = True
+        flat_indices_device = torch.where(keep_req_mask[req_indices_per_token])[0]
+
+        if self.hidden_states is not None:
+            self.hidden_states = self.hidden_states[flat_indices_device]
+        self.input_ids = self.input_ids[flat_indices_device]
+        self.num_correct_drafts = self.num_correct_drafts[new_indices]
+        self.num_accept_tokens = self.num_accept_tokens[new_indices]
+        self.seq_lens = self.seq_lens[new_indices]
+        self.req_pool_indices = self.req_pool_indices[new_indices]
+
+        if new_indices.device.type == "cpu":
+            if self.seq_lens_cpu is not None:
+                self.seq_lens_cpu = self.seq_lens_cpu[new_indices]
+            if self.num_accept_tokens_cpu is not None:
+                new_indices_cpu = new_indices.tolist()
+                self.num_accept_tokens_cpu = [
+                    self.num_accept_tokens_cpu[i] for i in new_indices_cpu
+                ]
+        else:
+            self.seq_lens_cpu = None
+            self.num_accept_tokens_cpu = None
+
+    def slice_single(self, batch_index: int) -> "EagleDraftExtendInput":
+        req_sli = slice(batch_index, batch_index + 1)
+        num_accept_tokens_cpu = self._get_num_accept_tokens_cpu()
+        token_start = sum(num_accept_tokens_cpu[:batch_index])
+        token_end = token_start + num_accept_tokens_cpu[batch_index]
+        token_sli = slice(token_start, token_end)
+        return EagleDraftExtendInput(
+            hidden_states=_slice_optional_tensor(self.hidden_states, token_sli),
+            num_correct_drafts=_slice_optional_tensor(self.num_correct_drafts, req_sli),
+            num_accept_tokens=_slice_optional_tensor(self.num_accept_tokens, req_sli),
+            num_accept_tokens_cpu=num_accept_tokens_cpu[batch_index : batch_index + 1],
+            input_ids=_slice_optional_tensor(self.input_ids, token_sli),
+            seq_lens=_slice_optional_tensor(self.seq_lens, req_sli),
+            seq_lens_cpu=_slice_optional_tensor(self.seq_lens_cpu, req_sli),
+            req_pool_indices=_slice_optional_tensor(self.req_pool_indices, req_sli),
+            positions=_slice_optional_tensor(self.positions, token_sli),
+            bonus_tokens=_slice_optional_tensor(self.bonus_tokens, req_sli),
+            capture_hidden_mode=self.capture_hidden_mode,
+            num_tokens_per_req=self.num_tokens_per_req,
+            num_tokens_for_logprob_per_req=self.num_tokens_for_logprob_per_req,
+            can_filter_batch=self.can_filter_batch,
+        )
+
+    def merge_batch(self, spec_info: "EagleDraftExtendInput"):
+        self.hidden_states = _cat_optional_tensor(
+            self.hidden_states, spec_info.hidden_states
+        )
+        self.num_correct_drafts = _cat_optional_tensor(
+            self.num_correct_drafts, spec_info.num_correct_drafts
+        )
+        self.num_accept_tokens = _cat_optional_tensor(
+            self.num_accept_tokens, spec_info.num_accept_tokens
+        )
+        if self.num_accept_tokens_cpu is None:
+            self.num_accept_tokens_cpu = spec_info.num_accept_tokens_cpu
+        elif spec_info.num_accept_tokens_cpu is not None:
+            self.num_accept_tokens_cpu += spec_info.num_accept_tokens_cpu
+        self.input_ids = _cat_optional_tensor(self.input_ids, spec_info.input_ids)
+        self.seq_lens = _cat_optional_tensor(self.seq_lens, spec_info.seq_lens)
+        self.seq_lens_cpu = _cat_optional_tensor(
+            self.seq_lens_cpu, spec_info.seq_lens_cpu
+        )
+        self.req_pool_indices = _cat_optional_tensor(
+            self.req_pool_indices, spec_info.req_pool_indices
+        )
+        self.positions = _cat_optional_tensor(self.positions, spec_info.positions)
+        self.bonus_tokens = _cat_optional_tensor(
+            self.bonus_tokens, spec_info.bonus_tokens
+        )
 
 
 @dataclass

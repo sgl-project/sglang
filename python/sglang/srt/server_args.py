@@ -7919,6 +7919,31 @@ class ServerArgs:
 
         validate_hisparse(self)
 
+        if self.enable_hisparse and self.speculative_algorithm is not None:
+            from sglang.srt.configs.model_config import is_deepseek_dsa
+
+            if is_deepseek_dsa(self.get_model_config().hf_config):
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                hisparse_cfg = parse_hisparse_config(self)
+                hisparse_page_size = getattr(hisparse_cfg, "page_size", 64)
+                max_draft = self.speculative_num_draft_tokens or 0
+                if max_draft >= hisparse_page_size:
+                    raise ValueError(
+                        f"hiSparse extra page capacity ({hisparse_page_size - 1} slots) "
+                        f"is insufficient for speculative_num_draft_tokens={max_draft}. "
+                        f"Reduce draft tokens or increase hiSparse page_size."
+                    )
+                if (
+                    self.speculative_eagle_topk is not None
+                    and self.speculative_eagle_topk > 1
+                    and self.page_size > 1
+                ):
+                    raise ValueError(
+                        "HiSparse + speculative topk > 1 + page_size > 1 is not yet "
+                        "supported. Use speculative_eagle_topk=1 or page_size=1."
+                    )
+
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"

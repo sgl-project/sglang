@@ -2,8 +2,9 @@
 
 import logging
 import weakref
-from typing import Optional
+from typing import Optional, Tuple
 
+import psutil
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -16,6 +17,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool_host import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -33,6 +35,27 @@ else:
             "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
             "It is not available on this backend."
         )
+
+
+def _hisparse_backup_state(
+    logical_allocator, hisparse_allocator, mapping: torch.Tensor
+) -> Tuple:
+    return (
+        logical_allocator.backup_state(),
+        hisparse_allocator.backup_state(),
+        mapping.clone(),
+    )
+
+
+def _hisparse_restore_state(
+    logical_allocator, hisparse_allocator, mapping: torch.Tensor, state: Tuple
+) -> None:
+    logical_state, hisparse_state, mapping_snapshot = state
+    logical_allocator.restore_state(logical_state)
+    hisparse_allocator.restore_state(hisparse_state)
+    mapping[: mapping_snapshot.shape[0]].copy_(mapping_snapshot)
+    if mapping_snapshot.shape[0] < mapping.shape[0]:
+        mapping[mapping_snapshot.shape[0] :] = 0
 
 
 class HiSparseDSATokenToKVPool(DSATokenToKVPool):
@@ -283,6 +306,51 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self._kvcache._translate_loc_to_hisparse_device(last_locs)
 
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical indices and map them to caller-managed HiSparse slots."""
+        avail = self.logical_attn_allocator.available_size()
+        if avail < extend_num_tokens:
+            raise RuntimeError(
+                f"HiSparse logical alloc: need {extend_num_tokens} tokens but only "
+                f"{avail} are available."
+            )
+
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        out = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if out is None:
+            raise RuntimeError(
+                f"HiSparse logical alloc failed for {extend_num_tokens} tokens. "
+                f"Logical pool available: {self.logical_attn_allocator.available_size()}"
+            )
+
+        self.full_to_hisparse_device_index_mapping[out] = device_slots
+        if backup_state:
+            return out, (logical_state, out.clone())
+        return out
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        """Clear mappings for caller-managed slots before freeing logical indices."""
+        self.full_to_hisparse_device_index_mapping[logical_indices] = 0
+
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -381,9 +449,141 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             <= self.hisparse_attn_allocator.size
         )
 
+    def backup_state(self):
+        return _hisparse_backup_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+        )
+
+    def restore_state(self, state):
+        if len(state) == 2:
+            # Draft extra-page mappings must stay live until accepted tokens are finalized.
+            self.logical_attn_allocator.restore_state(state[0])
+            return
+
+        _hisparse_restore_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+            state,
+        )
+
+
+class DeepSeekV4SingleKVPoolHost(HiSparseHostPoolMixin):
+    def __init__(
+        self,
+        device_pool: HiSparseC4DevicePool,
+        host_size: int,
+        page_size: int,
+        pin_memory: bool = True,
+        device: str = "cpu",
+    ):
+        assert host_size > 0, "Host size must be specified and greater than 0"
+
+        self.device_pool = device_pool
+        self.size = host_size
+        self.page_size = page_size
+        self.num_pages = (self.size + self.page_size - 1) // self.page_size
+        self.size = self.num_pages * self.page_size
+        self.pin_memory = pin_memory
+        self.device = device
+
+        self.dtype = device_pool.store_dtype
+        self.layer_num = device_pool.layer_num
+        self.kv_cache_total_dim = device_pool.kv_cache_total_dim
+
+        self.kv_buffer = self.init_kv_buffer()
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.clear()
+
+    def clear(self):
+        self.free_slots = torch.arange(
+            1, self.size + 1, dtype=torch.int64, device="cpu"
+        )
+
+    def init_kv_buffer(self):
+        dims = (self.layer_num, self.size + self.page_size, self.kv_cache_total_dim)
+        requested_bytes = (
+            self.layer_num
+            * (self.size + self.page_size)
+            * self.kv_cache_total_dim
+            * self.dtype.itemsize
+        )
+        host_mem = psutil.virtual_memory()
+        # preserve at least 10GB for other usage
+        ten_gb = 10 * (1024**3)
+        available_bytes = host_mem.available - ten_gb
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory available. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
+            )
+        else:
+            logger.info(
+                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+            )
+
+        host_pool = torch.empty(dims, dtype=self.dtype, device=self.device)
+        assert self.pin_memory, "DeepSeekV4SingleKVPoolHost requires pin_memory=True"
+        if self.pin_memory:
+            torch.cuda.cudart().cudaHostRegister(
+                host_pool.data_ptr(), host_pool.numel() * host_pool.element_size(), 0
+            )
+        return host_pool
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend="kernel"
+    ):
+        if io_backend != "kernel":
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        from sglang.jit_kernel.dsv4 import hisparse_offload_to_host
+
+        if host_indices.device != device_indices.device:
+            host_indices = host_indices.to(device=device_indices.device)
+        host_indices_i64 = (
+            host_indices.to(torch.int64)
+            if host_indices.dtype != torch.int64
+            else host_indices
+        )
+        device_indices_i64 = (
+            device_indices.to(torch.int64)
+            if device_indices.dtype != torch.int64
+            else device_indices
+        )
+        hisparse_offload_to_host(
+            gpu_ptrs=device_pool.data_ptrs,
+            cpu_ptrs=self.data_ptrs,
+            gpu_indices=device_indices_i64,
+            cpu_indices=host_indices_i64,
+        )
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if need_size > self.available_size():
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        return select_index
+
+    def free(self, indices: torch.Tensor) -> int:
+        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
+        return len(indices)
+
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
@@ -682,4 +882,19 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert (
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
+        )
+
+    def backup_state(self):
+        return _hisparse_backup_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+        )
+
+    def restore_state(self, state):
+        _hisparse_restore_state(
+            self.logical_attn_allocator,
+            self.hisparse_attn_allocator,
+            self.full_to_hisparse_device_index_mapping,
+            state,
         )
