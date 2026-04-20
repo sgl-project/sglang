@@ -1,11 +1,31 @@
 #include "ngram.h"
 
 #include "trie.h"
-#include <limits>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
 namespace ngram {
+
+// Implemented source-importance formula:
+//   score = source_prior * (w_specificity * specificity + w_confidence * confidence)
+//
+// where:
+// - specificity is normalized match depth / matched_len for the best anchor
+// - confidence is normalized top-1 next-token mass at that anchor
+// - the w_* terms are normalized from the user-provided match weights below
+double computeSourceScore(const MatchQuality& quality, double source_prior, const Param& param) {
+  if (!quality.has_match) {
+    return 0.0;
+  }
+  const double total_weight = param.match_specificity_weight + param.match_confidence_weight;
+  if (total_weight <= 0.0) {
+    return 0.0;
+  }
+  const double specificity_weight = param.match_specificity_weight / total_weight;
+  const double confidence_weight = param.match_confidence_weight / total_weight;
+  return source_prior * (specificity_weight * quality.specificity + confidence_weight * quality.confidence);
+}
 
 Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.max_trie_depth > 1)) {
@@ -25,6 +45,24 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.draft_token_num > 0)) {
     throw std::runtime_error(
         "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
+  }
+  if (param_.trie_source_prior < 0.0) {
+    throw std::runtime_error(
+        "trie_source_prior must be greater than or equal to 0, current value: " +
+        std::to_string(param_.trie_source_prior));
+  }
+  if (param_.match_specificity_weight < 0.0) {
+    throw std::runtime_error(
+        "match_specificity_weight must be greater than or equal to 0, current value: " +
+        std::to_string(param_.match_specificity_weight));
+  }
+  if (param_.match_confidence_weight < 0.0) {
+    throw std::runtime_error(
+        "match_confidence_weight must be greater than or equal to 0, current value: " +
+        std::to_string(param_.match_confidence_weight));
+  }
+  if (param_.match_specificity_weight + param_.match_confidence_weight <= 0.0) {
+    throw std::runtime_error("match quality weights must sum to a positive value");
   }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
@@ -149,28 +187,31 @@ Result Ngram::batchMatch(
 
   std::unique_lock<std::mutex> lock(mutex_);
 
-  using TrieResultBuildFn =
-      Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
-  using SamResultBuildFn = Result (SuffixAutomaton::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
-  TrieResultBuildFn trie_result_build_fn;
-  SamResultBuildFn sam_result_build_fn;
+  using TrieAnchoredBuildFn =
+      Result (Trie::*)(const std::vector<std::pair<const TrieNode*, int32_t>>&, int32_t, size_t, const Param&) const;
+  using SamAnchoredBuildFn =
+      Result (SuffixAutomaton::*)(const std::vector<SamAnchor>&, int32_t, size_t, const Param&) const;
+  TrieAnchoredBuildFn trie_anchored_build_fn;
+  SamAnchoredBuildFn sam_anchored_build_fn;
   if (param_.match_type == "BFS") {
-    trie_result_build_fn = &Trie::buildRecency;
-    sam_result_build_fn = &SuffixAutomaton::buildRecency;
+    trie_anchored_build_fn = &Trie::buildRecencyFromAnchors;
+    sam_anchored_build_fn = &SuffixAutomaton::buildRecencyFromAnchors;
   } else if (param_.match_type == "PROB") {
-    trie_result_build_fn = &Trie::buildFrequency;
-    sam_result_build_fn = &SuffixAutomaton::buildFrequency;
+    trie_anchored_build_fn = &Trie::buildFrequencyFromAnchors;
+    sam_anchored_build_fn = &SuffixAutomaton::buildFrequencyFromAnchors;
   } else {
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
 
-  // All budget values are loop-invariant (mutex_ held, sams_ won't change).
-  const size_t num_sams = sams_.size();
   const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
-  const size_t total_sam_budget =
-      num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
-  const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};
-  const size_t trie_budget = total_draft_token_num - (per_sam_budget * num_sams);
+  const auto result_token_num = static_cast<int>(total_draft_token_num + 1);
+  std::vector<std::pair<std::string, const SuffixAutomaton*>> ordered_sams;
+  ordered_sams.reserve(sams_.size());
+  for (const auto& [corpus_id, sam] : sams_) {
+    ordered_sams.emplace_back(corpus_id, sam.get());
+  }
+  std::sort(
+      ordered_sams.begin(), ordered_sams.end(), [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
 
   Result merged;
   for (size_t i = 0; i < state_ids.size(); ++i) {
@@ -180,22 +221,54 @@ Result Ngram::batchMatch(
     }
 
     auto& state = match_state_[state_ids[i]];
+    auto trie_anchors = trie_->match(suffix.data(), suffix.size(), state, total_lens[i]);
+    auto trie_quality = trie_->summarizeMatchQuality(trie_anchors, param_);
 
-    if (total_sam_budget == 0 || per_sam_budget == 0) {
-      auto res = (trie_.get()->*trie_result_build_fn)(
-          suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
+    if (ordered_sams.empty()) {
+      auto res = (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
       continue;
     }
 
-    auto combined = (trie_.get()->*trie_result_build_fn)(
-        suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
+    struct RankedSourceResult {
+      double score = 0.0;
+      Result result;
+    };
 
-    for (const auto& [_, sam] : sams_) {
-      auto sam_res =
-          (sam.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
-      combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
+    std::vector<RankedSourceResult> source_results;
+    source_results.reserve(ordered_sams.size() + 1);
+    if (trie_quality.has_match) {
+      source_results.push_back(
+          RankedSourceResult{
+              computeSourceScore(trie_quality, param_.trie_source_prior > 0.0 ? param_.trie_source_prior : 1.0, param_),
+              (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)});
+    }
+
+    for (const auto& [_, sam] : ordered_sams) {
+      auto anchors = sam->match(suffix.data(), suffix.size(), param_.max_trie_depth);
+      auto quality = sam->summarizeMatchQuality(anchors, param_);
+      const auto score = computeSourceScore(quality, 1.0, param_);
+      if (score <= 0.0) {
+        continue;
+      }
+      source_results.push_back(
+          RankedSourceResult{
+              score, (sam->*sam_anchored_build_fn)(anchors, suffix.back(), total_draft_token_num, param_)});
+    }
+
+    Result combined;
+    if (source_results.empty()) {
+      combined = (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
+    } else {
+      // Merge stronger sources first so the final cap keeps their branches when the tree saturates.
+      std::stable_sort(source_results.begin(), source_results.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.score > rhs.score;
+      });
+      combined = std::move(source_results.front().result);
+      for (size_t source_idx = 1; source_idx < source_results.size(); ++source_idx) {
+        combined = combineRootResults_(suffix.back(), result_token_num, combined, source_results[source_idx].result);
+      }
     }
 
     merged.token.insert(merged.token.end(), combined.token.begin(), combined.token.end());

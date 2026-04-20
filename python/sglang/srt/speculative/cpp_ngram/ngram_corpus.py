@@ -20,8 +20,10 @@ class NgramCorpus:
         draft_token_num=8,
         match_type="BFS",
         capacity=1000000,
-        external_sam_budget=0,
         external_corpus_max_tokens=10000000,
+        trie_source_prior=0.0,
+        match_specificity_weight=0.7,
+        match_confidence_weight=0.3,
     ) -> None:
         cls = get_ngram_corpus_cls()
         self._obj = cls(
@@ -31,8 +33,10 @@ class NgramCorpus:
             max_bfs_breadth=max_bfs_breadth,
             draft_token_num=draft_token_num,
             match_type=match_type,
-            external_sam_budget=external_sam_budget,
             external_corpus_max_tokens=external_corpus_max_tokens,
+            trie_source_prior=trie_source_prior,
+            match_specificity_weight=match_specificity_weight,
+            match_confidence_weight=match_confidence_weight,
         )
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num

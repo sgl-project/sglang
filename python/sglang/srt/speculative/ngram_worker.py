@@ -56,8 +56,10 @@ class NGRAMWorker:
             capacity=server_args.speculative_ngram_capacity,
             max_trie_depth=server_args.speculative_ngram_max_trie_depth,
             draft_token_num=server_args.speculative_num_draft_tokens,
-            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
+            trie_source_prior=server_args.speculative_ngram_trie_source_prior,
+            match_specificity_weight=server_args.speculative_ngram_match_specificity_weight,
+            match_confidence_weight=server_args.speculative_ngram_match_confidence_weight,
         )
         if server_args.speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (
