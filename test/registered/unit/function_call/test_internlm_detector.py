@@ -115,14 +115,13 @@ class TestInternlmDetector(CustomTestCase):
         info_func = self.detector.structure_info()
         info = info_func("get_weather")
         self.assertIn("get_weather", info.begin)
-        self.assertIn("|action_start|> <|plugin|>", info.begin)
+        self.assertIn("<|action_start|> <|plugin|>", info.begin)
         self.assertIn("<|action_end|>", info.end)
         self.assertEqual(info.trigger, "<|action_start|> <|plugin|>")
 
     # ==================== Streaming Tests ====================
 
     def test_streaming_single_tool_call(self):
-        detector = InternlmDetector()
         chunks = [
             "<|action_start|> ",
             '<|plugin|>\n{"name": "get_weather",',
@@ -131,7 +130,7 @@ class TestInternlmDetector(CustomTestCase):
         ]
         all_calls = []
         for chunk in chunks:
-            result = detector.parse_streaming_increment(chunk, self.tools)
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
             all_calls.extend(result.calls)
 
         func_calls = [c for c in all_calls if c.name]
@@ -143,15 +142,13 @@ class TestInternlmDetector(CustomTestCase):
         self.assertEqual(params["city"], "Beijing")
 
     def test_streaming_normal_text_before_tool(self):
-        detector = InternlmDetector()
-        result = detector.parse_streaming_increment(
+        result = self.detector.parse_streaming_increment(
             "Let me check the weather. ", self.tools
         )
         self.assertEqual(result.normal_text, "Let me check the weather. ")
         self.assertEqual(len(result.calls), 0)
 
     def test_streaming_text_then_tool_call(self):
-        detector = InternlmDetector()
         chunks = [
             "I'll look that up. ",
             "<|action_start|> ",
@@ -162,7 +159,7 @@ class TestInternlmDetector(CustomTestCase):
         all_calls = []
         all_normal_text = ""
         for chunk in chunks:
-            result = detector.parse_streaming_increment(chunk, self.tools)
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
             all_calls.extend(result.calls)
             all_normal_text += result.normal_text
 
