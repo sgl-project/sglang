@@ -313,7 +313,9 @@ def load_model_from_full_model_state_dict(
 
     # map names from checkpoint to customized names
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
-        full_sd_iterator, param_names_mapping
+        full_sd_iterator,
+        param_names_mapping,
+        valid_target_names=set(meta_sd.keys()),
     )  # type: ignore
 
     is_fsdp_model = isinstance(model, FSDPModule) or any(
@@ -410,7 +412,16 @@ def load_model_from_full_model_state_dict(
                 ):
                     requires_grad = False
                 temp_param.requires_grad = requires_grad
-                weight_loader(temp_param, full_tensor)
+                try:
+                    weight_loader(temp_param, full_tensor)
+                except AssertionError as exc:
+                    raise AssertionError(
+                        "Failed to shard/load parameter "
+                        f"{target_param_name}: full_tensor.shape={tuple(full_tensor.shape)}, "
+                        f"meta_sharded_param.shape={tuple(meta_sharded_param.shape)}, "
+                        f"temp_param.shape={tuple(temp_param.shape)}, "
+                        f"param_cls={type(actual_param).__name__}"
+                    ) from exc
                 sharded_tensor = temp_param.data
             else:
                 # In cases where parts of the model aren't sharded, some parameters will be plain tensors

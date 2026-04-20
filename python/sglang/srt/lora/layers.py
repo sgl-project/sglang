@@ -39,6 +39,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_backend: BaseLoRABackend = lora_backend
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
+        if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
+            self.bias = self.base_layer.bias
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -70,6 +72,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
+        self.num_embeddings = base_layer.num_embeddings
 
         # Embedding LoRA with TP > 1 keeps weights fully replicated
         # (unsharded) on every rank.  This works correctly because the
@@ -797,6 +800,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_backend)
 
         self.experts_shared_outer_loras: bool = False
+        self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
@@ -903,6 +907,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
+            lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):

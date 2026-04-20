@@ -318,8 +318,6 @@ class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=[
                     "--max-running-requests=1",
-                    # Disable PCG to avoid padding in flashinfer backend. Ref: https://github.com/sgl-project/sglang/pull/21452
-                    "--disable-piecewise-cuda-graph",
                 ],
             )
 
