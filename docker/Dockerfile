@@ -181,6 +181,13 @@ ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
 
+# Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
+# Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal \
+    && rustc --version && cargo --version
+
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
@@ -205,13 +212,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     fi
 
-# Copy ONLY dependency specification file (for better caching)
+# Copy dep spec + Rust crate source + proto files. setuptools-rust compiles the
+# Rust extension during the stub wheel build; the crate's build.rs references
+# ../../proto for tonic_build. Split from the pip install so source changes to
+# these paths invalidate the dep-install layer, but Python source changes don't.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
+COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
+COPY proto                 /tmp/sglang_deps/proto
 
 # Install sglang dependencies (torch, transformers, etc.)
-# This layer is cached unless pyproject.toml changes
 # Generate constraints.txt to prevent reinstalling these deps in later stages
 RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cargo/registry \
     case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
         12.8.1) CUINDEX=128 ;; \
@@ -471,13 +483,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     librdmacm1 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
-
-# Install Rust toolchain (for setuptools-rust-built extensions, e.g. sglang-grpc).
-# Minimum supported version: 1.85 (first stable with edition 2024).
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path \
-    && rustc --version && cargo --version
 
 # Install NVIDIA development tools
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
