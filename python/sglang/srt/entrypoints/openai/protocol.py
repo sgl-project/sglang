@@ -454,11 +454,26 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
     audio_url: ChatCompletionMessageContentAudioURL
 
 
+class ChatCompletionMessageContentInputAudio(BaseModel):
+    """OpenAI input_audio content: base64-encoded audio with format."""
+
+    data: str
+    format: Literal["wav", "mp3"]
+
+
+class ChatCompletionMessageContentInputAudioPart(BaseModel):
+    """OpenAI input_audio content part for base64 audio in chat completions."""
+
+    type: Literal["input_audio"]
+    input_audio: ChatCompletionMessageContentInputAudio
+
+
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
+    ChatCompletionMessageContentInputAudioPart,
 ]
 
 # Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)

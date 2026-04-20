@@ -194,6 +194,15 @@ def process_content_for_template_format(
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type
                     processed_content_parts.append({"type": "audio"})
+                elif chunk_type == "input_audio":
+                    # OpenAI input_audio: base64-encoded audio with format
+                    # Convert to data URI that load_audio() understands
+                    audio_obj = chunk.get("input_audio") or {}
+                    audio_format = audio_obj.get("format", "wav")
+                    audio_b64 = audio_obj.get("data", "")
+                    data_uri = f"data:audio/{audio_format};base64,{audio_b64}"
+                    audio_data.append(data_uri)
+                    processed_content_parts.append({"type": "audio"})
                 elif chunk_type == "text":
                     # For v32 encoding, collect text parts separately
                     if use_dpsk_v32_encoding:

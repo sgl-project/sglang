@@ -665,6 +665,13 @@ def generate_chat_conv(
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
+                    elif content.type == "input_audio":
+                        # OpenAI input_audio: base64-encoded audio
+                        real_content += audio_token
+                        audio_format = content.input_audio.format
+                        audio_b64 = content.input_audio.data
+                        data_uri = f"data:audio/{audio_format};base64,{audio_b64}"
+                        conv.append_audio(data_uri)
                 if add_token_as_needed:
                     real_content = _get_full_multimodal_text_prompt(
                         conv.image_token, num_image_url, real_content
