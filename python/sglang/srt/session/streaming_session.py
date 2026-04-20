@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 class _VirtualNode:
     """Sentinel node for streaming session requests.
 
-    Passed to inc_lock_ref / dec_lock_ref so the wrapper can distinguish
+    Passed to inc_lock_ref / dec_lock_ref so the cache can distinguish
     streaming-session locks (no-op) from real radix-tree locks (forwarded).
     """
 
@@ -113,12 +113,14 @@ def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
 
 
-class SessionAwareCache(BasePrefixCache):
-    """Decorator around any BasePrefixCache that manages streaming session KV.
+class StreamingSession(BasePrefixCache):
+    """Adds streaming-session KV save/restore on top of any BasePrefixCache.
 
-    Non-streaming requests are pure pass-through. Streaming requests have their
-    KV lifecycle managed by SessionSlot objects, avoiding any invasive changes
-    to the scheduling pipeline.
+    Works both as an external wrapper (``StreamingSession(RadixCache(...))``)
+    and in embedded composition (``StreamingSession(inner=self)``). For the
+    embedded case, the composing cache must pre-check dispatch conditions
+    (``_is_streaming`` / ``find_active_slot`` / ``has_slot``) so the internal
+    fall-through to ``self.inner.xxx`` never fires -- otherwise it recurses.
     """
 
     def __init__(self, inner: BasePrefixCache):
@@ -167,30 +169,67 @@ class SessionAwareCache(BasePrefixCache):
     def metrics_collector(self, value):
         self.inner.metrics_collector = value
 
+    # -- Condition helpers (used by embedded-mode callers for pre-dispatch) --
+
+    def has_slot(self, session_id: str) -> bool:
+        return session_id in self.slots
+
+    def any_holding_kv(self) -> bool:
+        return any(s.is_holding_kv for s in self.slots.values())
+
+    # -- Try-handle entries for composition (see class docstring) --
+
+    def try_inc_lock_ref(self, node: Any) -> Optional[IncLockRefResult]:
+        """No-op lock if ``node`` is a session-internal sentinel; returns
+        None to tell the caller to run its raw tree lock path."""
+        if isinstance(node, _VirtualNode):
+            return IncLockRefResult()
+        return None
+
+    def try_dec_lock_ref(
+        self, node: Any, params: Optional[DecLockRefParams] = None
+    ) -> Optional[DecLockRefResult]:
+        if isinstance(node, _VirtualNode):
+            return DecLockRefResult()
+        return None
+
+    def find_active_slot(self, req: Req) -> Optional[SessionSlot]:
+        """Returns an active slot for this req, or None.
+
+        Side effect: if req is pre-aborted (to_finish set, e.g. input too
+        long), detach it from the session so cache_finished_req treats it
+        as a normal req. The slot stays intact for the next request.
+        """
+        if not _is_streaming(req):
+            return None
+        slot = self.slots.get(req.session.session_id)
+        if slot is None or slot.req_pool_idx is None:
+            return None
+        if req.to_finish is not None:
+            req.session.abort_req()
+            req.session = None
+            return None
+        return slot
+
     # -- BasePrefixCache abstract methods --
 
     def reset(self):
         self.slots.clear()
         self.inner.reset()
 
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+    # -- Streaming entries: contract with embedded composers (e.g.
+    # UnifiedRadixCache) is a uniform "try_handle_*" pattern. Each method
+    # executes the streaming body if applicable and signals whether the
+    # caller still needs to run its raw path.
+
+    def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
+        """Returns a MatchResult iff the request hits an active session slot;
+        otherwise None (caller falls back to its raw match)."""
+        slot = self.find_active_slot(params.req)
+        if slot is None:
+            return None
+
         req = params.req
-        if not _is_streaming(req):
-            return self.inner.match_prefix(params)
-
-        session_id = req.session.session_id
-        slot = self.slots.get(session_id)
-        if slot is None or slot.req_pool_idx is None:
-            return self.inner.match_prefix(params)
-
-        # Pre-aborted req (scheduler-level abort, e.g. input too long):
-        # detach from session so cache_finished_req treats it as a normal
-        # req. The slot stays intact for the next request.
-        if req.to_finish is not None:
-            req.session.abort_req()
-            req.session = None
-            return self.inner.match_prefix(params)
-
         slot.restore_to_req(req)
 
         # token_ids = fill_ids[:input_len-1] (1-token logit reserve already
@@ -223,9 +262,13 @@ class SessionAwareCache(BasePrefixCache):
             cache_protected_len=slot.cache_protected_len,
         )
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+    def try_cache_finished_req(
+        self, req: Req, is_insert: bool = True, **kwargs
+    ) -> bool:
+        """Handles a streaming-session finish (save slot / mid-abort nuke).
+        Returns True if handled; False means caller runs its raw path."""
         if not _is_streaming(req):
-            return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
+            return False
 
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
@@ -234,7 +277,7 @@ class SessionAwareCache(BasePrefixCache):
         is_first = slot is None
 
         # Mid-processing abort only. Pre-aborted reqs have session=None
-        # (set in match_prefix) and never reach here.
+        # (set in find_active_slot) and never reach here.
         # Nuke all KV via release_session, delete slot. Token IDs stay
         # in req_nodes (finish_req was never called -> last successful
         # req). Next request re-prefills from scratch.
@@ -257,7 +300,7 @@ class SessionAwareCache(BasePrefixCache):
             req.req_pool_idx = None
             req.session.abort_req()
             self._mark_kv_freed(req)
-            return
+            return True
 
         if is_first:
             slot = SessionSlot()
@@ -274,94 +317,66 @@ class SessionAwareCache(BasePrefixCache):
         req.session.finish_req(req)
 
         self._mark_kv_freed(req)
+        return True
 
-    def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int):
-        """match_prefix path: free orphaned KV in [prefix_len, kv_allocated_len)
-        before alloc_for_extend overwrites it. The gap appears when spec
-        decoding pushes allocated above committed, or when retract retry's
-        logit-reserve pulls prefix_len below committed.
-        """
-        self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv_allocated_len)
-        slot.kv_allocated_len = prefix_len
-        slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
-        slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, prefix_len)
-        req.kv_allocated_len = prefix_len
-        req.kv_committed_len = min(req.kv_committed_len, prefix_len)
-        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
+    def try_cache_unfinished_req(
+        self, req: Req, chunked: bool = False, **kwargs
+    ) -> bool:
+        """Handles a streaming-session mid-flight cache op:
+          - chunked prefill: snapshot current KV as prefix, skip radix
+          - subsequent turn: skip radix (slot already holds KV)
+        Returns False for first-turn non-chunked (caller must run raw radix
+        insert to set up the initial tree lock)."""
+        if not _is_streaming(req):
+            return False
+        if chunked:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            return True
+        if req.session.session_id in self.slots:
+            return True
+        return False
 
-    def _trim_overshoot(self, req: Req, finished_len: int):
-        """Trim slot KV to finished_len boundary. Spec v2 may overshoot
-        max_new_tokens (verify round commits M+1 at a time); next turn's
-        input is output_ids[:finished_len], so positions past that must
-        be released to avoid token/KV mismatch.
-        """
-        target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.req_pool_idx, target, req.kv_allocated_len)
-        req.kv_allocated_len = min(req.kv_allocated_len, target)
-        req.kv_committed_len = min(req.kv_committed_len, target)
-        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, target)
-        req.output_ids = req.output_ids[:finished_len]
+    # -- BasePrefixCache abstract methods: thin adapters over try_handle_* --
 
-    def _free_kv_aligned(self, pool_idx: int, target: int, end: int):
-        """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
-        because PagedTokenToKVPoolAllocator.free returns whole pages
-        (free_index // page_size), so partial-page free would corrupt pages
-        still holding committed tokens. The range [target, ceil_align(target))
-        stays attached until release_session frees the whole page.
-        """
-        if end <= target:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        result = self.try_match_prefix(params)
+        if result is not None:
+            return result
+        return self.inner.match_prefix(params)
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+        if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
-        start = target
-        if self.page_size > 1:
-            start = ceil_align(start, self.page_size)
-        if start < end:
-            tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
-            self.token_to_kv_pool_allocator.free(tail)
-
-    @staticmethod
-    def _mark_kv_freed(req: Req):
-        """Set bookkeeping flags so busy check skips this finished req."""
-        if not req.kv_committed_freed:
-            req.pop_committed_kv_cache()
-        if not req.kv_overallocated_freed:
-            req.pop_overallocated_kv_cache()
+        self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
     def cache_unfinished_req(self, req: Req, **kwargs):
-        if _is_streaming(req):
-            # in chunked_prefill for streaming, we skip the stash path which triggers radix.
-            # only the last chunk in first turn trigger a full prompt radix insert.
-            if kwargs.get("chunked", False):
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, : len(req.fill_ids)
-                ]
-                req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-                return
-            if req.session.session_id in self.slots:
-                # Subsequent turns: slot exists, skip inner entirely.
-                return
-            # First turn (no slot): fall through to inner for lock management,
-            # tree insertion, and cache_protected_len updates between chunks.
+        if self.try_cache_unfinished_req(req, **kwargs):
+            return
         self.inner.cache_unfinished_req(req, **kwargs)
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
-        if isinstance(node, _VirtualNode):
-            return IncLockRefResult()
+        result = self.try_inc_lock_ref(node)
+        if result is not None:
+            return result
         return self.inner.inc_lock_ref(node)
 
     def dec_lock_ref(
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
-        if isinstance(node, _VirtualNode):
-            return DecLockRefResult()
+        result = self.try_dec_lock_ref(node, params)
+        if result is not None:
+            return result
         return self.inner.dec_lock_ref(node, params)
 
     # -- Session lifecycle --
 
-    def release_session(self, session_id: str):
-        """Release all KV resources held by a streaming session."""
+    def release_session(self, session_id: str) -> None:
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
@@ -396,7 +411,7 @@ class SessionAwareCache(BasePrefixCache):
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.
 
-        Excludes slots whose KV is currently owned by an owning request —
+        Excludes slots whose KV is currently owned by an owning request --
         those tokens are counted via uncached_size in the busy mem check.
         A slot's pool_idx being in active_pool_idxs indicates a req owns it.
         """
@@ -438,6 +453,59 @@ class SessionAwareCache(BasePrefixCache):
             return s.is_holding_kv and not in_batch
 
         return sum(_owned(s) for s in self.slots.values())
+
+    # -- Internal helpers (streaming body bits) --
+
+    def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int) -> None:
+        """match_prefix path: free orphaned KV in [prefix_len, kv_allocated_len)
+        before alloc_for_extend overwrites it. The gap appears when spec
+        decoding pushes allocated above committed, or when retract retry's
+        logit-reserve pulls prefix_len below committed.
+        """
+        self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv_allocated_len)
+        slot.kv_allocated_len = prefix_len
+        slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
+        slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, prefix_len)
+        req.kv_allocated_len = prefix_len
+        req.kv_committed_len = min(req.kv_committed_len, prefix_len)
+        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
+
+    def _trim_overshoot(self, req: Req, finished_len: int) -> None:
+        """Trim slot KV to finished_len boundary. Spec v2 may overshoot
+        max_new_tokens (verify round commits M+1 at a time); next turn's
+        input is output_ids[:finished_len], so positions past that must
+        be released to avoid token/KV mismatch.
+        """
+        target = len(req.origin_input_ids) + finished_len
+        self._free_kv_aligned(req.req_pool_idx, target, req.kv_allocated_len)
+        req.kv_allocated_len = min(req.kv_allocated_len, target)
+        req.kv_committed_len = min(req.kv_committed_len, target)
+        req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, target)
+        req.output_ids = req.output_ids[:finished_len]
+
+    def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
+        """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
+        because PagedTokenToKVPoolAllocator.free returns whole pages
+        (free_index // page_size), so partial-page free would corrupt pages
+        still holding committed tokens. The range [target, ceil_align(target))
+        stays attached until release_session frees the whole page.
+        """
+        if end <= target:
+            return
+        start = target
+        if self.page_size > 1:
+            start = ceil_align(start, self.page_size)
+        if start < end:
+            tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
+            self.token_to_kv_pool_allocator.free(tail)
+
+    @staticmethod
+    def _mark_kv_freed(req: Req) -> None:
+        """Set bookkeeping flags so busy check skips this finished req."""
+        if not req.kv_committed_freed:
+            req.pop_committed_kv_cache()
+        if not req.kv_overallocated_freed:
+            req.pop_overallocated_kv_cache()
 
     # -- Pass-through methods --
 
@@ -486,6 +554,9 @@ class SessionAwareCache(BasePrefixCache):
     def supports_mamba(self):
         return self.inner.supports_mamba()
 
+    def supports_streaming_session(self) -> bool:
+        return True
+
     def is_chunk_cache(self):
         return self.inner.is_chunk_cache()
 
@@ -501,7 +572,7 @@ class SessionAwareCache(BasePrefixCache):
     def sanity_check(self):
         # Skip inner sanity check when sessions hold tree locks, because
         # the check asserts all nodes are unlocked during idle.
-        if any(s.is_holding_kv for s in self.slots.values()):
+        if self.any_holding_kv():
             return
         self.inner.sanity_check()
 

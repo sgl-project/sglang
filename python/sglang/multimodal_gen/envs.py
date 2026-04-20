@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
+    SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
 
@@ -249,6 +250,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "false"
+    ),
+    # CUDA: enable the Triton GroupNorm+SiLU fast path in HunyuanVideo VAE
+    # residual blocks.
+    "SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU": _lazy_bool(
+        "SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU", "false"
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
