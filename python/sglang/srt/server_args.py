@@ -621,6 +621,7 @@ class ServerArgs:
     disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    disable_normalize_embedding: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
@@ -5810,6 +5811,14 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--disable-normalize-embedding",
+            action="store_true",
+            help="Disable L2 normalization applied by the embedding Pooler after pooling. "
+            "By default, models that set normalize=True on their Pooler will L2-normalize "
+            "the pooled embedding; this flag lets users turn that off at serve time without "
+            "modifying the model code.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
