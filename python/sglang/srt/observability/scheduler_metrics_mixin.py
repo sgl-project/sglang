@@ -171,7 +171,9 @@ class SchedulerMetricsMixin:
         )
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
-        self.enable_kv_cache_events = bool(kv_events_config and self.attn_tp_rank == 0)
+        self.enable_kv_cache_events = bool(
+            kv_events_config and self.attn_tp_rank == 0 and self.attn_cp_rank == 0
+        )
 
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
