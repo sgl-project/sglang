@@ -35,11 +35,6 @@ class _NegotiateOutput(NamedTuple):
 
 
 class PrefillDelayer:
-    # Number of int64 fields packed into the cross-rank all-gather tensor.
-    # Fields (in order): prefillable, token_watermark_force_allow, running_batch,
-    # max_prefill_bs, waiting_queue_len.
-    _GATHER_FIELDS = 5
-
     def __init__(
         self,
         dp_size: int,
@@ -53,10 +48,8 @@ class PrefillDelayer:
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
-        # Adaptive queue-based trigger (additive on top of slot_trigger).
-        # Opt-in: activates only when queue_min_ratio is explicitly set.
-        # max_delay_ms gets a default from ServerArgs so users only need to
-        # pass --prefill-delayer-queue-min-ratio to enable the new trigger.
+        # Queue-based trigger is opt-in: activates only when queue_min_ratio
+        # is explicitly set. Additive with the slot-based trigger.
         self._queue_min_ratio = getattr(
             server_args, "prefill_delayer_queue_min_ratio", None
         )
@@ -75,8 +68,11 @@ class PrefillDelayer:
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
+        # Fields packed per rank into the all-gather tensor: prefillable,
+        # token_watermark_force_allow, running_batch, max_prefill_bs,
+        # waiting_queue_len.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, self._GATHER_FIELDS),
+            (dp_size_dim, attn_tp_size, 5),
             dtype=torch.int64,
             device=device,
         )
@@ -208,10 +204,11 @@ class PrefillDelayer:
                     and global_waiting_queue_max < queue_min_effective
                 )
 
-            # Wall-clock cap bounds worst-case TTFT for queue_trigger only;
-            # slot_trigger is a hard capacity constraint (prefill would
-            # immediately over-subscribe running slots) and must not be
-            # overridden by the timeout.
+            # Cap cumulative wall-clock time of a single queue-trigger delay
+            # at prefill_delayer_max_delay_ms to bound worst-case TTFT. The
+            # cap applies to queue_trigger only; slot_trigger is a hard
+            # capacity constraint (releasing prefill would over-subscribe
+            # running slots) and must not be overridden by the timeout.
             queue_trigger_timed_out = False
             if queue_trigger and prev_state is not None:
                 elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
@@ -288,7 +285,6 @@ class PrefillDelayer:
             device="cpu",
             dtype=torch.int64,
         )
-        assert local_info.shape[0] == self._GATHER_FIELDS
         torch.distributed.all_gather_into_tensor(
             self._global_info_buffer.flatten(),
             local_info,

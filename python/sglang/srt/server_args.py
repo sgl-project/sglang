@@ -364,11 +364,6 @@ class ServerArgs:
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
-    # Adaptive queue-based trigger, complementary to the slot-based one.
-    # Active only when prefill_delayer_queue_min_ratio is explicitly set;
-    # otherwise --enable-prefill-delayer keeps the original slot-only
-    # behavior. prefill_delayer_max_delay_ms gates the wall-clock cap and
-    # is only consulted when the queue trigger is active.
     prefill_delayer_queue_min_ratio: Optional[float] = None
     prefill_delayer_max_delay_ms: Optional[float] = None
 
@@ -1009,12 +1004,8 @@ class ServerArgs:
         if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
             self.prefill_delayer_token_usage_low_watermark = x
 
-        # Queue trigger is opt-in: it activates only when the user explicitly
-        # sets --prefill-delayer-queue-min-ratio. This preserves the original
-        # slot-only behavior for users who pass --enable-prefill-delayer (or
-        # SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE) for the existing delayer.
-        # max_delay_ms gets a default so users only need to set the ratio to
-        # turn on the new trigger.
+        # Default max_delay_ms when the delayer is on; harmless for slot-only
+        # users since it is only consulted while the queue trigger is active.
         if self.enable_prefill_delayer and self.prefill_delayer_max_delay_ms is None:
             self.prefill_delayer_max_delay_ms = 5000.0
 
