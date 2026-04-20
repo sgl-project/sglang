@@ -635,7 +635,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     done; [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/sglang \
     && mv python/kernels.lock /root/.cache/sglang/ \
-    && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true \
+    && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 
 # Install pre-built gateway artifacts from parallel builder
