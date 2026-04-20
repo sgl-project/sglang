@@ -767,6 +767,15 @@ class SchedulerMetricsMixin:
                     / self.stats.max_running_requests_under_SLO,
                     self.stats.token_usage / 0.9,
                 )
+            elif (
+                self.stats.max_running_requests is not None
+                and self.stats.max_running_requests > 0
+            ):
+                self.stats.utilization = max(
+                    self.stats.num_running_reqs.total
+                    / self.stats.max_running_requests,
+                    self.stats.token_usage / 0.9,
+                )
 
     def _get_num_pending_tokens(self: Scheduler, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.

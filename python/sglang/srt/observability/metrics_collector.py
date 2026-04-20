@@ -117,6 +117,7 @@ class SchedulerStats:
     # Utilization
     utilization: float = 0.0
     max_running_requests_under_SLO: Optional[int] = None
+    max_running_requests: Optional[int] = None
 
     # Engine startup
     engine_startup_time: float = 0.0

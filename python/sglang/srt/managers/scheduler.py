@@ -708,6 +708,9 @@ class Scheduler(
                 self.max_running_requests // self.pp_size, 1
             )
 
+        # Store max_running_requests in stats for utilization calculation
+        self.stats.max_running_requests = self.max_running_requests
+
         self.tp_group = get_tp_group()
         self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = get_attention_tp_group()
