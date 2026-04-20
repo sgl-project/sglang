@@ -43,6 +43,37 @@ configure_environment() {
     USE_VENV="${USE_VENV:-0}"
     echo "USE_VENV=${USE_VENV}"
 
+    # ------------------------------------------------------------------------------
+    # Self-heal dangling flashinfer/tvm_ffi symlinks in system site-packages
+    # ------------------------------------------------------------------------------
+    # An earlier revision of the "Stabilize FlashInfer JIT cache paths" block below
+    # symlinked `<site-packages>/{tvm_ffi/include,flashinfer/data}` into
+    # `~/.cache/flashinfer/_stable_src/` without asserting the resolved path was
+    # inside the venv. Under USE_VENV=false (and on a buggy branch where the guard
+    # was missing), `python3 -c "import tvm_ffi"` returned the system path, so the
+    # symlink replaced the real headers in /usr/local/lib/python3.*/dist-packages/.
+    # A later job's `rm -rf "$STABLE_FI_DIR"` (on a flashinfer version bump) then
+    # left the symlink dangling, and every subsequent job failed with
+    #   tvm_ffi.libinfo.find_include_path() -> RuntimeError: Cannot find include path.
+    # until the runner was hand-patched. The guard added to the stabilize block
+    # below prevents re-planting, but runners still carrying old damage need repair.
+    SYSTEM_SITE=$(/usr/bin/python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
+    if [ -n "$SYSTEM_SITE" ]; then
+        for pair in "tvm_ffi/include apache-tvm-ffi" "flashinfer/data flashinfer-python"; do
+            # shellcheck disable=SC2086
+            set -- $pair
+            link="${SYSTEM_SITE}/$1"
+            pkg="$2"
+            if [ -L "$link" ] && [ ! -e "$link" ]; then
+                echo "::warning::Self-heal: dangling symlink ${link} -> $(readlink "$link"). Removing and force-reinstalling ${pkg}."
+                rm -f "$link"
+                # Use system pip explicitly — the venv (if any) doesn't exist yet,
+                # and we want the reinstall to target SYSTEM_SITE regardless.
+                /usr/bin/python3 -m pip install --force-reinstall --no-deps "$pkg" --root-user-action=ignore >/dev/null 2>&1 || true
+            fi
+        done
+    fi
+
     python3 -m pip install --upgrade pip
     if ! command -v uv >/dev/null 2>&1; then
         pip install uv
@@ -361,6 +392,20 @@ stabilize_flashinfer_jit_paths() {
     # Copy source files to stable path and symlink venv copies there
     FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
     TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
+
+    # Refuse to clobber paths outside the venv. If python3 here ever resolves
+    # to system site-packages (misconfigured PATH, --system-site-packages,
+    # explicit /usr/bin/python3, or venv activation silently failing), the
+    # `rm -rf` + `ln -s` below would wipe system-installed headers and leave
+    # a dangling symlink once $STABLE_FI_DIR gets rebuilt on a version bump.
+    # That exact bug corrupted every persistent CI runner on 2026-04-19 and
+    # required hand-repair via the self-heal block at the top of this script.
+    for p in "$FI_DATA" "$TVM_INC"; do
+        case "$p" in
+            "$UV_VENV"/*) ;;
+            *) echo "FATAL: refusing to symlink '$p' outside venv '$UV_VENV'"; exit 1 ;;
+        esac
+    done
 
     FI_VERSION="${FLASHINFER_PYTHON_REQUIRED}"
     if [ ! -d "$STABLE_FI_DIR/flashinfer-data" ] || [ "$(cat "$STABLE_FI_DIR/.version" 2>/dev/null)" != "$FI_VERSION" ]; then
