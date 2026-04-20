@@ -297,10 +297,10 @@ class ParallelTiledVAE(ABC, nn.Module):
 
         gathered_dim_metadata = [None] * world_size
         gathered_tile_indices = [None] * world_size
-        gathered_results = (
-            torch.zeros_like(padded_results)
-            .repeat(world_size, *[1] * len(padded_results.shape))
-            .contiguous()
+        gathered_results = torch.empty(
+            (world_size, *padded_results.shape),
+            device=padded_results.device,
+            dtype=padded_results.dtype,
         )
         dist.all_gather_into_tensor(gathered_results, padded_results)
         dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
@@ -436,10 +436,10 @@ class ParallelTiledVAE(ABC, nn.Module):
 
         padded_results = torch.zeros(max_size, device=z.device, dtype=z.dtype)
         padded_results[: local_result.size(0)] = local_result
-        gathered_results = (
-            torch.zeros_like(padded_results)
-            .repeat(world_size, *[1] * len(padded_results.shape))
-            .contiguous()
+        gathered_results = torch.empty(
+            (world_size, *padded_results.shape),
+            device=padded_results.device,
+            dtype=padded_results.dtype,
         )
         dist.all_gather_into_tensor(gathered_results, padded_results)
 
