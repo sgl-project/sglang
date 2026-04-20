@@ -1,13 +1,8 @@
 """MLX-specific TpModelWorker subclass for Apple Silicon.
 
-Overrides the standard TpModelWorker to route forward passes through
-the native MLX model runner, avoiding PyTorch MPS entirely for inference.
-
-PyTorch model weights are never loaded.  A lightweight ModelRunner stub
-(MlxModelRunnerStub) provides only the minimal bookkeeping structures
-(req_to_token_pool, token_to_kv_pool_allocator with a zero-memory
-dummy KV cache) that the SGLang scheduler expects.  The actual KV cache
-is managed internally by the MLX model runner.
+Routes forward passes through the MLX model runner, bypassing PyTorch
+MPS.  A lightweight stub provides scheduler bookkeeping; the actual
+KV data lives in MlxKVPool.
 """
 
 import logging
@@ -33,11 +28,22 @@ class MlxTpModelWorker(TpModelWorker):
     """
 
     def _init_model_runner(self):
-        """Override to use a lightweight ModelRunner that skips weight loading."""
+        """Create MLX runner first (auto-sizes pool), then stub with matching size."""
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
         from sglang.srt.hardware_backend.mlx.model_runner_stub import (
             MlxModelRunnerStub,
         )
+
+        logger.info("Initializing MlxModelRunner for end-to-end MLX inference")
+        init_kwargs = dict(
+            model_path=self.server_args.model_path,
+            trust_remote_code=self.server_args.trust_remote_code,
+            disable_radix_cache=self.server_args.disable_radix_cache,
+            mem_fraction_static=self.server_args.mem_fraction_static,
+        )
+        if self.server_args.max_total_tokens is not None:
+            init_kwargs["pool_size"] = self.server_args.max_total_tokens
+        self._mlx_runner = MlxModelRunner(**init_kwargs)
 
         self._model_runner = MlxModelRunnerStub(
             model_config=self.model_config,
@@ -56,19 +62,21 @@ class MlxTpModelWorker(TpModelWorker):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
+            mlx_pool_size=self._mlx_runner.pool_size,
         )
 
-        # Initialize the MLX model runner (loads weights via MLX, not PyTorch)
-        logger.info("Initializing MlxModelRunner for end-to-end MLX inference")
-        self._mlx_runner = MlxModelRunner(
-            model_path=self.server_args.model_path,
-            trust_remote_code=self.server_args.trust_remote_code,
-        )
         self._mlx_active_rids: set[str] = set()
+        self._mlx_pool_initialized = False
 
     def get_pad_input_ids_func(self):
         """Override since the stub ModelRunner has no real model."""
         return None
+
+    def _ensure_mlx_pool_initialized(self):
+        """Lazily initialize the MlxKVPool after the stub's pools are ready."""
+        if not self._mlx_pool_initialized:
+            self._mlx_runner.init_kv_pool(self._model_runner.req_to_token_pool)
+            self._mlx_pool_initialized = True
 
     def forward_batch_generation(
         self,
@@ -80,6 +88,7 @@ class MlxTpModelWorker(TpModelWorker):
     ) -> GenerationBatchResult:
         """Override to route through MLX model runner."""
         if model_worker_batch is not None:
+            self._ensure_mlx_pool_initialized()
             return self._forward_batch_generation_mlx(model_worker_batch)
 
         # Fallback to standard path for None batches
@@ -95,11 +104,7 @@ class MlxTpModelWorker(TpModelWorker):
         self,
         model_worker_batch: ModelWorkerBatch,
     ) -> GenerationBatchResult:
-        """Run forward pass through the MLX model runner.
-
-        Bypasses the standard ModelRunner forward+sample and uses native MLX
-        inference for the entire model. Only supports greedy sampling.
-        """
+        """Run forward pass through the MLX model runner (greedy only)."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         forward_mode = model_worker_batch.forward_mode
@@ -111,32 +116,61 @@ class MlxTpModelWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
 
-        # Auto-cleanup: remove MLX state for requests no longer in the batch
+        # Auto-cleanup: remove MLX state for requests no longer in the batch.
         current_rids = {req.rid for req in reqs}
-        stale_rids = self._mlx_active_rids - current_rids
-        for rid in stale_rids:
-            self._mlx_runner.remove_request(rid)
-        self._mlx_active_rids = current_rids
+        if forward_mode.is_decode():
+            stale_rids = self._mlx_active_rids - current_rids
+            for rid in stale_rids:
+                self._mlx_runner.remove_request(rid)
+            self._mlx_active_rids = current_rids
+        else:
+            self._mlx_active_rids |= current_rids
 
         next_token_ids_list = []
 
         if forward_mode.is_extend():
-            # Prefill (or MIXED): extract per-request tokens from concatenated input_ids
+            # Ensure pool is up-to-date before PoolBackedCache reads it
+            # for prefix-cached prefills.  Only runs on extend batches.
+            self._mlx_runner.flush_all_decode_kv()
             input_ids_cpu = model_worker_batch.input_ids.cpu().tolist()
+            out_cache_loc_cpu = model_worker_batch.out_cache_loc.cpu().tolist()
             extend_seq_lens = model_worker_batch.extend_seq_lens
-            offset = 0
+
+            offset = 0  # into input_ids_cpu
+            slot_offset = 0  # into out_cache_loc_cpu
             prefill_rids = []
+            extend_rids = []
             decode_rids = []
+
             for i, req in enumerate(reqs):
                 seq_len = extend_seq_lens[i]
                 req_token_ids = input_ids_cpu[offset : offset + seq_len]
+                req_new_slots = out_cache_loc_cpu[slot_offset : slot_offset + seq_len]
                 offset += seq_len
-                if req.rid in self._mlx_runner._request_states:
-                    # MIXED mode: this request already has MLX state, decode it
-                    decode_rids.append(req.rid)
+                slot_offset += seq_len
+
+                if self._mlx_runner.has_request(req.rid):
+                    if seq_len > 1:
+                        # Chunked prefill continuation
+                        next_token = self._mlx_runner.extend(
+                            req.rid, req_token_ids, req_new_slots
+                        )
+                        extend_rids.append((req.rid, next_token))
+                    else:
+                        # MIXED mode: single-token decode
+                        decode_rids.append(req.rid)
                 else:
-                    # Prefill: new request
-                    next_token = self._mlx_runner.prefill(req.rid, req_token_ids)
+                    # New prefill
+                    prefix_slot_ids = req.prefix_indices.tolist()
+                    full_token_ids = list(req.fill_ids)
+                    next_token = self._mlx_runner.prefill(
+                        req_id=req.rid,
+                        new_token_ids=req_token_ids,
+                        full_token_ids=full_token_ids,
+                        prefix_slot_ids=prefix_slot_ids,
+                        new_slot_ids=req_new_slots,
+                        req_pool_idx=req.req_pool_idx,
+                    )
                     prefill_rids.append((req.rid, next_token))
 
             # Batch decode all existing requests at once
@@ -147,16 +181,17 @@ class MlxTpModelWorker(TpModelWorker):
                 decode_map = {}
 
             prefill_map = dict(prefill_rids)
+            extend_map = dict(extend_rids)
 
-            # Reassemble in original request order
             for req in reqs:
                 if req.rid in decode_map:
                     next_token_ids_list.append(decode_map[req.rid])
+                elif req.rid in extend_map:
+                    next_token_ids_list.append(extend_map[req.rid])
                 else:
                     next_token_ids_list.append(prefill_map[req.rid])
 
         elif forward_mode.is_decode():
-            # Decode: batch decode all requests
             req_ids = [req.rid for req in reqs]
             next_token_ids_list = self._mlx_runner.decode_batch(req_ids)
 
