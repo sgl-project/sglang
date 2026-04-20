@@ -44,6 +44,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
+        enable_kv_cpu_backup: bool = False,
     ):
         super().__init__(
             size=size,
@@ -59,6 +60,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
+            enable_kv_cpu_backup=enable_kv_cpu_backup,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 

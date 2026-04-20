@@ -132,6 +132,7 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
+        enable_kv_cpu_backup: bool = False,
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -463,12 +464,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
+        enable_kv_cpu_backup: bool = False,
     ):
         super().__init__(
             size=size,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=enable_memory_saver,
+            enable_kv_cpu_backup=enable_kv_cpu_backup,
         )
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
@@ -654,6 +657,7 @@ class KVCache(abc.ABC):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_kv_cpu_backup: bool = False,
     ):
         self.size = size
         self.page_size = page_size
@@ -667,6 +671,7 @@ class KVCache(abc.ABC):
         self.layer_num = layer_num
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
+        self.enable_kv_cpu_backup = enable_kv_cpu_backup
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -758,6 +763,7 @@ class MHATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        enable_kv_cpu_backup: bool = False,
     ):
         super().__init__(
             size,
@@ -768,6 +774,7 @@ class MHATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            enable_kv_cpu_backup,
         )
         self.head_num = swa_head_num if swa_head_num is not None else head_num
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
@@ -843,7 +850,9 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_KV_CACHE, enable_cpu_backup=self.enable_kv_cpu_backup
+        ):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
@@ -1084,7 +1093,9 @@ class MHATokenToKVPool(KVCache):
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_KV_CACHE, enable_cpu_backup=self.enable_kv_cpu_backup
+        ):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
@@ -1239,6 +1250,7 @@ class HybridLinearKVPool(KVCache):
         device: str,
         mamba_pool: MambaPool,
         enable_memory_saver: bool = False,
+        enable_kv_cpu_backup: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
         kv_lora_rank: int = None,
@@ -1278,6 +1290,7 @@ class HybridLinearKVPool(KVCache):
                 layer_num=self.full_layer_nums,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
+                enable_kv_cpu_backup=enable_kv_cpu_backup,
             )
         else:
 
@@ -1299,6 +1312,7 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                enable_kv_cpu_backup=enable_kv_cpu_backup,
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
@@ -1449,6 +1463,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_nsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        enable_kv_cpu_backup: bool = False,
     ):
         super().__init__(
             size,
@@ -1459,6 +1474,7 @@ class MLATokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            enable_kv_cpu_backup,
         )
 
         self.kv_lora_rank = kv_lora_rank
@@ -1489,7 +1505,9 @@ class MLATokenToKVPool(KVCache):
             self._finalize_allocation_log(size)
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_KV_CACHE, enable_cpu_backup=self.enable_kv_cpu_backup
+        ):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
@@ -1671,7 +1689,9 @@ class MLATokenToKVPool(KVCache):
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_KV_CACHE, enable_cpu_backup=self.enable_kv_cpu_backup
+        ):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
@@ -1817,6 +1837,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        enable_kv_cpu_backup: bool = False,
     ):
 
         override_dim = (
@@ -1836,6 +1857,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_nsa=True,
             override_kv_cache_dim=override_dim,
+            enable_kv_cpu_backup=enable_kv_cpu_backup,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
@@ -1849,31 +1871,34 @@ class NSATokenToKVPool(MLATokenToKVPool):
             assert self.page_size == 1
         else:
             assert self.page_size == 64
-        with (
-            torch.cuda.use_mem_pool(self.custom_mem_pool)
-            if self.custom_mem_pool
-            else nullcontext()
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_KV_CACHE, enable_cpu_backup=self.enable_kv_cpu_backup
         ):
-            self.index_k_with_scale_buffer = [
-                torch.zeros(
-                    # Layout:
-                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
-                    #         * buf[i, :page_size * head_dim] for fp8 data
-                    #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    (
-                        (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
-                        * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.index_k_with_scale_buffer = [
+                    torch.zeros(
+                        # Layout:
+                        #     ref: test_attention.py :: kv_cache_cast_to_fp8
+                        #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
+                        #     data: for page i,
+                        #         * buf[i, :page_size * head_dim] for fp8 data
+                        #         * buf[i, page_size * head_dim:].view(float32) for scale
+                        (
+                            (index_buf_size + page_size + 1) // self.page_size,
+                            self.page_size
+                            * (
+                                index_head_dim + index_head_dim // self.quant_block_size * 4
+                            ),
                         ),
-                    ),
-                    dtype=self.index_k_with_scale_buffer_dtype,
-                    device=device,
-                )
-                for _ in range(layer_num)
-            ]
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
         self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
@@ -1983,6 +2008,7 @@ class DoubleSparseTokenToKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_kv_cpu_backup: bool = False,
     ):
         super().__init__(
             size,
@@ -1993,9 +2019,12 @@ class DoubleSparseTokenToKVPool(KVCache):
             enable_memory_saver,
             start_layer,
             end_layer,
+            enable_kv_cpu_backup,
         )
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_KV_CACHE, enable_cpu_backup=self.enable_kv_cpu_backup
+        ):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool

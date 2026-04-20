@@ -661,6 +661,7 @@ class ServerArgs:
     enable_memory_saver: bool = False
     enable_weights_cpu_backup: bool = False
     enable_draft_weights_cpu_backup: bool = False
+    enable_kv_cache_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
     flashinfer_mla_disable_ragged: bool = False
@@ -3709,6 +3710,18 @@ class ServerArgs:
                 )
 
     def _handle_cache_compatibility(self):
+        if self.enable_kv_cache_cpu_backup and not self.enable_memory_saver:
+            raise ValueError(
+                "--enable-kv-cache-cpu-backup requires --enable-memory-saver to be set."
+            )
+
+        if self.enable_kv_cache_cpu_backup and self.disable_radix_cache:
+            raise ValueError(
+                "--enable-kv-cache-cpu-backup requires radix cache to be enabled. "
+                "It is incompatible with --disable-radix-cache because the feature "
+                "relies on radix tree snapshot/restore for prefix cache preservation."
+            )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -5967,6 +5980,14 @@ class ServerArgs:
             "--enable-draft-weights-cpu-backup",
             action="store_true",
             help="Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
+        )
+        parser.add_argument(
+            "--enable-kv-cache-cpu-backup",
+            action="store_true",
+            help="Save active KV cache data to pinned CPU memory during release_memory_occupation, "
+            "so that it can be restored on resume_memory_occupation. Requires enable_memory_saver=True. "
+            "Useful when the server is paused for weight updates (e.g. RLHF) and prefix cache "
+            "should survive the sleep/wakeup cycle.",
         )
         parser.add_argument(
             "--allow-auto-truncate",

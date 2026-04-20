@@ -904,6 +904,218 @@ class RadixCache(BasePrefixCache):
         self.kv_event_queue = []
         return events
 
+    def export_snapshot(self) -> dict:
+        """Serialize the entire radix tree into a plain-Python dict.
+
+        The snapshot captures:
+        - Every tree node's key (token_ids + extra_key), value (GPU slot indices),
+          hash_value, last_access_time, creation_time, hit_count, and priority.
+        - The parent/child topology via integer node-IDs.
+
+        This dict can be passed to :meth:`import_snapshot` after the GPU memory has
+        been restored (e.g. after ``resume_memory_occupation``) to reconstruct the
+        full prefix cache without re-running prefill.
+
+        Returns ``{"disabled": True, ...}`` if the cache is disabled, or a normal
+        snapshot dict on success.  Raises ``RuntimeError`` with detailed context
+        if serialization fails (e.g. GPU tensors already freed).
+        """
+        if self.disable:
+            return {"disabled": True, "nodes": [], "root_id": None}
+
+        nodes = []
+        # Map from Python id(node) to sequential index for topology encoding
+        node_to_idx: dict = {}
+
+        # Iterative DFS to avoid hitting Python recursion limit on deep trees
+        # Stack entries: (node, parent_idx)
+        stack: list = [(self.root_node, -1)]
+        try:
+            while stack:
+                node, parent_idx = stack.pop()
+                idx = len(nodes)
+                node_to_idx[id(node)] = idx
+
+                try:
+                    value_list = (
+                        node.value.tolist()
+                        if isinstance(node.value, torch.Tensor)
+                        else (node.value if node.value is not None else [])
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"export_snapshot: failed to serialize node value at idx={idx}: {e}. "
+                        f"The GPU tensor may have been freed or is in an invalid state."
+                    ) from e
+
+                nodes.append(
+                    {
+                        "idx": idx,
+                        "parent_idx": parent_idx,
+                        "token_ids": list(node.key.token_ids) if node.key else [],
+                        "extra_key": node.key.extra_key if node.key else None,
+                        "value": value_list,
+                        "hash_value": node.hash_value,
+                        "last_access_time": node.last_access_time,
+                        "creation_time": node.creation_time,
+                        "hit_count": node.hit_count,
+                        "priority": node.priority,
+                        "lock_ref": node.lock_ref,
+                        "is_root": node is self.root_node,
+                    }
+                )
+                # Push children in reversed order so they are visited in original order
+                for child in reversed(list(node.children.values())):
+                    stack.append((child, idx))
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"export_snapshot: failed to traverse radix tree: {e}"
+            ) from e
+
+        return {
+            "disabled": False,
+            "nodes": nodes,
+            "root_id": node_to_idx[id(self.root_node)],
+            "evictable_size": self.evictable_size_,
+            "protected_size": self.protected_size_,
+        }
+
+    def import_snapshot(self, snapshot: dict) -> bool:
+        """Reconstruct the radix tree from a snapshot produced by :meth:`export_snapshot`.
+
+        After calling this method the tree is identical to its state when
+        ``export_snapshot`` was called.  The token_to_kv_pool_allocator free-list is
+        also updated so that all slot indices referenced by the restored tree are
+        marked as allocated.
+
+        This must be called **after** ``memory_saver_adapter.resume()`` has restored
+        the GPU KV tensors.
+
+        Returns ``True`` on success, ``False`` if the snapshot was empty/disabled or
+        if restoration failed (with a logged warning/error).
+        """
+        if snapshot.get("disabled", False) or not snapshot.get("nodes"):
+            logger.warning(
+                "import_snapshot: snapshot is disabled or contains no nodes, "
+                "skipping radix tree restore. Prefix cache will NOT be available after wakeup."
+            )
+            return False
+
+        nodes_data = snapshot["nodes"]
+
+        # Rebuild TreeNode objects keyed by their snapshot index
+        rebuilt: dict = {}
+
+        for nd in nodes_data:
+            try:
+                node = TreeNode(priority=nd["priority"])
+                node.last_access_time = nd["last_access_time"]
+                node.creation_time = nd["creation_time"]
+                node.hit_count = nd["hit_count"]
+                node.lock_ref = nd["lock_ref"]
+                node.key = RadixKey(
+                    token_ids=nd["token_ids"], extra_key=nd["extra_key"]
+                )
+                if nd["value"]:
+                    node.value = torch.tensor(
+                        nd["value"], dtype=torch.int64, device=self.device
+                    )
+                else:
+                    node.value = []
+                node.hash_value = nd["hash_value"]
+                node.host_value = None
+                rebuilt[nd["idx"]] = node
+            except (KeyError, TypeError, ValueError) as e:
+                node_idx = nd.get("idx", "?") if isinstance(nd, dict) else "?"
+                logger.error(
+                    f"import_snapshot: failed to rebuild node at idx={node_idx}: {e}. "
+                    f"Snapshot may be corrupted or from an incompatible version. "
+                    f"Prefix cache will NOT be restored."
+                )
+                return False
+
+        # Wire up parent/child relationships
+        root_node = None
+        for nd in nodes_data:
+            try:
+                node = rebuilt[nd["idx"]]
+                if nd["is_root"]:
+                    root_node = node
+                    continue
+                if nd["parent_idx"] not in rebuilt:
+                    raise KeyError(
+                        f"parent_idx={nd['parent_idx']} not found for node idx={nd['idx']}"
+                    )
+                parent = rebuilt[nd["parent_idx"]]
+                node.parent = parent
+                child_key = self.get_child_key_fn(node.key)
+                parent.children[child_key] = node
+            except (KeyError, TypeError) as e:
+                logger.error(
+                    f"import_snapshot: failed to wire up tree topology: {e}. "
+                    f"Snapshot may be corrupted. Prefix cache will NOT be restored."
+                )
+                return False
+
+        if root_node is None:
+            logger.warning(
+                "import_snapshot: root node not found in snapshot, skipping restore. "
+                "Prefix cache will NOT be available after wakeup."
+            )
+            return False
+
+        # Replace the current (empty) tree with the restored one
+        self.root_node = root_node
+        self.evictable_size_ = snapshot.get("evictable_size", 0)
+        self.protected_size_ = snapshot.get("protected_size", 0)
+
+        # Update the allocator free-list: remove all slot indices that the restored
+        # tree now holds so they are not double-allocated.
+        if self.token_to_kv_pool_allocator is not None:
+            used_slots_set = set()
+            for nd in nodes_data:
+                for slot in nd["value"]:
+                    if slot > 0:  # slot 0 is the dummy padding slot
+                        used_slots_set.add(slot)
+
+            if used_slots_set:
+                try:
+                    used_tensor = torch.tensor(
+                        sorted(used_slots_set), dtype=torch.int64, device=self.device
+                    )
+                    allocator = self.token_to_kv_pool_allocator
+                    # Rebuild free_pages by excluding used slots
+                    all_slots = torch.arange(
+                        1,
+                        allocator.size + 1,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    used_mask = torch.zeros(
+                        allocator.size + 1, dtype=torch.bool, device=self.device
+                    )
+                    used_mask[used_tensor] = True
+                    allocator.free_pages = all_slots[~used_mask[1:]]
+                    allocator.release_pages = torch.empty(
+                        (0,), dtype=torch.int64, device=self.device
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"import_snapshot: failed to restore allocator free-list: {e}. "
+                        f"Tree structure restored but slot allocation may be inconsistent."
+                    )
+                    return False
+
+        logger.info(
+            f"import_snapshot: restored radix tree with "
+            f"{len(nodes_data)} nodes, "
+            f"evictable_size={self.evictable_size_}, "
+            f"protected_size={self.protected_size_}."
+        )
+        return True
+
 
 if __name__ == "__main__":
     tree = RadixCache.create_simulated()

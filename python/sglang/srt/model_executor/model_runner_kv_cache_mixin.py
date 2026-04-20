@@ -195,6 +195,7 @@ class ModelRunnerKVCacheMixin:
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+        enable_kv_cpu_backup = self.server_args.enable_kv_cache_cpu_backup
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -223,6 +224,7 @@ class ModelRunnerKVCacheMixin:
                         + extra_max_context_len,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
+                        enable_kv_cpu_backup=enable_kv_cpu_backup,
                         cache_params=config.mamba2_cache_params,
                         mamba_layer_ids=(
                             [
@@ -245,6 +247,7 @@ class ModelRunnerKVCacheMixin:
                         + extra_max_context_len,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
+                        enable_kv_cpu_backup=enable_kv_cpu_backup,
                         pre_alloc_size=pre_alloc_size,
                     )
             elif config := self.mambaish_config:
@@ -256,6 +259,7 @@ class ModelRunnerKVCacheMixin:
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cpu_backup=enable_kv_cpu_backup,
                     cache_params=config.mamba2_cache_params,
                     mamba_layer_ids=(
                         [
@@ -276,6 +280,7 @@ class ModelRunnerKVCacheMixin:
                     + extra_max_context_len,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cpu_backup=enable_kv_cpu_backup,
                 )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -334,6 +339,7 @@ class ModelRunnerKVCacheMixin:
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cpu_backup=enable_kv_cpu_backup,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
@@ -353,6 +359,7 @@ class ModelRunnerKVCacheMixin:
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cpu_backup=enable_kv_cpu_backup,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
@@ -367,6 +374,7 @@ class ModelRunnerKVCacheMixin:
                 device=self.device,
                 kv_cache_dim=self.calculate_mla_kv_cache_dim(),
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                enable_kv_cpu_backup=enable_kv_cpu_backup,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
@@ -393,6 +401,7 @@ class ModelRunnerKVCacheMixin:
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cpu_backup=enable_kv_cpu_backup,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
@@ -406,6 +415,7 @@ class ModelRunnerKVCacheMixin:
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cpu_backup=enable_kv_cpu_backup,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
@@ -420,6 +430,7 @@ class ModelRunnerKVCacheMixin:
                 device=self.device,
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                enable_kv_cpu_backup=enable_kv_cpu_backup,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
             )
@@ -481,6 +492,7 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    enable_kv_cpu_backup=enable_kv_cpu_backup,
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     **extra_args,
@@ -498,6 +510,7 @@ class ModelRunnerKVCacheMixin:
                         layer_num=self.num_effective_layers,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
+                        enable_kv_cpu_backup=enable_kv_cpu_backup,
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
                         enable_alt_stream=not self.server_args.enable_pdmux,
@@ -517,6 +530,7 @@ class ModelRunnerKVCacheMixin:
                         layer_num=self.num_effective_layers,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
+                        enable_kv_cpu_backup=enable_kv_cpu_backup,
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
                         enable_alt_stream=not self.server_args.enable_pdmux,
