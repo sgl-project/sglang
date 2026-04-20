@@ -3,7 +3,6 @@ Usage:
 python3 -m unittest test_intel_xpu_backend.TestIntelXPUBackend.test_latency_qwen_model
 """
 
-import gc
 import unittest
 from functools import wraps
 
@@ -16,26 +15,12 @@ from sglang.test.test_utils import (
 )
 
 
-def _cleanup_xpu_memory():
-    gc.collect()
-    try:
-        import torch
-
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.synchronize()
-            torch.xpu.empty_cache()
-    except Exception:
-        # Best-effort cleanup only.
-        pass
-
-
 def intel_xpu_benchmark(
     extra_args=None, min_throughput=None, mem_fraction_static="0.4"
 ):
     def decorator(test_func):
         @wraps(test_func)
         def wrapper(self):
-            _cleanup_xpu_memory()
             common_args = [
                 "--disable-radix",
                 "--trust-remote-code",
@@ -50,12 +35,9 @@ def intel_xpu_benchmark(
             full_args = common_args + ci_args + (extra_args or [])
 
             model = test_func(self)
-            try:
-                prefill_latency, decode_throughput, decode_latency = (
-                    run_bench_one_batch(model, full_args)
-                )
-            finally:
-                _cleanup_xpu_memory()
+            prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+                model, full_args
+            )
 
             print(f"{model=}")
             print(f"{prefill_latency=}")
