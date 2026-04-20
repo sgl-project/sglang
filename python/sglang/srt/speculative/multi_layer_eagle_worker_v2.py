@@ -394,6 +394,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
+            forward_batch.req_to_token_pool = self.draft_runner_list[
+                step
+            ].req_to_token_pool
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
             )
@@ -498,6 +501,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
+                forward_batch.req_to_token_pool = self.draft_runner_list[
+                    step
+                ].req_to_token_pool
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch, skip_attn_backend_init=True
                 )
