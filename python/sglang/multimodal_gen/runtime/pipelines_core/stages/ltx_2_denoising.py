@@ -415,6 +415,22 @@ class LTX2DenoisingStage(DenoisingStage):
         self, ctx: LTX2DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Reset the mirrored audio scheduler before the shared loop begins."""
+        if ctx.stage in ("stage1", "stage2"):
+            pipeline = self.pipeline() if self.pipeline else None
+            switch_lora_phase = (
+                getattr(pipeline, "switch_lora_phase", None)
+                if pipeline is not None
+                else None
+            )
+            if callable(switch_lora_phase):
+                switch_lora_phase(ctx.stage)
+            ensure_phase_ready = (
+                getattr(pipeline, "ensure_ltx2_phase_ready", None)
+                if pipeline is not None
+                else None
+            )
+            if callable(ensure_phase_ready):
+                ensure_phase_ready(ctx.stage)
         super()._before_denoising_loop(ctx, batch, server_args)
         if ctx.audio_scheduler is None:
             raise ValueError("LTX-2 audio scheduler was not prepared.")

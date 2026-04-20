@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=394, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=394, suite="stage-c-test-4-gpu-h100")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):

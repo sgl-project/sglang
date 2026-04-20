@@ -42,3 +42,5 @@ class CacheInitParams:
     cache_ttl_seconds: Optional[float] = None
 
     tree_components: Optional[tuple[ComponentType, ...]] = None
+
+    enable_streaming_session: bool = False
