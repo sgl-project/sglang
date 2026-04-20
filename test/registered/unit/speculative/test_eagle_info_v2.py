@@ -42,6 +42,8 @@ class _DummySamplingInfo:
         self.is_all_greedy = True
         self.has_custom_logit_processor = True
         self.penalizer_orchestrator = _DummyPenalizer()
+        self.acc_additive_penalties = None
+        self.acc_scaling_penalties = None
         self.logit_bias = None
         self.temperatures = torch.ones((1, 1), dtype=torch.float32)
         self.top_ks = torch.ones((1,), dtype=torch.int32)
