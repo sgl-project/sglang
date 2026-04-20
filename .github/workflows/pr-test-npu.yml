@@ -63,7 +63,7 @@ jobs:
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
+              - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
@@ -322,7 +322,7 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
-          python3 sglang/multimodal_gen/test/run_suite.py --suite 1-npu
+          python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 1-npu
 
   multimodal-gen-test-2-npu-a3:
     needs: [check-changes, pr-gate]
@@ -369,7 +369,7 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
-          python3 sglang/multimodal_gen/test/run_suite.py --suite 2-npu
+          python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 2-npu
 
   multimodal-gen-test-8-npu-a3:
     needs: [check-changes, pr-gate]
@@ -415,7 +415,7 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite.py --suite 8-npu
+          python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 8-npu
 
   pr-test-npu-finish:
     needs:

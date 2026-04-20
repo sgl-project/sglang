@@ -18,7 +18,6 @@ from __future__ import annotations
 import datetime
 import gc
 import inspect
-import json
 import logging
 import os
 import socket
@@ -151,6 +150,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -208,6 +208,8 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
+elif current_platform.is_out_of_tree():
+    current_platform.init_backend()
 
 MLA_ATTENTION_BACKENDS = [
     "aiter",
@@ -665,14 +667,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # lora_manager.init_cuda_graph_batch_info().
                 self._init_lora_cuda_graph_moe_buffers()
 
-        # Init Double Sparsity
-        if server_args.enable_double_sparsity:
-            if server_args.ds_heavy_channel_type is None:
-                raise ValueError(
-                    "Please specify the heavy channel type for double sparsity optimization."
-                )
-            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
-
         # Enable batch invariant mode
         if server_args.enable_deterministic_inference:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
@@ -711,14 +705,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
+        # TODO: Refactor device-specific init branches into platform interface (separate PR).
+        # Must be called BEFORE init_device_graphs() so CUDA graph capture
+        # runs with aux hidden state capture enabled.
+        self.init_aux_hidden_state_capture()
+
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
+            self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
+        elif current_platform.is_out_of_tree():
+            self.init_attention_backend()
+            if current_platform.support_cuda_graph():
+                self.init_device_graphs()
+            else:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
         else:
             self.graph_runner = None
             self.graph_mem_usage = 0
@@ -726,19 +733,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
-
-        if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture(
-                self.eagle_aux_hidden_state_layer_ids
-            )
-
-        if self.dflash_use_aux_hidden_state:
-            if not hasattr(self.model, "set_dflash_layers_to_capture"):
-                raise ValueError(
-                    f"Model {self.model.__class__.__name__} does not implement set_dflash_layers_to_capture, "
-                    "which is required for DFLASH."
-                )
-            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
@@ -763,6 +757,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 device=self.device,
             )
         )
+
+    def init_aux_hidden_state_capture(self):
+        """Configure auxiliary hidden state capture for speculative decoding.
+
+        Must be called before CUDA graph capture so the captured graphs
+        include aux hidden state output paths.
+        """
+        if self.eagle_use_aux_hidden_state:
+            self.model.set_eagle3_layers_to_capture(
+                self.eagle_aux_hidden_state_layer_ids
+            )
+        if self.dflash_use_aux_hidden_state:
+            if not hasattr(self.model, "set_dflash_layers_to_capture"):
+                raise ValueError(
+                    f"Model {self.model.__class__.__name__} does not implement "
+                    "set_dflash_layers_to_capture, which is required for DFLASH."
+                )
+            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
     def remote_instance_init_transfer_engine(self):
         try:
@@ -914,13 +926,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def model_specific_adjustment(self):
         server_args = self.server_args
-
-        if server_args.enable_double_sparsity:
-            logger.info(
-                "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
-            )
-            server_args.attention_backend = "triton"
-            server_args.disable_cuda_graph = True
 
         if self.is_multimodal:
             if not self.is_multimodal_chunked_prefill_supported:
@@ -1490,7 +1495,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.server_args.load_format = load_format
         self.load_config = load_config
 
-        if recapture_cuda_graph and (self.device == "cuda" or self.device == "musa"):
+        if recapture_cuda_graph and (
+            self.device == "cuda"
+            or self.device == "musa"
+            or (
+                current_platform.is_out_of_tree()
+                and current_platform.support_cuda_graph()
+            )
+        ):
             self.init_device_graphs()
 
         logger.info("Update weights end.")
@@ -2144,23 +2156,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
         return attn_backend_wrapper(self, full_attention_backend)
 
-    def init_double_sparsity_channel_config(self, selected_channel):
-        selected_channel = "." + selected_channel + "_proj"
-        self.sorted_channels = []
-        # load channel config
-        with open(self.server_args.ds_channel_config_path, "r") as f:
-            channel_config = json.load(f)
-
-        for i in range(self.start_layer, self.end_layer):
-            key = "model.layers." + str(i) + ".self_attn" + selected_channel
-            self.sorted_channels.append(
-                torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
-                ]
-                .contiguous()
-                .cuda()
-            )
-
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
@@ -2171,6 +2166,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+    def _pre_initialize_flashinfer_allreduce_workspace(self):
+        """Pre-initialize flashinfer allreduce fusion workspaces.
+
+        Must run before CUDA graph capture to avoid collective operations
+        (broadcasts, barriers) inside the graph capture context, which can
+        deadlock with custom_all_reduce.register_graph_buffers.
+        """
+        if not self.server_args.enable_flashinfer_allreduce_fusion:
+            return
+
+        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            pre_initialize_workspaces,
+        )
+
+        pre_initialize_workspaces(
+            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+            hidden_dim=self.model_config.hidden_size,
+            dtype=self.dtype,
+        )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
@@ -2259,10 +2275,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 self.server_args.enable_torch_compile = False
 
-        if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture()
-        if self.dflash_use_aux_hidden_state:
-            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
+        # NOTE: aux hidden state capture (eagle3/dflash) is already
+        # configured by init_aux_hidden_state_capture() in initialize().
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
         if require_gathered_buffer(self.server_args):
@@ -2558,8 +2572,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         graph_backend = defaultdict(
-            lambda: "cuda graph",
+            lambda: f"{current_platform.device_name} graph",
             {
+                "cuda": "cuda graph",
+                "musa": "cuda graph",
                 "cpu": "cpu graph",
                 "npu": "npu graph",
             },
@@ -2567,14 +2583,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        graph_runners = defaultdict(
-            lambda: CudaGraphRunner,
-            {
-                "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
-            },
-        )
-        self.graph_runner = graph_runners[self.device](self)
+        if current_platform.is_out_of_tree():
+            GraphRunnerCls = current_platform.get_graph_runner_cls()
+            self.graph_runner = GraphRunnerCls(self)
+        else:
+            graph_runners = defaultdict(
+                lambda: CudaGraphRunner,
+                {
+                    "cpu": CPUGraphRunner,
+                    "npu": NPUGraphRunner,
+                },
+            )
+            self.graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2591,6 +2611,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(
                 "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
             )
+            return
+
+        # Draft models use decode CUDA graphs, not PCG
+        if self.is_draft_worker:
             return
 
         # Disable piecewise CUDA graph for non-language models
