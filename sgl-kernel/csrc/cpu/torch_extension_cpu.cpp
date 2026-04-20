@@ -75,6 +75,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_
     int64_t head_dim,
     int64_t num_head);
 
+// speculative decoding
+at::Tensor assign_draft_cache_locs_cpu(
+    const at::Tensor& req_pool_indices,
+    const at::Tensor& req_to_token,
+    const at::Tensor& seq_lens,
+    const at::Tensor& extend_lens,
+    const at::Tensor& num_new_pages_per_topk,
+    at::Tensor& out_cache_loc,
+    const std::optional<at::Tensor>& source_cache_loc,
+    const std::optional<at::Tensor>& target_cache_loc,
+    const std::optional<at::Tensor>& last_page_lens_cumsum,
+    int64_t duplicate_cache_len,
+    int64_t pool_len,
+    int64_t topk,
+    int64_t speculative_num_steps,
+    int64_t page_size,
+    int64_t bs_upper,
+    int64_t iter_upper);
+
 // topk
 std::tuple<at::Tensor, at::Tensor>
 topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
@@ -494,6 +513,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "head_dim, int num_head) -> "
       "(Tensor, Tensor, Tensor)");
   m.impl("fused_qk_gemma_rmsnorm_with_gate_cpu", torch::kCPU, &fused_qk_gemma_rmsnorm_with_gate_cpu);
+
+
+  // speculative decoding
+  m.def(
+      "assign_draft_cache_locs_cpu(Tensor req_pool_indices, Tensor req_to_token, Tensor seq_lens, "
+      "Tensor extend_lens, Tensor num_new_pages_per_topk, Tensor(a!) out_cache_loc, "
+      "Tensor(a!)? source_cache_loc, Tensor(a!)? target_cache_loc, Tensor? last_page_lens_cumsum, "
+      "int duplicate_cache_len, int pool_len, int topk, int speculative_num_steps, "
+      "int page_size, int bs_upper, int iter_upper) -> "
+      "Tensor");
+  m.impl("assign_draft_cache_locs_cpu", torch::kCPU, &assign_draft_cache_locs_cpu);
+
+
 
   // topk
   m.def("topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");

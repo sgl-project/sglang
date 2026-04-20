@@ -1,7 +1,13 @@
 import logging
 
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import is_blackwell, is_hip, is_musa, is_npu
+from sglang.srt.utils.common import (
+    cpu_has_amx_support,
+    is_blackwell,
+    is_hip,
+    is_musa,
+    is_npu,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +50,17 @@ class DraftBackendFactory:
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
             "triton": self._create_triton_decode_backend,
+            "intel_amx": self._create_intel_amx_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
             "hybrid_linear_attn": (
-                self._create_fa3_decode_backend
-                if not is_blackwell()
-                else self._create_triton_decode_backend
+                self._create_intel_amx_decode_backend
+                if cpu_has_amx_support()
+                else (
+                    self._create_fa3_decode_backend
+                    if not is_blackwell()
+                    else self._create_triton_decode_backend
+                )
             ),
             "flashmla": self._create_flashmla_decode_backend,
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
@@ -73,12 +84,17 @@ class DraftBackendFactory:
         backend_map = {
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
+            "intel_amx": self._create_intel_amx_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": (
-                self._create_fa3_prefill_backend
-                if not is_blackwell()
-                else self._create_triton_prefill_backend
+                self._create_intel_amx_prefill_backend
+                if cpu_has_amx_support()
+                else (
+                    self._create_fa3_prefill_backend
+                    if not is_blackwell()
+                    else self._create_triton_prefill_backend
+                )
             ),
             "flashmla": self._create_flashmla_prefill_backend,
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
@@ -141,6 +157,15 @@ class DraftBackendFactory:
         )
 
         return TritonMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_intel_amx_decode_backend(self):
+        from sglang.srt.layers.attention.intel_amx_backend import (
+            IntelAMXMultiStepDraftBackend,
+        )
+
+        return IntelAMXMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
@@ -276,6 +301,11 @@ class DraftBackendFactory:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
         return TritonAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_intel_amx_prefill_backend(self):
+        from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
+
+        return IntelAMXAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_aiter_prefill_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
