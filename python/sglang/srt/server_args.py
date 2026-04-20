@@ -591,14 +591,6 @@ class ServerArgs:
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
 
-    # Double Sparsity
-    enable_double_sparsity: bool = False
-    ds_channel_config_path: Optional[str] = None
-    ds_heavy_channel_num: int = 32
-    ds_heavy_token_num: int = 256
-    ds_heavy_channel_type: str = "qk"
-    ds_sparse_decode_threshold: int = 4096
-
     # Offloading
     cpu_offload_gb: int = 0
     offload_group_size: int = -1
@@ -797,6 +789,11 @@ class ServerArgs:
         self._handle_npu_backends()
         self._handle_mps_backends()
         self._handle_xpu_backends()
+
+        # Allow OOT platform plugins to apply server args defaults.
+        from sglang.srt.platforms import current_platform
+
+        current_platform.apply_server_args_defaults(self)
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
@@ -1165,6 +1162,12 @@ class ServerArgs:
         # 5. Non-CUDA hardware (AMD, NPU, CPU, MPS, XPU, etc.)
         if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
             self.disable_piecewise_cuda_graph = True
+        # 5b. OOT platforms that don't support piecewise cuda graph
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.is_out_of_tree():
+            if not current_platform.support_piecewise_cuda_graph():
+                self.disable_piecewise_cuda_graph = True
         # 6. MoE A2A backend
         if self.moe_a2a_backend != "none":
             self.disable_piecewise_cuda_graph = True
@@ -2187,7 +2190,8 @@ class ServerArgs:
             )
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
-        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
+        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
+        # Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
@@ -2205,6 +2209,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
+                "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
@@ -2332,6 +2337,12 @@ class ServerArgs:
             2.2 We will use Flashinfer backend on blackwell.
             2.3 Otherwise, we will use triton backend.
         """
+        # OOT platforms provide their own default attention backend.
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.is_out_of_tree():
+            return current_platform.get_default_attention_backend()
+
         # Whisper requires flashinfer for cross-attention CUDA graph support
         if "WhisperForConditionalGeneration" in (
             model_config.hf_config.architectures or []
@@ -5633,43 +5644,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dllm_algorithm_config,
             help="The diffusion LLM algorithm configurations. Must be a YAML file.",
-        )
-
-        # Double Sparsity
-        parser.add_argument(
-            "--enable-double-sparsity",
-            action="store_true",
-            help="Enable double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-channel-config-path",
-            type=str,
-            default=ServerArgs.ds_channel_config_path,
-            help="The path of the double sparsity channel config",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-num",
-            type=int,
-            default=ServerArgs.ds_heavy_channel_num,
-            help="The number of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-token-num",
-            type=int,
-            default=ServerArgs.ds_heavy_token_num,
-            help="The number of heavy tokens in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-type",
-            type=str,
-            default=ServerArgs.ds_heavy_channel_type,
-            help="The type of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-sparse-decode-threshold",
-            type=int,
-            default=ServerArgs.ds_sparse_decode_threshold,
-            help="The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel.",
         )
 
         # Offloading
