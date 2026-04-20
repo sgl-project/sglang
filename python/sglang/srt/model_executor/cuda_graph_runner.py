@@ -1134,7 +1134,7 @@ class CudaGraphRunner:
     def _can_compile_replay_prepare(self):
         if not self.compile_replay_prepare:
             return False
-        return self._get_replay_attn_backend().supports_compiled_replay_prepare
+        return self._get_replay_attn_backend().supports_compiled_replay_prepare()
 
     def _populate_from_forward_batch_and_init_attn_backend(
         self,

@@ -65,7 +65,8 @@ class TRTLLMMHAMetadata:
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
-    supports_compiled_replay_prepare = True
+    def supports_compiled_replay_prepare(self) -> bool:
+        return True
 
     def __init__(
         self,

@@ -309,7 +309,8 @@ _NSA_IMPL_T: TypeAlias = Literal[
 class NativeSparseAttnBackend(
     NativeSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
-    supports_compiled_replay_prepare = True
+    def supports_compiled_replay_prepare(self) -> bool:
+        return True
 
     def __init__(
         self,
