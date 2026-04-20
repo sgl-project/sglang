@@ -52,11 +52,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import (
-    is_cuda,
-    is_npu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -258,6 +254,7 @@ class GPTQConfig(QuantizationConfig):
             if isinstance(layer, LinearBase):
                 return GPTQLinearAscendMethod(self)
             return None
+
         if isinstance(layer, FusedMoE):
             raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
         else:
@@ -490,12 +487,10 @@ class GPTQLinearMethod(LinearMethodBase):
             group_size = self.quant_config.group_size
         else:
             group_size = input_size
-
         self.use_shuffle = True
 
         scale_and_zero_size = input_size // group_size
         scale_and_zero_input_dim = None
-
         if (
             input_size != input_size_per_partition
             and self.quant_config.group_size != -1
@@ -579,6 +574,7 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
         if self.use_shuffle:
@@ -1542,7 +1538,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_qweight,
             w2_qweight=layer.w2_qweight,

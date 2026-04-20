@@ -49,12 +49,7 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.utils import (
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_xpu,
-)
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -84,13 +79,12 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 
-
 elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
     warnings.warn(f"XPU does not support fused_marlin_moe currently.")
 else:
-    warnings.warn(f"Only CUDA, HIP, CPU and XPU support AWQ currently.")
+    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -143,10 +137,7 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        if _is_npu:
-            return [torch.float16, torch.bfloat16]
-        else:
-            return [torch.float16]
+        return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -195,8 +186,6 @@ class AWQConfig(QuantizationConfig):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
-        elif isinstance(layer, FusedMoE):
-            return AWQMoEMethod(self)
         return None
 
 
@@ -460,7 +449,6 @@ class AWQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         qweight = layer.qweight
         scales = layer.scales
         qzeros = layer.qzeros
