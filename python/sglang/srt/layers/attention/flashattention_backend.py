@@ -803,6 +803,7 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
+                    out=_fa_out,
                     **kwargs,
                 )
             else:
