@@ -300,7 +300,7 @@ class LTX2DenoisingStage(DenoisingStage):
         stg_scale: float,
         rescale_scale: float,
         modality_scale: float,
-        ) -> torch.Tensor:
+    ) -> torch.Tensor:
         pred = (
             cond
             + (cfg_scale - 1.0) * (cond - uncond_text)
@@ -735,9 +735,7 @@ class LTX2DenoisingStage(DenoisingStage):
             ctx, step, batch, server_args, sigma
         )
         batch_size = int(model_inputs.latent_model_input.shape[0])
-        base_model_kwargs = self._build_ltx2_base_model_kwargs(
-            ctx, batch, model_inputs
-        )
+        base_model_kwargs = self._build_ltx2_base_model_kwargs(ctx, batch, model_inputs)
 
         # 5. Run the branch-specific LTX forward path and apply CFG/guider logic.
         prompt_attention_mask = self._get_ltx_prompt_attention_mask(
@@ -785,7 +783,9 @@ class LTX2DenoisingStage(DenoisingStage):
                         ]
                     )
                     model_kwargs["encoder_attention_mask"] = repeated_attention_mask
-                    model_kwargs["audio_encoder_attention_mask"] = repeated_attention_mask
+                    model_kwargs["audio_encoder_attention_mask"] = (
+                        repeated_attention_mask
+                    )
 
             with set_forward_context(
                 current_timestep=step.step_index, attn_metadata=step.attn_metadata
@@ -995,10 +995,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     [pass_spec.encoder_hidden_states for pass_spec in pass_specs], dim=0
                 ),
                 audio_encoder_hidden_states=torch.cat(
-                    [
-                        pass_spec.audio_encoder_hidden_states
-                        for pass_spec in pass_specs
-                    ],
+                    [pass_spec.audio_encoder_hidden_states for pass_spec in pass_specs],
                     dim=0,
                 ),
                 encoder_attention_mask=self._cat_or_none(

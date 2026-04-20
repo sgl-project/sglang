@@ -797,9 +797,9 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         if phase == self._active_lora_phase:
             return
 
-        if self._device_manager.switch_phase(phase) and self._can_short_circuit_lora_switch(
+        if self._device_manager.switch_phase(
             phase
-        ):
+        ) and self._can_short_circuit_lora_switch(phase):
             self._active_lora_phase = phase
             return
 
