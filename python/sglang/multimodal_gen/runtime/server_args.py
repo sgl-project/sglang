@@ -73,6 +73,7 @@ logger = init_logger(__name__)
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline",)
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 
@@ -82,6 +83,10 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
         return None
     mode = mode.lower()
     return mode
+
+
+def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
+    return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
 
 
 class Backend(str, Enum):
@@ -394,11 +399,7 @@ class ServerArgs(DisaggArgsMixin):
                 self.vae_cpu_offload = True
 
     def _adjust_ltx2_two_stage_device_mode(self):
-        is_ltx23_two_stage = self.pipeline_class_name == "LTX2TwoStagePipeline" and (
-            self._is_ltx23_model_path(self.model_path)
-            or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
-        )
-        if not is_ltx23_two_stage:
+        if not self._is_ltx23_two_stage_pipeline():
             return
 
         mode = self.ltx2_two_stage_device_mode
@@ -448,6 +449,12 @@ class ServerArgs(DisaggArgsMixin):
             device_total_memory_gb,
         )
         return "snapshot"
+
+    def _is_ltx23_two_stage_pipeline(self) -> bool:
+        return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
+            self._is_ltx23_model_path(self.model_path)
+            or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
+        )
 
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:

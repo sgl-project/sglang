@@ -672,9 +672,6 @@ def create_multiple_batch_test_samples(
     prompts: List[str], lora_adapter_paths: List[str]
 ):
     random.seed(42)
-    from sglang.srt.utils.common import get_bool_env_var, is_hip
-
-    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
     test_cases = [
         (
@@ -721,19 +718,6 @@ def create_multiple_batch_test_samples(
         # ),
     ]
 
-    # [AMD] Aiter may fail this case but the model quality doesn't drop
-    # Skip this flaky case for now
-    if not _use_aiter:
-        test_cases.append(
-            (
-                [
-                    random.choice(prompts),
-                    random.choice(prompts),
-                    random.choice(prompts),
-                ],
-                [None, None, None],
-            )
-        )
     return test_cases
 
 

@@ -263,6 +263,14 @@ def is_deepep_class_backend() -> bool:
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
 
 
+def is_flashinfer_cutedsl_v1_path() -> bool:
+    """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
+    return (
+        get_moe_runner_backend().is_flashinfer_cutedsl()
+        and get_moe_a2a_backend().is_deepep()
+    )
+
+
 def get_tbo_token_distribution_threshold() -> float:
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     if TBO_TOKEN_DISTRIBUTION_THRESHOLD is None:
