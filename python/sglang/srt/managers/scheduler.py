@@ -202,6 +202,7 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_aware_cache import SessionAwareCache
@@ -1936,6 +1937,7 @@ class Scheduler(
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
+                http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
@@ -3746,6 +3748,8 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # Load plugins so hooks can override Scheduler and its dependencies.
+    load_plugins()
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,
