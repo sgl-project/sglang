@@ -109,6 +109,8 @@ Overall, with these optimizations, we have achieved up to **7x** acceleration in
 
 **Description**: This optimization involves data parallelism (DP) for the MLA attention mechanism of DeepSeek Series Models, which allows for a significant reduction in the KV cache size, enabling larger batch sizes. Each DP worker independently handles different types of batches (prefill, decode, idle), which are then synchronized before and after processing through the Mixture-of-Experts (MoE) layer. If you do not use DP attention, KV cache will be duplicated among all TP ranks.
 
+The same KV-duplication argument also applies to other MLA architectures, so if you need a non-DeepSeek example, GLM-5 is a better reference point than MiniMax-M2. MiniMax-M2 uses GQA rather than MLA.
+
 <p align="center">
   <img src="https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg" alt="Data Parallelism Attention for DeepSeek Series Models">
 </p>

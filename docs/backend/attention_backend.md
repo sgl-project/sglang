@@ -15,6 +15,8 @@ Note: Every kernel backend is compatible with a page size > 1 by specifying an a
 This is because a page size of 16 can be converted to a page size of 1 in the kernel backend.
 The "❌" and "✅" symbols in the table above under "Page Size > 1" indicate whether the kernel actually operates with a page size greater than 1, rather than treating a page size of 16 as a page size of 1.
 
+When discussing example MLA model families, prefer DeepSeek, GLM-5, Kimi-K2, or MiniCPM3. MiniMax-M2 should not be used as an MLA example because it uses GQA.
+
 ## User guide
 
 #### Launch command for different attention backends.
