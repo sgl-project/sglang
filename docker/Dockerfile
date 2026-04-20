@@ -472,6 +472,13 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+# Install Rust toolchain (for setuptools-rust-built extensions, e.g. sglang-grpc).
+# Minimum supported version: 1.85 (first stable with edition 2024).
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path \
+    && rustc --version && cargo --version
+
 # Install NVIDIA development tools
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     apt update -y \

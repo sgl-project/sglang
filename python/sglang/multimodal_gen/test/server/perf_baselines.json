@@ -664,28 +664,27 @@
         },
         "zimage_image_t2i_2_gpus": {
             "stages_ms": {
-                "TimestepPreparationStage": 35.17,
-                "DecodingStage": 9.73,
-                "TextEncodingStage": 307.62,
-                "LatentPreparationStage": 0.13,
                 "InputValidationStage": 0.05,
-                "DenoisingStage": 525.42
+                "TextEncodingStage": 309.68,
+                "LatentPreparationStage": 0.14,
+                "TimestepPreparationStage": 37.19,
+                "DenoisingStage": 525.39,
+                "DecodingStage": 10.18
             },
             "denoise_step_ms": {
-                "0": 19.97,
-                "1": 32.53,
-                "2": 62.6,
-                "3": 62.67,
-                "4": 63.03,
-                "5": 62.83,
-                "6": 62.73,
-                "7": 63.16,
-                "8": 62.63
+                "0": 40.09,
+                "1": 38.17,
+                "2": 54.71,
+                "3": 64.29,
+                "4": 65.0,
+                "5": 65.56,
+                "6": 64.61,
+                "7": 64.76,
+                "8": 64.35
             },
-            "expected_e2e_ms": 957.78,
-            "expected_avg_denoise_ms": 57.99,
-            "expected_median_denoise_ms": 64.64,
-            "estimated_full_test_time_s": 121.0
+            "expected_e2e_ms": 961.86,
+            "expected_avg_denoise_ms": 57.95,
+            "expected_median_denoise_ms": 64.35
         },
         "qwen_image_edit_ti2i": {
             "stages_ms": {
