@@ -53,6 +53,9 @@ jobs:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
 
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
