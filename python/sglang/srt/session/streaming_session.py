@@ -232,10 +232,13 @@ class StreamingSession(BasePrefixCache):
         req = params.req
         slot.restore_to_req(req)
 
-        # token_ids = fill_ids[:input_len-1] (1-token logit reserve already
-        # applied). min handles retract retry where committed_len can
-        # exceed len(token_ids) by 1.
-        prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
+        # unaligned_len = fill_ids[:input_len-1] from init_next_round_input
+        # (1-token logit reserve). min covers retract retry where
+        # committed_len exceeds it by 1.
+        assert (
+            params.unaligned_len is not None
+        ), "streaming session requires MatchPrefixParams.unaligned_len"
+        prefix_len = min(req.kv_committed_len, params.unaligned_len)
 
         # Streaming sessions are append-only (session_controller rollback
         # ensures req_nodes always points to the last successful req).

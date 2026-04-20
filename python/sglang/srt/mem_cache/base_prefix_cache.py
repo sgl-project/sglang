@@ -38,6 +38,10 @@ class MatchPrefixParams:
 
     key: RadixKey
 
+    # Raw len(token_ids) before make_radix_key page-aligned `key`.
+    # Streaming session uses this for raw prefix intent, not aligned key length.
+    unaligned_len: Optional[int] = None
+
     # Mamba specific
     cow_mamba: bool = False
     req: Optional[Req] = None
