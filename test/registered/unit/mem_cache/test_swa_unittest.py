@@ -478,8 +478,9 @@ class TestSWA(unittest.TestCase):
         )
         self.assertEqual(len(kv_indices), 6)
         self.assertEqual(len(last_node.key), 2)
-        self.assertEqual(last_node.key.token_ids[0], (5, 60))
-        self.assertEqual(last_node.key.token_ids[1], (60, 70))
+        # Bigram view: token_ids holds raw tokens; iteration yields bigram tuples.
+        self.assertTrue(last_node.key.is_bigram)
+        self.assertEqual(list(last_node.key), [(5, 60), (60, 70)])
 
     def test_swa_cache_finished_req_eagle_uses_cache_protected_len_and_bigram_key(self):
         tree, allocator, req_to_token_pool = self._build_swa_tree(is_eagle=True)

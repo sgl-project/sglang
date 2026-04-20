@@ -1,3 +1,8 @@
+"""
+# TODO: Fails on cu13 venv migration. Ref: https://github.com/sgl-project/sglang/actions/runs/24616960626/job/71980705675?pr=23119
+# Should move back to registered test after it's fixed
+"""
+
 import gc
 import multiprocessing
 import os
