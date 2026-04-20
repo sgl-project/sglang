@@ -1,0 +1,256 @@
+---
+title: Installation
+description: Install SGLang with pip/uv, source, Docker, Kubernetes, and cloud deployment options.
+keywords:
+  - installation
+  - sglang
+  - pip
+  - docker
+---
+
+You can install SGLang using one of the methods below.
+This page primarily applies to common NVIDIA GPU platforms.
+For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../hardware-platforms/amd-gpus), [Intel Xeon CPUs](../hardware-platforms/cpu-server), [Google TPU](../hardware-platforms/tpu), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../hardware-platforms/nvidia), [Ascend NPUs](../hardware-platforms/ascend-npus/SGLang-installation-with-NPUs-support), and [Intel XPU](../hardware-platforms/xpu).
+
+<a id="install-methods"></a>
+## Install methods
+
+<Tabs>
+  <Tab title="Pip or uv">
+    It is recommended to use <Tooltip tip="A fast Python package manager.">uv</Tooltip> for faster installation:
+
+    ```bash
+    pip install --upgrade pip
+    pip install uv
+    uv pip install "sglang"
+    ```
+
+    ### Quick fixes to common problems
+
+    <AccordionGroup>
+      <Accordion title="Wrong torch version">
+        In some cases (for example, GB200), the command above might install a wrong torch version (for example, the CPU version) due to dependency resolution. Reinstall the correct [PyTorch](https://pytorch.org/get-started/locally/) with the following:
+
+        ```bash
+        uv pip install "torch" "torchvision" --extra-index-url https://download.pytorch.org/whl/cu129 --force-reinstall
+        ```
+      </Accordion>
+
+      <Accordion title="CUDA 13 without Docker">
+        If you do not have Docker access, install the matching `sgl_kernel` wheel from [the sgl-project whl releases](https://github.com/sgl-project/whl/releases) after installing SGLang. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang (you can find this by running `uv pip show sgl_kernel`).
+
+        **x86_64**
+
+        ```bash
+        uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
+        ```
+
+        **aarch64**
+
+        ```bash
+        uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
+        ```
+      </Accordion>
+
+      <Accordion title="CUDA_HOME not set">
+        Choose one of the following solutions:
+
+        1. Set `CUDA_HOME` to your CUDA install root:
+
+        ```bash
+        export CUDA_HOME=/usr/local/cuda-<your-cuda-version>
+        ```
+
+        2. Install FlashInfer first following the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+
+  <Tab title="From source">
+```bash
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+pip install --upgrade pip
+pip install -e "python"
+```
+
+    ### Quick fixes to common problems
+
+    <AccordionGroup>
+      <Accordion title="Development setup">
+        If you want to develop SGLang, try the dev docker image. Refer to [setup docker container](../developer_guide/development_guide_using_docker#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
+      </Accordion>
+    </AccordionGroup>
+  </Tab>
+
+  <Tab title="Docker">
+    The docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags), built from [Dockerfile](https://github.com/sgl-project/sglang/tree/main/docker).
+    Replace `<secret>` below with your huggingface hub [token](https://huggingface.co/docs/hub/en/security-tokens).
+
+    **Standard image**
+
+    ```bash
+    docker run --gpus all \
+        --shm-size 32g \
+        -p 30000:30000 \
+        -v ~/.cache/huggingface:/root/.cache/huggingface \
+        --env "HF_TOKEN=<secret>" \
+        --ipc=host \
+        lmsysorg/sglang:latest \
+        python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
+    ```
+
+    **Runtime image for production**
+
+    ```bash
+    docker run --gpus all \
+        --shm-size 32g \
+        -p 30000:30000 \
+        -v ~/.cache/huggingface:/root/.cache/huggingface \
+        --env "HF_TOKEN=<secret>" \
+        --ipc=host \
+        lmsysorg/sglang:latest-runtime \
+        python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
+    ```
+
+    You can also find the nightly docker images [here](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly).
+
+    <Note>
+      On B300/GB300 (SM103) or CUDA 13 environment, use the nightly image at `lmsysorg/sglang:dev-cu13` or stable image at `lmsysorg/sglang:latest-cu130-runtime`. Do not re-install the project as editable inside the docker image, since it will override the version of libraries specified by the cu13 docker image.
+    </Note>
+  </Tab>
+
+  <Tab title="Kubernetes">
+    Please check out [OME](https://github.com/sgl-project/ome), a Kubernetes operator for enterprise-grade management and serving of large language models (LLMs).
+
+    <Tabs>
+      <Tab title="Single node serving">
+        For models that fit into GPUs on one node, create the deployment and service with llama-31-8b as example.
+
+        ```bash
+        kubectl apply -f docker/k8s-sglang-service.yaml
+        ```
+      </Tab>
+
+      <Tab title="Multi-node serving">
+        For larger models (for example, `DeepSeek-R1`), modify the model path and arguments, then create the statefulset and service.
+
+        ```bash
+        kubectl apply -f docker/k8s-sglang-distributed-sts.yaml
+        ```
+      </Tab>
+    </Tabs>
+  </Tab>
+
+  <Tab title="Docker Compose">
+    <Note>
+      This method is recommended if you plan to serve it as a service. A better approach is to use the [k8s-sglang-service.yaml](https://github.com/sgl-project/sglang/blob/main/docker/k8s-sglang-service.yaml).
+    </Note>
+
+    1. Copy the [compose.yml](https://github.com/sgl-project/sglang/blob/main/docker/compose.yaml) to your local machine.
+    2. Start the service:
+
+    ```bash
+    docker compose up -d
+    ```
+  </Tab>
+
+  <Tab title="SkyPilot">
+    To deploy on Kubernetes or 12+ clouds, you can use [SkyPilot](https://github.com/skypilot-org/skypilot).
+
+    1. Install SkyPilot and set up Kubernetes cluster or cloud access. See [SkyPilot's documentation](https://skypilot.readthedocs.io/en/latest/getting-started/installation.html).
+    2. Deploy on your own infra with a single command and get the HTTP API endpoint:
+
+    **SkyPilot YAML: `sglang.yaml`**
+
+    ```yaml Config
+    # sglang.yaml
+    envs:
+      HF_TOKEN: null
+
+    resources:
+      image_id: docker:lmsysorg/sglang:latest
+      accelerators: A100
+      ports: 30000
+
+    run: |
+      conda deactivate
+      python3 -m sglang.launch_server \
+        --model-path meta-llama/Llama-3.1-8B-Instruct \
+        --host 0.0.0.0 \
+        --port 30000
+    ```
+
+    ```bash
+    # Deploy on any cloud or Kubernetes cluster. Use --cloud <cloud> to select a specific cloud provider.
+    HF_TOKEN=<secret> sky launch -c sglang --env HF_TOKEN sglang.yaml
+
+    # Get the HTTP API endpoint
+    sky status --endpoint 30000 sglang
+    ```
+
+    3. To scale with autoscaling and failure recovery, check out the [SkyServe + SGLang guide](https://github.com/skypilot-org/skypilot/tree/master/llm/sglang#serving-llama-2-with-sglang-for-more-traffic-using-skyserve).
+  </Tab>
+
+  <Tab title="AWS SageMaker">
+    To deploy on SGLang on AWS SageMaker, check out [AWS SageMaker Inference](https://aws.amazon.com/sagemaker/ai/deploy).
+
+    Amazon Web Services provide supports for SGLang containers along with routine security patching. For available SGLang containers, check out [AWS SGLang DLCs](https://github.com/aws/deep-learning-containers/blob/master/available_images.md#sglang-containers).
+
+    To host a model with your own container, follow the following steps:
+
+    1. Build a docker container with [sagemaker.Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/sagemaker.Dockerfile) alongside the [serve](https://github.com/sgl-project/sglang/blob/main/docker/serve) script, then push it to AWS ECR.
+
+    **Dockerfile build script: `build-and-push.sh`**
+
+    ```bash
+    #!/bin/bash
+    AWS_ACCOUNT="<YOUR_AWS_ACCOUNT>"
+    AWS_REGION="<YOUR_AWS_REGION>"
+    REPOSITORY_NAME="<YOUR_REPOSITORY_NAME>"
+    IMAGE_TAG="<YOUR_IMAGE_TAG>"
+
+    ECR_REGISTRY="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    IMAGE_URI="${ECR_REGISTRY}/${REPOSITORY_NAME}:${IMAGE_TAG}"
+
+    echo "Starting build and push process..."
+
+    # Login to ECR
+    echo "Logging into ECR..."
+    aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+    # Build the image
+    echo "Building Docker image..."
+    docker build -t ${IMAGE_URI} -f sagemaker.Dockerfile .
+
+    echo "Pushing ${IMAGE_URI}"
+    docker push ${IMAGE_URI}
+
+    echo "Build and push completed successfully!"
+    ```
+
+    2. Deploy a model for serving on AWS Sagemaker. Refer to [deploy_and_serve_endpoint.py](https://github.com/sgl-project/sglang/blob/main/examples/sagemaker/deploy_and_serve_endpoint.py). For more information, check out [sagemaker-python-sdk](https://github.com/aws/sagemaker-python-sdk).
+
+    **Default command**
+
+    The model server on SageMaker runs: `python3 -m sglang.launch_server --model-path opt/ml/model --host 0.0.0.0 --port 8080`.
+
+    **Custom arguments**
+
+    The [serve](https://github.com/sgl-project/sglang/blob/main/docker/serve) script exposes all options in `python3 -m sglang.launch_server --help` through environment variables prefixed with `SM_SGLANG_`.
+
+    **Environment variable mapping**
+
+    The serve script converts variables with prefix `SM_SGLANG_` from `SM_SGLANG_INPUT_ARGUMENT` into `--input-argument` for the `python3 -m sglang.launch_server` CLI.
+
+    **Example**
+
+    To run [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) with reasoning parser, add `SM_SGLANG_MODEL_PATH=Qwen/Qwen3-0.6B` and `SM_SGLANG_REASONING_PARSER=qwen3`.
+  </Tab>
+</Tabs>
+
+## Common notes
+
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (for example, T4, A10, A100, L4, L40S, H100), switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
+- To reinstall flashinfer locally, use the following command: `pip3 install --upgrade flashinfer-python --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.
+- When encountering `ptxas fatal   : Value 'sm_103a' is not defined for option 'gpu-name'` on B300/GB300, fix it with `export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`.
