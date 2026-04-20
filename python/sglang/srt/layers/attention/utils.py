@@ -117,6 +117,7 @@ def concat_and_cast_mha_k_kernel(
     k_nope_ptr,
     k_rope_ptr,
     head_cnt: tl.constexpr,
+    head_cnt_pad: tl.constexpr,
     k_stride0: tl.constexpr,
     k_stride1: tl.constexpr,
     nope_stride0: tl.constexpr,
@@ -124,13 +125,20 @@ def concat_and_cast_mha_k_kernel(
     rope_stride0: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
 ):
+    # Many Triton builds require tl.arange(0, N) with N a power of 2. Pad
+    # heads / nope / rope ranges and mask so arbitrary model dims (e.g. 192)
+    # work on ROCm + triton-custom.
     pid_loc = tl.program_id(0)
-    head_range = tl.arange(0, head_cnt)
+    head_range = tl.arange(0, head_cnt_pad)
+    head_ok = head_range < head_cnt
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
 
-    nope_offs = tl.arange(0, nope_dim)
+    nope_offs = tl.arange(0, BLOCK_NOPE)
+    nope_ok = nope_offs < nope_dim
 
     src_nope_ptr = (
         k_nope_ptr
@@ -140,14 +148,17 @@ def concat_and_cast_mha_k_kernel(
     )
     dst_nope_ptr = k_head_ptr + nope_offs[None, :]
 
-    src_nope = tl.load(src_nope_ptr)
-    tl.store(dst_nope_ptr, src_nope)
+    m_nope = head_ok[:, None] & nope_ok[None, :]
+    src_nope = tl.load(src_nope_ptr, mask=m_nope, other=0.0)
+    tl.store(dst_nope_ptr, src_nope, mask=m_nope)
 
-    rope_offs = tl.arange(0, rope_dim)
+    rope_offs = tl.arange(0, BLOCK_ROPE)
+    rope_ok = rope_offs < rope_dim
     src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
     dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
-    src_rope = tl.load(src_rope_ptr)
-    tl.store(dst_rope_ptr, src_rope)
+    src_rope = tl.load(src_rope_ptr, mask=rope_ok[None, :], other=0.0)
+    m_rope_dst = head_ok[:, None] & rope_ok[None, :]
+    tl.store(dst_rope_ptr, src_rope, mask=m_rope_dst)
 
 
 def concat_and_cast_mha_k_triton(
@@ -178,6 +189,7 @@ def concat_and_cast_mha_k_triton(
         k_nope,
         k_rope,
         k.shape[1],
+        triton.next_power_of_2(int(k.shape[1])),
         k.stride(0),
         k.stride(1),
         k_nope.stride(0),
@@ -185,6 +197,8 @@ def concat_and_cast_mha_k_triton(
         k_rope.stride(0),
         nope_dim,
         rope_dim,
+        triton.next_power_of_2(int(nope_dim)),
+        triton.next_power_of_2(int(rope_dim)),
     )
 
 
