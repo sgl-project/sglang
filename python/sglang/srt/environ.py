@@ -554,6 +554,10 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
 
+    # Plugin system
+    SGLANG_PLATFORM = EnvStr("")
+    SGLANG_PLUGINS = EnvStr("")
+
 
 envs = Envs()
 EnvField._allow_set_name = False
