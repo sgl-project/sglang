@@ -582,6 +582,7 @@ class UnifiedRadixCacheSuite:
         self.assertIsInstance(child_key, tuple)
 
     def test_paged_match_truncates_unaligned_key(self):
+        """make_radix_key aligns keys to page boundary; match_prefix rejects unaligned."""
         if self.cfg.page_size == 1:
             self.skipTest("page_size > 1 only")
         ps = self.cfg.page_size
@@ -589,12 +590,18 @@ class UnifiedRadixCacheSuite:
         seq = self._make_seq(1, 2)
         self._insert(tree, allocator, req_to_token_pool, seq)
 
+        # make_radix_key truncates unaligned tail, so it matches the seq prefix.
         unaligned = seq + list(range(9000, 9000 + ps - 1))
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(unaligned)))
+        m = tree.match_prefix(MatchPrefixParams(key=tree.make_radix_key(unaligned)))
         self.assertEqual(len(m.device_indices), len(seq))
 
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq[: ps - 1])))
+        # Below-page-size key aligns to 0 -> no match.
+        m = tree.match_prefix(MatchPrefixParams(key=tree.make_radix_key(seq[: ps - 1])))
         self.assertEqual(len(m.device_indices), 0)
+
+        # Raw unaligned key violates the strict contract and raises.
+        with self.assertRaises(AssertionError):
+            tree.match_prefix(MatchPrefixParams(key=RadixKey(unaligned)))
 
         tree.sanity_check()
 
