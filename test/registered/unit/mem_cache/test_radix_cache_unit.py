@@ -366,9 +366,7 @@ class TestRadixCache(unittest.TestCase):
                 )
 
                 # Insert data
-                cache.insert(
-                    InsertParams(key=cache.make_radix_key([1, 2, 3, 4, 5]), value=None)
-                )
+                cache.insert(InsertParams(key=RadixKey([1, 2, 3, 4, 5]), value=None))
 
                 # Take events
                 events = cache.take_events()
@@ -549,7 +547,7 @@ class TestRadixCache(unittest.TestCase):
                 cache = RadixCache.create_simulated(page_size=page_size)
 
                 tokens = list(range(sequence_length))
-                key = cache.make_radix_key(tokens)
+                key = RadixKey(tokens)
                 cache.insert(
                     InsertParams(
                         key=key,
@@ -557,9 +555,7 @@ class TestRadixCache(unittest.TestCase):
                     )
                 )
 
-                result = cache.match_prefix(
-                    MatchPrefixParams(key=cache.make_radix_key(tokens))
-                )
+                result = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
                 self.assertGreater(len(result.device_indices), 0)
 
                 # Match length should be page-aligned

@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -334,7 +335,7 @@ def _insert_seq(env, seq):
     if env.has_mamba:
         req = env.make_req()
         mamba_val = req.mamba_pool_idx.unsqueeze(0)
-    key = env.tree.make_radix_key(seq)
+    key = RadixKey(seq)
     env.tree.insert(InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val))
     return True
 
@@ -356,7 +357,7 @@ def _fill_no_evict(env):
         if env.has_mamba:
             req = env.make_req()
             mamba_val = req.mamba_pool_idx.unsqueeze(0)
-        key = env.tree.make_radix_key(seq)
+        key = RadixKey(seq)
         env.tree.insert(
             InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val)
         )
@@ -504,7 +505,7 @@ def bench_match_prefix(
             queries.append([rng.randint(1, 32000)] * rng.randint(50, 300))
 
     def verify_fn(q):
-        k = env.tree.make_radix_key(q)
+        k = RadixKey(q)
         r1 = env.tree.match_prefix(MatchPrefixParams(key=k))
         r2 = env.tree.match_prefix(MatchPrefixParams(key=k))
         assert len(r1.device_indices) == len(r2.device_indices), "match not idempotent"
@@ -513,9 +514,7 @@ def bench_match_prefix(
     return bench_api(
         "match_prefix",
         lambda: queries,
-        lambda q: env.tree.match_prefix(
-            MatchPrefixParams(key=env.tree.make_radix_key(q))
-        ),
+        lambda q: env.tree.match_prefix(MatchPrefixParams(key=RadixKey(q))),
         min(len(queries) - warmup, num_seqs),
         env.avg_tokens,
         warmup,
@@ -567,7 +566,7 @@ def bench_lock_unlock(
 
     nodes = []
     for seq in env.seqs[: num_seqs // 2]:
-        r = env.tree.match_prefix(MatchPrefixParams(key=env.tree.make_radix_key(seq)))
+        r = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
         if r.last_device_node != env.tree.root_node:
             nodes.append(r.last_device_node)
     if not nodes:
@@ -614,7 +613,7 @@ def bench_cache_finished(
     # Pre-build Req objects with token IDs filled into req_to_token
     req_items: list = []
     for seq in env.seqs:
-        key = env.tree.make_radix_key(seq)
+        key = RadixKey(seq)
         mr = env.tree.match_prefix(MatchPrefixParams(key=key))
         matched_len = len(mr.device_indices)
         node = mr.last_device_node
