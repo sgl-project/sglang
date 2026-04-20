@@ -6,7 +6,7 @@
 # per-expert bias correction, shared (always-active) experts, and SwiGLU MLP.
 #
 # Reference: vLLM implementation merged at
-#   https://github.com/vllm-project/vllm (param2moe branch)
+#   https://github.com/vllm-project/vllm/pull/38000 (param2moe branch)
 """SGLang Param2MoE model."""
 
 import logging
