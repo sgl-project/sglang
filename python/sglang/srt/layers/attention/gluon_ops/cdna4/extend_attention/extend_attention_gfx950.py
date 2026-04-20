@@ -3,21 +3,15 @@
 
 """Gluon extend-attention dispatch for gfx950 (MI350X / CDNA4).
 
-Symmetric heads only (Lq == Lv): D64, D128, D256.
-Mixed-dim / DeepSeek MLA heads (Lq != Lv) are handled by mla_prefill/.
+Public entry point: :func:`gluon_extend_attention_fwd`. Supports symmetric
+heads only (Lq == Lv) at D in {64, 128, 256} with BF16 or FP8 KV cache.
+Mixed-dim / DeepSeek MLA heads live on a separate ``mla_prefill`` branch
+and are out of scope here.
 
-The public entry point is gluon_extend_attention_fwd().
-
-Known tech debt (deferred to fast-follow refactor):
-- BLOCK_DPE / ACTUAL_BLOCK_DPE constexpr scaffolding is threaded through
-  every kernel call site but is always 0 on this (symmetric) branch.
-  It exists so the kernels stay source-compatible with the MLA prefill
-  branch where DPE > 0. Removing it here is safe but mechanically large
-  (~30 call sites * 4 kernel files + _common.py helpers); do it in a
-  dedicated refactor PR after this branch merges.
-- _bf16_extend_gfx950.py and _bf16_extend_persistent_gfx950.py share
-  >90% of their body and can be collapsed once the persistent-grid
-  scheduling is factored out. Same for the two FP8 kernels.
+Dispatch picks between four kernel bodies (BF16 basic, BF16 WCA persistent,
+FP8 basic, FP8 WCA persistent) via a config-keyed cache; on cache hit the
+launcher invokes HIPLauncher directly and bypasses Triton's JITFunction
+specialization.
 """
 
 import functools
@@ -49,61 +43,34 @@ from ._fp8_kv_extend_basic_gfx950 import (
     gluon_extend_attn_fwd_basic as _gluon_extend_attn_fwd_fp8_basic,
 )
 
-_gluon_extend_attn_fwd_symmetric_d128_experimental = None
-_launch_d128_decode1_wca_experimental = None
-try:
-    from ._gluon_kernel_symmetric_d128_experimental import (
-        gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric_d128_experimental,
-        launch_d128_decode1_wca as _launch_d128_decode1_wca_experimental,
-    )
-except ImportError:
-    pass
-
 _dummy_cm = None
 _dummy_mi = None
 _dummy_mi_size = 0
 _dummy_wkvo = None
 _dummy_wkvo_size = 0
-# Sinks tensor is consumed only when HAS_SINK=True. For HAS_SINK=False we
-# still need *some* tensor to pass through the HIPLauncher (arg list is
-# fixed; the kernel body never loads from it under HAS_SINK=False). Keep a
-# single 1-element bf16 tensor around; dtype matches the common sinks
-# dtype for GPT-OSS/Gemma and the kernel body's unused-load branch is DCE'd.
+# Singleton passed to the kernel when HAS_SINK=False (HIPLauncher arg list
+# is fixed; the kernel body never loads from it and DCE eliminates the path).
 _dummy_sinks = None
 
 _LOGGED_FP8_KV_MODE = False
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
 # Config-keyed dispatch cache.
 #
-# Problem: max_len_extend and batch_size change every scheduling step in
-# real serving, so a cache keyed on exact (batch_size, max_len_extend) will
-# NEVER hit in production.
+# Key on the OUTPUT of `_get_basic_dispatch_config` rather than the raw
+# (batch_size, max_len_extend) input. Dispatch is a step function with
+# ~6 configs per (Lq, is_fp8) pair, so calls that land on the same config
+# share one cache entry regardless of the exact driving inputs. Hit rate
+# is near-100% in production; per-call we only recompute grid = (B, H,
+# ceildiv(max_len_extend, BM)).
 #
-# Fix: key the cache on the CONFIG OUTPUT of _get_basic_dispatch_config(),
-# not the input.  The dispatch logic is a step function with ~6 distinct
-# configs per (Lq, is_fp8) pair.  Two calls that produce the same
-# (BM, BN, NW, NS, ...) tuple share one cache entry regardless of the
-# exact batch_size/max_len_extend that produced it.
-#
-# Per-call, we recompute only:
-#   grid = (batch_size, head_num, ceildiv(max_len_extend, BM))
-# which is one integer division (~10ns).
-# ---------------------------------------------------------------------------
-# config_key -> ("fast", fast_run_closure, sm, strides, BM)
-# All paths (BF16 and FP8) now invoke HIPLauncher directly via
-# _make_fast_runner / _make_fast_runner_fp8, bypassing ~40-60us/call of
-# JITFunction.run specialization overhead (see profile_fast_path.py). The
-# "legacy" tag is still handled in _run_config_cache_entry as a forward-
-# compat fallback but is no longer inserted into the cache.
+# Entry layout: ("fast", fast_run_closure, sm, strides, BM). Both BF16 and
+# FP8 paths use `_make_fast_runner` / `_make_fast_runner_fp8` to invoke the
+# HIPLauncher directly, bypassing Triton's JITFunction specialization.
 _config_cache = {}
 
-# Dispatch-path counters. Incremented on every call so we can prove whether
-# the fast-path cache is actually hitting at E2E time vs silently routing
-# through WCA / slow first-call JIT / full dispatch. Flip SGLANG_GLUON_TRACE=1
-# to get a WARN log every N calls summarising the breakdown; otherwise the
-# counters are free.
+# Dispatch-path counters. Set SGLANG_GLUON_TRACE=<N> to get a WARN log every
+# N calls summarising where calls landed; unset they are effectively free.
 _dispatch_counters = {
     "total": 0,
     "early_cache_hit": 0,       # uniform_like fast-path hit
@@ -122,24 +89,20 @@ def _bump_dispatch(key):
     _maybe_trace_dispatch()
 
 
-_CACHED_ENV_TRACE = None
+_TRACE_INTERVAL = int(os.getenv("SGLANG_GLUON_TRACE", "0"))
 _TRACE_LAST_TOTAL = 0
 
 
 def _trace_enabled():
-    global _CACHED_ENV_TRACE
-    if _CACHED_ENV_TRACE is None:
-        _CACHED_ENV_TRACE = int(os.getenv("SGLANG_GLUON_TRACE", "0"))
-    return _CACHED_ENV_TRACE
+    return _TRACE_INTERVAL
 
 
 def _maybe_trace_dispatch():
-    interval = _trace_enabled()
-    if interval <= 0:
+    if _TRACE_INTERVAL <= 0:
         return
     global _TRACE_LAST_TOTAL
     total = _dispatch_counters["total"]
-    if total - _TRACE_LAST_TOTAL < interval:
+    if total - _TRACE_LAST_TOTAL < _TRACE_INTERVAL:
         return
     _TRACE_LAST_TOTAL = total
     parts = [f"total={total}"]
@@ -179,102 +142,46 @@ def _ensure_dummies(device, mi_size, wkvo_size):
         _dummy_sinks = torch.zeros(1, dtype=torch.bfloat16, device=device)
 
 
-_CACHED_ENV_FP8_KV_FORCE_BF16 = None
-_CACHED_ENV_D128_EXPERIMENTAL = None
-_CACHED_ENV_UNIFY_CAUSAL_PATH = None
-# Hot-path env-var caches: resolved once at module import so the hot
-# dispatcher can read these with a plain global load (~50 ns) instead
-# of paying ~370 ns for a function call + `is None` check every call.
-# These are debug-only knobs that never change within a process, so
-# eager evaluation is safe.
+# Env escape hatches: read once at import time so per-call cost is a
+# simple global lookup. Semantics:
+#   SGLANG_GLUON_DISABLE_CFG_CACHE=1  bypass the fast-runner cache entirely
+#   SGLANG_GLUON_FP8_KV_FORCE_BF16=1  route FP8 KV through the BF16 kernels
+#                                     (pays a per-call dtype cast)
+#   SGLANG_GLUON_UNIFY_CAUSAL_PATH=1  collapse the causal kernel's
+#                                     full/masked split into one loop
 _CFG_CACHE_DISABLED = int(os.getenv("SGLANG_GLUON_DISABLE_CFG_CACHE", "0")) != 0
-_D128_EXPERIMENTAL_ENV = int(os.getenv("SGLANG_GLUON_D128_EXPERIMENTAL", "0")) != 0
-
-
-def _cfg_cache_disabled():
-    """Debug escape hatch: bypass the _config_cache fast path entirely.
-
-    When SGLANG_GLUON_DISABLE_CFG_CACHE=1, every extend call goes through
-    the full dispatch (JITFunction.run) instead of the cached CompiledKernel
-    direct-invoke path. Used to isolate whether fast-path caching is
-    responsible for production crashes / correctness issues.
-    """
-    return _CFG_CACHE_DISABLED
+_FP8_KV_FORCE_BF16 = int(os.getenv("SGLANG_GLUON_FP8_KV_FORCE_BF16", "0")) != 0
+_UNIFY_CAUSAL_PATH = int(os.getenv("SGLANG_GLUON_UNIFY_CAUSAL_PATH", "0")) != 0
 
 
 def _use_fp8_kv_bf16_bridge():
-    """Whether to force fp8 KV -> bf16-kernel bridge path.
-
-    When enabled, fp8 prefix KV cache tensors are cast to bf16 and dispatched
-    through the bf16 Gluon kernels. This is intended as a global fallback /
-    perf-regression escape hatch during fp8 rollout.
-    """
-    global _CACHED_ENV_FP8_KV_FORCE_BF16
-    if _CACHED_ENV_FP8_KV_FORCE_BF16 is None:
-        _CACHED_ENV_FP8_KV_FORCE_BF16 = (
-            int(os.getenv("SGLANG_GLUON_FP8_KV_FORCE_BF16", "0")) != 0
-        )
-    return _CACHED_ENV_FP8_KV_FORCE_BF16
-
-
-def _use_d128_experimental_kernel():
-    """Whether to route D128 symmetric path to the experimental kernel fork."""
-    return (
-        _D128_EXPERIMENTAL_ENV
-        and _gluon_extend_attn_fwd_symmetric_d128_experimental is not None
-    )
+    return _FP8_KV_FORCE_BF16
 
 
 def _use_unify_causal_path():
-    """Whether to force the causal masked path to process all blocks in a
-    single pipelined loop (n_full_blocks=0).
-
-    The split full/masked path pays a pipeline drain + barrier cost when
-    transitioning between the unmasked and masked sections. For causal
-    attention, processing everything as masked (mask is a no-op below the
-    diagonal) lets the pipeline run uninterrupted. Matches the CK-style
-    experimental kernel's approach.
-    """
-    global _CACHED_ENV_UNIFY_CAUSAL_PATH
-    if _CACHED_ENV_UNIFY_CAUSAL_PATH is None:
-        _CACHED_ENV_UNIFY_CAUSAL_PATH = (
-            int(os.getenv("SGLANG_GLUON_UNIFY_CAUSAL_PATH", "0")) != 0
-        )
-    return _CACHED_ENV_UNIFY_CAUSAL_PATH
+    return _UNIFY_CAUSAL_PATH
 
 
 _cached_num_xcds = {}
 
 
 def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
-    """Build a closure that bypasses Triton's JITFunction.run specialization
-    (~55 us/call, see profile_fast_path.py) AND `compiled_kernel[grid]` closure
-    indirection by invoking the HIPLauncher directly.
+    """Build a HIPLauncher-direct closure for the BF16 basic kernel.
 
-    Once we know which dispatch-config applies, all constexprs are fixed.
-    The only things that change per call are the 12 tensors, `sm_scale`,
-    the 12 stride ints, and the 3-int grid. Everything else is baked into
-    the closure.
+    Once dispatch has picked a config, all constexprs are fixed; only the
+    tensors, sm_scale, 12 stride ints, and grid change per call. Baking the
+    constexprs into a closure avoids Triton's JITFunction specialization
+    pass on every launch.
 
-    Call chain is now: `gluon_extend_attention_fwd` -> `_fast_run` ->
-    `HIPLauncher.__call__` -> `hip_utils.launch`. We skip Triton's
-    `JITFunction.run` and the intermediate `runner` closure from
-    `CompiledKernel.__getitem__`.
-
-    Signature for the returned callable:
-        fast_run(q, k, v, o, kb, vb, qo_i, kv_i, kv_x,
-                 mask, mi, wkvo, sm_scale, strides_tuple, grid)
-
-    Assumes `knobs.runtime.launch_enter_hook` / `launch_exit_hook` are None
-    at closure construction time (the common case with no profiler). If hooks
-    get installed later, the cached closure won't see them; callers that need
-    profiler integration should clear `_config_cache`.
+    Assumes ``knobs.runtime.launch_enter_hook`` / ``launch_exit_hook`` are
+    ``None`` at construction time. Callers that later install a profiler
+    should clear ``_config_cache`` so the closures are rebuilt.
     """
-    from triton.runtime import driver as _triton_driver  # local import: keep cold-path overhead out of top-level imports
+    from triton.runtime import driver as _triton_driver
     from triton import knobs as _triton_knobs
 
     compiled_kernel._init_handles()
-    _hip_launcher = compiled_kernel.run  # returns HIPLauncher.__call__ (memoized)
+    _hip_launcher = compiled_kernel.run
     _fn_handle = compiled_kernel.function
     _packed_md = compiled_kernel.packed_metadata
     _active = _triton_driver.active
@@ -291,10 +198,9 @@ def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
     BLOCK_DMODEL = frozen_kw['BLOCK_DMODEL']
     ACTUAL_BLOCK_DMODEL = frozen_kw['ACTUAL_BLOCK_DMODEL']
     NUM_STAGES = frozen_kw['NUM_STAGES']
-    # Sinks tensor is a RUNTIME arg (pointer differs per layer for GPT-OSS).
-    # HAS_SINK is a compile-time constant baked into the specialized kernel,
-    # so swapping the Sinks pointer across calls is safe as long as the
-    # cache key discriminates HAS_SINK=True vs HAS_SINK=False (it does).
+    # Sinks pointer is a runtime arg (varies per layer on GPT-OSS); HAS_SINK
+    # is a compile-time constant baked into the specialized kernel and part
+    # of the cache key, so swapping the pointer across calls is safe.
     HAS_SINK = frozen_kw['HAS_SINK']
     LOGIT_CAP = frozen_kw['LOGIT_CAP']
     XAI_TEMPERATURE_LEN = frozen_kw['XAI_TEMPERATURE_LEN']
@@ -327,16 +233,13 @@ def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
 
 
 def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
-    """FP8 twin of `_make_fast_runner`. The FP8 kernel has more constexprs
-    than BF16 (SKIP_PREFIX_CUSTOM_MASK, ENABLE_MASK_SPLIT, BLOCK_DPE/DV,
-    EXT_BLOCK_N/NUM_STAGES, ASYNC_PAD_K/V) so the HIPLauncher positional
-    arg list is longer. Signature order here must match the `@gluon.jit`
-    definition in `_fp8_kv_extend_basic_gfx950.py`.
-    
-    Before this existed, the FP8 path fell back to `JITFunction.run` every
-    call (~40-60 us of Python overhead), which swamped the GPU work on
-    small-batch ShareGPT shapes. With the fast path in place, the FP8
-    hot path is cut to a single direct HIPLauncher call (~5-10 us).
+    """FP8 twin of :func:`_make_fast_runner`.
+
+    The FP8 kernel signature carries extra constexprs
+    (``SKIP_PREFIX_CUSTOM_MASK``, ``ENABLE_MASK_SPLIT``, ``BLOCK_DPE``/``DV``,
+    ``EXT_BLOCK_N``/``EXT_NUM_STAGES``, ``ASYNC_PAD_K``/``V``) so the arg list
+    is longer; order below matches the ``@gluon.jit`` definition in
+    ``_fp8_kv_extend_basic_gfx950.py``.
     """
     from triton.runtime import driver as _triton_driver
     from triton import knobs as _triton_knobs
@@ -407,13 +310,10 @@ def _get_num_xcds(device):
     idx = device.index if hasattr(device, 'index') and device.index is not None else 0
     if idx not in _cached_num_xcds:
         num_CUs = torch.cuda.get_device_properties(device).multi_processor_count
-        # MI350X: 256 CUs / 8 XCDs = 32 CUs/XCD
-        # MI300X: 304 CUs / 8 XCDs = 38 CUs/XCD
+        # 38 CUs/XCD on MI300X (304/8); MI350X has 32 CUs/XCD (256/8) but
+        # both divide cleanly enough here to not need special-casing.
         _cached_num_xcds[idx] = max(1, num_CUs // 38)
     return _cached_num_xcds[idx]
-
-
-# _resolve_qk_split_dims is imported from _launch_helpers
 
 
 def _select_d256_dispatch(
@@ -424,44 +324,27 @@ def _select_d256_dispatch(
     total_extend_len: int,
     avg_pfx_proxy: int = 0,
 ):
-    """D=256 launch policy — prior tree with Apr 2026 oracle overrides.
+    """D=256 launch policy (Gemma-style models).
 
-    Overrides vs prior tree:
-      - B>=4 ext>=256:           BM128 BN32 NW8 NS1  (oracle +31-43% over NS=3)
-      - B=1 ext in [2048,4096):  BM128 BN32 NW8 NS1  (oracle +6-13%)
-      - B=1 ext>=4096 small pfx: BM128 BN32 NW8 NS2  (v3: pipeline hides
-                                                      long-ext latency better
-                                                      when there's no prefix
-                                                      to amortize it over)
-      - B=1 ext>=4096 large pfx: BM128 BN32 NW8 NS1  (prefix-heavy; NS=1 fine)
+    Narrow oracle-tuned overrides for B>=4 ext>=256 and B=1 ext>=2048 fire
+    first; everything else falls through to the prior tree. ``avg_pfx_proxy``
+    is a coarse proxy for avg prefix length supplied by the caller when
+    ``total_prefix_len`` is not threaded through.
 
-    Everything else keeps the prior selector's choice. The prior tree
-    was ignoring `total_prefix_len` (always called with 0) in basic
-    dispatch, which meant its `prefix_frac` branch fired for all
-    ext<768 shapes; retaining that behavior avoids regressing shapes
-    the oracle did not sample.
-
-    `avg_pfx_proxy` is an approximation of avg prefix length supplied by
-    the caller when the raw `total_prefix_len` is not threaded through.
+    NS=1 is avoided even where it would win: the prefix-pipelined kernel
+    hard-asserts NS>=2 for determinism, so NS=2 is used throughout at a
+    3-6% cost (within BF16 noise) on shapes where NS=1 would have won.
     """
     total_tokens = max(1, total_prefix_len + total_extend_len)
     prefix_frac = total_prefix_len / total_tokens
     ext_ratio = max_len_extend / max(1, min_len_extend)
     avg_pfx = total_prefix_len // max(1, batch_size)
-    avg_pfx_hint = max(avg_pfx, avg_pfx_proxy)
 
-    # D=256 "big" shapes go to BM=128 NW=8 NS=2. NS=1 was the oracle winner
-    # but it compile-error/NaNs on the prefix-pipelined path (hard
-    # tl.static_assert(NS>=2) for determinism) and on zero-prefix variants
-    # that route to the same kernel. NS=2 costs 3-6% (within BF16 noise) on
-    # the shapes where NS=1 would have won, in exchange for all feature
-    # combos and all batch sizes being correct.
     if batch_size >= 4 and max_len_extend >= 256:
         return 128, 8, 2, 16, 16
     if batch_size == 1 and max_len_extend >= 2048:
         return 128, 8, 2, 16, 16
 
-    # Prior tree (unchanged logic, for shapes outside oracle domain).
     if max_len_extend >= 768:
         if batch_size <= 2:
             return 64, 4, 2, 16, 16
@@ -486,9 +369,7 @@ def _select_d256_dispatch(
     return 64, 8, 4, 16, 16
 
 
-# ===-----------------------------------------------------------------------===#
-# Cached dispatch config (AITER-style per-shape lookup)
-# ===-----------------------------------------------------------------------===#
+# Cached dispatch config (AITER-style per-shape lookup).
 
 _CACHED_FP8_ENV = None
 
@@ -532,37 +413,23 @@ def _get_basic_dispatch_config(
     Lq, batch_size, max_len_extend, pfx_bucket, is_fp8, sliding_window_size=-1,
     head_num=None,
 ):
-    """Return (BLOCK_M, BLOCK_N, num_warps, NUM_STAGES, PAD_K, PAD_V,
-              EXT_BLOCK_N, EXT_NUM_STAGES) for the basic (non-persistent) path.
+    """Pick (BLOCK_M, BLOCK_N, num_warps, NUM_STAGES, PAD_K, PAD_V,
+    EXT_BLOCK_N, EXT_NUM_STAGES) for the basic (non-persistent) kernel.
 
-    Cached per shape signature. pfx_bucket buckets avg prefix length (see
-    _pfx_bucket) so the cache stays small while exposing the prefix-vs-no-
-    prefix distinction the oracle identified as first-order.
+    Cached per shape signature. ``pfx_bucket`` buckets avg prefix length
+    (see :func:`_pfx_bucket`) so the cache stays small while keeping the
+    prefix-vs-no-prefix distinction. ``sliding_window_size`` selects SWA
+    configs where a smaller BM tends to win.
 
-    sliding_window_size lets us pick configs tuned for SWA shapes. When SWA
-    is active with sw < max_len_extend, each tile's useful KV range is at
-    most ~(BM + sw) columns, so a smaller BM + fewer warps tends to beat the
-    large-BM configs we'd pick for plain prefill at the same seqlen.
-
-    head_num is the number of Q heads. B=1 tuning uses it to choose BM:
-    the win from larger BM (256 NW=8) depends on whether the resulting
-    grid (1, H, ceil(S/BM)) fills enough waves across 256 CUs. H=64 hits
-    the sweet-spot at S>=1600 (D=64) / S>=2000 (D=128); H=32 needs larger
-    S before the half-wave penalty stops dominating.
+    ``head_num`` is the number of Q heads; B=1 uses it to choose BM since
+    the win from BM=256 depends on how the grid ``(1, H, ceil(S/BM))`` fills
+    waves across 256 CUs.
     """
     if Lq == 256:
         _BN = 32
         _total_ext = batch_size * max_len_extend
-        # Mirror prior behavior: pass 0 as total_prefix_len so the selector's
-        # fallback tree sees prefix_frac=0 (same as pre-retune code). The
-        # narrow oracle-proven overrides inside _select_d256_dispatch fire
-        # before that fallback and do not depend on total_prefix_len.
-        #
-        # Supply a coarse avg-prefix proxy derived from pfx_bucket so the
-        # v3 B=1 ext>=4096 small-vs-large-prefix split can take effect.
-        # Thresholds mirror _pfx_bucket: bucket<=1 -> avg<512 -> proxy 0;
-        # bucket==2 -> avg in [512,2048) -> proxy ~1024 (< 2048 cutoff);
-        # bucket>=3 -> avg>=2048 -> proxy 2048+.
+        # Coarse avg-prefix proxy derived from pfx_bucket (matches
+        # _pfx_bucket thresholds).
         _avg_pfx_proxy = (
             0 if pfx_bucket <= 1
             else 1024 if pfx_bucket == 2
@@ -574,8 +441,8 @@ def _get_basic_dispatch_config(
             avg_pfx_proxy=_avg_pfx_proxy,
         )
     elif Lq == 64:
-        # D=64 BF16 basic dispatch. Tree is tuned per-shape against the
-        # AITER/CK reference; see bench_fp8_vs_ck.py for the grid.
+        # D=64 BF16 basic dispatch tree. Per-shape winners from the
+        # AITER/CK grid (see bench_fp8_vs_ck.py).
         _PAD_K, _PAD_V = 16, 16
         _total_ext = batch_size * max_len_extend
         _BN = 64
@@ -593,16 +460,11 @@ def _get_basic_dispatch_config(
             else:
                 _BM, _NW, _NS = 64, 4, 4
         else:
-            # B=1..3 single/small-seq serving (GPT-OSS 120B, ShareGPT). The
-            # B=1 cross-over from BM=128 NW=8 NS=4 to BM=256 NW=8 depends
-            # on H_q: H_q>=64 (TP=1 GPT-OSS 120B) hits the BM=256 sweet-
-            # spot at S>=1600 (15-20% GPU win at S=2000-4000; BM=128 still
-            # wins by ~4% at S=1500 because ceil(1500/256)*64 = 384 CTAs
-            # = 1.5 waves of BM=256 wastes half a wave). H_q=32 (TP=2)
-            # reaches BM=256 earlier at S>=1500 because the already-low
-            # wave count means BM=256's bigger per-tile work dominates
-            # before the half-wave-waste penalty bites. B=2,3 rare het-
-            # batch tail keeps the conservative S>=2048 boundary.
+            # B=1..3 single/small-seq serving. The B=1 cross-over from
+            # BM=128 NW=8 NS=4 to BM=256 NW=8 depends on H_q: H_q>=64 wants
+            # S>=1600 and H_q=32 wants S>=1500 (lower H already under-
+            # subscribes so BM=256's bigger per-tile work dominates earlier).
+            # B=2,3 keep the conservative S>=2048 boundary.
             _h = head_num if head_num is not None else 0
             if batch_size == 1 and _h >= 64 and max_len_extend >= 1600:
                 _BM, _NW, _NS = 256, 8, 2
@@ -613,8 +475,8 @@ def _get_basic_dispatch_config(
             else:
                 _BM, _NW, _NS = 128, 8, 4
 
-        # B>=16 ext==256 full-attn misdispatches to BM=64 (tile count
-        # undersubscribes 256 CUs by 4x); route to BM=256.
+        # B>=16 ext==256 full-attn misdispatches to BM=64 (undersubscribes
+        # 256 CUs by 4x); route to BM=256.
         if (
             sliding_window_size <= 0
             and batch_size >= 16 and max_len_extend == 256
@@ -622,13 +484,9 @@ def _get_basic_dispatch_config(
             _BM, _BN, _NW, _NS = 256, 64, 8, 2
             _EXT_BN, _EXT_NS = 64, 2
 
-        # BM=256 NW=8 NS=2 picks up an extra stage on prefill shapes that
-        # still have occupancy headroom (max_ext <= 8192 or total_ext <=
-        # 32768); gate NS=4 out of small-ext spec-decode. B=1 single-seq
-        # ShareGPT prefill already sits at the occupancy floor (one q-tile
-        # row per wave), so the extra NS=4 stage eats LDS/registers without
-        # overlapping anything: NS=2 benches 1-3% faster at S in [1600, 8192]
-        # for D=64 H_q=64 B=1 (fine sweep). Gate it out.
+        # BM=256 NW=8 gets an extra stage on batched prefill shapes with
+        # occupancy headroom. Skip for B=1 — single-seq ShareGPT already sits
+        # at the occupancy floor and the extra stage only eats LDS/regs.
         if (
             _BM == 256 and _NW == 8 and _NS == 2
             and max_len_extend >= 1024
@@ -637,11 +495,15 @@ def _get_basic_dispatch_config(
         ):
             _NS = 4
     else:
-        # D=128 BF16 basic dispatch. The pipelined paths (NW=8) require
-        # NS>=2 on the prefix phase -- NS=1 races on the prefix-pipelined
-        # DMA ring (attn_fwd_inner_prefix_pipelined) and benches within
-        # +-3% of NS=2 on D=128 prefill so the correctness tradeoff is
-        # free.
+        # D=128 BF16 basic dispatch. NS=1 is unsafe on the prefix-
+        # pipelined path (races on the DMA ring) and benches within +-3%
+        # of NS=2, so NS>=2 throughout.
+        #
+        # Note: BM=256 NW=8 NS=2 is avoided at D=128 — it has a latent
+        # reduction-order issue (max_err ~5e-3 to 1.3e-2 on ~0.1% of outputs,
+        # concentrated on a few head-dim lanes). BM=128 NS=2 at H>=64 is
+        # correct and captures most of the win; H=32 stays on BM=64 NW=4
+        # since BM=128 cannot fill enough waves to hide the bigger tile work.
         _BN = 64
         _PAD_K, _PAD_V = 16, 16
         _total_ext = batch_size * max_len_extend
@@ -654,22 +516,6 @@ def _get_basic_dispatch_config(
         elif pfx_bucket >= 2 and max_len_extend >= 2048:
             _BM, _NW, _NS = 128, 8, 2
         elif batch_size == 1:
-            # Single-seq prefill (ShareGPT median). Head-count-aware:
-            #   H_q=64 (Llama-70B TP=1, Llama-8B TP=1, Qwen-7B TP=1, Mistral
-            #     TP=1, etc.): BM=128 NW=8 wins 3-6% vs BM=64 NW=4 at
-            #     S>=1024. NS=2 at S>=2000 is a further small win.
-            #   H_q=32 (TP=2 of above): halved tile parallelism means BM=64
-            #     NW=4 is the sweet spot end-to-end. BM=128 NW=8 NS=2 is
-            #     2.5% slower at H=32 S>=4000 (cannot fill enough waves to
-            #     hide the bigger tile work), and BM=256 NS=2 is ruled out
-            #     for correctness (see below).
-            # BM=256 NW=8 NS=2 is avoided at D=128 throughout: the pipelined
-            # NS=2 path has a latent reduction-order issue on ~0.1% of output
-            # elements (max_err ~5e-3 to 1.3e-2, concentrated on specific
-            # head-dim lanes like D_idx=23). NS=4 is numerically clean but
-            # ~60% slower than NS=2 at these shapes, so we stay on BM=128
-            # NS=2 at H=64 which is correct AND captures most of the perf
-            # win vs the prior BM=64 NW=4 default.
             _h = head_num if head_num is not None else 0
             if _h >= 64 and max_len_extend >= 2000:
                 _BM, _NW, _NS = 128, 8, 2
@@ -680,24 +526,16 @@ def _get_basic_dispatch_config(
         elif batch_size <= 4:
             _BM, _NW, _NS = 64, 4, 2
         elif _total_ext >= 32768:
-            # Avoid BM=256 NW=8 NS=2 at D=128 (same pipelined-NS=2 issue as
-            # above); BM=128 NS=2 is within 5-8% and numerically clean.
             _BM, _NW, _NS = 128, 8, 2
         else:
             _BM, _NW, _NS = 64, 4, 2
 
     if is_fp8:
-        # FP8 basic dispatch. Two hard invariants shape the configs here:
-        #   1. NS=2 is the floor for the 8-warp pipelined path -- NS=1 is
-        #      bit-nondeterministic because the DMA write / LDS read
-        #      clusters rotate across iterations with a single physical
-        #      buffer and `membarFilter` skips barriers between
-        #      syncedViaAsyncWait ops at the cluster boundary. NS>=3
-        #      OOMs LDS at BN=128 (per-stage K+V ~= 64 KB; 160 KB/CU).
-        #   2. D<128 currently only has the NW=4 NS=1 serial path; the
-        #      pipelined D<128 layouts are not wired up. BM=256 at NW=4
-        #      blows register pressure (DQ registers span 256 rows,
-        #      2-3x slower than BM=128), so BM<=128 throughout.
+        # FP8 basic dispatch. Invariants:
+        #   * NS>=2 on the 8-warp pipelined path (NS=1 is
+        #     bit-nondeterministic; NS>=3 OOMs LDS at BN=128).
+        #   * D<128 only has the NW=4 NS=1 serial path; pipelined layouts
+        #     are not wired up. BM>128 at NW=4 blows register pressure.
         _PAD_K, _PAD_V = 16, 16
         _total_ext = batch_size * max_len_extend
         if Lq == 128:
@@ -711,18 +549,12 @@ def _get_basic_dispatch_config(
                 and pfx_bucket <= 2
             ):
                 # Decode / spec-verify / draft-extend on short-prefix
-                # continuous batches: BM=64 NW=4 avoids wasted-row work
-                # (only `ext` of BM rows are valid) and frees warps for
-                # DMA overlap. +31-40% vs BM=128 NW=8 across B>=32 ext<=8
-                # at avg_pfx<=2048.
+                # continuous batches: BM=64 NW=4 avoids pad-heavy tiles.
                 _BM, _NW = 64, 4
         elif Lq == 64:
             _BM, _BN, _NW, _NS = 128, 128, 4, 1
             _EXT_BN, _EXT_NS = 128, 1
-            # BM=64 wins at every decode/verify-like shape where tiles
-            # are pad-heavy. At qH=64 even B=8 saturates 256 CUs enough
-            # that the smaller-BM waves hide memory latency better.
-            # Covers: high-B short-ext (existing), low-B ext<=8.
+            # BM=64 wins wherever tiles are pad-heavy.
             if max_len_extend <= 8 or (
                 batch_size >= 16 and max_len_extend <= 128
             ):
@@ -740,12 +572,10 @@ def _get_basic_dispatch_config(
         _EXT_BN = _BN
         _EXT_NS = _NS
 
-    # BF16 D=64 SWA-aware BM override. Under SWA the per-tile key band is
-    # ~(BM + sw) keys wide regardless of tile count, so BM=256 (which is
-    # the base-tree win for plain causal at this head-dim) wastes work.
-    # Smaller BM / fewer warps splits the (static) window across more CTAs
-    # and lets the scheduler hide memory latency across more in-flight
-    # waves. Gates tuned on GPT-OSS-rank D=64 H=32 kvH=4 sw=127.
+    # BF16 D=64 SWA override. The per-tile key band is ~(BM + sw) wide
+    # regardless of tile count, so BM=256 (base-tree win for plain causal)
+    # wastes work. Smaller BM splits the static window across more CTAs
+    # and hides memory latency. Gates tuned on D=64 H=32 kvH=4 sw=127.
     if (
         not is_fp8
         and Lq == 64
@@ -809,21 +639,16 @@ def gluon_extend_attention_fwd(
     use_rfidx_prefix=False,
 ):
     global _LOGGED_FP8_KV_MODE
-    # Pull q/qo shape tuples once: avoids repeated PyObject shape-attr loads
-    # (TensorBase.__getattr__('shape') is ~80 ns; 4-5 of these add up to
-    # ~400 ns/call on the hot path). Cached ints are accessed via tuple
-    # indexing (~20 ns).
+    # Cache shape tuples once; downstream accesses use tuple indexing.
     _q_shape = q_extend.shape
     Lq = _q_shape[-1]
     Lv = v_extend.shape[-1]
     _kb_dtype = k_buffer.dtype
     _kv_is_fp8 = _kb_dtype is torch.float8_e4m3fn or _kb_dtype is torch.float8_e4m3fnuz
-    # All FP8 validation + bridge in one block so BF16 calls skip the 4x
-    # `if _kv_is_fp8 and ...` chain (saves ~500 ns/call on BF16 paths).
     _kv_was_fp8 = _kv_is_fp8
     if _kv_is_fp8:
-        # gfx950 MFMA expects OCP FP8 (float8_e4m3fn); FNUZ would silently
-        # double values because MFMA reads bias=7 but FNUZ is bias=8.
+        # gfx950 MFMA expects OCP FP8 (bias=7); FNUZ (bias=8) silently
+        # doubles values on this hardware.
         if _kb_dtype is torch.float8_e4m3fnuz:
             raise ValueError(
                 "Gluon FP8 extend on gfx950 requires OCP FP8 (torch.float8_e4m3fn). "
@@ -832,23 +657,22 @@ def gluon_extend_attention_fwd(
                 "Re-quantize KV buffers with torch.float8_e4m3fn, or use "
                 "SGLang's fp8_kernel.fp8_dtype which auto-selects the right format."
             )
-        # FP8 KV + custom_mask on D<=128 hits the 8-warp pipelined fallback
-        # which has IMA at NS>=2 and nondeterminism at NS=1. Use BF16 KV.
+        # FP8 KV + custom_mask on D<=128 lands on the 8-warp pipelined
+        # fallback which has IMA at NS>=2 and nondeterminism at NS=1.
         if custom_mask is not None and Lq <= 128:
             raise NotImplementedError(
                 "Gluon FP8 KV + custom_mask is not supported on D<=128. Use "
                 "BF16 KV for spec-decode verify, or set "
-                "GLUON_FP8_KV_TO_BF16_BRIDGE=1."
+                "SGLANG_GLUON_FP8_KV_FORCE_BF16=1."
             )
-        # FP8 KV + D=256 fails Triton IR lowering (MFMA_F8 at head-dim 256
-        # emits unrealized_conversion_cast the backend can't materialize).
+        # FP8 KV + D=256 fails Triton IR lowering (MFMA_F8 emits
+        # unrealized_conversion_cast the backend can't materialize).
         if Lq == 256:
             raise NotImplementedError(
                 "Gluon FP8 KV extend is not supported at head-dim 256. Use "
                 "BF16 KV (Gemma and other D=256 models ship BF16), or set "
-                "GLUON_FP8_KV_TO_BF16_BRIDGE=1."
+                "SGLANG_GLUON_FP8_KV_FORCE_BF16=1."
             )
-        # Global escape hatch: bridge fp8 KV to bf16 kernels when requested.
         if _use_fp8_kv_bf16_bridge():
             bridge_dtype = q_extend.dtype
             k_buffer = k_buffer.to(bridge_dtype)
@@ -869,90 +693,31 @@ def gluon_extend_attention_fwd(
             f"Gluon extend attention only supports symmetric heads (Lq == Lv), "
             f"got Lq={Lq}, Lv={Lv}. Use mla_prefill/ for mixed-dim DeepSeek MLA."
         )
-    # Hoist the d128-experimental env check once. The module-level globals
-    # `_D128_EXPERIMENTAL_ENV` / `_gluon_extend_attn_fwd_symmetric_d128_experimental`
-    # are resolved at import time, so this is a plain bool-AND chain with no
-    # function-call overhead (saves ~600 ns/call vs calling the helper).
-    _d128_experimental = (
-        Lq == 128
-        and _D128_EXPERIMENTAL_ENV
-        and _gluon_extend_attn_fwd_symmetric_d128_experimental is not None
+    _kernel_fn = (
+        _gluon_extend_attn_fwd_fp8_basic if _kv_is_fp8
+        else _gluon_extend_attn_fwd_symmetric
     )
-    if _kv_is_fp8:
-        _kernel_fn = _gluon_extend_attn_fwd_fp8_basic
-    elif _d128_experimental:
-        _kernel_fn = _gluon_extend_attn_fwd_symmetric_d128_experimental
-    else:
-        _kernel_fn = _gluon_extend_attn_fwd_symmetric
     batch_size = qo_indptr.shape[0] - 1
     head_num = _q_shape[1]
 
-    # Experimental D128 ext>=1 split/fix-up path:
-    # - independent D128 kernel fork
-    # - WCA-style partial-state fix-up with host merge + locks
-    if (
-        _d128_experimental
-        and (not _kv_is_fp8)
-        and custom_mask is None
-        and mask_indptr is None
-        and is_causal
-        and sliding_window_size <= 0
-    ):
-        _used = _launch_d128_decode1_wca_experimental(
-            q_extend,
-            k_extend,
-            v_extend,
-            o_extend,
-            k_buffer,
-            v_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            sm_scale=sm_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-        if _used:
-            return
-
-    # Zero-cost uniform detection: if sum of extend lengths equals
-    # batch_size * max_len_extend, every entry must equal max_len_extend
-    # (monotone sum bound). q_extend.shape[0] IS that sum. This lets the
-    # cache fast-path engage even when callers forget to pass min_len_extend,
-    # which is a common pattern in benches and some serving paths.
+    # Uniform detection without hitting the GPU: `q_extend.shape[0]`
+    # already equals sum(ext_i); if it equals B * max_ext, every seq
+    # has length max_ext.
     _total_extend_rows = _q_shape[0]
     _uniform_by_shape = (_total_extend_rows == batch_size * max_len_extend)
     _uniform_like = (batch_size <= 1 or _uniform_by_shape)
 
-    # -- Config-keyed dispatch cache --
-    # Key on the CONFIG OUTPUT, not the raw (batch_size, max_len_extend) input.
-    # The dispatch logic is a step function with ~6 configs per model, so this
-    # cache has near-100% hit rate after workup regardless of workload mix.
-    # Grid is recomputed per-call (one integer division).
-    # The fast config cache only serves the basic (non-persistent, non-splitk)
-    # code path. Treat `_force_use_persistent=False` and `_force_use_splitk=False`
-    # as compatible with the fast cache (caller explicitly asking for basic).
-    #
-    # IMPORTANT: Gate the basic-path cache on `_uniform_like`. The basic kernel
-    # dispatches a grid of (B, H, ceil(max_ext/BM)) tiles, so a heterogeneous
-    # batch with a large max/min skew makes most tiles do no useful work --
-    # WCA persistent beats basic by 10-100x on those shapes. For non-uniform
-    # batches, fall through to the `_is_ragged` WCA routing below. The
-    # persistent path has its own `_persistent_fast_cache` so het callers
-    # still get a cache-hit launch.
+    # Config-keyed dispatch cache (see module-level comment). The
+    # basic-path cache is gated on `_uniform_like` because the basic
+    # grid is `(B, H, ceil(max_ext / BM))` — heterogeneous batches
+    # waste most of those tiles and route through WCA persistent.
     _basic_forced_only = (
         (_force_use_persistent is False or _force_use_persistent is None)
         and (_force_use_splitk is False or _force_use_splitk is None)
     )
-    # Detect "small-ext + big-pfx-skew" cases (e.g. spec-decode B=8 ext=[7]*8
-    # with pfx ranging 100..8192). `_uniform_like` is True (uniform ext),
-    # but the basic path launches 1 CTA per seq/head with widely varying
-    # per-seq prefix lengths: the longest-pfx CTA dominates kernel runtime
-    # and WCA persistent wins ~1.77x. We need to exclude these from the
-    # basic cache so the ragged-routing block below can send them to WCA.
-    # Gated to D=128 because the WCA ragged-routing block below only fires
-    # for Lq==128; excluding D=64 would just force those calls into an
-    # uncached path that JITs every dispatch.
+    # Spec-decode-style small-ext + big-pfx-skew shapes look uniform but
+    # the longest-prefix CTA dominates; WCA persistent regains ~1.77x,
+    # so exclude them from the basic cache. D=128 only (below WCA branch).
     _cache_exclude_pfx_skew = (
         Lq == 128
         and batch_size >= 4
@@ -964,23 +729,9 @@ def gluon_extend_attention_fwd(
         and (_force_use_persistent is not False)
         and (_force_use_splitk is not False)
     )
-    # `_cfg_cache_eligible` is the *structural* gate: no force_* overrides,
-    # no custom mask, no sinks/window/preload hooks. The actual decision
-    # between basic-fast-path and WCA-persistent is deferred: we check the
-    # cache even for heterogeneous batches since many of them (low ext_ratio
-    # on D=64 at moderate max_ext) stay on the basic path and benefit from
-    # the same CompiledKernel closure a uniform batch installs. The WCA
-    # routing block below still fires FIRST for het shapes where WCA wins
-    # (see `_is_ragged` computation).
-    # Fast-path cache is eligible even when `sinks` or `window_kv_offsets` are
-    # supplied: `_fast_run` now accepts both as per-call tensor args
-    # (HAS_SINK / SLIDING_WINDOW_SIZE are compile-time constexprs already in
-    # the cache key, so distinct variants don't collide).
-    # Direct global read for the debug escape-hatch saves ~300 ns/call vs
-    # calling `_cfg_cache_disabled()` (function-call + is-None + return
-    # vs plain global load). The flag is eager-evaluated at module import
-    # from SGLANG_GLUON_DISABLE_CFG_CACHE, so it never changes within a
-    # process.
+    # Structural gate: no force_* overrides, no custom mask. Sinks and
+    # window_kv_offsets are runtime args keyed via HAS_SINK /
+    # SLIDING_WINDOW_SIZE, so they don't need to be part of this check.
     _cfg_cache_eligible = (
         _force_block_m is None
         and _force_block_n is None
@@ -996,28 +747,16 @@ def gluon_extend_attention_fwd(
     _has_sink = sinks is not None
 
     def _try_config_cache():
-        """Compute the cache key for the current shape and return the entry
-        if present. Called both for uniform-like batches (early fast path)
-        and heterogeneous batches that bypass WCA routing (late fast path).
-        """
+        """Return the cache entry for the current shape, or None on miss."""
         _pfx_b_local = _pfx_bucket(total_prefix_len, batch_size)
         _cfg_local = _get_basic_dispatch_config(
             Lq, batch_size, max_len_extend, _pfx_b_local, _kv_is_fp8,
             sliding_window_size=sliding_window_size,
             head_num=head_num,
         )
-        # (head_num, k_head_num) must be in the key: the fast-runner closure
-        # bakes kv_group_num, and strides are also model-dependent. Without
-        # this, processes serving multiple models (or tests cycling through
-        # specs) would alias different GQA configs to the same cache entry
-        # and launch the cached kernel with the wrong kv_group_num.
-        # `_has_sink` added so HAS_SINK-specialized kernels don't alias the
-        # HAS_SINK=False variant (kernel bodies differ).
-        # (qo/kv_indptr/kv_indices dtypes) are included because Triton
-        # specializes CompiledKernel on each tensor arg's dtype — the pointer
-        # element type is baked into SASS. SGLang's triton_backend hands us
-        # int64/int32/int64 while AITER hands us int32/int32/int64; each
-        # combination needs its own cached kernel (no cross-dtype aliasing).
+        # Key includes head_num/k_head_num (kv_group_num is baked), HAS_SINK
+        # (distinct kernel bodies), and the indptr/indices dtypes (Triton
+        # bakes pointer element type into SASS).
         return _config_cache.get(
             (_cfg_local, Lq, _kv_is_fp8,
              is_causal, logit_cap, sliding_window_size, xai_temperature_len,
@@ -1026,27 +765,11 @@ def gluon_extend_attention_fwd(
         )
 
     def _run_config_cache_entry(_cc_entry):
-        """Execute a cache hit. Returns nothing; caller must `return` after.
-         
-        CRITICAL: we MUST recompute strides from the current call's tensors
-        rather than reusing `_cc_entry`'s cached strides. The cached
-        CompiledKernel closure is correct for ANY tensor shape that matches
-        the cache-key tuple, but strides are per-call runtime args (passed
-        through HIPLauncher's arg list, not baked as constexprs). Using the
-        FIRST install's strides for layer N!=0 silently reads the wrong
-        memory when e.g. the caller's per-layer k_buffer allocation reports
-        a different stride(0) / stride(1) than the prewarm tensors did.
-        That was the root cause of the Llama-70B BF16 quality regression
-        (Apr 2026): per-layer error compounded from ~0.1 at layer 0 to
-        ~3.0 at layer 79, producing garbled text.
+        """Execute a cache hit.
 
-        Same story for sm_scale: SGLang may pass different k_scale values
-        per layer (some quantization schemes use per-layer KV scales), and
-        sm_scale is a HIPLauncher runtime arg (not a constexpr). Recompute
-        `_sm_live` from the CURRENT call's sm_scale+k_scale so the cached
-        kernel sees the right softmax scaling even when an earlier layer's
-        install wrote a different value into `_cc_sm`. The arithmetic is a
-        single multiply (~20 ns) so the defensive recompute is free.
+        Strides and sm_scale are recomputed per call: both are HIPLauncher
+        runtime args, and per-layer tensors may have different strides or
+        KV scales than the install-time sample.
         """
         _mi_n = _total_extend_rows + 1
         _wkvo_n = batch_size if batch_size > 0 else 1
@@ -1058,18 +781,12 @@ def gluon_extend_attention_fwd(
             if window_kv_offsets is not None
             else _dummy_wkvo[:_wkvo_n]
         )
-        # Single .stride() tuple-pull per tensor saves ~54% of this block's
-        # Python overhead vs 12 individual .stride(i) calls (microbench:
-        # 636 ns/call vs 1410 ns/call). At 80 layers x ~3 calls/token on
-        # Llama-70B that's ~190 us/token of avoided CPU work.
         _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
         _os = o_extend.stride(); _kbs = k_buffer.stride(); _vbs = v_buffer.stride()
         _live_strides = (
             _qs[0], _qs[1], _ks[0], _ks[1], _vs[0], _vs[1],
             _os[0], _os[1], _kbs[0], _kbs[1], _vbs[0], _vbs[1],
         )
-        # Recompute sm_scale from THIS call's values (not the cached install).
-        # k_scale may vary per layer under per-layer FP8 quantization schemes.
         _sm_live = (sm_scale if sm_scale is not None else Lq**-0.5) * k_scale
         _tag = _cc_entry[0]
         if _tag == "fast":
@@ -1085,10 +802,7 @@ def gluon_extend_attention_fwd(
                  (max_len_extend + _cc_BM - 1) // _cc_BM),
             )
         else:
-            # Legacy path (FP8): still goes through JITFunction.run with
-            # baked kwargs. The strides are still fresh per call (passed
-            # positionally below), so this path was never affected by the
-            # stale-stride bug above.
+            # Legacy JITFunction.run path, kept as a forward-compat fallback.
             _, _cc_run, _cc_sm, _cc_gn, _cc_strides, _cc_kw, _cc_BM = _cc_entry
             if "Sinks" in _cc_kw:
                 _cc_kw = {**_cc_kw, "Sinks": _sinks_arg}
@@ -1110,13 +824,10 @@ def gluon_extend_attention_fwd(
             _bump_dispatch("early_cache_hit")
             _run_config_cache_entry(_cc_entry)
             return
-        # Cache miss: fall through to normal path, which will populate the cache.
+        # Cache miss falls through to the full dispatch, which populates it.
 
-    # -- Fast path: no custom mask, no test overrides --
-    # For uniform/B=1: launches with hardcoded constants.
-    # For ragged batches with significant imbalance: routes to WCA persistent.
-    # Treat `_force_use_*=False` as "explicitly ask for basic, no persistent or
-    # splitk" which is compatible with the basic fast path.
+    # Fast-path eligibility: no custom mask, no ``_force_*`` overrides.
+    # ``_force_use_*=False`` is accepted (explicit "basic, please").
     _is_fast_eligible = (
         _force_block_m is None
         and _force_block_n is None
@@ -1126,22 +837,14 @@ def gluon_extend_attention_fwd(
     )
     _is_uniform = (batch_size <= 1 or min_len_extend == max_len_extend
                    or _uniform_by_shape)
-    # WCA auto-routing requires the caller to NOT have explicitly asked for
-    # basic (i.e. force-disabled persistent). `_is_fast_eligible` now accepts
-    # `_force_use_*=False` (so the basic config cache can fire), but we must
-    # not auto-route to WCA when the caller has explicitly asked for basic.
     _ragged_routable = (
         _is_fast_eligible
         and (_force_use_persistent is not False)
         and (_force_use_splitk is not False)
     )
     _is_ragged_ext = _ragged_routable and not _is_uniform and batch_size >= 2
-    # Extra path: "small-ext pfx-skew" cases like spec-decode batches
-    # (ext=[7]*8 with pfx ranging 100..8192). Basic launches (ceil(max_ext/BM),
-    # B*H) = (1, B*H) tiles, each serially streaming its seq's full prefix.
-    # With no per-tile rebalancing and widely varying per-seq prefix lengths,
-    # the longest-prefix CTA dominates kernel runtime. WCA persistent
-    # rebalances across CUs and regains ~1.7x on these shapes.
+    # Small-ext + big-prefix-skew (e.g. spec-decode) — looks uniform but
+    # the longest-prefix CTA dominates; WCA persistent regains ~1.7x.
     _total_pfx_est_pre = (
         total_prefix_len if total_prefix_len is not None
         else kv_indices.numel()
@@ -1154,25 +857,15 @@ def gluon_extend_attention_fwd(
     )
     _is_ragged = _is_ragged_ext or _is_ragged_pfx
 
-    # FP8 KV + ragged-extend on the WCA persistent path produces ~10% per-
-    # element error (BM=256 masked-tile-tail interacts with FP8 MFMA
-    # accumulation order). BF16 WCA is unaffected. Until fixed, route
-    # ragged FP8 to the basic dispatch (per-seq tiles, no cross-seq
-    # padding). See test_heterogeneous_batch.py for the gating test.
+    # FP8 KV + ragged on WCA persistent has ~10% per-element error
+    # (BM=256 masked-tail x FP8 MFMA accumulation order); keep FP8 het
+    # batches on the basic path until fixed.
     if _kv_is_fp8 and not _is_uniform:
         _is_ragged = False
 
-    # Ragged batches go to WCA persistent when the work imbalance dwarfs
-    # WCA's scheduler overhead. The per-head-dim gates below are calibrated
-    # against bench_real_het.py. D256 keeps the basic dispatch (the tuned
-    # tree already handles ragged well enough and WCA BM=256 has LDS issues).
-    #
-    # Fast short-circuit: for Lq=128/BF16 and B<=4 (not _is_ragged_pfx),
-    # every WCA clause requires B>=5 or B>=8 -- we can skip the entire
-    # waste_frac / _use_wca computation and fall straight through to the
-    # late cache. This trims ~10us of per-call Python overhead on the
-    # hot Llama-70B BF16 prefill shapes (B in {2,3}) that dominate
-    # production traffic. FP8 and D=64 paths still need the full block.
+    # D=128 B<=4: every WCA clause requires B>=5 so short-circuit.
+    # D=256 stays on basic (tuned tree is sufficient and WCA BM=256 has
+    # LDS issues).
     _skip_wca_check = (
         Lq == 128
         and not _kv_is_fp8
@@ -1185,31 +878,8 @@ def gluon_extend_attention_fwd(
         _waste_frac = 1.0 - _total_ext / max(1, _grid_est)
         _total_pfx_est = _total_pfx_est_pre
         if Lq == 128:
-            # B<=4 het prefill: the basic fast_run closure (BM=64 NW=4 NS=2)
-            # beats the WCA persistent launcher across the (max_ext in
-            # [1024, 4096], waste in {mild, strong}) surface. Per
-            # bench_wca_vs_basic_smallB.py (N=50 per point, Apr 2026):
-            #
-            #   geomean(WCA/basic)      basic wins ~ 1.22x
-            #   B=2: 1.22x              basic wins ~ 1.25x
-            #   B=3: 1.25x              basic wins ~ 1.09x
-            #   B=4: 1.09x
-            #   B=5: 0.99x (tie)
-            #   B=6: 1.11x              mixed, tie or basic
-            #   B=7: 0.96x (WCA wins)
-            #   B=8: 1.05x (tie)
-            #
-            # B=5+ is where WCA's cross-sequence tile rebalancing
-            # reliably dominates its ~25us Python-side setup (cum_tiles
-            # buffer prep, persistent grid sizing, WCA inline-scan
-            # slot accounting). Below B=5 basic wins on both the CPU
-            # (one kernel launch via fast_run -- no slot-scan, no
-            # reshape) and the GPU (per-seq tile grid is already
-            # balanced when there are few seqs). Keeping B<=4 on basic
-            # is the single biggest serving-side win on real Llama-70B
-            # BF16 prefill traffic, which is dominated by B in
-            # {1, 2, 3, 7, 9, 10} (see the profiler dump referenced in
-            # bench_serving_shapes.py).
+            # D=128: WCA only reliably dominates at B>=5 (basic avoids
+            # ~25us of WCA Python-side setup at smaller B).
             _use_wca = (
                 _is_ragged_pfx
                 or (max_len_extend >= 1024 and _waste_frac > 0.05 and batch_size >= 5)
@@ -1232,16 +902,13 @@ def gluon_extend_attention_fwd(
             )
         if _use_wca:
             _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-            # BF16 persistent has three flavors: bsearch tile map
-            # (TILE_MAP_MODE=0, for full-batch prefill), WCA default
-            # (TILE_MAP_MODE=1 + BM=128 NW=8 NS=4, for prefix-dominated
-            # chat-mix), and WCA small (BM=64 NW=4 NS=2, for ext-dominated
-            # or heavily-skewed batches). Thresholds from bench_real_het.py.
+            # BF16 persistent has three variants (thresholds from
+            # bench_real_het.py): bsearch tile map for full-batch prefill,
+            # WCA default for prefix-dominated chat-mix, and WCA small
+            # (BM=64 NW=4 NS=2) for ext-dominated / heavily-skewed batches.
+            # The force_* knobs only exist on the BF16 launcher.
             _wca_kw = dict()
             _avg_ext = _total_ext / max(1, batch_size)
-            # `_force_tile_map_mode` and the BM=64/NW=4/NS=2 override only
-            # exist on the BF16 persistent launcher (FP8 persistent has a
-            # different kernel body and does not accept these knobs).
             _use_bsearch = (
                 (not _kv_is_fp8)
                 and Lq == 128
@@ -1283,13 +950,9 @@ def gluon_extend_attention_fwd(
             )
             return
 
-    # Late config-cache lookup for heterogeneous batches that either failed
-    # the uniform-like guard or fell out of the `_is_ragged` block without
-    # routing to WCA. They land on the basic path with the same dispatch
-    # cfg as a uniform batch of matching (B, max_ext, pfx_bucket); if that
-    # cfg is in `_config_cache` (installed by an earlier uniform call or by
-    # prewarm phase 2), hit the fast runner here instead of paying the
-    # full-dispatch path cost (~9ms first-call) on every such shape.
+    # Late config-cache lookup for het batches that bypassed the early
+    # uniform path and then fell out of the ``_is_ragged`` block without
+    # routing to WCA. Skip full dispatch on cache hit.
     if (not _uniform_like) and _cfg_cache_eligible:
         _cc_entry = _try_config_cache()
         if _cc_entry is not None:
@@ -1361,9 +1024,8 @@ def gluon_extend_attention_fwd(
                     )
             if _need_persistent and _ragged_routable:
                 if min_len_extend is None:
-                    # See _launch_persistent: avoid 6ms CPU sync; conservative
-                    # fallback is uniform-ratio (max), which only mildly affects
-                    # tile-size selection downstream.
+                    # Avoid the 6ms CPU sync that computing min_len_extend
+                    # would cost; falling back to max is conservative.
                     min_len_extend = max_len_extend
                 if _kv_is_fp8:
                     _p_bm = 64 if Lq == 128 else 32
@@ -1400,9 +1062,8 @@ def gluon_extend_attention_fwd(
         if _wkvo is None:
             _wkvo = _dummy_wkvo[:batch_size]
 
-        # D256: check for prefix-aware WCA routing before basic dispatch.
-        # FP8 D256 persistent exceeds LDS budget (204KB > 160KB) and
-        # hits LLVM codegen bugs in some split-K configs — skip for FP8.
+        # D=256 prefix-aware WCA routing. FP8 D=256 persistent overflows
+        # LDS (204KB > 160KB) and hits LLVM codegen bugs, so BF16 only.
         if Lq == 256 and not _kv_is_fp8:
             _total_pfx_256 = total_prefix_len if total_prefix_len is not None else 0
             _avg_pfx_256 = _total_pfx_256 // max(1, batch_size)
@@ -1467,9 +1128,6 @@ def gluon_extend_attention_fwd(
             "BLOCK_DV": _BLOCK_DMODEL, "ACTUAL_BLOCK_DV": Lq,
             "ASYNC_PAD_K": _PAD_K, "ASYNC_PAD_V": _PAD_V,
         } if _kv_is_fp8 else {}
-        # V_PRELOAD / UNIFY_CAUSAL_PATH are hardcoded to False inside the
-        # kernel body (dead-code eliminated at Gluon JIT time), so they are
-        # not kernel-signature constexprs anymore.
 
         _frozen_kw = dict(
             IS_CAUSAL=is_causal,
@@ -1494,10 +1152,9 @@ def gluon_extend_attention_fwd(
             _q_s0, _q_s1, _k_s0, _k_s1, _v_s0, _v_s1,
             _o_s0, _o_s1, _kb_s0, _kb_s1, _vb_s0, _vb_s1,
         )
-        # First call: go through JITFunction.run (compiles if needed, runs the
-        # expensive ~55us specialization/binder path). The return value is the
-        # CompiledKernel, which we capture and reuse on subsequent calls via
-        # _make_fast_runner to skip the binder entirely (BF16 path only for now).
+        # First call: pay JITFunction.run once (compiles if needed), capture
+        # the CompiledKernel, and install a direct HIPLauncher closure for
+        # subsequent hits via `_make_fast_runner[_fp8]`.
         _bump_dispatch("basic_slow_first")
         if _trace_enabled():
             _cfg_for_log = (_BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS)
@@ -1518,30 +1175,15 @@ def gluon_extend_attention_fwd(
             grid=_frozen_grid, **_frozen_kw,
         )
 
-        # Populate config cache for future calls with same dispatch config.
-        # For het batches, `_get_basic_dispatch_config` returns the same BM/BN/NW/NS
-        # as the full dispatch path would, so the cached CompiledKernel is valid.
-        # We no longer gate on `sinks is None` / `window_kv_offsets is None`:
-        # `_fast_run` now takes those as per-call args, and the cache key
-        # distinguishes HAS_SINK-True vs HAS_SINK-False (kernel bodies differ).
-        #
-        # DTYPE SAFETY: Triton specializes CompiledKernel on each tensor arg's
-        # dtype (pointer element type is baked into the SASS). If we cache a
-        # kernel compiled for one dtype and later call with a different dtype,
-        # the kernel reads wrong stride bytes -> garbage pointer math ->
-        # HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION (async, attributed to
-        # the NEXT kernel via a SystemError in Triton's launch hooks).
-        # Fix: include (qo_indptr.dtype, kv_indptr.dtype, kv_indices.dtype) in
-        # the cache key so every distinct indptr/indices dtype combination gets
-        # its own CompiledKernel. Callers pick their natural dtype (SGLang
-        # triton_backend hands us int64/int32/int64, AITER hands us
-        # int32/int32/int64, etc.) and each combination has a dedicated fast
-        # path with no per-call cast.
+        # Install the direct-HIPLauncher closure for future calls with
+        # matching (config, shape, dtype) — including the indptr/indices
+        # dtypes since Triton specializes CompiledKernel on pointer element
+        # type.
         if (
             _force_block_n is None
             and _force_num_warps is None
             and custom_mask is None
-            and not _cfg_cache_disabled()
+            and not _CFG_CACHE_DISABLED
         ):
             _cfg = (_BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS)
             _has_sink_w = sinks is not None
@@ -1550,13 +1192,6 @@ def gluon_extend_attention_fwd(
                        head_num, k_extend.shape[1], _has_sink_w,
                        qo_indptr.dtype, kv_indptr.dtype, kv_indices.dtype)
             if _cc_key not in _config_cache:
-                # Both BF16 and FP8 go through the direct HIPLauncher "fast"
-                # path now. FP8 uses a specialized runner that matches the
-                # wider FP8 kernel signature (SKIP_PREFIX_CUSTOM_MASK,
-                # ENABLE_MASK_SPLIT, BLOCK_DPE/DV, EXT_BLOCK_N/NS, ASYNC_PAD_*
-                # constexprs). This eliminates the ~40-60us Triton
-                # JITFunction.run overhead on every FP8 call, which was
-                # dominating the CPU cost on small-batch ShareGPT shapes.
                 _runner_factory = _make_fast_runner_fp8 if _kv_is_fp8 else _make_fast_runner
                 _config_cache[_cc_key] = (
                     "fast",
@@ -1565,14 +1200,14 @@ def gluon_extend_attention_fwd(
                 )
         return
 
-    # -- Full dispatch path (heterogeneous batches, custom mask, test overrides) --
+    # Full dispatch path: heterogeneous batches, custom_mask, test overrides.
     _bump_dispatch("full_dispatch")
 
     BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
-    # min_len_extend is only needed by the D>=256 dispatch and the
-    # persistent/splitk paths. Computing it eagerly costs a GPU sync
-    # (~15us per call). Compute lazily below where actually used.
+    # min_len_extend is only needed below on the D>=256 / persistent / splitk
+    # branches. Computing it eagerly would cost a ~15us GPU sync; compute
+    # lazily at the point of use.
 
     _ensure_dummies(q_extend.device, q_extend.shape[0] + 1, batch_size)
 
@@ -1589,12 +1224,10 @@ def gluon_extend_attention_fwd(
         use_splitk = True
     elif _force_use_persistent:
         use_persistent = True
-    elif _force_use_splitk is False and _force_use_persistent is False:
-        pass  # Both explicitly disabled → fall through to basic kernel.
-    elif _force_use_splitk is False:
-        pass  # splitk explicitly off; leave persistent to default rules.
-    elif _force_use_persistent is False:
-        pass  # persistent explicitly off; leave splitk to default rules.
+    elif (_force_use_splitk is False) or (_force_use_persistent is False):
+        # At least one of splitk / persistent explicitly disabled — let
+        # the remaining default rules below decide.
+        pass
     elif Lq >= 256:
         use_persistent = False
     elif custom_mask is None and Lq <= 128:
@@ -1684,10 +1317,9 @@ def gluon_extend_attention_fwd(
         BLOCK_M = _force_block_m
         num_warps = _force_num_warps
     elif BLOCK_DMODEL >= 256:
+        # Caller should pass total_{prefix,extend}_len; fall back to
+        # CPU-side proxies instead of a GPU reduction on miss.
         if total_prefix_len is None or total_extend_len is None:
-            # Cheap 2-scalar sync, but still ~100us on hot path. Caller should
-            # pass these hints; when they don't, fall back to kv_indices.numel
-            # (CPU-side shape) and q shape instead of GPU reductions.
             if total_prefix_len is None:
                 total_prefix_len = kv_indices.numel()
             if total_extend_len is None:
@@ -1702,7 +1334,6 @@ def gluon_extend_attention_fwd(
             total_extend_len,
         )
     elif BLOCK_DMODEL == 64:
-        # D64 full-path dispatch. BM=64 beats BM=128/256 for high-batch small-extend.
         _total_ext = batch_size * max_len_extend
         if batch_size >= 16:
             if max_len_extend <= 64:
@@ -1767,13 +1398,7 @@ def gluon_extend_attention_fwd(
 
     if _kv_is_fp8:
         if BLOCK_DMODEL < 128:
-            # D=64 FP8 basic: the 4-warp DMA path assumes BLOCK_DMODEL>=128
-            # for its layout bases; 8-warp DMA path is likewise broken for
-            # D<128. Only NW=4 NS=1 compiles cleanly. For pipelined execution
-            # on D=64 FP8, dispatch should route to the persistent kernel
-            # which has a working D<128 branch. NW=4 + NS=1 is safe because
-            # USE_SERIAL=True routes to the non-pipelined _dma_simple/_short
-            # variants (no warp_pipeline_stage, no NS>=2 requirement).
+            # D<128 FP8: only the NW=4 NS=1 serial path is wired up.
             NUM_STAGES = _force_num_stages or 1
             num_warps = _force_num_warps or 4
             if _force_block_m is not None:
@@ -1781,17 +1406,13 @@ def gluon_extend_attention_fwd(
             elif batch_size >= 16 and max_len_extend <= 128:
                 BLOCK_M = 64
             else:
-                BLOCK_M = 128  # Retune Apr 2026: BM=128 wins 2-3x vs BM=256
+                BLOCK_M = 128
         else:
-            # D=128 FP8 basic fallback (het-batch / custom-mask / test
-            # overrides). The 8-warp pipelined path requires NS>=2 for
-            # determinism (static_assert in attn_fwd_inner_{extend,prefix}
-            # _pipelined). Keep defaults aligned with the fast-path.
+            # D>=128 FP8 basic fallback (het / custom mask / forced).
+            # Mirrors the fast-path defaults; NS>=2 required by the
+            # 8-warp pipelined path.
             NUM_STAGES = _force_num_stages or 1
-            if _force_num_warps is not None:
-                num_warps = _force_num_warps
-            else:
-                num_warps = 8
+            num_warps = _force_num_warps if _force_num_warps is not None else 8
             if _force_block_m is not None:
                 BLOCK_M = _force_block_m
             elif batch_size == 1 and max_len_extend <= 256:
@@ -1800,7 +1421,8 @@ def gluon_extend_attention_fwd(
                 BLOCK_M = 128
     EXT_NUM_STAGES = NUM_STAGES
 
-    # Correctness guards.
+    # Correctness guards (D=64 NW=8 BM=256 is nondeterministic at NS!=2;
+    # D>=256 NW=8 NS=1 races on the DMA ring).
     if BLOCK_DMODEL == 64 and num_warps == 8:
         if BLOCK_M in (64, 128) and NUM_STAGES == 1:
             NUM_STAGES = 2
@@ -1830,9 +1452,6 @@ def gluon_extend_attention_fwd(
         "BLOCK_DV": BLOCK_DMODEL, "ACTUAL_BLOCK_DV": Lq,
         "ASYNC_PAD_K": 16, "ASYNC_PAD_V": 16,
     } if _kv_is_fp8 else {}
-    # V_PRELOAD / UNIFY_CAUSAL_PATH are hardcoded to False inside the BF16
-    # kernel body. _ck_v_preload on the wrapper is now a no-op (kept for
-    # backward-compat with oracle/test scripts).
 
     _kernel_fn.run(
         q_extend, k_extend, v_extend, o_extend,
@@ -1862,56 +1481,7 @@ def gluon_extend_attention_fwd(
     )
 
 
-# ===-----------------------------------------------------------------------===#
-# Test / Benchmark Helpers
-# ===-----------------------------------------------------------------------===#
-
-
-def _run_gluon(q, k, v, kb, vb, qo, kv, ki, o, elens, causal, **kw):
-    gluon_extend_attention_fwd(
-        q,
-        k,
-        v,
-        o,
-        kb,
-        vb,
-        qo,
-        kv,
-        ki,
-        custom_mask=None,
-        is_causal=causal,
-        mask_indptr=None,
-        max_len_extend=max(elens),
-        sm_scale=1.0 / math.sqrt(q.shape[-1]),
-        min_len_extend=min(elens),
-        **kw,
-    )
-
-
-def _run_gluon_persistent(q, k, v, kb, vb, qo, kv, ki, o, elens, causal, **kw):
-    _launch_persistent(
-        q,
-        k,
-        v,
-        o,
-        kb,
-        vb,
-        qo,
-        kv,
-        ki,
-        custom_mask=None,
-        is_causal=causal,
-        mask_indptr=None,
-        max_len_extend=max(elens),
-        sm_scale=1.0 / math.sqrt(q.shape[-1]),
-        min_len_extend=min(elens),
-        **kw,
-    )
-
-
-# ===-----------------------------------------------------------------------===#
-# FP8 Persistent / Split-K Launchers
-# ===-----------------------------------------------------------------------===#
+# FP8 persistent / split-K launchers.
 
 
 def _launch_persistent_fp8(
@@ -1949,7 +1519,8 @@ def _launch_persistent_fp8(
     SPLIT_K=1,
     total_prefix_len=None,
 ):
-    """FP8 persistent launcher: calls the FP8 persistent kernel."""
+    """Launch the FP8 persistent-CTA kernel, managing split-K workspace
+    and the dummy mask tensors when ``USE_CUSTOM_MASK`` is False."""
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
     BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
@@ -2129,8 +1700,9 @@ def _launch_splitk_fp8(
     _force_waves_per_eu=None,
     total_prefix_len=None,
 ):
-    """FP8 split-K launcher: determines SPLIT_K and delegates to
-    _launch_persistent_fp8 with the right split factor."""
+    """Pick ``SPLIT_K`` and delegate to ``_launch_persistent_fp8``; falls
+    back to SPLIT_K=1 when the tiles-per-CU / pfx-per-BN heuristics
+    don't justify a multi-split reduction."""
     head_num = q_extend.shape[1]
     device = q_extend.device
     batch_size = qo_indptr.shape[0] - 1

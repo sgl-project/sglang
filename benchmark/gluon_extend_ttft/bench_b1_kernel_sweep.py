@@ -1,23 +1,13 @@
-"""B=1 kernel-level before/after sweep for the head-aware extend-attention
-basic-path dispatch.
+"""B=1 kernel-level sweep for the head-aware extend-attention dispatch.
 
-Measures pure GPU time via CUDA events for the SGLang-realistic ShareGPT-
-style B=1 prefill shapes on both the prior (non-head-aware) dispatch and
-the new head-aware dispatch. Runs the `basic` kernel path in both cases
-(disables Split-K and Persistent launchers via `_force_*=False`) so the
-comparison isolates config selection from kernel-selection noise.
+Measures pure GPU time via CUDA events across ShareGPT-style B=1
+prefill shapes under the prior (non-head-aware) and the new head-aware
+dispatch rules. Pins both runs to the basic kernel path
+(``_force_use_splitk=_force_use_persistent=False``) so the comparison
+isolates config selection from kernel-selection noise.
 
-Usage:
-  python bench_b1_kernel_sweep.py
-
-Columns:
-  Triton      — triton_ops/extend_attention reference
-  OLD(forced) — Gluon basic kernel forced to the prior (pre-change) B=1
-                dispatch config for this shape
-  NEW(auto)   — Gluon auto dispatch (new head-aware rule) — hits the
-                fast-runner cache on the second call so CPU overhead is
-                amortized
-  gain%       — (OLD - NEW) / OLD, positive means NEW wins
+Columns: Triton reference, OLD (forced to pre-change config),
+NEW (auto dispatch, cache-warm), gain% = (OLD - NEW) / OLD.
 """
 import torch
 from sglang.srt.layers.attention.gluon_ops.cdna4.extend_attention.extend_attention_gfx950 import (
@@ -72,7 +62,7 @@ def call_triton(inp):
 
 
 def _old_cfg_b1(S, H_q, D):
-    """Pre-change config that _get_basic_dispatch_config would have returned."""
+    """Pre-change ``_get_basic_dispatch_config`` output for B=1."""
     if D == 128:
         return (64, 4, 2)
     elif D == 64:

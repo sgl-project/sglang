@@ -3,13 +3,11 @@
 
 """Layout factory functions for Gluon extend-attention kernels.
 
-Consolidates repeated layout definitions shared by the symmetric, DeepSeek,
-and FP8 kernel files.  Each factory returns layout tuples suitable for
-unpacking via indexed ``gl.constexpr`` assignments inside ``@gluon.jit``
-kernels.
-
-All factories must be decorated with ``@gluon.constexpr_function`` so the
-Gluon JIT can evaluate them at compile time.
+Consolidates repeated layout definitions shared across the BF16 and FP8
+kernel bodies. Each factory returns layout tuples suitable for unpacking
+via indexed ``gl.constexpr`` assignments inside ``@gluon.jit`` kernels,
+and must be decorated with ``@gluon.constexpr_function`` so the Gluon
+JIT can evaluate them at compile time.
 """
 
 from triton.experimental import gluon
@@ -21,9 +19,7 @@ from triton.experimental.gluon.language._layouts import (
     PaddedSharedLayout,
 )
 
-# ===-----------------------------------------------------------------------===#
-# Phase 1 -- Header layouts (MFMA + dot operands + blocked + slices)
-# ===-----------------------------------------------------------------------===#
+# MFMA + dot-operand + blocked header layouts.
 
 
 @gluon.constexpr_function
@@ -79,18 +75,14 @@ def make_blocked_and_slice_layouts(num_warps, mma_layout):
     return blocked, offs_m, offs_d, mma_n_col, mma_m_row, mma_m_ly
 
 
-# ===-----------------------------------------------------------------------===#
-# Phase 2 -- Serial shared-memory layouts (SwizzledShared + serial BlockedLayout)
-# ===-----------------------------------------------------------------------===#
+# Shared-memory layouts for the serial (non-DMA) KT / V path.
 
 SERIAL_KT_SMEM = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[0, 1])
 SERIAL_V_SMEM = gl.SwizzledSharedLayout(vec=8, per_phase=1, max_phase=16, order=[1, 0])
 SERIAL_Q_SMEM = SERIAL_V_SMEM
 
 
-# ===-----------------------------------------------------------------------===#
-# Phase 3 -- PaddedSharedLayout factory
-# ===-----------------------------------------------------------------------===#
+# PaddedSharedLayout factory for async DMA tiles.
 
 
 @gluon.constexpr_function
@@ -108,9 +100,7 @@ def make_padded_smem(shape, offset_bases, padding_pairs):
     )
 
 
-# ===-----------------------------------------------------------------------===#
-# Phase 4 -- DistributedLinearLayout (DLL) wrapper
-# ===-----------------------------------------------------------------------===#
+# DistributedLinearLayout wrapper for async DMA tiles.
 
 
 @gluon.constexpr_function
@@ -136,9 +126,7 @@ def make_serial_kt_blocked(num_warps):
     )
 
 
-# ===-----------------------------------------------------------------------===#
-# Phase 5 -- Offset-bases factory for PaddedSharedLayout
-# ===-----------------------------------------------------------------------===#
+# Offset-bases factory for PaddedSharedLayout async DMA tiles.
 
 
 @gluon.constexpr_function
@@ -167,16 +155,13 @@ def make_offset_bases(major_max, minor_coarse, minor_fine, major_dim):
     return bases
 
 
-# ===-----------------------------------------------------------------------===#
-# Phase 6 -- High-level async DMA layout factories
+# High-level async DMA layout factories.
 #
-# K^T and V layouts are transposes of each other for symmetric attention:
-# V = K^T with every basis vector [a, b] mirrored to [b, a] and the tile
-# shape swapped from [D, N] to [N, D]. The private ``_kt_*_bases``
-# helpers encode the single source of truth; public ``make_v_*`` just
-# mirror them. The FP8 kernel needs a few non-standard V variants for
-# shared-memory-pressure reasons -- those live below in Phase 7.
-# ===-----------------------------------------------------------------------===#
+# For symmetric attention, V is the transpose of K^T: every basis
+# ``[a, b]`` is mirrored to ``[b, a]`` and the tile shape swaps from
+# ``[D, N]`` to ``[N, D]``. ``_kt_*_bases`` are the single source of
+# truth; the public ``make_v_*`` helpers just transpose them. FP8
+# variants (below) diverge to relieve shared-memory pressure.
 
 
 @gluon.constexpr_function
@@ -313,14 +298,12 @@ def make_v_dll(num_warps, BLOCK_DV, BLOCK_N):
     )
 
 
-# ===-----------------------------------------------------------------------===#
-# Phase 7 -- FP8 kernel BF16-extend V layout factories
+# FP8 kernel's BF16-extend V layout factories.
 #
-# The FP8 symmetric kernel's BF16 extend phase needs a non-standard V
-# layout in three (num_warps, BLOCK_DV, BLOCK_N) corners for shared-
-# memory-pressure reasons. Standard V layout is used everywhere else.
-# BF16 K^T in the FP8 kernel uses the standard ``make_kt_dll``.
-# ===-----------------------------------------------------------------------===#
+# The FP8 kernel's BF16 extend phase uses a non-standard V layout in
+# three ``(num_warps, BLOCK_DV, BLOCK_N)`` corners for shared-memory-
+# pressure reasons; elsewhere it uses the standard layout. BF16 K^T in
+# the FP8 kernel uses the standard ``make_kt_dll``.
 
 
 @gluon.constexpr_function

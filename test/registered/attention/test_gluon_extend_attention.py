@@ -1,19 +1,9 @@
-"""Unit tests for the Gluon extend-attention kernel + its Triton fallback.
+"""Unit tests for the Gluon extend-attention kernel and its Triton fallback.
 
-Covers:
-  * Kernel parity vs. the canonical Triton extend path across every
-    head-dim and pattern Gluon claims to support
-    (D=64 / 128 / 256, causal / non-causal, SWA, sinks, logit_cap).
-  * The ``make_extend_attention_fwd`` wrapper's Triton-fallback
-    invariant: unsupported shapes (D not in {64,128,256}, Lq != Lv,
-    FP8 KV + custom_mask on D<=128) MUST route to Triton instead of
-    raising or producing garbage.
-  * The layer-spec / MODEL_PRESETS table stays coherent (a GPU-less
-    sanity walk -- runs even on x86 CI).
-
-The kernel tests skip gracefully when not running on gfx950 (MI350/355),
-since Gluon is the only supported entry point there and the kernels
-won't compile elsewhere.
+Covers kernel parity across every supported head-dim/pattern pair, the
+``make_extend_attention_fwd`` fallback invariant (unsupported shapes
+MUST route to Triton), and GPU-less preset-table sanity checks that run
+on x86 CI as well. Kernel tests are skipped when not on gfx950.
 """
 
 from __future__ import annotations
@@ -35,8 +25,8 @@ _GFX95 = is_gfx95_supported()
 
 
 def _random_shapes(B, max_prefix, max_extend, device):
-    """Match the existing Triton test's shape-sampling style so the two
-    test files stay diff-comparable."""
+    """Shape sampler matching the Triton extend-attention test so the
+    two test files stay diff-comparable."""
     b_seq_len_prefix = torch.randint(
         1, max_prefix, (B,), dtype=torch.int32, device=device
     )
@@ -57,9 +47,8 @@ def _build_extend_inputs(
     *, B, H_Q, H_KV, D, max_prefix=512, max_extend=256,
     dtype=torch.bfloat16, device=None, seed=42,
 ):
-    """Create a realistic extend-attention call: prefix KV in the cache,
-    extend KV at the tail of the same buffer, Q for the extend tokens.
-    """
+    """Build a realistic extend-attention call: prefix KV in the cache,
+    extend KV at the tail of the same buffer, Q for the extend tokens."""
     torch.manual_seed(seed)
     device = device or get_device()
     (
@@ -125,9 +114,8 @@ def _build_extend_inputs(
 
 
 class TestLayerSpecAndPresets(CustomTestCase):
-    """GPU-less sanity walk of the prewarm layer-spec builder + presets.
-    Runs on every platform so even pure-CPU CI catches preset typos.
-    """
+    """GPU-less sanity walk of the prewarm layer-spec builder + presets;
+    runs on every platform so CPU CI catches preset typos."""
 
     def _hfcfg(self, **kw):
         class _Cfg:
@@ -149,7 +137,6 @@ class TestLayerSpecAndPresets(CustomTestCase):
         )
         layers = _build_layer_spec_from_hf_config(cfg)
         self.assertEqual(len(layers), 42)
-        # Even layer_ids must be sliding, odd full.
         for i, L in enumerate(layers):
             expected_sw = 4095 if (i % 2 == 0) else -1
             self.assertEqual(L["sliding_window_size"], expected_sw)
@@ -203,8 +190,9 @@ class TestLayerSpecAndPresets(CustomTestCase):
         self.assertEqual(layers[1]["sliding_window_size"], 127)
 
     def test_mistral_sliding_window_ignored(self):
-        """Mistral HF config declares sliding_window but sglang ignores it;
-        our prewarm must therefore treat every layer as full attention."""
+        """Mistral ships ``sliding_window`` in HF config but SGLang's
+        model class ignores it, so prewarm must treat every layer as
+        full attention."""
         from sglang.srt.layers.attention.gluon_extend_attention import (
             _build_layer_spec_from_hf_config,
         )
@@ -231,8 +219,8 @@ class TestLayerSpecAndPresets(CustomTestCase):
                 msg=f"preset {name}: non-integer GQA ratio {Hq}/{Hkv}",
             )
             patterns = enumerate_layer_patterns(layers)
-            # SWA-alternating models compile at most 2 patterns; uniform
-            # models collapse to 1. Any more than 3 suggests a mistake.
+            # SWA-alternating presets compile at most 2 patterns; uniform
+            # collapses to 1. >3 suggests a preset bug.
             self.assertLessEqual(
                 len(patterns), 3,
                 msg=f"preset {name}: {len(patterns)} unique patterns",
@@ -240,7 +228,7 @@ class TestLayerSpecAndPresets(CustomTestCase):
 
 
 class TestGluonSupports(CustomTestCase):
-    """Validate the `_gluon_supports` guard that gates Gluon vs. Triton."""
+    """Validate the ``_gluon_supports`` guard that gates Gluon vs Triton."""
 
     def _mktensor(self, shape, dtype=torch.bfloat16):
         return torch.empty(shape, dtype=dtype, device="meta")
@@ -256,8 +244,7 @@ class TestGluonSupports(CustomTestCase):
             )
 
     def test_mismatched_lq_lv_falls_back(self):
-        """MLA / mixed-dim shapes (Lq != Lv) route to Triton instead
-        of the Gluon symmetric-head path."""
+        """MLA / mixed-dim shapes (Lq != Lv) route to Triton."""
         from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
         q = self._mktensor((4, 8, 192))
         v = self._mktensor((4, 4, 128))
@@ -280,8 +267,8 @@ class TestGluonSupports(CustomTestCase):
         )
 
     def test_non_causal_falls_back(self):
-        """Non-causal extend (encoder / vision tower) is not supported by
-        the Gluon kernel family yet -- ensure we fall back to Triton."""
+        """Non-causal extend (encoder / vision tower) is not yet
+        supported by the Gluon kernel, so it must route to Triton."""
         from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
         q = self._mktensor((4, 8, 128))
         v = self._mktensor((4, 4, 128))
@@ -301,9 +288,8 @@ class TestGluonSupports(CustomTestCase):
             )
 
     def test_make_extend_attention_fwd_returns_fallback_on_import_failure(self):
-        """If Gluon fails to import, make_extend_attention_fwd must return
-        the Triton fallback unchanged -- never a closure that'd explode
-        on first call."""
+        """When Gluon fails to import, ``make_extend_attention_fwd`` must
+        return the Triton fallback unchanged."""
         import sglang.srt.layers.attention.gluon_extend_attention as mod
         saved_fn = mod._GLUON_FN
         saved_try = mod._try_import_gluon
@@ -325,10 +311,8 @@ class TestGluonSupports(CustomTestCase):
 
 @unittest.skipUnless(_GFX95, "Gluon extend attention requires gfx950")
 class TestGluonKernelParity(CustomTestCase):
-    """End-to-end kernel parity: Gluon output ~= Triton output (the
-    reference SGLang Triton extend kernel). Skipped unless we're on
-    an MI350/355 card.
-    """
+    """Kernel parity: Gluon output ~= Triton reference extend output.
+    Skipped unless we're on an MI350 / 355 card."""
 
     def setUp(self):
         random.seed(42)
@@ -374,9 +358,7 @@ class TestGluonKernelParity(CustomTestCase):
         inputs = _build_extend_inputs(B=B, H_Q=H_Q, H_KV=H_KV, D=D)
         o_gluon = self._run_gluon(inputs, **kwargs)
         o_triton = self._run_triton(inputs, **kwargs)
-        # Gluon uses FP8 loads on the prefix loop (when FP8) and bf16
-        # otherwise; both go through fp32 softmax. Match the tolerance
-        # the existing Triton test uses for extend attention.
+        # Tolerance matches the existing Triton extend-attention test.
         torch.testing.assert_close(
             o_gluon, o_triton, rtol=2e-2, atol=2e-3,
             msg=f"D={D} H_Q={H_Q} H_KV={H_KV} kwargs={kwargs}",
@@ -408,12 +390,11 @@ class TestGluonKernelParity(CustomTestCase):
         )
 
     def test_parity_noncausal_d128(self):
-        """Extend attention supports is_causal=False for some bidi
-        models. Gluon dispatches to the non-causal kernel branch."""
+        """Bidirectional extend: Gluon dispatches to the non-causal branch."""
         self._check_parity(D=128, H_Q=32, H_KV=8, is_causal=False)
 
     def test_parity_with_logit_cap(self):
-        """Gemma-style logit cap: tanh(s/cap)*cap applied pre-softmax."""
+        """Gemma-style logit cap: ``tanh(s/cap)*cap`` applied pre-softmax."""
         self._check_parity(
             D=128, H_Q=32, H_KV=8, is_causal=True, logit_cap=30.0,
         )
@@ -432,40 +413,28 @@ class TestGluonKernelParity(CustomTestCase):
 
 @unittest.skipUnless(_GFX95, "Gluon prewarm requires gfx950")
 class TestGluonJITFreeInvariant(CustomTestCase):
-    """After ``prewarm_for_model`` returns, no live dispatch call for
-    that (head_dim, num_q_heads, num_kv_heads, pattern) tuple may
-    trigger JIT compilation. This is the property that lets SGLang
-    serve first-token requests without a compile stall.
+    """After ``prewarm_for_model`` returns, live dispatch must not
+    trigger JIT compilation for the warmed (D, H_q, H_kv, pattern)
+    tuple — this is the invariant that lets SGLang serve the first
+    request without a compile stall.
 
-    We assert the property by:
-      1. Clearing the Gluon kernel ``_config_cache`` and the dispatch
-         counter ``basic_slow_first`` (which only increments on a
-         first-time JIT+install).
-      2. Running ``prewarm_for_model`` for a small preset.
-      3. Clearing the counters AGAIN so we measure post-prewarm
-         dispatch only.
-      4. Issuing a handful of realistic extend-attention calls.
-      5. Checking that ``basic_slow_first`` stayed at 0 and that the
-         number of new entries added to ``_config_cache`` is bounded
-         (at most the number of unique dispatch configs the shape grid
-         can hit -- NOT zero, because prewarm Phase 2 pre-populates the
-         cache but the basic-path cache key also includes tensor
-         dtypes and we may pick a slightly different combination in
-         the test, which is fine as long as it doesn't mean a *compile*).
-    """
+    Asserted by clearing the kernel ``_config_cache`` and the
+    ``basic_slow_first`` counter, prewarming a small preset, issuing
+    a handful of realistic extend calls, then verifying the counter
+    stayed at zero and the cache grew by at most a small bounded
+    number of entries (dtype-only dispatch mismatches are fine — only
+    fresh compiles are treated as a failure)."""
 
     def _pick_small_preset(self):
-        """Use a uniform full-attention preset with small head counts so
-        the test runs in a few seconds. We pick llama3-8b style shape
-        (D=128, H=32, kvH=8) -- the single most common production
-        setup."""
+        """Uniform full-attention Llama 3 8B-shape preset (D=128,
+        H=32, kvH=8) — small enough to prewarm in a few seconds."""
         return dict(
             head_dim=128, num_q_heads=32, num_kv_heads=8,
             layers=[
                 {"sliding_window_size": -1, "has_sink": False,
                  "logit_cap": 0.0, "xai_temperature_len": -1,
                  "is_causal": True}
-                for _ in range(4)  # uniform pattern
+                for _ in range(4)
             ],
         )
 
@@ -479,11 +448,9 @@ class TestGluonJITFreeInvariant(CustomTestCase):
         device = get_device()
         spec = self._pick_small_preset()
 
-        # 1. Clear kernel cache + counters.
         _ext._config_cache.clear()
         _ext.reset_dispatch_counters()
 
-        # 2. Prewarm a single-pattern model.
         prewarm_for_model(
             spec["layers"],
             head_dim=spec["head_dim"],
@@ -492,25 +459,23 @@ class TestGluonJITFreeInvariant(CustomTestCase):
             device=device,
             dtype=torch.bfloat16,
             include_basic=True,
-            include_persistent=False,  # keep the test cheap
+            include_persistent=False,
             include_fp8=False,
             parallel=4,
             verbose=False,
         )
 
-        # 3. Reset counters so we only look at live dispatch.
         _ext.reset_dispatch_counters()
         cache_size_after_prewarm = len(_ext._config_cache)
 
-        # 4. Run representative extend calls across realistic shapes.
         from sglang.srt.layers.attention.gluon_ops.cdna4.extend_attention import (
             gluon_extend_attention_fwd,
         )
         shape_grid = [
-            (1, 256),   # single-request prefill
-            (4, 128),   # small-batch chat
-            (8, 64),    # spec-decode style
-            (2, 512),   # longer prefill
+            (1, 256),
+            (4, 128),
+            (8, 64),
+            (2, 512),
         ]
         for B, ext_len in shape_grid:
             inputs = _build_extend_inputs(
@@ -527,7 +492,6 @@ class TestGluonJITFreeInvariant(CustomTestCase):
                 logit_cap=0.0, sliding_window_size=-1,
             )
 
-        # 5. Verify: zero first-time JIT installs during live dispatch.
         slow = _ext._dispatch_counters.get("basic_slow_first", 0)
         self.assertEqual(
             slow, 0,
@@ -536,9 +500,6 @@ class TestGluonJITFreeInvariant(CustomTestCase):
                 f"prewarm. Dispatch counters: {_ext._dispatch_counters!r}"
             ),
         )
-        # Cache must not have SHRUNK (sanity) -- it may grow slightly if a
-        # test shape happened to pick a never-prewarmed dispatch config;
-        # capped at a reasonable bound.
         cache_size_final = len(_ext._config_cache)
         self.assertGreaterEqual(cache_size_final, cache_size_after_prewarm)
         self.assertLessEqual(

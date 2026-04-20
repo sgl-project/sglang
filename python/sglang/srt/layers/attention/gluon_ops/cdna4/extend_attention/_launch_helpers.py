@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Python-side launch helpers for persistent CTA and split-K attention kernels.
+"""Python-side launch helpers for the persistent BF16 attention kernel.
 
-Provides _launch_persistent and _launch_splitk which wrap the unified
-gluon_extend_attn_fwd kernel with appropriate tile scheduling and workspace
-management.
+``_launch_persistent`` and ``_launch_splitk`` both wrap
+``gluon_extend_attn_fwd_persistent`` with tile-scheduling and split-K
+workspace management, and share a single ``_persistent_fast_cache`` of
+direct-HIPLauncher closures.
 """
 
 import math
@@ -31,28 +32,17 @@ def _unify_causal_path_env():
     return _CACHED_ENV_UNIFY_CAUSAL_PATH
 
 
-# ===-----------------------------------------------------------------------===#
-# Fast-runner cache for the persistent kernel (shared between _launch_persistent
-# and _launch_splitk). Both end up calling `_bf16_kernel` with the same
-# constexpr bundle, so a single cache covers the heterogeneous-batch fast path.
-#
-# Same idea as the `_make_fast_runner` in extend_attention_gfx950.py for the
-# basic kernel: skip Triton's ~40us JITFunction.run specialization on cache
-# hits by invoking HIPLauncher directly with pre-bound constexprs.
-# ===-----------------------------------------------------------------------===#
-
+# Fast-runner cache shared between _launch_persistent and _launch_splitk.
+# Same idea as `_make_fast_runner` in extend_attention_gfx950.py: skip
+# Triton's JITFunction specialization on cache hits.
 _persistent_fast_cache = {}
 
 
 def _make_persistent_fast_runner(compiled_kernel, frozen_kw: dict):
-    """Build a direct-HIPLauncher closure for `gluon_extend_attn_fwd_persistent`.
+    """Build a direct-HIPLauncher closure for the persistent BF16 kernel.
 
-    `frozen_kw` must contain every constexpr in the kernel signature:
-        IS_CAUSAL, USE_CUSTOM_MASK, ENABLE_PREFIX_UNMASKED,
-        BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL, NUM_STAGES,
-        HAS_SINK, LOGIT_CAP, XAI_TEMPERATURE_LEN, SLIDING_WINDOW_SIZE,
-        IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2.
-    kv_group_num and sm_scale flow in at call time so a single cached runner
+    ``frozen_kw`` must carry every constexpr in the kernel signature;
+    ``kv_group_num`` and ``sm_scale`` flow in at call time so one runner
     serves multiple GQA configs sharing the same constexpr bundle.
     """
     from triton.runtime import driver as _triton_driver
@@ -127,15 +117,11 @@ def _make_persistent_fast_runner(compiled_kernel, frozen_kw: dict):
 
 
 def _persistent_cache_key(Lq, frozen_kw: dict, dtypes: tuple = ()) -> tuple:
-    """Key that uniquely identifies a compiled persistent/split-K kernel.
+    """Key for a compiled persistent/split-K kernel.
 
-    `dtypes` is a tuple of torch.dtype values for the indptr/indices
-    tensors whose pointer element types the Triton AOT compile bakes into
-    SASS (qo_indptr, kv_indptr, kv_indices). Different dtype combos MUST
-    map to separate CompiledKernel entries — otherwise a cached int64
-    kernel launched on int32 data reads 8-byte strides from a 4-byte
-    buffer and asynchronously faults with HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION.
-    See the matching fix in extend_attention_gfx950.py::_try_config_cache.
+    ``dtypes`` carries the indptr/indices tensor dtypes; Triton bakes the
+    pointer element type into SASS, so distinct dtype combos MUST map to
+    separate cache entries (else async HSA memory-aperture faults).
     """
     return (
         Lq,
@@ -160,23 +146,19 @@ def _persistent_cache_key(Lq, frozen_kw: dict, dtypes: tuple = ()) -> tuple:
     )
 
 
-# Default MAX_BATCH_LOG2. 8 -> supports batch_size up to 256, 8 static
-# iterations of binary search per tile. Fixed as constexpr so all launches
-# share the same compiled kernel.
+# MAX_BATCH_LOG2=8 supports batch_size up to 256 with 8 static iterations
+# of per-tile binary search; fixed as constexpr so all launches share a
+# single compiled kernel.
 _DEFAULT_MAX_BATCH_LOG2 = 8
 
 
-# Module-level override for the tile-map mode. Set from benchmarks / tests
-# to route all persistent launches through mode 0 (cum_tiles binary search)
-# or mode 1 (WCA inline linear scan) regardless of the per-call setting.
-# Respected by _launch_persistent / _launch_splitk when truthy (0 or 1).
+# Tile-map mode override for bench/test scripts: 0 = cum_tiles binary
+# search, 1 = WCA inline linear scan. None restores per-call defaults.
 _GLOBAL_TILE_MAP_MODE = None
 
 
 def set_global_tile_map_mode(mode):
-    """Override the TILE_MAP_MODE constexpr for all subsequent persistent
-    launches. Pass None to restore the per-call default (0 = cum_tiles).
-    """
+    """Override the persistent TILE_MAP_MODE constexpr process-wide."""
     global _GLOBAL_TILE_MAP_MODE
     _GLOBAL_TILE_MAP_MODE = None if mode is None else int(mode)
 
@@ -215,11 +197,9 @@ def _get_num_CUs(device):
     return _cached_num_CUs[idx]
 
 
-# Cached dummy tensors for the no-custom-mask / no-sliding-window case.
-# Avoids per-call torch.empty/zeros allocations in the persistent/splitk
-# launchers. The mask_indptr dummy is a single zeroed int64 buffer that grows
-# monotonically; the kernel reads mask_indptr[batch_id] which is 0 for a
-# "no mask" batch, so any prefix of a zeroed buffer is valid.
+# Cached dummies for the no-custom-mask / no-sliding-window case. Reused
+# across launches; the zeroed mask_indptr buffer grows monotonically and
+# any prefix is valid (kernel reads index 0 for a "no mask" batch).
 _dummy_cm_lh = None
 _dummy_mi_lh = None
 _dummy_wkvo_lh = None
@@ -228,8 +208,7 @@ _dummy_wkvo_cap = 0
 
 
 def _ensure_dummy_mask_tensors(device, q_total, batch_size):
-    """Return (custom_mask, mask_indptr, window_kv_offsets) dummy tensors
-    sized at least to (0, q_total+1, batch_size). Reused across calls."""
+    """Return (custom_mask, mask_indptr, window_kv_offsets) dummy tensors."""
     global _dummy_cm_lh, _dummy_mi_lh, _dummy_wkvo_lh
     global _dummy_mi_cap, _dummy_wkvo_cap
     if _dummy_cm_lh is None or _dummy_cm_lh.device != device:
@@ -300,19 +279,11 @@ _cum_tiles_cap = 0
 
 
 def _ensure_cum_tiles(qo_indptr, BLOCK_M, num_heads, batch_size):
-    """Compute cum_tiles_per_batch = [0, ceil(e0/BM), ceil(e0+e1/BM), ...]
-    on GPU without CPU sync. Returns (cum_tiles_tensor, total_output_tiles_tensor).
+    """Compute cum_tiles_per_batch = cumsum of ceil(ext_i / BM) on-device.
 
-    The kernel's persistent path binary-searches cum_tiles_per_batch to
-    find the (seq, head, block_m) for each tile_idx, enabling dense
-    packing of valid tiles across CTAs (no wasted CTA slots on over-
-    provisioned n_m_tiles). See _bf16_extend_persistent_gfx950.py lines
-    ~155-175 for the kernel-side scheduling logic.
-
-    Note: we store total_output_tiles on device (Python caller passes
-    this to the kernel's total_valid_tiles arg after multiplying by
-    SPLIT_K if applicable). Using device tensor avoids a sync and is
-    acceptable because the kernel reads it once per CTA.
+    The kernel's persistent path binary-searches this buffer to map
+    ``tile_idx -> (seq, head, block_m)``, enabling dense packing of valid
+    tiles across CTAs regardless of batch heterogeneity.
     """
     global _cum_tiles_buf, _cum_tiles_cap
     device = qo_indptr.device
@@ -333,13 +304,7 @@ def _ensure_cum_tiles(qo_indptr, BLOCK_M, num_heads, batch_size):
 
 
 def _wca_total_seq_tiles(qo_indptr, BLOCK_M, batch_size):
-    """Return the exact number of (seq * tile) pairs sum(ceil(ext/BM)).
-
-    Performs ONE CPU sync -- that's the cost of the pure-WCA path (vs
-    the cum_tiles path which avoids syncs but pays a per-tile binary
-    search). Caller multiplies by num_heads [* SPLIT_K] to get the
-    total_valid_tiles scalar passed to the kernel.
-    """
+    """Exact ``sum(ceil(ext/BM))`` across seqs. Costs one CPU sync."""
     ext_lens = qo_indptr[1:batch_size + 1] - qo_indptr[:batch_size]
     n_tiles = (ext_lens + (BLOCK_M - 1)) // BLOCK_M
     return int(n_tiles.sum().item())
@@ -445,40 +410,23 @@ def _launch_persistent(
     batch_size = qo_indptr.shape[0] - 1
 
     if min_len_extend is None:
-        # Cheap conservative fallback: treat the batch as uniform (ratio=1).
-        # The actual GPU min would cost ~6ms of CPU sync on heterogeneous
-        # batches — this is the single largest source of first-call latency
-        # when SGLang doesn't thread through min_len_extend. Tile-selection
-        # downstream only uses min_len_extend to *shrink* BM for extremely
-        # skewed batches (ratio>=2 with max<=256); defaulting to max is
-        # conservative (slightly larger BM) but avoids the sync.
+        # Conservative fallback; the GPU-computed min would cost ~6ms of
+        # CPU sync on heterogeneous batches. Tile selection below only
+        # uses min_len_extend to shrink BM on skewed batches, so max is
+        # safe and slightly pessimistic.
         min_len_extend = max_len_extend
     head_num = q_extend.shape[1]
 
-    # Small-tile regime: when per-seq work is small OR the batch is heterogeneous
-    # enough that BM=128/256 wastes compute on masked tokens. Basic-path kernel
-    # beats persistent with BM=128/256 by 1.5-2x on these shapes; matching BM=64
-    # nw=4 ns=2 here closes the gap (confirmed by bench_wca_vs_cum_tiles.py).
-    #
-    # EXCEPTION: big-B batches with a substantial prefix (multi-turn chat, long-
-    # context decode). Each tile iterates its seq's full prefix regardless of
-    # BM, so larger BM amortizes that scan over more query rows. Random-perf
-    # bench showed BM=128 NW=8 NS=4 is 2-3x faster than BM=64 for
-    # big-B-chat shapes (B>=8, max_ext<=256, avg_pfx >= 1k per seq).
+    # Small-tile regime: BM=64 NW=4 NS=2 when per-seq work is small or
+    # the batch is ragged enough that BM=128 wastes compute on masked
+    # tokens. Exception: big-B chat with a substantial prefix — each tile
+    # iterates the full per-seq prefix regardless of BM, so larger BM
+    # amortizes the scan over more query rows.
     _het_ratio = max_len_extend / max(min_len_extend, 1)
-    # Cheap no-sync total-pfx: kv_indices is sized to total_prefix_len by
-    # construction in every caller path. Threaded-in value preferred; the
-    # numel fallback is correct and costs no CPU sync.
     _total_pfx_est = (
         total_prefix_len if total_prefix_len is not None
         else kv_indices.numel()
     )
-    # Exclude spec-decode (max_ext<=8) from this override: for ext=1..8 the
-    # BM=64 tile avoids wasting compute on masked rows beyond min_ext, and
-    # random-perf bench showed BM=128 regressed spec-decode 20-70% there.
-    # The bigger-BM win only holds when there are real query rows to amortize
-    # prefix streaming over (max_ext >= 32 comfortably covers chat-mix max
-    # ~200-500 which benefits).
     _pfx_dominated_big_b = (
         batch_size >= 8
         and _total_pfx_est >= batch_size * 1024
@@ -506,11 +454,9 @@ def _launch_persistent(
         BLOCK_M = 128
         num_warps = 8
     else:
-        # BM=256 was observed to trigger an LLVM iota_range assertion in the
-        # persistent kernel at some shapes (e.g. B=32 uniform max=256) in the
-        # current Triton snapshot. BM=128 is the largest safe M-tile for the
-        # persistent path; it is also the tile size CK uses on equivalent
-        # shapes, so we are not leaving meaningful throughput on the table.
+        # BM=256 hits an LLVM iota_range assertion in the persistent kernel
+        # on some shapes; BM=128 is the largest safe M-tile (and matches
+        # what CK picks on these shapes).
         BLOCK_M = 128
         num_warps = 8
 
@@ -519,7 +465,7 @@ def _launch_persistent(
     elif BLOCK_DMODEL >= 256:
         NUM_STAGES = 1
     elif BLOCK_M == 64 and num_warps == 4:
-        NUM_STAGES = 2  # matches basic-path dispatch; ns=1 was a regression here
+        NUM_STAGES = 2
     elif BLOCK_M == 64:
         NUM_STAGES = 1
     else:
@@ -539,21 +485,14 @@ def _launch_persistent(
 
     device = q_extend.device
     n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
-    # Loose upper bound: batch_size * n_m_tiles (each seq gets at most
-    # n_m_tiles independent tiles). Used for SPLIT_K decision.
     total_output_tiles_upper = batch_size * head_num * n_m_tiles
     if total_output_tiles_upper == 0:
         return
 
-    # Tight sync-free upper bound on sum(ceil(ext_i / BM)):
-    #   sum(ceil(ext_i/BM)) <= (sum(ext_i) + batch*(BM-1)) / BM
-    #                       = (q_extend.shape[0] + batch*(BM-1)) / BM
-    # This is at most `batch + floor(total_ext/BM)` tiles, vs the loose
-    # bound `batch * ceil(max_ext/BM)`. For heterogeneous batches the
-    # tight bound can be 3-4x smaller, cutting the WCA kernel's empty-
-    # slot scans proportionally. Replaces the old `_wca_total_seq_tiles`
-    # path (which did a 35us .item() sync) with a pure-Python int
-    # calculation that costs ~200 ns.
+    # Tight sync-free upper bound on sum(ceil(ext_i / BM)). For
+    # heterogeneous batches this is 3-4x smaller than the loose bound
+    # ``batch * ceil(max_ext/BM)`` — cuts WCA's empty-slot scans
+    # proportionally without a .item() sync.
     total_extend_rows = q_extend.shape[0]
     total_output_tiles_tight = (
         (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
@@ -561,25 +500,20 @@ def _launch_persistent(
 
     TILE_MAP_MODE = _effective_tile_map_mode(_force_tile_map_mode)
     if TILE_MAP_MODE == 1:
-        # WCA's inline scan tolerates empty slots. Pass the tight bound
-        # so the grid size and CTA loop are tuned to within ~0-15% of
-        # the exact count, with zero CPU sync cost.
+        # WCA inline-scan: tolerates empty slots; pass the tight bound.
         total_output_tiles = total_output_tiles_tight
         cum_tiles_per_batch = _ensure_splitk_dummy(device)
     else:
-        # cum_tiles path (mode 0) uses the exact GPU-computed per-seq
-        # counts; total_output_tiles just sets the grid-size fallback.
+        # cum_tiles path: exact GPU-computed per-seq counts.
         total_output_tiles = total_output_tiles_tight
         cum_tiles_per_batch = _ensure_cum_tiles(qo_indptr, BLOCK_M, head_num, batch_size)
 
     num_CUs = _get_num_CUs(device)
 
-    # Auto-splitk inside the persistent launcher is only correct at BM=128
-    # nw=8 NS=4 (the "big tile" configuration used by _launch_splitk). At other
-    # tile configs (e.g. BM=64 nw=4 NS=2) the multi-split reduction kernel
-    # produces NaNs because the accumulator layout diverges from what
-    # `_ensure_splitk_workspace` assumes. Callers who need split-K MUST go
-    # through _launch_splitk, which hardcodes the canonical big-tile config.
+    # Auto-splitk here is only correct at the BM=128 NW=8 NS=4 "big-tile"
+    # config used by _launch_splitk; other tile shapes produce NaNs from
+    # the multi-split reduction. Callers who need split-K at other configs
+    # must go through _launch_splitk directly.
     SPLIT_K = 1
     if (
         total_output_tiles < num_CUs
@@ -631,9 +565,6 @@ def _launch_persistent(
         'TILE_MAP_MODE': TILE_MAP_MODE,
         '_num_warps': num_warps,
     }
-    # Single .stride() call per tensor (6 calls -> 12 int unpacks) is
-    # ~2x faster than 12 .stride(i) calls on the hot path. See microbench
-    # in bench_stride_calls.py: 636 ns vs 1410 ns per block.
     _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
     _os = o_extend.stride(); _kbs = k_buffer.stride(); _vbs = v_buffer.stride()
     _strides = (
@@ -799,9 +730,7 @@ def _launch_splitk(
 
     # n_m_tiles may have shifted if we forced a different BLOCK_M above.
     n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
-    # Tight upper bound matches `_launch_persistent`: see comment there.
-    # Split-K only routes here when total grid is small, so batches tend
-    # toward uniform; the tight bound is essentially the exact count.
+    # Tight sync-free upper bound on total_output_tiles (see _launch_persistent).
     total_output_tiles = (
         (q_extend.shape[0] + batch_size * (BLOCK_M - 1)) // BLOCK_M
     ) * head_num
@@ -842,7 +771,6 @@ def _launch_splitk(
         'TILE_MAP_MODE': TILE_MAP_MODE,
         '_num_warps': num_warps,
     }
-    # Batched stride extraction (see matching block above in _launch_persistent).
     _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
     _os = o_extend.stride(); _kbs = k_buffer.stride(); _vbs = v_buffer.stride()
     _strides = (

@@ -4,29 +4,20 @@
 
 Drop-in replacement for the Triton ``extend_attention_fwd`` kernel in
 ``sglang.srt.layers.attention.triton_ops.extend_attention`` when running
-on gfx950. Supports symmetric head dims (D64, D128, D256) with BF16 /
-FP8 KV caches, causal + sliding-window, attention sinks, logit
-capping, and GQA up to 32:8.
+on gfx950. Supports symmetric head dims (D=64, 128, 256) with BF16 or
+FP8 KV caches, causal + sliding-window, attention sinks, logit capping,
+and GQA up to 32:8.
 
-Public re-exports (consumed by
-``sglang.srt.layers.attention.gluon_extend_attention``):
+Public re-exports consumed by
+``sglang.srt.layers.attention.gluon_extend_attention``:
 
-* ``gluon_extend_attention_fwd``  -- main entry point matching the
-                                     Triton reference signature.
-* ``prewarm_extend_attention``    -- warm the JIT cache for a single
-                                     ``(head_dim, num_q_heads,
-                                     num_kv_heads)`` tuple.
-* ``prewarm_for_model``           -- HF-config-aware prewarm that emits
-                                     one kernel per distinct attention
-                                     pattern in the layer list.
-* ``MODEL_PRESETS`` + ``spec_*``  -- known-good layer specs for
-                                     GPT-OSS, Gemma 3, Qwen 3, Llama
-                                     3 / 4, etc.
-
-The canonical research copy of these sources lives in
-``AMD-Triton/gluon-kernels`` branch
-``tussingh/extend-attention-experiments``; this is the subset SGLang
-imports at runtime.
+* ``gluon_extend_attention_fwd`` -- main entry point, matches the
+  Triton reference signature.
+* ``prewarm_extend_attention`` / ``prewarm_for_model`` -- JIT-free
+  serving prewarm by ``(head_dim, num_q_heads, num_kv_heads)`` or by
+  HuggingFace config.
+* ``MODEL_PRESETS`` + ``spec_*`` -- known-good layer specs for
+  GPT-OSS, Gemma 3, Qwen 3, Llama 3 / 4, etc.
 """
 
 from .extend_attention_gfx950 import gluon_extend_attention_fwd  # noqa: F401

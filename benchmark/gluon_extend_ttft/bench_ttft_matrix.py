@@ -743,11 +743,9 @@ def print_batched_table(all_results):
             hdr += f" | {'gluon/ck':>10}"
         if "gluon" in backends and "triton" in backends:
             hdr += f" | {'triton/gluon':>12}"
-        if "ck" in backends and "ck-gluon" in backends:
-            hdr += f" | {'ckGlu/ck':>10}"
         print(hdr)
         keys = sorted(k for k in by_model if k[0] == model)
-        g_ck, t_g, cg_ck = [], [], []
+        g_ck, t_g = [], []
         for k in keys:
             d = by_model[k]
             case = k[1]
@@ -776,12 +774,6 @@ def print_batched_table(all_results):
                 line += f" | {r:>11.3f}x"
             elif "gluon" in backends and "triton" in backends:
                 line += f" | {'-':>12}"
-            if "ck" in backends and "ck-gluon" in backends and m["ck"] and m["ck-gluon"]:
-                r = m["ck-gluon"] / m["ck"]
-                cg_ck.append(r)
-                line += f" | {r:>9.3f}x"
-            elif "ck" in backends and "ck-gluon" in backends:
-                line += f" | {'-':>10}"
             print(line)
         if g_ck:
             geo = math.exp(sum(math.log(x) for x in g_ck) / len(g_ck))
@@ -789,9 +781,6 @@ def print_batched_table(all_results):
         if t_g:
             geo = math.exp(sum(math.log(x) for x in t_g) / len(t_g))
             print(f"  triton/gluon geomean = {geo:.3f}  (>1 means gluon faster than triton)")
-        if cg_ck:
-            geo = math.exp(sum(math.log(x) for x in cg_ck) / len(cg_ck))
-            print(f"  ck-gluon/ck  geomean = {geo:.3f}  (<1 means gluon wins on CK's path)")
         # Batch-level throughput summary: arithmetic mean tokens/sec across
         # all batched shapes. Higher = more tokens pushed through the batch
         # per second for this backend.

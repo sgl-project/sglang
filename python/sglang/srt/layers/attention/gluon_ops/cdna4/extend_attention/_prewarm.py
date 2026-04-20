@@ -1,60 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Prewarm every kernel variant the extend-attention dispatch can produce
-for a given model, so no JIT compilation occurs during serving.
+"""JIT-free prewarm for the extend-attention dispatch.
 
-Motivation
-----------
-Gluon uses Triton's `@jit` machinery, which compiles kernels lazily on
-first call with a given constexpr signature. First-hit compile latency is
-2-5 s per variant -- a visible stall if it happens on a live request.
+Walks every (BM, BN, NW, NS) config the dispatcher can select for a
+given model and compiles the corresponding kernel variant in a parallel
+thread pool, so live serving never JITs. After ``prewarm_extend_attention``
+(or ``prewarm_for_model``) returns, both the on-disk Triton cache and the
+in-process ``_config_cache`` fast-runner table are populated.
 
-Walking the dispatch grid produces a small set of configs per head dim
-(D=64: 4, D=128: 5, D=256: 4 for BF16 symmetric heads at time of writing).
-For a fixed model only one head dim is used, so the full prewarm footprint
-is ~5 basic + ~4 persistent + ~2 split-K variants = 10-15 kernel compiles.
+The full-model prewarm footprint is typically 10-15 kernel compiles; the
+runtime-cache population phase then routes one tiny dummy call through
+each unique config so the direct-HIPLauncher closures are installed.
 
-Sequential cold compile is ~30-50 s wall clock. With
-`AsyncCompileMode(ThreadPoolExecutor(...))` the LLVM pass pipeline drops
-the GIL long enough for N-way parallelism to cut this to ~10-15 s.
-
-After `prewarm_extend_attention(...)` returns, every subsequent dispatch
-hits the in-memory kernel cache. Both the on-disk `~/.triton/cache` and
-`JITFunction.device_caches[device]` are populated.
-
-Usage
------
-    import torch
-    from gluon_kernels.cdna4.fa.extend import prewarm_extend_attention
-
-    # Call once at model load, before any real requests are served.
-    prewarm_extend_attention(
-        head_dim=128,
-        num_q_heads=32,
-        num_kv_heads=8,          # GQA: H / kv_H = group_size
-        device=torch.device("cuda:0"),
-        dtype=torch.bfloat16,
-        # Model-level constants (affect constexpr specialization):
-        has_sink=False,          # GPT-OSS: True
-        sliding_window_size=-1,  # Mistral: window size, else -1
-        logit_cap=0.0,           # Gemma/Grok: cap value, else 0
-        xai_temperature_len=-1,  # Grok: temperature routing, else -1
-        parallel=4,              # 0 = sequential, >0 = threaded compile
-        verbose=True,
-    )
-
-Coverage
---------
-- Basic (uniform-batch) BF16 kernel: all (BM,BN,NW,NS) configs the
-  dispatch can select across the realistic shape grid.
-- Persistent BF16 kernel: all (BM,BN,NW,NS,SPLIT_K) combos the persistent
-  dispatch can select.
-- Split-K BF16 kernel: the fixed high-parallelism config the split-K
-  path uses when the basic grid has too few tiles.
-
-FP8 kernels are not prewarmed by default -- pass `include_fp8=True`
-to cover them.
+Callers: ``TritonAttnBackend.__init__`` invokes ``prewarm_for_model``
+with the model's HF config. FP8 kernels are off by default; pass
+``include_fp8=True`` to cover them as well.
 """
 
 from __future__ import annotations
@@ -96,22 +57,14 @@ def enumerate_basic_configs(
     head_dim: int, is_fp8: bool = False, sliding_window_size: int = -1,
     head_num: Optional[int] = None,
 ) -> list[tuple]:
-    """Return the unique (BM, BN, NW, NS, PAD_K, PAD_V, EXT_BN, EXT_NS)
-    tuples the basic-path dispatch can produce for this head dim.
+    """Unique (BM, BN, NW, NS, PAD_K, PAD_V, EXT_BN, EXT_NS) tuples the
+    basic-path dispatch can emit for this head dim.
 
-    Purely static -- walks `_get_basic_dispatch_config` over the shape
-    grid. No GPU involvement.
-
-    `sliding_window_size` forwarded so SWA-specific dispatch overrides
-    produce distinct configs (e.g. D=64 BF16 SWA long-extend uses BM=64
-    NW=2 NS=2 which is never emitted for full attention). Without this,
-    prewarm misses those variants and the first live SWA call pays a
-    JIT compile stall.
-
-    `head_num` forwarded because B=1 dispatch forks on H_q (BM=256 NW=8
-    threshold differs for H_q=64 vs H_q=32). Without it, prewarm would
-    miss the B=1 BM=256 variants on TP=1 Llama-70B / GPT-OSS shapes and
-    the first long-prompt request would JIT-stall.
+    Purely static: walks ``_get_basic_dispatch_config`` over the shape
+    grid, no GPU calls. ``sliding_window_size`` and ``head_num`` must
+    match the live model — SWA configs and the B=1 H-aware BM=256
+    variants are distinct constexpr specializations, so omitting either
+    lets the first live request JIT-compile the missing variant.
     """
     cfgs: set[tuple] = set()
     for b in _BATCH_GRID:
@@ -128,19 +81,19 @@ def enumerate_basic_configs(
 
 
 def enumerate_persistent_configs(head_dim: int) -> list[tuple]:
-    """Return unique (BM, BN, NW, NS, SPLIT_K) tuples the persistent
-    launcher picks across the realistic shape grid. Mirrors the logic
-    inside `_launch_persistent` exactly -- keep in sync with that
-    function's branches.
+    """Unique (BM, BN, NW, NS, SPLIT_K) tuples the persistent launcher
+    can emit.
+
+    Mirrors the branches inside ``_launch_persistent`` — keep in sync
+    with that function.
     """
     BLOCK_DMODEL, _ = _resolve_qk_split_dims(head_dim)
     BLOCK_N = 32 if BLOCK_DMODEL >= 256 else 64
     cfgs: set[tuple] = set()
     for batch_size in _BATCH_GRID:
         for max_len_extend in _EXTEND_GRID:
-            # Launcher branches on (max_len_extend, min_len_extend, batch_size)
-            # via _het_ratio = max/min. Sweep both uniform and a skewed
-            # proxy to cover _use_small_tile transitions.
+            # Branches on _het_ratio = max/min; sweep uniform + skewed
+            # proxies to cover the _use_small_tile transitions.
             for min_len_extend in (
                 max_len_extend,
                 max(1, max_len_extend // 2),
@@ -154,15 +107,11 @@ def enumerate_persistent_configs(head_dim: int) -> list[tuple]:
                     or (min_len_extend < 64 and max_len_extend <= 512 and batch_size <= 4)
                 )
 
-                if BLOCK_DMODEL >= 256:
+                if BLOCK_DMODEL >= 256 or use_small_tile:
                     BM, NW = 64, 4
-                elif use_small_tile:
-                    BM, NW = 64, 4
-                elif batch_size <= 4:
-                    BM, NW = 128, 8
                 else:
-                    # Launcher clamps to BM=128 (avoids the BM=256 iota_range
-                    # compiler crash). Never enumerate BM=256 here.
+                    # Launcher always clamps to BM=128 (BM=256 hits an
+                    # iota_range compiler crash on persistent).
                     BM, NW = 128, 8
 
                 if BLOCK_DMODEL >= 256:
@@ -177,10 +126,8 @@ def enumerate_persistent_configs(head_dim: int) -> list[tuple]:
                 if BM == 128 and NW == 8 and NS == 2:
                     NS = 3
 
-                # SPLIT_K is data-dependent via _select_k_splits. Cover
-                # the values the launcher can actually emit (only BM=128
-                # NW=8 NS=4 auto-enables SPLIT_K>1; other tile sizes are
-                # always SPLIT_K=1 per the stability gate).
+                # SPLIT_K>1 is only emitted on BM=128 NW=8 NS=4; all
+                # other tile shapes stay at SPLIT_K=1.
                 split_set = (
                     (1, 2, 4, 8)
                     if (BM == 128 and NW == 8 and NS == 4)
@@ -199,25 +146,16 @@ def _make_dummy_tensors(
     head_dim: int,
     has_sink: bool,
 ):
-    """Minimal-size dummy tensors with realistic strides so the binder
-    specializes identically to a runtime call.
+    """Minimal dummies with realistic strides so the binder specializes
+    identically to a runtime call.
 
-    CRITICAL dtype matrix (must EXACTLY match SGLang's triton_backend.py):
-      qo_indptr:         int64 (backend line 231: torch.zeros(..., int64))
-      kv_indptr:         int32 (backend line 212: torch.zeros(..., int32))
-      kv_indices:        int64 (backend line 386, 451: torch.empty(..., int64))
-      mask_indptr:       int64 (backend line 235: torch.zeros(..., int64))
-      window_kv_offsets: int32 (backend line 615: torch.zeros(..., int32))
+    Dtype matrix MUST match SGLang's ``triton_backend.py``:
+      qo_indptr / kv_indices / mask_indptr: int64
+      kv_indptr / window_kv_offsets:        int32
 
-    Triton specializes `CompiledKernel` on each tensor argument's dtype (the
-    pointer element type is baked into the SASS at compile time). A dtype
-    mismatch doesn't raise at launch -- the kernel just reads 2x the bytes
-    (or half) from the base pointer, striding past allocated memory and
-    triggering HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION on the first OOB
-    access. The previous `kv_indptr=int64` here compiled a kernel that
-    read 8-byte strides from SGLang's 4-byte-stride int32 buffer, which
-    produced garbage `kv_indices` offsets and crashed asynchronously on
-    larger batched loads (e.g. B=3 ext=64 -> q=(192,32,64) seen in prod).
+    Triton bakes each tensor's pointer element type into SASS, so a
+    dtype mismatch silently strides past allocated memory instead of
+    raising — it just faults asynchronously on the first OOB access.
     """
     q = torch.zeros((1, num_q_heads, head_dim), dtype=dtype, device=device)
     k = torch.zeros((1, num_kv_heads, head_dim), dtype=dtype, device=device)
@@ -232,15 +170,11 @@ def _make_dummy_tensors(
     custom_mask = torch.empty(0, dtype=torch.uint8, device=device)
     mask_indptr = torch.zeros(2, dtype=torch.int64, device=device)
     window_kv_offsets = torch.zeros(1, dtype=torch.int32, device=device)
-    # Persistent kernel workspace (dummy, only specialization matters).
     partial_out = torch.empty(1, dtype=torch.float32, device=device)
     partial_lse = torch.empty(1, dtype=torch.float32, device=device)
     tile_done = torch.empty(1, dtype=torch.float32, device=device)
-    # Variable-tile-per-batch scheduling: cum_tiles_per_batch[B+1] int32.
     cum_tiles_per_batch = torch.zeros(2, dtype=torch.int32, device=device)
-    # sinks tensor has shape (H,) when HAS_SINK=True, else None. Dtype must
-    # match runtime (bf16 for SGLang's Triton-backend GPT-OSS path); Triton
-    # specializes compiled kernels on the tensor dtype.
+    # HAS_SINK dtype must match the runtime tensor (bf16 for GPT-OSS).
     sinks = (
         torch.zeros(num_q_heads, dtype=dtype, device=device)
         if has_sink else None
@@ -269,11 +203,9 @@ def _warm_basic_variant(
     logit_cap: float,
     xai_temperature_len: int,
 ):
-    """Trigger compile of one basic-kernel variant via warmup=True.
-
-    Returns the `CompiledKernel` so callers can install it in a
-    dispatch-keyed cache for the CompiledKernel.run bypass path.
-    """
+    """Compile one basic-kernel variant via ``warmup=True`` and return
+    the ``CompiledKernel`` so callers can install it in the dispatch
+    cache for the direct-HIPLauncher bypass path."""
     BM, BN, NW, NS, PAD_K, PAD_V, EXT_BN, EXT_NS = config
     BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(head_dim)
     kv_group_num = num_q_heads // num_kv_heads
@@ -325,10 +257,9 @@ def _warm_persistent_variant(
     xai_temperature_len: int,
     tile_map_mode: int = 0,
 ):
-    """Trigger compile of one persistent-kernel variant (incl. split-K).
+    """Compile one persistent-kernel variant (inc. split-K).
 
-    tile_map_mode: 0 = cum_tiles binary search (default),
-                   1 = WCA inline linear scan.
+    ``tile_map_mode``: 0 = cum_tiles binary search, 1 = WCA inline scan.
     """
     BM, BN, NW, NS, SPLIT_K = config
     BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(head_dim)
@@ -390,22 +321,12 @@ def _build_work_list(
     sliding_window_size: int = -1,
     head_num: Optional[int] = None,
 ) -> list[tuple]:
-    """Build the list of (path, config, is_causal[, tile_map_mode]) tuples to warm.
+    """Build the list of ``(path, config, is_causal, tile_map_mode)``
+    tuples to warm.
 
-    path in {"basic", "persistent", "fp8_basic"}.
-
-    Persistent variants are keyed on TILE_MAP_MODE (cum_tiles=0 / WCA=1) as
-    well — each is a distinct constexpr specialization and must be warmed
-    independently so live dispatch never triggers JIT.
-
-    `sliding_window_size` forwarded to enumerate_basic_configs so the
-    SWA-specific dispatch overrides (BM=64 NW=2 NS=2 for long-extend SWA)
-    get prewarmed; otherwise the first live SWA call JIT-compiles that
-    variant during serving.
-
-    `head_num` forwarded so the B=1 H-aware BM=256 variants are enumerated
-    for the model's actual H_q. Without it, prewarm would miss those and
-    first long-prompt ShareGPT request would JIT-stall.
+    ``path`` is one of ``{"basic", "persistent", "fp8_basic"}``.
+    Persistent variants are keyed on ``TILE_MAP_MODE`` as well —
+    each mode is a distinct constexpr specialization.
     """
     work: list[tuple] = []
     basic_cfgs = enumerate_basic_configs(
@@ -457,36 +378,15 @@ def prewarm_extend_attention(
     """Compile every kernel variant the dispatch can produce for ONE
     (attention-pattern, head-dim) pair.
 
-    For models that mix attention patterns across layers (GPT-OSS, Gemma3,
-    Qwen3, Llama4 all do), call `prewarm_for_model(...)` instead -- it
-    de-duplicates and walks every unique pattern the model exposes.
+    For models that mix attention patterns across layers (GPT-OSS,
+    Gemma 3, Qwen 3, Llama 4 all do this), call ``prewarm_for_model``
+    instead — it walks every unique pattern the HF config exposes and
+    de-dupes the work list.
 
-    Parameters
-    ----------
-    head_dim, num_q_heads, num_kv_heads : int
-        Attention shape. GQA group size is `num_q_heads // num_kv_heads`.
-    device : torch.device, optional
-        Target device. Defaults to the current CUDA device.
-    dtype : torch.dtype
-        Q/K/V/O dtype. FP8 variants always use their own dtypes regardless.
-    is_causal_modes : tuple of bool
-        Which causal modes to warm. Extend attention is almost always
-        causal; pass `(True, False)` only for bidirectional models.
-    has_sink, sliding_window_size, logit_cap, xai_temperature_len :
-        Model constants that become kernel constexprs. Pass -1 / 0.0 /
-        False for "not used".
-    include_basic, include_persistent, include_fp8 :
-        Which kernel families to warm. FP8 off by default.
-    parallel : int
-        Number of compile threads. 0 = sequential. Triton releases the
-        GIL in the heavy LLVM passes so threading gives near-linear
-        speedup for compile-bound loops.
-    verbose : bool
-        Log per-variant timing.
-
-    Returns
-    -------
-    dict with 'num_variants', 'wall_time', 'sequential_time_est'.
+    ``parallel > 0`` compiles through ``triton.AsyncCompileMode`` +
+    a thread pool; Triton releases the GIL on the heavy LLVM passes,
+    so threading gives near-linear speedup. ``parallel = 0`` is
+    sequential. Returns a dict with timings and variant counts.
     """
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -544,14 +444,11 @@ def prewarm_extend_attention(
     seq_total = 0.0
 
     if parallel and parallel > 0 and len(work) > 1:
-        # Parallel via Triton's AsyncCompileMode. It submits each
-        # compile to the executor and finalizes them on context exit.
         executor = ThreadPoolExecutor(max_workers=parallel)
         try:
             with triton.AsyncCompileMode(executor):
                 for item in work:
-                    t = _run_one(item)
-                    seq_total += t
+                    seq_total += _run_one(item)
         finally:
             executor.shutdown(wait=True)
     else:
@@ -559,20 +456,11 @@ def prewarm_extend_attention(
             seq_total += _run_one(item)
 
     # Phase 2: real-launch pass through the live dispatch.
-    #
-    # Phase 1 (above) only triggers Triton's AMDGCN compile via warmup=True.
-    # That leaves two runtime costs unpaid:
-    #   a) HIP module load (hipModuleLoadData): ~14ms per unique kernel on
-    #      the first REAL launch. Without this, the "first cache-hit" call
-    #      after prewarm still stalls.
-    #   b) `_config_cache` population. The dispatch installs its fast-path
-    #      CompiledKernel closure only after a live call. Without this, the
-    #      first runtime dispatch goes through the slow JITFunction.run
-    #      path (~20ms) before the fast path kicks in.
-    #
-    # We route a tiny (B=1 ext=1 pfx=0) call through gluon_extend_attention_fwd
-    # with _force_* overrides that land on each unique basic config. For
-    # persistent kernels the same trick works via _force_use_persistent=True.
+    # Phase 1 (warmup=True) compiles AMDGCN but leaves two runtime
+    # costs unpaid: hipModuleLoadData (~14ms per unique kernel) and
+    # `_config_cache` installation (~20ms via JITFunction.run). Phase 2
+    # routes a tiny call through each dispatch path so both costs are
+    # paid before first serving token.
     phase2_start = time.time()
     try:
         _populate_runtime_caches(
@@ -614,9 +502,7 @@ def prewarm_extend_attention(
     return result
 
 
-# ===-----------------------------------------------------------------------===#
-# Runtime-cache population (HIP module load + _config_cache)
-# ===-----------------------------------------------------------------------===#
+# Runtime-cache population (HIP module load + _config_cache).
 
 
 def _make_realistic_tensors(
@@ -634,19 +520,9 @@ def _make_realistic_tensors(
 ):
     """Tensors matching an attention backend's runtime extend call.
 
-    Dtype contract varies by backend:
-      - SGLang's triton_backend.py: qo_indptr=int64, kv_indptr=int32,
-        kv_indices=int64.
-      - SGLang's aiter_backend.py:  qo_indptr=int32, kv_indptr=int32,
-        kv_indices=int64.
-    Gluon's `_config_cache` keys on the dtype triple so each combination
-    needs its own prewarm pass. `qo_indptr_dtype` selects which one.
-
-    Triton specializes `CompiledKernel` on each tensor argument's dtype
-    (the pointer element type is baked into the SASS at compile time). A
-    dtype mismatch doesn't raise at launch - the kernel reads wrong-sized
-    strides and either returns garbage or, worse, asynchronously faults
-    with HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION on the next kernel.
+    Dtype contract varies by backend (triton_backend uses qo_indptr=int64,
+    aiter_backend uses int32). ``_config_cache`` keys on the dtype triple,
+    so each combo needs its own prewarm pass; ``qo_indptr_dtype`` selects.
     """
     total_ext = max(1, batch_size * max_ext)
     total_pfx = max(0, batch_size * max_pfx)
@@ -666,11 +542,9 @@ def _make_realistic_tensors(
         else torch.zeros(0, dtype=torch.int64, device=device)
     )
     mask_indptr = torch.zeros(batch_size + 1, dtype=torch.int64, device=device)
-    # Sinks dtype must match what the runtime will pass -- SGLang's GPT-OSS
-    # path builds sinks as bf16 under the Triton attention backend (fp32 only
-    # for trtllm_mha), and Triton specializes its compiled kernel on the
-    # Sinks-tensor dtype. Using fp32 here would compile a different variant
-    # that runtime never hits, defeating the prewarm.
+    # Sinks dtype must match runtime (SGLang's GPT-OSS path uses bf16
+    # under Triton backend). Using fp32 here would compile a variant
+    # runtime never hits, defeating the prewarm.
     sinks = (
         torch.zeros(num_q_heads, dtype=dtype, device=device)
         if has_sink else None
@@ -683,28 +557,14 @@ def _enumerate_basic_shape_reps(
     sliding_window_size: int = -1,
     head_num: Optional[int] = None,
 ) -> list[tuple]:
-    """Walk the (b, e, p_bucket) grid, collect one representative shape per
-    unique dispatch output. Natural dispatch (no _force_*) is required so
-    the fast-path cache-install block inside gluon_extend_attention_fwd
-    fires (that block is gated on `_force_block_m is None` etc).
+    """One representative ``(batch_size, max_ext, total_prefix_len)``
+    tuple per unique basic dispatch output.
 
-    Returns a list of (batch_size, max_ext, total_prefix_len) tuples. Each
-    tuple, when dispatched, lands on a distinct basic config AND (by
-    virtue of `_uniform_like = True` at B=1 or uniform-shape) hits the
-    fast-path cache-install branch.
-
-    `head_num` forwarded because the B=1 dispatch branches on H_q (see
-    `_get_basic_dispatch_config`). Without it, phase-2 `_config_cache`
-    warming would use a different dispatch config than the live call at
-    B=1 H_q=64 and the cache would miss.
+    Natural dispatch (no ``_force_*`` overrides) is required so the
+    cache-install branch inside ``gluon_extend_attention_fwd`` fires.
+    ``head_num`` must match the live model — B=1 dispatch branches on
+    H_q and mismatched warming would miss the live cache key.
     """
-    # NB: use the module-scope import rather than a fresh `from
-    # extend_attention_gfx950 ...` statement. The bare name only resolves
-    # under flat sys.path imports; when the package is imported as
-    # `kernels.cdna4.fa.extend._prewarm` (sglang's path), a bare import
-    # raises ModuleNotFoundError and phase 2 gets swallowed by the outer
-    # try/except at line ~566, leaving `_config_cache` empty and every
-    # runtime call paying the ~20ms JIT-slowpath on first hit.
     _gcfg = _get_basic_dispatch_config
     pfx_avg_for_bucket = {0: 0, 1: 256, 2: 1024, 3: 4096, 4: 16384}
     seen: dict[tuple, tuple] = {}
@@ -718,9 +578,9 @@ def _enumerate_basic_shape_reps(
                 )
                 if cfg in seen:
                     continue
-                # Prefer B=1 shapes when available (uniform_like=True so the
-                # fast cache install fires). If b>1 we can still land on
-                # _uniform_by_shape since q_extend.shape[0] == b*e.
+                # Keeping the (b, e) pair uniform ensures `_uniform_like`
+                # is True at dispatch time so the fast-path cache install
+                # branch fires.
                 pfx_total = b * pfx_avg_for_bucket[p]
                 seen[cfg] = (b, e, pfx_total)
     return list(seen.values())
@@ -742,14 +602,12 @@ def _warm_persistent_dispatch_cases(
     qo_dt: torch.dtype,
     kv_pool_size: int,
 ):
-    """Run the 4 persistent-dispatch warmup cases once for a given
-    (is_causal, qo_dt) combo. Exists as a helper so the outer caller
-    can loop over qo_indptr dtype without an extra indent level
-    polluting the git diff.
-    """
+    """Run the 4 persistent-dispatch warmup cases for one
+    ``(is_causal, qo_dt)`` combo. Split out so the outer loop can iterate
+    over ``qo_indptr`` dtypes without an extra indent level."""
     sm_scale_local = 1.0 / math.sqrt(head_dim)
 
-    # Case 1: D64/D128 big-ext het (routes WCA small or WCA default).
+    # Case 1: big-ext het -> WCA small / WCA default.
     bs = 4
     elens = [4096, 2048, 1024, 512]
     pfx_per = 0
@@ -784,7 +642,7 @@ def _warm_persistent_dispatch_cases(
         if verbose:
             logger.warning("phase2 persistent big-het causal=%s: %r", is_causal, e)
 
-    # Case 2: spec-decode style - small ext, big pfx skew (D=128 wca).
+    # Case 2: spec-decode style (small ext, big pfx skew) -> D=128 WCA.
     bs = 8
     elens = [1] * 8
     plens = [4096] * 8
@@ -872,7 +730,7 @@ def _warm_persistent_dispatch_cases(
         if verbose:
             logger.warning("phase2 persistent bsearch causal=%s: %r", is_causal, e)
 
-    # Case 4: D>=128 chat-mix style het+pfx -> WCA default.
+    # Case 4: chat-mix style het+pfx -> WCA default (D>=128 only).
     if head_dim >= 128:
         bs = 8
         elens = [512, 256, 128, 64, 512, 256, 128, 64]
@@ -934,26 +792,18 @@ def _populate_runtime_caches(
     verbose: bool,
     qo_indptr_dtypes: Sequence[torch.dtype] = (torch.int64, torch.int32),
 ):
-    """Route a small real call through gluon_extend_attention_fwd for each
-    unique basic config + each persistent variant. This:
-      * Loads the HIP module into the runtime (first hipModuleLoadData is
-        ~14ms; paying it here keeps the runtime's first "cache-hit" call
-        fast).
-      * Populates the dispatch-level `_config_cache` so the fast-path
-        CompiledKernel closure is ready before the first live call.
+    """Route a small real call through ``gluon_extend_attention_fwd``
+    for each unique basic config and each persistent variant. Loads the
+    HIP module into the runtime and populates ``_config_cache`` so the
+    first live call hits the fast path.
 
-    NOTE: We do natural dispatch (no `_force_*` args) so the fast cache
-    install inside gluon_extend_attention_fwd fires. It's gated on
-    `_force_block_m is None` etc.
-
-    `qo_indptr_dtypes` warms both SGLang's triton_backend (int64) and
-    aiter_backend (int32) qo_indptr conventions by default. Gluon's
-    `_config_cache` keys on dtype so each combination needs a dedicated
-    real-launch pass.
+    Uses natural dispatch (no ``_force_*`` args) so the cache-install
+    branch inside the dispatcher fires. Warms both int64 and int32
+    ``qo_indptr`` conventions (triton_backend vs aiter_backend) since
+    the cache keys on dtype.
     """
-    # --- Basic path: real-launch one shape per unique dispatch config. ---
     if include_basic:
-        kv_pool_size = 64 * 1024  # realistic pool so indices stay valid
+        kv_pool_size = 64 * 1024
         shape_reps = _enumerate_basic_shape_reps(
             head_dim, sliding_window_size=sliding_window_size,
             head_num=num_q_heads,
@@ -987,10 +837,7 @@ def _populate_runtime_caches(
                                 bs, ext, pfx_total, is_causal, qo_dt, e,
                             )
 
-    # --- Persistent path: ragged batches to exercise WCA and bsearch.
-    # For D=64 the ragged-routing in dispatch requires ext_ratio>4 or
-    # (ratio>20 and ext>=64). For D=128 we use a pfx-heavy shape to
-    # trigger _is_ragged_pfx.
+    # Persistent path: ragged batches to exercise WCA and bsearch.
     if include_persistent:
         kv_pool_size = 128 * 1024
         for qo_dt in qo_indptr_dtypes:
@@ -1014,64 +861,26 @@ def _populate_runtime_caches(
     torch.cuda.synchronize(device)
 
 
-# ===-----------------------------------------------------------------------===#
-# Model-aware prewarm
-# ===-----------------------------------------------------------------------===#
+# Model-aware prewarm.
 #
-# Real models mix attention patterns across layers. Each distinct pattern
-# specializes the kernel differently because SLIDING_WINDOW_SIZE, HAS_SINK,
-# LOGIT_CAP, and XAI_TEMPERATURE_LEN are all constexprs. We ENUMERATE every
-# pattern the model exposes, de-dupe, and warm each unique one.
-#
-# Observed patterns (from sglang model loaders + model cards as of 2026-04):
-#
-#   GPT-OSS 20B/120B (D=64, GQA 64->8):
-#     - `config.layer_types` alternates "full_attention" and
-#       "sliding_attention". sliding window = 128.
-#     - `sinks` parameter present on every attention module
-#       (HAS_SINK=True on all layers).
-#     => 2 unique patterns: (swa=-1, sink=1), (swa=128, sink=1)
-#
-#   Gemma 3 (D=256, GQA):
-#     - 5 local (sliding_attention, window=1024) for every 1 global
-#       (full_attention) layer. No sinks. Optional logit_cap on
-#       `final_logit_softcapping` path but attention cap is 0.
-#     => 2 unique patterns: (swa=-1, sink=0), (swa=1024, sink=0)
-#
-#   Qwen 3 (D=128, GQA 32->8):
-#     - `max_window_layers` splits: early layers full, later layers SWA
-#       (window=4096) when `use_sliding_window=True`.
-#     - No sinks.
-#     => 2 unique patterns when SWA enabled, 1 when disabled.
-#
-#   Llama 4 Maverick/Scout (D=128, GQA):
-#     - iRoPE: odd/even layer alternation between RoPE and NoPE. For
-#       attention-masking purposes: alternating full and "chunked"
-#       (window=8192) layers.
-#     => 2 unique patterns.
-#
-#   Llama 3 / Qwen 2.5 / Mistral / DeepSeek-style dense: single pattern
-#     (full_attention everywhere, no sinks).
-#     => 1 unique pattern.
+# Real models mix attention patterns across layers (e.g. GPT-OSS
+# alternates full / SWA, Gemma 3 uses 5:1 local:global, Llama 4 iRoPE,
+# Qwen 3 ``max_window_layers`` split). Each distinct pattern is a
+# unique kernel variant because ``SLIDING_WINDOW_SIZE``, ``HAS_SINK``,
+# ``LOGIT_CAP``, and ``XAI_TEMPERATURE_LEN`` are all constexprs.
+# ``prewarm_for_model`` enumerates every pattern, de-dupes, and warms
+# each unique one.
 
 
 def enumerate_layer_patterns(
     layers: Sequence[dict],
 ) -> list[tuple]:
-    """De-dupe a list of per-layer attention configs into the unique
-    constexpr-affecting combinations.
+    """De-dupe per-layer attention configs into unique constexpr tuples.
 
-    Each entry in `layers` is a dict with keys:
-      sliding_window_size : int  (-1 = full attention)
-      has_sink            : bool
-      logit_cap           : float
-      xai_temperature_len : int
-      is_causal           : bool (default True -- set False for encoder-style)
-
-    Returns a sorted list of tuples
-        (sliding_window_size, has_sink, logit_cap, xai_temperature_len,
-         is_causal)
-    so the caller can walk unique patterns instead of all N layers.
+    Each ``layers[i]`` is a dict with keys ``sliding_window_size``,
+    ``has_sink``, ``logit_cap``, ``xai_temperature_len``, ``is_causal``.
+    Returns a sorted list of the distinct combinations so callers can
+    walk unique patterns instead of all N layers.
     """
     seen: set[tuple] = set()
     for L in layers:
@@ -1085,18 +894,14 @@ def enumerate_layer_patterns(
     return sorted(seen)
 
 
-# Built-in model presets. Each returns the list of per-layer attention configs
-# that the named architecture produces. Presets cover the most common sglang
-# target models for gfx950.
+# Built-in model presets: each returns the per-layer attention configs
+# for the named architecture. Covers the common sglang target models
+# for gfx950.
+
 
 def spec_gpt_oss(num_layers: int = 36, sliding_window: int = 128) -> list[dict]:
-    """GPT-OSS 20B (24 layers) / 120B (36 layers).
-
-    layer_types alternates ["full_attention", "sliding_attention", ...].
-    All layers use attention sinks.
-
-    head_dim = 64, GQA num_q_heads = 64, num_kv_heads = 8 (both sizes).
-    """
+    """GPT-OSS 20B (24 layers) / 120B (36 layers): alternating full /
+    SWA(=128), attention sinks on every layer. D=64, GQA 64->8."""
     return [
         {
             "sliding_window_size": sliding_window if (i % 2 == 1) else -1,
@@ -1110,11 +915,7 @@ def spec_gpt_oss(num_layers: int = 36, sliding_window: int = 128) -> list[dict]:
 
 
 def spec_gemma3(num_layers: int = 26, sliding_window: int = 1024) -> list[dict]:
-    """Gemma 3 27B: 5:1 local:global pattern.
-
-    Local layers use sliding_window=1024; global layers use full attention.
-    No sinks, no logit cap on attention.
-    """
+    """Gemma 3 27B: 5:1 local(SWA=1024):global(full) pattern, no sinks."""
     return [
         {
             "sliding_window_size": -1 if ((i + 1) % 6 == 0) else sliding_window,
@@ -1133,10 +934,9 @@ def spec_qwen3(
     sliding_window: int = 4096,
     use_sliding_window: bool = True,
 ) -> list[dict]:
-    """Qwen 3: layers < max_window_layers use full attention; layers >=
-    max_window_layers use sliding window. Many Qwen 3 configs ship with
-    `use_sliding_window=False`; pass that through to warm a single pattern.
-    """
+    """Qwen 3: layers < ``max_window_layers`` are full, the rest are SWA
+    when ``use_sliding_window``. Many Qwen 3 configs ship with SWA off —
+    pass ``use_sliding_window=False`` to warm a single pattern."""
     patterns = []
     for i in range(num_layers):
         sw = (
@@ -1155,14 +955,11 @@ def spec_qwen3(
 
 
 def spec_llama4(num_layers: int = 48, sliding_window: int = 8191) -> list[dict]:
-    """Llama 4 (iRoPE): chunked-window + every-4th NoPE global layer.
+    """Llama 4 (iRoPE): 3-of-4 chunked-window layers, every 4th full NoPE.
 
-    Matches ``llama4.py`` exactly: ``use_rope = (layer_id + 1) % 4 != 0``,
-    i.e. 3/4 of layers use the chunked window (SWA-style for
-    mask-shape purposes) and every 4th layer is full-attention NoPE.
-    ``sliding_window`` here is the SGLang exclusive value (HF's
-    ``attention_chunk_size`` minus 1; the default 8192 chunk -> 8191
-    exclusive).
+    Matches ``llama4.py``'s ``use_rope = (layer_id + 1) % 4 != 0``.
+    ``sliding_window`` is SGLang's exclusive value (HF's 8192-token
+    ``attention_chunk_size`` maps to 8191 exclusive).
     """
     return [
         {
@@ -1177,12 +974,8 @@ def spec_llama4(num_layers: int = 48, sliding_window: int = 8191) -> list[dict]:
 
 
 def spec_gemma2(num_layers: int = 42, sliding_window: int = 4095) -> list[dict]:
-    """Gemma 2 (9B/27B): alternating sliding/full layers (SWA on even ids).
-
-    Matches ``gemma2.py`` exactly: ``use_sliding_window = (layer_id % 2 == 0)
-    and hasattr(config, "sliding_window")``. Both 9B (42 layers) and 27B
-    (46 layers) use attn_logit_softcapping=50.0.
-    """
+    """Gemma 2 (9B/27B): alternating SWA/full (SWA on even layer ids),
+    attn_logit_softcapping=50.0. Matches ``gemma2.py``."""
     return [
         {
             "sliding_window_size": sliding_window if (i % 2 == 0) else -1,
@@ -1200,14 +993,8 @@ def spec_cohere2(
     sliding_window: int = 4096,
     layer_types: Optional[Sequence[str]] = None,
 ) -> list[dict]:
-    """Cohere Command R+ v2 (Cohere2Config): explicit layer_types.
-
-    Every 4th layer is ``full_attention`` (NoPE global), the rest
-    ``sliding_attention``. If ``layer_types`` is None we use the stock
-    Command R+ v2 pattern (``[sliding]*3 + [full]``). Cohere v2 passes
-    the raw HF ``sliding_window`` (no -1 off-by-one) - we follow that
-    convention here.
-    """
+    """Cohere Command R+ v2: 3 sliding + 1 full, repeated. Cohere v2
+    uses the raw HF ``sliding_window`` value (no off-by-one)."""
     if layer_types is None:
         layer_types = [
             "full_attention" if ((i + 1) % 4 == 0) else "sliding_attention"
@@ -1230,14 +1017,9 @@ def spec_grok(
     logit_cap: float = 30.0,
     xai_temperature_len: int = -1,
 ) -> list[dict]:
-    """Grok-1 style: uniform full attention with attn_logit_softcapping=30.
-
-    ``grok.py`` sets ``self.attn.xai_temperature_len`` from HF's
-    ``attn_temperature_len`` and applies ``attn_logit_softcapping``
-    (default 30.0) as the LOGIT_CAP kernel constexpr. No sinks. Pass
-    ``xai_temperature_len>0`` to prewarm the Grok-1 temperature-routing
-    variant.
-    """
+    """Grok-1: uniform full attention with LOGIT_CAP=30 (default).
+    Pass ``xai_temperature_len > 0`` to warm the temperature-routing
+    variant."""
     return [
         {
             "sliding_window_size": -1,
@@ -1251,12 +1033,11 @@ def spec_grok(
 
 
 def spec_llama3(num_layers: int = 32) -> list[dict]:
-    """Uniform full-attention, no sinks, no caps, no sliding.
+    """Uniform full-attention, no sinks / caps / sliding.
 
-    Covers Llama 3 / 3.1 / 3.3, Qwen 2 / 2.5, Mistral 7B (sliding_window
-    config field is present but ignored by the SGLang Mistral class),
-    Mixtral, DBRX, OLMo 2 (for configs with no ``layer_types``), Arcee,
-    and the general dense-decoder family.
+    Covers Llama 3.x, Qwen 2 / 2.5, Mistral 7B, Mixtral, DBRX, OLMo 2
+    (no-``layer_types`` configs), Arcee, and the dense-decoder family
+    generally.
     """
     return [
         {
@@ -1270,11 +1051,9 @@ def spec_llama3(num_layers: int = 32) -> list[dict]:
     ]
 
 
-# Named preset dispatch for convenience.
-#
-# Tuples are ``(head_dim, num_q_heads, num_kv_heads, layer_spec)``. Values
-# taken from the public HF config for each model. Keep alphabetised within
-# each family block for easy diffing.
+# Named preset dispatch. Tuples are ``(head_dim, H_q, H_kv, layer_spec)``.
+# Values from each model's public HF config. Alphabetised within family
+# blocks.
 MODEL_PRESETS = {
     # Cohere Command R+ v2 (interleaved SWA, D=128, GQA 96->8)
     "cohere-command-r-plus": lambda: (128, 96, 8, spec_cohere2(num_layers=64)),
@@ -1341,11 +1120,10 @@ def prewarm_for_model(
 ) -> dict:
     """Prewarm every unique kernel variant across a model's layer patterns.
 
-    `layers` is a sequence of per-layer dicts (see enumerate_layer_patterns).
-    You can build one manually, or use one of the `spec_*` helpers / the
-    `MODEL_PRESETS` table.
-
-    Returns a dict with per-pattern statistics and the aggregate wall time.
+    ``layers`` is a sequence of per-layer dicts (see
+    ``enumerate_layer_patterns``) — build one manually or use a
+    ``spec_*`` helper or a ``MODEL_PRESETS`` entry. Returns a dict with
+    per-pattern stats and aggregate wall time.
     """
     patterns = enumerate_layer_patterns(layers)
     if verbose:

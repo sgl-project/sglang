@@ -490,10 +490,9 @@ class ServerArgs:
     )
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
-    # Opt in to the Gluon extend-attention kernel on MI350/MI355 (gfx950).
-    # Only effective under the Triton attention backend; no effect on
-    # non-gfx950 hardware or non-Triton backends. Off by default to keep
-    # main-line behaviour bit-identical to the Triton reference path.
+    # Opt in to the Gluon extend-attention kernel on MI350 / MI355
+    # (gfx950) under the Triton attention backend. No-op on other
+    # hardware or backends; falls back to Triton on unsupported shapes.
     enable_gluon_extend_attention: bool = False
 
     # Speculative decoding

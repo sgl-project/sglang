@@ -58,10 +58,9 @@ class ForwardMetadata:
     window_kv_offsets: torch.Tensor
     # Separate attn_logits for SWA layers when v_head_dim differs
     swa_attn_logits: Optional[torch.Tensor] = None
-    # Gluon extend-attention dispatch hints -- O(B) CPU reduction in
-    # init_forward_metadata, forwarded as kwargs to the kernel launcher
-    # only when the Gluon wrapper is active. Ignored by the Triton
-    # reference (which does not accept these kwargs).
+    # Gluon dispatch hints computed once in init_forward_metadata
+    # (O(B) CPU-side reduction, no GPU sync). Only forwarded to the
+    # Gluon wrapper; the Triton reference ignores them.
     total_prefix_len: Optional[int] = None
     total_extend_len: Optional[int] = None
     min_len_extend: Optional[int] = None
@@ -87,15 +86,12 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
-        # Opt-in Gluon extend-attention kernel for MI350/MI355 (gfx950).
-        # Gated behind --enable-gluon-extend-attention and a gfx950 check;
-        # no effect on other hardware or attention backends. The wrapper
-        # transparently falls back to the Triton reference on unsupported
-        # shapes or any runtime exception, so enabling is always safe.
-        #
-        # MLA models (Lq != Lv) are short-circuited here -- the Gluon
-        # extend kernel only supports symmetric heads, so wrapping would
-        # just pay an extra dispatch check per call for no benefit.
+        # Optional Gluon extend-attention kernel for gfx950 (MI350 / 355).
+        # Gated on --enable-gluon-extend-attention + hardware probe; the
+        # wrapper falls back to the Triton reference on any unsupported
+        # shape or runtime exception, so enabling is always safe.
+        # MLA models (Lq != Lv) skip the wrapper entirely — Gluon extend
+        # is symmetric-head only.
         self._gluon_extend_enabled = False
         _extend_fwd = extend_attention_fwd
         _mla_model = (
@@ -136,8 +132,7 @@ class TritonAttnBackend(AttentionBackend):
                         ),
                     )
                 except Exception:
-                    # Prewarm is best-effort; first live calls will JIT
-                    # as normal if this fails.
+                    # Best-effort; first live calls will JIT as normal.
                     pass
         self.extend_attention_fwd = torch.compiler.disable(_extend_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
@@ -511,8 +506,9 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             num_kv_splits = None
 
-        # Gluon dispatch hints: O(B) CPU reduction, no GPU sync. Input
-        # is either List[int] or cpu Tensor (piecewise-cuda-graph runner).
+        # Compute Gluon dispatch hints once (O(B) CPU-side, no GPU sync).
+        # Input may be list[int] or a cpu tensor from the piecewise
+        # cuda-graph runner.
         _pfx_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
         _ext_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if _pfx_cpu is not None and _ext_cpu is not None:
@@ -1029,8 +1025,8 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # Gluon-only keyword-only hints; the Triton reference does not
-        # accept these so we only pass them when Gluon is active.
+        # Dispatch hints are keyword-only on the Gluon wrapper; the
+        # Triton reference does not accept them.
         _gluon_hints = (
             dict(
                 total_prefix_len=self.forward_metadata.total_prefix_len,

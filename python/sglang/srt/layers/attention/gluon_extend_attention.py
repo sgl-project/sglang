@@ -24,16 +24,10 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Optional per-call shape profiler.
-#
-# Enable with SGLANG_GLUON_PROFILE_SHAPES=<path>. Records per-call
-# (batch_size, max_len_extend, total_extend, total_prefix,
-#  kv_is_fp8, has_custom_mask, sliding_window_size, has_sinks,
-#  logit_cap>0, path) into a bucketed counter; dumps on process exit.
-# Used offline to diagnose TTFT regressions, never on the hot path unless
-# the env var is set.
-# ---------------------------------------------------------------------------
+# Optional per-call shape profiler. Enable with
+# SGLANG_GLUON_PROFILE_SHAPES=<path>. Buckets (path, shape, feature) counts
+# and dumps on exit / SIGUSR1 / every N calls. Off when the env var is
+# unset; used offline to diagnose TTFT regressions.
 _PROFILE_PATH = os.environ.get("SGLANG_GLUON_PROFILE_SHAPES") or None
 _PROFILE_COUNTS: dict = {}
 _PROFILE_LOCK = threading.Lock()
@@ -94,10 +88,8 @@ _PROFILE_TOTAL = 0
 
 
 def _profile_maybe_dump_live() -> None:
-    """If SGLANG_GLUON_PROFILE_DUMP_AFTER=N is set, dump the shape counters
-    every time the total call count crosses another multiple of N. Written
-    in-place so the file is safe to read between dumps.
-    """
+    """Dump the shape counters every ``SGLANG_GLUON_PROFILE_DUMP_AFTER``
+    calls when that env var is set; the file is safe to tail in place."""
     global _PROFILE_TOTAL
     if not _PROFILE_PATH or _PROFILE_DUMP_AFTER_N <= 0:
         return
@@ -129,10 +121,9 @@ _PREWARM_FN: Optional[Callable] = None
 _PREWARM_MODEL_FN: Optional[Callable] = None
 _PREWARMED_MODELS: set = set()
 
-# Optional numerical-parity check: when SGLANG_GLUON_COMPARE=<int> is set,
-# the wrapper runs BOTH Gluon and the Triton reference for the first N
-# calls after startup and logs max|diff| / mean|diff| to help diagnose
-# serving-level quality regressions. Disabled (N=0) on the hot path.
+# Optional numerical-parity check: SGLANG_GLUON_COMPARE=<N> runs BOTH
+# Gluon and the Triton reference for the first N calls after startup and
+# logs max|diff| / mean|diff|. N=0 (default) is a no-op on the hot path.
 _COMPARE_REMAINING = int(os.environ.get("SGLANG_GLUON_COMPARE", "0") or 0)
 _COMPARE_LOCK = threading.Lock()
 _COMPARE_PATH = os.environ.get("SGLANG_GLUON_COMPARE_LOG") or None
@@ -156,11 +147,8 @@ def _compare_log_diff(
     max_len_extend, sliding_window_size, sinks, logit_cap,
     custom_mask, is_causal,
 ) -> None:
-    """Log max|diff| / mean|diff| between Gluon and Triton outputs.
-
-    Written only when SGLANG_GLUON_COMPARE=<N> (N>0). Used offline to
-    chase quality regressions; not part of the hot path.
-    """
+    """Log max/mean abs diff between Gluon and Triton outputs. Only
+    invoked when ``SGLANG_GLUON_COMPARE=<N>`` (N>0)."""
     try:
         diff = (o_gluon.float() - o_triton_ref.float()).abs()
         max_abs = diff.max().item()
@@ -197,11 +185,9 @@ def _compare_log_diff(
 
 
 def _try_import_gluon() -> bool:
-    """Populate ``_GLUON_FN`` / ``_PREWARM_FN`` from the vendored package.
-
-    Idempotent. Returns True on success, False if the import raised (we
-    will then stay on the Triton fallback).
-    """
+    """Populate the Gluon entry points from the vendored package.
+    Idempotent; returns True on success, False if the import raised
+    (wrapper stays on the Triton fallback)."""
     global _GLUON_FN, _PREWARM_FN, _PREWARM_MODEL_FN
     if _GLUON_FN is not None:
         return True
@@ -224,21 +210,18 @@ def _try_import_gluon() -> bool:
 
 
 # Architectures whose SGLang model class passes ``sinks=...`` into the
-# attention backend (i.e. the HAS_SINK=True kernel constexpr path).
-#
-# Grok1ForCausalLM is intentionally absent: grok.py does not pass sinks
-# into RadixAttention (only attn_temperature_len); including it here
-# would prewarm the wrong kernel family and miss the live variant on
-# first Grok-1 prefill.
+# attention backend (HAS_SINK=True kernel constexpr). Grok1 is
+# intentionally absent — grok.py passes attn_temperature_len only, not
+# sinks, so including it here would warm the wrong variant.
 _HAS_SINK_ARCHS = {
     "GptOssForCausalLM",
     "GptOssMoeForCausalLM",
 }
 
-# Architectures whose SGLang model class *does not* use ``config.layer_types``
-# to spell out sliding layers, and instead pattern-matches on layer_id.
-# We replicate the exact runtime convention so the prewarm cache hits the
-# same SLIDING_WINDOW_SIZE constexpr the runtime will ask for.
+# Architectures that pattern-match sliding-vs-full layers on layer_id
+# (i.e. no explicit ``config.layer_types``). Mirror the runtime
+# convention exactly so prewarm hits the same SLIDING_WINDOW_SIZE
+# constexpr the runtime will request.
 _GEMMA2_ARCHS = {"Gemma2ForCausalLM", "Gemma2Model"}
 _LLAMA4_ARCHS = {
     "Llama4ForCausalLM",
@@ -250,34 +233,28 @@ _LLAMA4_ARCHS = {
 def _build_layer_spec_from_hf_config(hf_config) -> Optional[list]:
     """Derive a per-layer attention-pattern list for ``prewarm_for_model``.
 
-    Returning the actual ``HAS_SINK`` / ``SLIDING_WINDOW_SIZE`` /
-    ``LOGIT_CAP`` tuples the runtime will ask for avoids a JIT miss per
-    SWA layer on the first E2E prefill.
+    Returns the exact ``(HAS_SINK, SLIDING_WINDOW_SIZE, LOGIT_CAP,
+    XAI_TEMPERATURE_LEN)`` tuples the runtime will request so prewarm
+    hits every variant and the first E2E prefill never JITs.
 
     SGLang uses exclusive sliding windows while HF uses inclusive, so
-    the runtime ``layer.sliding_window_size`` is ``config.sliding_window
-    - 1`` for most families; we must prewarm with that same off-by-one
-    value. (Cohere v2 passes the raw value, but that's just one extra
-    JIT-compile on the first real call, not a correctness hazard.)
+    the runtime window is ``hf_config.sliding_window - 1`` for most
+    families (Cohere v2 is the exception; see ``spec_cohere2``).
+    Pattern inference order:
 
-    Pattern inference order for deciding which layers are sliding vs
-    full:
-      1. ``hf_config.layer_types`` (explicit per-layer labels, e.g.
-         GPT-OSS, Gemma 3, Cohere v2, OLMo 2). Authoritative when
-         present.
-      2. Family-specific rules from the SGLang model code:
-           * Gemma 2: even layer_ids are sliding, odd are full.
-           * Llama 4 iRoPE: layers where ``(id+1) % 4 != 0`` use the
-             chunked window, every 4th layer is global NoPE.
-      3. Fallback: uniform full attention.
+    1. ``hf_config.layer_types`` (GPT-OSS / Gemma 3 / Cohere v2 /
+       OLMo 2 — authoritative when present).
+    2. Family-specific rules:
 
-    Note we intentionally do *not* fall back to "treat every layer as
-    sliding" when ``sliding_window > 0``. Many HF configs (Mistral v0.3,
-    Mixtral, older Llama) ship a non-zero ``sliding_window`` that the
-    SGLang model class ignores; treating it as globally sliding would
-    compile an SWA kernel variant the runtime never uses and, in
-    kernels that special-case the SWA path, produce the wrong cache
-    entry.
+       * Gemma 2: even layer ids are sliding.
+       * Llama 4 iRoPE: layers with ``(id + 1) % 4 != 0`` are chunked;
+         every 4th is full NoPE.
+
+    3. Fallback: uniform full attention.
+
+    Missing-layer-types configs (Mistral v0.3, Mixtral, older Llama)
+    intentionally fall through to (3) — their HF ``sliding_window``
+    field is present but ignored by the SGLang model class.
     """
     if hf_config is None:
         return None
@@ -292,9 +269,7 @@ def _build_layer_spec_from_hf_config(hf_config) -> Optional[list]:
     raw_sliding_window = getattr(hf_config, "sliding_window", None) or -1
     sliding_window = raw_sliding_window - 1 if raw_sliding_window > 0 else -1
     logit_cap = float(getattr(hf_config, "attn_logit_softcapping", None) or 0.0)
-    # Grok sets the runtime ``xai_temperature_len`` attribute from HF's
-    # ``attn_temperature_len`` config field. Accept either key so older
-    # pinned configs also match.
+    # Accept both the new HF key and the older xai-style alias for Grok.
     xai_temp_len = int(
         getattr(hf_config, "attn_temperature_len", None)
         or getattr(hf_config, "xai_temperature_len", None)
@@ -335,10 +310,10 @@ def prewarm_for_model(
     """Warm the Gluon JIT cache at server boot.
 
     Called once per ``(head_dim, num_q_heads, num_kv_heads)`` tuple by
-    :class:`TritonAttnBackend`. When ``hf_config`` is supplied the
-    model-specific per-layer spec (sinks, alternating SWA, logit cap)
-    is used so the fast-path cache gets populated for every kernel
-    variant runtime will ask for. No-op if Gluon import failed.
+    :class:`TritonAttnBackend`. With ``hf_config`` we warm the exact
+    per-layer pattern (sinks, alternating SWA, logit cap); without one
+    we fall back to the generic (causal, full-attention) warm. No-op
+    if the Gluon import failed.
     """
     if _PREWARM_FN is None:
         return
@@ -411,34 +386,22 @@ def _gluon_supports(
     custom_mask,
     is_causal: bool,
 ) -> bool:
-    """Quick upfront check for shape / feature combos the Gluon kernel
-    does not implement yet.
-
-    Keep in sync with the guards at the top of
-    ``gluon_extend_attention_fwd`` in ``extend_attention_gfx950``; the
-    goal is to short-circuit to Triton without paying the cost of a
-    raised ``ValueError`` on every MLA / unsupported-shape call.
-    """
+    """Cheap pre-dispatch filter for shape / feature combos the Gluon
+    kernel does not implement. Keep in sync with the ``raise`` guards
+    at the top of ``gluon_extend_attention_fwd``; falling through to
+    those would work but costs a raised ``ValueError`` per call."""
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
     if Lq not in _GLUON_SUPPORTED_HEAD_DIMS:
         return False
     if Lq != Lv:
-        # Mixed-dim / DeepSeek MLA heads live in gluon_ops/mla_prefill/.
         return False
     if not is_causal:
-        # Non-causal extend (encoder-style, vision towers) has a known
-        # small-batch tail issue in the Gluon kernel. No autoregressive
-        # LLM served via this kernel path asks for non-causal.
         return False
     kv_is_fp8 = k_buffer.dtype in _FP8_KV_DTYPES
     if kv_is_fp8 and Lq == 256:
-        # FP8 KV + D=256 fails Triton IR lowering on gfx950 (MFMA_F8 at
-        # head-dim 256). Gemma (the main D=256 model) ships BF16 KV.
         return False
     if kv_is_fp8 and custom_mask is not None and Lq <= 128:
-        # Spec-decode verify with FP8 KV is not yet supported (see the
-        # matching guard in extend_attention_gfx950.py for details).
         return False
     return True
 
@@ -446,15 +409,11 @@ def _gluon_supports(
 def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
     """Return a drop-in replacement for ``extend_attention_fwd``.
 
-    The returned callable has the same positional/keyword signature as the
-    Triton reference plus three optional dispatch hints
-    (``total_prefix_len`` / ``total_extend_len`` / ``min_len_extend``)
-    that :class:`TritonAttnBackend` fills from CPU tensors in
-    :class:`ForwardMetadata`.
-
-    Unsupported shapes (``Lq != Lv``, head-dims outside ``{64, 128,
-    256}``, FP8 KV + custom_mask on D<=128) and any runtime exception
-    route to ``triton_fallback`` -- never silent wrong output.
+    Signature matches the Triton reference plus three optional dispatch
+    hints (``total_prefix_len`` / ``total_extend_len`` / ``min_len_extend``)
+    that :class:`TritonAttnBackend` fills from :class:`ForwardMetadata`.
+    Any unsupported shape and any runtime exception routes to
+    ``triton_fallback`` — never silent wrong output.
     """
     if not _try_import_gluon():
         return triton_fallback
@@ -519,9 +478,8 @@ def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
                 max_len_extend,
             )
             _profile_maybe_dump_live()
-        # Optional side-by-side Triton/Gluon parity check; only enters
-        # the branch when SGLANG_GLUON_COMPARE=<N> is set (N>0) and we
-        # still have budget left.
+        # Side-by-side Triton parity check; only runs when
+        # SGLANG_GLUON_COMPARE=<N> is set and we still have budget.
         _compare_this_call = False
         if _COMPARE_REMAINING > 0:
             with _COMPARE_LOCK:
