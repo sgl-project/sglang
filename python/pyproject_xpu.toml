@@ -140,6 +140,7 @@ exclude = [
   "playground*",
   "scripts*",
   "tests*",
+  "build*",
 ]
 
 [tool.wheel]
@@ -151,7 +152,6 @@ exclude = [
   "playground*",
   "scripts*",
   "tests*",
-  "build*",
 ]
 
 [tool.setuptools_scm]
