@@ -13,7 +13,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   ```bash
   # Create config.yaml
   cat > config.yaml << EOF
-  model-path: meta-llama/Meta-Llama-3-8B-Instruct
+  model-path: meta-llama/Llama-3.2-1B-Instruct
   host: 0.0.0.0
   port: 30000
   tensor-parallel-size: 2
@@ -28,19 +28,19 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 - To enable multi-GPU tensor parallelism, add `--tp 2`. If it reports the error "peer access is not supported between these two devices", add `--enable-p2p-check` to the server launch command.
 
   ```bash
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 2
+  python -m sglang.launch_server --model-path meta-llama/Llama-3.2-1B-Instruct --tp 2
   ```
 
 - To enable multi-GPU data parallelism, add `--dp 2`. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total. We recommend [SGLang Model Gateway (former Router)](../advanced_features/sgl_model_gateway.md) for data parallelism.
 
   ```bash
-  python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --dp 2 --tp 2
+  python -m sglang_router.launch_server --model-path meta-llama/Llama-3.2-1B-Instruct --dp 2 --tp 2
   ```
 
 - If you see out-of-memory errors during serving, try to reduce the memory usage of the KV cache pool by setting a smaller value of `--mem-fraction-static`. The default value is `0.9`.
 
   ```bash
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --mem-fraction-static 0.7
+  python -m sglang.launch_server --model-path meta-llama/Llama-3.2-1B-Instruct --mem-fraction-static 0.7
   ```
 
 - See [hyperparameter tuning](hyperparameter_tuning.md) on tuning hyperparameters for better performance.
@@ -48,7 +48,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 - If you see out-of-memory errors during prefill for long prompts, try to set a smaller chunked prefill size.
 
   ```bash
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --chunked-prefill-size 4096
+  python -m sglang.launch_server --model-path meta-llama/Llama-3.2-1B-Instruct --chunked-prefill-size 4096
   ```
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e4m3` or `--kv-cache-dtype fp8_e5m2`.
@@ -59,7 +59,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   ```bash
   # Node 0
   python -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --tp 4 \
     --dist-init-addr sgl-dev-0:50000 \
     --nnodes 2 \
@@ -67,7 +67,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
   # Node 1
   python -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3-8B-Instruct \
+    --model-path meta-llama/Llama-3.2-1B-Instruct \
     --tp 4 \
     --dist-init-addr sgl-dev-0:50000 \
     --nnodes 2 \

@@ -312,7 +312,7 @@ Additionally, if you want to locate the SGLang Python source code through the cu
 2. To profile a single batch, use
 
    ```bash
-   nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node python3 -m sglang.bench_one_batch --model meta-llama/Meta-Llama-3-8B --batch-size 64 --input-len 512
+   nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node python3 -m sglang.bench_one_batch --model meta-llama/Llama-3.2-1B-Instruct --batch-size 64 --input-len 512
    ```
 
 3. To profile a server, e.g.

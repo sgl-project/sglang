@@ -216,7 +216,7 @@ model.save(quant_path) # save model
 pip install llmcompressor
 ```
 
-Here, we take quantize `meta-llama/Meta-Llama-3-8B-Instruct` to `FP8` as an example to elaborate on how to do offline quantization.
+Here, we take quantize `meta-llama/Llama-3.2-1B-Instruct` to `FP8` as an example to elaborate on how to do offline quantization.
 
 ```python
 from transformers import AutoTokenizer
@@ -225,7 +225,7 @@ from llmcompressor.transformers import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 
 # Step 1: Load the original model.
-MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
+MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 
 model = SparseAutoModelForCausalLM.from_pretrained(
   MODEL_ID, device_map="auto", torch_dtype="auto")
