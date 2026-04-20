@@ -50,12 +50,10 @@ class PrefillDelayer:
         self._token_usage_low_watermark = token_usage_low_watermark
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
-        self._queue_min_ratio = getattr(
-            server_args, "prefill_delayer_queue_min_ratio", None
-        )
+        self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
         # Fall back to 5000ms if unset; this is a local safety cap, not a
         # semantic default, so we don't surface it via ServerArgs.
-        self._max_delay_ms = getattr(server_args, "prefill_delayer_max_delay_ms", None)
+        self._max_delay_ms = server_args.prefill_delayer_max_delay_ms
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
