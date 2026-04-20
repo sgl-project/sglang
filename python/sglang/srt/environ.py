@@ -3,7 +3,7 @@ import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
-from typing import Any
+from typing import Any, Optional
 
 
 @contextmanager
@@ -163,6 +163,7 @@ class Envs:
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
@@ -243,6 +244,7 @@ class Envs:
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
+    SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     # Extra slots in req_to_token_pool for decode workers (only effective when
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
@@ -263,6 +265,7 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
+    SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER = EnvFloat(1.0)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -313,8 +316,10 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
@@ -331,6 +336,9 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
 
+    # MTHREADS & MUSA
+    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
@@ -338,7 +346,6 @@ class Envs:
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
-    SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
@@ -406,6 +413,9 @@ class Envs:
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
+    # Flash Attention
+    SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
+
     # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
@@ -460,12 +470,18 @@ class Envs:
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
-    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
+    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+
+    # Unified Radix Tree
+    SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+
+    # Breakable CUDA Graph
+    SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -489,6 +505,9 @@ class Envs:
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
 
+    # HTTP/2 Server
+    SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
+
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
 
@@ -496,6 +515,10 @@ class Envs:
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
+
+    # Native gRPC server (internal, not yet user-facing)
+    SGLANG_GRPC_PORT = EnvInt(None)
+    SGLANG_ENABLE_GRPC = EnvBool(False)
 
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
@@ -518,6 +541,7 @@ class Envs:
 
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
+    SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
@@ -531,17 +555,27 @@ class Envs:
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
+    # Sglang Cache Dir
+    SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+
+    # Plugin system
+    SGLANG_PLATFORM = EnvStr("")
+    SGLANG_PLUGINS = EnvStr("")
+
 
 envs = Envs()
 EnvField._allow_set_name = False
 
 
-def _print_deprecated_env(new_name: str, old_name: str):
+def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
     if old_name in os.environ:
-        warnings.warn(
-            f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
-        )
-        os.environ[new_name] = os.environ[old_name]
+        if new_name is None:
+            warnings.warn(f"Environment variable {old_name} has been deprecated.")
+        else:
+            warnings.warn(
+                f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
+            )
+            os.environ[new_name] = os.environ[old_name]
 
 
 def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
@@ -554,14 +588,15 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
 
 
 def _convert_SGL_to_SGLANG():
-    _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
+    _print_deprecated_env("SGLANG_GC_LOG", "SGLANG_LOG_GC")
     _print_deprecated_env(
-        "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
+        "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "SGLANG_MOE_NVFP4_DISPATCH"
     )
     _print_deprecated_env(
-        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
     )
+    _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
     _deprecated_ms_to_s = {
         "SGLANG_QUEUED_TIMEOUT_MS": "SGLANG_REQ_WAITING_TIMEOUT",
         "SGLANG_FORWARD_TIMEOUT_MS": "SGLANG_REQ_RUNNING_TIMEOUT",

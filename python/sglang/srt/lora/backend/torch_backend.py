@@ -64,13 +64,18 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         return output_tensor
 
     def run_lora_a_sgemm(
-        self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        stack_num: int = 1,
+        *args,
+        **kwargs,
     ) -> torch.Tensor:
         output_tensor = sgemm_lora_a_fwd(
             inputs=x,
             weights=weights,
             batch_info=self.batch_info,
-            num_slices=1,
+            num_slices=stack_num,
         )
 
         return output_tensor

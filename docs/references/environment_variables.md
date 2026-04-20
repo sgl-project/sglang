@@ -19,6 +19,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_FORWARD_UNKNOWN_TOOLS`            | Forward unknown tool calls to clients instead of dropping them                                                                   | `false` (drop unknown tools) |
 | `SGLANG_REQ_WAITING_TIMEOUT`              | Timeout (in seconds) for requests waiting in the queue before being scheduled                                                    | `-1`                         |
 | `SGLANG_REQ_RUNNING_TIMEOUT`              | Timeout (in seconds) for requests running in the decode batch                                                                    | `-1`                         |
+| `SGLANG_CACHE_DIR`                        | Cache directory for model weights and other data | `~/.cache/sglang` |
+| `SGLANG_PREFETCH_BLOCK_SIZE_MB`           | Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap | `16` |
 
 ## Performance Tuning
 
@@ -47,6 +49,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_CUSTOM_ALLREDUCE_ALGO` | The algorithm of custom all-reduce. Set to `oneshot` or `1stage` to force use one-shot. Set to `twoshot` or `2stage` to force use two-shot. | `` |
 | `SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM prefill attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
 | `SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM decode attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
+| `SGLANG_USE_SGL_FA3_KERNEL`               | Use sgl-kernel implementation for FlashAttention v3 | `true` |
 
 
 ## DeepGEMM Configuration (Advanced Optimization)
@@ -80,6 +83,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_MORI_FP8_COMB` | Use FP8 for combine | `"false"` |
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
+| `SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS` | This argument devives `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` which indicates customized amount of tokens preallocated for a rank, valid range from 1 to world_size*SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, by default `0` means maximum. Setting a smaller value will reduce memory footprint but too small value could cause buffer overflow. | `0` |
+| `SGLANG_MORI_MOE_MAX_INPUT_TOKENS` | Truncate the dispatch buffer to this many rows before MoE computation, reducing kernel overhead on padding tokens. The value must be >= the actual number of received tokens (`totalRecvTokenNum`); setting it too small causes incorrect results. `0` disables truncation (use full buffer). | `0` |
 | `SGLANG_MORI_QP_PER_TRANSFER` | Number of RDMA Queue Pairs (QPs) used per transfer operation | `1` |
 | `SGLANG_MORI_POST_BATCH_SIZE` | Number of RDMA work requests posted in a single batch to each QP | `-1` |
 | `SGLANG_MORI_NUM_WORKERS` | Number of worker threads in the RDMA executor thread pool | `1` |
@@ -119,7 +124,6 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_INT4_WEIGHT` | Enable INT4 weight quantization | `false` |
-| `SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2` | Apply per token group quantization kernel with fused silu and mul and masked m | `false` |
 | `SGLANG_FORCE_FP8_MARLIN` | Force using FP8 MARLIN kernels even if other FP8 kernels are available | `false` |
 | `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN` | Quantize q_b_proj from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_MOE_NVFP4_DISPATCH` | Use nvfp4 for moe dispatch (on flashinfer_cutlass or flashinfer_cutedsl moe runner backend) | `"false"` |
@@ -158,6 +162,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_TEST_RETRACT_NO_PREFILL_BS` | When SGLANG_TEST_RETRACT is enabled, no prefill is performed if the batch size exceeds SGLANG_TEST_RETRACT_NO_PREFILL_BS. | `2 ** 31`     |
 | `SGLANG_RECORD_STEP_TIME` | Record step time for profiling | `false` |
 | `SGLANG_TEST_REQUEST_TIME_STATS` | Test request time statistics | `false` |
+| `SGLANG_DEBUG_SYMM_MEM` | Enable debug checks that verify tensors passed to NCCL communication ops are allocated in the symmetric memory pool. Logs warnings (rank 0 only) with stack traces for any tensor not in the pool. | `false` |
 | `SGLANG_KERNEL_API_LOGLEVEL` | Controls crash-debug kernel API logging. `0` disables logging, `1` logs API names, `3` logs tensor metadata, `5` adds tensor statistics, and `10` also writes pre-call dump snapshots. | `0` |
 | `SGLANG_KERNEL_API_LOGDEST` | Destination for crash-debug kernel API logs. Use `stdout`, `stderr`, or a file path. `%i` is replaced with the process PID. | `stdout` |
 | `SGLANG_KERNEL_API_DUMP_DIR` | Output directory for level-10 kernel API input/output dumps. `%i` is replaced with the process PID. | `sglang_kernel_api_dumps` |
