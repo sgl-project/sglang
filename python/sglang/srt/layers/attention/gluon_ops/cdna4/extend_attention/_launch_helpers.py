@@ -10,7 +10,6 @@ direct-HIPLauncher closures.
 """
 
 import math
-import os
 
 import torch
 import triton
@@ -18,18 +17,7 @@ import triton
 from ._bf16_extend_persistent_gfx950 import (
     gluon_extend_attn_fwd_persistent as _bf16_kernel,
 )
-
-_CACHED_ENV_UNIFY_CAUSAL_PATH = None
-
-
-def _unify_causal_path_env():
-    """Single-block causal loop (n_full_blocks=0). Env-cached once per process."""
-    global _CACHED_ENV_UNIFY_CAUSAL_PATH
-    if _CACHED_ENV_UNIFY_CAUSAL_PATH is None:
-        _CACHED_ENV_UNIFY_CAUSAL_PATH = (
-            int(os.getenv("SGLANG_GLUON_UNIFY_CAUSAL_PATH", "0")) != 0
-        )
-    return _CACHED_ENV_UNIFY_CAUSAL_PATH
+from ._debug import DEBUG
 
 
 # Fast-runner cache shared between _launch_persistent and _launch_splitk.

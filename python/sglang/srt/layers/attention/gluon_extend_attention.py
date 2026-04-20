@@ -25,10 +25,11 @@ logger = logging.getLogger(__name__)
 
 
 # Optional per-call shape profiler. Enable with
-# SGLANG_GLUON_PROFILE_SHAPES=<path>. Buckets (path, shape, feature) counts
-# and dumps on exit / SIGUSR1 / every N calls. Off when the env var is
-# unset; used offline to diagnose TTFT regressions.
-_PROFILE_PATH = os.environ.get("SGLANG_GLUON_PROFILE_SHAPES") or None
+# ``SGLANG_GLUON_DEBUG=profile_shapes=<path>``. Buckets (path, shape,
+# feature) counts and dumps on exit / SIGUSR1 / every N calls.
+from sglang.srt.layers.attention.gluon_ops.cdna4.extend_attention._debug import DEBUG
+
+_PROFILE_PATH = DEBUG.profile_shapes_path
 _PROFILE_COUNTS: dict = {}
 _PROFILE_LOCK = threading.Lock()
 
@@ -83,13 +84,12 @@ def _profile_dump() -> None:
         logger.warning(f"Gluon shape-profile dump failed: {e!r}")
 
 
-_PROFILE_DUMP_AFTER_N = int(os.environ.get("SGLANG_GLUON_PROFILE_DUMP_AFTER", "0") or 0)
+_PROFILE_DUMP_AFTER_N = DEBUG.profile_dump_after
 _PROFILE_TOTAL = 0
 
 
 def _profile_maybe_dump_live() -> None:
-    """Dump the shape counters every ``SGLANG_GLUON_PROFILE_DUMP_AFTER``
-    calls when that env var is set; the file is safe to tail in place."""
+    """Periodic flush when ``profile_dump_after=<N>`` is set; safe to tail."""
     global _PROFILE_TOTAL
     if not _PROFILE_PATH or _PROFILE_DUMP_AFTER_N <= 0:
         return
@@ -108,9 +108,9 @@ if _PROFILE_PATH:
     except Exception:
         pass
     logger.warning(
-        f"SGLANG_GLUON_PROFILE_SHAPES active; per-call shape counts dumped to "
-        f"{_PROFILE_PATH}.rank<N>.tsv on shutdown, SIGUSR1, or every "
-        f"{_PROFILE_DUMP_AFTER_N} calls (0=off)."
+        f"Gluon shape profiler active (SGLANG_GLUON_DEBUG=profile_shapes); "
+        f"per-call counts dumped to {_PROFILE_PATH}.rank<N>.tsv on shutdown, "
+        f"SIGUSR1, or every {_PROFILE_DUMP_AFTER_N} calls (0=off)."
     )
 
 
@@ -121,12 +121,12 @@ _PREWARM_FN: Optional[Callable] = None
 _PREWARM_MODEL_FN: Optional[Callable] = None
 _PREWARMED_MODELS: set = set()
 
-# Optional numerical-parity check: SGLANG_GLUON_COMPARE=<N> runs BOTH
-# Gluon and the Triton reference for the first N calls after startup and
-# logs max|diff| / mean|diff|. N=0 (default) is a no-op on the hot path.
-_COMPARE_REMAINING = int(os.environ.get("SGLANG_GLUON_COMPARE", "0") or 0)
+# Optional numerical-parity check: ``SGLANG_GLUON_DEBUG=compare=<N>`` runs
+# BOTH Gluon and Triton for the first N calls after startup and logs
+# max|diff| / mean|diff|. Unset is a no-op on the hot path.
+_COMPARE_REMAINING = DEBUG.compare_remaining
 _COMPARE_LOCK = threading.Lock()
-_COMPARE_PATH = os.environ.get("SGLANG_GLUON_COMPARE_LOG") or None
+_COMPARE_PATH = DEBUG.compare_log
 _COMPARE_INDEX = 0
 
 
@@ -147,8 +147,7 @@ def _compare_log_diff(
     max_len_extend, sliding_window_size, sinks, logit_cap,
     custom_mask, is_causal,
 ) -> None:
-    """Log max/mean abs diff between Gluon and Triton outputs. Only
-    invoked when ``SGLANG_GLUON_COMPARE=<N>`` (N>0)."""
+    """Log max/mean abs diff. Only invoked when ``compare=<N>`` is active."""
     try:
         diff = (o_gluon.float() - o_triton_ref.float()).abs()
         max_abs = diff.max().item()
@@ -479,7 +478,7 @@ def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
             )
             _profile_maybe_dump_live()
         # Side-by-side Triton parity check; only runs when
-        # SGLANG_GLUON_COMPARE=<N> is set and we still have budget.
+        # ``SGLANG_GLUON_DEBUG=compare=<N>`` is set and we still have budget.
         _compare_this_call = False
         if _COMPARE_REMAINING > 0:
             with _COMPARE_LOCK:

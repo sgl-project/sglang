@@ -12,6 +12,15 @@ Dispatch picks between four kernel bodies (BF16 basic, BF16 WCA persistent,
 FP8 basic, FP8 WCA persistent) via a config-keyed cache; on cache hit the
 launcher invokes HIPLauncher directly and bypasses Triton's JITFunction
 specialization.
+
+Env vars
+--------
+- ``SGLANG_GLUON_FP8_KV_FORCE_BF16=1`` (user-facing safety rail): route
+  FP8 KV through the BF16 kernels by casting per call. Used when a new
+  FP8 config hits a numerical issue in production.
+- ``SGLANG_GLUON_DEBUG=...`` (dev): comma-separated k[=v] tokens; see
+  :mod:`._debug` for the full set (``trace``, ``compare``,
+  ``profile_shapes``, ``disable_cfg_cache``, ...).
 """
 
 import functools
@@ -25,6 +34,7 @@ import triton
 from ._bf16_extend_gfx950 import (
     gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric,
 )
+from ._debug import DEBUG
 from ._launch_helpers import (
     _select_persistent_grid,
     _launch_persistent,
@@ -69,8 +79,8 @@ logger = logging.getLogger(__name__)
 # HIPLauncher directly, bypassing Triton's JITFunction specialization.
 _config_cache = {}
 
-# Dispatch-path counters. Set SGLANG_GLUON_TRACE=<N> to get a WARN log every
-# N calls summarising where calls landed; unset they are effectively free.
+# Dispatch-path counters. Enabled via ``SGLANG_GLUON_DEBUG=trace=N`` (see
+# ``_debug``); unset they are effectively free.
 _dispatch_counters = {
     "total": 0,
     "early_cache_hit": 0,       # uniform_like fast-path hit
@@ -89,20 +99,15 @@ def _bump_dispatch(key):
     _maybe_trace_dispatch()
 
 
-_TRACE_INTERVAL = int(os.getenv("SGLANG_GLUON_TRACE", "0"))
 _TRACE_LAST_TOTAL = 0
 
 
-def _trace_enabled():
-    return _TRACE_INTERVAL
-
-
 def _maybe_trace_dispatch():
-    if _TRACE_INTERVAL <= 0:
+    if DEBUG.trace_interval <= 0:
         return
     global _TRACE_LAST_TOTAL
     total = _dispatch_counters["total"]
-    if total - _TRACE_LAST_TOTAL < _TRACE_INTERVAL:
+    if total - _TRACE_LAST_TOTAL < DEBUG.trace_interval:
         return
     _TRACE_LAST_TOTAL = total
     parts = [f"total={total}"]
@@ -142,24 +147,10 @@ def _ensure_dummies(device, mi_size, wkvo_size):
         _dummy_sinks = torch.zeros(1, dtype=torch.bfloat16, device=device)
 
 
-# Env escape hatches: read once at import time so per-call cost is a
-# simple global lookup. Semantics:
-#   SGLANG_GLUON_DISABLE_CFG_CACHE=1  bypass the fast-runner cache entirely
-#   SGLANG_GLUON_FP8_KV_FORCE_BF16=1  route FP8 KV through the BF16 kernels
-#                                     (pays a per-call dtype cast)
-#   SGLANG_GLUON_UNIFY_CAUSAL_PATH=1  collapse the causal kernel's
-#                                     full/masked split into one loop
-_CFG_CACHE_DISABLED = int(os.getenv("SGLANG_GLUON_DISABLE_CFG_CACHE", "0")) != 0
+# User-facing safety rail: route FP8 KV through the BF16 kernels (pays a
+# per-call dtype cast). Referenced in user-visible error messages so it
+# stays top-level rather than under SGLANG_GLUON_DEBUG.
 _FP8_KV_FORCE_BF16 = int(os.getenv("SGLANG_GLUON_FP8_KV_FORCE_BF16", "0")) != 0
-_UNIFY_CAUSAL_PATH = int(os.getenv("SGLANG_GLUON_UNIFY_CAUSAL_PATH", "0")) != 0
-
-
-def _use_fp8_kv_bf16_bridge():
-    return _FP8_KV_FORCE_BF16
-
-
-def _use_unify_causal_path():
-    return _UNIFY_CAUSAL_PATH
 
 
 _cached_num_xcds = {}
@@ -369,22 +360,12 @@ def _select_d256_dispatch(
     return 64, 8, 4, 16, 16
 
 
-# Cached dispatch config (AITER-style per-shape lookup).
-
-_CACHED_FP8_ENV = None
-
-
-def _get_fp8_env():
-    """Cache FP8 tuning env reads once per process."""
-    global _CACHED_FP8_ENV
-    if _CACHED_FP8_ENV is None:
-        _CACHED_FP8_ENV = {
-            'bn': int(os.environ.get('_GLUON_FP8_BN', '128')),
-            'ns': int(os.environ.get('_GLUON_FP8_NS', '2')),
-            'ext_bn': int(os.environ.get('_GLUON_FP8_EXT_BN', '64')),
-            'ext_ns': int(os.environ.get('_GLUON_FP8_EXT_NS', '3')),
-        }
-    return _CACHED_FP8_ENV
+# FP8 dispatch defaults for the rare D not in {64, 128} fallthrough. The
+# main D=64 / D=128 FP8 paths have these baked in explicitly.
+_FP8_DEFAULT_BN = 128
+_FP8_DEFAULT_NS = 2
+_FP8_DEFAULT_EXT_BN = 64
+_FP8_DEFAULT_EXT_NS = 3
 
 
 def _pfx_bucket(total_prefix_len, batch_size):
@@ -408,28 +389,188 @@ def _pfx_bucket(total_prefix_len, batch_size):
     return 4
 
 
+def _dispatch_d64_bf16(batch_size, max_len_extend, pfx_bucket, head_num):
+    """Pick (BM, NW, NS) for the D=64 BF16 basic kernel.
+
+    Per-shape winners from the AITER/CK grid (see bench_fp8_vs_ck.py).
+    B=1 uses ``head_num`` to choose BM — the win from BM=256 depends on
+    how the grid ``(1, H, ceil(S/BM))`` fills waves across 256 CUs.
+    """
+    _total_ext = batch_size * max_len_extend
+    if batch_size >= 8 and max_len_extend <= 128 and pfx_bucket >= 2:
+        return 128, 128, 4, 4
+    if batch_size >= 16 and max_len_extend <= 32:
+        return 64, 64, 4, 4
+    if batch_size >= 16:
+        if max_len_extend >= 512:
+            return 256, 64, 8, 2
+        return 64, 64, 4, 4
+    if batch_size >= 4:
+        if _total_ext >= 2048 or max_len_extend >= 512:
+            return 256, 64, 8, 2
+        if batch_size <= 7:
+            return 128, 64, 8, 4
+        return 64, 64, 4, 4
+
+    # B=1..3. H_q>=64 crosses over to BM=256 at S>=1600; H_q=32 at S>=1500
+    # (lower H already under-subscribes so BM=256's bigger per-tile work
+    # dominates earlier). B=2,3 keep the conservative S>=2048 boundary.
+    _h = head_num or 0
+    if batch_size == 1 and _h >= 64 and max_len_extend >= 1600:
+        return 256, 64, 8, 2
+    if batch_size == 1 and _h == 32 and max_len_extend >= 1500:
+        return 256, 64, 8, 2
+    if max_len_extend >= 2048:
+        return 256, 64, 8, 2
+    return 128, 64, 8, 4
+
+
+def _dispatch_d128_bf16(batch_size, max_len_extend, pfx_bucket, head_num):
+    """Pick (BM, NW, NS) for the D=128 BF16 basic kernel.
+
+    NS=1 is unsafe on the prefix-pipelined path (DMA-ring races) and
+    benches within +-3% of NS=2, so NS>=2 throughout. BM=256 NW=8 NS=2
+    is avoided at D=128: a latent reduction-order issue produces
+    max_err ~5e-3 to 1.3e-2 on ~0.1% of outputs. BM=128 NS=2 at H>=64
+    captures most of the win; H=32 stays on BM=64 NW=4.
+    """
+    _total_ext = batch_size * max_len_extend
+    if batch_size >= 16 and max_len_extend <= 16:
+        return 16, 64, 4, 2
+    if batch_size >= 16 and max_len_extend <= 64:
+        return 64, 64, 4, 2
+    if pfx_bucket >= 3 and max_len_extend >= 4096:
+        return 128, 64, 8, 2
+    if pfx_bucket >= 2 and max_len_extend >= 2048:
+        return 128, 64, 8, 2
+    if batch_size == 1:
+        _h = head_num or 0
+        if _h >= 64 and max_len_extend >= 2000:
+            return 128, 64, 8, 2
+        if _h >= 64 and max_len_extend >= 1024:
+            return 128, 64, 8, 4
+        return 64, 64, 4, 2
+    if batch_size <= 4:
+        return 64, 64, 4, 2
+    if _total_ext >= 32768:
+        return 128, 64, 8, 2
+    return 64, 64, 4, 2
+
+
+def _d64_bf16_batched_overrides(BM, BN, NW, NS, batch_size, max_len_extend,
+                                sliding_window_size, total_ext):
+    """Post-process the D=64 BF16 config for batched edge cases.
+
+    EXT_BN/EXT_NS are derived from the post-override (BM, BN, NW, NS)
+    by the caller, not here, so the BM=256 NS=2→NS=4 promotion propagates
+    correctly.
+    """
+    # B>=16 ext==256 full-attn: BM=64 undersubscribes 256 CUs by 4x,
+    # route to BM=256.
+    if (
+        sliding_window_size <= 0
+        and batch_size >= 16 and max_len_extend == 256
+    ):
+        BM, BN, NW, NS = 256, 64, 8, 2
+
+    # BM=256 NW=8 gets an extra stage on batched prefill shapes with
+    # occupancy headroom. Skip for B=1 — single-seq ShareGPT already sits
+    # at the occupancy floor and the extra stage only eats LDS/regs.
+    if (
+        BM == 256 and NW == 8 and NS == 2
+        and max_len_extend >= 1024
+        and batch_size != 1
+        and (max_len_extend <= 8192 or total_ext <= 32768)
+    ):
+        NS = 4
+    return BM, BN, NW, NS
+
+
+def _apply_fp8_overrides(Lq, batch_size, max_len_extend, pfx_bucket,
+                         BM, BN, NW, NS, total_ext):
+    """FP8 basic dispatch. Invariants:
+
+    * NS>=2 on the 8-warp pipelined path (NS=1 is bit-nondeterministic;
+      NS>=3 OOMs LDS at BN=128).
+    * D<128 only has the NW=4 NS=1 serial path; pipelined layouts are
+      not wired up. BM>128 at NW=4 blows register pressure.
+    """
+    if Lq == 128:
+        BM, BN, NW, NS = 128, 128, 8, 2
+        EXT_BN, EXT_NS = 128, 2
+        if batch_size == 1 and max_len_extend <= 256:
+            BM = 64
+        elif (
+            batch_size >= 32
+            and max_len_extend <= 8
+            and pfx_bucket <= 2
+        ):
+            # Decode / spec-verify / draft-extend on short-prefix
+            # continuous batches: BM=64 NW=4 avoids pad-heavy tiles.
+            BM, NW = 64, 4
+        return BM, BN, NW, NS, EXT_BN, EXT_NS
+
+    if Lq == 64:
+        BM, BN, NW, NS = 128, 128, 4, 1
+        EXT_BN, EXT_NS = 128, 1
+        # BM=64 wins wherever tiles are pad-heavy.
+        if max_len_extend <= 8 or (
+            batch_size >= 16 and max_len_extend <= 128
+        ):
+            BM = 64
+        return BM, BN, NW, NS, EXT_BN, EXT_NS
+
+    # Lq == 256 (and other unusual D that land here) — serial fallback.
+    BN = 32 if Lq >= 256 else _FP8_DEFAULT_BN
+    NS = _FP8_DEFAULT_NS
+    NW = min(NW, 4) if Lq < 128 else NW
+    EXT_BN = _FP8_DEFAULT_EXT_BN
+    EXT_NS = _FP8_DEFAULT_EXT_NS
+    if Lq >= 256 and NW <= 4:
+        EXT_NS = 1 if total_ext >= 512 else 2
+    return BM, BN, NW, NS, EXT_BN, EXT_NS
+
+
+def _apply_d64_swa_overrides(BM, BN, NW, NS, EXT_BN, EXT_NS,
+                             batch_size, max_len_extend, sliding_window_size):
+    """BF16 D=64 sliding-window override.
+
+    The per-tile key band is ~(BM + sw) wide regardless of tile count, so
+    BM=256 (base-tree win for plain causal) wastes work. Smaller BM splits
+    the static window across more CTAs and hides memory latency. Gates
+    tuned on D=64 H=32 kvH=4 sw=127.
+    """
+    total_ext = batch_size * max_len_extend
+    if max_len_extend >= 1024 and total_ext >= 2048:
+        BM, BN, NW, NS = 64, 64, 2, 2
+        EXT_BN, EXT_NS = BN, NS
+    elif max_len_extend > 16 * sliding_window_size:
+        if BM > 128:
+            BM = 128
+        NW, NS = 4, 2
+        EXT_NS = NS
+    elif BM > 128:
+        BM, NS = 128, 4
+        EXT_NS = NS
+    return BM, BN, NW, NS, EXT_BN, EXT_NS
+
+
 @functools.lru_cache(maxsize=2048)
 def _get_basic_dispatch_config(
     Lq, batch_size, max_len_extend, pfx_bucket, is_fp8, sliding_window_size=-1,
     head_num=None,
 ):
-    """Pick (BLOCK_M, BLOCK_N, num_warps, NUM_STAGES, PAD_K, PAD_V,
+    """Route to the per-(Lq, dtype) helper and apply SWA / batched overrides.
+
+    Returns (BLOCK_M, BLOCK_N, num_warps, NUM_STAGES, PAD_K, PAD_V,
     EXT_BLOCK_N, EXT_NUM_STAGES) for the basic (non-persistent) kernel.
-
-    Cached per shape signature. ``pfx_bucket`` buckets avg prefix length
-    (see :func:`_pfx_bucket`) so the cache stays small while keeping the
-    prefix-vs-no-prefix distinction. ``sliding_window_size`` selects SWA
-    configs where a smaller BM tends to win.
-
-    ``head_num`` is the number of Q heads; B=1 uses it to choose BM since
-    the win from BM=256 depends on how the grid ``(1, H, ceil(S/BM))`` fills
-    waves across 256 CUs.
+    Cached per shape signature; ``pfx_bucket`` keeps the cache small
+    while preserving the prefix-vs-no-prefix distinction.
     """
+    _total_ext = batch_size * max_len_extend
+    _PAD_K, _PAD_V = 16, 16
+
     if Lq == 256:
-        _BN = 32
-        _total_ext = batch_size * max_len_extend
-        # Coarse avg-prefix proxy derived from pfx_bucket (matches
-        # _pfx_bucket thresholds).
         _avg_pfx_proxy = (
             0 if pfx_bucket <= 1
             else 1024 if pfx_bucket == 2
@@ -440,163 +581,39 @@ def _get_basic_dispatch_config(
             batch_size, max_len_extend, max_len_extend, 0, _total_ext,
             avg_pfx_proxy=_avg_pfx_proxy,
         )
+        _BN = 32
+        _EXT_BN, _EXT_NS = _BN, _NS
     elif Lq == 64:
-        # D=64 BF16 basic dispatch tree. Per-shape winners from the
-        # AITER/CK grid (see bench_fp8_vs_ck.py).
-        _PAD_K, _PAD_V = 16, 16
-        _total_ext = batch_size * max_len_extend
-        _BN = 64
-        if batch_size >= 8 and max_len_extend <= 128 and pfx_bucket >= 2:
-            _BM, _BN, _NW, _NS = 128, 128, 4, 4
-        elif batch_size >= 16 and max_len_extend <= 32:
-            _BM, _NW, _NS = 64, 4, 4
-        elif batch_size >= 16:
-            _BM, _NW, _NS = (256, 8, 2) if max_len_extend >= 512 else (64, 4, 4)
-        elif batch_size >= 4:
-            if _total_ext >= 2048 or max_len_extend >= 512:
-                _BM, _NW, _NS = 256, 8, 2
-            elif batch_size <= 7:
-                _BM, _NW, _NS = 128, 8, 4
-            else:
-                _BM, _NW, _NS = 64, 4, 4
-        else:
-            # B=1..3 single/small-seq serving. The B=1 cross-over from
-            # BM=128 NW=8 NS=4 to BM=256 NW=8 depends on H_q: H_q>=64 wants
-            # S>=1600 and H_q=32 wants S>=1500 (lower H already under-
-            # subscribes so BM=256's bigger per-tile work dominates earlier).
-            # B=2,3 keep the conservative S>=2048 boundary.
-            _h = head_num if head_num is not None else 0
-            if batch_size == 1 and _h >= 64 and max_len_extend >= 1600:
-                _BM, _NW, _NS = 256, 8, 2
-            elif batch_size == 1 and _h == 32 and max_len_extend >= 1500:
-                _BM, _NW, _NS = 256, 8, 2
-            elif max_len_extend >= 2048:
-                _BM, _NW, _NS = 256, 8, 2
-            else:
-                _BM, _NW, _NS = 128, 8, 4
-
-        # B>=16 ext==256 full-attn misdispatches to BM=64 (undersubscribes
-        # 256 CUs by 4x); route to BM=256.
-        if (
-            sliding_window_size <= 0
-            and batch_size >= 16 and max_len_extend == 256
-        ):
-            _BM, _BN, _NW, _NS = 256, 64, 8, 2
-            _EXT_BN, _EXT_NS = 64, 2
-
-        # BM=256 NW=8 gets an extra stage on batched prefill shapes with
-        # occupancy headroom. Skip for B=1 — single-seq ShareGPT already sits
-        # at the occupancy floor and the extra stage only eats LDS/regs.
-        if (
-            _BM == 256 and _NW == 8 and _NS == 2
-            and max_len_extend >= 1024
-            and batch_size != 1
-            and (max_len_extend <= 8192 or _total_ext <= 32768)
-        ):
-            _NS = 4
+        _BM, _BN, _NW, _NS = _dispatch_d64_bf16(
+            batch_size, max_len_extend, pfx_bucket, head_num
+        )
+        _BM, _BN, _NW, _NS = _d64_bf16_batched_overrides(
+            _BM, _BN, _NW, _NS, batch_size, max_len_extend,
+            sliding_window_size, _total_ext,
+        )
+        _EXT_BN, _EXT_NS = _BN, _NS
     else:
-        # D=128 BF16 basic dispatch. NS=1 is unsafe on the prefix-
-        # pipelined path (races on the DMA ring) and benches within +-3%
-        # of NS=2, so NS>=2 throughout.
-        #
-        # Note: BM=256 NW=8 NS=2 is avoided at D=128 — it has a latent
-        # reduction-order issue (max_err ~5e-3 to 1.3e-2 on ~0.1% of outputs,
-        # concentrated on a few head-dim lanes). BM=128 NS=2 at H>=64 is
-        # correct and captures most of the win; H=32 stays on BM=64 NW=4
-        # since BM=128 cannot fill enough waves to hide the bigger tile work.
-        _BN = 64
-        _PAD_K, _PAD_V = 16, 16
-        _total_ext = batch_size * max_len_extend
-        if batch_size >= 16 and max_len_extend <= 16:
-            _BM, _NW, _NS = 16, 4, 2
-        elif batch_size >= 16 and max_len_extend <= 64:
-            _BM, _NW, _NS = 64, 4, 2
-        elif pfx_bucket >= 3 and max_len_extend >= 4096:
-            _BM, _NW, _NS = 128, 8, 2
-        elif pfx_bucket >= 2 and max_len_extend >= 2048:
-            _BM, _NW, _NS = 128, 8, 2
-        elif batch_size == 1:
-            _h = head_num if head_num is not None else 0
-            if _h >= 64 and max_len_extend >= 2000:
-                _BM, _NW, _NS = 128, 8, 2
-            elif _h >= 64 and max_len_extend >= 1024:
-                _BM, _NW, _NS = 128, 8, 4
-            else:
-                _BM, _NW, _NS = 64, 4, 2
-        elif batch_size <= 4:
-            _BM, _NW, _NS = 64, 4, 2
-        elif _total_ext >= 32768:
-            _BM, _NW, _NS = 128, 8, 2
-        else:
-            _BM, _NW, _NS = 64, 4, 2
+        _BM, _BN, _NW, _NS = _dispatch_d128_bf16(
+            batch_size, max_len_extend, pfx_bucket, head_num
+        )
+        _EXT_BN, _EXT_NS = _BN, _NS
 
     if is_fp8:
-        # FP8 basic dispatch. Invariants:
-        #   * NS>=2 on the 8-warp pipelined path (NS=1 is
-        #     bit-nondeterministic; NS>=3 OOMs LDS at BN=128).
-        #   * D<128 only has the NW=4 NS=1 serial path; pipelined layouts
-        #     are not wired up. BM>128 at NW=4 blows register pressure.
-        _PAD_K, _PAD_V = 16, 16
-        _total_ext = batch_size * max_len_extend
-        if Lq == 128:
-            _BM, _BN, _NW, _NS = 128, 128, 8, 2
-            _EXT_BN, _EXT_NS = 128, 2
-            if batch_size == 1 and max_len_extend <= 256:
-                _BM = 64
-            elif (
-                batch_size >= 32
-                and max_len_extend <= 8
-                and pfx_bucket <= 2
-            ):
-                # Decode / spec-verify / draft-extend on short-prefix
-                # continuous batches: BM=64 NW=4 avoids pad-heavy tiles.
-                _BM, _NW = 64, 4
-        elif Lq == 64:
-            _BM, _BN, _NW, _NS = 128, 128, 4, 1
-            _EXT_BN, _EXT_NS = 128, 1
-            # BM=64 wins wherever tiles are pad-heavy.
-            if max_len_extend <= 8 or (
-                batch_size >= 16 and max_len_extend <= 128
-            ):
-                _BM = 64
-        else:
-            fp8 = _get_fp8_env()
-            _BN = 32 if Lq >= 256 else fp8['bn']
-            _NS = fp8['ns']
-            _NW = min(_NW, 4) if Lq < 128 else _NW
-            _EXT_BN = fp8['ext_bn']
-            _EXT_NS = fp8['ext_ns']
-            if Lq >= 256 and _NW <= 4:
-                _EXT_NS = 1 if _total_ext >= 512 else 2
-    else:
-        _EXT_BN = _BN
-        _EXT_NS = _NS
+        _BM, _BN, _NW, _NS, _EXT_BN, _EXT_NS = _apply_fp8_overrides(
+            Lq, batch_size, max_len_extend, pfx_bucket,
+            _BM, _BN, _NW, _NS, _total_ext,
+        )
 
-    # BF16 D=64 SWA override. The per-tile key band is ~(BM + sw) wide
-    # regardless of tile count, so BM=256 (base-tree win for plain causal)
-    # wastes work. Smaller BM splits the static window across more CTAs
-    # and hides memory latency. Gates tuned on D=64 H=32 kvH=4 sw=127.
     if (
         not is_fp8
         and Lq == 64
         and sliding_window_size > 0
         and sliding_window_size < max_len_extend
     ):
-        _total_ext_swa = batch_size * max_len_extend
-        if (
-            max_len_extend >= 1024
-            and _total_ext_swa >= 2048
-        ):
-            _BM, _BN, _NW, _NS = 64, 64, 2, 2
-            _EXT_BN, _EXT_NS = _BN, _NS
-        elif max_len_extend > 16 * sliding_window_size:
-            if _BM > 128:
-                _BM = 128
-            _NW, _NS = 4, 2
-            _EXT_NS = _NS
-        elif _BM > 128:
-            _BM, _NS = 128, 4
-            _EXT_NS = _NS
+        _BM, _BN, _NW, _NS, _EXT_BN, _EXT_NS = _apply_d64_swa_overrides(
+            _BM, _BN, _NW, _NS, _EXT_BN, _EXT_NS,
+            batch_size, max_len_extend, sliding_window_size,
+        )
 
     return _BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS
 
@@ -673,7 +690,7 @@ def gluon_extend_attention_fwd(
                 "BF16 KV (Gemma and other D=256 models ship BF16), or set "
                 "SGLANG_GLUON_FP8_KV_FORCE_BF16=1."
             )
-        if _use_fp8_kv_bf16_bridge():
+        if _FP8_KV_FORCE_BF16:
             bridge_dtype = q_extend.dtype
             k_buffer = k_buffer.to(bridge_dtype)
             v_buffer = v_buffer.to(bridge_dtype)
@@ -742,7 +759,7 @@ def gluon_extend_attention_fwd(
         and _force_num_stages is None
         and _force_waves_per_eu is None
         and not _cache_exclude_pfx_skew
-        and not _CFG_CACHE_DISABLED
+        and not DEBUG.disable_cfg_cache
     )
     _has_sink = sinks is not None
 
@@ -925,7 +942,7 @@ def gluon_extend_attention_fwd(
                     _force_num_stages=2,
                 )
             _bump_dispatch("wca_persistent")
-            if _trace_enabled() and _dispatch_counters["wca_persistent"] <= 20:
+            if DEBUG.trace_interval and _dispatch_counters["wca_persistent"] <= 20:
                 logger.warning(
                     "gluon extend WCA: B=%d minE=%s maxE=%d pfx_est=%d Lq=%d "
                     "sw=%s sink=%s kw=%s",
@@ -1156,7 +1173,7 @@ def gluon_extend_attention_fwd(
         # the CompiledKernel, and install a direct HIPLauncher closure for
         # subsequent hits via `_make_fast_runner[_fp8]`.
         _bump_dispatch("basic_slow_first")
-        if _trace_enabled():
+        if DEBUG.trace_interval:
             _cfg_for_log = (_BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS)
             logger.warning(
                 "gluon extend JIT: B=%d maxE=%d pfxB=%d Lq=%d H=%d kvH=%d "
@@ -1183,7 +1200,7 @@ def gluon_extend_attention_fwd(
             _force_block_n is None
             and _force_num_warps is None
             and custom_mask is None
-            and not _CFG_CACHE_DISABLED
+            and not DEBUG.disable_cfg_cache
         ):
             _cfg = (_BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS)
             _has_sink_w = sinks is not None
@@ -1575,10 +1592,10 @@ def _launch_persistent_fp8(
     if _force_num_stages is not None:
         NUM_STAGES = _force_num_stages
     else:
-        NUM_STAGES = int(os.environ.get('_GLUON_FP8_NS', '2'))
+        NUM_STAGES = _FP8_DEFAULT_NS
 
-    EXT_BLOCK_N = int(os.environ.get('_GLUON_FP8_EXT_BN', '64'))
-    EXT_NUM_STAGES = int(os.environ.get('_GLUON_FP8_EXT_NS', '3'))
+    EXT_BLOCK_N = _FP8_DEFAULT_EXT_BN
+    EXT_NUM_STAGES = _FP8_DEFAULT_EXT_NS
 
     ASYNC_PAD_K = 8 if BLOCK_DMODEL >= 256 else 16
     ASYNC_PAD_V = 32 if BLOCK_DV >= 256 else 16
@@ -1746,7 +1763,7 @@ def _launch_splitk_fp8(
     if max(BLOCK_DMODEL, BLOCK_DV) < 256:
         BLOCK_M = 128
         num_warps = 8
-        NUM_STAGES = int(os.environ.get('_GLUON_FP8_NS', '2'))
+        NUM_STAGES = _FP8_DEFAULT_NS
 
     enable_prefix_unmasked = is_causal
     enable_mask_split = (custom_mask is None) and is_causal
