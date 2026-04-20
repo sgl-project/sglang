@@ -321,11 +321,10 @@ class TestModelOptExportIntegration(unittest.TestCase):
 
         model_config = ModelConfig(
             model_path="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            modelopt_quant="fp8",
-            modelopt_export_path=self.export_dir,
+            quantization="modelopt_fp8",
         )
 
-        load_config = LoadConfig()
+        load_config = LoadConfig(modelopt_export_path=self.export_dir)
         device_config = DeviceConfig()
 
         # Mock the quantization and export process

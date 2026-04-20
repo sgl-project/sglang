@@ -99,7 +99,7 @@ srt_hip = [
 
 diffusion_hip = [
   "sglang[diffusion_common]",
-  "peft>=0.18.0",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
@@ -161,7 +161,7 @@ test = [
   "jsonlines",
   "matplotlib",
   "pandas",
-  "peft>=0.18.0",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "pytest",
   "sentence_transformers",
   "tabulate",
