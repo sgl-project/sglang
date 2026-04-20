@@ -9,7 +9,6 @@ import triton.language as tl
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
@@ -477,52 +476,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    # Streaming sessions transfer req_pool ownership into SessionSlot objects.
-    # Trim any speculative tail before that transfer, otherwise later turns
-    # restore only the committed prefix and can strand unreachable KV pages.
-    #
-    # Aborted streaming-session requests (e.g. input too long) skip the
-    # streaming path entirely.  match_prefix did not restore the slot's KV
-    # state, so the request has a fresh pool slot that should be freed by
-    # cache_finished_req below (which also sets req_pool_idx = None).
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-    is_streaming_session = (
-        isinstance(tree_cache, SessionAwareCache)
-        and getattr(req, "session", None) is not None
-        and req.session.streaming
-    )
-    is_aborted_streaming = is_streaming_session and isinstance(
-        getattr(req, "finished_reason", None), FINISH_ABORT
-    )
-    if is_streaming_session and not is_aborted_streaming:
-        start_p, end_p = req.pop_overallocated_kv_cache()
-        page_size = get_global_server_args().page_size
-        if page_size > 1:
-            start_p = ceil_align(start_p, page_size)
-        if start_p < end_p:
-            indices_to_free = tree_cache.req_to_token_pool.req_to_token[
-                req.req_pool_idx
-            ][start_p:end_p]
-            tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
-        req.kv_allocated_len = req.kv_committed_len
-
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
-    # SessionAwareCache.cache_finished_req sets req_pool_idx = None to transfer
-    # KV ownership to the SessionSlot, so the remaining cleanup is skipped.
-    # Streaming-session specific overalloc trimming must therefore happen
-    # before cache_finished_req above.
+    # StreamingSession.cache_finished_req handles speculative tail trim
+    # and bookkeeping flag sync internally, then sets req_pool_idx = None.
     if req.req_pool_idx is None:
-        if is_streaming_session:
-            # The request no longer owns any KV once SessionAwareCache either
-            # transfers it into the session slot or frees it on abort. Mark
-            # both bookkeeping flags so busy-time memory checks do not keep
-            # counting this finished request as uncached KV.
-            if not req.kv_committed_freed:
-                req.pop_committed_kv_cache()
-            if not req.kv_overallocated_freed:
-                req.pop_overallocated_kv_cache()
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()
