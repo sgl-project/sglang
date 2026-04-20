@@ -1,4 +1,4 @@
-name: Release Docker Images ROCm 7.2.0 Nightly Preview (AMD)
+name: Release Docker Images Nightly ROCm7.2 (AMD)
 on:
   workflow_dispatch:
   schedule:

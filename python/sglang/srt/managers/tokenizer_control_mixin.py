@@ -39,8 +39,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
-    GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
@@ -121,7 +119,6 @@ _COMMUNICATOR_SPECS = [
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
-    ("get_load", GetLoadReqOutput, "watching"),
     ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
 ]
@@ -803,11 +800,6 @@ class TokenizerControlMixin:
     ) -> List[DumperControlReqOutput]:
         self.auto_create_handle_loop()
         return await self.dumper_control_communicator(obj)
-
-    async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
-        self.auto_create_handle_loop()
-        req = GetLoadReqInput()
-        return await self.get_load_communicator(req)
 
     async def get_loads(
         self: TokenizerManager,

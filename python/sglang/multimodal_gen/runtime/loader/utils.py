@@ -102,6 +102,7 @@ def get_param_names_mapping(
 def hf_to_custom_state_dict(
     hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
     param_names_mapping: Callable[[str], tuple[str, Any, Any]],
+    valid_target_names: set[str] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]]]:
     """
     Converts a Hugging Face parameter state dictionary to a custom parameter state dictionary.
@@ -123,6 +124,15 @@ def hf_to_custom_state_dict(
         target_param_name, merge_index, num_params_to_merge = param_names_mapping(
             source_param_name
         )
+        if (
+            valid_target_names is not None
+            and target_param_name != source_param_name
+            and source_param_name in valid_target_names
+            and target_param_name not in valid_target_names
+        ):
+            target_param_name = source_param_name
+            merge_index = None
+            num_params_to_merge = None
         if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
             continue
         reverse_param_names_mapping[target_param_name] = (

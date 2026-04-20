@@ -97,13 +97,15 @@ class RadixKey:
             for i in range(len(t) - 1):
                 yield (t[i], t[i + 1])
         else:
-            return iter(self.token_ids)
+            yield from self.token_ids
 
     def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
         # Normalize int -> 1-element slice so the rest handles one shape.
         if isinstance(idx, int):
             if idx < 0:
                 idx += len(self)
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f"RadixKey index out of range: {idx}")
             idx = slice(idx, idx + 1)
         start, stop, step = idx.indices(len(self))
         if step != 1:
