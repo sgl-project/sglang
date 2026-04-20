@@ -1380,6 +1380,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     shapes: List[List[int]]
     # The group name
     group_name: str = "weight_update_group"
+    # The source rank for broadcast (default 0 for backward compatibility)
+    src_rank: int = 0
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
     # Whether to abort all requests before updating weights

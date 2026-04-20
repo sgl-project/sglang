@@ -151,6 +151,7 @@ class BaseTpWorker(ABC):
             recv_req.shapes,
             recv_req.group_name,
             recv_req.load_format,
+            recv_req.src_rank,
         )
         return success, message
 

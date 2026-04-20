@@ -905,6 +905,7 @@ class Engine(EngineScoreMixin, EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
         load_format: Optional[str] = None,
+        src_rank: int = 0,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -912,6 +913,7 @@ class Engine(EngineScoreMixin, EngineBase):
             dtypes=dtypes,
             shapes=shapes,
             group_name=group_name,
+            src_rank=src_rank,
             flush_cache=flush_cache,
             load_format=load_format,
         )
