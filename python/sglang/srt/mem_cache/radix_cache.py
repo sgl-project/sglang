@@ -505,11 +505,13 @@ class RadixCache(BasePrefixCache):
         priority = params.priority
         chunked = params.chunked
 
+        assert value is None or len(value) == len(key), (
+            f"insert() expects value aligned to len(key); "
+            f"got {len(value)=} vs {len(key)=}"
+        )
         if value is None:
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
-        else:
-            value = value[: len(key)]
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)

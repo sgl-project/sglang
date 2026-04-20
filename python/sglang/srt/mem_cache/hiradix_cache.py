@@ -1392,8 +1392,10 @@ class HiRadixCache(RadixCache):
         if priority is None:
             priority = 0
 
-        if value is not None:
-            value = value[: len(key)]
+        assert value is None or len(value) == len(key), (
+            f"insert() expects value aligned to len(key); "
+            f"got {len(value)=} vs {len(key)=}"
+        )
 
         if len(key) == 0:
             return InsertResult(prefix_len=0)
