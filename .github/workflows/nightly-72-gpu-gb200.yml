@@ -34,8 +34,11 @@ env:
   SRT_SLURM_BRANCH: sglang-nightly-regression
   SLURM_PARTITION: batch
   SLURM_ACCOUNT: sglang
-  # Package name for ephemeral branch-build images on GHCR
-  CI_IMAGE_PACKAGE: sglang-nightly-ci
+  # Docker Hub repo for ephemeral branch/PR build images (kept separate from
+  # the released `lmsysorg/sglang` repo). Cleaned up by `cleanup-image`.
+  CI_IMAGE_REPO: lmsysorg/sglang-staging
+  # How many most recent staging tags to retain after each run.
+  CI_IMAGE_KEEP_TAGS: 60
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -111,10 +114,11 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # When pr_number or sglang_branch is provided, build an ARM64 (GB200) image
-  # from that ref and push it to GHCR. Uses refs/pull/<N>/head for PRs so fork
-  # PRs work without cross-repo auth. The image is deleted by `cleanup-image`
-  # at the end of the run. Skipped on nightly (cron) runs and manual runs with
-  # neither pr_number nor sglang_branch.
+  # from that ref and push it to Docker Hub under lmsysorg/sglang-staging.
+  # Uses refs/pull/<N>/head for PRs so fork PRs work without cross-repo auth.
+  # Old staging tags are pruned by `cleanup-image` at the end of the run.
+  # Skipped on nightly (cron) runs and manual runs with neither pr_number nor
+  # sglang_branch.
   # ---------------------------------------------------------------------------
   build-image:
     needs: [validate-inputs, setup]
@@ -122,11 +126,9 @@ jobs:
       github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch'
       && (inputs.pr_number != '' || inputs.sglang_branch != '')
     runs-on: arm-docker-build-node
-    permissions:
-      contents: read
-      packages: write
     outputs:
       image_ref: ${{ steps.build.outputs.image_ref }}
+      image_tag: ${{ steps.build.outputs.image_tag }}
     steps:
       # Self-hosted runners retain the workspace across jobs. Prior `docker buildx`
       # runs on this node leave root-owned build artifacts (e.g. sgl-kernel/build/)
@@ -165,12 +167,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
+      - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push ARM64 image
         id: build
@@ -185,7 +186,7 @@ jobs:
           # run_attempt disambiguates "Re-run jobs" so the squash filename
           # (derived from the image URL) doesn't collide with a stale one.
           TAG="${TAG_STUB}-${{ github.run_id }}-${{ github.run_attempt }}"
-          IMAGE_REF="ghcr.io/sgl-project/${CI_IMAGE_PACKAGE}:${TAG}"
+          IMAGE_REF="${CI_IMAGE_REPO}:${TAG}"
           echo "Building ${IMAGE_REF} from ${SOURCE_DESC}"
 
           docker buildx build \
@@ -203,12 +204,14 @@ jobs:
             .
 
           echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
+          echo "image_tag=${TAG}" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------------------------
   # Import Docker images to Lustre squash files once before all benchmark jobs.
   # This avoids parallel jobs racing to enroot import the same image.
-  # When build-image ran, we import the freshly built GHCR image; otherwise we
-  # use the `image` input (or its default).
+  # When build-image ran, we import the freshly built Docker Hub staging image
+  # (lmsysorg/sglang-staging is public → no auth needed for enroot pull).
+  # Otherwise we use the `image` input (or its default public nightly image).
   # ---------------------------------------------------------------------------
   prepare-image:
     needs: [setup, build-image]
@@ -238,14 +241,6 @@ jobs:
             echo "image=$IMAGE" >> $GITHUB_OUTPUT
           fi
 
-      - name: Configure enroot credentials for GHCR
-        if: needs.build-image.outputs.image_ref != ''
-        run: |
-          mkdir -p "$HOME/.config/enroot"
-          CRED="$HOME/.config/enroot/.credentials"
-          echo "machine ghcr.io login ${{ github.actor }} password ${{ secrets.GITHUB_TOKEN }}" > "$CRED"
-          chmod 600 "$CRED"
-
       - name: Import Docker images to Lustre
         id: import
         env:
@@ -268,10 +263,6 @@ jobs:
 
           echo "squash_file=$SQUASH_FILE" >> $GITHUB_OUTPUT
           echo "nginx_squash_file=$NGINX_SQUASH_FILE" >> $GITHUB_OUTPUT
-
-      - name: Remove GHCR credentials
-        if: always() && needs.build-image.outputs.image_ref != ''
-        run: rm -f "$HOME/.config/enroot/.credentials"
 
   nightly-gb200-benchmark:
     needs: [setup, prepare-image]
@@ -402,26 +393,46 @@ jobs:
           python3 scripts/ci/slurm/summarize.py results/ >> $GITHUB_STEP_SUMMARY
 
   # ---------------------------------------------------------------------------
-  # Delete the entire ephemeral GHCR package built by `build-image`. Safe to
-  # wipe everything because:
-  #   - `concurrency: nightly-test-gb200` serializes runs so nothing else is
-  #     using the package mid-run,
-  #   - the sqsh file is already on Lustre by the time this runs, so the
-  #     benchmark jobs no longer need the GHCR image,
-  #   - this package is CI-only — no human artifacts live here.
-  # Skipped when build-image was skipped.
+  # Prune old tags in the staging repo, keeping only the most recent N. Mirrors
+  # the pattern used by release-docker-dev.yml. Runs after benchmarks so the
+  # freshly built image (whose sqsh is already on Lustre) becomes a regular
+  # aged-out tag over time. No-op when the repo has ≤ CI_IMAGE_KEEP_TAGS tags.
   # ---------------------------------------------------------------------------
   cleanup-image:
     needs: [build-image, nightly-gb200-benchmark]
     if: always() && needs.build-image.result == 'success'
     runs-on: ubuntu-latest
-    permissions:
-      packages: write
     steps:
-      - name: Delete GHCR package
+      - name: Prune old staging tags on Docker Hub
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMAGE_REF: ${{ needs.build-image.outputs.image_ref }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          echo "Deleting GHCR package ${CI_IMAGE_PACKAGE} (built image: ${IMAGE_REF})"
-          gh api --method DELETE "/orgs/sgl-project/packages/container/${CI_IMAGE_PACKAGE}"
+          TOKEN=$(curl -s -H "Content-Type: application/json" \
+            -X POST -d "{\"username\": \"${DOCKERHUB_USERNAME}\", \"password\": \"${DOCKERHUB_TOKEN}\"}" \
+            https://hub.docker.com/v2/users/login/ | jq -r .token)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Docker Hub login failed"
+            exit 1
+          fi
+
+          TAGS_RESPONSE=$(curl -s -H "Authorization: JWT $TOKEN" \
+            "https://hub.docker.com/v2/repositories/${CI_IMAGE_REPO}/tags/?page_size=100")
+
+          # Sort tags by last_updated (newest first), keep names only.
+          TAGS=$(echo "$TAGS_RESPONSE" | jq -r \
+            '.results[] | "\(.last_updated)|\(.name)"' \
+            | sort -r | cut -d'|' -f2)
+
+          TAG_COUNT=$(echo "$TAGS" | grep -c . || true)
+          if [ "$TAG_COUNT" -gt "$CI_IMAGE_KEEP_TAGS" ]; then
+            echo "Found $TAG_COUNT tags in ${CI_IMAGE_REPO}, keeping $CI_IMAGE_KEEP_TAGS most recent"
+            TAGS_TO_DELETE=$(echo "$TAGS" | tail -n +$((CI_IMAGE_KEEP_TAGS + 1)))
+            for tag in $TAGS_TO_DELETE; do
+              echo "Deleting ${CI_IMAGE_REPO}:${tag}"
+              curl -s -X DELETE -H "Authorization: JWT $TOKEN" \
+                "https://hub.docker.com/v2/repositories/${CI_IMAGE_REPO}/tags/${tag}/"
+            done
+          else
+            echo "Only $TAG_COUNT tags in ${CI_IMAGE_REPO}, no cleanup needed"
+          fi
