@@ -591,14 +591,6 @@ class ServerArgs:
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
 
-    # Double Sparsity
-    enable_double_sparsity: bool = False
-    ds_channel_config_path: Optional[str] = None
-    ds_heavy_channel_num: int = 32
-    ds_heavy_token_num: int = 256
-    ds_heavy_channel_type: str = "qk"
-    ds_sparse_decode_threshold: int = 4096
-
     # Offloading
     cpu_offload_gb: int = 0
     offload_group_size: int = -1
@@ -797,6 +789,11 @@ class ServerArgs:
         self._handle_npu_backends()
         self._handle_mps_backends()
         self._handle_xpu_backends()
+
+        # Allow OOT platform plugins to apply server args defaults.
+        from sglang.srt.platforms import current_platform
+
+        current_platform.apply_server_args_defaults(self)
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
@@ -1002,6 +999,21 @@ class ServerArgs:
             envs.SGLANG_SPEC_NAN_DETECTION.set(True)
             envs.SGLANG_SPEC_OOB_DETECTION.set(True)
 
+        # Native gRPC flags — env-only for now, not exposed as CLI args.
+        # Set as instance attributes (not dataclass fields) to avoid
+        # argparse namespace lookup in from_cli_args.
+        self.enable_grpc = envs.SGLANG_ENABLE_GRPC.get()
+
+        grpc_port_env = envs.SGLANG_GRPC_PORT.get()
+        self.grpc_port = (
+            grpc_port_env if grpc_port_env is not None else self.port + 10000
+        )
+
+        if not (1 <= self.grpc_port <= 65535):
+            raise ValueError(
+                f"SGLANG_GRPC_PORT ({self.grpc_port}) must be between 1 and 65535"
+            )
+
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
             self.enable_prefill_delayer = True
@@ -1165,6 +1177,12 @@ class ServerArgs:
         # 5. Non-CUDA hardware (AMD, NPU, CPU, MPS, XPU, etc.)
         if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
             self.disable_piecewise_cuda_graph = True
+        # 5b. OOT platforms that don't support piecewise cuda graph
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.is_out_of_tree():
+            if not current_platform.support_piecewise_cuda_graph():
+                self.disable_piecewise_cuda_graph = True
         # 6. MoE A2A backend
         if self.moe_a2a_backend != "none":
             self.disable_piecewise_cuda_graph = True
@@ -2187,7 +2205,8 @@ class ServerArgs:
             )
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
-        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
+        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe,
+        # Qwen3/Qwen3Next/Qwen3.5 MoE families)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
@@ -2205,6 +2224,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
+                "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
@@ -2212,7 +2232,6 @@ class ServerArgs:
             and (is_sm90_supported() or is_sm100_supported())
             and self.tp_size > 1
             and not self.enable_dp_attention
-            and self.attn_cp_size <= 1
             and self.nnodes == 1
             and not is_h20_device
             and self.moe_a2a_backend == "none"
@@ -2332,6 +2351,12 @@ class ServerArgs:
             2.2 We will use Flashinfer backend on blackwell.
             2.3 Otherwise, we will use triton backend.
         """
+        # OOT platforms provide their own default attention backend.
+        from sglang.srt.platforms import current_platform
+
+        if current_platform.is_out_of_tree():
+            return current_platform.get_default_attention_backend()
+
         # Whisper requires flashinfer for cross-attention CUDA graph support
         if "WhisperForConditionalGeneration" in (
             model_config.hf_config.architectures or []
@@ -4475,7 +4500,7 @@ class ServerArgs:
             "--enable-streaming-session",
             action="store_true",
             default=ServerArgs.enable_streaming_session,
-            help="Enable streaming session mode and SessionAwareCache wrapper.",
+            help="Enable streaming session mode and StreamingSession wrapper.",
         )
         parser.add_argument(
             "--random-seed",
@@ -5635,43 +5660,6 @@ class ServerArgs:
             help="The diffusion LLM algorithm configurations. Must be a YAML file.",
         )
 
-        # Double Sparsity
-        parser.add_argument(
-            "--enable-double-sparsity",
-            action="store_true",
-            help="Enable double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-channel-config-path",
-            type=str,
-            default=ServerArgs.ds_channel_config_path,
-            help="The path of the double sparsity channel config",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-num",
-            type=int,
-            default=ServerArgs.ds_heavy_channel_num,
-            help="The number of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-token-num",
-            type=int,
-            default=ServerArgs.ds_heavy_token_num,
-            help="The number of heavy tokens in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-heavy-channel-type",
-            type=str,
-            default=ServerArgs.ds_heavy_channel_type,
-            help="The type of heavy channels in double sparsity attention",
-        )
-        parser.add_argument(
-            "--ds-sparse-decode-threshold",
-            type=int,
-            default=ServerArgs.ds_sparse_decode_threshold,
-            help="The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel.",
-        )
-
         # Offloading
         parser.add_argument(
             "--cpu-offload-gb",
@@ -6648,6 +6636,19 @@ class ServerArgs:
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
+
+        if (
+            self.enable_grpc
+            and self.grpc_port is not None
+            and self.grpc_port == self.port
+        ):
+            raise ValueError(
+                f"SGLANG_GRPC_PORT ({self.grpc_port}) must differ from --port ({self.port})"
+            )
+
+        # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port
+        # to avoid opaque bind errors at runtime. Deferred because metrics_http_port
+        # and nccl_port have dynamic defaults that may not be resolved yet here.
 
         if self.gc_threshold:
             if not (1 <= len(self.gc_threshold) <= 3):

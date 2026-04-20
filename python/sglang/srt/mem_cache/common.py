@@ -478,7 +478,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
-    # SessionAwareCache.cache_finished_req handles speculative tail trim
+    # StreamingSession.cache_finished_req handles speculative tail trim
     # and bookkeeping flag sync internally, then sets req_pool_idx = None.
     if req.req_pool_idx is None:
         return
