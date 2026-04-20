@@ -111,6 +111,7 @@ from sglang.srt.layers.attention.attention_registry import (
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -3233,11 +3234,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.prepare_attn_tp_scatter_input(self)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+        # The skip is scoped to NSACPLayerCommunicator-style CP (NSA, MLA): those
+        # flavors already feed a zigzag-split rank-local layout whose token count
+        # should not be further divided by attn_tp_size. MHA-arch prefill CP
+        # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
+        # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
             and not is_nsa_enable_prefill_cp()
+            and not is_mla_prefill_cp_enabled()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,

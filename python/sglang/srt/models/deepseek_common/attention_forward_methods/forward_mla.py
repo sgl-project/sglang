@@ -8,6 +8,7 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -373,7 +374,7 @@ class DeepseekMLAForwardMixin:
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        if nsa_use_prefill_cp(forward_batch):
+        if nsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe

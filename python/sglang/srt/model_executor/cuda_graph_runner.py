@@ -44,6 +44,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -588,7 +589,15 @@ class CudaGraphRunner:
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        # True if an NSACPLayerCommunicator-style prefill-CP flavor is active
+        # (NSA or MLA). These flavors feed a zigzag-split rank-local layout
+        # into the runner; MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR
+        # #18233) uses the plain LayerCommunicator with an attn_tp-replicated
+        # layout and is intentionally excluded so the attn_tp-local
+        # num_token_non_padded adjustment still runs for it.
+        self.enable_prefill_cp = (
+            is_nsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+        )
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
@@ -946,7 +955,7 @@ class CudaGraphRunner:
         if (
             enable_num_token_non_padded()
             and self.require_gathered_buffer
-            and not self.nsa_enable_prefill_cp
+            and not self.enable_prefill_cp
         ):
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buffers.num_token_non_padded,
@@ -1211,7 +1220,9 @@ class CudaGraphRunner:
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
-            nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
+            # Parameter name retained for API stability; semantically this is
+            # "any prefill-CP flavor enabled" (NSA CP or MLA CP).
+            nsa_enable_prefill_cp=self.enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(),
             pp_proxy_tensors=pp_proxy_tensors,
         )

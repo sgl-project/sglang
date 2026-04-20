@@ -123,9 +123,12 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    is_prefill_context_parallel_enabled,
+    mla_use_prefill_cp,
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -368,7 +371,11 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
+        self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.mla_enable_prefill_cp = (
+            is_prefill_context_parallel_enabled() and not self.use_nsa
+        )
 
     def forward(
         self,
@@ -390,7 +397,10 @@ class MoEGate(nn.Module):
         if (
             not self.is_deepseek_v4
             and forward_batch is not None
-            and nsa_use_prefill_cp(forward_batch)
+            and (
+                nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+                or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+            )
         ):
             logits = F.linear(hidden_states, self.weight, None)
         else:
@@ -1349,10 +1359,15 @@ class DeepseekV2AttentionMLA(
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.mla_enable_prefill_cp = (
+            is_prefill_context_parallel_enabled() and not self.use_nsa
+        )
         if self.nsa_enable_prefill_cp:
             assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
-        # cp reuse the attn_tp comm group but need to duplicate the weights
-        if self.nsa_enable_prefill_cp and self.use_nsa:
+        # cp reuses the attn_tp comm group but needs to duplicate the weights;
+        # store cp_size whenever either CP flavor is active so rebuild_cp_kv_cache
+        # and the FA3 MLA wrapper can reach it on the dense MLA path too.
+        if self.nsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
@@ -1804,6 +1819,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             get_global_server_args().speculative_algorithm
         )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.mla_enable_prefill_cp = (
+            is_prefill_context_parallel_enabled() and not is_deepseek_nsa(config)
+        )
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(
@@ -1876,7 +1894,10 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        if self.nsa_enable_prefill_cp:
+        if self.nsa_enable_prefill_cp or self.mla_enable_prefill_cp:
+            # NSACPLayerCommunicator is flavor-agnostic; its internal gates
+            # read both nsa_use_prefill_cp and mla_use_prefill_cp. The rename
+            # to CPLayerCommunicator is deferred to a cleanup PR.
             self.layer_communicator = NSACPLayerCommunicator(
                 layer_scatter_modes=self.layer_scatter_modes,
                 input_layernorm=self.input_layernorm,
@@ -1991,7 +2012,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                 gemm_output_zero_allocator,
             )
 
-        if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
+        if (
+            not (self.nsa_enable_prefill_cp or self.mla_enable_prefill_cp)
+            and should_allreduce_fusion
+        ):
             hidden_states._sglang_needs_allreduce_fusion = True
 
         if not should_allreduce_fusion:
@@ -2089,7 +2113,10 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
+        self.mla_enable_prefill_cp = (
+            is_prefill_context_parallel_enabled() and not is_deepseek_nsa(config)
+        )
+        if self.nsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
@@ -2248,7 +2275,9 @@ class DeepseekV2Model(nn.Module):
             else None
         )
 
-        if nsa_use_prefill_cp(forward_batch):
+        if nsa_use_prefill_cp(
+            forward_batch, self.nsa_enable_prefill_cp
+        ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -2333,7 +2362,10 @@ class DeepseekV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
+        if self.pp_group.is_last_rank and (
+            nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp)
+            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+        ):
             # allgather + rerrange
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
@@ -2405,7 +2437,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.capture_aux_hidden_states = False
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
+        self.mla_enable_prefill_cp = (
+            is_prefill_context_parallel_enabled() and not is_deepseek_nsa(config)
+        )
+        if self.nsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             self.cp_rank = get_attention_cp_rank()
             self.cp_size = get_attention_cp_size()
         else:
@@ -2487,6 +2522,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             if can_nsa_cp_split(
                 len(input_ids), self.cp_size, self.use_nsa, forward_batch
             ):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+        elif self.mla_enable_prefill_cp:
+            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,

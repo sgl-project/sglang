@@ -50,15 +50,14 @@ def is_prefill_cp_in_seq_split():
     )
 
 
-def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
-    """Runtime gate for MLA prefill-CP attention-internal sites.
+def is_mla_prefill_cp_enabled() -> bool:
+    sa = get_global_server_args()
+    return sa.enable_prefill_context_parallel and sa.use_mla_backend()
 
-    Mirrors ``nsa_use_prefill_cp`` (layers/attention/nsa/utils.py). Use at
-    MLA-only call sites (``rebuild_cp_kv_cache``, FA3 absorbed-MLA CP
-    wrapper, MLA dispatcher).
-    """
+
+def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
     if mla_enable_prefill_cp is None:
-        mla_enable_prefill_cp = is_prefill_context_parallel_enabled()
+        mla_enable_prefill_cp = is_mla_prefill_cp_enabled()
     return (
         forward_batch.attn_cp_metadata is not None
         and mla_enable_prefill_cp
