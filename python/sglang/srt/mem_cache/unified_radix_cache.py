@@ -282,6 +282,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
 
+        if self.cache_controller is not None:
+            self.cache_controller.reset()
+            self.cache_controller.mem_pool_host.clear()
+
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
