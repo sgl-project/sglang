@@ -147,13 +147,13 @@ jobs:
               - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             sgl_kernel:
-              - "sgl-kernel/**/*.!(md|txt)"
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             jit_kernel:
               - "python/sglang/jit_kernel/**"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
+              - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
               - "python/sglang/jit_kernel/diffusion/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
