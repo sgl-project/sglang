@@ -772,13 +772,19 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     def shutdown(self):
-        """Shutdown the engine"""
+        """Shutdown the engine.
+
+        Waits for the scheduler subprocess to exit so its GPU context is
+        released before returning. Callers that immediately allocate GPU
+        memory (e.g. loading a reference HF model right after) would
+        otherwise race the kernel's reap of the killed child.
+        """
         if (
             self.tokenizer_manager is not None
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
-        kill_process_tree(os.getpid(), include_parent=False)
+        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
         return self

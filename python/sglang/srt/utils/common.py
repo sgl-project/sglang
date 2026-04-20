@@ -1047,8 +1047,54 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
         return False
 
 
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
+def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
+    """Block until `procs` exit, warning midway and raising on hard timeout.
+
+    SIGKILL is asynchronous: a killed process keeps holding resources (GPU
+    contexts, pinned memory, file descriptors) until the kernel reaps it.
+    Callers that reuse those resources right after kill must wait for reap.
+    This helper warns at ~10s if anything is still alive, then raises at
+    `wait_timeout` so a stuck process surfaces loudly instead of leaving a
+    latent race in place.
+    """
+    warn_at = min(10.0, wait_timeout / 2)
+    gone, alive = psutil.wait_procs(procs, timeout=warn_at)
+    if not alive:
+        return
+    logger.warning(
+        "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
+        "continuing to wait up to %.1fs total. pids=%s",
+        len(alive),
+        warn_at,
+        wait_timeout,
+        [p.pid for p in alive],
+    )
+    remaining = wait_timeout - warn_at
+    if remaining > 0:
+        _, alive = psutil.wait_procs(alive, timeout=remaining)
+    if alive:
+        raise RuntimeError(
+            f"kill_process_tree: {len(alive)} process(es) not reaped within "
+            f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
+        )
+
+
+def kill_process_tree(
+    parent_pid,
+    include_parent: bool = True,
+    skip_pid: int = None,
+    wait_timeout: Optional[float] = None,
+):
+    """Kill the process and all its child processes.
+
+    If `wait_timeout` is set, block until every killed process is reaped by
+    the kernel (so its GPU context, pinned memory and fds are actually
+    released). Exceeding `wait_timeout` raises `RuntimeError`. Leave it as
+    `None` for fire-and-forget kills where no resource is reused after.
+    The `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot
+    wait for itself; pass `include_parent=False` in that case if you need
+    child reap to complete first.
+    """
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -1059,11 +1105,13 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
         return
 
     children = itself.children(recursive=True)
+    killed = []
     for child in children:
         if child.pid == skip_pid:
             continue
         try:
             child.kill()
+            killed.append(child)
         except psutil.NoSuchProcess:
             pass
 
@@ -1078,8 +1126,12 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
             itself.send_signal(signal.SIGQUIT)
+            killed.append(itself)
         except psutil.NoSuchProcess:
             pass
+
+    if wait_timeout is not None and killed:
+        _wait_for_reap_or_raise(killed, wait_timeout)
 
 
 def monkey_patch_p2p_access_check():

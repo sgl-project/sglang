@@ -140,10 +140,12 @@ class PDDisaggregationServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # wait_timeout ensures each killed server releases its GPU context
+        # and RDMA resources before the next test class sets up new servers.
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
                 try:
-                    kill_process_tree(process.pid)
+                    kill_process_tree(process.pid, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 
