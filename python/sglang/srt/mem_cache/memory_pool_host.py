@@ -1273,7 +1273,9 @@ class MambaPoolHost(HostKVCache):
                 allocator=self.allocator,
             )
             self.conv_buffer = []
-            for conv_shape in self.conv_state_shapes:
+            for i, conv_shape in enumerate(self.conv_state_shapes):
+                if self.conv_state_elem_sizes[i] <= 0:
+                    continue
                 conv_dims = (self.size, self.num_mamba_layers, 1) + conv_shape
                 self.conv_buffer.append(
                     alloc_func(
@@ -1298,7 +1300,9 @@ class MambaPoolHost(HostKVCache):
                 allocator=self.allocator,
             )
             self.conv_buffer = []
-            for conv_shape in self.conv_state_shapes:
+            for i, conv_shape in enumerate(self.conv_state_shapes):
+                if self.conv_state_elem_sizes[i] <= 0:
+                    continue
                 conv_dims = (self.num_mamba_layers, self.size) + conv_shape
                 self.conv_buffer.append(
                     alloc_func(
@@ -1497,6 +1501,8 @@ class MambaPoolHost(HostKVCache):
                 io_backend=io_backend,
             )
             for conv_idx in range(len(self.conv_state_shapes)):
+                if self.conv_state_elem_sizes[conv_idx] <= 0:
+                    continue
                 self._copy_tensor_pf_lf(
                     src=self.conv_buffer[conv_idx],
                     dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
@@ -1515,6 +1521,8 @@ class MambaPoolHost(HostKVCache):
                 io_backend,
             )
             for conv_idx in range(len(self.conv_state_shapes)):
+                if self.conv_state_elem_sizes[conv_idx] <= 0:
+                    continue
                 self._copy_tensor(
                     self.conv_buffer[conv_idx][layer_id],
                     device_pool.mamba_cache.conv[conv_idx][layer_id],
@@ -1537,6 +1545,8 @@ class MambaPoolHost(HostKVCache):
                 io_backend=io_backend,
             )
             for conv_idx in range(len(self.conv_state_shapes)):
+                if self.conv_state_elem_sizes[conv_idx] <= 0:
+                    continue
                 self._copy_tensor_all_layers_lf_pf(
                     src_layers=device_pool.mamba_cache.conv[conv_idx],
                     dst=self.conv_buffer[conv_idx],
@@ -1556,6 +1566,8 @@ class MambaPoolHost(HostKVCache):
                     io_backend,
                 )
                 for conv_idx in range(len(self.conv_state_shapes)):
+                    if self.conv_state_elem_sizes[conv_idx] <= 0:
+                        continue
                     self._copy_tensor(
                         device_pool.mamba_cache.conv[conv_idx][layer_id],
                         self.conv_buffer[conv_idx][layer_id],
@@ -1665,6 +1677,8 @@ class PoolEntry:
     # When True, host_pool uses the same logical slot indices as the anchor pool
     # (e.g. DSA indexer); HostPoolGroup.free mirrors frees to this pool.
     share_indices_with_anchor: bool = False
+    # when True, Only data from tp0 will be backed up.
+    tp_redundant: bool = False
     # Optional eviction callbacks for auto-alloc in HybridCacheController.
     # host_evict_fn(n): evict n slots from the host pool (used by write()).
     # device_evict_fn(n): evict n slots from the device pool (used by load()).

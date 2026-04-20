@@ -68,6 +68,7 @@ def build_nsa_hybrid_stack(
                     device_pool=kv,
                     layer_mapper=layer_mapper,
                     is_primary_index_anchor=True,
+                    tp_redundant=True,
                 ),
                 PoolEntry(
                     name=PoolName.INDEXER,
@@ -75,6 +76,7 @@ def build_nsa_hybrid_stack(
                     device_pool=kv,
                     layer_mapper=layer_mapper,
                     share_indices_with_anchor=True,
+                    tp_redundant=True,
                 ),
             ]
         )
@@ -167,6 +169,7 @@ def build_mamba_hybrid_stack(
                     device_pool=kvcache,
                     layer_mapper=kv_layer_mapper,
                     is_primary_index_anchor=True,
+                    tp_redundant=True if hybrid_kv.use_mla else False,
                 ),
                 PoolEntry(
                     name=PoolName.MAMBA,
