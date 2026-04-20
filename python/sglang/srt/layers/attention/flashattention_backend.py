@@ -989,9 +989,9 @@ class FlashAttentionBackend(AttentionBackend):
                     # Concat q_nope + q_rope along dim=-1 so the wrapper's
                     # chunk(2, dim=0) keeps their alignment; split back
                     # inside the closure.
-                    assert not use_cascade_attn, (
-                        "Cascade attention under MLA CP is not supported in v1."
-                    )
+                    assert (
+                        not use_cascade_attn
+                    ), "Cascade attention under MLA CP is not supported in v1."
                     q_fused = torch.cat([q_nope, q_rope], dim=-1)
 
                     def _mla_cp_attn(

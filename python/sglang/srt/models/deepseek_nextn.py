@@ -266,9 +266,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
         self.use_nsa = is_deepseek_nsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        self.mla_enable_prefill_cp = (
-            is_mla_prefill_cp_enabled() and not self.use_nsa
-        )
+        self.mla_enable_prefill_cp = is_mla_prefill_cp_enabled() and not self.use_nsa
         if self.nsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             self.cp_rank = get_attention_cp_rank()
             self.cp_size = get_attention_cp_size()

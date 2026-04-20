@@ -2992,11 +2992,6 @@ class ServerArgs:
             )
 
     def _handle_context_parallelism(self):
-        # MLA prefill CP and NSA prefill CP are two flavors of the same
-        # underlying infrastructure (zigzag split, latent all-gather,
-        # per-layer communicator) and are mutually exclusive at runtime.
-        # A user setting both is almost certainly a typo; fail fast so
-        # one flag does not silently no-op.
         if (
             self.enable_prefill_context_parallel
             and self.enable_nsa_prefill_context_parallel
@@ -3007,7 +3002,7 @@ class ServerArgs:
                 "exclusive. Use --enable-nsa-prefill-context-parallel for "
                 "DeepSeek V3.2 (NSA) models and "
                 "--enable-prefill-context-parallel for MLA-based models "
-                "(DeepSeek V3/R1, Kimi K2.5)."
+                "(DeepSeek V3/R1, Kimi K2.5) or MHA/GQA-based models."
             )
 
         if self.attn_cp_size > 1:
@@ -3022,30 +3017,6 @@ class ServerArgs:
             assert (
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
-
-            # v1 of MLA prefill context parallelism only wires up the fa3
-            # attention backend (see docs/design/prefill-cp-mla.md — non-goals).
-            # Reject other MLA backends at server-args time so users get a
-            # clear error instead of a silent mis-dispatch downstream. This
-            # also catches "wrong flag on NSA model" — NSA runs set
-            # attention_backend="nsa", which trips the same check with a
-            # message pointing the user at the right flag.
-            if self.use_mla_backend() and self.enable_prefill_context_parallel:
-                effective_prefill_backend = (
-                    self.prefill_attention_backend or self.attention_backend
-                )
-                if effective_prefill_backend != "fa3":
-                    raise ValueError(
-                        "MLA prefill context parallelism "
-                        "(--enable-prefill-context-parallel) currently only "
-                        "supports the fa3 attention backend. Effective "
-                        f"prefill backend is {effective_prefill_backend!r}. "
-                        "Set --attention-backend fa3 (or "
-                        "--prefill-attention-backend fa3), or disable "
-                        "prefill context parallelism. For DeepSeek V3.2 "
-                        "(NSA) models, use "
-                        "--enable-nsa-prefill-context-parallel instead."
-                    )
 
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size

@@ -37,10 +37,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
-from sglang.srt.layers.utils.cp_utils import (
-    is_mla_prefill_cp_enabled,
-    mla_use_prefill_cp,
-)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -68,6 +64,10 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
+from sglang.srt.layers.utils.cp_utils import (
+    is_mla_prefill_cp_enabled,
+    mla_use_prefill_cp,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args

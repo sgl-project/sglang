@@ -76,7 +76,7 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
 
     # MLA prefill CP forces absorbed MLA regardless of prefix length: the
     # CP path gathers latent KV via rebuild_cp_kv_cache and feeds the
-    # backend's absorbed-MLA kernel. 
+    # backend's absorbed-MLA kernel.
     if mla_use_prefill_cp(forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
