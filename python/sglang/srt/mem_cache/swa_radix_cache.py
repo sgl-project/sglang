@@ -429,10 +429,7 @@ class SWARadixCache(BasePrefixCache):
         prev_prefix_len = params.prev_prefix_len
         swa_evicted_seqlen = params.swa_evicted_seqlen
 
-        assert value is None or len(value) == len(key), (
-            f"insert() expects value aligned to len(key); "
-            f"got {len(value)=} vs {len(key)=}"
-        )
+        key.assert_valid_for(self.page_size, value)
         if value is None:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
@@ -839,10 +836,7 @@ class SWARadixCache(BasePrefixCache):
         key = params.key
         if self.disable or len(key) == 0:
             return None
-        assert len(key) % self.page_size == 0, (
-            f"match_prefix expects page-aligned key; use make_radix_key(). "
-            f"Got {len(key)=}, {self.page_size=}"
-        )
+        key.assert_valid_for(self.page_size)
         return key
 
     def _match_post_processor(

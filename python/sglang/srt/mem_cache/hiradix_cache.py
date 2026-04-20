@@ -1215,10 +1215,7 @@ class HiRadixCache(RadixCache):
                 host_hit_length=0,
             )
 
-        assert len(key) % self.page_size == 0, (
-            f"match_prefix expects page-aligned key; use make_radix_key(). "
-            f"Got {len(key)=}, {self.page_size=}"
-        )
+        key.assert_valid_for(self.page_size)
         page_aligned_len = len(key)
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
@@ -1395,10 +1392,7 @@ class HiRadixCache(RadixCache):
         if priority is None:
             priority = 0
 
-        assert value is None or len(value) == len(key), (
-            f"insert() expects value aligned to len(key); "
-            f"got {len(value)=} vs {len(key)=}"
-        )
+        key.assert_valid_for(self.page_size, value)
 
         if len(key) == 0:
             return InsertResult(prefix_len=0)

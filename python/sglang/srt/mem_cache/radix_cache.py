@@ -128,6 +128,19 @@ class RadixKey:
         aligned_len = len(self) // page_size * page_size
         return self[:aligned_len]
 
+    def assert_valid_for(
+        self, page_size: int, value: Optional[torch.Tensor] = None
+    ) -> None:
+        """Assert this key is page-aligned and, if provided, value length matches key length."""
+        assert len(self) % page_size == 0, (
+            f"key not page-aligned; use make_radix_key(). "
+            f"Got {len(self)=}, {page_size=}"
+        )
+        if value is not None:
+            assert len(value) == len(
+                self
+            ), f"value not aligned to key; got {len(value)=} vs {len(self)=}"
+
 
 class TreeNode:
 
@@ -478,9 +491,7 @@ class RadixCache(BasePrefixCache):
         if self.disable or len(key) == 0:
             return empty_match_result()
 
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
+        key.assert_valid_for(self.page_size)
 
         if len(key) == 0:
             return empty_match_result()
@@ -505,10 +516,7 @@ class RadixCache(BasePrefixCache):
         priority = params.priority
         chunked = params.chunked
 
-        assert value is None or len(value) == len(key), (
-            f"insert() expects value aligned to len(key); "
-            f"got {len(value)=} vs {len(key)=}"
-        )
+        key.assert_valid_for(self.page_size, value)
         if value is None:
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)

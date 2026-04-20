@@ -247,10 +247,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
             )
-        assert len(key) % self.page_size == 0, (
-            f"match_prefix expects page-aligned key; use make_radix_key(). "
-            f"Got {len(key)=}, {self.page_size=}"
-        )
+        key.assert_valid_for(self.page_size)
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)
@@ -261,10 +258,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         key = params.key
         value = params.value
-        assert value is None or len(value) == len(key), (
-            f"insert() expects value aligned to len(key); "
-            f"got {len(value)=} vs {len(key)=}"
-        )
+        key.assert_valid_for(self.page_size, value)
         if value is None:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
