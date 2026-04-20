@@ -108,6 +108,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def can_fuse_shared_expert(
     config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
 
@@ -120,6 +121,20 @@ def can_fuse_shared_expert(
         or get_moe_a2a_backend().is_deepep()
     ):
         return False
+
+    # If the shared expert is excluded from quantization (stored as FP32 in the
+    # checkpoint), fusing it into the quantized MoE weight tensor requires online
+    # quantization which is not supported. Disable fusion in this case.
+    if quant_config is not None:
+        exclude_layers = getattr(quant_config, "exclude_layers", [])
+        if any(
+            "shared_expert" in layer
+            and "shared_expert_gate" not in layer
+            and not layer.startswith("mtp.")
+            for layer in exclude_layers
+        ):
+            return False
+
     return True
 
 
@@ -212,7 +227,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if _use_aiter:
             # enable shared expert fusion when use aiter
             self.enable_shared_expert_fusion = (
-                support_shared_expert_fusion and can_fuse_shared_expert(config)
+                support_shared_expert_fusion
+                and can_fuse_shared_expert(config, quant_config)
             )
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
@@ -324,7 +340,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if shared_weights is None:
             return topk_output
 
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             fused_append_shared_experts_with_weights,
         )
 
