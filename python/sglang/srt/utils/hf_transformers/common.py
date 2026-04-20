@@ -52,7 +52,7 @@ from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 
-from .compat import normalize_rope_scaling_compat
+from ..hf_transformers_patches import normalize_rope_scaling_compat
 
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
     from modelscope import AutoConfig, GenerationConfig
