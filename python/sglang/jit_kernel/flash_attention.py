@@ -4,8 +4,6 @@ import torch
 
 from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_func
 from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
-from .flash_attention_v4 import flash_attn_varlen_func as fa4_flash_attn_varlen_func
-from .flash_attention_v4 import flash_attn_with_kvcache as fa4_flash_attn_with_kvcache
 
 
 def flash_attn_with_kvcache(
@@ -168,6 +166,10 @@ def flash_attn_with_kvcache(
             sinks=sinks,
         )
     elif ver == 4:
+        from .flash_attention_v4 import (
+            flash_attn_with_kvcache as fa4_flash_attn_with_kvcache,
+        )
+
         return fa4_flash_attn_with_kvcache(
             q,
             k_cache,
@@ -260,6 +262,10 @@ def flash_attn_varlen_func(
             sinks=sinks,
         )
     elif ver == 4:
+        from .flash_attention_v4 import (
+            flash_attn_varlen_func as fa4_flash_attn_varlen_func,
+        )
+
         return fa4_flash_attn_varlen_func(
             q,
             k,

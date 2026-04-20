@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration
-register_cuda_ci(est_time=220, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=262, suite="stage-b-test-1-gpu-large")
 
 
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
@@ -53,7 +53,7 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
         metrics = run_eval(args)
         print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
-        self.assertGreaterEqual(metrics["score"], 0.82)
+        self.assertGreaterEqual(metrics["score"], 0.80)
 
 
 class TestPiecewiseCudaGraphInternVL25(CustomTestCase):

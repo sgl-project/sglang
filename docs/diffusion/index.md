@@ -7,7 +7,7 @@ SGLang Diffusion is a high-performance inference framework for image and video g
 - Broad model support across Wan, Hunyuan, Qwen-Image, FLUX, Z-Image, GLM-Image, and more
 - Fast inference with `sgl-kernel`, JIT kernels, scheduler improvements, and caching acceleration
 - Multiple interfaces: `sglang generate`, `sglang serve`, and an OpenAI-compatible API
-- Multi-platform support for NVIDIA, AMD, Ascend, Apple Silicon, and Moore Threads
+- Multi-platform support for NVIDIA, AMD, Intel XPU, Ascend, Apple Silicon, and Moore Threads
 
 ## Quick Start
 
@@ -28,7 +28,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 ## Start Here
 
 - [Installation](installation.md): install SGLang Diffusion and platform dependencies
-- [Compatibility Matrix](compatibility_matrix.md): check model and optimization support
+- [Compatibility Matrix](compatibility_matrix.md): check model, optimization, and component override support
 - [CLI](api/cli.md): run one-off generation jobs or launch a persistent server
 - [OpenAI-Compatible API](api/openai_api.md): send image and video requests to the HTTP server
 - [Attention Backends](performance/attention_backends.md): choose the best backend for your model and hardware
