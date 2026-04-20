@@ -26,6 +26,7 @@ configuration first before handing the problem to a specialized kernel-optimizat
 - Use cases: `x * (1 + scale) + shift` and `a * (k + b) + c`
 - Constraints: `x` must be CUDA and contiguous. `scale/shift` support 0D/1D/2D/3D/4D broadcast. 4D `[B, F, 1, C]` requires `L % F == 0`.
 - NPU fallback: `scale_shift.py` swaps to `npu_fallback` native path.
+- Validation: `python/sglang/jit_kernel/tests/diffusion/test_qwen_image_modulation.py`.
 
 2. Norm + Scale/Shift fusion (CuTe DSL)
 - Kernels: `fused_norm_scale_shift`, `fused_scale_residual_norm_scale_shift`
@@ -44,13 +45,14 @@ configuration first before handing the problem to a specialized kernel-optimizat
   - `y, y2 = tanh(gate) * norm(x) + shift`, then `y2 = norm(y) * (1 + scale)`
 - Constraints: same CuTe DSL envelope as the norm+scale/shift family in practice: contiguous last dim, fp16/bf16/fp32, and `D % 256 == 0`, `D <= 8192`.
 - Validation: `python/sglang/jit_kernel/tests/diffusion/test_norm_tanh_mul_add_norm_scale.py`
-- Behavior: this is already a merged fast path, so if Z-Image traces show the unfused chain, treat it as a missing or regressed existing optimization before proposing a new kernel.
+- Behavior: this is already a mainline fast path, so if Z-Image traces show the unfused chain, treat it as a missing or regressed existing optimization before proposing a new kernel.
 
 4. Triton LayerNorm/RMSNorm fusion
 - Kernels: `rms_norm_fn`, `layer_norm_fn`, `norm_infer`
 - Locations: `triton/norm.py`, `layernorm.py`
 - Use cases: fp32 RMSNorm with residual/dropout/rowscale/x1 branches, and inference-friendly `norm_infer`.
 - Constraints: last dim must be contiguous, and `N * element_size < 64KB`.
+- Validation: `python/sglang/jit_kernel/tests/test_rmsnorm.py`.
 
 5. Triton one-pass RMSNorm (small hidden size fast path)
 - Kernel: `triton_one_pass_rms_norm`
@@ -64,6 +66,7 @@ configuration first before handing the problem to a specialized kernel-optimizat
 - Use case: GPT-J style RoPE when not Neox.
 - Constraints: `head_size` must be even.
 - NPU fallback: `npu_fallback.apply_rotary_embedding_native`.
+- Validation: `python/sglang/jit_kernel/tests/test_rope.py`.
 
 **Faster CUDA Kernel Usage Points**
 
@@ -93,6 +96,7 @@ configuration first before handing the problem to a specialized kernel-optimizat
   - `can_use_fused_inplace_qknorm(head_dim, dtype)` returns true.
   - Supported head dims: `64, 128, 256, 512, 1024`.
 - Behavior: Fused path operates on `q` and `k` in place after reshaping to `[B, -1, head_dim]`. If preconditions fail, fall back to per-tensor RMSNorm.
+- Validation: `python/sglang/jit_kernel/tests/test_qknorm.py` and `python/sglang/jit_kernel/tests/test_qknorm_across_heads.py`.
 
 **QK Norm + RoPE Optimization**
 
@@ -107,6 +111,7 @@ configuration first before handing the problem to a specialized kernel-optimizat
   - `can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, dtype)` returns true.
   - Supported head dims: `64, 128, 256`.
 - Behavior: `apply_qk_norm_rope` prefers the fused JIT kernel when all guards pass; otherwise it falls back to `apply_qk_norm(...)` plus `apply_flashinfer_rope_qk_inplace(...)`.
+- Validation: `python/sglang/jit_kernel/tests/diffusion/test_qknorm_rope.py`.
 
 **Nunchaku Fused GELU MLP**
 
