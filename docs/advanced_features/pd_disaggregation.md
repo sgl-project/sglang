@@ -15,7 +15,7 @@ PD Disaggregation resolves these by separating the two stages, enabling tailored
 
 For the design details, please refer to [link](https://docs.google.com/document/d/1rQXJwKd5b9b1aOzLh98mnyMhBMhlxXA5ATZTHoQrwvc/edit?tab=t.0).
 
-Currently, we support Mooncake and NIXL as the transfer engine.
+Currently, we support Mooncake, NIXL, and `shm_pinned` as transfer backends. `shm_pinned` is intended for single-node PCIe deployments without NVLink. See [shm_pinned backend](../disaggregation/shm_pinned.md) for the design scope and current limitations.
 
 ## Profiling in PD Disaggregation Mode
 
