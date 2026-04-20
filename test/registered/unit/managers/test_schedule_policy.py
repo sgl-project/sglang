@@ -193,7 +193,9 @@ class TestSortByLongestOutput(CustomTestCase):
             _make_req(rid="r2", max_new_tokens=100),
         ]
         SchedulePolicy._sort_by_longest_output(reqs, False, priority_sign=-1)
-        self.assertEqual([r.sampling_params.max_new_tokens for r in reqs], [200, 100, 50])
+        self.assertEqual(
+            [r.sampling_params.max_new_tokens for r in reqs], [200, 100, 50]
+        )
 
     def test_with_priority_high_values_first(self):
         reqs = [
@@ -275,7 +277,9 @@ class TestSortByRoutingKey(CustomTestCase):
             _make_req(rid="r1", routing_key="key-b"),
         ]
         original_order = [r.rid for r in reqs]
-        SchedulePolicy._sort_by_routing_key(reqs, self._make_running_batch([None, None]))
+        SchedulePolicy._sort_by_routing_key(
+            reqs, self._make_running_batch([None, None])
+        )
         self.assertEqual([r.rid for r in reqs], original_order)
 
     def test_matching_keys_sorted_by_frequency_descending(self):
