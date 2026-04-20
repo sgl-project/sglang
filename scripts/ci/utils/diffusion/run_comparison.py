@@ -65,6 +65,46 @@ def _framework_executable(executable: str, framework_bin_dir: str | None) -> str
     return executable
 
 
+def _filter_ld_library_path_for_venv(ld: str | None) -> str | None:
+    """Keep CUDA-related entries so libcudart/NCCL resolve; drop other host paths.
+
+    Clearing LD_LIBRARY_PATH entirely avoids ABI mismatches from a host-built
+    PyTorch, but it also breaks typical CI/container setups where CUDA lives
+    only on LD_LIBRARY_PATH. We keep entries that look CUDA-related.
+
+    Note: ``source venv/bin/activate`` does **not** remove or replace
+    ``LD_LIBRARY_PATH`` — it mainly prepends the venv ``bin`` to ``PATH`` and
+    sets ``VIRTUAL_ENV``. So "activating the venv" is not a substitute for
+    deciding how much of the inherited ``LD_LIBRARY_PATH`` to keep; the dynamic
+    linker can still prefer host paths when loading ``.so`` files.
+    """
+    if not ld:
+        return None
+    keep: list[str] = []
+    for entry in ld.split(":"):
+        if not entry:
+            continue
+        lower = entry.lower()
+        if any(
+            token in lower
+            for token in (
+                "cuda",
+                "cudnn",
+                "nccl",
+                "nvidia",
+                "tensorrt",
+                "cublas",
+                "cusparse",
+                "cusolver",
+                "curand",
+                "nvjitlink",
+                "libcudnn",
+            )
+        ):
+            keep.append(entry)
+    return ":".join(keep) if keep else None
+
+
 def _expected_framework_bin_dir(fw_name: str) -> str | None:
     """Return expected framework venv bin directory for installable frameworks."""
     if fw_name not in INSTALLABLE_FRAMEWORKS:
@@ -79,8 +119,14 @@ def _expected_framework_bin_dir(fw_name: str) -> str | None:
 
 
 def _build_sglang_cmd(
-    case: dict, fw_cfg: dict, port: int, framework_bin_dir: str | None = None
+    case: dict,
+    fw_cfg: dict,
+    port: int,
+    framework_bin_dir: str | None = None,
+    *,
+    resolve_model_path: bool = True,
 ) -> list[str]:
+    # framework_bin_dir unused; resolve_model_path unused — kept for uniform builder signature.
     cmd = [
         "sglang",
         "serve",
@@ -99,8 +145,14 @@ def _build_sglang_cmd(
 
 
 def _build_vllm_cmd(
-    case: dict, fw_cfg: dict, port: int, framework_bin_dir: str | None = None
+    case: dict,
+    fw_cfg: dict,
+    port: int,
+    framework_bin_dir: str | None = None,
+    *,
+    resolve_model_path: bool = True,
 ) -> list[str]:
+    # resolve_model_path unused — kept for uniform builder signature.
     cmd = [
         _framework_executable("vllm", framework_bin_dir),
         "serve",
@@ -128,6 +180,22 @@ def _resolve_hf_model_path(model_id: str) -> str:
         return path
     except Exception:
         return model_id
+
+
+def _lightx2v_spatial_params(case: dict) -> dict:
+    """Height/width/frames mapping shared by LightX2V server config and HTTP payload."""
+    out: dict = {}
+    if "num_frames" in case:
+        out["target_video_length"] = case["num_frames"]
+    if "height" in case:
+        h = case["height"]
+        out["height"] = h
+        out["target_height"] = h
+    if "width" in case:
+        w = case["width"]
+        out["width"] = w
+        out["target_width"] = w
+    return out
 
 
 def _write_lightx2v_config(case: dict, fw_cfg: dict, model_path: str) -> str:
@@ -169,15 +237,7 @@ def _write_lightx2v_config(case: dict, fw_cfg: dict, model_path: str) -> str:
                 cfg["dit_original_ckpt"] = ckpt
                 break
 
-    if "num_frames" in case:
-        cfg["target_video_length"] = case["num_frames"]
-    if "height" in case:
-        cfg["height"] = case["height"]
-        # LTX2 runner reads target_height/target_width in request-time config.
-        cfg["target_height"] = case["height"]
-    if "width" in case:
-        cfg["width"] = case["width"]
-        cfg["target_width"] = case["width"]
+    cfg.update(_lightx2v_spatial_params(case))
 
     config_path = os.path.join(
         tempfile.gettempdir(), f"lightx2v_config_{case['id']}.json"
@@ -192,6 +252,7 @@ def _build_lightx2v_cmd(
     fw_cfg: dict,
     port: int,
     framework_bin_dir: str | None = None,
+    *,
     resolve_model_path: bool = True,
 ) -> list[str]:
     """Build LightX2V server launch command.
@@ -259,9 +320,9 @@ def build_server_cmd(
     builder = builders.get(framework)
     if builder is None:
         raise ValueError(f"Unknown framework: {framework}")
-    if framework == "lightx2v":
-        return builder(case, fw_cfg, port, framework_bin_dir, resolve_model_path)
-    return builder(case, fw_cfg, port, framework_bin_dir)
+    return builder(
+        case, fw_cfg, port, framework_bin_dir, resolve_model_path=resolve_model_path
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -671,15 +732,7 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
         "seed": case.get("seed", 42),
         "infer_steps": case.get("num_inference_steps", 50),
     }
-    # LightX2V uses target_video_length for frames, height/width directly
-    if "num_frames" in case:
-        payload["target_video_length"] = case["num_frames"]
-    if "height" in case:
-        payload["height"] = case["height"]
-        payload["target_height"] = case["height"]
-    if "width" in case:
-        payload["width"] = case["width"]
-        payload["target_width"] = case["width"]
+    payload.update(_lightx2v_spatial_params(case))
     if "guidance_scale" in case:
         payload["guidance_scale"] = case["guidance_scale"]
     if "fps" in case:
@@ -706,6 +759,17 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
 
     # Poll for completion
     poll_url = f"{base_url}/v1/tasks/{task_id}/status"
+    _KNOWN_ACTIVE = {
+        "PENDING",
+        "QUEUED",
+        "RUNNING",
+        "PROCESSING",
+        "IN_PROGRESS",
+        "STARTING",
+        "SUBMITTED",
+    }
+    unknown_streak = 0
+    max_unknown_streak = 30
     while True:
         time.sleep(1)
         poll_resp = requests.get(poll_url, timeout=30)
@@ -718,6 +782,15 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
             break
         elif status in ("FAILED", "CANCELLED"):
             raise RuntimeError(f"LightX2V task {status}: {poll_data}")
+        elif status in _KNOWN_ACTIVE:
+            unknown_streak = 0
+        else:
+            unknown_streak += 1
+            if unknown_streak >= max_unknown_streak:
+                raise RuntimeError(
+                    f"LightX2V: {unknown_streak} consecutive unexpected status values "
+                    f"(last={status!r}): {poll_data}"
+                )
         if time.time() - start > REQUEST_TIMEOUT:
             raise TimeoutError(f"LightX2V task timed out after {REQUEST_TIMEOUT}s")
 
@@ -786,12 +859,21 @@ def run_single(
 
     env = os.environ.copy()
     if framework_bin_dir:
-        # Isolate the venv: override PATH so the venv's bin comes first,
-        # and remove LD_LIBRARY_PATH / PYTHONPATH inherited from the host
-        # to prevent ABI mismatches (e.g. host PyTorch vs venv PyTorch).
+        # Same effect as `source .../bin/activate` for running commands: venv bin
+        # first on PATH + VIRTUAL_ENV. That does not control LD_LIBRARY_PATH (see
+        # _filter_ld_library_path_for_venv docstring).
         env["PATH"] = framework_bin_dir + ":" + env.get("PATH", "")
         env["VIRTUAL_ENV"] = os.path.dirname(framework_bin_dir)
-        env.pop("LD_LIBRARY_PATH", None)
+        inherit_ld = os.environ.get("COMPARISON_INHERIT_LD_LIBRARY_PATH", "").strip().lower()
+        if inherit_ld in ("1", "true", "yes"):
+            # Optional: keep full host LD_LIBRARY_PATH (e.g. unusual CUDA layouts).
+            pass
+        else:
+            filtered_ld = _filter_ld_library_path_for_venv(env.get("LD_LIBRARY_PATH"))
+            if filtered_ld:
+                env["LD_LIBRARY_PATH"] = filtered_ld
+            else:
+                env.pop("LD_LIBRARY_PATH", None)
         env.pop("PYTHONPATH", None)
     env.update(fw_cfg.get("extra_env", {}))
 
@@ -892,22 +974,49 @@ def _install_framework(fw_name: str, dry_run: bool = False) -> tuple[bool, str |
     print(f"\n{'='*60}")
     print(f"Installing framework: {fw_name}")
     print(f"{'='*60}")
-    ret = subprocess.run(
+    proc = subprocess.Popen(
         ["bash", str(INSTALL_SCRIPT), fw_name, "install"],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=FRAMEWORK_INSTALL_TIMEOUT,
+        bufsize=1,
     )
-    if ret.returncode != 0:
-        print(f"  WARNING: {fw_name} installation failed (exit {ret.returncode})")
-        if ret.stdout:
-            print(ret.stdout.strip())
-        if ret.stderr:
-            print(ret.stderr.strip())
+    install_lines: list[str] = []
+
+    def _tee_install_output() -> None:
+        assert proc.stdout is not None
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                install_lines.append(line)
+                sys.stdout.write(f"  [install] {line}")
+                sys.stdout.flush()
+        except ValueError:
+            pass
+
+    tee_thread = threading.Thread(target=_tee_install_output, daemon=True)
+    tee_thread.start()
+    try:
+        proc.wait(timeout=FRAMEWORK_INSTALL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            pass
+        tee_thread.join(timeout=30)
+        print(
+            f"  WARNING: {fw_name} installation timed out after "
+            f"{FRAMEWORK_INSTALL_TIMEOUT}s"
+        )
+        return False, None
+    tee_thread.join(timeout=120)
+    if proc.returncode != 0:
+        print(f"  WARNING: {fw_name} installation failed (exit {proc.returncode})")
         return False, None
 
+    combined_out = "".join(install_lines)
     framework_bin_dir = None
-    for line in f"{ret.stdout}\n{ret.stderr}".splitlines():
+    for line in combined_out.splitlines():
         if line.startswith("FRAMEWORK_BIN_DIR="):
             framework_bin_dir = line.split("=", 1)[1].strip()
             break
