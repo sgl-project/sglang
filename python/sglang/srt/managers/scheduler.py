@@ -2368,6 +2368,8 @@ class Scheduler(
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
+            if self.running_batch.is_empty():
+                self.running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()

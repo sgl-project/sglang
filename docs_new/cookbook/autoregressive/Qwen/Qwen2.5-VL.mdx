@@ -1,0 +1,392 @@
+---
+title: Qwen2.5-VL
+metatags:
+    description: "Deploy Qwen2.5-VL vision-language models with SGLang on AMD MI300X - available in 3B to 72B sizes with enhanced visual understanding."
+---
+
+import { Qwen25VLDeployment } from '/src/snippets/autoregressive/qwen25-vl-deployment.jsx';
+
+## 1. Model Introduction
+
+**[Qwen2.5-VL](https://huggingface.co/collections/Qwen/qwen25-vl)** is a vision-language model series from the Qwen team, offering significant improvements over its predecessor in understanding, reasoning, and multi-modal processing.
+
+**Key Features:**
+
+- **Understand things visually**: Proficient in recognizing common objects such as flowers, birds, fish, and insects, and it is highly capable of analyzing texts, charts, icons, graphics, and layouts within images.
+- **More Agentic**: Play as a visual agent that can reason and dynamically direct tools, which is capable of computer use and phone use.
+- **Understanding long videos and capturing events**: Supports comprehending videos of over 1 hour, and this time it has a new ability of capturing event by pinpointing the relevant video segments.
+- **Capable of visual localization in different formats**: Accurately localize objects in an image by generating bounding boxes or points, and it can provide stable JSON outputs for coordinates and attributes.
+- **Generating structured outputs**: Supports structured outputs of the contents, benefiting usages in finance, commerce, etc for data like scans of invoices, forms, tables, etc.
+- **Dynamic Resolution and Frame Rate Training for Video Understanding**: Extend dynamic resolution to the temporal dimension by adopting dynamic FPS sampling, enabling the model to comprehend videos at various sampling rates. Accordingly, we update mRoPE in the time dimension with IDs and absolute time alignment, enabling the model to learn temporal sequence and speed, and ultimately acquire the ability to pinpoint specific moments.
+- **Multiple Sizes**: Available in 3B, 7B, 32B, and 72B variants to suit different deployment needs.
+- **ROCm Support**: Compatible with AMD MI300X, MI325X and MI355X GPUs via SGLang (verified).
+
+For more details, please refer to the [official Qwen2.5-VL GitHub Repository](https://github.com/QwenLM/Qwen3-VL).
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for AMD MI300X, MI325X and MI355X hardware platforms and different use cases.
+
+### 3.1 Basic Configuration
+
+The Qwen2.5-VL series offers models in various sizes. The following configurations have been verified on AMD MI300X, MI325X and MI355X GPUs.
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model size.
+
+<Qwen25VLDeployment />
+
+### 3.2 Configuration Tips
+
+* **Memory Management**: For the 72B model on MI300X/MI325X/MI355X, we have verified successful deployment with `--context-length 128000`. Smaller context lengths can be used to reduce memory usage if needed.
+* **Multi-GPU Deployment**: Use Tensor Parallelism (`--tp`) to scale across multiple GPUs. For example, use `--tp 8` for the 72B model and `--tp 2` for the 32B model on MI300X/MI325X/MI355X.
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+- [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Multi-Modal Inputs
+
+Qwen2.5-VL supports image inputs. Here's a basic example with single image input:
+
+```python Example
+import time
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="EMPTY",
+    base_url="http://localhost:30000/v1",
+    timeout=3600
+)
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png"
+                }
+            },
+            {
+                "type": "text",
+                "text": "Read all the text in the image."
+            }
+        ]
+    }
+]
+
+start = time.time()
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-VL-7B-Instruct",
+    messages=messages,
+    max_tokens=2048
+)
+print(f"Response costs: {time.time() - start:.2f}s")
+print(f"Generated text: {response.choices[0].message.content}")
+```
+
+**Example Output:**
+
+```text Output
+Response costs: 2.31s
+Generated text: Auntie Anne's
+
+CINNAMON SUGAR
+1 x 17,000
+SUB TOTAL
+17,000
+
+GRAND TOTAL
+17,000
+
+CASH IDR
+20,000
+
+CHANGE DUE
+3,000
+```
+
+**Multi-Image Input Example:**
+
+Qwen2.5-VL can process multiple images in a single request for comparison or analysis:
+
+```python Example
+import time
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="EMPTY",
+    base_url="http://localhost:30000/v1",
+    timeout=3600
+)
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://www.civitatis.com/f/china/hong-kong/guia/taxi.jpg"
+                }
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://cdn.cheapoguides.com/wp-content/uploads/sites/7/2025/05/GettyImages-509614603-1280x600.jpg"
+                }
+            },
+            {
+                "type": "text",
+                "text": "Compare these two images and describe the differences in 100 words or less."
+            }
+        ]
+    }
+]
+
+start = time.time()
+response = client.chat.completions.create(
+    model="Qwen/Qwen2.5-VL-7B-Instruct",
+    messages=messages,
+    max_tokens=2048
+)
+print(f"Response costs: {time.time() - start:.2f}s")
+print(f"Generated text: {response.choices[0].message.content}")
+```
+
+**Example Output:**
+
+```text Output
+Response costs: 13.79s
+Generated text: The first image shows a single red taxi driving on a street with a few other taxis in the background. The second image shows a large number of taxis parked in a lot, with some appearing to be in various states of repair. The first image has a single taxi with a visible license plate, while the second image has multiple taxis with different license plates. The first image has a clear view of the street and surrounding area, while the second image is taken from an elevated perspective, showing a wider view of the parking lot and the surrounding area.
+```
+
+**Note:**
+
+- You can also provide local file paths using `file://` protocol.
+- For larger images, you may need more memory, adjust `--mem-fraction-static` accordingly.
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: AMD MI300X GPU (8x)
+- Model: Qwen2.5-VL-72B-Instruct
+- Tensor Parallelism: 8
+- SGLang Version: 0.5.6
+
+We use SGLang's built-in benchmarking tool to conduct performance evaluation with random images. To simulate real-world usage, you can specify different input and output lengths for each request. For example, each request can have 128 input tokens, two 720p images, and 1024 output tokens.
+
+#### 5.1.1 Latency-Sensitive Benchmark
+
+- Model Deployment Command:
+
+```shell Command
+python -m sglang.launch_server \
+  --model Qwen/Qwen2.5-VL-72B-Instruct \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen2.5-VL-72B-Instruct \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+#### 5.1.2 Throughput-Sensitive Benchmark
+
+- Model Deployment Command:
+
+```shell Command
+python -m sglang.launch_server \
+  --model Qwen/Qwen2.5-VL-72B-Instruct \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+- Result:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  37.99
+Total input tokens:                      24781
+Total input text tokens:                 821
+Total input vision tokens:               23960
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    2365
+Request throughput (req/s):              0.26
+Input token throughput (tok/s):          652.26
+Output token throughput (tok/s):         111.07
+Peak output token throughput (tok/s):    128.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          763.34
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   3797.61
+Median E2E Latency (ms):                 3140.90
+P90 E2E Latency (ms):                    6545.54
+P99 E2E Latency (ms):                    7939.56
+---------------Time to First Token----------------
+Mean TTFT (ms):                          504.45
+Median TTFT (ms):                        510.93
+P99 TTFT (ms):                           521.78
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.82
+Median TPOT (ms):                        7.82
+P99 TPOT (ms):                           7.84
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           10.07
+Median ITL (ms):                         7.90
+P95 ITL (ms):                            15.79
+P99 ITL (ms):                            15.93
+Max ITL (ms):                            23.60
+==================================================
+```
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model Qwen/Qwen2.5-VL-72B-Instruct \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  454.68
+Total input tokens:                      2481865
+Total input text tokens:                 85865
+Total input vision tokens:               2396000
+Total generated tokens:                  510855
+Total generated tokens (retokenized):    296466
+Request throughput (req/s):              2.20
+Input token throughput (tok/s):          5458.50
+Output token throughput (tok/s):         1123.55
+Peak output token throughput (tok/s):    5004.00
+Peak concurrent requests:                106
+Total token throughput (tok/s):          6582.05
+Concurrency:                             98.63
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   44844.92
+Median E2E Latency (ms):                 42866.15
+P90 E2E Latency (ms):                    82798.20
+P99 E2E Latency (ms):                    106306.30
+---------------Time to First Token----------------
+Mean TTFT (ms):                          4507.79
+Median TTFT (ms):                        1180.83
+P99 TTFT (ms):                           39975.22
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          80.26
+Median TPOT (ms):                        82.38
+P99 TPOT (ms):                           152.89
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           100.66
+Median ITL (ms):                         13.26
+P95 ITL (ms):                            428.45
+P99 ITL (ms):                            1393.35
+Max ITL (ms):                            31943.26
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 MMMU Benchmark
+
+You can evaluate the model's accuracy using the MMMU dataset:
+
+- Benchmark Command:
+
+```shell Command
+python3 benchmark/mmmu/bench_sglang.py \
+    --port 30000 \
+    --concurrency 64
+```
+```text Output
+Benchmark time: 97.75084622902796
+answers saved to: ./answer_sglang.json
+Evaluating...
+answers saved to: ./answer_sglang.json
+{'Accounting': {'acc': 0.633, 'num': 30},
+ 'Agriculture': {'acc': 0.5, 'num': 30},
+ 'Architecture_and_Engineering': {'acc': 0.367, 'num': 30},
+ 'Art': {'acc': 0.767, 'num': 30},
+ 'Art_Theory': {'acc': 0.9, 'num': 30},
+ 'Basic_Medical_Science': {'acc': 0.7, 'num': 30},
+ 'Biology': {'acc': 0.467, 'num': 30},
+ 'Chemistry': {'acc': 0.433, 'num': 30},
+ 'Clinical_Medicine': {'acc': 0.733, 'num': 30},
+ 'Computer_Science': {'acc': 0.567, 'num': 30},
+ 'Design': {'acc': 0.833, 'num': 30},
+ 'Diagnostics_and_Laboratory_Medicine': {'acc': 0.467, 'num': 30},
+ 'Economics': {'acc': 0.767, 'num': 30},
+ 'Electronics': {'acc': 0.433, 'num': 30},
+ 'Energy_and_Power': {'acc': 0.467, 'num': 30},
+ 'Finance': {'acc': 0.533, 'num': 30},
+ 'Geography': {'acc': 0.633, 'num': 30},
+ 'History': {'acc': 0.7, 'num': 30},
+ 'Literature': {'acc': 0.867, 'num': 30},
+ 'Manage': {'acc': 0.633, 'num': 30},
+ 'Marketing': {'acc': 0.733, 'num': 30},
+ 'Materials': {'acc': 0.333, 'num': 30},
+ 'Math': {'acc': 0.533, 'num': 30},
+ 'Mechanical_Engineering': {'acc': 0.433, 'num': 30},
+ 'Music': {'acc': 0.367, 'num': 30},
+ 'Overall': {'acc': 0.62, 'num': 900},
+ 'Overall-Art and Design': {'acc': 0.717, 'num': 120},
+ 'Overall-Business': {'acc': 0.66, 'num': 150},
+ 'Overall-Health and Medicine': {'acc': 0.693, 'num': 150},
+ 'Overall-Humanities and Social Science': {'acc': 0.775, 'num': 120},
+ 'Overall-Science': {'acc': 0.553, 'num': 150},
+ 'Overall-Tech and Engineering': {'acc': 0.443, 'num': 210},
+ 'Pharmacy': {'acc': 0.833, 'num': 30},
+ 'Physics': {'acc': 0.7, 'num': 30},
+ 'Psychology': {'acc': 0.767, 'num': 30},
+ 'Public_Health': {'acc': 0.733, 'num': 30},
+ 'Sociology': {'acc': 0.767, 'num': 30}}
+eval out saved to ./val_sglang.json
+Overall accuracy: 0.62
+```
