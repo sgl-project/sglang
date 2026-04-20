@@ -75,49 +75,96 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     return tensor_gpu
 
 
+# old version : CPU based, not working with cuda graph
+# def build_offsets_experts_from_masked_m(
+#     masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128
+# ):
+#     """
+#     Build offsets and experts for sparse m-grouped masked GEMM.
+
+#     Each group gets a fixed allocation of max_m rows in the A matrix.
+#     Only groups with masked_m[g] > 0 are included in the output mapping.
+#     Each active group produces an (start, end) offset pair where:
+#         start = g * max_m
+#         end   = start + ceil(masked_m[g] / block_m) * block_m
+
+#     Args:
+#         masked_m:   (num_groups,) tensor of actual token counts per group
+#         num_groups: number of expert groups
+#         max_m:      allocated row stride per group (e.g. m_max)
+#         block_m:    block-M alignment for padding (default 128)
+
+#     Returns:
+#         offsets:   flat int32 tensor [start_0, end_0, start_1, end_1, ...]
+#         experts:   int32 tensor of active expert IDs + terminator (-1)
+#         list_size: len(experts), i.e. num_active_experts + 1
+#     """
+#     offsets = []
+#     experts = []
+
+#     for g in range(num_groups):
+#         v = masked_m[g].item()
+#         if v > 0:
+#             start = g * max_m
+#             end = start + ((v + block_m - 1) // block_m) * block_m
+#             offsets.append(start)
+#             offsets.append(end)
+#             experts.append(g)
+
+#     experts.append(-1)
+
+#     print(f"~~~~~~~~~~~~ offsets {offsets}")
+#     print(f"~~~~~~~~~~~~ experts {experts}")
+#     print(f"~~~~~~~~~~~~ list_size {len(experts)}")
+
+      
+
+#     return (
+#         torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
+#         torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
+#         len(experts),
+#     )
+
+
 def build_offsets_experts_from_masked_m(
     masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128
 ):
-    """
-    Build offsets and experts for sparse m-grouped masked GEMM.
+    """CUDA-graph-safe builder.
 
-    Each group gets a fixed allocation of max_m rows in the A matrix.
-    Only groups with masked_m[g] > 0 are included in the output mapping.
-    Each active group produces an (start, end) offset pair where:
-        start = g * max_m
-        end   = start + ceil(masked_m[g] / block_m) * block_m
-
-    Args:
-        masked_m:   (num_groups,) tensor of actual token counts per group
-        num_groups: number of expert groups
-        max_m:      allocated row stride per group (e.g. m_max)
-        block_m:    block-M alignment for padding (default 128)
+    Produces a dense per-group layout: each group g occupies slot g, regardless of
+    whether it is active. The kernel launches with grid Y = num_groups and skips
+    blocks whose offset range is empty (m_start == m_end).
 
     Returns:
-        offsets:   flat int32 tensor [start_0, end_0, start_1, end_1, ...]
-        experts:   int32 tensor of active expert IDs + terminator (-1)
-        list_size: len(experts), i.e. num_active_experts + 1
+        offsets:   int32 tensor of shape (num_groups * 2,) with pairs
+                   [start_g, end_g] per group. Inactive groups get end_g == start_g.
+        experts:   int32 tensor of shape (num_groups + 1,); slot g holds the expert
+                   id g if active else -1, with a trailing -1 terminator.
+        list_size: 1-element int32 tensor = num_active + 1 (advisory; kept for ABI).
     """
-    offsets = []
-    experts = []
+    device = masked_m.device
 
-    for g in range(num_groups):
-        v = masked_m[g].item()
-        if v > 0:
-            start = g * max_m
-            end = start + ((v + block_m - 1) // block_m) * block_m
-            offsets.append(start)
-            offsets.append(end)
-            experts.append(g)
+    group_ids = torch.arange(num_groups, device=device, dtype=torch.int32)
+    masked_m_i32 = masked_m.to(torch.int32)
+    mask = masked_m_i32 > 0
 
-    experts.append(-1)
+    starts = group_ids * max_m
+    ends = starts + ((masked_m_i32 + (block_m - 1)) // block_m) * block_m
+    # Inactive groups: collapse range so the kernel block becomes a no-op.
+    ends = torch.where(mask, ends, starts)
 
-    return (
-        torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
-        torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
-        len(experts),
-    )
+    # Dense per-group expert ids: g for active, -1 for inactive.
+    inactive_id = torch.full_like(group_ids, -1)
+    experts_dense = torch.where(mask, group_ids, inactive_id)
 
+    terminator = torch.full((1,), -1, device=device, dtype=torch.int32)
+    experts_fixed = torch.cat([experts_dense, terminator])
+
+    offsets_fixed = torch.stack([starts, ends], dim=1).flatten()
+
+    list_size = (mask.to(torch.int32).sum() + 1).to(torch.int32).view(1)
+
+    return offsets_fixed, experts_fixed, list_size
 
 @dataclass
 class AsymGemmRunnerInput(RunnerInput):
@@ -127,9 +174,9 @@ class AsymGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
-    offsets: Optional[int] = None
-    experts: Optional[int] = None
-    list_size: int = 0
+    offsets: Optional[torch.Tensor] = None
+    experts: Optional[torch.Tensor] = None
+    list_size: Optional[torch.Tensor] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:

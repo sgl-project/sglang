@@ -288,6 +288,7 @@ class _GroupedContBf16WarmupExecutor(_BaseWarmupExecutor):
         # Pre-allocate buffers for offsets/experts conversion
         self.offsets = torch.empty((max_m + 1,), device="cuda", dtype=torch.int32)
         self.experts = torch.empty((max_m + 1,), device="cuda", dtype=torch.int32)
+        self.list_size = torch.empty((1,), device="cuda", dtype=torch.int32)
 
     def _convert_m_indices(self, m: int):
         """Convert m_indices to offsets/experts format matching C++ build_offsets_experts_from_indices."""
@@ -296,6 +297,7 @@ class _GroupedContBf16WarmupExecutor(_BaseWarmupExecutor):
         self.m_indices[:m].fill_(0)
         self.offsets[:2].copy_(torch.tensor([0, m], device="cuda", dtype=torch.int32))
         self.experts[:2].copy_(torch.tensor([0, -1], device="cuda", dtype=torch.int32))
+        self.list_size.fill_(2)
         return 2  # list_size
 
     def execute(self, m):
@@ -306,7 +308,7 @@ class _GroupedContBf16WarmupExecutor(_BaseWarmupExecutor):
             self.out[:m],
             self.offsets[:list_size],
             self.experts[:list_size],
-            list_size,
+            self.list_size,
         )
 
 

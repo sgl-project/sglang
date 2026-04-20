@@ -30,7 +30,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     expected_m: int,
     offsets: torch.Tensor,
     experts: torch.Tensor,
-    list_size: int,
+    list_size: torch.Tensor,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
 ):
@@ -65,7 +65,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
     out: torch.Tensor,
     offsets: torch.Tensor,
     experts: torch.Tensor,
-    list_size: int,
+    list_size: torch.Tensor,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -89,7 +89,7 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
     num_groups: int,
     offsets: torch.Tensor,
     experts: torch.Tensor,
-    list_size: int,
+    list_size: torch.Tensor,
 ):
     num_groups, m_max, k = lhs.shape
     _, n, _ = rhs.shape
@@ -116,7 +116,7 @@ def grouped_gemm_nt_bf16bf16bf16_contig(
     out: torch.Tensor,
     offsets: torch.Tensor,
     experts: torch.Tensor,
-    list_size: int,
+    list_size: torch.Tensor,
 ):
     m, k = lhs.shape
     num_groups, n, _ = rhs.shape
