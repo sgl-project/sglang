@@ -2,35 +2,16 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import os
-import time
-from typing import List
 
 import torch
 
-from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_group,
-)
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_cfg_group,
-    get_tp_group,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
-from sglang.multimodal_gen.runtime.pipelines_core import (
-    ComposedPipelineBase,
-    Req,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
-from sglang.multimodal_gen.runtime.utils.perf_logger import (
-    PerformanceLogger,
-)
 from sglang.srt.utils import cpu_has_amx_support, get_cpu_ids_by_node
 
-from .gpu_worker import OOM_MSG, GPUWorker, _oom_exceptions
+from .gpu_worker import GPUWorker
 
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -49,114 +30,9 @@ class CPUWorker(GPUWorker):
         master_port: int,
         server_args: ServerArgs,
     ):
-        self.local_rank = local_rank
-        self.rank = rank
-        self.master_port = master_port
-        # FIXME: should we use tcp as distribute init method?
-        self.server_args = server_args
-        self.pipeline: ComposedPipelineBase = None
+        super().__init__(local_rank, rank, master_port, server_args)
         if _is_cpu_amx_available:
             self.init_cpu_threads_binding()
-
-        self.init_device_and_model()
-        self.sp_group = get_sp_group()
-        self.sp_cpu_group = self.sp_group.cpu_group
-        self.tp_group = get_tp_group()
-        self.tp_cpu_group = self.tp_group.cpu_group
-
-        self.cfg_group = get_cfg_group()
-        self.cfg_cpu_group = self.cfg_group.cpu_group
-
-    def execute_forward(self, batch: List[Req]) -> OutputBatch:
-        """
-        Execute a forward pass.
-        """
-        assert self.pipeline is not None
-        req = batch[0]
-        output_batch = None
-        try:
-            start_time = time.monotonic()
-
-            req.log(server_args=self.server_args)
-            result = self.pipeline.forward(req, self.server_args)
-
-            if isinstance(result, Req):
-                output_batch = OutputBatch(
-                    output=result.output,
-                    audio=getattr(result, "audio", None),
-                    audio_sample_rate=getattr(result, "audio_sample_rate", None),
-                    metrics=result.metrics,
-                    trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
-                    trajectory_latents=getattr(result, "trajectory_latents", None),
-                    rollout_trajectory_data=getattr(
-                        result, "rollout_trajectory_data", None
-                    ),
-                    noise_pred=getattr(result, "noise_pred", None),
-                    trajectory_decoded=getattr(result, "trajectory_decoded", None),
-                )
-            else:
-                output_batch = result
-
-            duration_ms = (time.monotonic() - start_time) * 1000
-            output_batch.metrics.total_duration_ms = duration_ms
-
-            # Save output to file and return file path only if requested. Avoid the serialization
-            # and deserialization overhead between scheduler_client and cpu_worker.
-            if req.save_output and req.return_file_paths_only:
-                if self.rank == 0 and output_batch.output is not None:
-                    output_paths = save_outputs(
-                        output_batch.output,
-                        req.data_type,
-                        req.fps,
-                        True,
-                        lambda idx: req.output_file_path(len(output_batch.output), idx),
-                        audio=output_batch.audio,
-                        audio_sample_rate=output_batch.audio_sample_rate,
-                        output_compression=req.output_compression,
-                        enable_frame_interpolation=req.enable_frame_interpolation,
-                        frame_interpolation_exp=req.frame_interpolation_exp,
-                        frame_interpolation_scale=req.frame_interpolation_scale,
-                        frame_interpolation_model_path=req.frame_interpolation_model_path,
-                        enable_upscaling=req.enable_upscaling,
-                        upscaling_model_path=req.upscaling_model_path,
-                        upscaling_scale=req.upscaling_scale,
-                    )
-                    output_batch.output_file_paths = output_paths
-
-                # No rank needs to hold on to generated tensors once the file-path
-                # response has been materialized on rank 0
-                output_batch.output = None
-                output_batch.audio = None
-                output_batch.audio_sample_rate = None
-
-            # TODO: extract to avoid duplication
-            if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-                # Avoid logging warmup perf records that share the same request_id.
-                if not req.is_warmup:
-                    PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
-
-            # dump per-request perf report to specified file (server mode)
-            if (
-                req.perf_dump_path is not None
-                and not req.is_warmup
-                and output_batch.metrics is not None
-            ):
-                PerformanceLogger.dump_benchmark_report(
-                    file_path=req.perf_dump_path,
-                    metrics=output_batch.metrics,
-                    meta={"model": self.server_args.model_path},
-                    tag="server_perf_dump",
-                )
-        except Exception as e:
-            logger.error(
-                f"Error executing request {req.request_id}: {e}", exc_info=True
-            )
-            if isinstance(e, _oom_exceptions()):
-                logger.warning(OOM_MSG)
-            if output_batch is None:
-                output_batch = OutputBatch()
-            output_batch.error = f"Error executing request {req.request_id}: {e}"
-        return output_batch
 
     def init_cpu_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
