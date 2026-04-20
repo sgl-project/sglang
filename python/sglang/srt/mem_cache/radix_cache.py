@@ -1023,7 +1023,7 @@ class RadixCache(BasePrefixCache):
                         nd["value"], dtype=torch.int64, device=self.device
                     )
                 else:
-                    node.value = []
+                    node.value = None
                 node.hash_value = nd["hash_value"]
                 node.host_value = None
                 rebuilt[nd["idx"]] = node
@@ -1086,7 +1086,9 @@ class RadixCache(BasePrefixCache):
                         sorted(used_slots_set), dtype=torch.int64, device=self.device
                     )
                     allocator = self.token_to_kv_pool_allocator
-                    # Rebuild free_pages by excluding used slots
+                    # Rebuild free_pages by excluding used slots.
+                    # KVCache allocators use 1-based indexing: [1, 2, ..., size].
+                    # Slot 0 is a dummy padding slot used for padded tokens.
                     all_slots = torch.arange(
                         1,
                         allocator.size + 1,
