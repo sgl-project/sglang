@@ -67,7 +67,7 @@ dependencies = [
   "torch==2.11.0",
   "torchao==0.17.0",
   "torchaudio==2.11.0",
-  "torchcodec==0.10 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.10 for torch 2.11.x. Not available on Linux ARM.
+  "torchcodec==0.11.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.11.1 for torch 2.11.x (0.10 is ABI-incompatible: references the pre-2.11 c10::MessageLogger ctor signature). Not available on Linux ARM.
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "torchvision",
   "tqdm",
