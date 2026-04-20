@@ -275,7 +275,13 @@ jobs:
 
   nightly-gb200-benchmark:
     needs: [setup, prepare-image]
-    if: github.repository == 'sgl-project/sglang'
+    # Use always() + explicit success checks so a skipped transitive upstream
+    # (e.g. build-image when neither pr_number nor sglang_branch is set) does
+    # not propagate a skip to this job. Direct deps must still have succeeded.
+    if: |
+      always() && github.repository == 'sgl-project/sglang'
+      && needs.setup.result == 'success'
+      && needs.prepare-image.result == 'success'
     runs-on: 72-gpu-gb200
     strategy:
       fail-fast: false
