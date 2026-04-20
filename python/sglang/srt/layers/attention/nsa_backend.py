@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
@@ -7,6 +8,8 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
+
+logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
@@ -2101,7 +2104,24 @@ class NativeSparseAttnBackend(
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        out = torch.empty(
+            (batch_size, num_heads, self.kv_lora_rank),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        out_kernel = out
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            # In piecewise cudagraph, input tensors (q, block_tables) are padded to static_num_tokens
+            # but seq_lens only covers the real token count. Slice to real tokens before the
+            # FMHA kernel to avoid invalid (-1) block index accesses on padding rows.
+            # out is kept at full batch_size for the caller; out_kernel is the slice the kernel writes into.
+            real_batch_size = seq_lens.shape[0]
+            if real_batch_size < batch_size:
+                q = q[:real_batch_size]
+                block_tables = block_tables[:real_batch_size]
+                out_kernel = out[:real_batch_size]
+
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv,
             workspace_buffer=self.workspace_buffer,
@@ -2112,12 +2132,13 @@ class NativeSparseAttnBackend(
             seq_lens=seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.nsa_index_topk,
+            out=out_kernel,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
         )
-        # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
-        return out.squeeze(1)
+
+        return out
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
