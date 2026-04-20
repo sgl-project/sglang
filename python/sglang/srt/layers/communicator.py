@@ -160,9 +160,6 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_flashinfer_allreduce_fusion
         and not is_flashinfer_allreduce_unavailable()
-        # FlashInfer's TRT-LLM allreduce backend creates its own NCCL communicator
-        # which doesn't support PyTorch sub-process groups used by context parallelism
-        and get_global_server_args().attn_cp_size <= 1
     )
 
 
@@ -518,7 +515,7 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=True
+                            hidden_states, residual, use_attn_tp_group=False
                         )
                     )
                 else:
