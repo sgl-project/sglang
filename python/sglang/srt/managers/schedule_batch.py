@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -989,11 +990,9 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            radix_key = tree_cache.make_radix_key(token_ids, self.extra_key)
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
-                    key=radix_key,
-                    unaligned_len=len(token_ids),
+                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                     req=self,
                     cow_mamba=cow_mamba,
                 )

@@ -237,6 +237,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return result
 
         key = params.key
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=torch.empty(
@@ -247,7 +248,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
             )
-        key.assert_valid_for(self.page_size)
+        key = key.page_aligned(self.page_size)
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)
@@ -258,8 +259,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         key = params.key
         value = params.value
-        key.assert_valid_for(self.page_size, value)
-        if value is None:
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+        else:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         result = self._insert_helper(self.root_node, key, value, params)
@@ -350,7 +354,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
-            radix_key = self.make_radix_key(token_ids, req.extra_key)
+            radix_key = RadixKey(
+                token_ids, req.extra_key, is_bigram=self.is_eagle
+            ).page_aligned(self.page_size)
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
@@ -414,7 +420,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
-        radix_key = self.make_radix_key(token_ids[:effective_cache_len], req.extra_key)
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 

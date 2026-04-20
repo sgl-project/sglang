@@ -27,7 +27,7 @@ import sys
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -128,18 +128,18 @@ class RadixKey:
         aligned_len = len(self) // page_size * page_size
         return self[:aligned_len]
 
-    def assert_valid_for(
-        self, page_size: int, value: Optional[torch.Tensor] = None
-    ) -> None:
-        """Assert this key is page-aligned and, if provided, value length matches key length."""
-        assert len(self) % page_size == 0, (
-            f"key not page-aligned; use make_radix_key(). "
-            f"Got {len(self)=}, {page_size=}"
-        )
-        if value is not None:
-            assert len(value) == len(
-                self
-            ), f"value not aligned to key; got {len(value)=} vs {len(self)=}"
+    def maybe_to_bigram_view(
+        self,
+        is_eagle: bool,
+        value: Optional[torch.Tensor] = None,
+    ) -> Tuple["RadixKey", Optional[torch.Tensor]]:
+        # O(1): flip the bigram flag instead of materializing a tuple list.
+        # value is paired with raw tokens and gets truncated to the bigram count.
+        if is_eagle and not self.is_bigram:
+            self.is_bigram = True
+            if value is not None:
+                value = value[: len(self)]
+        return self, value
 
 
 class TreeNode:
@@ -476,6 +476,7 @@ class RadixCache(BasePrefixCache):
                 subsequent match efficiency and does not duplicate data.
         """
         key = params.key
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
 
         def empty_match_result():
             return MatchResult(
@@ -491,7 +492,7 @@ class RadixCache(BasePrefixCache):
         if self.disable or len(key) == 0:
             return empty_match_result()
 
-        key.assert_valid_for(self.page_size)
+        key = key.page_aligned(self.page_size)
 
         if len(key) == 0:
             return empty_match_result()
@@ -516,8 +517,11 @@ class RadixCache(BasePrefixCache):
         priority = params.priority
         chunked = params.chunked
 
-        key.assert_valid_for(self.page_size, value)
-        if value is None:
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+        else:
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
@@ -543,7 +547,9 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        radix_key = self.make_radix_key(token_ids, req.extra_key)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
@@ -579,7 +585,9 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        radix_key = self.make_radix_key(token_ids, req.extra_key)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool

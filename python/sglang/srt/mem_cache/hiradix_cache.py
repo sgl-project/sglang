@@ -1207,6 +1207,7 @@ class HiRadixCache(RadixCache):
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -1215,7 +1216,7 @@ class HiRadixCache(RadixCache):
                 host_hit_length=0,
             )
 
-        key.assert_valid_for(self.page_size)
+        key = key.page_aligned(self.page_size)
         page_aligned_len = len(key)
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
@@ -1392,7 +1393,10 @@ class HiRadixCache(RadixCache):
         if priority is None:
             priority = 0
 
-        key.assert_valid_for(self.page_size, value)
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
 
         if len(key) == 0:
             return InsertResult(prefix_len=0)
