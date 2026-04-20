@@ -865,6 +865,7 @@ class Scheduler(
                         ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
                     )
                 params.tree_components = tuple(tree_components)
+                params.enable_streaming_session = server_args.enable_streaming_session
                 self.tree_cache = UnifiedRadixCache(params)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -889,7 +890,10 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
-        if server_args.enable_streaming_session:
+        if (
+            server_args.enable_streaming_session
+            and not self.tree_cache.supports_streaming_session()
+        ):
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
         if self.enable_hisparse:
