@@ -42,7 +42,7 @@ def build_kv_host_pool(
     *,
     kv_pool: Any,
     page_size: int,
-    server_args: "ServerArgs",
+    server_args: ServerArgs,
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
 ):
@@ -87,8 +87,8 @@ def build_pool_entry(
 
 def build_kv_only_stack(
     *,
-    params: "CacheInitParams",
-    server_args: "ServerArgs",
+    params: CacheInitParams,
+    server_args: ServerArgs,
     kv_pool: Any,
     full_layer_mapping: dict[int, int],
     page_size: int,
@@ -149,8 +149,8 @@ def build_kv_only_stack(
 
 def build_hybrid_mamba_stack(
     *,
-    params: "CacheInitParams",
-    server_args: "ServerArgs",
+    params: CacheInitParams,
+    server_args: ServerArgs,
     kv_pool: Any,
     mamba_pool: Any,
     full_layer_mapping: dict[int, int],
@@ -229,8 +229,8 @@ def build_hybrid_mamba_stack(
 
 def build_shared_anchor_stack(
     *,
-    params: "CacheInitParams",
-    server_args: "ServerArgs",
+    params: CacheInitParams,
+    server_args: ServerArgs,
     kv_pool: Any,
     shared_pool_name: PoolName,
     full_layer_mapping: dict[int, int],
@@ -301,9 +301,9 @@ def build_shared_anchor_stack(
 
 
 def attach_hybrid_pool_to_unified_cache(
-    cache: "UnifiedRadixCache",
-    params: "CacheInitParams",
-    server_args: "ServerArgs",
+    cache: UnifiedRadixCache,
+    params: CacheInitParams,
+    server_args: ServerArgs,
     *,
     load_cache_event,
 ) -> None:
@@ -403,9 +403,9 @@ def attach_hybrid_pool_to_unified_cache(
 
 
 def attach_hybrid_nsa_pool_to_hiradix_cache(
-    radix_cache: "HiRadixCache",
-    params: "CacheInitParams",
-    server_args: "ServerArgs",
+    radix_cache: HiRadixCache,
+    params: CacheInitParams,
+    server_args: ServerArgs,
     *,
     extra_config: dict,
     prefetch_threshold: int,
@@ -459,9 +459,9 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
 
 
 def attach_hybrid_pool_to_mamba_cache(
-    mamba_cache: "HiMambaRadixCache",
-    params: "CacheInitParams",
-    server_args: "ServerArgs",
+    mamba_cache: HiMambaRadixCache,
+    params: CacheInitParams,
+    server_args: ServerArgs,
     *,
     extra_config: dict,
     prefetch_threshold: int,
