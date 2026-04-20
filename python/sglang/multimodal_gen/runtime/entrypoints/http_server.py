@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.utils.auth import add_api_key_middleware, auth_level, AuthLevel
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
@@ -312,6 +313,14 @@ def create_app(server_args: ServerArgs):
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
+
+    # Add API key authentication middleware
+    if server_args.api_key or server_args.admin_api_key:
+        add_api_key_middleware(
+            app,
+            api_key=server_args.api_key,
+            admin_api_key=server_args.admin_api_key,
+        )
 
     app.state.server_args = server_args
     return app
