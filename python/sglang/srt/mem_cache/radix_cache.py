@@ -97,7 +97,7 @@ class RadixKey:
             for i in range(len(t) - 1):
                 yield (t[i], t[i + 1])
         else:
-            return iter(self.token_ids)
+            yield from self.token_ids
 
     def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
         # Normalize int -> 1-element slice so the rest handles one shape.
