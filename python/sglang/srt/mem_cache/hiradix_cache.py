@@ -1392,6 +1392,9 @@ class HiRadixCache(RadixCache):
         if priority is None:
             priority = 0
 
+        if value is not None:
+            value = value[: len(key)]
+
         if len(key) == 0:
             return InsertResult(prefix_len=0)
 

@@ -508,6 +508,8 @@ class RadixCache(BasePrefixCache):
         if value is None:
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
+        else:
+            value = value[: len(key)]
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)

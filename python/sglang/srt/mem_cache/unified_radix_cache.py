@@ -260,6 +260,8 @@ class UnifiedRadixCache(BasePrefixCache):
         value = params.value
         if value is None:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
+        else:
+            value = value[: len(key)]
 
         result = self._insert_helper(self.root_node, key, value, params)
         return result
