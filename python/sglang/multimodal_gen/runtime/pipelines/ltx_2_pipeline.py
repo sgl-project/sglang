@@ -690,7 +690,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         upsampler_path = server_args.component_paths.get("spatial_upsampler")
         if not upsampler_path:
             raise ValueError(
-                "LTX2TwoStagePipeline requires --spatial-upsampler-path "
+                f"{self.pipeline_name} requires --spatial-upsampler-path "
                 "(component_paths['spatial_upsampler'])."
             )
         module, memory_usage = PipelineComponentLoader.load_component(
@@ -705,7 +705,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         distilled_lora_path = server_args.component_paths.get("distilled_lora")
         if not distilled_lora_path:
             raise ValueError(
-                "LTX2TwoStagePipeline requires --distilled-lora-path "
+                f"{self.pipeline_name} requires --distilled-lora-path "
                 "(component_paths['distilled_lora'])."
             )
         self._distilled_lora_path = distilled_lora_path
@@ -741,6 +741,10 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         """Release inactive premerged DiTs according to the selected device mode."""
         self._device_manager.release_premerged_transformers()
 
+    def release_ltx2_phase_state(self, phase: str | None) -> None:
+        if phase == "stage2":
+            self.release_premerged_transformers_to_cpu_snapshots()
+
     def ensure_ltx2_phase_ready(self, phase: str | None) -> None:
         self._device_manager.ensure_phase_ready(phase)
 
@@ -753,32 +757,28 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             "resident",
         )
 
-    def switch_lora_phase(self, phase: str) -> None:
-        if phase == self._active_lora_phase:
-            return
+    def _can_short_circuit_lora_switch(self, phase: str) -> bool:
+        return (
+            phase in ("stage1", "stage2")
+            and self._use_premerged_stage2_transformer
+            and self._stage1_lora_path is None
+        )
 
-        if self._device_manager.switch_phase(phase):
-            self._active_lora_phase = phase
-            return
+    def _build_lora_switch_spec(
+        self, phase: str
+    ) -> tuple[list[str], list[str], list[float], list[str]]:
+        lora_nicknames: list[str] = []
+        lora_paths: list[str] = []
+        lora_strengths: list[float] = []
+        lora_targets: list[str] = []
 
         if phase == "stage1":
             if self._stage1_lora_path:
-                self.set_lora(
-                    lora_nickname="ltx2_stage1_base",
-                    lora_path=self._stage1_lora_path,
-                    target="transformer",
-                    strength=self._stage1_lora_scale,
-                )
-            else:
-                # Stage 1 must run on the base transformer weights. If stage 2 left the
-                # distilled adapter active, stage 1 quality drifts away from the official
-                # two-stage pipeline immediately.
-                self.deactivate_lora_weights(target="transformer")
+                lora_nicknames.append("ltx2_stage1_base")
+                lora_paths.append(self._stage1_lora_path)
+                lora_strengths.append(self._stage1_lora_scale)
+                lora_targets.append("transformer")
         elif phase == "stage2":
-            lora_nicknames = []
-            lora_paths = []
-            lora_strengths = []
-            lora_targets = []
             if self._stage1_lora_path:
                 lora_nicknames.append("ltx2_stage1_base")
                 lora_paths.append(self._stage1_lora_path)
@@ -788,20 +788,46 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             lora_paths.append(self._distilled_lora_path)
             lora_strengths.append(1.0)
             lora_targets.append("transformer")
-            self.set_lora(
+        else:
+            raise ValueError(f"Unknown LTX2 two-stage LoRA phase: {phase}")
+
+        return lora_nicknames, lora_paths, lora_strengths, lora_targets
+
+    def switch_lora_phase(self, phase: str) -> None:
+        if phase == self._active_lora_phase:
+            return
+
+        if self._device_manager.switch_phase(
+            phase
+        ) and self._can_short_circuit_lora_switch(phase):
+            self._active_lora_phase = phase
+            return
+
+        lora_nicknames, lora_paths, lora_strengths, lora_targets = (
+            self._build_lora_switch_spec(phase)
+        )
+        if lora_nicknames:
+            set_lora_kwargs = dict(
                 lora_nickname=lora_nicknames,
                 lora_path=lora_paths,
                 target=lora_targets,
                 strength=lora_strengths,
+            )
+            if phase == "stage2":
                 # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
                 # into the transformer weights. Legacy LTX-2 should keep the
                 # preexisting unmerged behavior to avoid regressing stage 2 quality.
-                merge_weights=self._should_merge_stage2_distilled_lora(
-                    self.server_args
-                ),
+                set_lora_kwargs["merge_weights"] = (
+                    self._should_merge_stage2_distilled_lora(self.server_args)
+                )
+            self.set_lora(
+                **set_lora_kwargs,
             )
         else:
-            raise ValueError(f"Unknown LTX2 two-stage LoRA phase: {phase}")
+            # Stage 1 must run on the base transformer weights. If stage 2 left the
+            # distilled adapter active, stage 1 quality drifts away from the official
+            # two-stage pipeline immediately.
+            self.deactivate_lora_weights(target="transformer")
 
         self._active_lora_phase = phase
 

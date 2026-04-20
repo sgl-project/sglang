@@ -620,8 +620,24 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             use_nvfp4 = True
-        else:
+        elif not get_moe_runner_backend().is_flashinfer_cutedsl():
+            # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
+            # off; its kernel quantizes to NVFP4 internally.
             use_fp8 = True
+
+        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
+        # to return int32-packed UE8M0 scales that don't feed the flashinfer
+        # cutedsl kernel.
+        fp8_deepgemm_scale_opts = (
+            dict(
+                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+            )
+            if use_fp8
+            else dict()
+        )
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
@@ -640,10 +656,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                **fp8_deepgemm_scale_opts,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
