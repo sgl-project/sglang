@@ -26,7 +26,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
-import torch
+import msgspec
+import msgspec.msgpack
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -35,7 +36,7 @@ from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     DPControllerReqTimeStats,
-    SchedulerReqTimeStats,
+    SchedulerReqTimeStatsIPC,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
@@ -1031,20 +1032,28 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
         return iter(self.batch)
 
 
-@dataclass
-class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
-    # The finish reason
-    finished_reasons: List[BaseFinishReason]
+class BatchTokenIDOutput(msgspec.Struct, tag=True):
+    # BaseBatchReq fields (inlined)
+    rids: Optional[List[str]] = None
+    http_worker_ipcs: Optional[List[Optional[str]]] = None
+
+    # Speculative decoding metrics (inlined from SpeculativeDecodingMetricsMixin)
+    spec_verify_ct: Optional[List[int]] = None
+    spec_accepted_tokens: Optional[List[int]] = None
+    spec_acceptance_histogram: Optional[List[List[int]]] = None
+
+    # The finish reason (already dict at runtime via .to_json())
+    finished_reasons: Optional[List[Optional[dict]]] = None
     # For incremental decoding
-    decoded_texts: List[str]
-    decode_ids: List[int]
-    read_offsets: List[int]
+    decoded_texts: Optional[List[str]] = None
+    decode_ids: Optional[List[List[int]]] = None
+    read_offsets: Optional[List[int]] = None
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[int]]
+    output_ids: Optional[List[List[int]]] = None
     # Detokenization configs
-    skip_special_tokens: List[bool]
-    spaces_between_special_tokens: List[bool]
-    no_stop_trim: List[bool]
+    skip_special_tokens: Optional[List[bool]] = None
+    spaces_between_special_tokens: Optional[List[bool]] = None
+    no_stop_trim: Optional[List[bool]] = None
 
     # Token counts
     prompt_tokens: List[int]
@@ -1052,39 +1061,36 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     completion_tokens: List[int]
     cached_tokens: List[int]
 
-    # Logprobs
-    input_token_logprobs_val: List[float]
-    input_token_logprobs_idx: List[int]
-    output_token_logprobs_val: List[float]
-    output_token_logprobs_idx: List[int]
-    input_top_logprobs_val: List[List]
-    input_top_logprobs_idx: List[List]
-    output_top_logprobs_val: List[List]
-    output_top_logprobs_idx: List[List]
-    input_token_ids_logprobs_val: List[List]
-    input_token_ids_logprobs_idx: List[List]
-    output_token_ids_logprobs_val: List[List]
-    output_token_ids_logprobs_idx: List[List]
-    output_token_entropy_val: List[float]
+    # Logprobs (each is a list-per-request, elements can be None)
+    input_token_logprobs_val: Optional[list] = None
+    input_token_logprobs_idx: Optional[list] = None
+    output_token_logprobs_val: Optional[list] = None
+    output_token_logprobs_idx: Optional[list] = None
+    input_top_logprobs_val: Optional[list] = None
+    input_top_logprobs_idx: Optional[list] = None
+    output_top_logprobs_val: Optional[list] = None
+    output_top_logprobs_idx: Optional[list] = None
+    input_token_ids_logprobs_val: Optional[list] = None
+    input_token_ids_logprobs_idx: Optional[list] = None
+    output_token_ids_logprobs_val: Optional[list] = None
+    output_token_ids_logprobs_idx: Optional[list] = None
+    output_token_entropy_val: Optional[list] = None
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: Optional[list] = None
 
-    # The routed experts for each token, including both input and output tokens
-    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
-    routed_experts: List[Optional[torch.Tensor]]
+    # Pre-serialized routed_experts (pickle bytes of List[Optional[torch.Tensor]])
+    routed_experts: Optional[bytes] = None
 
     # The information of placeholder tokens (e.g., image token)
-    # idx is the index of the token in the prompt after expansion.
-    # val is the length of padded tokens after expansion.
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
+    placeholder_tokens_idx: Optional[List[Optional[List[int]]]] = None
+    placeholder_tokens_val: Optional[List[Optional[List[int]]]] = None
 
     # Number of times each request was retracted.
-    retraction_counts: List[int]
+    retraction_counts: Optional[List[int]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]] = None
+    token_steps: Optional[List[List[int]]] = None
 
     # Load for DP balance
     load: GetLoadsReqOutput = None
@@ -1093,20 +1099,28 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
-    dp_ranks: Optional[List[int]] = None
+    dp_ranks: Optional[List[Optional[int]]] = None
 
     # For observability
-    time_stats: Optional[List[SchedulerReqTimeStats]] = None
+    time_stats: Optional[List[SchedulerReqTimeStatsIPC]] = None
 
 
-@dataclass
-class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+class BatchStrOutput(msgspec.Struct, tag=True):
+    # BaseBatchReq fields (inlined)
+    rids: Optional[List[str]] = None
+    http_worker_ipcs: Optional[List[Optional[str]]] = None
+
+    # Speculative decoding metrics (inlined)
+    spec_verify_ct: Optional[List[int]] = None
+    spec_accepted_tokens: Optional[List[int]] = None
+    spec_acceptance_histogram: Optional[List[List[int]]] = None
+
     # The finish reason
-    finished_reasons: List[dict]
+    finished_reasons: Optional[List[Optional[dict]]] = None
     # The output decoded strings
-    output_strs: List[str]
+    output_strs: Optional[List[str]] = None
     # The token ids
-    output_ids: Optional[List[int]]
+    output_ids: Optional[List[List[int]]] = None
 
     # Token counts
     prompt_tokens: List[int]
@@ -1114,74 +1128,74 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     reasoning_tokens: List[int]
     cached_tokens: List[int]
 
-    # Logprobs
-    input_token_logprobs_val: List[float]
-    input_token_logprobs_idx: List[int]
-    output_token_logprobs_val: List[float]
-    output_token_logprobs_idx: List[int]
-    input_top_logprobs_val: List[List]
-    input_top_logprobs_idx: List[List]
-    output_top_logprobs_val: List[List]
-    output_top_logprobs_idx: List[List]
-    input_token_ids_logprobs_val: List[List]
-    input_token_ids_logprobs_idx: List[List]
-    output_token_ids_logprobs_val: List[List]
-    output_token_ids_logprobs_idx: List[List]
-    output_token_entropy_val: List[float]
+    # Logprobs (each is a list-per-request, elements can be None)
+    input_token_logprobs_val: Optional[list] = None
+    input_token_logprobs_idx: Optional[list] = None
+    output_token_logprobs_val: Optional[list] = None
+    output_token_logprobs_idx: Optional[list] = None
+    input_top_logprobs_val: Optional[list] = None
+    input_top_logprobs_idx: Optional[list] = None
+    output_top_logprobs_val: Optional[list] = None
+    output_top_logprobs_idx: Optional[list] = None
+    input_token_ids_logprobs_val: Optional[list] = None
+    input_token_ids_logprobs_idx: Optional[list] = None
+    output_token_ids_logprobs_val: Optional[list] = None
+    output_token_ids_logprobs_idx: Optional[list] = None
+    output_token_entropy_val: Optional[list] = None
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: Optional[list] = None
 
-    # The routed experts for each token, including both input and output tokens
-    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
-    routed_experts: List[Optional[torch.Tensor]]
+    # Pre-serialized routed_experts (pickle bytes of List[Optional[torch.Tensor]])
+    routed_experts: Optional[bytes] = None
 
     # The information of placeholder tokens (e.g., image token)
-    # idx is the index of the token in the prompt after expansion.
-    # val is the length of padded tokens after expansion.
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
+    placeholder_tokens_idx: Optional[List[Optional[List[int]]]] = None
+    placeholder_tokens_val: Optional[List[Optional[List[int]]]] = None
 
     # Number of times each request was retracted.
-    retraction_counts: List[int]
+    retraction_counts: Optional[List[int]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]] = None
+    token_steps: Optional[List[List[int]]] = None
 
     # Load for DP balance
     load: GetLoadsReqOutput = None
 
-    # Customized info
-    customized_info: Optional[Dict[str, List[Any]]] = None
+    # Customized info (pre-serialized as pickle bytes)
+    customized_info: Optional[bytes] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
-    dp_ranks: Optional[List[int]] = None
+    dp_ranks: Optional[List[Optional[int]]] = None
 
     # For observability
-    time_stats: Optional[List[SchedulerReqTimeStats]] = None
+    time_stats: Optional[List[SchedulerReqTimeStatsIPC]] = None
 
 
-@dataclass
-class BatchEmbeddingOutput(BaseBatchReq):
-    # The finish reason
-    finished_reasons: List[BaseFinishReason]
-    # The output embedding
-    embeddings: Union[List[List[float]], List[Dict[int, float]]]
+class BatchEmbeddingOutput(msgspec.Struct, tag=True):
+    # BaseBatchReq fields (inlined)
+    rids: Optional[List[str]] = None
+    http_worker_ipcs: Optional[List[Optional[str]]] = None
+
+    # The finish reason (already dict at runtime via .to_json())
+    finished_reasons: Optional[List[Optional[dict]]] = None
+    # The output embedding (List[List[float]] or List[Dict[int, float]])
+    embeddings: Optional[list] = None
     # Token counts
-    prompt_tokens: List[int]
-    cached_tokens: List[int]
+    prompt_tokens: Optional[List[int]] = None
+    cached_tokens: Optional[List[int]] = None
     # Placeholder token info
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
+    placeholder_tokens_idx: Optional[List[Optional[List[int]]]] = None
+    placeholder_tokens_val: Optional[List[Optional[List[int]]]] = None
 
     # Number of times each request was retracted.
-    retraction_counts: List[int]
+    retraction_counts: Optional[List[int]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
     # For observability
-    time_stats: Optional[List[SchedulerReqTimeStats]] = None
+    time_stats: Optional[List[SchedulerReqTimeStatsIPC]] = None
 
     # Optional pooled hidden states (pre-head transformer output).
     # Sent as a single stacked tensor to minimize pickle overhead.
@@ -1682,8 +1696,7 @@ class ProfileReqOutput(BaseReq):
     message: str
 
 
-@dataclass
-class FreezeGCReq(BaseReq):
+class FreezeGCReq(msgspec.Struct, tag=True):
     pass
 
 
@@ -2046,6 +2059,181 @@ class DumperControlReqOutput(BaseReq):
     error: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Msgpack IPC helpers for detokenizer channels
+# ---------------------------------------------------------------------------
+
+# Type unions for each IPC channel direction
+SchedulerToDetokenizerMsg = Union[BatchTokenIDOutput, BatchEmbeddingOutput, FreezeGCReq]
+DetokenizerToTokenizerMsg = Union[
+    BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput
+]
+
+_msgpack_encoder = msgspec.msgpack.Encoder()
+_s2d_decoder = msgspec.msgpack.Decoder(SchedulerToDetokenizerMsg)
+_d2t_decoder = msgspec.msgpack.Decoder(DetokenizerToTokenizerMsg)
+
+
+def send_msgpack(socket, obj):
+    """Send a msgspec.Struct via zmq using msgpack serialization."""
+    socket.send(_msgpack_encoder.encode(obj))
+
+
+def recv_msgpack_s2d(socket):
+    """Receive scheduler→detokenizer message via msgpack."""
+    return _s2d_decoder.decode(socket.recv())
+
+
+async def async_recv_msgpack_d2t(socket):
+    """Receive detokenizer→tokenizer message via async zmq msgpack.
+
+    All senders now use msgpack (both detokenizer and scheduler via
+    SenderWrapper with use_msgpack=True). Pickle fallback retained for
+    backward compat with older scheduler versions.
+    """
+    data = await socket.recv()
+    try:
+        return _d2t_decoder.decode(data)
+    except (msgspec.DecodeError, msgspec.ValidationError):
+        pass
+
+    # Try as a tagged dict (dataclass control replies encoded by SenderWrapper)
+    try:
+        raw = msgspec.msgpack.decode(data)
+        if isinstance(raw, dict):
+            msg_type = raw.get("type", "")
+            if msg_type == "AbortReq":
+                req = AbortReq()
+                req.rid = raw.get("rid")
+                req.abort_all = raw.get("abort_all", False)
+                req.finished_reason = raw.get("finished_reason")
+                req.abort_message = raw.get("abort_message")
+                req.http_worker_ipc = raw.get("http_worker_ipc")
+                return req
+            return raw
+    except (msgspec.DecodeError, msgspec.ValidationError):
+        pass
+
+    # Legacy pickle fallback
+    import pickle as _pickle
+    return _pickle.loads(data)
+
+
+def recv_msgpack_d2t(socket):
+    """Receive detokenizer→tokenizer message via zmq msgpack (sync)."""
+    data = socket.recv()
+    try:
+        return _d2t_decoder.decode(data)
+    except (msgspec.DecodeError, msgspec.ValidationError):
+        pass
+
+    # Try as a tagged dict (dataclass control replies encoded by SenderWrapper)
+    try:
+        raw = msgspec.msgpack.decode(data)
+        if isinstance(raw, dict):
+            msg_type = raw.get("type", "")
+            if msg_type == "AbortReq":
+                req = AbortReq()
+                req.rid = raw.get("rid")
+                req.abort_all = raw.get("abort_all", False)
+                req.finished_reason = raw.get("finished_reason")
+                req.abort_message = raw.get("abort_message")
+                req.http_worker_ipc = raw.get("http_worker_ipc")
+                return req
+            return raw
+    except (msgspec.DecodeError, msgspec.ValidationError):
+        pass
+
+    # Legacy pickle fallback
+    import pickle as _pickle
+    return _pickle.loads(data)
+
+
+# ---------------------------------------------------------------------------
+# Msgpack IPC helpers for tokenizer->scheduler channel (Rust frontend support)
+# ---------------------------------------------------------------------------
+
+
+def _sampling_params_from_dict(d):
+    """Reconstruct a SamplingParams from a msgpack-decoded dict."""
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    stop_strs = d.get("stop_strs")
+    if stop_strs is None:
+        stop_strs = []
+    return SamplingParams(
+        max_new_tokens=d.get("max_new_tokens", 128),
+        stop=stop_strs,
+        stop_token_ids=d.get("stop_token_ids"),
+        temperature=d.get("temperature", 1.0),
+        top_p=d.get("top_p", 1.0),
+        top_k=d.get("top_k", -1),
+        min_p=d.get("min_p", 0.0),
+        frequency_penalty=d.get("frequency_penalty", 0.0),
+        presence_penalty=d.get("presence_penalty", 0.0),
+        repetition_penalty=d.get("repetition_penalty", 1.0),
+        min_new_tokens=d.get("min_new_tokens", 0),
+        n=d.get("n", 1),
+        json_schema=d.get("json_schema"),
+        regex=d.get("regex"),
+        ebnf=d.get("ebnf"),
+        structural_tag=d.get("structural_tag"),
+        ignore_eos=d.get("ignore_eos", False),
+        skip_special_tokens=d.get("skip_special_tokens", True),
+        spaces_between_special_tokens=d.get("spaces_between_special_tokens", True),
+        no_stop_trim=d.get("no_stop_trim", False),
+        custom_params=d.get("custom_params"),
+        stream_interval=d.get("stream_interval"),
+        logit_bias=d.get("logit_bias"),
+        sampling_seed=d.get("sampling_seed"),
+    )
+
+
+def _tokenized_req_from_dict(d):
+    """Reconstruct a TokenizedGenerateReqInput from a msgpack-decoded dict."""
+    sp_raw = d.get("sampling_params", {})
+    if isinstance(sp_raw, dict):
+        sp = _sampling_params_from_dict(sp_raw)
+    else:
+        sp = sp_raw  # already a SamplingParams (shouldn't happen from Rust)
+
+    # Normalize sampling params (normally done by TokenizerManager, but Rust frontend skips it).
+    # The Rust frontend pre-computes stop_str_max_len in token units using its tokenizer,
+    # so we use that value when available instead of falling back to character length.
+    pre_computed_max_len = sp_raw.get("stop_str_max_len") if isinstance(sp_raw, dict) else None
+    sp.normalize(None)
+    if pre_computed_max_len is not None:
+        sp.stop_str_max_len = pre_computed_max_len
+
+    req = TokenizedGenerateReqInput(
+        input_text=d.get("input_text", ""),
+        input_ids=d.get("input_ids", []),
+        mm_inputs=d.get("mm_inputs"),
+        sampling_params=sp,
+        return_logprob=d.get("return_logprob", False),
+        logprob_start_len=d.get("logprob_start_len", -1),
+        top_logprobs_num=d.get("top_logprobs_num", 0),
+        token_ids_logprob=d.get("token_ids_logprob", []),
+        stream=d.get("stream", False),
+    )
+    req.rid = d.get("rid")
+    req.http_worker_ipc = d.get("http_worker_ipc")
+
+    # Optional fields
+    for field in [
+        "return_hidden_states", "return_routed_experts", "routed_experts_start_len",
+        "input_embeds", "session_params", "lora_id", "custom_logit_processor",
+        "bootstrap_host", "bootstrap_port", "bootstrap_room", "bootstrap_pair_key",
+        "decode_tp_size", "require_reasoning", "routed_dp_rank",
+        "disagg_prefill_dp_rank", "priority", "extra_key", "routing_key",
+        "no_logs", "return_bytes", "return_entropy", "time_stats",
+    ]:
+        if field in d:
+            setattr(req, field, d[field])
+
+    return req
+
+
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect
@@ -2058,12 +2246,18 @@ def _check_all_req_types():
         is_io_struct = (
             name.endswith("Req") or name.endswith("Input") or name.endswith("Output")
         )
-        is_base_req = issubclass(class_type[1], BaseReq) or issubclass(
-            class_type[1], BaseBatchReq
+        is_base_req = (
+            issubclass(class_type[1], BaseReq)
+            or issubclass(class_type[1], BaseBatchReq)
+            or issubclass(class_type[1], msgspec.Struct)
         )
         if is_io_struct and not is_base_req:
             raise ValueError(f"{name} is not a subclass of BaseReq or BaseBatchReq.")
-        if is_base_req and not is_io_struct:
+        if (
+            is_base_req
+            and not is_io_struct
+            and not issubclass(class_type[1], msgspec.Struct)
+        ):
             raise ValueError(
                 f"{name} is a subclass of BaseReq but not follow the naming convention."
             )

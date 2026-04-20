@@ -31,6 +31,8 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
+    recv_msgpack_s2d,
+    send_msgpack,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -138,10 +140,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = self.recv_from_scheduler.recv_pyobj()
+                recv_obj = recv_msgpack_s2d(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
+                send_msgpack(self.send_to_tokenizer, output)
             self.soft_watchdog.feed()
 
     def trim_matched_stop(

@@ -87,7 +87,6 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
-    BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -144,7 +143,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    send_msgpack,
+    _msgpack_encoder,
 )
+import msgspec
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
     init_mm_embedding_cache,
@@ -521,8 +523,12 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
-            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
-            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+            self.send_to_tokenizer = SenderWrapper(
+                send_to_tokenizer, use_msgpack=True
+            )
+            self.send_to_detokenizer = SenderWrapper(
+                send_to_detokenizer, use_msgpack=True
+            )
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -1503,6 +1509,46 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    @staticmethod
+    def _decode_t2s_message(data: bytes):
+        """Decode a tokenizer->scheduler message from raw bytes.
+
+        Supports both msgpack (from Rust frontend and modern Python senders)
+        and pickle (legacy Python tokenizer path). Tries msgpack first since
+        it's the fast path.
+        """
+        from sglang.srt.managers.io_struct import (
+            AbortReq,
+            TokenizedGenerateReqInput,
+        )
+
+        # Try msgpack first -- fast path for Rust frontend and Python senders
+        # using SenderWrapper(use_msgpack=True).
+        try:
+            raw = msgspec.msgpack.decode(data)
+            if isinstance(raw, dict):
+                msg_type = raw.get("type", "")
+                if msg_type == "TokenizedGenerateReqInput":
+                    from sglang.srt.managers.io_struct import (
+                        _tokenized_req_from_dict,
+                    )
+                    return _tokenized_req_from_dict(raw)
+                elif msg_type == "AbortReq":
+                    req = AbortReq()
+                    req.rid = raw.get("rid")
+                    req.abort_all = raw.get("abort_all", False)
+                    req.finished_reason = raw.get("finished_reason")
+                    req.abort_message = raw.get("abort_message")
+                    req.http_worker_ipc = raw.get("http_worker_ipc")
+                    return req
+            return raw
+        except (msgspec.DecodeError, msgspec.ValidationError):
+            pass
+
+        # Fall back to pickle (legacy Python tokenizer path)
+        import pickle as _pickle
+        return _pickle.loads(data)
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1523,7 +1569,8 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        data = self.recv_from_tokenizer.recv(zmq.NOBLOCK)
+                        recv_req = self._decode_t2s_message(data)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -3627,26 +3674,53 @@ def is_work_request(recv_req):
 
 
 class SenderWrapper:
-    def __init__(self, socket: zmq.Socket):
+    def __init__(self, socket: zmq.Socket, use_msgpack: bool = False):
         self.socket = socket
+        self.use_msgpack = use_msgpack
 
     def send_output(
         self,
-        output: Union[BaseReq, BaseBatchReq],
-        recv_obj: Optional[Union[BaseReq, BaseBatchReq]] = None,
+        output,
+        recv_obj=None,
     ):
         if self.socket is None:
             return
 
+        if self.use_msgpack:
+            if isinstance(output, msgspec.Struct):
+                send_msgpack(self.socket, output)
+            else:
+                # Dataclass or other non-msgspec objects: encode as a tagged
+                # dict so the receiver can decode uniformly via msgpack.
+                # This covers AbortReq, FlushCacheReqOutput, HealthCheckOutput,
+                # etc. which are @dataclass subclasses of BaseReq.
+                self._send_dataclass_as_msgpack(output, recv_obj)
+        else:
+            if (
+                isinstance(recv_obj, BaseReq)
+                and recv_obj.http_worker_ipc is not None
+                and output.http_worker_ipc is None
+            ):
+                output.http_worker_ipc = recv_obj.http_worker_ipc
+            self.socket.send_pyobj(output)
+
+    def _send_dataclass_as_msgpack(self, output, recv_obj=None):
+        """Encode a dataclass as a tagged dict and send via msgpack."""
+        import dataclasses as _dc
+
         if (
             isinstance(recv_obj, BaseReq)
             and recv_obj.http_worker_ipc is not None
+            and hasattr(output, "http_worker_ipc")
             and output.http_worker_ipc is None
         ):
-            # handle communicator reqs for multi-http worker case
             output.http_worker_ipc = recv_obj.http_worker_ipc
 
-        self.socket.send_pyobj(output)
+        d = {"type": type(output).__name__}
+        if _dc.is_dataclass(output):
+            for f in _dc.fields(output):
+                d[f.name] = getattr(output, f.name)
+        self.socket.send(_msgpack_encoder.encode(d))
 
 
 def dispatch_event_loop(scheduler: Scheduler):

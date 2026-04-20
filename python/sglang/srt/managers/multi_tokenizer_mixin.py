@@ -30,6 +30,7 @@ from functools import partialmethod
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, Union
 
+import msgspec
 import setproctitle
 import zmq
 import zmq.asyncio
@@ -43,6 +44,9 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    async_recv_msgpack_d2t,
+    recv_msgpack_s2d,
+    send_msgpack,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -83,7 +87,35 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=False)
-        self._mapping[ipc_name].send_pyobj(output)
+        if isinstance(output, msgspec.Struct):
+            send_msgpack(self._mapping[ipc_name], output)
+        else:
+            self._mapping[ipc_name].send_pyobj(output)
+
+
+def _extract_bytes_field_by_index(output: Any, field_name: str, index: int) -> Any:
+    """Extract a single element from a pickle-serialized bytes field.
+
+    Used for routed_experts (bytes of List[Optional[Tensor]]) and
+    customized_info (bytes of Dict[str, List[Any]]).
+    """
+    field = getattr(output, field_name, None)
+    if field is None:
+        return None
+    data = pickle.loads(field)
+    if isinstance(data, dict):
+        new_field = {}
+        for k, v in data.items():
+            if len(v) <= index:
+                new_field[k] = None
+            else:
+                new_field[k] = v[index]
+        return pickle.dumps(new_field)
+    if isinstance(data, list):
+        if len(data) <= index:
+            return None
+        return pickle.dumps([data[index]])
+    return None
 
 
 def _extract_field_by_index(
@@ -269,12 +301,8 @@ def _handle_output_by_index(output, i):
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
-            routed_experts=_extract_field_by_index(
-                output, "routed_experts", i, check_length=False
-            ),
-            customized_info=_extract_field_by_index(
-                output, "customized_info", i, check_length=False
-            ),
+            routed_experts=_extract_bytes_field_by_index(output, "routed_experts", i),
+            customized_info=_extract_bytes_field_by_index(output, "customized_info", i),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
@@ -299,14 +327,14 @@ class MultiHttpWorkerDetokenizerMixin:
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = recv_msgpack_s2d(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is None:
                 continue
 
-            assert isinstance(
-                recv_obj, BaseBatchReq
-            ), "for multi-http-worker, recv_obj must be BaseBatchReq"
+            assert hasattr(
+                recv_obj, "http_worker_ipcs"
+            ), "for multi-http-worker, recv_obj must have http_worker_ipcs"
 
             # Send data using the corresponding socket
             for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
@@ -357,14 +385,14 @@ class MultiTokenizerRouter:
         # special reqs will recv from scheduler, need to route to right worker
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = await async_recv_msgpack_d2t(self.recv_from_detokenizer)
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
         # Distribute result to each worker
         if isinstance(recv_obj, BaseReq):
             ipc_names = [recv_obj.http_worker_ipc]
-        elif isinstance(recv_obj, BaseBatchReq):
+        elif hasattr(recv_obj, "http_worker_ipcs"):
             ipc_names = recv_obj.http_worker_ipcs
         else:
             raise ValueError(f"Unknown recv_obj type: {type(recv_obj)}")

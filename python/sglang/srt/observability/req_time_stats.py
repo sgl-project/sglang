@@ -21,6 +21,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import msgspec
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -74,6 +76,65 @@ def convert_time_cross_thread(
 ) -> float:
     # note: precision loss
     return time_value + old_diff - new_diff
+
+
+class SchedulerReqTimeStatsIPC(msgspec.Struct, tag=True):
+    """IPC-serializable subset of SchedulerReqTimeStats for msgpack transport."""
+
+    wait_queue_entry_time: float = 0.0
+    forward_entry_time: float = 0.0
+    prefill_run_batch_start_time: float = 0.0
+    prefill_run_batch_end_time: float = 0.0
+    prefill_finished_time: float = 0.0
+    diff_realtime_monotonic: float = 0.0
+
+    @staticmethod
+    def from_full(ts: "SchedulerReqTimeStats") -> "SchedulerReqTimeStatsIPC":
+        if not ts.enable_metrics:
+            return SchedulerReqTimeStatsIPC()
+        return SchedulerReqTimeStatsIPC(
+            wait_queue_entry_time=ts.wait_queue_entry_time,
+            forward_entry_time=ts.forward_entry_time,
+            prefill_run_batch_start_time=ts.prefill_run_batch_start_time,
+            prefill_run_batch_end_time=ts.prefill_run_batch_end_time,
+            prefill_finished_time=ts.prefill_finished_time,
+            diff_realtime_monotonic=global_diff_realtime_monotonic,
+        )
+
+    def get_queueing_time(self) -> float:
+        return self.forward_entry_time - self.wait_queue_entry_time
+
+    def get_prefill_waiting_latency(self) -> Optional[float]:
+        if self.prefill_run_batch_start_time > 0.0:
+            return self.prefill_run_batch_start_time - self.forward_entry_time
+        return None
+
+    def get_prefill_launch_latency(self) -> Optional[float]:
+        if (
+            self.prefill_run_batch_start_time > 0.0
+            and self.prefill_run_batch_end_time > 0.0
+        ):
+            return self.prefill_run_batch_end_time - self.prefill_run_batch_start_time
+        return None
+
+    def convert_to_output_meta_info(self):
+        meta_data = {}
+        if self.forward_entry_time > 0.0:
+            meta_data["forward_entry_time"] = (
+                self.forward_entry_time + self.diff_realtime_monotonic
+            )
+        if self.prefill_finished_time > 0.0:
+            meta_data["prefill_finished_time"] = (
+                self.prefill_finished_time + self.diff_realtime_monotonic
+            )
+        meta_data.update(
+            {
+                "queue_time": self.get_queueing_time(),
+                "prefill_waiting_latency": self.get_prefill_waiting_latency(),
+                "prefill_launch_latency": self.get_prefill_launch_latency(),
+            }
+        )
+        return meta_data
 
 
 @dataclass

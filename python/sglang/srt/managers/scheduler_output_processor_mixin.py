@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -21,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStatsIPC
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -1170,6 +1172,19 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if reqs or is_idle_batch:
+            # Pre-serialize opaque fields for msgpack transport
+            routed_experts_bytes = (
+                pickle.dumps(routed_experts) if routed_experts is not None else None
+            )
+            customized_info_bytes = (
+                pickle.dumps(customized_info) if customized_info else None
+            )
+            time_stats_ipc = (
+                [SchedulerReqTimeStatsIPC.from_full(ts) for ts in time_stats]
+                if time_stats
+                else None
+            )
+
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
@@ -1177,7 +1192,7 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
                     spec_acceptance_histogram=spec_acceptance_histogram,
-                    time_stats=time_stats,
+                    time_stats=time_stats_ipc,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
                     decode_ids=decode_ids_list,
@@ -1205,8 +1220,8 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
-                    routed_experts=routed_experts,
-                    customized_info=customized_info,
+                    routed_experts=routed_experts_bytes,
+                    customized_info=customized_info_bytes,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
@@ -1263,11 +1278,16 @@ class SchedulerOutputProcessorMixin:
             else:
                 stacked_phs = phs_list
 
+        time_stats_ipc = (
+            [SchedulerReqTimeStatsIPC.from_full(ts) for ts in time_stats]
+            if time_stats
+            else None
+        )
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                time_stats=time_stats,
+                time_stats=time_stats_ipc,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,

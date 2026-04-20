@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
+    async_recv_msgpack_d2t,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1612,7 +1613,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+                recv_obj = await async_recv_msgpack_d2t(self.recv_from_detokenizer)
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
@@ -1625,6 +1626,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
+        # Eagerly deserialize pre-serialized bytes fields once before the loop
+        _routed_experts_list = (
+            pickle.loads(recv_obj.routed_experts)
+            if getattr(recv_obj, "routed_experts", None)
+            else None
+        )
+        _customized_info_dict = (
+            pickle.loads(recv_obj.customized_info)
+            if getattr(recv_obj, "customized_info", None)
+            else None
+        )
+
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1678,14 +1691,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-            if getattr(recv_obj, "routed_experts", None):
-                routed_experts_tensor = recv_obj.routed_experts[i]
+            if _routed_experts_list is not None:
+                routed_experts_tensor = _routed_experts_list[i]
                 if routed_experts_tensor is not None:
                     meta_info["routed_experts"] = pybase64.b64encode(
                         routed_experts_tensor.numpy().tobytes()
                     ).decode("utf-8")
-            if getattr(recv_obj, "customized_info", None):
-                for k, v in recv_obj.customized_info.items():
+            if _customized_info_dict is not None:
+                for k, v in _customized_info_dict.items():
                     meta_info[k] = v[i]
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
