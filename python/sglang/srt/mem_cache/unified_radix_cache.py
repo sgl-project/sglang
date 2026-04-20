@@ -39,7 +39,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
-from sglang.srt.session.session_aware_cache import SessionAwareCache
+from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -209,12 +209,12 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             self.key_convert_fn = lambda key: key
 
-        # Streaming session: embedded SessionAwareCache with self as inner.
+        # Streaming session: embedded StreamingSession with self as inner.
+        # Always on -- zero overhead when no streaming session is open (the
+        # try_* entries short-circuit on non-streaming reqs / real TreeNodes).
         # Dispatch methods below pre-check conditions so the session's
         # internal fall-through to self.inner.xxx never fires -- no recursion.
-        self.session: Optional[SessionAwareCache] = (
-            SessionAwareCache(inner=self) if params.enable_streaming_session else None
-        )
+        self.session = StreamingSession(inner=self)
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -230,14 +230,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.lru_lists = {
             ct: UnifiedLRUList(ct, self.tree_components) for ct in self.tree_components
         }
-        if self.session is not None:
-            self.session.slots.clear()
+        self.session.slots.clear()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        if self.session is not None:
-            result = self.session.try_match_prefix(params)
-            if result is not None:
-                return result
+        result = self.session.try_match_prefix(params)
+        if result is not None:
+            return result
 
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
@@ -288,10 +286,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
-        if self.session is not None:
-            result = self.session.try_inc_lock_ref(node)
-            if result is not None:
-                return result
+        result = self.session.try_inc_lock_ref(node)
+        if result is not None:
+            return result
         if self.disable:
             return IncLockRefResult()
         result = IncLockRefResult()
@@ -302,10 +299,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def dec_lock_ref(
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
-        if self.session is not None:
-            result = self.session.try_dec_lock_ref(node, params)
-            if result is not None:
-                return result
+        result = self.session.try_dec_lock_ref(node, params)
+        if result is not None:
+            return result
         if self.disable:
             return DecLockRefResult()
         for component in self._components_tuple:
@@ -314,9 +310,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return DecLockRefResult()
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
-        if self.session is not None and self.session.try_cache_finished_req(
-            req, is_insert=is_insert, **kwargs
-        ):
+        if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
         kv_committed_len = req.pop_committed_kv_cache()
@@ -387,9 +381,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     def cache_unfinished_req(self, req: Req, chunked=False, **kwargs) -> None:
-        if self.session is not None and self.session.try_cache_unfinished_req(
-            req, chunked=chunked, **kwargs
-        ):
+        if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
         token_ids = req.fill_ids
@@ -812,33 +804,24 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_mamba(self) -> bool:
         return ComponentType.MAMBA in self.components
 
-    # ---- Streaming session API (delegates to composed SessionImpl) ----
+    # ---- Streaming session API (delegates to composed StreamingSession) ----
 
     def supports_streaming_session(self) -> bool:
-        return self.session is not None
+        return True
 
     def release_session(self, session_id: str) -> None:
-        if self.session is not None:
-            self.session.release_session(session_id)
+        self.session.release_session(session_id)
 
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        if self.session is None:
-            return 0
         return self.session.session_held_tokens(active_pool_idxs)
 
     def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        if self.session is None:
-            return 0
         return self.session.session_held_full_tokens(active_pool_idxs)
 
     def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
-        if self.session is None:
-            return 0
         return self.session.session_held_swa_tokens(active_pool_idxs)
 
     def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
-        if self.session is None:
-            return 0
         return self.session.session_held_req_count(active_pool_idxs)
 
     def evictable_size(self) -> int:
@@ -963,7 +946,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Skip when streaming sessions hold tree locks: the check asserts
         # all nodes are unlocked during idle, which streaming sessions break
         # by design (they hold a first-turn lock across turns).
-        if self.session is not None and self.session.any_holding_kv():
+        if self.session.any_holding_kv():
             return
         try:
             # 1. Collect all nodes from tree
