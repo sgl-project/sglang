@@ -47,6 +47,13 @@ logger = init_logger(__name__)
 
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
+# Placeholder negative_prompt used in synthesized warmup Reqs when
+# --enable-cfg-parallel is on. A non-empty, real word (vs "" or " ") so
+# every tokenizer backend emits a predictable, non-degenerate token
+# sequence — rank 1's uncond branch then produces a valid tensor for
+# _combine_cfg_parallel's all-reduce.
+DEFAULT_PLACEHOLDER_PROMPT = "warmup"
+
 
 class Scheduler(SchedulerDisaggMixin):
     """
@@ -254,7 +261,7 @@ class Scheduler(SchedulerDisaggMixin):
                     req_kwargs["negative_prompt"] = ""
                     req_kwargs["image_path"] = [warmup_input_path]
                 if self.server_args.enable_cfg_parallel:
-                    req_kwargs["negative_prompt"] = "warmup"
+                    req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
                     req_kwargs["do_classifier_free_guidance"] = True
                 req = Req(**req_kwargs)
                 req.set_as_warmup(self.server_args.warmup_steps)

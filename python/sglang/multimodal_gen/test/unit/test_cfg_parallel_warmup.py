@@ -14,7 +14,10 @@ from collections import deque
 from unittest.mock import MagicMock, patch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.managers.scheduler import (
+    DEFAULT_PLACEHOLDER_PROMPT,
+    Scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
@@ -80,7 +83,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(len(scheduler.waiting_queue), 1)
         _, req = scheduler.waiting_queue[0]
         self.assertIs(req.do_classifier_free_guidance, True)
-        self.assertEqual(req.negative_prompt, "warmup")
+        self.assertEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
 
     def test_warmup_req_no_cfg_parallel_unchanged(self):
         # Regression guard: the cfg-parallel=on fix must not bleed into
@@ -94,7 +97,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(len(scheduler.waiting_queue), 1)
         _, req = scheduler.waiting_queue[0]
         self.assertIs(req.do_classifier_free_guidance, False)
-        self.assertNotEqual(req.negative_prompt, "warmup")
+        self.assertNotEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
 
 
 class TestInputValidationCfgParallelGuard(unittest.TestCase):
