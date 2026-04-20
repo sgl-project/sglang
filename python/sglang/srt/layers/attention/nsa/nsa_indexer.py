@@ -14,7 +14,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     add_prefix,
@@ -32,13 +32,15 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
 if _is_cuda:
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
+
+if _use_aiter:
+    from aiter.ops.cache import indexer_k_quant_and_cache
 
 if is_npu():
     import torch_npu
@@ -220,7 +222,7 @@ class Indexer(MultiPlatformOp):
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.bfloat16 if _is_cuda else torch.float32,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(
@@ -272,9 +274,10 @@ class Indexer(MultiPlatformOp):
             deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
             return out
 
-        if _is_hip:
-            x = x.to(self.weights_proj.weight.dtype)
         weights, _ = self.weights_proj(x)
+        if _is_hip:
+            # Return bf16; multiplying with q_scale promotes back to fp32.
+            return weights
         return weights.float()
 
     @torch.compile(dynamic=True)
@@ -1025,6 +1028,22 @@ class Indexer(MultiPlatformOp):
                 buf,
                 forward_batch.out_cache_loc,
                 forward_batch.token_to_kv_pool.page_size,
+            )
+            return
+
+        # Fast path: AITER fused quant + cache store (HIP, page_size=1)
+        if _use_aiter:
+            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
+            # Reshape from (num_pages, 132) uint8 to (num_pages, 1, 132) fp8
+            # to match kernel's (num_blocks, block_size, head_dim + scale_bytes) layout
+            kv_cache = buf.unsqueeze(1).view(fp8_dtype)
+            out_loc = forward_batch.out_cache_loc
+            if not out_loc.is_contiguous():
+                out_loc = out_loc.contiguous()
+            indexer_k_quant_and_cache(
+                key, kv_cache, out_loc, self.block_size, self.scale_fmt
             )
             return
 
