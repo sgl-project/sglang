@@ -13,6 +13,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import aiohttp
+import numpy as np
 import torch
 import zmq
 import zmq.asyncio
@@ -196,12 +197,27 @@ _VIDEO_META_ATTRS = ("video_timestamps", "second_per_grid_ts")
 
 
 def _cat_grid(dims, flatten_items=False):
-    """Concatenate non-None tensors from a list; optionally flatten each before cat."""
-    valid = (
-        [g.flatten() for g in dims if g is not None]
-        if flatten_items
-        else [g for g in dims if g is not None]
-    )
+    """Concatenate non-None grid entries; supports tensor/ndarray/list inputs."""
+
+    def _to_tensor(g):
+        if isinstance(g, torch.Tensor):
+            return g.cpu() if g.is_cuda else g
+        if isinstance(g, np.ndarray):
+            return torch.from_numpy(g)
+        return torch.as_tensor(g)
+
+    valid = []
+    for g in dims:
+        if g is None:
+            continue
+        t = _to_tensor(g)
+        if flatten_items:
+            t = t.flatten()
+        elif t.ndim == 0:
+            # Keep cat semantics stable for scalar-like metadata.
+            t = t.unsqueeze(0)
+        valid.append(t)
+
     return torch.cat(valid, dim=0) if valid else None
 
 
@@ -1021,6 +1037,26 @@ class MMReceiverBase(ABC):
         return num_items_assigned
 
     def _extract_url_data(self, request_obj) -> List[Dict]:
+        def flatten_mm_items(items):
+            if not isinstance(items, list):
+                return [items]
+
+            flat = []
+            for item in items:
+                if isinstance(item, (list, tuple)):
+                    flat.extend(flatten_mm_items(list(item)))
+                else:
+                    flat.append(item)
+            return flat
+
+        def to_raw_url(mm_item):
+            if isinstance(mm_item, ImageData):
+                return mm_item.url
+            if isinstance(mm_item, dict):
+                # tolerate {"url": ...} shaped payloads
+                return mm_item.get("url", mm_item)
+            return mm_item
+
         mm_data = []
         for attr, modality in [
             ("image_data", Modality.IMAGE),
@@ -1029,16 +1065,11 @@ class MMReceiverBase(ABC):
         ]:
             mm_items = getattr(request_obj, attr, None)
             if mm_items:
-                if not isinstance(mm_items, list):
-                    mm_items = [mm_items]
+                mm_items = flatten_mm_items(mm_items)
                 for mm_item in mm_items:
                     mm_data.append(
                         {
-                            "url": (
-                                mm_item.url
-                                if isinstance(mm_item, ImageData)
-                                else mm_item
-                            ),
+                            "url": to_raw_url(mm_item),
                             "modality": modality,
                         }
                     )

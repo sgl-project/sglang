@@ -39,6 +39,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_backend: BaseLoRABackend = lora_backend
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
+        if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
+            self.bias = self.base_layer.bias
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -70,6 +72,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
+        self.num_embeddings = base_layer.num_embeddings
 
         # Embedding LoRA with TP > 1 keeps weights fully replicated
         # (unsharded) on every rank.  This works correctly because the
