@@ -81,11 +81,6 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 try:
-    torch._dynamo.config.capture_scalar_outputs = True
-except:
-    pass
-
-try:
     from kt_kernel import KTMoEWrapper
 
     KTRANSFORMERS_AVAILABLE = True
@@ -655,6 +650,14 @@ class CudaGraphRunner:
 
         # Combo scheduling is needed to have good performance for replay-prepare.
         self.compile_replay_prepare = hasattr(torch._inductor.config, "combo_kernels")
+        if self.compile_replay_prepare:
+            # Avoid graph breaks from .item() calls (e.g. seq_lens_cpu.max().item())
+            # by capturing them as unbacked symbolic ints in the FX graph. Without
+            # this, dynamo splits the compiled region into multiple sub-graphs.
+            try:
+                torch._dynamo.config.capture_scalar_outputs = True
+            except Exception:
+                self.compile_replay_prepare = False
         self.compiled_replay_prepare = None
 
         # Capture
