@@ -23,6 +23,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 
 - **Best speed/quality (recommended)**: Use **EAGLE-3** with `--speculative-algorithm EAGLE3`.
 - **Strong default / broad compatibility**: Use **EAGLE-2** with `--speculative-algorithm EAGLE`.
+- **Workload acceptance changes over time**: Use [**Adaptive speculative decoding**](adaptive_speculative_decoding.md) on top of **EAGLE** with `--speculative-eagle-topk 1`.
 - **Lower `lm_head` overhead for EAGLE-2**: Enable **FR-Spec** with `--speculative-token-map`.
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
@@ -75,6 +76,7 @@ To enable EAGLE speculative decoding the following parameters are relevant:
 
 These parameters are mostly the same for EAGLE-2 and EAGLE-3. `--speculative-token-map` is ignored for EAGLE-3 models.
 For `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`: leave all three unset to use auto-tuning, or set all three explicitly when tuning.
+If you use EAGLE with `--speculative-eagle-topk 1` and your acceptance rate varies across requests, see [Adaptive Speculative Decoding](adaptive_speculative_decoding.md).
 
 You can find the best combinations of these parameters with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py).
 
