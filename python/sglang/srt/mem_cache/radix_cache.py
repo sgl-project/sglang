@@ -558,10 +558,8 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # EAGLE: keep raw tokens; RadixKey exposes bigram semantics via is_bigram.
         keys = page_align_keys(token_ids, self.page_size, is_bigram=self.is_eagle)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
-        # values are indexed by bigram/token units (= logical key length).
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
@@ -577,11 +575,11 @@ class RadixCache(BasePrefixCache):
             )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : len(keys)]
+                kv_indices[req.cache_protected_len : len(radix_key)]
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
+        self.token_to_kv_pool_allocator.free(kv_indices[len(radix_key) :])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -596,7 +594,6 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # EAGLE: keep raw tokens; RadixKey exposes bigram semantics via is_bigram.
         keys = page_align_keys(token_ids, self.page_size, is_bigram=self.is_eagle)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
@@ -622,7 +619,9 @@ class RadixCache(BasePrefixCache):
             match_result.device_indices,
             match_result.last_device_node,
         )
-        assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
+        assert len(new_indices) == len(
+            radix_key
+        ), f"{len(new_indices)=}, {len(radix_key)=}"
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
