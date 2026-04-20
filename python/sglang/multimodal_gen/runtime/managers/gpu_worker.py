@@ -208,9 +208,16 @@ class GPUWorker:
             f"Related offload server args to disable: {suggested_args_str}"
         )
 
-    def execute_forward(self, batch: List[Req]) -> OutputBatch:
+    def execute_forward(
+        self, batch: List[Req], return_req: bool = False
+    ) -> OutputBatch | Req:
         """
         Execute a forward pass.
+
+        Args:
+            batch: List of requests to process.
+            return_req: If True, return the raw Req instead of OutputBatch.
+                Used by disaggregated pipelines to access intermediate tensors.
         """
         assert self.pipeline is not None
         req = batch[0]
@@ -229,6 +236,11 @@ class GPUWorker:
             req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
 
+            # For disagg roles, return raw Req to let the caller handle
+            # the role-to-role tensor transfer before OutputBatch conversion.
+            if return_req and isinstance(result, Req):
+                return result
+
             if isinstance(result, Req):
                 output_batch = OutputBatch(
                     output=result.output,
@@ -237,6 +249,9 @@ class GPUWorker:
                     metrics=result.metrics,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
+                    rollout_trajectory_data=getattr(
+                        result, "rollout_trajectory_data", None
+                    ),
                     noise_pred=getattr(result, "noise_pred", None),
                     trajectory_decoded=getattr(result, "trajectory_decoded", None),
                 )
@@ -258,7 +273,8 @@ class GPUWorker:
                 self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
-            output_batch.metrics.total_duration_ms = duration_ms
+            if output_batch.metrics is not None:
+                output_batch.metrics.total_duration_ms = duration_ms
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
@@ -297,6 +313,19 @@ class GPUWorker:
                 # Avoid logging warmup perf records that share the same request_id.
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
+
+            # dump per-request perf report to specified file (server mode)
+            if (
+                req.perf_dump_path is not None
+                and not req.is_warmup
+                and output_batch.metrics is not None
+            ):
+                PerformanceLogger.dump_benchmark_report(
+                    file_path=req.perf_dump_path,
+                    metrics=output_batch.metrics,
+                    meta={"model": self.server_args.model_path},
+                    tag="server_perf_dump",
+                )
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
@@ -510,6 +539,7 @@ def run_scheduler_process(
             port_args=port_args,
             task_pipes_to_slaves=task_pipes_to_slaves,
             result_pipes_from_slaves=result_pipes_from_slaves,
+            local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(

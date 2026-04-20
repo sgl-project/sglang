@@ -18,6 +18,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_QUANTIZED_DTYPES = {
+    torch.uint8,
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.int8,
+}
+
 
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype):
@@ -95,6 +102,7 @@ def get_param_names_mapping(
 def hf_to_custom_state_dict(
     hf_param_sd: dict[str, torch.Tensor] | Iterator[tuple[str, torch.Tensor]],
     param_names_mapping: Callable[[str], tuple[str, Any, Any]],
+    valid_target_names: set[str] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, tuple[str, Any, Any]]]:
     """
     Converts a Hugging Face parameter state dictionary to a custom parameter state dictionary.
@@ -116,6 +124,15 @@ def hf_to_custom_state_dict(
         target_param_name, merge_index, num_params_to_merge = param_names_mapping(
             source_param_name
         )
+        if (
+            valid_target_names is not None
+            and target_param_name != source_param_name
+            and source_param_name in valid_target_names
+            and target_param_name not in valid_target_names
+        ):
+            target_param_name = source_param_name
+            merge_index = None
+            num_params_to_merge = None
         if target_param_name == "" or target_param_name is None:  # type: ignore[comparison-overlap]
             continue
         reverse_param_names_mapping[target_param_name] = (
@@ -135,6 +152,25 @@ def hf_to_custom_state_dict(
                 del to_merge_params[target_param_name]
             else:
                 continue
+        existing_tensor = custom_param_sd.get(target_param_name)
+        if existing_tensor is not None and existing_tensor.dtype != full_tensor.dtype:
+            existing_is_quantized = existing_tensor.dtype in _QUANTIZED_DTYPES
+            current_is_quantized = full_tensor.dtype in _QUANTIZED_DTYPES
+            if existing_is_quantized and not current_is_quantized:
+                logger.debug(
+                    "Keeping quantized duplicate for %s: existing=%s new=%s",
+                    target_param_name,
+                    existing_tensor.dtype,
+                    full_tensor.dtype,
+                )
+                continue
+            if current_is_quantized and not existing_is_quantized:
+                logger.debug(
+                    "Replacing non-quantized duplicate for %s: existing=%s new=%s",
+                    target_param_name,
+                    existing_tensor.dtype,
+                    full_tensor.dtype,
+                )
         custom_param_sd[target_param_name] = full_tensor
     return custom_param_sd, reverse_param_names_mapping
 
@@ -155,9 +191,7 @@ class skip_init_modules:
 
 def _normalize_component_type(module_type: str) -> str:
     """Normalize module types like 'text_encoder_2' -> 'text_encoder'."""
-    if module_type.endswith("_2"):
-        return module_type[:-2]
-    return module_type
+    return re.sub(r"_\d+$", "", module_type)
 
 
 def _clean_hf_config_inplace(model_config: dict) -> None:

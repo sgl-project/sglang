@@ -23,6 +23,7 @@ from xgrammar import (
     CompiledGrammar,
     GrammarCompiler,
     GrammarMatcher,
+    StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
@@ -33,6 +34,9 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarStats,
     InvalidGrammarObject,
+)
+from sglang.srt.constrained.torch_ops.bitmask_ops import (
+    apply_token_bitmask_inplace_torch,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
@@ -104,15 +108,13 @@ class XGrammarGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if (
-            logits.device.type == "cuda"
-            or logits.device.type == "npu"
-            or logits.device.type == "xpu"
-        ):
+        if logits.device.type in {"cuda", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif logits.device.type == "npu":
+            apply_token_bitmask_inplace_torch(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -299,9 +301,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     )
                     for structure in structural_tag["structures"]
                 ]
-                ctx = self.grammar_compiler.compile_structural_tag(
+                new_tag = StructuralTag.from_legacy_structural_tag(
                     tags, structural_tag["triggers"]
                 )
+                new_tag.format.at_least_one = structural_tag.get("at_least_one", False)
+                ctx = self.grammar_compiler.compile_structural_tag(new_tag)
             else:
                 format_dict = structural_tag.get("format")
                 if isinstance(format_dict, dict):
@@ -317,6 +321,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         )
 
     def reset(self):
+        super().reset()
         self.grammar_compiler.clear_cache()
 
 
