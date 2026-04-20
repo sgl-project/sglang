@@ -832,23 +832,36 @@ apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& 
   int64_t k_stride_s = key.stride(0);
   TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
   TORCH_CHECK(cos.scalar_type() == sin.scalar_type(), "cos and sin must have the same data type");
-  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input_dtype, cos.scalar_type(), "apply_multidimensional_rope_cpu", [&] {
-    apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
-        query.data_ptr<scalar_t>(),
-        cos.data_ptr<param_t>(),
-        sin.data_ptr<param_t>(),
-        q_stride_s,
-        num_heads,
-        head_dim,
-        num_tokens);
-    apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
-        key.data_ptr<scalar_t>(),
-        cos.data_ptr<param_t>(),
-        sin.data_ptr<param_t>(),
-        k_stride_s,
-        num_heads,
-        head_dim,
-        num_tokens);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "apply_multidimensional_rope_cpu", [&] {
+    auto cos_dtype = cos.scalar_type();
+    auto invoke = [&](auto param_tag) {
+      using param_t = decltype(param_tag);
+      apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
+          query.data_ptr<scalar_t>(),
+          cos.data_ptr<param_t>(),
+          sin.data_ptr<param_t>(),
+          q_stride_s,
+          num_heads,
+          head_dim,
+          num_tokens);
+      apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
+          key.data_ptr<scalar_t>(),
+          cos.data_ptr<param_t>(),
+          sin.data_ptr<param_t>(),
+          k_stride_s,
+          num_heads,
+          head_dim,
+          num_tokens);
+    };
+    if (cos_dtype == at::kFloat) {
+      invoke(float{});
+    } else if (cos_dtype == at::ScalarType::BFloat16) {
+      invoke(at::BFloat16{});
+    } else if (cos_dtype == at::ScalarType::Half) {
+      invoke(at::Half{});
+    } else {
+      TORCH_CHECK(false, "Unsupported cos/sin data type.");
+    }
   });
   return std::make_tuple(query, key);
 }
