@@ -262,6 +262,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_size = None
 
         nextn_quant_config = quant_config
+        # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
         if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
             from sglang.srt.layers.quantization.quark.utils import (
                 should_ignore_layer,
