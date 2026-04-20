@@ -54,8 +54,9 @@ class PrefillDelayer:
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
         # Adaptive queue-based trigger (additive on top of slot_trigger).
-        # Active only when both knobs are set; ServerArgs auto-fills defaults
-        # when enable_prefill_delayer is on.
+        # Opt-in: activates only when queue_min_ratio is explicitly set.
+        # max_delay_ms gets a default from ServerArgs so users only need to
+        # pass --prefill-delayer-queue-min-ratio to enable the new trigger.
         self._queue_min_ratio = getattr(
             server_args, "prefill_delayer_queue_min_ratio", None
         )

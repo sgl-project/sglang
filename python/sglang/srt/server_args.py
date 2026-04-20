@@ -365,10 +365,10 @@ class ServerArgs:
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
     # Adaptive queue-based trigger, complementary to the slot-based one.
-    # Delays prefill until the waiting queue accumulates enough fragments to
-    # form a larger batch. Active only when both knobs are set; None means
-    # "unspecified" and _handle_prefill_delayer_env_compat fills defaults
-    # (ratio=0.1, max_delay_ms=5000) when enable_prefill_delayer is on.
+    # Active only when prefill_delayer_queue_min_ratio is explicitly set;
+    # otherwise --enable-prefill-delayer keeps the original slot-only
+    # behavior. prefill_delayer_max_delay_ms gates the wall-clock cap and
+    # is only consulted when the queue trigger is active.
     prefill_delayer_queue_min_ratio: Optional[float] = None
     prefill_delayer_max_delay_ms: Optional[float] = None
 
@@ -1009,22 +1009,14 @@ class ServerArgs:
         if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
             self.prefill_delayer_token_usage_low_watermark = x
 
-        # Auto-fill queue-trigger defaults so --enable-prefill-delayer is a
-        # single-switch UX. Users can still override either knob explicitly.
-        if self.enable_prefill_delayer:
-            applied = []
-            if self.prefill_delayer_queue_min_ratio is None:
-                self.prefill_delayer_queue_min_ratio = 0.1
-                applied.append("queue_min_ratio=0.1")
-            if self.prefill_delayer_max_delay_ms is None:
-                self.prefill_delayer_max_delay_ms = 5000.0
-                applied.append("max_delay_ms=5000")
-            if applied:
-                logger.info(
-                    "enable_prefill_delayer=True without explicit queue-trigger "
-                    "tuning; applying defaults: %s",
-                    ", ".join(applied),
-                )
+        # Queue trigger is opt-in: it activates only when the user explicitly
+        # sets --prefill-delayer-queue-min-ratio. This preserves the original
+        # slot-only behavior for users who pass --enable-prefill-delayer (or
+        # SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE) for the existing delayer.
+        # max_delay_ms gets a default so users only need to set the ratio to
+        # turn on the new trigger.
+        if self.enable_prefill_delayer and self.prefill_delayer_max_delay_ms is None:
+            self.prefill_delayer_max_delay_ms = 5000.0
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -4422,10 +4414,11 @@ class ServerArgs:
             type=float,
             default=None,
             help=(
-                "Enable adaptive queue-based delay trigger. Delays prefill until the waiting "
-                "queue reaches min(running_req * ratio, max_prefill_bs), so small fragments "
-                "batch into a larger prefill. Requires --prefill-delayer-max-delay-ms. "
-                "Typical: 0.1 ~ 0.5. Defaults to 0.1 when --enable-prefill-delayer is on."
+                "Opt-in to the adaptive queue-based delay trigger (independent of the "
+                "slot-based one). Delays prefill until the waiting queue reaches "
+                "min(running_req * ratio, max_prefill_bs) so small fragments batch into a "
+                "larger prefill. Unset (default) keeps the original slot-only behavior. "
+                "Typical: 0.1 ~ 0.5."
             ),
         )
         parser.add_argument(
@@ -4434,9 +4427,9 @@ class ServerArgs:
             default=None,
             help=(
                 "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, prefill "
-                "is force-released to bound worst-case TTFT. Required for "
-                "--prefill-delayer-queue-min-ratio to take effect. Typical: 1000 ~ 5000. "
-                "Defaults to 5000 when --enable-prefill-delayer is on."
+                "is force-released to bound worst-case TTFT. Only consulted when "
+                "--prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ 5000. Defaults to "
+                "5000 when --enable-prefill-delayer is on."
             ),
         )
 
