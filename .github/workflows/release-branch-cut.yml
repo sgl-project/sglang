@@ -151,6 +151,7 @@ jobs:
     with:
       git_ref: ${{ needs.cut-release-branch.outputs.branch_name }}
       run_all_tests: true
+      skip_stage_health_check: true
     secrets: inherit
 
   run-pr-tests-amd:

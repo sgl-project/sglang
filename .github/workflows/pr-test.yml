@@ -42,6 +42,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_stage_health_check:
+        description: "Skip stage health check fast-fail (e.g. for release branch cuts)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   # Concurrency group structure: pr-test-{event}-{branch}-{pr_sha}-{stage}
@@ -57,8 +62,10 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
 
 permissions:
   actions: write
@@ -82,6 +89,8 @@ jobs:
       jit_kernel: ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       max_parallel: ${{ steps.set-parallel.outputs.max_parallel }}
+      max_parallel_small: ${{ steps.set-parallel.outputs.max_parallel_small }}
+      max_parallel_2gpu: ${{ steps.set-parallel.outputs.max_parallel_2gpu }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
@@ -119,15 +128,15 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
-              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/!(multimodal_gen|jit_kernel/diffusion|jit_kernel/tests/diffusion|jit_kernel/benchmark/diffusion|cli)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
-              - "test/**"
+              - "test/**/!(*.md)"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
-              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
+              - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/jit_kernel/diffusion/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
               - "python/sglang/jit_kernel/benchmark/diffusion/**"
@@ -139,7 +148,7 @@ jobs:
               - "python/sglang/jit_kernel/**"
             sgl_kernel:
               - ".github/workflows/pr-test-sgl-kernel.yml"
-              - "sgl-kernel/**"
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
 
       # For /rerun-stage (workflow_dispatch with target_stage), dorny/paths-filter doesn't work
       # correctly because it falls back to "last commit" detection which breaks for merge commits.
@@ -179,9 +188,9 @@ jobs:
             echo "sgl_kernel=false" >> $GITHUB_OUTPUT
           fi
 
-          # Check for main_package changes (excluding multimodal_gen)
-          # Note: Need to filter out multimodal_gen before checking, not pipe grep -q output
-          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v "^python/sglang/multimodal_gen/" || true)
+          # Check for main_package changes (excluding multimodal_gen, jit_kernel/diffusion, jit_kernel/tests/diffusion, jit_kernel/benchmark/diffusion, cli)
+          # Note: Need to filter out multimodal_gen and diffusion-related paths before checking, not pipe grep -q output
+          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v -E "^(python/sglang/multimodal_gen/|python/sglang/jit_kernel/diffusion/|python/sglang/jit_kernel/tests/diffusion/|python/sglang/jit_kernel/benchmark/diffusion/|python/sglang/cli/)" || true)
           if [ -n "$MAIN_PKG_FILES" ]; then
             echo "main_package=true" >> $GITHUB_OUTPUT
             echo "Detected main_package changes"
@@ -210,13 +219,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Scheduled runs and high-priority PRs get full parallelism
+          # Determine if this run gets full parallelism (scheduled / high priority)
+          FULL=false
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            echo "max_parallel=14" >> $GITHUB_OUTPUT
-            echo "Scheduled run detected, setting max_parallel to 14"
+            FULL=true
+            echo "Scheduled run detected, using full parallelism"
           elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
-            echo "max_parallel=14" >> $GITHUB_OUTPUT
-            echo "High priority PR detected, setting max_parallel to 14"
+            FULL=true
+            echo "High priority PR detected, using full parallelism"
           elif [[ -n "${{ inputs.target_stage }}" ]]; then
             # /rerun-stage (workflow_dispatch): query PR labels via GitHub API
             # Try SHA lookup first (fork PRs), fallback to branch name (non-fork PRs)
@@ -232,16 +242,26 @@ jobs:
             fi
             echo "PR labels: ${LABELS:-"(none)"}"
             if echo "$LABELS" | grep -Fxq "high priority"; then
-              echo "max_parallel=14" >> $GITHUB_OUTPUT
-              echo "High priority PR detected via API (/rerun-stage), setting max_parallel to 14"
-            else
-              echo "max_parallel=3" >> $GITHUB_OUTPUT
-              echo "Using default max_parallel of 3 (/rerun-stage, no high priority label)"
+              FULL=true
+              echo "High priority PR detected via API (/rerun-stage), using full parallelism"
             fi
-          else
-            echo "max_parallel=3" >> $GITHUB_OUTPUT
-            echo "Using default max_parallel of 3"
           fi
+
+          # Set max-parallel for each runner type
+          #   1-gpu-h100: 14 partitions, 1-gpu-5090: 8 partitions, 2-gpu-h100: 4 partitions
+          if [[ "$FULL" == "true" ]]; then
+            LEVEL=full
+            echo "max_parallel=14" >> $GITHUB_OUTPUT
+            echo "max_parallel_small=8" >> $GITHUB_OUTPUT
+            echo "max_parallel_2gpu=4" >> $GITHUB_OUTPUT
+          else
+            LEVEL=low
+            echo "max_parallel=3" >> $GITHUB_OUTPUT
+            echo "max_parallel_small=3" >> $GITHUB_OUTPUT
+            echo "max_parallel_2gpu=2" >> $GITHUB_OUTPUT
+          fi
+          echo "parallel_level=$LEVEL" >> $GITHUB_OUTPUT
+          echo "Parallelism level: $LEVEL"
 
       - name: Set B200 runner tag
         id: set-runner
@@ -308,7 +328,7 @@ jobs:
             echo "| multimodal_gen    | ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
             echo "| target_stage      | ${{ inputs.target_stage || '(none)' }} |"
             echo "| detection_method  | ${{ inputs.target_stage && 'GitHub API' || 'dorny/paths-filter' }} |"
-            echo "| max_parallel      | ${{ steps.set-parallel.outputs.max_parallel }} |"
+            echo "| max_parallel      | ${{ steps.set-parallel.outputs.parallel_level }} (h100=${{ steps.set-parallel.outputs.max_parallel }}, 5090=${{ steps.set-parallel.outputs.max_parallel_small }}, 2gpu=${{ steps.set-parallel.outputs.max_parallel_2gpu }}) |"
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
             echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
             echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
@@ -321,9 +341,6 @@ jobs:
 
   wait-for-stage-a:
     needs: [check-changes, call-gate]
-    # Only run for PRs (not scheduled) and when not targeting a specific stage
-    # Skip if call-gate failed (stage-a jobs will be skipped, nothing to wait for)
-    # !cancelled() ensures this job respects workflow cancellation from concurrency group
     if: |
       always() &&
       !cancelled() &&
@@ -344,13 +361,11 @@ jobs:
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["stage-a-test-1-gpu-small", "stage-a-test-cpu"]'
+          jobs: '["stage-a-test-1-gpu-small", {"prefix": "stage-a-test-cpu", "expected_count": 4}]'
           max-wait-minutes: '240'
 
   wait-for-stage-b:
     needs: [check-changes, call-gate, wait-for-stage-a]
-    # Only run for PRs (not scheduled) and when not targeting a specific stage
-    # Skip if call-gate failed (stage-b jobs will be skipped, nothing to wait for)
     if: |
       always() &&
       !cancelled() &&
@@ -410,10 +425,7 @@ jobs:
       matrix:
         include:
           - python-version: "3.10"
-            cuda-version: "12.9"
-          # Add back when CUDA 13.0 is supported on CI
-          # - python-version: "3.10"
-          #   cuda-version: "13.0"
+            cuda-version: "13.0"
     name: Build Wheel
     steps:
       - name: Cleanup
@@ -461,7 +473,7 @@ jobs:
       matrix:
         include:
           - python-version: "3.10"
-            cuda-version: "12.9"
+            cuda-version: "13.0"
     name: Build Wheel Arm
     steps:
       - name: Cleanup
@@ -516,6 +528,7 @@ jobs:
       b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   # =============================================== jit-kernel ====================================================
@@ -526,10 +539,12 @@ jobs:
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
+      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
       target_stage: ${{ inputs.target_stage || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true }}
     secrets: inherit
 
   # =============================================== primary ====================================================
@@ -565,7 +580,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -581,7 +596,11 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+      - name: Cleanup venv
         if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-a-test-cpu:
     needs: [check-changes, call-gate]
@@ -597,6 +616,10 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1, 2, 3]
     steps:
       - name: Free disk space
         run: |
@@ -620,6 +643,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      - name: Install Rust toolchain
+        run: bash scripts/ci/utils/install_rustup.sh
+
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
         timeout-minutes: 20
@@ -634,7 +665,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite stage-a-test-cpu $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
@@ -653,7 +684,7 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_small) }}
       matrix:
         partition: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
@@ -672,16 +703,13 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
         run: |
           source /etc/profile.d/sglang-ci.sh
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
@@ -693,9 +721,13 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-1-gpu-large:
@@ -733,7 +765,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -749,9 +781,13 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-b-test-2-gpu-large:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
@@ -769,6 +805,7 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_2gpu) }}
       matrix:
         partition: [0, 1, 2, 3]
     steps:
@@ -787,15 +824,12 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
@@ -806,9 +840,13 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
@@ -843,7 +881,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -864,7 +902,11 @@ jobs:
           python3 -m pytest -q python/sglang/jit_kernel/tests/test_flash_attention_4.py
 
       - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+      - name: Cleanup venv
         if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   call-multimodal-gen-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -874,6 +916,10 @@ jobs:
       (
         inputs.target_stage == 'multimodal-gen-test-1-gpu' ||
         inputs.target_stage == 'multimodal-gen-test-2-gpu' ||
+        inputs.target_stage == 'multimodal-gen-component-accuracy' ||
+        inputs.target_stage == 'multimodal-gen-component-accuracy-1-gpu' ||
+        inputs.target_stage == 'multimodal-gen-component-accuracy-2-gpu' ||
+        inputs.target_stage == 'multimodal-gen-test-1-b200' ||
         inputs.target_stage == 'multimodal-gen-unit-test' ||
         (
           !inputs.target_stage &&
@@ -885,12 +931,14 @@ jobs:
     with:
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
       target_stage: ${{ inputs.target_stage || '' }}
       test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
       caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
+      skip_stage_health_check: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
     secrets: inherit
 
   stage-c-test-4-gpu-h100:
@@ -927,7 +975,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -943,9 +991,13 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -981,7 +1033,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -991,6 +1043,9 @@ jobs:
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 25
         run: |
+          # Activate venv if available (GITHUB_ENV may have failed to propagate)
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             deepseek-ai/DeepSeek-V3.2-Exp:8
@@ -998,6 +1053,8 @@ jobs:
       - name: Warmup Server CUDA Graphs
         timeout-minutes: 25
         run: |
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             inclusionAI/Ring-2.5-1T:8
@@ -1011,9 +1068,13 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1031,6 +1092,7 @@ jobs:
     timeout-minutes: 240
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
+      CU_VERSION: cu129
     strategy:
       fail-fast: false
       matrix:
@@ -1051,7 +1113,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1067,9 +1129,13 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1101,7 +1167,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1111,12 +1177,17 @@ jobs:
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 25
         run: |
+          # Activate venv if available (GITHUB_ENV may have failed to propagate)
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             lmsys/sglang-ci-dsv3-test:4
 
       - name: Warmup Server CUDA Graphs
         timeout-minutes: 25
         run: |
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py \
             lmsys/sglang-ci-dsv3-test:4
 
@@ -1129,7 +1200,11 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+      - name: Cleanup venv
         if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1143,7 +1218,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 8-gpu-h200
+    runs-on: 8-gpu-h200-deepep
     timeout-minutes: 240
     steps:
       - name: Checkout code
@@ -1161,7 +1236,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1171,6 +1246,9 @@ jobs:
       - name: Warmup DeepGEMM JIT Compilation
         timeout-minutes: 25
         run: |
+          # Activate venv if available (GITHUB_ENV may have failed to propagate)
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             deepseek-ai/DeepSeek-V3.2-Exp:8
@@ -1178,6 +1256,8 @@ jobs:
       - name: Warmup Server CUDA Graphs
         timeout-minutes: 25
         run: |
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_server.py \
             deepseek-ai/DeepSeek-V3-0324:8
 
@@ -1190,7 +1270,11 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+      - name: Cleanup venv
         if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1209,7 +1293,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3]
+        part: [0, 1, 2, 3, 4, 5]
 
     steps:
       - name: Checkout code
@@ -1227,7 +1311,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda13.0
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1240,12 +1324,16 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
+
+      - name: Cleanup venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   # NOTE: GB200 stage temporarily disabled — no company-owned GB200 runner available yet.
   # Re-enable when a 4-gpu-gb200 runner is provisioned.
@@ -1281,7 +1369,7 @@ jobs:
   #       with:
   #         path: sgl-kernel/dist/
   #         merge-multiple: true
-  #         pattern: wheel-python3.10-cuda12.9-aarch64
+  #         pattern: wheel-python3.10-cuda13.0-aarch64
   #
   #     - name: Install dependencies
   #       timeout-minutes: 20
@@ -1297,7 +1385,7 @@ jobs:
   #         python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
   #
   #     - uses: ./.github/actions/upload-cuda-coredumps
-  #       if: always()
+  #       if: failure()
 
   pr-test-finish:
     needs:
