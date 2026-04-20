@@ -5,7 +5,6 @@ from typing import Callable, List
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -68,7 +67,11 @@ def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
 
 
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
-    # CP metadata (zigzag split) only supports batch=1 for now.
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+    # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
+    # the seq data needs to be divided and recombined at twice the size of cp_size.
     cur_cp_seq_len = seq_len // (cp_size * 2)
     return (
         cur_cp_seq_len != 0
