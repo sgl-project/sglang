@@ -5,7 +5,7 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache, SessionSlot
+from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
@@ -97,7 +97,7 @@ def test_streaming_release_kv_cache_defers_tail_free(monkeypatch):
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
-    tree_cache = SessionAwareCache(
+    tree_cache = StreamingSession(
         _FakeInnerCache(req_to_token_pool, allocator, page_size)
     )
     req = _FakeReq("session-a", req_pool_idx=0, committed=17, allocated=40)
@@ -137,7 +137,7 @@ def test_preabort_detaches_session_and_preserves_slot():
             )
         ],
     )
-    tree_cache = SessionAwareCache(inner)
+    tree_cache = StreamingSession(inner)
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=48,
@@ -173,7 +173,7 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    tree_cache = SessionAwareCache(inner)
+    tree_cache = StreamingSession(inner)
 
     # No slot exists yet (first request).
     req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=20)
@@ -202,7 +202,7 @@ def test_nth_mid_abort_nukes_session_slot():
     req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    tree_cache = SessionAwareCache(inner)
+    tree_cache = StreamingSession(inner)
 
     # Session already has a slot from a previous turn.
     tree_cache.slots["session-a"] = SessionSlot(
@@ -235,3 +235,39 @@ def test_nth_mid_abort_nukes_session_slot():
 # Shrink tests removed: streaming sessions are append-only after the
 # rollback fix in session_controller (rollback_aborted_req).  The shrink
 # code path in cache_finished_req no longer exists.
+
+
+def test_trim_overshoot_postcondition():
+    """`_trim_overshoot` postcondition: every per-req KV field is capped at
+    target = origin+finished_len, output_ids is truncated, and the tail
+    KV slots are freed. Covers both non-SWA fields (kv_committed_len,
+    kv_allocated_len, output_ids) and SWA bookkeeping (swa_evicted_seqlen)
+    in one shot — same invariant `_free_tail` enforces on the match_prefix
+    path.
+    """
+    page_size = 1
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    )
+
+    # Overshoot scenario: origin=26, finished_len=12 -> target=38.
+    # committed=40 (overshoot 2), allocated=44, swa_evicted=42 (> target),
+    # output_ids extended to 14 by the overshoot round.
+    req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
+    req.origin_input_ids = list(range(26))
+    req.output_ids = list(range(14))
+    req.swa_evicted_seqlen = 42
+
+    tree_cache._trim_overshoot(req, finished_len=12)
+
+    target = 38
+    assert req.kv_committed_len == target
+    assert req.kv_allocated_len == target
+    assert req.swa_evicted_seqlen == target
+    assert len(req.output_ids) == 12
+    # Tail [38, 44) freed by _free_kv_aligned.
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(38, 44))

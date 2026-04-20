@@ -1,12 +1,12 @@
 ARG BASE_IMG=pytorch/manylinux2_28-builder
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION=13.0
 
 # Dependency stage: install system deps, CMake, ccache, Python deps (including torch)
 FROM ${BASE_IMG}:cuda${CUDA_VERSION} AS deps
 
 # Overridable build arguments
 ARG ARCH=x86_64
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION=13.0
 ARG PYTHON_VERSION=3.10
 # Manylinux python path tag, e.g. cp310-cp310 / cp312-cp312
 ARG PYTHON_TAG=cp310-cp310

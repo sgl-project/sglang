@@ -143,7 +143,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
                 try:
-                    kill_process_tree(process.pid)
+                    kill_process_tree(process.pid, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 

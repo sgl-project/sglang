@@ -150,8 +150,27 @@ runs:
               }
 
               if (matchingJobs.length < spec.expected_count) {
-                console.log(`${spec.prefix}: found ${matchingJobs.length}/${spec.expected_count} jobs (waiting for more)`);
-                allCompleted = false;
+                // Job-level `if:` is evaluated before matrix expansion. When it
+                // evaluates false, GitHub emits exactly one "skipped" entry using
+                // the un-expanded job name (bare prefix, no " (shard)" suffix)
+                // instead of N matrix entries. Detect that precise shape so we
+                // don't poll forever — and so we don't mistake a partially
+                // materialized dynamic/reusable matrix for a skipped one.
+                const unexpandedSkip = matchingJobs.length === 1 &&
+                  matchingJobs[0].name === spec.prefix &&
+                  matchingJobs[0].status === 'completed' &&
+                  matchingJobs[0].conclusion === 'skipped';
+                if (unexpandedSkip) {
+                  const missing = spec.expected_count - 1;
+                  totalCount += missing;
+                  completedCount += missing;
+                  if (!cached) {
+                    console.log(`${spec.prefix}: job-level skip (bare entry, conclusion=skipped); treating as all ${spec.expected_count} skipped`);
+                  }
+                } else {
+                  console.log(`${spec.prefix}: found ${matchingJobs.length}/${spec.expected_count} jobs (waiting for more)`);
+                  allCompleted = false;
+                }
               }
             }
 

@@ -196,22 +196,20 @@ def build_prompt(job_id: str, repo_urls: list[str]) -> str:
 ## Your Environment
 
 - **Logs**: `/workspace/logs/`
-- **GitHub CLI**: `gh` is installed and authenticated if `GH_TOKEN` is present
+- **GitHub CLI**: `gh` is installed and authenticated.
 {repo_section}
 
-## Task
+## Job
 
-Analyze the log bundle for job `{job_id}`.
+You are analyzing job `{job_id}`. Follow Steps 1–5 in the prompt above.
 
-1. Read the logs in the priority order described above.
-2. Correlate timestamps to identify the most likely root cause.
-3. Use `gh` to inspect related PRs or commits if it materially helps.
-4. **You MUST write the final markdown report to `/workspace/logs/ai_analysis.md`.**
-   This is a hard requirement. Do not just print the report to stdout.
-   Use your file-writing tool to create `/workspace/logs/ai_analysis.md` with the
-   full analysis. The downstream pipeline reads this file.
+**You MUST write the final markdown report to `/workspace/logs/ai_analysis.md`.**
+This is a hard requirement. Do not just print the report to stdout. Use your
+file-writing tool to create `/workspace/logs/ai_analysis.md` with the full
+analysis. The downstream pipeline reads this file.
 
-Keep the report concise but concrete. Include evidence, likely root cause, and notable noise.
+**You MUST file GitHub issues when the root cause is clear (Category A or B).**
+Do not skip issue filing. The whole point of this system is automated triage.
 """
 
 
