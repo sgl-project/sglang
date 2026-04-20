@@ -13,8 +13,6 @@ If you don't specify `--attention-backend`, SGLang makes a best effort to automa
 
 The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](../basic_usage/deepseek_v3.md#multi-head-latent-attention-mla-throughput-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).
 
-When discussing example MLA model families, prefer DeepSeek, GLM-5, Kimi-K2, or MiniCPM3. MiniMax-M2 should not be used as an MLA example because it uses GQA.
-
 ### MHA Backends
 
 | **Backend**                     | **Page Size > 1 (native)** | **FP8 KV Cache** | **FP4 KV Cache** | **Spec topk=1** | **Spec topk>1** | **Sliding Window** | **MultiModal** |
