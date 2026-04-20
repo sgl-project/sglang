@@ -113,12 +113,6 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
 
 #     experts.append(-1)
 
-#     print(f"~~~~~~~~~~~~ offsets {offsets}")
-#     print(f"~~~~~~~~~~~~ experts {experts}")
-#     print(f"~~~~~~~~~~~~ list_size {len(experts)}")
-
-      
-
 #     return (
 #         torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
 #         torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
@@ -129,40 +123,59 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
 def build_offsets_experts_from_masked_m(
     masked_m: torch.Tensor, num_groups: int, max_m: int, block_m: int = 128
 ):
-    """CUDA-graph-safe builder.
+    """CUDA-graph-safe builder preserving the old compact ABI.
 
-    Produces a dense per-group layout: each group g occupies slot g, regardless of
-    whether it is active. The kernel launches with grid Y = num_groups and skips
-    blocks whose offset range is empty (m_start == m_end).
+    Active groups are packed contiguously to the front of the output buffers in
+    ascending group-id order. The layout is:
 
-    Returns:
-        offsets:   int32 tensor of shape (num_groups * 2,) with pairs
-                   [start_g, end_g] per group. Inactive groups get end_g == start_g.
-        experts:   int32 tensor of shape (num_groups + 1,); slot g holds the expert
-                   id g if active else -1, with a trailing -1 terminator.
-        list_size: 1-element int32 tensor = num_active + 1 (advisory; kept for ABI).
+        experts[0..num_active-1] = active group ids (ascending)
+        experts[num_active]      = -1 (terminator)
+        experts[num_active+1..]  = -1 (sentinel padding)
+        offsets[0..2*num_active-1] = packed [start_g0, end_g0, start_g1, end_g1, ...]
+        offsets[2*num_active..]  = 0, 0, 0, ... (sentinel pairs)
+        list_size = num_active + 1 (1-element int32 tensor)
+
+    Kernel launches grid Y = num_groups (CUDA-graph requirement). For
+    blockIdx.y >= num_active the sentinel offsets pair (0, 0) yields
+    m_start == m_end and the kernel early-exits.
+
+    Packing is done with a cumsum-based scatter (no boolean indexing, no host
+    copies of device scalars, no dynamic shapes), so this is capture-safe.
     """
     device = masked_m.device
 
     group_ids = torch.arange(num_groups, device=device, dtype=torch.int32)
     masked_m_i32 = masked_m.to(torch.int32)
     mask = masked_m_i32 > 0
+    mask_int = mask.to(torch.int32)
+
+    # Packed rank (0-indexed) for active groups: cumsum-1 in ascending group order.
+    # The value for inactive groups is meaningless; we redirect those writes
+    # to a discard slot at index num_groups (past the kernel's read range).
+    rank = mask_int.cumsum(0).to(torch.int32) - 1
+    discard_slot = torch.full_like(rank, num_groups)
+    write_idx = torch.where(mask, rank, discard_slot).to(torch.int64)
 
     starts = group_ids * max_m
     ends = starts + ((masked_m_i32 + (block_m - 1)) // block_m) * block_m
-    # Inactive groups: collapse range so the kernel block becomes a no-op.
-    ends = torch.where(mask, ends, starts)
 
-    # Dense per-group expert ids: g for active, -1 for inactive.
-    inactive_id = torch.full_like(group_ids, -1)
-    experts_dense = torch.where(mask, group_ids, inactive_id)
+    # Fixed-size buffers with one extra slot for inactive-write discard.
+    # experts initial fill of -1 doubles as the post-active terminator + sentinel
+    # padding; offsets initial fill of 0 makes unused pairs (0, 0) → sentinel.
+    experts_fixed = torch.full((num_groups + 1,), -1, device=device, dtype=torch.int32)
+    starts_buf = torch.zeros((num_groups + 1,), device=device, dtype=torch.int32)
+    ends_buf = torch.zeros((num_groups + 1,), device=device, dtype=torch.int32)
 
-    terminator = torch.full((1,), -1, device=device, dtype=torch.int32)
-    experts_fixed = torch.cat([experts_dense, terminator])
+    experts_fixed.scatter_(0, write_idx, group_ids)
+    starts_buf.scatter_(0, write_idx, starts)
+    ends_buf.scatter_(0, write_idx, ends)
 
-    offsets_fixed = torch.stack([starts, ends], dim=1).flatten()
+    # Interleave the kernel-visible range [0, num_groups) into pair layout.
+    offsets_fixed = torch.stack(
+        [starts_buf[:num_groups], ends_buf[:num_groups]], dim=1
+    ).flatten()
 
-    list_size = (mask.to(torch.int32).sum() + 1).to(torch.int32).view(1)
+    list_size = (mask_int.sum() + 1).to(torch.int32).view(1)
 
     return offsets_fixed, experts_fixed, list_size
 
