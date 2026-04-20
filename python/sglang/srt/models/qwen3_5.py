@@ -1502,7 +1502,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if (
                     self.config.tie_word_embeddings
                     and name == "model.embed_tokens.weight"
-                    and not (_is_cpu and _is_amx_available)
+                    and (_is_cpu and _is_amx_available)
                 ):
                     param_lm_head = params_dict["lm_head.weight"]
                     weight_loader = getattr(
