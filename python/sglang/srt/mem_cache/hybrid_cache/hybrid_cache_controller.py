@@ -257,6 +257,15 @@ class HybridCacheController(BaseHiCacheController):
         self.start_writing()
         return host_indices
 
+    @staticmethod
+    def _record_stream_transfers(pool_transfers, stream):
+        """Ensure transfer index tensors stay alive until *stream* finishes."""
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
+                transfer.host_indices.record_stream(stream)
+            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
+                transfer.device_indices.record_stream(stream)
+
     def move_indices(self, op):
         host_indices, device_indices = super().move_indices(op)
         for transfer in op.pool_transfers or []:
@@ -300,6 +309,7 @@ class HybridCacheController(BaseHiCacheController):
                 host_indices.record_stream(self.write_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
+            self._record_stream_transfers(op.pool_transfers, self.write_stream)
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(
@@ -364,6 +374,7 @@ class HybridCacheController(BaseHiCacheController):
                 host_indices.record_stream(self.load_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.load_stream)
+            self._record_stream_transfers(op.pool_transfers, self.load_stream)
         self.ack_load_queue.append(
             HiCacheAck(
                 producer_event.start_event,
