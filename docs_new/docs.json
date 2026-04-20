@@ -345,13 +345,14 @@
                     ]
                   },
                   {
-                    "group": "Moonshotai",
-                    "pages": [
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2",
-                      "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
-                      "cookbook/autoregressive/Moonshotai/Kimi-Linear"
-                    ]
-                  },
+                "group": "Moonshotai",
+                "pages": [
+                  "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
+                  "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
+                  "cookbook/autoregressive/Moonshotai/Kimi-K2",
+                  "cookbook/autoregressive/Moonshotai/Kimi-Linear"
+                ]
+              },
                   {
                     "group": "MiniMax",
                     "pages": [
