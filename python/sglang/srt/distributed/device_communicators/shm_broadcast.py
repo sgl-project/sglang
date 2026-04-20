@@ -16,7 +16,7 @@ from torch.distributed import ProcessGroup
 from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
-from sglang.srt.utils import get_ip, get_open_port, is_valid_ipv6_address
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto, get_open_port
 
 # SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
 SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
@@ -186,7 +186,9 @@ class MessageQueue:
         self.n_remote_reader = n_remote_reader
 
         if connect_ip is None:
-            connect_ip = get_ip() if n_remote_reader > 0 else "127.0.0.1"
+            connect_ip = (
+                get_local_ip_auto("0.0.0.0") if n_remote_reader > 0 else "127.0.0.1"
+            )
 
         context = Context()
 
@@ -208,7 +210,6 @@ class MessageQueue:
             socket_addr = f"tcp://127.0.0.1:{local_subscribe_port}"
             logger.debug("Binding to %s", socket_addr)
             self.local_socket.bind(socket_addr)
-
             self.current_idx = 0
 
         else:
@@ -223,11 +224,12 @@ class MessageQueue:
             self.remote_socket = context.socket(XPUB)
             self.remote_socket.setsockopt(XPUB_VERBOSE, True)
             remote_subscribe_port = get_open_port()
-            if is_valid_ipv6_address(connect_ip):
+            na = NetworkAddress(connect_ip, remote_subscribe_port)
+            if na.is_ipv6:
                 self.remote_socket.setsockopt(IPV6, 1)
-                connect_ip = f"[{connect_ip}]"
-            socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"
-            self.remote_socket.bind(socket_addr)
+            address = na.to_tcp()
+            logger.debug(f"class MessageQueue: Binding remote socket to {address=}")
+            self.remote_socket.bind(address)
 
         else:
             remote_subscribe_port = None
@@ -286,9 +288,10 @@ class MessageQueue:
 
             self.remote_socket = context.socket(SUB)
             self.remote_socket.setsockopt_string(SUBSCRIBE, "")
-            if is_valid_ipv6_address(handle.connect_ip):
+            na = NetworkAddress(handle.connect_ip, handle.remote_subscribe_port)
+            if na.is_ipv6:
                 self.remote_socket.setsockopt(IPV6, 1)
-            socket_addr = f"tcp://{handle.connect_ip}:{handle.remote_subscribe_port}"
+            socket_addr = na.to_tcp()
             logger.debug("Connecting to %s", socket_addr)
             self.remote_socket.connect(socket_addr)
 

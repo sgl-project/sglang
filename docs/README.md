@@ -1,12 +1,23 @@
 # SGLang Documentation
 
-We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase. Most documentation files are located under the `docs/` folder. We prefer **Jupyter Notebooks** over Markdown so that all examples can be executed and validated by our docs CI pipeline.
+This is the documentation website for the SGLang project (https://github.com/sgl-project/sglang).
+
+We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
+Most documentation files are located under the `docs/` folder.
 
 ## Docs Workflow
 
 ### Install Dependency
 
+**Linux:**
 ```bash
+apt-get update && apt-get install -y pandoc parallel retry
+pip install -r requirements.txt
+```
+
+**macOS:**
+```bash
+brew install pandoc parallel retry
 pip install -r requirements.txt
 ```
 
@@ -15,11 +26,11 @@ pip install -r requirements.txt
 Update your Jupyter notebooks in the appropriate subdirectories under `docs/`. If you add new files, remember to update `index.rst` (or relevant `.rst` files) accordingly.
 
 - **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
-- **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
 
 ```bash
 # 1) Compile all Jupyter notebooks
-make compile
+make compile  # This step can take a long time (10+ mins). You can consider skipping this step if you can make sure your added files are correct.
+make html
 
 # 2) Compile and Preview documentation locally with auto-build
 # This will automatically rebuild docs when files change
@@ -41,70 +52,80 @@ find . -name '*.ipynb' -exec nbstripout {} \;
 # After these checks pass, push your changes and open a PR on your branch
 pre-commit run --all-files
 ```
----
 
-### **Port Allocation and CI Efficiency**
+## Documentation Style Guidelines
 
-**To launch and kill the server:**
+- For common functionalities, we prefer **Jupyter Notebooks** over Markdown so that all examples can be executed and validated by our docs CI pipeline. For complex features (e.g., distributed serving), Markdown is preferred.
+- Keep in mind the documentation execution time when writing interactive Jupyter notebooks. Each interactive notebook will be run and compiled against every commit to ensure they are runnable, so it is important to apply some tips to reduce the documentation compilation time:
+  - Use small models (e.g., `qwen/qwen2.5-0.5b-instruct`) for most cases to reduce server launch time.
+  - Reuse the launched server as much as possible to reduce server launch time.
+- Do not use absolute links (e.g., `https://docs.sglang.io/get_started/install.html`). Always prefer relative links (e.g., `../get_started/install.md`).
+- Follow the existing examples to learn how to launch a server, send a query and other common styles.
 
-```python
-from sglang.test.test_utils import is_in_ci
-from sglang.utils import wait_for_server, print_highlight, terminate_process
+## Documentation Build, Deployment, and CI
 
-if is_in_ci():
-    from patch import launch_server_cmd
-else:
-    from sglang.utils import launch_server_cmd
+The SGLang documentation pipeline is based on **Sphinx** and supports rendering Jupyter notebooks (`.ipynb`) into HTML/Markdown for web display. Detailed logits can be found in the [Makefile](./Makefile).
 
-server_process, port = launch_server_cmd(
-    """
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
- --host 0.0.0.0
-"""
-)
+### Notebook Execution (`make compile`)
 
-wait_for_server(f"http://localhost:{port}")
+The `make compile` target is responsible for executing notebooks before rendering:
 
-# Terminate Server
-terminate_process(server_process)
+* Finds all `.ipynb` files under `docs/` (excluding `_build/`)
+* Executes notebooks in parallel using GNU Parallel, with a relatively small `--mem-fraction-static`
+* Wraps execution with `retry` to reduce flaky failures
+* Executes notebooks via `jupyter nbconvert --execute --inplace`
+* Records execution timing in `logs/timing.log`
+
+This step ensures notebooks contain up-to-date outputs with each commit in the main branch before rendering.
+
+### Web Rendering (`make html`)
+
+After compilation, Sphinx builds the website:
+
+* Reads Markdown, reStructuredText, and Jupyter notebooks
+* Renders them into HTML pages
+* Outputs the website into:
+
+```
+docs/_build/html/
 ```
 
-**To launch and kill the engine:**
+This directory is the source for online documentation hosting.
 
-```python
-# Launch Engine
-import sglang as sgl
-import asyncio
-from sglang.test.test_utils import is_in_ci
+### Markdown Export (`make markdown`)
 
-if is_in_ci():
-    import patch
+To support downstream consumers, we add a **new Makefile target**:
 
-llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
-
-# Terminalte Engine
-llm.shutdown()
+```bash
+make markdown
 ```
 
-### **Why this approach?**
+This target:
 
-- **Dynamic Port Allocation**: Avoids port conflicts by selecting an available port at runtime, enabling multiple server instances to run in parallel.
-- **Optimized for CI**: The `patch` version of `launch_server_cmd` and `sgl.Engine()` in CI environments helps manage GPU memory dynamically, preventing conflicts and improving test parallelism.
-- **Better Parallel Execution**: Ensures smooth concurrent tests by avoiding fixed port collisions and optimizing memory usage.
+* Does **not modify** `make compile`
+* Scans all `.ipynb` files (excluding `_build/`)
+* Converts notebooks directly to Markdown using `jupyter nbconvert --to markdown`
+* Writes Markdown artifacts into the existing build directory:
 
-### **Model Selection**
-
-For demonstrations in the docs, **prefer smaller models** to reduce memory consumption and speed up inference. Running larger models in CI can lead to instability due to memory constraints.
-
-### **Prompt Alignment Example**
-
-When designing prompts, ensure they align with SGLang's structured formatting. For example:
-
-```python
-prompt = """You are an AI assistant. Answer concisely and accurately.
-
-User: What is the capital of France?
-Assistant: The capital of France is Paris."""
+```
+docs/_build/html/markdown/<relative-path>.md
 ```
 
-This keeps responses aligned with expected behavior and improves reliability across different files.
+Example:
+
+```
+docs/advanced_features/lora.ipynb
+→ docs/_build/html/markdown/advanced_features/lora.md
+```
+
+### CI Execution
+
+In our [CI](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-docs.yml), the documentation pipeline first gets all the executed results and renders HTML and Markdown by:
+
+```bash
+make compile    # execute notebooks (ensure outputs are up to date)
+make html       # build website as usual
+make markdown   # export markdown artifacts into _build/html/markdown
+```
+
+Then, the compiled results are forced pushed to [sgl-project.io](https://github.com/sgl-project/sgl-project.github.io) for rendering. In other words, sgl-project.io is push-only. All the changes of SGLang docs should be made directly in SGLang main repo, then push to the sgl-project.io.

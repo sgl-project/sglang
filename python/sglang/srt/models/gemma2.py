@@ -39,7 +39,9 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_npu, make_layers
+
+_is_npu = is_npu()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -142,13 +144,28 @@ class Gemma2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=self.rope_theta,
-            is_neox_style=True,
-        )
+        if (
+            not _is_npu
+            or "Gemma2ForSequenceClassification" not in self.config.architectures
+        ):
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=self.rope_theta,
+                is_neox_style=True,
+            )
+            logit_cap = self.config.attn_logit_softcapping
+        else:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=self.rope_theta,
+                is_neox_style=True,
+                dtype=torch.float32,
+            )
+            logit_cap = 0.0
 
         use_sliding_window = layer_id % 2 == 0 and hasattr(config, "sliding_window")
         self.attn = RadixAttention(
@@ -157,7 +174,7 @@ class Gemma2Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            logit_cap=self.config.attn_logit_softcapping,
+            logit_cap=logit_cap,
             sliding_window_size=(
                 get_attention_sliding_window_size(config)
                 if use_sliding_window
@@ -200,7 +217,7 @@ class Gemma2DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=config.rope_parameters["rope_theta"],
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
@@ -294,7 +311,9 @@ class Gemma2Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=torch.float16)
+        normalizer = torch.tensor(
+            self.config.hidden_size**0.5, dtype=hidden_states.dtype
+        )
         hidden_states *= normalizer
 
         residual = None
@@ -431,40 +450,6 @@ class Gemma2ForCausalLM(nn.Module):
             result = None
 
         return result
-
-    def get_hidden_dim(self, module_name):
-        # return input_dim, output_dim
-        if module_name in ["q_proj", "qkv_proj"]:
-            return (
-                self.config.hidden_size,
-                self.config.head_dim * self.config.num_attention_heads,
-            )
-        elif module_name in ["o_proj"]:
-            return (
-                self.config.head_dim * self.config.num_attention_heads,
-                self.config.hidden_size,
-            )
-        elif module_name in ["kv_proj"]:
-            return (
-                self.config.hidden_size,
-                self.config.head_dim * self.config.num_key_value_heads,
-            )
-        elif module_name == "gate_up_proj":
-            return self.config.hidden_size, self.config.intermediate_size
-        elif module_name == "down_proj":
-            return self.config.intermediate_size, self.config.hidden_size
-        else:
-            raise NotImplementedError()
-
-    def get_module_name(self, name):
-        params_mapping = {
-            "q_proj": "qkv_proj",
-            "k_proj": "qkv_proj",
-            "v_proj": "qkv_proj",
-            "gate_proj": "gate_up_proj",
-            "up_proj": "gate_up_proj",
-        }
-        return params_mapping.get(name, name)
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)

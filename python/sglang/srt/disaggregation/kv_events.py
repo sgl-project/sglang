@@ -56,16 +56,40 @@ class KVCacheEvent(
     """Base class for all KV cache-related events"""
 
 
+# Medium values for hicache storage tiers
+MEDIUM_GPU = "GPU"
+MEDIUM_CPU = "CPU_PINNED"
+
+
+class OffloadedState:
+    """
+    OffloadedState represents the state of a KV cache block offloaded to the hicache.
+
+    - prefill_len (int): The length of the prefill part of the KV cache block.
+    - inc_len (int): The length of the incremental part of the KV cache block.
+    - last_hash (Optional[str]): The hash of the last token in the KV cache block.
+    """
+
+    def __init__(
+        self, prefill_len: int, inc_len: int = 0, last_hash: Optional[str] = None
+    ):
+        self.prefill_len = prefill_len
+        self.inc_len = inc_len
+        self.last_hash = last_hash
+
+
 class BlockStored(KVCacheEvent):
     block_hashes: list[int]
     parent_block_hash: Optional[int]
     token_ids: list[int]
     block_size: int
     lora_id: Optional[int]
+    medium: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    medium: Optional[str] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
@@ -238,6 +262,9 @@ class ZmqEventPublisher(EventPublisher):
                 or self._endpoint.startswith("ipc://")
                 or self._endpoint.startswith("inproc://")
             ):
+                logger.debug(
+                    f"ZmqEventPublisher socket publisher_endpoint bind to {self._endpoint}"
+                )
                 self._pub.bind(self._endpoint)
             else:
                 self._pub.connect(self._endpoint)
@@ -248,6 +275,9 @@ class ZmqEventPublisher(EventPublisher):
         # 3) works in our non‑blocking poll loop alongside PUB
         if self._replay_endpoint is not None:
             self._replay = self._ctx.socket(zmq.ROUTER)
+            logger.debug(
+                f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
+            )
             self._replay.bind(self._replay_endpoint)
 
     def _publisher_thread(self) -> None:

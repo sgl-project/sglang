@@ -1,0 +1,97 @@
+{
+    "1": {
+      "inputs": {
+        "base_url": "http://localhost:3000/v1",
+        "api_key": "sk-proj-1234567890"
+      },
+      "class_type": "SGLDiffusionServerModel",
+      "_meta": {
+        "title": "SGLDiffusion Server Model"
+      }
+    },
+    "3": {
+      "inputs": {
+        "prompt": "The girl turn the body and spin around in place.",
+        "main": "none",
+        "lighting": "none",
+        "speak_and_recognation": {
+          "__value__": [
+            false,
+            true
+          ]
+        }
+      },
+      "class_type": "easy prompt",
+      "_meta": {
+        "title": "Prompt"
+      }
+    },
+    "4": {
+      "inputs": {
+        "text": "",
+        "anything": [
+          "1",
+          1
+        ]
+      },
+      "class_type": "easy showAnything",
+      "_meta": {
+        "title": "Show Any"
+      }
+    },
+    "15": {
+      "inputs": {
+        "positive_prompt": [
+          "3",
+          0
+        ],
+        "negative_prompt": "",
+        "seed": 2435791308,
+        "steps": 50,
+        "cfg": 4,
+        "width": 704,
+        "height": 1280,
+        "num_frames": 16,
+        "fps": 16,
+        "seconds": 1,
+        "enable_teacache": false,
+        "sgld_client": [
+          "1",
+          0
+        ],
+        "image": [
+          "17",
+          0
+        ]
+      },
+      "class_type": "SGLDiffusionGenerateVideo",
+      "_meta": {
+        "title": "SGLDiffusion Generate Video"
+      }
+    },
+    "16": {
+      "inputs": {
+        "filename_prefix": "video/ComfyUI",
+        "format": "auto",
+        "codec": "auto",
+        "video-preview": "",
+        "video": [
+          "15",
+          0
+        ]
+      },
+      "class_type": "SaveVideo",
+      "_meta": {
+        "title": "save video"
+      }
+    },
+    "17": {
+      "inputs": {
+        "image": "tmpe_w0bd_0.jpg"
+      },
+      "class_type": "LoadImage",
+      "_meta": {
+        "title": "load image"
+      }
+    }
+  }

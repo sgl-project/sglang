@@ -43,6 +43,7 @@ class GraniteMoeMoE(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
@@ -71,10 +72,10 @@ class GraniteMoeMoE(nn.Module):
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            layer_id=layer_id,
             params_dtype=params_dtype,
             reduce_results=True,
             quant_config=quant_config,
-            tp_size=tp_size,
             prefix=f"{prefix}.experts",
         )
 
@@ -186,7 +187,7 @@ class GraniteMoeDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         self.self_attn = GraniteMoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -203,6 +204,7 @@ class GraniteMoeDecoderLayer(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
+            layer_id=layer_id,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe",
         )

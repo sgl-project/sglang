@@ -23,6 +23,7 @@ limitations under the License.
 #ifndef USE_ROCM
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
+#include <cuda/functional>
 #else
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
@@ -32,6 +33,18 @@ limitations under the License.
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+// Define reduction operators based on CUDA version
+// CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
+#if CUDA_VERSION >= 12090
+using MaxReduceOp = cuda::maximum<>;
+using MinReduceOp = cuda::minimum<>;
+#else
+using MaxReduceOp = cub::Max;
+using MinReduceOp = cub::Min;
+#endif
+
+using cub_kvp = cub::KeyValuePair<int, float>;
 
 /// Aligned array type
 template <
@@ -62,8 +75,13 @@ __device__ float convert_to_float(T x) {
 // We have our own implementation of softmax here so we can support transposing the output
 // in the softmax kernel when we extend this module to support expert-choice routing.
 template <typename T, int TPB>
-__launch_bounds__(TPB) __global__
-    void moeSoftmax(const T* input, const bool* finished, float* output, const int num_cols) {
+__launch_bounds__(TPB) __global__ void moeSoftmax(
+    const T* input,
+    const bool* finished,
+    float* output,
+    const int num_cols,
+    const float moe_softcapping,
+    const float* correction_bias) {
   using BlockReduce = cub::BlockReduce<float, TPB>;
   __shared__ typename BlockReduce::TempStorage tmpStorage;
 
@@ -72,7 +90,6 @@ __launch_bounds__(TPB) __global__
 
   const int thread_row_offset = blockIdx.x * num_cols;
 
-  cub::Sum sum;
   float threadData(-FLT_MAX);
 
   // Don't touch finished rows.
@@ -80,42 +97,170 @@ __launch_bounds__(TPB) __global__
     return;
   }
 
+  // First pass: Apply transformation, find max, and write transformed values to output
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
     const int idx = thread_row_offset + ii;
-    threadData = max(convert_to_float<T>(input[idx]), threadData);
+    float val = convert_to_float<T>(input[idx]);
+
+    // Apply tanh softcapping if enabled
+    if (moe_softcapping != 0.0f) {
+      val = tanhf(val / moe_softcapping) * moe_softcapping;
+    }
+
+    // Apply correction bias if provided
+    if (correction_bias != nullptr) {
+      val = val + correction_bias[ii];
+    }
+
+    output[idx] = val;  // Store transformed value
+    threadData = max(val, threadData);
   }
 
-  const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, cub::Max());
+  const float maxElem = BlockReduce(tmpStorage).Reduce(threadData, MaxReduceOp());
 
   if (threadIdx.x == 0) {
     float_max = maxElem;
   }
   __syncthreads();
 
+  // Second pass: Compute sum using transformed values from output
   threadData = 0;
-
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
     const int idx = thread_row_offset + ii;
-    threadData += exp((convert_to_float<T>(input[idx]) - float_max));
+    threadData += exp((output[idx] - float_max));
   }
 
-  const auto Z = BlockReduce(tmpStorage).Reduce(threadData, sum);
+  const auto Z = BlockReduce(tmpStorage).Sum(threadData);
 
   if (threadIdx.x == 0) {
     normalizing_factor = 1.f / Z;
   }
   __syncthreads();
 
+  // Third pass: Compute final softmax using transformed values from output
   for (int ii = threadIdx.x; ii < num_cols; ii += TPB) {
     const int idx = thread_row_offset + ii;
-    const float val = exp((convert_to_float<T>(input[idx]) - float_max)) * normalizing_factor;
-    output[idx] = val;
+    const float softmax_val = exp((output[idx] - float_max)) * normalizing_factor;
+    output[idx] = softmax_val;
+  }
+}
+
+namespace moe {
+struct TopKPair {
+  static const int PAIR = 2;
+  static const int MAX_INDEX = 0;
+  cub_kvp max;
+  cub_kvp secondMax;
+
+  __device__ TopKPair() {}
+  __device__ TopKPair(cub_kvp max, cub_kvp secondMax) : max(max), secondMax(secondMax) {}
+};
+
+struct TopKPairArgMax {
+  __device__ TopKPairArgMax() {}
+  __device__ __forceinline__ TopKPair operator()(const TopKPair& candidate1, const TopKPair& candidate2) const {
+    cub_kvp globalMax, globalSecondMax;
+
+    // Determine the global maximum
+    if (candidate1.max.value > candidate2.max.value) {
+      globalMax = candidate1.max;
+    } else {
+      globalMax = candidate2.max;
+    }
+
+    // Determine the global second maximum
+    if (globalMax.key == candidate1.max.key) {
+      // If candidate1 contributed the max, compare its secondMax with candidate2's max
+      globalSecondMax = (candidate1.secondMax.value > candidate2.max.value) ? candidate1.secondMax : candidate2.max;
+    } else {
+      // If candidate2 contributed the max, compare its secondMax with candidate1's max
+      globalSecondMax = (candidate2.secondMax.value > candidate1.max.value) ? candidate2.secondMax : candidate1.max;
+    }
+    return TopKPair(globalMax, globalSecondMax);
+  }
+};
+}  // namespace moe
+
+template <int TPB>
+__launch_bounds__(TPB) __global__ void moeTopKFast(
+    float* inputs_after_softmax,
+    const bool* finished,
+    float* output,
+    int* indices,
+    const int num_experts,
+    const int k,
+    const int start_expert,
+    const int end_expert,
+    const bool renormalize) {
+  using namespace moe;
+  using BlockReduce = cub::BlockReduce<TopKPair, TPB>;
+  __shared__ typename BlockReduce::TempStorage tmpStorage;
+  TopKPair thread_pair;
+
+  const int block_row = blockIdx.x;
+
+  const bool row_is_active = finished ? !finished[block_row] : true;
+  const int thread_read_offset = blockIdx.x * num_experts;
+  float row_sum_for_renormalize = 0;
+  // Each loop finds the top 2 elements,
+  // thus requiring only ⌈k/2⌉ loops (calculated as (k + 1) / 2).
+  for (int k_idx = 0; k_idx < (k + TopKPair::PAIR - 1) / TopKPair::PAIR; ++k_idx) {
+    // Initializing the top 2 elements by the minimum value.
+    thread_pair.max.key = 0;
+    thread_pair.max.value = -1.f;
+    thread_pair.secondMax.key = 0;
+    thread_pair.secondMax.value = -1.f;
+
+    cub_kvp inp_kvp;
+    for (int expert = threadIdx.x; expert < num_experts; expert += TPB) {
+      const int idx = thread_read_offset + expert;
+      inp_kvp.key = expert;
+      inp_kvp.value = inputs_after_softmax[idx];
+      // updating the thread_pair according to inp_kvp's value
+      if (inp_kvp.value > thread_pair.max.value) {
+        thread_pair.secondMax = thread_pair.max;
+        thread_pair.max = inp_kvp;
+      } else if (inp_kvp.value > thread_pair.secondMax.value) {
+        thread_pair.secondMax = inp_kvp;
+      }
+    }
+
+    TopKPairArgMax reducer;
+    const TopKPair result_pair = BlockReduce(tmpStorage).Reduce(thread_pair, reducer);
+    if (threadIdx.x == 0) {
+#pragma unroll
+      // updating 2 elements to the result.
+      for (int i = 0; i < TopKPair::PAIR; i++) {
+        if (k_idx * 2 + i >= k) break;
+        cub_kvp result = (i == TopKPair::MAX_INDEX) ? result_pair.max : result_pair.secondMax;
+        int expert = result.key;
+        bool node_uses_expert = expert >= start_expert && expert < end_expert;
+        bool should_process_row = row_is_active && node_uses_expert;
+        // The inputs_after_softmax is modified in-place to avoid unnecessary loops for finding the top k-1 value.
+        // 1.f represents the minimum value.
+        inputs_after_softmax[thread_read_offset + expert] = -1.f;
+        int idx = k * block_row + k_idx * 2 + i;
+        output[idx] = result.value;
+        indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
+        assert(indices[idx] >= 0);
+        row_sum_for_renormalize += result.value;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (renormalize && threadIdx.x == 0) {
+    float row_sum_for_renormalize_inv = 1.f / row_sum_for_renormalize;
+    for (int k_idx = 0; k_idx < k; ++k_idx) {
+      const int idx = k * block_row + k_idx;
+      output[idx] = output[idx] * row_sum_for_renormalize_inv;
+    }
   }
 }
 
 template <int TPB>
 __launch_bounds__(TPB) __global__ void moeTopK(
-    const float* inputs_after_softmax,
+    float* inputs_after_softmax,
     const bool* finished,
     float* output,
     int* indices,
@@ -145,15 +290,6 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       const int idx = thread_read_offset + expert;
       inp_kvp.key = expert;
       inp_kvp.value = inputs_after_softmax[idx];
-
-      for (int prior_k = 0; prior_k < k_idx; ++prior_k) {
-        const int prior_winning_expert = indices[k * block_row + prior_k];
-
-        if (prior_winning_expert == expert) {
-          inp_kvp = thread_kvp;
-        }
-      }
-
       thread_kvp = arg_max(inp_kvp, thread_kvp);
     }
 
@@ -169,6 +305,9 @@ __launch_bounds__(TPB) __global__ void moeTopK(
       indices[idx] = should_process_row ? (expert - start_expert) : num_experts;
       assert(indices[idx] >= 0);
       row_sum_for_renormalize += result_kvp.value;
+      // The inputs_after_softmax is modified in-place to avoid unnecessary loops for finding the top k-1 value.
+      // 1.f represents the minimum value.
+      inputs_after_softmax[thread_read_offset + expert] = -1.f;
     }
     __syncthreads();
   }
@@ -206,7 +345,9 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
     const int k,
     const int start_expert,
     const int end_expert,
-    const bool renormalize) {
+    const bool renormalize,
+    const float moe_softcapping,
+    const float* correction_bias) {
   // We begin by enforcing compile time assertions and setting up compile time constants.
   static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
   static_assert(NUM_EXPERTS == (NUM_EXPERTS & -NUM_EXPERTS), "NUM_EXPERTS must be power of 2");
@@ -273,14 +414,46 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
   AccessType* row_chunk_vec_ptr = reinterpret_cast<AccessType*>(&row_chunk_temp);
   const AccessType* vec_thread_read_ptr = reinterpret_cast<const AccessType*>(thread_read_ptr);
 #pragma unroll
+  // Note(Byron): interleaved loads to achieve better memory coalescing
+  // | thread[0] | thread[1] | thread[2] | thread[3] | thread[0] | thread[1] | thread[2] | thread[3] | ...
   for (int ii = 0; ii < LDG_PER_THREAD; ++ii) {
     row_chunk_vec_ptr[ii] = vec_thread_read_ptr[ii * THREADS_PER_ROW];
   }
 
   float row_chunk[VPT];
 #pragma unroll
+  // Note(Byron): upcast logits to float32
   for (int ii = 0; ii < VPT; ++ii) {
     row_chunk[ii] = convert_to_float<T>(row_chunk_temp[ii]);
+  }
+
+  // Apply tanh softcapping and correction bias
+  if (moe_softcapping != 0.0f || correction_bias != nullptr) {
+#pragma unroll
+    for (int ii = 0; ii < VPT; ++ii) {
+      float val = row_chunk[ii];
+
+      // Apply tanh softcapping if enabled
+      if (moe_softcapping != 0.0f) {
+        val = tanhf(val / moe_softcapping) * moe_softcapping;
+      }
+
+      // Apply correction bias if provided
+      if (correction_bias != nullptr) {
+        /*
+        LDG is interleaved
+        |thread0 LDG| |thread1 LDG| |thread0 LDG| |thread1 LDG|
+        |--------- group0 --------| |----------group1 --------|
+                                      ^ local2
+        */
+        const int group_id = ii / ELTS_PER_LDG;
+        const int local_id = ii % ELTS_PER_LDG;
+        const int expert_idx = first_elt_read_by_thread + group_id * THREADS_PER_ROW * ELTS_PER_LDG + local_id;
+        val = val + correction_bias[expert_idx];
+      }
+
+      row_chunk[ii] = val;
+    }
   }
 
   // First, we perform a max reduce within the thread. We can do the max in fp16 safely (I think) and just
@@ -291,9 +464,15 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
     thread_max = max(thread_max, row_chunk[ii]);
   }
 
+  /*********************************/
+  /********* Softmax Begin *********/
+  /*********************************/
+
 // Now, we find the max within the thread group and distribute among the threads. We use a butterfly reduce.
+// lane id: 0-31 within a warp
 #pragma unroll
   for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
+    // butterfly reduce with (lane id ^ mask)
     thread_max = max(thread_max, SGLANG_SHFL_XOR_SYNC_WIDTH(0xffffffff, thread_max, mask, THREADS_PER_ROW));
   }
 
@@ -323,6 +502,9 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
   for (int ii = 0; ii < VPT; ++ii) {
     row_chunk[ii] = row_chunk[ii] * reciprocal_row_sum;
   }
+  /*******************************/
+  /********* Softmax End *********/
+  /*******************************/
 
   // Now, softmax_res contains the softmax of the row chunk. Now, I want to find the topk elements in each row, along
   // with the max index.
@@ -428,6 +610,8 @@ void topkGatingSoftmaxLauncherHelper(
     const int start_expert,
     const int end_expert,
     const bool renormalize,
+    const float moe_softcapping,
+    const float* correction_bias,
     cudaStream_t stream) {
   static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
@@ -440,12 +624,33 @@ void topkGatingSoftmaxLauncherHelper(
 
   dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
   topkGatingSoftmax<T, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG><<<num_blocks, block_dim, 0, stream>>>(
-      input, finished, output, num_rows, indices, k, start_expert, end_expert, renormalize);
+      input,
+      finished,
+      output,
+      num_rows,
+      indices,
+      k,
+      start_expert,
+      end_expert,
+      renormalize,
+      moe_softcapping,
+      correction_bias);
 }
 
 #define LAUNCH_SOFTMAX(TYPE, NUM_EXPERTS, WARPS_PER_TB)             \
   topkGatingSoftmaxLauncherHelper<TYPE, NUM_EXPERTS, WARPS_PER_TB>( \
-      gating_output, nullptr, topk_weights, topk_indices, num_tokens, topk, 0, num_experts, renormalize, stream);
+      gating_output,                                                \
+      nullptr,                                                      \
+      topk_weights,                                                 \
+      topk_indices,                                                 \
+      num_tokens,                                                   \
+      topk,                                                         \
+      0,                                                            \
+      num_experts,                                                  \
+      renormalize,                                                  \
+      moe_softcapping,                                              \
+      correction_bias,                                              \
+      stream);
 
 template <typename T>
 void topkGatingSoftmaxKernelLauncher(
@@ -457,6 +662,8 @@ void topkGatingSoftmaxKernelLauncher(
     const int num_experts,
     const int topk,
     const bool renormalize,
+    const float moe_softcapping,
+    const float* correction_bias,
     cudaStream_t stream) {
   static constexpr int WARPS_PER_TB = 4;
   switch (num_experts) {
@@ -492,19 +699,28 @@ void topkGatingSoftmaxKernelLauncher(
           softmax_workspace != nullptr,
           "softmax_workspace must be provided for num_experts that are not a power of 2.");
       static constexpr int TPB = 256;
-      moeSoftmax<T, TPB><<<num_tokens, TPB, 0, stream>>>(gating_output, nullptr, softmax_workspace, num_experts);
-      moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
-          softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
+      moeSoftmax<T, TPB><<<num_tokens, TPB, 0, stream>>>(
+          gating_output, nullptr, softmax_workspace, num_experts, moe_softcapping, correction_bias);
+      if (topk == 1) {
+        // Note: As an optimization for better performance,
+        // the softmax_workspace is overwritten in-place by both moeTopK and moeTopKFast.
+        moeTopK<TPB><<<num_tokens, TPB, 0, stream>>>(
+            softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
+      } else {
+        moeTopKFast<TPB><<<num_tokens, TPB, 0, stream>>>(
+            softmax_workspace, nullptr, topk_weights, topk_indices, num_experts, topk, 0, num_experts, renormalize);
+      }
     }
   }
 }
 
 void topk_softmax(
-    torch::Tensor& topk_weights,  // [num_tokens, topk]
-    torch::Tensor& topk_indices,  // [num_tokens, topk]
-    torch::Tensor& gating_output,
-    const bool renormalize)  // [num_tokens, num_experts]
-{
+    torch::Tensor& topk_weights,   // [num_tokens, topk]
+    torch::Tensor& topk_indices,   // [num_tokens, topk]
+    torch::Tensor& gating_output,  // [num_tokens, num_experts]
+    const bool renormalize,
+    const double moe_softcapping,
+    const c10::optional<torch::Tensor>& correction_bias) {
   // Check data type
   TORCH_CHECK(
       gating_output.scalar_type() == at::ScalarType::Float || gating_output.scalar_type() == at::ScalarType::Half ||
@@ -542,6 +758,23 @@ void topk_softmax(
       torch::empty({workspace_size}, gating_output.options().dtype(at::ScalarType::Float));
 
   const at::ScalarType dtype = gating_output.scalar_type();
+
+  // Validate correction_bias if provided - must always be float32
+  const float* bias_ptr = nullptr;
+  if (correction_bias.has_value()) {
+    const torch::Tensor& bias_tensor = correction_bias.value();
+    TORCH_CHECK(bias_tensor.dim() == 1, "correction_bias must be 1D tensor [num_experts]");
+    TORCH_CHECK(bias_tensor.size(0) == num_experts, "correction_bias size must match num_experts");
+    TORCH_CHECK(
+        bias_tensor.scalar_type() == at::ScalarType::Float,
+        "correction_bias must be float32, got ",
+        bias_tensor.scalar_type());
+    bias_ptr = bias_tensor.data_ptr<float>();
+  }
+
+  // Cast moe_softcapping from double to float for CUDA kernels
+  const float moe_softcapping_f = static_cast<float>(moe_softcapping);
+
   if (dtype == at::ScalarType::Float) {
     topkGatingSoftmaxKernelLauncher<float>(
         gating_output.data_ptr<float>(),
@@ -552,6 +785,8 @@ void topk_softmax(
         num_experts,
         topk,
         renormalize,
+        moe_softcapping_f,
+        bias_ptr,
         stream);
   } else if (dtype == at::ScalarType::Half) {
     topkGatingSoftmaxKernelLauncher<__half>(
@@ -563,6 +798,8 @@ void topk_softmax(
         num_experts,
         topk,
         renormalize,
+        moe_softcapping_f,
+        bias_ptr,
         stream);
   } else if (dtype == at::ScalarType::BFloat16) {
     topkGatingSoftmaxKernelLauncher<__nv_bfloat16>(
@@ -574,6 +811,8 @@ void topk_softmax(
         num_experts,
         topk,
         renormalize,
+        moe_softcapping_f,
+        bias_ptr,
         stream);
   } else {
     TORCH_CHECK(false, "Unsupported gating_output dtype: ", dtype);

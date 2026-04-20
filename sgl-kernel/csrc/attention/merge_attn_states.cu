@@ -176,8 +176,10 @@ void merge_attn_states_launcher(
   LAUNCH_MERGE_ATTN_STATES(scalar_t, NUM_THREADS);
 }
 
-#define CALL_MERGE_ATTN_STATES_LAUNCHER(scalar_t) \
-  { merge_attn_states_launcher<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
+#define CALL_MERGE_ATTN_STATES_LAUNCHER(scalar_t)                                 \
+  {                                                                               \
+    merge_attn_states_launcher<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); \
+  }
 
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {

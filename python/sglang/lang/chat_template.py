@@ -398,6 +398,21 @@ register_chat_template(
             "user": ("<start_of_turn>user\n", "<end_of_turn>\n"),
             "assistant": ("<start_of_turn>model\n", "<end_of_turn>\n"),
         },
+        image_token="<start_of_image>",
+        audio_token="<start_of_audio>",
+        style=ChatTemplateStyle.PLAIN,
+    )
+)
+
+register_chat_template(
+    ChatTemplate(
+        name="gemma-4-it",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("", ""),
+            "user": ("<|turn>user\n", "<turn|>\n"),
+            "assistant": ("<|turn>assistant\n", "<turn|>\n"),
+        },
         style=ChatTemplateStyle.PLAIN,
     )
 )
@@ -439,6 +454,19 @@ register_chat_template(
     ChatTemplate(
         name="internvl-2-5",
         default_system_prompt="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
+        role_prefix_and_suffix={
+            "system": ("<|im_start|>system\n", "<|im_end|>\n"),
+            "user": ("<|im_start|>user\n", "<|im_end|>\n"),
+            "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
+        },
+        stop_str=["<|im_end|>", "<|action_end|>"],
+    )
+)
+
+register_chat_template(
+    ChatTemplate(
+        name="interns1",
+        default_system_prompt="You are an AI assistant whose name is Intern-S1 (书生大模型).\n- Intern-S1 (书生大模型) is a vision-language model that is developed by Shanghai AI Laboratory (上海人工智能实验室).  It is designed to be helpful, honest, and harmless.\n- Intern-S1 (书生大模型) can understand and communicate fluently in the language chosen by the user such as English and 中文.\nYou are an expert reasoner with extensive experience in all areas. You approach problems through systematic thinking and rigorous reasoning. Your response should reflect deep understanding and precise logical thinking, making your solution path and reasoning clear to others. Please put your thinking process within <think>...</think> tags.",
         role_prefix_and_suffix={
             "system": ("<|im_start|>system\n", "<|im_end|>\n"),
             "user": ("<|im_start|>user\n", "<|im_end|>\n"),
@@ -492,6 +520,22 @@ register_chat_template(
     )
 )
 
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/glm4_v#usage-example
+register_chat_template(
+    ChatTemplate(
+        name="glm-4v",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("<|system|>\n", "\n"),
+            "user": ("<|user|>\n", "\n"),
+            "assistant": ("<|assistant|>\n", "\n"),
+        },
+        style=ChatTemplateStyle.PLAIN,
+        stop_str=["<|user|>", "<|endoftext|>", "<|observation|>"],
+        image_token="<|image|>",
+    )
+)
+
 
 @register_chat_template_matching_function
 def match_deepseek(model_path: str):
@@ -499,6 +543,12 @@ def match_deepseek(model_path: str):
         r"base", model_path, re.IGNORECASE
     ):
         return "deepseek-v3"
+
+
+@register_chat_template_matching_function
+def match_orion(model_path: str):
+    if "orion" in model_path.lower():
+        return "claude"
 
 
 @register_chat_template_matching_function
@@ -549,6 +599,8 @@ def match_chat_ml(model_path: str):
         return "chatml"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+    if re.search(r"glm[-_]?4(\.\d+)?v", model_path, re.IGNORECASE):
+        return "glm-4v"
     if re.search(r"qwen.*(chat|instruct)", model_path, re.IGNORECASE) and not re.search(
         r"llava", model_path, re.IGNORECASE
     ):
@@ -572,8 +624,10 @@ def match_chat_yi(model_path: str):
 
 
 @register_chat_template_matching_function
-def match_gemma_it(model_path: str):
-    if re.search(r"gemma.*it", model_path, re.IGNORECASE):
+def match_gemma(model_path: str):
+    if re.search(r"gemma-4.*it", model_path, re.IGNORECASE):
+        return "gemma-4-it"
+    if re.search(r"(gemma.*it)|(gemma-3)", model_path, re.IGNORECASE):
         return "gemma-it"
 
 
@@ -598,15 +652,17 @@ def match_granite_instruct(model_path: str):
 
 
 @register_chat_template_matching_function
-def match_gemma3_instruct(model_path: str):
-    if re.search(r"gemma-3", model_path, re.IGNORECASE):
-        return "gemma-it"
-
-
-@register_chat_template_matching_function
 def match_internvl_chat(model_path: str):
     if re.search(r"internvl2_5", model_path, re.IGNORECASE):
         return "internvl-2-5"
+
+
+@register_chat_template_matching_function
+def match_interns1_chat(model_path: str):
+    if re.search(r"intern-s1", model_path, re.IGNORECASE):
+        return "interns1"
+    if re.search(r"interns1", model_path, re.IGNORECASE):
+        return "interns1"
 
 
 if __name__ == "__main__":

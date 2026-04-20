@@ -1,0 +1,7 @@
+# Basic configurations
+chunk_size: 256
+
+# CPU offloading configurations
+local_cpu: true
+use_layerwise: true
+max_local_cpu_size: 10 # number of CPU backend GB

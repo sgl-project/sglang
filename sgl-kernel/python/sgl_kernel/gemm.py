@@ -1,7 +1,7 @@
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import torch
-from sgl_kernel.utils import _get_cache_buf, get_cuda_stream
+from sgl_kernel.utils import _get_cache_buf
 
 
 def awq_dequantize(
@@ -59,7 +59,6 @@ def _bmm_fp8_internal(
         B_scale,
         workspace_buffer,
         cublas_handle,
-        get_cuda_stream(),
     )
 
 
@@ -97,7 +96,7 @@ def dsv3_fused_a_gemm(
     return output
 
 
-def sgl_per_token_group_quant_fp8(
+def sgl_per_token_group_quant_8bit(
     input: torch.Tensor,
     output_q: torch.Tensor,
     output_s: torch.Tensor,
@@ -105,36 +104,39 @@ def sgl_per_token_group_quant_fp8(
     eps: float,
     fp8_min: float,
     fp8_max: float,
-    scale_ue8m0: bool,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
 ) -> None:
-    torch.ops.sgl_kernel.sgl_per_token_group_quant_fp8.default(
+    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
+    if enable_v2 is None:
+        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
+
+    if enable_v2:
+        return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_v2.default(
+            input,
+            output_q,
+            output_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
+        )
+
+    assert not fuse_silu_and_mul, "only v2 support fuse_silu_and_mul"
+    assert masked_m is None, "only v2 support masked_m"
+    torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit.default(
         input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
     )
 
 
-def sgl_per_token_group_quant_int8(
-    input: torch.Tensor,
-    output_q: torch.Tensor,
-    output_s: torch.Tensor,
-    group_size: int,
-    eps: float,
-    int8_min: float,
-    int8_max: float,
-) -> None:
-    torch.ops.sgl_kernel.sgl_per_token_group_quant_int8.default(
-        input, output_q, output_s, group_size, eps, int8_min, int8_max
-    )
-
-
-def sgl_per_tensor_quant_fp8(
-    input: torch.Tensor,
-    output_q: torch.Tensor,
-    output_s: torch.Tensor,
-    is_static: bool,
-) -> None:
-    torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default(
-        input, output_q, output_s, is_static
-    )
+# For legacy usage
+sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
+sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
 
 
 def sgl_per_token_quant_fp8(
@@ -143,76 +145,6 @@ def sgl_per_token_quant_fp8(
     output_s: torch.Tensor,
 ) -> None:
     torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(input, output_q, output_s)
-
-
-def cutlass_scaled_fp4_mm(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    block_scale_a: torch.Tensor,
-    block_scale_b: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    assert a.ndim == 2 and b.ndim == 2
-    m, n = a.shape[0], b.shape[0]
-    out = torch.empty((m, n), dtype=out_dtype, device=a.device)
-    torch.ops.sgl_kernel.cutlass_scaled_fp4_mm.default(
-        out, a, b, block_scale_a, block_scale_b, alpha
-    )
-    return out
-
-
-def scaled_fp4_quant(
-    input: torch.Tensor, input_global_scale: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to FP4 and return quantized tensor and scale.
-
-    This function quantizes the last dimension of the given tensor `input`. For
-    every 16 consecutive elements, a single dynamically computed scaling factor
-    is shared. This scaling factor is quantized using the `input_global_scale`
-    and is stored in a swizzled layout (see
-    https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-b-layout-4x).
-
-    Args:
-        input: The input tensor to be quantized to FP4
-        input_global_scale: A scalar scaling factor for the entire tensor.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: The output tensor in FP4 but every
-            two values are packed into a uint8 and float8_e4m3 scaling factors
-            in a sizzled layout.
-    """
-    assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
-    other_dims = 1 if input.ndim == 1 else -1
-    input = input.reshape(other_dims, input.shape[-1])
-    m, n = input.shape
-    block_size = 16
-    device = input.device
-
-    assert n % block_size == 0, f"last dim has to be multiple of 16, but got {n}."
-    assert input.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
-
-    # Two fp4 values will be packed into an uint8.
-    output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
-
-    # We use the rounded values to store the swizzled values. Then, the scaling
-    # factors in float8_e4m3fn are packed into an int32 for every 4 values.
-    rounded_m = ((m + 128 - 1) // 128) * 128
-    scale_n = n // block_size
-    rounded_n = ((scale_n + 4 - 1) // 4) * 4
-    output_scale = torch.empty(
-        (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
-    )
-
-    torch.ops.sgl_kernel.scaled_fp4_quant.default(
-        output, input, output_scale, input_global_scale
-    )
-    output_scale = output_scale.view(torch.float8_e4m3fn)
-    return output, output_scale
 
 
 def qserve_w4a8_per_chn_gemm(
@@ -288,68 +220,20 @@ def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
     return output_tensor
 
 
-def scaled_fp4_experts_quant(
-    input_tensor: torch.Tensor,
-    input_global_scale: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    blockscale_offsets: torch.Tensor,
-    topk: int,
-    expert_map: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to FP4 and return quantized tensor and scale, for
-    packed MoE Inputs.
-    Args:
-        input: The input tensor to be quantized to FP4
-        expert_map: The expert map tensor
-        input_global_scale: A scalar scaling factor for the entire tensor.
-        expert_offsets: The expert offsets tensor
-        blockscale_offsets: The blockscale offsets tensor
-    Outputs:
-        output: The quantized tensor in FP4
-        output_scales: The blockscale tensor in FP8-E4M3
-    """
-    assert (
-        input_tensor.ndim == 2
-    ), f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
-    if expert_map is not None:
-        (m, k) = input_tensor.shape
-        output_tensor_shape = (m * topk, k)
-        input_tensor = shuffle_rows(input_tensor, expert_map, output_tensor_shape)
-    m_numtopk, k = input_tensor.shape
-    # Control the maximum number of tokens per expert supported by the
-    # NVFP4 MoE Expert Quantization. This is used to prevent the kernel
-    # from running out of memory. This value can also be increased to support
-    # larger models.
-    import os
+# GPTQ kernels
+def gptq_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_gptq_qzeros: torch.Tensor,
+    b_gptq_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
+    use_shuffle: bool,
+    bit: int,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.gptq_gemm(
+        a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit
+    )
 
-    MAX_TOKENS_PER_EXPERT = os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536)
-    assert m_numtopk <= MAX_TOKENS_PER_EXPERT * topk, (
-        f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT("
-        f"{MAX_TOKENS_PER_EXPERT})"
-        f" for cutlass_moe_fp4, observed m_numtopk = {m_numtopk}. Use"
-        f" MODELOPT_MAX_TOKENS_PER_EXPERT to set this value."
-    )
-    scales_k = k // 16
-    padded_k = (scales_k + (4 - 1)) // 4
 
-    # output is uint8 and packed fp4 values
-    output = torch.empty(
-        m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
-    )
-    output_scales = torch.empty(
-        MAX_TOKENS_PER_EXPERT * topk,
-        padded_k,
-        dtype=torch.int32,
-        device=input_tensor.device,
-    )
-    torch.ops.sgl_kernel.scaled_fp4_experts_quant.default(
-        output,
-        output_scales,
-        input_tensor,
-        input_global_scale,
-        expert_offsets,
-        blockscale_offsets,
-    )
-    output_scales = output_scales.view(torch.float8_e4m3fn)
-    return output, output_scales
+def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
+    torch.torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)

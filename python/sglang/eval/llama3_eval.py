@@ -12,7 +12,6 @@ from dataclasses import dataclass
 import httpx
 import numpy as np
 import openai
-import transformers
 from datasets import load_dataset
 from openai import AsyncOpenAI
 from tqdm import tqdm
@@ -87,7 +86,7 @@ class CustomAsyncHTTPXClient(httpx.AsyncClient):
 
 def get_client(provider):
     if provider not in "b10":
-        if os.getenv("OPENAI_API_KEY") == None:
+        if os.getenv("OPENAI_API_KEY") is None:
             os.environ["OPENAI_API_KEY"] = "EMPTY"
     return {
         "oai": AsyncOpenAI(base_url="http://127.0.0.1:8000/v1/"),

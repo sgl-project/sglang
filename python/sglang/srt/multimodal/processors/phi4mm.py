@@ -3,7 +3,7 @@ from typing import List, Union
 
 from transformers.processing_utils import ProcessorMixin
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.phi4mm import Phi4MMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -47,9 +47,9 @@ class Phi4MMProcessorAdapter(ProcessorMixin):
 class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
     models = [Phi4MMForCausalLM]
 
-    def __init__(self, hf_config, server_args, _processor):
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.processor = Phi4MMProcessorAdapter(_processor)
-        super().__init__(hf_config, server_args, self.processor)
+        super().__init__(hf_config, server_args, self.processor, *args, **kwargs)
 
         # the following CONSTANTS come from hugging-face microsoft/Phi-4-multimodal-instruct's processing_phi4mm.py file
         # ref: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py
@@ -93,9 +93,9 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
             base_output, self.mm_tokens
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "audio_token_id": self.mm_tokens.audio_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_token_id=self.mm_tokens.image_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+        )

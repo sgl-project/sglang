@@ -3,9 +3,7 @@ import math
 import unittest
 
 # TODO: use interface in cpu.py
-import sgl_kernel
 import torch
-import torch.nn as nn
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -20,6 +18,7 @@ from utils import (
     torch_w8a8_per_column_moe,
 )
 
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(1234)
@@ -64,8 +63,6 @@ class TestSharedExpert(CustomTestCase):
             True,
             False,
             False,
-            None,
-            None,
             None,
             None,
             None,
@@ -125,8 +122,6 @@ class TestSharedExpert(CustomTestCase):
             w1_s,
             w2_s,
             None,
-            None,
-            None,
             False,
         )
 
@@ -149,6 +144,8 @@ class TestSharedExpert(CustomTestCase):
                 self._int8_shared_expert(*params)
 
     def _fp8_shared_expert(self, M, N, K, routed_scaling_factor):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
         dtype = torch.bfloat16
         prepack = True
 
@@ -195,8 +192,6 @@ class TestSharedExpert(CustomTestCase):
             w1s,
             w2s,
             [BLOCK_N, BLOCK_K],
-            None,
-            None,
             True,
         )
 

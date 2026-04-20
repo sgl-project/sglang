@@ -2,7 +2,6 @@ import json
 import os
 import pickle
 import random
-from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -12,13 +11,13 @@ from nextqa import NExTQALoader
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-
-from sglang.bench_serving import (
-    download_and_cache_file,
+from sglang.benchmark.datasets.common import (
+    SHAREGPT_FILENAME,
+    SHAREGPT_REPO_ID,
     gen_prompt,
-    get_gen_prefix_cache_path,
 )
+from sglang.benchmark.datasets.generated_shared_prefix import get_gen_prefix_cache_path
+from sglang.benchmark.utils import download_and_cache_hf_file
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
 from sglang.utils import encode_video_base64
@@ -105,7 +104,10 @@ def sample_sharegpt_requests(
 
     # Download sharegpt if necessary
     if not os.path.isfile(dataset_path):
-        dataset_path = download_and_cache_file(SHAREGPT_URL)
+        dataset_path = download_and_cache_hf_file(
+            repo_id=SHAREGPT_REPO_ID,
+            filename=SHAREGPT_FILENAME,
+        )
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -368,7 +370,10 @@ def sample_random_requests(
 
         # Download sharegpt if necessary
         if not os.path.isfile(dataset_path):
-            dataset_path = download_and_cache_file(SHAREGPT_URL)
+            dataset_path = download_and_cache_hf_file(
+                repo_id=SHAREGPT_REPO_ID,
+                filename=SHAREGPT_FILENAME,
+            )
 
         # Load the dataset.
         with open(dataset_path) as f:
@@ -426,26 +431,6 @@ def sample_random_requests(
     return input_requests
 
 
-def gen_prompt(tokenizer, token_num):
-    """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    selected_tokens = random.choices(all_available_tokens, k=token_num)
-    return tokenizer.decode(selected_tokens)
-
-
-def get_gen_prefix_cache_path(args, tokenizer):
-    """Create cache directory under ~/.cache/sglang/benchmark"""
-    cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
-
-    # Create a unique cache filename based on the generation parameters
-    cache_key = (
-        f"gen_prefix_{args.gen_num_groups}_{args.gen_prompts_per_group}_"
-        f"{args.gen_system_prompt_len}_{args.gen_question_len}_{args.gen_output_len}_"
-        f"{tokenizer.__class__.__name__}.pkl"
-    )
-    return cache_dir / cache_key
-
-
 def sample_generated_shared_prefix_requests(
     num_groups: int,
     prompts_per_group: int,
@@ -457,7 +442,15 @@ def sample_generated_shared_prefix_requests(
     disable_shuffle: bool = False,
 ) -> SampleOutput:
     """Generate benchmark requests with shared system prompts using random tokens and caching."""
-    cache_path = get_gen_prefix_cache_path(args, tokenizer)
+    cache_path = get_gen_prefix_cache_path(
+        args.seed,
+        num_groups,
+        prompts_per_group,
+        system_prompt_len,
+        question_len,
+        output_len,
+        tokenizer,
+    )
 
     # Try to load from cache first
     if cache_path.exists():
@@ -577,11 +570,11 @@ def get_dataset(args, tokenizer):
         )
     elif args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(
-            num_groups=args.gen_num_groups,
-            prompts_per_group=args.gen_prompts_per_group,
-            system_prompt_len=args.gen_system_prompt_len,
-            question_len=args.gen_question_len,
-            output_len=args.gen_output_len,
+            num_groups=args.gsp_num_groups,
+            prompts_per_group=args.gsp_prompts_per_group,
+            system_prompt_len=args.gsp_system_prompt_len,
+            question_len=args.gsp_question_len,
+            output_len=args.gsp_output_len,
             args=args,
             tokenizer=tokenizer,
         )

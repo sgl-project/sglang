@@ -10,6 +10,7 @@ from transformers import SiglipVisionConfig
 
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -26,7 +27,7 @@ class SiglipVisionEmbeddings(nn.Module):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -50,7 +51,7 @@ class SiglipVisionEmbeddings(nn.Module):
         patch_embeds = self.patch_embedding(
             pixel_values.to(dtype=target_dtype)
         )  # shape = [*, width, grid, grid]
-        embeddings = patch_embeds.flatten(2).transpose(1, 2)
+        embeddings = patch_embeds.flatten(2).transpose(1, 2).contiguous()
         # interpolate_pos_encoding is never used in sglang
         embeddings = embeddings + self.position_embedding(self.position_ids)
 
@@ -97,7 +98,6 @@ class SiglipEncoderLayer(nn.Module):
         config: SiglipVisionConfig,
         act_layer: Type[nn.Module] = QuickGELU,
         norm_layer: Type[nn.Module] = None,
-        attn_implementation: Optional[str] = "sdpa",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -106,22 +106,11 @@ class SiglipEncoderLayer(nn.Module):
             norm_layer = partial(nn.LayerNorm, eps=config.layer_norm_eps)
         self.layer_norm1 = norm_layer(config.hidden_size)
         self.layer_norm2 = norm_layer(config.hidden_size)
-        if attn_implementation == "sdpa":
-            qkv_backend = "sdpa"
-            softmax_in_single_precision = False
-        elif attn_implementation == "flash_attention_2":
-            qkv_backend = "triton_attn"
-            softmax_in_single_precision = False
-        elif attn_implementation == "eager":
-            qkv_backend = "sdpa"
-            softmax_in_single_precision = True
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
             projection_size=config.hidden_size,
             use_qkv_parallel=True,
-            qkv_backend=qkv_backend,
-            softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
@@ -190,7 +179,6 @@ class SiglipEncoder(nn.Module):
                 SiglipEncoderLayer(
                     config=config,
                     norm_layer=norm_layer,
-                    attn_implementation="sdpa",
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_idx}", prefix),
                 )

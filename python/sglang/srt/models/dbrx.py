@@ -26,13 +26,18 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    fused_moe_npu,
+)
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -46,7 +51,9 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+
+_is_npu = is_npu()
 
 
 class DbrxRouter(nn.Module):
@@ -104,6 +111,11 @@ class DbrxExperts(nn.Module):
         self.params_dtype = params_dtype
 
         self.router = DbrxRouter(config, self.params_dtype)
+        self.topk = TopK(
+            self.top_k,
+            renormalize=True,
+        )
+        self.moe_runner_config = MoeRunnerConfig(inplace=True)
         self.ws = nn.Parameter(
             torch.empty(
                 self.num_total_experts,
@@ -135,6 +147,7 @@ class DbrxExperts(nn.Module):
                 "weight_loader": self.weight_loader,
             },
         )
+        self.fused_moe_method = fused_moe if not _is_npu else fused_moe_npu
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str
@@ -169,14 +182,13 @@ class DbrxExperts(nn.Module):
         hidden_states = hidden_states.view(-1, self.d_model)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
-        final_hidden_states = fused_moe(
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = self.fused_moe_method(
             hidden_states,
             self.ws,
             self.w2s,
-            router_logits,
-            self.top_k,
-            renormalize=True,
-            inplace=True,
+            topk_output,
+            self.moe_runner_config,
         )
 
         if self.tp_size > 1:
@@ -293,7 +305,7 @@ class DbrxFusedNormAttention(nn.Module):
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.norm_1(hidden_states)
         x = self.attn(

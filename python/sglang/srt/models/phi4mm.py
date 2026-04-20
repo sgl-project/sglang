@@ -24,7 +24,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn
-from transformers import PretrainedConfig, SiglipVisionConfig
+from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -54,25 +54,6 @@ VISION_ENCODER_TO_PROCESSING_CONFIG = {
 }
 
 
-def get_navit_vision_model():
-    vision_config = {
-        "hidden_size": 1152,
-        "image_size": 448,
-        "intermediate_size": 4304,
-        "model_type": "siglip_vision_model",
-        "num_attention_heads": 16,
-        "num_hidden_layers": 26,  # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
-        "patch_size": 14,
-    }
-    model_config = SiglipVisionConfig(**vision_config)
-
-    vision_model = Idefics2VisionTransformer(
-        config=model_config, require_post_norm=False
-    )
-
-    return vision_model
-
-
 class Phi4MMImageEncoder(nn.Module):
     """Image embedding."""
 
@@ -88,8 +69,9 @@ class Phi4MMImageEncoder(nn.Module):
         # n_embed or hidden_size
         hidden_size = config.n_embd if hasattr(config, "n_embd") else config.hidden_size
         self.type_feature = "patch"
-
-        self.img_processor = get_navit_vision_model()
+        self.img_processor = Idefics2VisionTransformer(
+            config=config.vision_config, require_post_norm=False
+        )
 
         pe_weight = self.img_processor.embeddings.position_embedding.weight
         L, D = pe_weight.size()
@@ -458,7 +440,7 @@ class Phi4MMForCausalLM(nn.Module):
             self.embed_tokens_extend(
                 # item.feature: (num_audios_in_a_sequence, T, D)
                 # item.audio_attention_mask: (num_audios_in_a_sequence, T, D) BoolTensor or None
-                audio_features=item.feature.to(device).type(dtype),
+                audio_features=item.feature.type(dtype),
                 audio_attention_mask=(
                     item.audio_attention_mask.to(device)
                     if hasattr(item, "audio_attention_mask")
@@ -547,7 +529,7 @@ class Phi4MMForCausalLM(nn.Module):
                 param = params_dict.get(name)
                 if param is None:
                     if "lora" not in name:
-                        logger.warning("Warning: {name} not found in model parameters")
+                        logger.warning(f"Warning: {name} not found in model parameters")
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

@@ -100,8 +100,7 @@ void segment_gemm_kernel_impl(
   const int64_t NB1 = div_up(N1, BLOCK_N);
   const int64_t NB = NB0 + NB1;
 
-  // TODO: brgemm u8s8 depends on PyTorch 2.7 release.
-  const bool use_brgemm = false;
+  const bool use_brgemm = can_use_brgemm<int8_t>(M);
 
   // K + 4 after compensation
   const int64_t packed_row_size = get_row_size<int8_t>(K);
@@ -435,6 +434,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
     std::optional<at::Tensor> q_a_proj_scale,
     std::optional<at::Tensor> q_b_proj_scale,
     std::optional<at::Tensor> kv_a_proj_scale,
+    std::optional<at::Tensor> w_scale,
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size) {
   RECORD_FUNCTION(
@@ -602,10 +602,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
   qb.as_strided_({num_seqs, num_heads, qk_head_dim}, {num_heads * qk_head_dim, qk_head_dim, 1});
 
   // stage 4: bmm
-  std::optional<at::Tensor> scale;
   auto q_nope = qb.narrow(2, 0, qk_nope_head_dim).transpose_(0, 1);
   auto q_nope_out = q_input.narrow(2, 0, kv_lora_rank).transpose_(0, 1);
-  bmm_cpu(q_nope_out, q_nope, w_kc, is_vnni, scale);
+  bmm_cpu(q_nope_out, q_nope, w_kc, is_vnni, w_scale);
 
   // stage 5: rope
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "rotary_emb_kernel_impl", [&] {
@@ -644,6 +643,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     bool use_fp8_w8a16,
     std::optional<at::Tensor> qkv_a_proj_scale,
     std::optional<at::Tensor> q_b_proj_scale,
+    std::optional<at::Tensor> w_scale,
     bool is_vnni,
     std::optional<std::vector<int64_t>> block_size,
     int64_t q_lora_rank,
@@ -697,6 +697,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
       q_a_proj_s,
       q_b_proj_scale,
       kv_a_proj_s,
+      w_scale,
       is_vnni,
       block_size);
 }

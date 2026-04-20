@@ -63,6 +63,7 @@ class OlmoeMoE(nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
+        layer_id: int = 0,
         prefix: str = "",
     ):
         super().__init__()
@@ -88,7 +89,7 @@ class OlmoeMoE(nn.Module):
             intermediate_size=intermediate_size,
             reduce_results=True,
             quant_config=quant_config,
-            tp_size=tp_size,
+            layer_id=layer_id,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -203,8 +204,8 @@ class OlmoeDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 4096)
 
         self.self_attn = OlmoeAttention(
@@ -224,6 +225,7 @@ class OlmoeDecoderLayer(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
+            layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )

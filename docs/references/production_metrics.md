@@ -1,6 +1,6 @@
 # Production Metrics
 
-SGLang exposes the following metrics via Prometheus. The metrics are namespaced by `$name` (the model name).
+SGLang exposes the following metrics via Prometheus. You can enable it by adding `--enable-metrics` when you launch the server.
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
@@ -139,7 +139,11 @@ This section describes how to set up the monitoring stack (Prometheus + Grafana)
 1.  **Start your SGLang server with metrics enabled:**
 
     ```bash
-    python -m sglang.launch_server --model-path <your_model_path> --port 30000 --enable-metrics
+    python -m sglang.launch_server \
+      --model-path <your_model_path> \
+      --port 30000 \
+      --enable-metrics \
+      --enable-mfu-metrics
     ```
     Replace `<your_model_path>` with the actual path to your model (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct`). Ensure the server is accessible from the monitoring stack (you might need `--host 0.0.0.0` if running in Docker). By default, the metrics endpoint will be available at `http://<sglang_server_host>:30000/metrics`.
 
@@ -212,6 +216,52 @@ You can customize the setup by modifying these files. For instance, you might ne
 
 #### Check if the metrics are being collected
 
-Run `python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5` to generate some requests.
+Run:
+```
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --dataset-name random \
+  --num-prompts 3000 \
+  --random-input 1024 \
+  --random-output 1024 \
+  --random-range-ratio 0.5
+```
+
+to generate some requests.
 
 Then you should be able to see the metrics in the Grafana dashboard.
+
+## Estimated Performance Metrics (MFU-related)
+
+SGLang exports the following estimated per-GPU counters that can be used to derive
+Model FLOPs Utilization (MFU)-related signals:
+
+- `sglang:estimated_flops_per_gpu_total`: Estimated floating-point operations.
+- `sglang:estimated_read_bytes_per_gpu_total`: Estimated bytes read from memory.
+- `sglang:estimated_write_bytes_per_gpu_total`: Estimated bytes written to memory.
+
+These metrics are available when both `--enable-metrics` and
+`--enable-mfu-metrics` are enabled.
+
+These are cumulative counters. Use Prometheus `rate(...)` to get per-second values.
+
+### PromQL examples
+
+Average TFLOPS per GPU:
+
+```promql
+rate(sglang:estimated_flops_per_gpu_total[1m]) / 1e12
+```
+
+Average estimated memory bandwidth in GB/s:
+
+```promql
+(rate(sglang:estimated_read_bytes_per_gpu_total[1m]) +
+ rate(sglang:estimated_write_bytes_per_gpu_total[1m])) / 1e9
+```
+
+### Notes
+
+- These metrics are estimates intended for observability and trend analysis.
+- Estimated memory bytes reflect modeled traffic and are not a direct hardware
+  counter from GPU profilers.
