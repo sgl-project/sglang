@@ -53,10 +53,12 @@ class PrefillDelayer:
         self._queue_min_ratio = getattr(
             server_args, "prefill_delayer_queue_min_ratio", None
         )
-        self._max_delay_ms = getattr(server_args, "prefill_delayer_max_delay_ms", None)
-        self._queue_trigger_enabled = (
-            self._queue_min_ratio is not None and self._max_delay_ms is not None
+        # Fall back to 5000ms if unset; this is a local safety cap, not a
+        # semantic default, so we don't surface it via ServerArgs.
+        self._max_delay_ms = (
+            getattr(server_args, "prefill_delayer_max_delay_ms", None) or 5000.0
         )
+        self._queue_trigger_enabled = self._queue_min_ratio is not None
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "

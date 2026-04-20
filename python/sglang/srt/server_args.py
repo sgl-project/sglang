@@ -1004,11 +1004,6 @@ class ServerArgs:
         if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
             self.prefill_delayer_token_usage_low_watermark = x
 
-        # Default max_delay_ms when the delayer is on; harmless for slot-only
-        # users since it is only consulted while the queue trigger is active.
-        if self.enable_prefill_delayer and self.prefill_delayer_max_delay_ms is None:
-            self.prefill_delayer_max_delay_ms = 5000.0
-
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -4419,8 +4414,8 @@ class ServerArgs:
             help=(
                 "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, prefill "
                 "is force-released to bound worst-case TTFT. Only consulted when "
-                "--prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ 5000. Defaults to "
-                "5000 when --enable-prefill-delayer is on."
+                "--prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ 5000; defaults to "
+                "5000 if unset."
             ),
         )
 
