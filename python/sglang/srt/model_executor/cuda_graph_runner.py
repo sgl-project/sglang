@@ -649,7 +649,10 @@ class CudaGraphRunner:
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         # Combo scheduling is needed to have good performance for replay-prepare.
-        self.compile_replay_prepare = hasattr(torch._inductor.config, "combo_kernels")
+        self.compile_replay_prepare = (
+            envs.SGLANG_TORCH_COMPILE_REPLAY_PREPARE.get()
+            and hasattr(torch._inductor.config, "combo_kernels")
+        )
         if self.compile_replay_prepare:
             # Avoid graph breaks from .item() calls (e.g. seq_lens_cpu.max().item())
             # by capturing them as unbacked symbolic ints in the FX graph. Without
