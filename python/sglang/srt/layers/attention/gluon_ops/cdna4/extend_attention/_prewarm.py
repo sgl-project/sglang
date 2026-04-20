@@ -14,18 +14,21 @@ runtime-cache population phase then routes one tiny dummy call through
 each unique config so the direct-HIPLauncher closures are installed.
 
 Callers: ``TritonAttnBackend.__init__`` invokes ``prewarm_for_model``
-with the model's HF config. FP8 kernels are off by default; pass
-``include_fp8=True`` to cover them as well.
+with the model's HF config. FP8 kernels are populated lazily on the
+first live call (their shape space is small and the saturation
+warmup rounds in every serving bench already absorb the one-time
+JIT cost). The ``include_fp8`` parameter is reserved for a future
+Phase-1 FP8 warmup pass and currently raises ``NotImplementedError``
+if set to ``True``.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 import triton
@@ -36,13 +39,11 @@ from ._bf16_extend_gfx950 import gluon_extend_attn_fwd as _kfn_basic
 from ._bf16_extend_persistent_gfx950 import (
     gluon_extend_attn_fwd_persistent as _kfn_persistent,
 )
+from ._launch_helpers import _resolve_qk_split_dims
 from .extend_attention_gfx950 import (
     _get_basic_dispatch_config,
-    gluon_extend_attention_fwd as _dispatch_fwd,
-    _config_cache,
 )
-from ._launch_helpers import _resolve_qk_split_dims
-
+from .extend_attention_gfx950 import gluon_extend_attention_fwd as _dispatch_fwd
 
 # Shape grid used to enumerate dispatch outputs. Chosen to cover the
 # realistic sglang serving range (B up to 128, ext up to 16384 tokens,
@@ -54,7 +55,9 @@ _PFX_BUCKET_GRID = (0, 1, 2, 3, 4)
 
 
 def enumerate_basic_configs(
-    head_dim: int, is_fp8: bool = False, sliding_window_size: int = -1,
+    head_dim: int,
+    is_fp8: bool = False,
+    sliding_window_size: int = -1,
     head_num: Optional[int] = None,
 ) -> list[tuple]:
     """Unique (BM, BN, NW, NS, PAD_K, PAD_V, EXT_BN, EXT_NS) tuples the
@@ -72,7 +75,11 @@ def enumerate_basic_configs(
             for p in _PFX_BUCKET_GRID:
                 cfgs.add(
                     _get_basic_dispatch_config(
-                        head_dim, b, e, p, is_fp8,
+                        head_dim,
+                        b,
+                        e,
+                        p,
+                        is_fp8,
                         sliding_window_size=sliding_window_size,
                         head_num=head_num,
                     )
@@ -104,7 +111,11 @@ def enumerate_persistent_configs(head_dim: int) -> list[tuple]:
                 use_small_tile = (
                     max_len_extend <= 128
                     or (max_len_extend <= 256 and het_ratio >= 2.0)
-                    or (min_len_extend < 64 and max_len_extend <= 512 and batch_size <= 4)
+                    or (
+                        min_len_extend < 64
+                        and max_len_extend <= 512
+                        and batch_size <= 4
+                    )
                 )
 
                 if BLOCK_DMODEL >= 256 or use_small_tile:
@@ -129,9 +140,7 @@ def enumerate_persistent_configs(head_dim: int) -> list[tuple]:
                 # SPLIT_K>1 is only emitted on BM=128 NW=8 NS=4; all
                 # other tile shapes stay at SPLIT_K=1.
                 split_set = (
-                    (1, 2, 4, 8)
-                    if (BM == 128 and NW == 8 and NS == 4)
-                    else (1,)
+                    (1, 2, 4, 8) if (BM == 128 and NW == 8 and NS == 4) else (1,)
                 )
                 for split_k in split_set:
                     cfgs.add((BM, BLOCK_N, NW, NS, split_k))
@@ -172,19 +181,29 @@ def _make_dummy_tensors(
     window_kv_offsets = torch.zeros(1, dtype=torch.int32, device=device)
     partial_out = torch.empty(1, dtype=torch.float32, device=device)
     partial_lse = torch.empty(1, dtype=torch.float32, device=device)
-    tile_done = torch.empty(1, dtype=torch.float32, device=device)
+    # tile_done is an int32 atomic counter (see _ensure_splitk_workspace);
+    # the dummy must match the runtime dtype so the persistent/split-K
+    # kernel doesn't specialize on a float32 pointer and JIT-miss at
+    # first live call.
+    tile_done = torch.empty(1, dtype=torch.int32, device=device)
     cum_tiles_per_batch = torch.zeros(2, dtype=torch.int32, device=device)
     # HAS_SINK dtype must match the runtime tensor (bf16 for GPT-OSS).
-    sinks = (
-        torch.zeros(num_q_heads, dtype=dtype, device=device)
-        if has_sink else None
-    )
+    sinks = torch.zeros(num_q_heads, dtype=dtype, device=device) if has_sink else None
     return {
-        "q": q, "k": k, "v": v, "o": o, "kb": kb, "vb": vb,
-        "qo_indptr": qo_indptr, "kv_indptr": kv_indptr, "kv_indices": kv_indices,
-        "custom_mask": custom_mask, "mask_indptr": mask_indptr,
+        "q": q,
+        "k": k,
+        "v": v,
+        "o": o,
+        "kb": kb,
+        "vb": vb,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_indices": kv_indices,
+        "custom_mask": custom_mask,
+        "mask_indptr": mask_indptr,
         "window_kv_offsets": window_kv_offsets,
-        "partial_out": partial_out, "partial_lse": partial_lse,
+        "partial_out": partial_out,
+        "partial_lse": partial_lse,
         "tile_done": tile_done,
         "cum_tiles_per_batch": cum_tiles_per_batch,
         "sinks": sinks,
@@ -215,29 +234,49 @@ def _warm_basic_variant(
     kb, vb = tensors["kb"], tensors["vb"]
 
     return _kfn_basic.run(
-        q, k, v, o, kb, vb,
-        tensors["qo_indptr"], tensors["kv_indptr"], tensors["kv_indices"],
-        tensors["custom_mask"], tensors["mask_indptr"], tensors["window_kv_offsets"],
-        sm_scale, kv_group_num,
-        q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1),
-        v.stride(0), v.stride(1),
-        o.stride(0), o.stride(1),
-        kb.stride(0), kb.stride(1),
-        vb.stride(0), vb.stride(1),
+        q,
+        k,
+        v,
+        o,
+        kb,
+        vb,
+        tensors["qo_indptr"],
+        tensors["kv_indptr"],
+        tensors["kv_indices"],
+        tensors["custom_mask"],
+        tensors["mask_indptr"],
+        tensors["window_kv_offsets"],
+        sm_scale,
+        kv_group_num,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        o.stride(0),
+        o.stride(1),
+        kb.stride(0),
+        kb.stride(1),
+        vb.stride(0),
+        vb.stride(1),
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=False,
         ENABLE_PREFIX_UNMASKED=is_causal,
-        BLOCK_M=BM, BLOCK_N=BN,
+        BLOCK_M=BM,
+        BLOCK_N=BN,
         BLOCK_DMODEL=BLOCK_DMODEL,
         ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
         NUM_STAGES=NS,
-        Sinks=tensors["sinks"], HAS_SINK=has_sink,
+        Sinks=tensors["sinks"],
+        HAS_SINK=has_sink,
         LOGIT_CAP=logit_cap,
         XAI_TEMPERATURE_LEN=xai_temperature_len,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         v_scale=1.0,
-        num_warps=NW, num_stages=1, waves_per_eu=2,
+        num_warps=NW,
+        num_stages=1,
+        waves_per_eu=2,
         matrix_instr_nonkdim=32,
         grid=(1, num_q_heads, 1),
         warmup=True,
@@ -270,24 +309,42 @@ def _warm_persistent_variant(
     kb, vb = tensors["kb"], tensors["vb"]
 
     return _kfn_persistent.run(
-        q, k, v, o, kb, vb,
-        tensors["qo_indptr"], tensors["kv_indptr"], tensors["kv_indices"],
-        tensors["custom_mask"], tensors["mask_indptr"], tensors["window_kv_offsets"],
-        sm_scale, kv_group_num,
-        q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1),
-        v.stride(0), v.stride(1),
-        o.stride(0), o.stride(1),
-        kb.stride(0), kb.stride(1),
-        vb.stride(0), vb.stride(1),
+        q,
+        k,
+        v,
+        o,
+        kb,
+        vb,
+        tensors["qo_indptr"],
+        tensors["kv_indptr"],
+        tensors["kv_indices"],
+        tensors["custom_mask"],
+        tensors["mask_indptr"],
+        tensors["window_kv_offsets"],
+        sm_scale,
+        kv_group_num,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        o.stride(0),
+        o.stride(1),
+        kb.stride(0),
+        kb.stride(1),
+        vb.stride(0),
+        vb.stride(1),
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=False,
         ENABLE_PREFIX_UNMASKED=is_causal,
-        BLOCK_M=BM, BLOCK_N=BN,
+        BLOCK_M=BM,
+        BLOCK_N=BN,
         BLOCK_DMODEL=BLOCK_DMODEL,
         ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
         NUM_STAGES=NS,
-        Sinks=tensors["sinks"], HAS_SINK=has_sink,
+        Sinks=tensors["sinks"],
+        HAS_SINK=has_sink,
         LOGIT_CAP=logit_cap,
         XAI_TEMPERATURE_LEN=xai_temperature_len,
         SLIDING_WINDOW_SIZE=sliding_window_size,
@@ -301,10 +358,13 @@ def _warm_persistent_variant(
         tile_done=tensors["tile_done"],
         cum_tiles_per_batch=tensors["cum_tiles_per_batch"],
         actual_batch_size=1,
-        IS_PERSISTENT=True, SPLIT_K=SPLIT_K,
+        IS_PERSISTENT=True,
+        SPLIT_K=SPLIT_K,
         MAX_BATCH_LOG2=8,
         TILE_MAP_MODE=tile_map_mode,
-        num_warps=NW, num_stages=1, waves_per_eu=2,
+        num_warps=NW,
+        num_stages=1,
+        waves_per_eu=2,
         matrix_instr_nonkdim=32,
         grid=(1,),
         warmup=True,
@@ -316,7 +376,6 @@ def _build_work_list(
     is_causal_modes: Sequence[bool],
     include_basic: bool,
     include_persistent: bool,
-    include_fp8: bool,
     persistent_tile_map_modes: Sequence[int] = (0, 1),
     sliding_window_size: int = -1,
     head_num: Optional[int] = None,
@@ -324,13 +383,17 @@ def _build_work_list(
     """Build the list of ``(path, config, is_causal, tile_map_mode)``
     tuples to warm.
 
-    ``path`` is one of ``{"basic", "persistent", "fp8_basic"}``.
-    Persistent variants are keyed on ``TILE_MAP_MODE`` as well —
-    each mode is a distinct constexpr specialization.
+    ``path`` is one of ``{"basic", "persistent"}``. Persistent
+    variants are keyed on ``TILE_MAP_MODE`` as well — each mode is a
+    distinct constexpr specialization. FP8 variants are not emitted
+    here; they are compiled lazily by Phase 2's live dispatch when
+    the model's KV dtype is FP8.
     """
     work: list[tuple] = []
     basic_cfgs = enumerate_basic_configs(
-        head_dim, is_fp8=False, sliding_window_size=sliding_window_size,
+        head_dim,
+        is_fp8=False,
+        sliding_window_size=sliding_window_size,
         head_num=head_num,
     )
     persistent_cfgs = enumerate_persistent_configs(head_dim)
@@ -342,14 +405,6 @@ def _build_work_list(
             for cfg in persistent_cfgs:
                 for tmm in persistent_tile_map_modes:
                     work.append(("persistent", cfg, is_causal, tmm))
-    if include_fp8:
-        fp8_basic = enumerate_basic_configs(
-            head_dim, is_fp8=True, sliding_window_size=sliding_window_size,
-            head_num=head_num,
-        )
-        for is_causal in is_causal_modes:
-            for cfg in fp8_basic:
-                work.append(("fp8_basic", cfg, is_causal, 0))
     return work
 
 
@@ -388,26 +443,43 @@ def prewarm_extend_attention(
     so threading gives near-linear speedup. ``parallel = 0`` is
     sequential. Returns a dict with timings and variant counts.
     """
+    if include_fp8:
+        raise NotImplementedError(
+            "include_fp8=True is reserved for a future Phase-1 FP8 warmup "
+            "pass. FP8 kernels are compiled lazily on the first live "
+            "call; the saturation warmup rounds in every standard serving "
+            "bench absorb this one-time cost. Pass include_fp8=False."
+        )
+
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
 
     tensors = _make_dummy_tensors(
-        device, dtype, num_q_heads, num_kv_heads, head_dim, has_sink,
+        device,
+        dtype,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        has_sink,
     )
 
     work = _build_work_list(
-        head_dim, is_causal_modes, include_basic, include_persistent, include_fp8,
+        head_dim,
+        is_causal_modes,
+        include_basic,
+        include_persistent,
         sliding_window_size=sliding_window_size,
         head_num=num_q_heads,
     )
     if verbose:
         logger.info(
-            "prewarm: %d variants (basic=%d persistent=%d fp8=%d) for D=%d H=%d kvH=%d",
+            "prewarm: %d variants (basic=%d persistent=%d) for D=%d H=%d kvH=%d",
             len(work),
             sum(1 for w in work if w[0] == "basic"),
             sum(1 for w in work if w[0] == "persistent"),
-            sum(1 for w in work if w[0] == "fp8_basic"),
-            head_dim, num_q_heads, num_kv_heads,
+            head_dim,
+            num_q_heads,
+            num_kv_heads,
         )
 
     def _run_one(item):
@@ -415,16 +487,26 @@ def prewarm_extend_attention(
         t0 = time.time()
         if path == "basic":
             _warm_basic_variant(
-                tensors, num_q_heads, num_kv_heads, head_dim, cfg,
-                is_causal=is_causal, has_sink=has_sink,
+                tensors,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                cfg,
+                is_causal=is_causal,
+                has_sink=has_sink,
                 sliding_window_size=sliding_window_size,
                 logit_cap=logit_cap,
                 xai_temperature_len=xai_temperature_len,
             )
         elif path == "persistent":
             _warm_persistent_variant(
-                tensors, num_q_heads, num_kv_heads, head_dim, cfg,
-                is_causal=is_causal, has_sink=has_sink,
+                tensors,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                cfg,
+                is_causal=is_causal,
+                has_sink=has_sink,
                 sliding_window_size=sliding_window_size,
                 logit_cap=logit_cap,
                 xai_temperature_len=xai_temperature_len,
@@ -436,7 +518,11 @@ def prewarm_extend_attention(
         if verbose:
             logger.info(
                 "  [%s] cfg=%s causal=%s tmm=%d: %.2fs",
-                path, cfg, is_causal, tile_map_mode, dt,
+                path,
+                cfg,
+                is_causal,
+                tile_map_mode,
+                dt,
             )
         return dt
 
@@ -497,7 +583,11 @@ def prewarm_extend_attention(
         logger.info(
             "prewarm: done. %d variants in %.2fs wall "
             "(phase1 compile %.2fs, phase2 real-launch %.2fs, seq estimate %.2fs)",
-            len(work), wall_time, wall_time - phase2_time, phase2_time, seq_total,
+            len(work),
+            wall_time,
+            wall_time - phase2_time,
+            phase2_time,
+            seq_total,
         )
     return result
 
@@ -530,12 +620,18 @@ def _make_realistic_tensors(
     k = torch.zeros((total_ext, num_kv_heads, head_dim), dtype=dtype, device=device)
     v = torch.zeros((total_ext, num_kv_heads, head_dim), dtype=dtype, device=device)
     o = torch.zeros((total_ext, num_q_heads, head_dim), dtype=dtype, device=device)
-    kb = torch.zeros((max(2, kv_pool_size), num_kv_heads, head_dim), dtype=dtype, device=device)
-    vb = torch.zeros((max(2, kv_pool_size), num_kv_heads, head_dim), dtype=dtype, device=device)
+    kb = torch.zeros(
+        (max(2, kv_pool_size), num_kv_heads, head_dim), dtype=dtype, device=device
+    )
+    vb = torch.zeros(
+        (max(2, kv_pool_size), num_kv_heads, head_dim), dtype=dtype, device=device
+    )
     qo_indptr = (
         torch.arange(0, batch_size + 1, dtype=qo_indptr_dtype, device=device) * max_ext
     )
-    kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * max_pfx
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * max_pfx
+    )
     kv_indices = (
         torch.arange(total_pfx, dtype=torch.int64, device=device) % max(1, kv_pool_size)
         if total_pfx > 0
@@ -545,10 +641,7 @@ def _make_realistic_tensors(
     # Sinks dtype must match runtime (SGLang's GPT-OSS path uses bf16
     # under Triton backend). Using fp32 here would compile a variant
     # runtime never hits, defeating the prewarm.
-    sinks = (
-        torch.zeros(num_q_heads, dtype=dtype, device=device)
-        if has_sink else None
-    )
+    sinks = torch.zeros(num_q_heads, dtype=dtype, device=device) if has_sink else None
     return q, k, v, o, kb, vb, qo_indptr, kv_indptr, kv_indices, mask_indptr, sinks
 
 
@@ -572,7 +665,11 @@ def _enumerate_basic_shape_reps(
         for e in _EXTEND_GRID:
             for p in _PFX_BUCKET_GRID:
                 cfg = _gcfg(
-                    head_dim, b, e, p, False,
+                    head_dim,
+                    b,
+                    e,
+                    p,
+                    False,
                     sliding_window_size=sliding_window_size,
                     head_num=head_num,
                 )
@@ -612,13 +709,22 @@ def _warm_persistent_dispatch_cases(
     elens = [4096, 2048, 1024, 512]
     pfx_per = 0
     q, k, v, o, kb, vb, _, kv_ip, kv_ix, mi_ip, sinks = _make_realistic_tensors(
-        device, dtype, num_q_heads, num_kv_heads, head_dim,
-        bs, max(elens), pfx_per, kv_pool_size, has_sink,
+        device,
+        dtype,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        bs,
+        max(elens),
+        pfx_per,
+        kv_pool_size,
+        has_sink,
     )
     total_ext = sum(elens)
     qo_ip = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(elens), 0).tolist()),
-        dtype=qo_dt, device=device,
+        dtype=qo_dt,
+        device=device,
     )
     q = q[:total_ext].contiguous()
     k = k[:total_ext].contiguous()
@@ -626,9 +732,21 @@ def _warm_persistent_dispatch_cases(
     o = o[:total_ext].contiguous()
     try:
         _dispatch_fwd(
-            q, k, v, o, kb, vb, qo_ip, kv_ip, kv_ix,
-            None, is_causal, mi_ip, max(elens),
-            k_scale=1.0, v_scale=1.0,
+            q,
+            k,
+            v,
+            o,
+            kb,
+            vb,
+            qo_ip,
+            kv_ip,
+            kv_ix,
+            None,
+            is_causal,
+            mi_ip,
+            max(elens),
+            k_scale=1.0,
+            v_scale=1.0,
             sm_scale=sm_scale_local,
             logit_cap=logit_cap,
             sliding_window_size=sliding_window_size,
@@ -648,17 +766,27 @@ def _warm_persistent_dispatch_cases(
     plens = [4096] * 8
     total_pfx = sum(plens)
     q, k, v, o, kb, vb, _, _, _, mi_ip, sinks = _make_realistic_tensors(
-        device, dtype, num_q_heads, num_kv_heads, head_dim,
-        bs, 1, 0, kv_pool_size, has_sink,
+        device,
+        dtype,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        bs,
+        1,
+        0,
+        kv_pool_size,
+        has_sink,
     )
     total_ext = sum(elens)
     qo_ip = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(elens), 0).tolist()),
-        dtype=qo_dt, device=device,
+        dtype=qo_dt,
+        device=device,
     )
     kv_ip = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(plens), 0).tolist()),
-        dtype=torch.int32, device=device,
+        dtype=torch.int32,
+        device=device,
     )
     kv_ix = torch.arange(total_pfx, dtype=torch.int64, device=device) % kv_pool_size
     q = q[:total_ext].contiguous()
@@ -667,9 +795,21 @@ def _warm_persistent_dispatch_cases(
     o = o[:total_ext].contiguous()
     try:
         _dispatch_fwd(
-            q, k, v, o, kb, vb, qo_ip, kv_ip, kv_ix,
-            None, is_causal, mi_ip, 1,
-            k_scale=1.0, v_scale=1.0,
+            q,
+            k,
+            v,
+            o,
+            kb,
+            vb,
+            qo_ip,
+            kv_ip,
+            kv_ix,
+            None,
+            is_causal,
+            mi_ip,
+            1,
+            k_scale=1.0,
+            v_scale=1.0,
             sm_scale=sm_scale_local,
             logit_cap=logit_cap,
             sliding_window_size=sliding_window_size,
@@ -684,39 +824,96 @@ def _warm_persistent_dispatch_cases(
             logger.warning("phase2 persistent spec-decode causal=%s: %r", is_causal, e)
 
     # Case 3: big-batch heterogeneous prefill -> bsearch.
-    elens = [4096, 4096, 2048, 2048, 2048, 2048,
-             1024, 1024, 1024, 1024,
-             512, 512, 512, 512, 512, 512]
-    plens = [8192, 4096, 2048, 0, 2048, 1024,
-             8192, 4096, 2048, 0,
-             4096, 2048, 1024, 0, 2048, 1024]
+    elens = [
+        4096,
+        4096,
+        2048,
+        2048,
+        2048,
+        2048,
+        1024,
+        1024,
+        1024,
+        1024,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+    ]
+    plens = [
+        8192,
+        4096,
+        2048,
+        0,
+        2048,
+        1024,
+        8192,
+        4096,
+        2048,
+        0,
+        4096,
+        2048,
+        1024,
+        0,
+        2048,
+        1024,
+    ]
     bs = len(elens)
     total_ext = sum(elens)
     total_pfx = sum(plens)
     q, k, v, o, kb, vb, _, _, _, mi_ip, sinks = _make_realistic_tensors(
-        device, dtype, num_q_heads, num_kv_heads, head_dim,
-        bs, max(elens), 0, kv_pool_size, has_sink,
+        device,
+        dtype,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        bs,
+        max(elens),
+        0,
+        kv_pool_size,
+        has_sink,
     )
     qo_ip = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(elens), 0).tolist()),
-        dtype=qo_dt, device=device,
+        dtype=qo_dt,
+        device=device,
     )
     kv_ip = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(plens), 0).tolist()),
-        dtype=torch.int32, device=device,
+        dtype=torch.int32,
+        device=device,
     )
-    kv_ix = torch.arange(
-        max(total_pfx, 1), dtype=torch.int64, device=device,
-    ) % kv_pool_size
+    kv_ix = (
+        torch.arange(
+            max(total_pfx, 1),
+            dtype=torch.int64,
+            device=device,
+        )
+        % kv_pool_size
+    )
     q = q[:total_ext].contiguous()
     k = k[:total_ext].contiguous()
     v = v[:total_ext].contiguous()
     o = o[:total_ext].contiguous()
     try:
         _dispatch_fwd(
-            q, k, v, o, kb, vb, qo_ip, kv_ip, kv_ix,
-            None, is_causal, mi_ip, max(elens),
-            k_scale=1.0, v_scale=1.0,
+            q,
+            k,
+            v,
+            o,
+            kb,
+            vb,
+            qo_ip,
+            kv_ip,
+            kv_ix,
+            None,
+            is_causal,
+            mi_ip,
+            max(elens),
+            k_scale=1.0,
+            v_scale=1.0,
             sm_scale=sm_scale_local,
             logit_cap=logit_cap,
             sliding_window_size=sliding_window_size,
@@ -738,16 +935,26 @@ def _warm_persistent_dispatch_cases(
         total_ext = sum(elens)
         total_pfx = sum(plens)
         q, k, v, o, kb, vb, _, _, _, mi_ip, sinks = _make_realistic_tensors(
-            device, dtype, num_q_heads, num_kv_heads, head_dim,
-            bs, max(elens), 0, kv_pool_size, has_sink,
+            device,
+            dtype,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            bs,
+            max(elens),
+            0,
+            kv_pool_size,
+            has_sink,
         )
         qo_ip = torch.tensor(
             [0] + list(torch.cumsum(torch.tensor(elens), 0).tolist()),
-            dtype=qo_dt, device=device,
+            dtype=qo_dt,
+            device=device,
         )
         kv_ip = torch.tensor(
             [0] + list(torch.cumsum(torch.tensor(plens), 0).tolist()),
-            dtype=torch.int32, device=device,
+            dtype=torch.int32,
+            device=device,
         )
         kv_ix = torch.arange(total_pfx, dtype=torch.int64, device=device) % kv_pool_size
         q = q[:total_ext].contiguous()
@@ -756,9 +963,21 @@ def _warm_persistent_dispatch_cases(
         o = o[:total_ext].contiguous()
         try:
             _dispatch_fwd(
-                q, k, v, o, kb, vb, qo_ip, kv_ip, kv_ix,
-                None, is_causal, mi_ip, max(elens),
-                k_scale=1.0, v_scale=1.0,
+                q,
+                k,
+                v,
+                o,
+                kb,
+                vb,
+                qo_ip,
+                kv_ip,
+                kv_ix,
+                None,
+                is_causal,
+                mi_ip,
+                max(elens),
+                k_scale=1.0,
+                v_scale=1.0,
                 sm_scale=sm_scale_local,
                 logit_cap=logit_cap,
                 sliding_window_size=sliding_window_size,
@@ -772,7 +991,8 @@ def _warm_persistent_dispatch_cases(
             if verbose:
                 logger.warning(
                     "phase2 persistent wca-default causal=%s: %r",
-                    is_causal, e,
+                    is_causal,
+                    e,
                 )
 
 
@@ -805,22 +1025,45 @@ def _populate_runtime_caches(
     if include_basic:
         kv_pool_size = 64 * 1024
         shape_reps = _enumerate_basic_shape_reps(
-            head_dim, sliding_window_size=sliding_window_size,
+            head_dim,
+            sliding_window_size=sliding_window_size,
             head_num=num_q_heads,
         )
         for qo_dt in qo_indptr_dtypes:
             for is_causal in is_causal_modes:
-                for (bs, ext, pfx_total) in shape_reps:
-                    q, k, v, o, kb, vb, qo_ip, kv_ip, kv_ix, mi_ip, sinks = _make_realistic_tensors(
-                        device, dtype, num_q_heads, num_kv_heads, head_dim,
-                        bs, ext, pfx_total // max(1, bs), kv_pool_size, has_sink,
-                        qo_indptr_dtype=qo_dt,
+                for bs, ext, pfx_total in shape_reps:
+                    q, k, v, o, kb, vb, qo_ip, kv_ip, kv_ix, mi_ip, sinks = (
+                        _make_realistic_tensors(
+                            device,
+                            dtype,
+                            num_q_heads,
+                            num_kv_heads,
+                            head_dim,
+                            bs,
+                            ext,
+                            pfx_total // max(1, bs),
+                            kv_pool_size,
+                            has_sink,
+                            qo_indptr_dtype=qo_dt,
+                        )
                     )
                     try:
                         _dispatch_fwd(
-                            q, k, v, o, kb, vb, qo_ip, kv_ip, kv_ix,
-                            None, is_causal, mi_ip, ext,
-                            k_scale=1.0, v_scale=1.0,
+                            q,
+                            k,
+                            v,
+                            o,
+                            kb,
+                            vb,
+                            qo_ip,
+                            kv_ip,
+                            kv_ix,
+                            None,
+                            is_causal,
+                            mi_ip,
+                            ext,
+                            k_scale=1.0,
+                            v_scale=1.0,
                             sm_scale=1.0 / math.sqrt(head_dim),
                             logit_cap=logit_cap,
                             sliding_window_size=sliding_window_size,
@@ -834,7 +1077,12 @@ def _populate_runtime_caches(
                         if verbose:
                             logger.warning(
                                 "phase2 basic bs=%d ext=%d pfx=%d causal=%s qo_dt=%s failed: %r",
-                                bs, ext, pfx_total, is_causal, qo_dt, e,
+                                bs,
+                                ext,
+                                pfx_total,
+                                is_causal,
+                                qo_dt,
+                                e,
                             )
 
     # Persistent path: ragged batches to exercise WCA and bsearch.
@@ -884,13 +1132,15 @@ def enumerate_layer_patterns(
     """
     seen: set[tuple] = set()
     for L in layers:
-        seen.add((
-            int(L.get("sliding_window_size", -1)),
-            bool(L.get("has_sink", False)),
-            float(L.get("logit_cap", 0.0)),
-            int(L.get("xai_temperature_len", -1)),
-            bool(L.get("is_causal", True)),
-        ))
+        seen.add(
+            (
+                int(L.get("sliding_window_size", -1)),
+                bool(L.get("has_sink", False)),
+                float(L.get("logit_cap", 0.0)),
+                int(L.get("xai_temperature_len", -1)),
+                bool(L.get("is_causal", True)),
+            )
+        )
     return sorted(seen)
 
 
@@ -939,18 +1189,16 @@ def spec_qwen3(
     pass ``use_sliding_window=False`` to warm a single pattern."""
     patterns = []
     for i in range(num_layers):
-        sw = (
-            sliding_window
-            if (use_sliding_window and i >= max_window_layers)
-            else -1
+        sw = sliding_window if (use_sliding_window and i >= max_window_layers) else -1
+        patterns.append(
+            {
+                "sliding_window_size": sw,
+                "has_sink": False,
+                "logit_cap": 0.0,
+                "xai_temperature_len": -1,
+                "is_causal": True,
+            }
         )
-        patterns.append({
-            "sliding_window_size": sw,
-            "has_sink": False,
-            "logit_cap": 0.0,
-            "xai_temperature_len": -1,
-            "is_causal": True,
-        })
     return patterns
 
 
@@ -1002,13 +1250,17 @@ def spec_cohere2(
         ]
     out = []
     for lt in layer_types:
-        out.append({
-            "sliding_window_size": sliding_window if lt == "sliding_attention" else -1,
-            "has_sink": False,
-            "logit_cap": 0.0,
-            "xai_temperature_len": -1,
-            "is_causal": True,
-        })
+        out.append(
+            {
+                "sliding_window_size": (
+                    sliding_window if lt == "sliding_attention" else -1
+                ),
+                "has_sink": False,
+                "logit_cap": 0.0,
+                "xai_temperature_len": -1,
+                "is_causal": True,
+            }
+        )
     return out
 
 
@@ -1057,50 +1309,39 @@ def spec_llama3(num_layers: int = 32) -> list[dict]:
 MODEL_PRESETS = {
     # Cohere Command R+ v2 (interleaved SWA, D=128, GQA 96->8)
     "cohere-command-r-plus": lambda: (128, 96, 8, spec_cohere2(num_layers=64)),
-
     # DBRX (Mosaic, dense full attention, D=128, 40 heads MHA -> 8 KV GQA)
-    "dbrx-instruct":         lambda: (128, 48, 8, spec_llama3(num_layers=40)),
-
+    "dbrx-instruct": lambda: (128, 48, 8, spec_llama3(num_layers=40)),
     # Gemma 2 (alternating SWA, attn_logit_softcap=50)
-    "gemma2-9b":             lambda: (256, 16, 8, spec_gemma2(num_layers=42)),
-    "gemma2-27b":            lambda: (128, 32, 16, spec_gemma2(num_layers=46)),
-
+    "gemma2-9b": lambda: (256, 16, 8, spec_gemma2(num_layers=42)),
+    "gemma2-27b": lambda: (128, 32, 16, spec_gemma2(num_layers=46)),
     # Gemma 3 (5:1 local:global, attn_logit_softcap=0; model uses final_logit_softcap)
-    "gemma3-27b":            lambda: (256, 32, 16, spec_gemma3(num_layers=62)),
-
+    "gemma3-27b": lambda: (256, 32, 16, spec_gemma3(num_layers=62)),
     # GPT-OSS (alternating SWA, attention sinks)
-    "gpt-oss-20b":           lambda: (64, 64, 8, spec_gpt_oss(num_layers=24)),
-    "gpt-oss-120b":          lambda: (64, 64, 8, spec_gpt_oss(num_layers=36)),
-
+    "gpt-oss-20b": lambda: (64, 64, 8, spec_gpt_oss(num_layers=24)),
+    "gpt-oss-120b": lambda: (64, 64, 8, spec_gpt_oss(num_layers=36)),
     # Grok-1 (uniform full, attn_logit_softcap=30, optional temperature_len)
-    "grok-1":                lambda: (128, 48, 8, spec_grok(num_layers=64)),
-
+    "grok-1": lambda: (128, 48, 8, spec_grok(num_layers=64)),
     # Llama 3 family (uniform full attention)
-    "llama3-8b":             lambda: (128, 32, 8, spec_llama3(num_layers=32)),
-    "llama3-70b":            lambda: (128, 64, 8, spec_llama3(num_layers=80)),
-    "llama3.1-405b":         lambda: (128, 128, 8, spec_llama3(num_layers=126)),
-
+    "llama3-8b": lambda: (128, 32, 8, spec_llama3(num_layers=32)),
+    "llama3-70b": lambda: (128, 64, 8, spec_llama3(num_layers=80)),
+    "llama3.1-405b": lambda: (128, 128, 8, spec_llama3(num_layers=126)),
     # Llama 4 iRoPE (every 4th layer NoPE global, the rest chunked-window)
-    "llama4-maverick":       lambda: (128, 128, 8, spec_llama4(num_layers=48)),
-    "llama4-scout":          lambda: (128, 48, 8, spec_llama4(num_layers=48)),
-
+    "llama4-maverick": lambda: (128, 128, 8, spec_llama4(num_layers=48)),
+    "llama4-scout": lambda: (128, 48, 8, spec_llama4(num_layers=48)),
     # Mistral (sliding_window is defined in HF config but ignored by sglang)
-    "mistral-7b-v0.3":       lambda: (128, 32, 8, spec_llama3(num_layers=32)),
-    "mistral-nemo-12b":      lambda: (128, 32, 8, spec_llama3(num_layers=40)),
-    "mistral-small-24b":     lambda: (128, 32, 8, spec_llama3(num_layers=40)),
-
+    "mistral-7b-v0.3": lambda: (128, 32, 8, spec_llama3(num_layers=32)),
+    "mistral-nemo-12b": lambda: (128, 32, 8, spec_llama3(num_layers=40)),
+    "mistral-small-24b": lambda: (128, 32, 8, spec_llama3(num_layers=40)),
     # Mixtral (MoE, dense full attention per layer)
-    "mixtral-8x7b":          lambda: (128, 32, 8, spec_llama3(num_layers=32)),
-    "mixtral-8x22b":         lambda: (128, 48, 8, spec_llama3(num_layers=56)),
-
+    "mixtral-8x7b": lambda: (128, 32, 8, spec_llama3(num_layers=32)),
+    "mixtral-8x22b": lambda: (128, 48, 8, spec_llama3(num_layers=56)),
     # OLMo 2 (uniform full; 7B/13B both have `layer_types` but uniformly full)
-    "olmo2-7b":              lambda: (128, 32, 32, spec_llama3(num_layers=32)),
-    "olmo2-13b":             lambda: (128, 40, 40, spec_llama3(num_layers=40)),
-
+    "olmo2-7b": lambda: (128, 32, 32, spec_llama3(num_layers=32)),
+    "olmo2-13b": lambda: (128, 40, 40, spec_llama3(num_layers=40)),
     # Qwen 2.5 / Qwen 3 (Qwen3 ignores use_sliding_window in sglang; treat as uniform)
-    "qwen2.5-72b":           lambda: (128, 64, 8, spec_llama3(num_layers=80)),
-    "qwen3-8b":              lambda: (128, 32, 8, spec_qwen3(num_layers=36)),
-    "qwen3-32b":             lambda: (128, 64, 8, spec_qwen3(num_layers=64)),
+    "qwen2.5-72b": lambda: (128, 64, 8, spec_llama3(num_layers=80)),
+    "qwen3-8b": lambda: (128, 32, 8, spec_qwen3(num_layers=36)),
+    "qwen3-32b": lambda: (128, 64, 8, spec_qwen3(num_layers=64)),
 }
 
 
@@ -1129,12 +1370,20 @@ def prewarm_for_model(
     if verbose:
         logger.info(
             "prewarm_for_model: D=%d H=%d kvH=%d -- %d layers collapse to %d unique patterns",
-            head_dim, num_q_heads, num_kv_heads, len(layers), len(patterns),
+            head_dim,
+            num_q_heads,
+            num_kv_heads,
+            len(layers),
+            len(patterns),
         )
         for swa, sink, cap, xai_len, causal in patterns:
             logger.info(
                 "  pattern: swa=%d sink=%s cap=%.3g xai_len=%d causal=%s",
-                swa, sink, cap, xai_len, causal,
+                swa,
+                sink,
+                cap,
+                xai_len,
+                causal,
             )
 
     pat_stats = []
@@ -1157,17 +1406,21 @@ def prewarm_for_model(
             parallel=parallel,
             verbose=verbose,
         )
-        pat_stats.append({
-            "pattern": (swa, sink, cap, xai_len, causal),
-            **sub,
-        })
+        pat_stats.append(
+            {
+                "pattern": (swa, sink, cap, xai_len, causal),
+                **sub,
+            }
+        )
 
     wall = time.time() - t0
     total_variants = sum(p["num_variants"] for p in pat_stats)
     if verbose:
         logger.info(
             "prewarm_for_model: %d patterns, %d total variants, %.2fs wall",
-            len(patterns), total_variants, wall,
+            len(patterns),
+            total_variants,
+            wall,
         )
     return {
         "num_patterns": len(patterns),
@@ -1189,8 +1442,7 @@ def prewarm_preset(
     """Prewarm from a named preset (see MODEL_PRESETS)."""
     if preset_name not in MODEL_PRESETS:
         raise ValueError(
-            f"unknown preset {preset_name!r}; "
-            f"available: {sorted(MODEL_PRESETS)}"
+            f"unknown preset {preset_name!r}; " f"available: {sorted(MODEL_PRESETS)}"
         )
     head_dim, num_q_heads, num_kv_heads, layers = MODEL_PRESETS[preset_name]()
     return prewarm_for_model(
