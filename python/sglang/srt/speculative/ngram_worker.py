@@ -295,16 +295,23 @@ class NGRAMWorker:
 
     def _update_ngram_corpus(self, batch: ModelWorkerBatch):
         batch_tokens = []
+        i, stride = 0, self.draft_token_num
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.
             # if batch.forward_mode.is_extend():
             #     put_ids = req.origin_input_ids + req.output_ids
             # else:
+            prev_tokens = (
+                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
+                if not batch.has_grammar
+                else []
+            )
             put_ids = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids, self.max_trie_depth
+                req.origin_input_ids, req.output_ids + prev_tokens, self.max_trie_depth
             )
             batch_tokens.append(put_ids)
+            i += 1
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
@@ -314,11 +321,15 @@ class NGRAMWorker:
             torch.get_device_module(self.device).current_stream()
         )
         bs = len(model_worker_batch.seq_lens)
-        
-        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+
+        set_time_batch(
+            model_worker_batch.reqs, "set_spec_draft_start_time", trace_only=True
+        )
         self._prepare_for_speculative_decoding(model_worker_batch)
-        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
-        
+        set_time_batch(
+            model_worker_batch.reqs, "set_spec_draft_end_time", trace_only=True
+        )
+
         verify_input: NgramVerifyInput = model_worker_batch.spec_info
         accept_length = torch.tensor([1] * bs, dtype=torch.int32, device=self.device)
 
@@ -331,7 +342,9 @@ class NGRAMWorker:
                     verify_input.retrive_next_token.shape
                 ).cpu()
 
-            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+            set_time_batch(
+                model_worker_batch.reqs, "set_spec_verify_start_time", trace_only=True
+            )
 
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
@@ -384,12 +397,12 @@ class NGRAMWorker:
                 self.token_to_kv_pool_allocator,
                 self.draft_token_num,
             )
-            # TODO logprobs for spec v2
+            # TODO logprobs for ngram spec v2
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
 
             if get_global_tracing_enabled():
-                for idx, req in enumerate(batch.reqs):
+                for idx, req in enumerate(model_worker_batch.reqs):
                     accepted = (
                         verify_input.accept_length[idx].item()
                         if verify_input.accept_length is not None
