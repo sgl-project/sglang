@@ -403,6 +403,14 @@ class XPUAttentionBackend(AttentionBackend):
                     workspace_size, device=self.device, dtype=torch.uint8
                 )
 
+        # Translate full-pool indices to SWA-pool indices for hybrid models
+        if self.use_sliding_window_kv_pool:
+            metadata.swa_page_table = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    metadata.page_table
+                )
+            )
+
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
             self.strided_indices = torch.arange(
