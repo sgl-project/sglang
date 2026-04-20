@@ -11,16 +11,154 @@ on:
         required: false
         type: string
         default: 'main'
-      job_filter:
-        description: 'Comma-separated workflows to run: nightly-amd, nightly-amd-rocm720, pr-test-amd, pr-test-amd-rocm720. Default: all'
+      custom_image:
+        description: 'Custom Docker image to use (e.g. rocm/sgl-dev:v0.5.9-rocm700-mi30x-20260315). Leave empty to use latest nightly.'
         required: false
         type: string
-        default: 'all'
+        default: ''
       continue_on_error:
         description: 'Continue running other workflows even if one fails'
         required: false
         type: boolean
         default: true
+      nightly_amd_jobs:
+        description: 'Nightly AMD: select a job (or "all"/"none"). For multiple jobs use job_filter below.'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - 'none'
+          - nightly-test-1-gpu-unit
+          - nightly-accuracy-2-gpu
+          - nightly-accuracy-2-gpu-vlm
+          - nightly-perf-2-gpu-text
+          - nightly-perf-2-gpu-vlm
+          - nightly-4-gpu
+          - nightly-accuracy-8-gpu
+          - nightly-8-gpu-grok1-int4
+          - nightly-8-gpu-grok2
+          - nightly-8-gpu-deepseek-v31
+          - nightly-8-gpu-deepseek-v32
+          - nightly-8-gpu-deepseek-v32-mtp
+          - nightly-8-gpu-deepseek-v3-kv-fp8
+          - nightly-8-gpu-kimi-k25
+          - nightly-8-gpu-qwen3-235b
+          - nightly-8-gpu-qwen35
+          - nightly-8-gpu-glm5
+          - nightly-8-gpu-minimax-m25
+          - nightly-1-gpu-zimage-turbo
+          - nightly-test-1-gpu-mi35x
+          - nightly-accuracy-8-gpu-mi35x
+          - nightly-8-gpu-mi35x-grok1-int4
+          - nightly-8-gpu-mi35x-grok2
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion
+          - nightly-accuracy-8-gpu-mi35x-deepseek-v32
+          - nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp
+          - nightly-perf-8-gpu-mi35x-deepseek-v32-basic
+          - nightly-perf-8-gpu-mi35x-deepseek-v32-mtp
+          - nightly-8-gpu-mi35x-kimi-k25
+          - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
+          - nightly-8-gpu-mi35x-qwen35
+          - nightly-8-gpu-mi35x-glm5
+          - nightly-8-gpu-mi35x-minimax-m25
+      nightly_amd_rocm720_jobs:
+        description: 'Nightly AMD ROCm 7.2: select a job (or "all"/"none"). For multiple jobs use job_filter below.'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - 'none'
+          - nightly-test-1-gpu-unit-rocm720
+          - nightly-accuracy-2-gpu-rocm720
+          - nightly-accuracy-2-gpu-vlm-rocm720
+          - nightly-perf-2-gpu-text-rocm720
+          - nightly-perf-2-gpu-vlm-rocm720
+          - nightly-4-gpu-rocm720
+          - nightly-accuracy-8-gpu-rocm720
+          - nightly-8-gpu-grok1-int4-rocm720
+          - nightly-8-gpu-grok2-rocm720
+          - nightly-8-gpu-deepseek-v31-rocm720
+          - nightly-8-gpu-deepseek-v32-rocm720
+          - nightly-8-gpu-deepseek-v32-mtp-rocm720
+          - nightly-8-gpu-deepseek-v3-kv-fp8-rocm720
+          - nightly-8-gpu-kimi-k25-rocm720
+          - nightly-8-gpu-qwen3-235b-rocm720
+          - nightly-8-gpu-qwen35-rocm720
+          - nightly-8-gpu-glm5-rocm720
+          - nightly-8-gpu-minimax-m25-rocm720
+          - nightly-1-gpu-zimage-turbo-rocm720
+          - nightly-test-1-gpu-mi35x-rocm720
+          - nightly-accuracy-8-gpu-mi35x-rocm720
+          - nightly-8-gpu-mi35x-grok1-int4-rocm720
+          - nightly-8-gpu-mi35x-grok2-rocm720
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-rocm720
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8-rocm720
+          - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion-rocm720
+          - nightly-accuracy-8-gpu-mi35x-deepseek-v32-rocm720
+          - nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp-rocm720
+          - nightly-perf-8-gpu-mi35x-deepseek-v32-basic-rocm720
+          - nightly-perf-8-gpu-mi35x-deepseek-v32-mtp-rocm720
+          - nightly-8-gpu-mi35x-kimi-k25-rocm720
+          - nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720
+          - nightly-8-gpu-mi35x-qwen35-rocm720
+          - nightly-8-gpu-mi35x-glm5-rocm720
+          - nightly-8-gpu-mi35x-glm47-fp8-rocm720
+          - nightly-8-gpu-mi35x-minimax-m25-rocm720
+      pr_test_amd_jobs:
+        description: 'PR Test AMD: select a stage (or "all"/"none"). For multiple stages use job_filter below.'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - 'none'
+          - sgl-kernel-unit-test-amd
+          - sgl-kernel-unit-test-2-gpu-amd
+          - stage-a-test-1-gpu-small-amd
+          - jit-kernel-unit-test-amd
+          - stage-b-test-1-gpu-small-amd
+          - stage-b-test-1-gpu-small-amd-nondeterministic
+          - stage-b-test-1-gpu-small-amd-mi35x
+          - stage-b-test-1-gpu-large-amd
+          - stage-b-test-2-gpu-large-amd
+          - multimodal-gen-test-1-gpu-amd
+          - multimodal-gen-test-2-gpu-amd
+          - stage-c-test-4-gpu-amd
+          - stage-c-test-large-8-gpu-amd
+          - stage-c-test-large-8-gpu-amd-mi35x
+          - stage-b-test-large-8-gpu-disaggregation-amd
+      pr_test_amd_rocm720_jobs:
+        description: 'PR Test AMD ROCm 7.2: select a stage (or "all"/"none"). For multiple stages use job_filter below.'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - 'none'
+          - sgl-kernel-unit-test-amd
+          - sgl-kernel-unit-test-2-gpu-amd
+          - stage-a-test-1-gpu-small-amd
+          - jit-kernel-unit-test-amd
+          - stage-b-test-1-gpu-small-amd
+          - stage-b-test-1-gpu-small-amd-nondeterministic
+          - stage-b-test-1-gpu-small-amd-mi35x
+          - stage-b-test-1-gpu-large-amd
+          - stage-b-test-2-gpu-large-amd
+          - multimodal-gen-test-1-gpu-amd
+          - multimodal-gen-test-2-gpu-amd
+          - stage-c-test-large-8-gpu-amd
+          - stage-c-test-large-8-gpu-amd-mi35x
+          - stage-b-test-large-8-gpu-disaggregation-amd
+          - stage-c-test-4-gpu-amd
+      job_filter:
+        description: 'Advanced: override dropdowns with structured format. E.g. "nightly-amd:job1,job2;pr-test-amd:stage1,stage2". Unmentioned workflows are skipped.'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: amd-aiter-scout-${{ github.run_id }}
@@ -31,10 +169,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       aiter_sha: ${{ steps.resolve.outputs.sha }}
-      run_nightly_amd: ${{ steps.parse.outputs.run_nightly_amd }}
-      run_nightly_amd_rocm720: ${{ steps.parse.outputs.run_nightly_amd_rocm720 }}
-      run_pr_test_amd: ${{ steps.parse.outputs.run_pr_test_amd }}
-      run_pr_test_amd_rocm720: ${{ steps.parse.outputs.run_pr_test_amd_rocm720 }}
     steps:
       - name: Resolve AITER commit
         id: resolve
@@ -59,75 +193,158 @@ jobs:
           echo "- **Resolved SHA:** \`${SHA}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${SHA}" >> $GITHUB_STEP_SUMMARY
 
+  parse-job-filter:
+    runs-on: ubuntu-latest
+    outputs:
+      run_nightly_amd: ${{ steps.parse.outputs.run_nightly_amd }}
+      nightly_amd_filter: ${{ steps.parse.outputs.nightly_amd_filter }}
+      run_nightly_amd_rocm720: ${{ steps.parse.outputs.run_nightly_amd_rocm720 }}
+      nightly_amd_rocm720_filter: ${{ steps.parse.outputs.nightly_amd_rocm720_filter }}
+      run_pr_test_amd: ${{ steps.parse.outputs.run_pr_test_amd }}
+      pr_test_amd_filter: ${{ steps.parse.outputs.pr_test_amd_filter }}
+      run_pr_test_amd_rocm720: ${{ steps.parse.outputs.run_pr_test_amd_rocm720 }}
+      pr_test_amd_rocm720_filter: ${{ steps.parse.outputs.pr_test_amd_rocm720_filter }}
+    steps:
       - name: Parse job filter
         id: parse
         run: |
-          FILTER="${{ inputs.job_filter || 'all' }}"
-          echo "Job filter: ${FILTER}"
+          OVERRIDE="${{ inputs.job_filter }}"
 
-          if [[ "$FILTER" == "all" ]]; then
-            echo "run_nightly_amd=true" >> $GITHUB_OUTPUT
-            echo "run_nightly_amd_rocm720=true" >> $GITHUB_OUTPUT
-            echo "run_pr_test_amd=true" >> $GITHUB_OUTPUT
-            echo "run_pr_test_amd_rocm720=true" >> $GITHUB_OUTPUT
+          # Nightly workflows use job_filter="all" for all jobs.
+          # PR test workflows use target_stage="" (empty) for all jobs, since their
+          # job conditions don't have an explicit "all" check.
+          resolve_workflow() {
+            local wf_key="$1"
+            local value="$2"
+            local all_value="$3"  # "all" for nightly, "" for PR test
+            local run_var="run_${wf_key}"
+            local filter_var="${wf_key}_filter"
+
+            if [[ "$value" == "none" ]]; then
+              echo "${run_var}=false" >> $GITHUB_OUTPUT
+              echo "${filter_var}=" >> $GITHUB_OUTPUT
+            elif [[ "$value" == "all" || -z "$value" ]]; then
+              echo "${run_var}=true" >> $GITHUB_OUTPUT
+              echo "${filter_var}=${all_value}" >> $GITHUB_OUTPUT
+            else
+              echo "${run_var}=true" >> $GITHUB_OUTPUT
+              echo "${filter_var}=${value}" >> $GITHUB_OUTPUT
+            fi
+          }
+
+          if [ -n "$OVERRIDE" ]; then
+            echo "Using advanced job_filter override: ${OVERRIDE}"
+
+            NA_FILTER="" NA_720_FILTER="" PR_FILTER="" PR_720_FILTER=""
+            RUN_NA=false RUN_NA_720=false RUN_PR=false RUN_PR_720=false
+
+            IFS=';' read -ra ENTRIES <<< "$OVERRIDE"
+            for entry in "${ENTRIES[@]}"; do
+              entry=$(echo "$entry" | xargs)
+              [ -z "$entry" ] && continue
+
+              if [[ "$entry" == *":"* ]]; then
+                WF_NAME="${entry%%:*}"
+                JOBS="${entry#*:}"
+              else
+                WF_NAME="$entry"
+                JOBS="all"
+              fi
+
+              WF_NAME=$(echo "$WF_NAME" | xargs)
+              JOBS=$(echo "$JOBS" | xargs)
+
+              case "$WF_NAME" in
+                nightly-amd)
+                  RUN_NA=true
+                  NA_FILTER="$( [[ "$JOBS" == "all" ]] && echo "all" || echo "$JOBS" )" ;;
+                nightly-amd-rocm720)
+                  RUN_NA_720=true
+                  NA_720_FILTER="$( [[ "$JOBS" == "all" ]] && echo "all" || echo "$JOBS" )" ;;
+                pr-test-amd)
+                  RUN_PR=true
+                  PR_FILTER="$( [[ "$JOBS" == "all" ]] && echo "" || echo "$JOBS" )" ;;
+                pr-test-amd-rocm720)
+                  RUN_PR_720=true
+                  PR_720_FILTER="$( [[ "$JOBS" == "all" ]] && echo "" || echo "$JOBS" )" ;;
+                *)
+                  echo "::warning::Unknown workflow in job_filter: ${WF_NAME}" ;;
+              esac
+            done
+
+            echo "run_nightly_amd=${RUN_NA}" >> $GITHUB_OUTPUT
+            echo "nightly_amd_filter=${NA_FILTER}" >> $GITHUB_OUTPUT
+            echo "run_nightly_amd_rocm720=${RUN_NA_720}" >> $GITHUB_OUTPUT
+            echo "nightly_amd_rocm720_filter=${NA_720_FILTER}" >> $GITHUB_OUTPUT
+            echo "run_pr_test_amd=${RUN_PR}" >> $GITHUB_OUTPUT
+            echo "pr_test_amd_filter=${PR_FILTER}" >> $GITHUB_OUTPUT
+            echo "run_pr_test_amd_rocm720=${RUN_PR_720}" >> $GITHUB_OUTPUT
+            echo "pr_test_amd_rocm720_filter=${PR_720_FILTER}" >> $GITHUB_OUTPUT
           else
-            # Wrap with commas for exact substring matching (avoids "nightly-amd" matching "nightly-amd-rocm720")
-            PADDED=",${FILTER// /},"
-            echo "run_nightly_amd=$(echo "$PADDED" | grep -q ',nightly-amd,' && echo true || echo false)" >> $GITHUB_OUTPUT
-            echo "run_nightly_amd_rocm720=$(echo "$PADDED" | grep -q ',nightly-amd-rocm720,' && echo true || echo false)" >> $GITHUB_OUTPUT
-            echo "run_pr_test_amd=$(echo "$PADDED" | grep -q ',pr-test-amd,' && echo true || echo false)" >> $GITHUB_OUTPUT
-            echo "run_pr_test_amd_rocm720=$(echo "$PADDED" | grep -q ',pr-test-amd-rocm720,' && echo true || echo false)" >> $GITHUB_OUTPUT
+            echo "Using dropdown selections"
+            resolve_workflow "nightly_amd" "${{ inputs.nightly_amd_jobs || 'all' }}" "all"
+            resolve_workflow "nightly_amd_rocm720" "${{ inputs.nightly_amd_rocm720_jobs || 'all' }}" "all"
+            resolve_workflow "pr_test_amd" "${{ inputs.pr_test_amd_jobs || 'all' }}" ""
+            resolve_workflow "pr_test_amd_rocm720" "${{ inputs.pr_test_amd_rocm720_jobs || 'all' }}" ""
           fi
 
-          echo "### Job Filter" >> $GITHUB_STEP_SUMMARY
-          echo "- **Filter:** \`${FILTER}\`" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Filter Resolution" >> $GITHUB_STEP_SUMMARY
+          echo "| Workflow | Run | Filter |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-----|--------|" >> $GITHUB_STEP_SUMMARY
 
   call-nightly-amd:
-    if: needs.resolve-aiter.outputs.run_nightly_amd == 'true'
-    needs: resolve-aiter
+    if: needs.parse-job-filter.outputs.run_nightly_amd == 'true'
+    needs: [resolve-aiter, parse-job-filter]
     uses: ./.github/workflows/nightly-test-amd.yml
     secrets: inherit
     with:
       ref: ${{ github.sha }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
-      job_filter: 'all'
+      custom_image: ${{ inputs.custom_image || '' }}
+      job_filter: ${{ needs.parse-job-filter.outputs.nightly_amd_filter }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-nightly-amd-rocm720:
-    if: needs.resolve-aiter.outputs.run_nightly_amd_rocm720 == 'true'
-    needs: resolve-aiter
+    if: needs.parse-job-filter.outputs.run_nightly_amd_rocm720 == 'true'
+    needs: [resolve-aiter, parse-job-filter]
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     secrets: inherit
     with:
       ref: ${{ github.sha }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
-      job_filter: 'all'
+      custom_image: ${{ inputs.custom_image || '' }}
+      job_filter: ${{ needs.parse-job-filter.outputs.nightly_amd_rocm720_filter }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd:
-    if: needs.resolve-aiter.outputs.run_pr_test_amd == 'true'
-    needs: resolve-aiter
+    if: needs.parse-job-filter.outputs.run_pr_test_amd == 'true'
+    needs: [resolve-aiter, parse-job-filter]
     uses: ./.github/workflows/pr-test-amd.yml
     secrets: inherit
     with:
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      custom_image: ${{ inputs.custom_image || '' }}
+      target_stage: ${{ needs.parse-job-filter.outputs.pr_test_amd_filter }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd-rocm720:
-    if: needs.resolve-aiter.outputs.run_pr_test_amd_rocm720 == 'true'
-    needs: resolve-aiter
+    if: needs.parse-job-filter.outputs.run_pr_test_amd_rocm720 == 'true'
+    needs: [resolve-aiter, parse-job-filter]
     uses: ./.github/workflows/pr-test-amd-rocm720.yml
     secrets: inherit
     with:
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
+      custom_image: ${{ inputs.custom_image || '' }}
+      target_stage: ${{ needs.parse-job-filter.outputs.pr_test_amd_rocm720_filter }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   check-all-jobs:
     if: always()
     needs:
       - resolve-aiter
+      - parse-job-filter
       - call-nightly-amd
       - call-nightly-amd-rocm720
       - call-pr-test-amd
@@ -141,6 +358,15 @@ jobs:
           echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Filters" >> $GITHUB_STEP_SUMMARY
+          echo "| Workflow | Filter |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Nightly AMD | \`${{ needs.parse-job-filter.outputs.run_nightly_amd == 'true' && (needs.parse-job-filter.outputs.nightly_amd_filter || 'all') || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nightly AMD ROCm 7.2 | \`${{ needs.parse-job-filter.outputs.run_nightly_amd_rocm720 == 'true' && (needs.parse-job-filter.outputs.nightly_amd_rocm720_filter || 'all') || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD | \`${{ needs.parse-job-filter.outputs.run_pr_test_amd == 'true' && (needs.parse-job-filter.outputs.pr_test_amd_filter || 'all') || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD ROCm 7.2 | \`${{ needs.parse-job-filter.outputs.run_pr_test_amd_rocm720 == 'true' && (needs.parse-job-filter.outputs.pr_test_amd_rocm720_filter || 'all') || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Results" >> $GITHUB_STEP_SUMMARY
           echo "| Workflow | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Nightly AMD (AITER Latest) | \`${{ needs.call-nightly-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY

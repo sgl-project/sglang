@@ -63,6 +63,11 @@ on:
         required: false
         type: string
         default: ''
+      custom_image:
+        description: 'Custom Docker image (e.g. rocm/sgl-dev:v0.5.9-rocm720-mi30x-20260315). Leave empty for latest nightly.'
+        required: false
+        type: string
+        default: ''
       continue_on_error:
         description: 'Continue on error (do not fail the workflow on test failures)'
         required: false
@@ -85,14 +90,25 @@ on:
         required: false
         type: string
         default: ''
+      custom_image:
+        description: 'Custom Docker image to use directly (overrides auto-detection)'
+        required: false
+        type: string
+        default: ''
       continue_on_error:
         description: 'Continue on error (do not fail the workflow on test failures)'
         required: false
         type: boolean
         default: true
+      target_stage:
+        description: 'Comma-separated stage/job names to run (empty = all)'
+        required: false
+        type: string
+        default: ''
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  CUSTOM_IMAGE: ${{ inputs.custom_image }}
 
 concurrency:
   # When called via workflow_call with run_all_tests=true, use a unique group per run to

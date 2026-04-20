@@ -28,11 +28,17 @@ LOCAL_DOCKER_REGISTRY="172.29.8.23:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
+CUSTOM_IMAGE="${CUSTOM_IMAGE:-}"
+BUILD_FROM_DOCKERFILE=""
+GPU_ARCH_BUILD=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
+    --build-from-dockerfile) BUILD_FROM_DOCKERFILE="1"; shift;;
+    --gpu-arch) GPU_ARCH_BUILD="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
       MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
@@ -40,7 +46,14 @@ while [[ $# -gt 0 ]]; do
       echo "Using ROCm version override: ${ROCM_VERSION}"
       shift 2;;
     -h|--help)
-      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--rocm-version VERSION]"
+      echo "Usage: $0 [OPTIONS]"
+      echo "Options:"
+      echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
+      echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
+      echo "  --custom-image IMAGE       Use a specific Docker image directly"
+      echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
+      echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
+      echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -208,17 +221,48 @@ find_latest_image() {
   esac
 }
 
-# Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-echo "Pulling Docker image: ${IMAGE}"
-if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
-  # Local registry is on-LAN; no need to retry.
+# Determine which image to use
+if [[ -n "${CUSTOM_IMAGE}" ]]; then
+  IMAGE="${CUSTOM_IMAGE}"
+  echo "Using custom image: ${IMAGE}"
   docker pull "${IMAGE}"
-  docker tag "${IMAGE}" "${IMAGE#${LOCAL_DOCKER_REGISTRY}/}"
-  IMAGE="${IMAGE#${LOCAL_DOCKER_REGISTRY}/}"
+elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
+  if [[ -z "${GPU_ARCH_BUILD}" ]]; then
+    echo "Error: --gpu-arch is required when using --build-from-dockerfile" >&2
+    exit 1
+  fi
+
+  DOCKERFILE_DIR="${GITHUB_WORKSPACE:-$PWD}/docker"
+  DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
+
+  if [[ ! -f "${DOCKERFILE}" ]]; then
+    echo "Error: Dockerfile not found at ${DOCKERFILE}" >&2
+    exit 1
+  fi
+
+  IMAGE="sglang-ci:${GPU_ARCH_BUILD}-$(date +%Y%m%d)"
+  echo "Building Docker image from ${DOCKERFILE} with GPU_ARCH=${GPU_ARCH_BUILD}..."
+
+  docker build \
+    --build-arg GPU_ARCH="${GPU_ARCH_BUILD}" \
+    --build-arg SGL_BRANCH="main" \
+    -t "${IMAGE}" \
+    -f "${DOCKERFILE}" \
+    "${DOCKERFILE_DIR}"
+  echo "Successfully built image: ${IMAGE}"
 else
-  # Public registry pulls can hit rate limits; retry with backoff.
-  retry_with_backoff 6 docker pull "${IMAGE}"
+  # Pull and run the latest image
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+  echo "Pulling Docker image: ${IMAGE}"
+  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
+    # Local registry is on-LAN; no need to retry.
+    docker pull "${IMAGE}"
+    docker tag "${IMAGE}" "${IMAGE#${LOCAL_DOCKER_REGISTRY}/}"
+    IMAGE="${IMAGE#${LOCAL_DOCKER_REGISTRY}/}"
+  else
+    # Public registry pulls can hit rate limits; retry with backoff.
+    retry_with_backoff 6 docker pull "${IMAGE}"
+  fi
 fi
 
 # CACHE_HOST=/home/runner/sgl-data
