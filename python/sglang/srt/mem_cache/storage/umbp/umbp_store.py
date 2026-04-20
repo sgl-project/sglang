@@ -353,11 +353,15 @@ class UMBPStore(HiCacheStorage):
 
         self.storage_config = storage_config
 
-        # MLA + TP > 1: shared SSD mode
+        # MLA + TP > 1: shared SSD mode (standalone only).
+        # In distributed mode every rank is a peer of the master-led pool; we
+        # must NOT short-circuit followers (would leave their DRAM pool empty
+        # while the master still routes keys to them, causing Get misses).
         self.is_mla_follower = False
         tp_size = self.tp_size
         use_spdk = cfg.ssd_backend in ("spdk", "spdk_proxy")
-        if self.is_mla_backend and tp_size > 1:
+        distributed_enabled = cfg.distributed is not None
+        if not distributed_enabled and self.is_mla_backend and tp_size > 1:
             cfg.ssd.enabled = True
             if self.local_rank == 0:
                 # Leader: copy every DRAM write to shared SSD.
@@ -540,6 +544,50 @@ class UMBPStore(HiCacheStorage):
             "page_first_direct",
             "page_head",
         ], "UMBP store only supports page_first, page_first_direct, or page_head layout"
+
+        # In distributed mode, pre-register the entire host KV buffer with the
+        # underlying RDMA IOEngine so PoolClient can take the zero-copy path
+        # for batch_get_into_ptr / batch_put_from_ptr (skips the staging
+        # buffer memcpy + lock and removes the per-call `staging_buffer_size`
+        # cap).  Standalone mode is a no-op (pybind register_memory returns
+        # true without doing anything when the impl is not DistributedClient).
+        self._zero_copy_registered = False
+        if self.client is None:
+            return
+        try:
+            is_distributed = bool(self.client.is_distributed())
+        except Exception:
+            is_distributed = False
+        if not is_distributed:
+            return
+        if not hasattr(self.client, "register_memory"):
+            return
+        try:
+            kv_buffer = mem_pool_host.kv_buffer
+            host_ptr = int(kv_buffer.data_ptr())
+            host_size = int(kv_buffer.numel() * kv_buffer.element_size())
+            ok = bool(self.client.register_memory(host_ptr, host_size))
+        except Exception as exc:
+            logger.warning(
+                "UMBPStore: register_memory failed (%s); falling back to staging "
+                "buffer path. Per-transfer size will be capped by "
+                "distributed.staging_buffer_size.",
+                exc,
+            )
+            return
+        if ok:
+            self._zero_copy_registered = True
+            logger.info(
+                "UMBPStore: registered host KV buffer for RDMA zero-copy "
+                "(ptr=0x%x, size=%d MB)",
+                host_ptr,
+                host_size // (1024 * 1024),
+            )
+        else:
+            logger.warning(
+                "UMBPStore: register_memory returned false; staying on staging "
+                "buffer fallback path."
+            )
 
     # ------------------------------------------------------------------
     # Key suffix generation — mirrors MooncakeStore
