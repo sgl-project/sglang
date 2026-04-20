@@ -153,6 +153,27 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      - name: Analyze logs with AI on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.NV_MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.NV_MODAL_TOKEN_SECRET }}
+        run: |
+          TARBALL="${{ github.workspace }}/multinode_server_logs.tar.gz"
+          if [ -f "$TARBALL" ]; then
+            uv run --with modal python scripts/ci/slurm/analyze_logs_with_modal.py \
+              --tarball "$TARBALL" \
+              --job-id "${{ matrix.config.name }}-${{ github.run_id }}" \
+              --output "${{ github.workspace }}/ai_analysis.md"
+            if [ -f "${{ github.workspace }}/ai_analysis.md" ]; then
+              echo "## AI Log Analysis" >> $GITHUB_STEP_SUMMARY
+              cat "${{ github.workspace }}/ai_analysis.md" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "No log tarball found, skipping analysis"
+          fi
+
       - name: Clean up Slurm jobs on failure/cancel
         if: failure() || cancelled()
         continue-on-error: true

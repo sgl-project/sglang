@@ -13,6 +13,7 @@ from enum import Enum, auto
 
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
@@ -102,6 +103,11 @@ class PipelineStage(ABC):
         Offload the model for the stage.
         """
         pass
+
+    # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.ENCODER
 
     # execute on all ranks by default
     @property
