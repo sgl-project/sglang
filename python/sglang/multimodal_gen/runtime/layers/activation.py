@@ -123,35 +123,10 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
 
-@CustomOp.register("gelu_pytorch_tanh")
-class GeLUPyTorchTanh(CustomOp):
-    """GeLU with tanh approximation.
-
-    On ROCm/HIP with bf16 input, dispatches to a FlyDSL bandwidth-optimized
-    kernel when available; otherwise falls back to PyTorch native.
-    """
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        return F.gelu(x, approximate="tanh")
-
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
-
-    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype == torch.bfloat16:
-            try:
-                from sglang.jit_kernel.diffusion.flydsl.gelu import flydsl_gelu_tanh
-
-                return flydsl_gelu_tanh(x)
-            except ImportError:
-                pass
-        return self.forward_native(x)
-
-
 _ACTIVATION_REGISTRY = {
     "gelu": nn.GELU,
     "gelu_new": NewGELU,
-    "gelu_pytorch_tanh": GeLUPyTorchTanh,
+    "gelu_pytorch_tanh": lambda: nn.GELU(approximate="tanh"),
     "relu": nn.ReLU,
     "silu": nn.SiLU,
     "quick_gelu": QuickGELU,

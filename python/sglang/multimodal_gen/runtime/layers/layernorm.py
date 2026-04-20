@@ -32,6 +32,7 @@ _is_cuda = current_platform.is_cuda()
 _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
 _is_xpu = current_platform.is_xpu()
+_use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
@@ -430,6 +431,9 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not _use_rocm_flydsl:
+            return self.forward_native(residual, x, gate, shift, scale)
+
         try:
             from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
@@ -563,6 +567,9 @@ class _NormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> torch.Tensor:
+        if not _use_rocm_flydsl:
+            return self.forward_native(x, shift, scale)
+
         try:
             from sglang.jit_kernel.diffusion.flydsl.fused_residual_norm import (
                 FLYDSL_NORM_MIN_ALIGNED_DIM,
