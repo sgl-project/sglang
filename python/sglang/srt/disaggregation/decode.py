@@ -197,18 +197,27 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
+        # Each decode-side request slot may need one main mamba slot plus
+        # extra tracking slots when extra_buffer is enabled.
+        slots_per_req = 1 + (
+            self.mamba_ping_pong_track_buffer_size
+            if enable_mamba_extra_buffer
+            else 0
+        )
+        max_slots_needed = (size + pre_alloc_size) * slots_per_req
         if mamba_size is not None:
-            effective_mamba_size = min(mamba_size, size + pre_alloc_size)
-            if mamba_size > size + pre_alloc_size:
-                logger.warning(
-                    "mamba_size (%d) exceeds size + pre_alloc_size (%d), "
-                    "capping effective_mamba_size to %d",
-                    mamba_size,
-                    size + pre_alloc_size,
-                    effective_mamba_size,
-                )
+            effective_mamba_size = max(mamba_size, max_slots_needed)
+            logger.warning(
+                "Configured mamba_size=%d, estimated decode requirement=%d "
+                "(%d reqs * %d slots/req), effective_mamba_size=%d in PD decode.",
+                mamba_size,
+                max_slots_needed,
+                size + pre_alloc_size,
+                slots_per_req,
+                effective_mamba_size,
+            )
         else:
-            effective_mamba_size = size + pre_alloc_size
+            effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
