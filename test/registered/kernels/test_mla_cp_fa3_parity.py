@@ -65,15 +65,11 @@ def _build_cache_and_q(seq_len):
     k_rope_cache = torch.randn(
         num_pages, PAGE_SIZE, 1, QK_ROPE_HEAD_DIM, dtype=DTYPE, device=DEVICE
     )
-    q_nope = torch.randn(
-        seq_len, NUM_HEADS, V_HEAD_DIM, dtype=DTYPE, device=DEVICE
-    )
+    q_nope = torch.randn(seq_len, NUM_HEADS, V_HEAD_DIM, dtype=DTYPE, device=DEVICE)
     q_rope = torch.randn(
         seq_len, NUM_HEADS, QK_ROPE_HEAD_DIM, dtype=DTYPE, device=DEVICE
     )
-    page_table = torch.arange(
-        num_pages, dtype=torch.int32, device=DEVICE
-    ).unsqueeze(0)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=DEVICE).unsqueeze(0)
     return c_kv_cache, k_rope_cache, q_nope, q_rope, page_table
 
 
@@ -160,9 +156,9 @@ def _cp_attn_for_rank(
 @pytest.mark.parametrize(
     "cp_size, block_size",
     [
-        (2, 64),   # DSv3 TP=8 baseline
+        (2, 64),  # DSv3 TP=8 baseline
         (2, 128),  # longer per-block seq
-        (4, 32),   # multi-rank zigzag: rank r gets blocks [r, 7-r]
+        (4, 32),  # multi-rank zigzag: rank r gets blocks [r, 7-r]
     ],
 )
 def test_cp_parity(cp_size, block_size):
@@ -170,9 +166,7 @@ def test_cp_parity(cp_size, block_size):
     seq_len = block_size * cp_size * 2
     softmax_scale = 1.0 / math.sqrt(V_HEAD_DIM + QK_ROPE_HEAD_DIM)
 
-    c_kv_cache, k_rope_cache, q_nope, q_rope, page_table = _build_cache_and_q(
-        seq_len
-    )
+    c_kv_cache, k_rope_cache, q_nope, q_rope, page_table = _build_cache_and_q(seq_len)
     ref_out = _full_seq_attn(
         seq_len, q_nope, q_rope, c_kv_cache, k_rope_cache, page_table, softmax_scale
     )
