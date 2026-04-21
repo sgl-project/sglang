@@ -17,6 +17,9 @@
 #   SHAREGPT_CONTEXT_LEN=4096          (sharegpt only)
 #   NUM_FEWSHOT=5  MAX_GEN_TOKS=512    (bench_eval only)
 #   APPLY_CHAT_TEMPLATE=1              (bench_eval only; default on)
+#   FEWSHOT_AS_MULTITURN=1             (bench_eval only; default on — wraps
+#                                       each fewshot exemplar as its own
+#                                       chat turn so model learns to stop)
 set -uo pipefail
 
 TASK="${1:-}"
@@ -50,16 +53,53 @@ SHAREGPT_CONTEXT_LEN="${SHAREGPT_CONTEXT_LEN:-4096}"
 NUM_FEWSHOT="${NUM_FEWSHOT:-5}"
 MAX_GEN_TOKS="${MAX_GEN_TOKS:-512}"
 APPLY_CHAT_TEMPLATE="${APPLY_CHAT_TEMPLATE:-1}"
+# Wrap each fewshot exemplar as its own <|im_start|>user/assistant turn so the
+# model sees N examples of "assistant closes with <|im_end|>" before emitting
+# its own answer. Without this, chat-tuned models under the Question:/Answer:
+# fewshot scaffold don't learn to stop and run to MAX_GEN_TOKS on every req.
+# MUST match the value used in run_calib.sh — the KV sizing depends on the
+# output-length distribution this flag produces.
+FEWSHOT_AS_MULTITURN="${FEWSHOT_AS_MULTITURN:-1}"
+# bench_eval.py defaults temperature=0.7 (non-thinking), which overrides the
+# per-task greedy setting and causes runaway generation up to MAX_GEN_TOKS.
+# Force greedy here; override with TEMPERATURE=<x> if needed.
+TEMPERATURE="${TEMPERATURE:-0}"
+# Per-task system instructions (math/MCQ). bench_eval.py docstring:
+#   Math: 'Please reason step by step, and put your final answer within \boxed{}.'
+#   MCQ:  'Please show your choice in the answer field with only the choice letter...'
+if [ -z "${SYSTEM_INSTRUCTION+x}" ]; then
+    case "$TASK" in
+        math*)
+            SYSTEM_INSTRUCTION='Please reason step by step, and put your final answer within \boxed{}.'
+            ;;
+        mmlu*|gpqa*|hellaswag|winogrande|arc_*)
+            SYSTEM_INSTRUCTION='Please show your choice in the answer field with only the choice letter, e.g., "answer": "C".'
+            ;;
+        *)
+            # gsm8k intentionally left empty: the 5-shot template already ends
+            # every example with "#### N", which is the format the strict-match
+            # filter extracts. Adding a \boxed{} instruction creates a conflict
+            # (model completes \boxed{}, then keeps generating since the fewshot
+            # "#### N" stop signal isn't what it's producing → hits max_gen_toks
+            # on 100% of requests).
+            SYSTEM_INSTRUCTION=""
+            ;;
+    esac
+fi
 
-MC_LIST=(8 16 32 64 128 256)
+MC_LIST=(256 128 64 32 16 8)
 # VARIANTS env override: `VARIANTS="thr128 hot0" bash run_sweep.sh ...` — for
 # smoke tests. Leave unset for the full 6×11 grid.
 if [ -n "${VARIANTS:-}" ]; then
     read -r -a VARIANTS <<< "$VARIANTS"
 else
-    VARIANTS=(hot0 hot20 hot40 hot60 hot80 hot100 thr32 thr64 thr128 thr256 thr512)
+    VARIANTS=(hot0 hot20 hot40 hot60 hot80 hot100)
 fi
-GPUS=(4 5 6 7)
+if [ -n "${GPUS:-}" ]; then
+    read -r -a GPUS <<< "$GPUS"
+else
+    GPUS=(0 1 2 3 4 5 6 7)
+fi
 
 declare -a ALL_PAIRS=()
 for mc in "${MC_LIST[@]}"; do
@@ -109,22 +149,28 @@ run_bench() {
             --sharegpt-context-len "$SHAREGPT_CONTEXT_LEN" \
             --num-prompts "$NUM_PROMPTS" \
             --max-concurrency "$mc" \
-            --output-details \
             --output-file "$out" > "$log" 2>&1
     else
         local ct_flag=()
         [ "$APPLY_CHAT_TEMPLATE" = "1" ] && ct_flag=(--apply-chat-template)
+        local mt_flag=()
+        [ "$FEWSHOT_AS_MULTITURN" = "1" ] && mt_flag=(--fewshot-as-multiturn)
+        local sys_flag=()
+        [ -n "$SYSTEM_INSTRUCTION" ] && sys_flag=(--system-instruction "$SYSTEM_INSTRUCTION")
         python3 -m sglang.bench_eval \
-            --task "$TASK" \
+            --task "${BENCH_TASK:-$TASK}" \
             --base-url "http://${HOST}:${port}" \
-            --backend sglang \
+            --backend sglang-oai \
             --model "$BF16_MODEL" \
             --tokenizer "$BF16_MODEL" \
             --num-fewshot "$NUM_FEWSHOT" \
             --max-gen-toks "$MAX_GEN_TOKS" \
             --request-rate inf \
             --max-concurrency "$mc" \
+            --temperature "$TEMPERATURE" \
             "${ct_flag[@]}" \
+            "${mt_flag[@]}" \
+            "${sys_flag[@]}" \
             --output-file "$out" > "$log" 2>&1
     fi
 }
@@ -208,7 +254,7 @@ run_gpu_worker() {
 }
 
 echo "============================================================"
-echo "  Sweep: $TASK  (6 mc × 11 variants = 66)"
+echo "  Sweep: $TASK  (${#MC_LIST[@]} mc × ${#VARIANTS[@]} variants = $((${#MC_LIST[@]}*${#VARIANTS[@]})))"
 echo "  GPUs:      ${GPUS[*]}"
 echo "  variants:  ${VARIANTS[*]}"
 echo "  configs:   $CFG_DIR  [$CFG_SOURCE]"
@@ -216,7 +262,9 @@ echo "  out:       $OUT_DIR"
 if [ "$TASK" = "sharegpt" ]; then
     echo "  bench:     bench_serving (n=$NUM_PROMPTS, ctx=$SHAREGPT_CONTEXT_LEN)"
 else
-    echo "  bench:     bench_eval --task=$TASK (fewshot=$NUM_FEWSHOT, max_gen=$MAX_GEN_TOKS)"
+    echo "  bench:     bench_eval --task=$TASK (fewshot=$NUM_FEWSHOT, max_gen=$MAX_GEN_TOKS, T=$TEMPERATURE)"
+    echo "             apply_chat_template=$APPLY_CHAT_TEMPLATE  fewshot_as_multiturn=$FEWSHOT_AS_MULTITURN"
+    [ -n "$SYSTEM_INSTRUCTION" ] && echo "  sys_instr: $SYSTEM_INSTRUCTION"
 fi
 for g in "${GPUS[@]}"; do
     npairs=$(echo ${GPU_PAIRS[$g]} | wc -w)
