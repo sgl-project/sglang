@@ -8,6 +8,7 @@ from pathlib import Path
 
 import requests
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -23,6 +24,7 @@ register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 TEST_ROUTING_KEY = "test-routing-key-12345"
 TEST_CUSTOM_HEADER_NAME = "X-Test-Header"
 TEST_CUSTOM_HEADER_VALUE = "test-header-value-67890"
+TEST_MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
 class BaseTestRequestLogger:
@@ -54,7 +56,7 @@ class BaseTestRequestLogger:
             os.environ[key] = value
 
         cls.process = popen_launch_server(
-            "Qwen/Qwen3-0.6B",
+            TEST_MODEL_NAME,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
@@ -77,6 +79,32 @@ class BaseTestRequestLogger:
     def _verify_logs(self, content: str, source_name: str):
         raise NotImplementedError
 
+    def _verify_openai_logs(self, content: str, source_name: str):
+        raise NotImplementedError
+
+    def _wait_until_verified(
+        self,
+        verify_fn,
+        get_content_fn,
+        source_name: str,
+        timeout: float = 10.0,
+        interval: float = 0.1,
+    ):
+        deadline = time.time() + timeout
+        last_error = None
+
+        while time.time() < deadline:
+            content = get_content_fn()
+            try:
+                verify_fn(content, source_name)
+                return
+            except AssertionError as err:
+                last_error = err
+                time.sleep(interval)
+
+        if last_error is not None:
+            raise last_error
+
     def test_logging(self):
         response = requests.post(
             DEFAULT_URL_FOR_TEST + "/generate",
@@ -88,16 +116,46 @@ class BaseTestRequestLogger:
             timeout=30,
         )
         self.assertEqual(response.status_code, 200)
-        time.sleep(1)
-
-        stdout_content = self.stdout.getvalue() + self.stderr.getvalue()
-        self._verify_logs(stdout_content, "stdout")
+        self._wait_until_verified(
+            self._verify_logs,
+            lambda: self.stdout.getvalue() + self.stderr.getvalue(),
+            "stdout",
+        )
+        self._wait_until_verified(
+            self._verify_logs,
+            lambda: "".join(f.read_text() for f in Path(self.temp_dir).glob("*.log")),
+            "log files",
+        )
 
         log_files = list(Path(self.temp_dir).glob("*.log"))
         self.assertGreater(len(log_files), 0, "No log files found in temp directory")
 
-        file_content = "".join(f.read_text() for f in log_files)
-        self._verify_logs(file_content, "log files")
+    def test_openai_chat_logging(self):
+        response = requests.post(
+            DEFAULT_URL_FOR_TEST + "/v1/chat/completions",
+            json={
+                "model": TEST_MODEL_NAME,
+                "messages": [{"role": "user", "content": "hello request logger"}],
+                "max_tokens": 8,
+                "temperature": 0,
+            },
+            headers=self.request_headers,
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 200)
+        self._wait_until_verified(
+            self._verify_openai_logs,
+            lambda: self.stdout.getvalue() + self.stderr.getvalue(),
+            "stdout",
+        )
+        self._wait_until_verified(
+            self._verify_openai_logs,
+            lambda: "".join(f.read_text() for f in Path(self.temp_dir).glob("*.log")),
+            "log files",
+        )
+
+        log_files = list(Path(self.temp_dir).glob("*.log"))
+        self.assertGreater(len(log_files), 0, "No log files found in temp directory")
 
 
 class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
@@ -113,6 +171,17 @@ class TestRequestLoggerText(BaseTestRequestLogger, CustomTestCase):
             "x-smg-routing-key", content, f"Header name not found in {source_name}"
         )
 
+    def _verify_openai_logs(self, content: str, source_name: str):
+        self.assertIn(
+            "Receive OpenAI:", content, f"OpenAI receive log not found in {source_name}"
+        )
+        self.assertIn("'messages':", content, f"Messages not found in {source_name}")
+        self.assertIn(
+            "hello request logger",
+            content,
+            f"OpenAI user prompt not found in {source_name}",
+        )
+
 
 class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
     log_requests_format = "json"
@@ -123,10 +192,13 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
         for line in content.splitlines():
             if not line.strip() or not line.startswith("{"):
                 continue
-            data = json.loads(line)
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
             rid = data.get("rid", "")
-            if rid.startswith("HEALTH_CHECK"):
+            if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                 continue
 
             if data.get("event") == "request.received":
@@ -150,6 +222,34 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
         )
         self.assertTrue(
             finished_found, f"request.finished event not found in {source_name}"
+        )
+
+    def _verify_openai_logs(self, content: str, source_name: str):
+        openai_received_found = False
+        for line in content.splitlines():
+            if not line.strip() or not line.startswith("{"):
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if data.get("event") != "request.received.openai":
+                continue
+
+            obj = data.get("obj", {})
+            self.assertEqual(obj.get("model"), TEST_MODEL_NAME)
+            self.assertIsInstance(obj.get("messages"), list)
+            self.assertGreater(len(obj.get("messages")), 0)
+            self.assertEqual(obj["messages"][0].get("content"), "hello request logger")
+            self.assertEqual(
+                data.get("headers", {}).get("x-smg-routing-key"), TEST_ROUTING_KEY
+            )
+            openai_received_found = True
+            break
+
+        self.assertTrue(
+            openai_received_found,
+            f"request.received.openai event not found in {source_name}",
         )
 
 
@@ -185,6 +285,21 @@ class TestCustomHeaderViaEnvVar(BaseTestRequestLogger, CustomTestCase):
             TEST_ROUTING_KEY,
             content,
             f"Default header value not found in {source_name}",
+        )
+
+    def _verify_openai_logs(self, content: str, source_name: str):
+        self.assertIn(
+            "Receive OpenAI:", content, f"OpenAI receive log not found in {source_name}"
+        )
+        self.assertIn(
+            TEST_CUSTOM_HEADER_NAME.lower(),
+            content,
+            f"Custom header name not found in {source_name}",
+        )
+        self.assertIn(
+            TEST_CUSTOM_HEADER_VALUE,
+            content,
+            f"Custom header value not found in {source_name}",
         )
 
 

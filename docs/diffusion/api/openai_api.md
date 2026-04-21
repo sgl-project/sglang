@@ -102,7 +102,8 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 ```
 
 > **Note**
-> The `response_format=url` option is not supported for `POST /v1/images/generations` and will return a `400` error.
+> If `response_format=url` is used and cloud storage is not configured, the API returns
+> a relative URL like `/v1/images/<IMAGE_ID>/content`.
 
 **Edit an image**
 
@@ -136,7 +137,8 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
 
 **Download image content**
 
-When `response_format=url` is used with `POST /v1/images/edits`, the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
+When `response_format=url` is used with `POST /v1/images/generations` or `POST /v1/images/edits`,
+the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
 
 **Endpoint:** `GET /v1/images/{image_id}/content`
 
@@ -152,7 +154,7 @@ curl -sS -L "http://localhost:30010/v1/images/<IMAGE_ID>/content" \
 
 The server implements a subset of the OpenAI Videos API under the `/v1/videos` namespace.
 
-**Create a video**
+**Create a video (text-to-video)**
 
 **Endpoint:** `POST /v1/videos`
 
@@ -178,6 +180,33 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
   -H "Authorization: Bearer sk-proj-1234567890" \
   -d '{
         "prompt": "A calico cat playing a piano on stage",
+        "size": "1280x720"
+      }'
+```
+
+**Create a video (image-to-video)**
+
+For I2V or TI2V models (e.g., Wan2.1 I2V, LTX-2.3 two-stage), pass an input image via multipart form upload or a reference URL.
+
+**Curl Example (multipart form upload):**
+
+```bash
+curl -sS -X POST "http://localhost:30010/v1/videos" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -F "prompt=A cat playing a piano" \
+  -F "input_reference=@input_image.png" \
+  -F "size=1280x720"
+```
+
+**Curl Example (reference URL):**
+
+```bash
+curl -sS -X POST "http://localhost:30010/v1/videos" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -d '{
+        "prompt": "A cat playing a piano",
+        "reference_url": "https://example.com/input_image.png",
         "size": "1280x720"
       }'
 ```

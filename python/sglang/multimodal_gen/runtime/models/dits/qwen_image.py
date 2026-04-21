@@ -16,23 +16,25 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
-    fuse_scale_shift_gate_select01_kernel,
+    fuse_layernorm_scale_shift_gate_select01_kernel,
+    fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
-    apply_layernorm_only,
-    apply_qk_norm,
+    apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
-    RowParallelLinear,
+    ReplicatedLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -53,12 +55,22 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-_is_cuda = current_platform.is_cuda()
+
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
 except Exception:
     NunchakuFeedForward = None
+
+
+def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
+    """get the local seq len, from seq_len padding to the next multiple of sp_world_size, then shard to local"""
+    if sp_world_size <= 1:
+        return seq_len
+    padded_len = seq_len
+    if padded_len % sp_world_size != 0:
+        padded_len += sp_world_size - (padded_len % sp_world_size)
+    return padded_len // sp_world_size
 
 
 def _get_qkv_projections(
@@ -87,109 +99,6 @@ def _get_qkv_projections(
             txt_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return img_query, img_key, img_value, txt_query, txt_key, txt_value
-
-
-class GELU(nn.Module):
-    r"""
-    GELU activation function with tanh approximation support with `approximate="tanh"`.
-
-    Parameters:
-        dim_in (`int`): The number of channels in the input.
-        dim_out (`int`): The number of channels in the output.
-        approximate (`str`, *optional*, defaults to `"none"`): If `"tanh"`, use tanh approximation.
-        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
-        quant_config: Quantization configure.
-        prefix: The name of the layer in the state dict.
-    """
-
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        approximate: str = "none",
-        bias: bool = True,
-        quant_config=None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim_in,
-            dim_out,
-            bias=bias,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj" if prefix else "",
-        )
-        self.approximate = approximate
-
-    def forward(self, hidden_states):
-        hidden_states = self.proj(hidden_states)
-        return F.gelu(hidden_states[0], approximate=self.approximate)
-
-
-class FeedForward(nn.Module):
-    r"""
-    A feed-forward layer.
-
-    Parameters:
-        dim (`int`): The number of channels in the input.
-        dim_out (`int`, *optional*): The number of channels in the output. If not given, defaults to `dim`.
-        mult (`int`, *optional*, defaults to 4): The multiplier to use for the hidden dimension.
-        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
-        bias (`bool`, defaults to True): Whether to use a bias in the linear layer.
-        quant_config: Quantization configure.
-        prefix: The name of the layer in the state dict.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        dim_out: Optional[int] = None,
-        mult: int = 4,
-        activation_fn: str = "geglu",
-        inner_dim=None,
-        bias: bool = True,
-        quant_config=None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        if inner_dim is None:
-            inner_dim = int(dim * mult)
-        dim_out = dim_out if dim_out is not None else dim
-
-        if activation_fn == "gelu":
-            act_fn = GELU(dim, inner_dim, bias=bias, quant_config=None, prefix=prefix)
-        if activation_fn == "gelu-approximate":
-            act_fn = GELU(
-                dim,
-                inner_dim,
-                approximate="tanh",
-                bias=bias,
-                quant_config=None,
-                prefix=prefix,
-            )
-        else:
-            raise NotImplementedError(
-                f"activation_fn '{activation_fn}' is not supported."
-            )
-
-        self.net = nn.ModuleList([])
-        self.net.append(act_fn)
-        self.net.append(nn.Identity())
-        self.net.append(
-            RowParallelLinear(
-                inner_dim,
-                dim_out,
-                bias=True,
-                input_is_parallel=True,
-                quant_config=None,
-            )
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        for module in self.net:
-            hidden_states = module(hidden_states)
-        return hidden_states
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -624,27 +533,9 @@ class QwenImageCrossAttention(nn.Module):
             )
         else:
             # Use separate Q/K/V projections for non-quantized models
-            self.to_q = ColumnParallelLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_q",
-            )
-            self.to_k = ColumnParallelLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_k",
-            )
-            self.to_v = ColumnParallelLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_v",
-            )
+            self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
+            self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True)
+            self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
@@ -662,34 +553,21 @@ class QwenImageCrossAttention(nn.Module):
                 )
             else:
                 # Use separate Q/K/V projections for non-quantized models
-                self.add_q_proj = ColumnParallelLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_q_proj",
+                self.add_q_proj = ReplicatedLinear(
+                    added_kv_proj_dim, self.inner_dim, bias=True
                 )
-                self.add_k_proj = ColumnParallelLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_k_proj",
+                self.add_k_proj = ReplicatedLinear(
+                    added_kv_proj_dim, self.inner_dim, bias=True
                 )
-                self.add_v_proj = ColumnParallelLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_v_proj",
+                self.add_v_proj = ReplicatedLinear(
+                    added_kv_proj_dim, self.inner_dim, bias=True
                 )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ColumnParallelLinear(
+            self.to_add_out = ReplicatedLinear(
                 self.inner_dim,
                 self.dim,
                 bias=out_bias,
-                gather_output=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.to_add_out",
             )
@@ -699,11 +577,10 @@ class QwenImageCrossAttention(nn.Module):
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ColumnParallelLinear(
+                ReplicatedLinear(
                     self.inner_dim,
                     self.dim,
                     bias=out_bias,
-                    gather_output=True,
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_out.0",
                 )
@@ -724,6 +601,7 @@ class QwenImageCrossAttention(nn.Module):
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.AITER,
+                AttentionBackendEnum.AITER_SAGE,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
                 AttentionBackendEnum.SAGE_ATTN_3,
@@ -752,26 +630,7 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
-        # Apply QK normalization
-        if self.qk_norm:
-            img_query, img_key = apply_qk_norm(
-                q=img_query,
-                k=img_key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
-                allow_inplace=True,
-            )
-            txt_query, txt_key = apply_qk_norm(
-                q=txt_query,
-                k=txt_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=txt_query.shape[-1],
-                allow_inplace=True,
-            )
-
-        # Apply RoPE
+        img_cache = txt_cache = None
         if image_rotary_emb is not None:
             if not (
                 isinstance(image_rotary_emb[0], torch.Tensor)
@@ -781,6 +640,28 @@ class QwenImageCrossAttention(nn.Module):
 
             img_cache, txt_cache = image_rotary_emb
 
+        if self.qk_norm:
+            img_query, img_key = apply_qk_norm_with_optional_rope(
+                q=img_query,
+                k=img_key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=img_query.shape[-1],
+                cos_sin_cache=img_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+            txt_query, txt_key = apply_qk_norm_with_optional_rope(
+                q=txt_query,
+                k=txt_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=txt_query.shape[-1],
+                cos_sin_cache=txt_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+        elif img_cache is not None and txt_cache is not None:
             img_query, img_key = apply_flashinfer_rope_qk_inplace(
                 img_query, img_key, img_cache, is_neox=False
             )
@@ -799,6 +680,7 @@ class QwenImageCrossAttention(nn.Module):
             joint_query,
             joint_key,
             joint_value,
+            num_replicated_prefix=seq_len_txt,
         )
 
         # Reshape back
@@ -840,20 +722,14 @@ class QwenImageTransformerBlock(nn.Module):
         self.quant_config = quant_config
         self.zero_cond_t = zero_cond_t
 
-        mod_quant_config = (
-            quant_config
-            if (quant_config is not None and quant_config.get_name() == "svdquant")
-            else None
-        )
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ColumnParallelLinear(
+            ReplicatedLinear(
                 dim,
                 6 * dim,
                 bias=True,
-                gather_output=True,
-                quant_config=mod_quant_config,
+                quant_config=quant_config,
                 prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
@@ -877,12 +753,11 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ColumnParallelLinear(
+            ReplicatedLinear(
                 dim,
                 6 * dim,
                 bias=True,
-                gather_output=True,
-                quant_config=mod_quant_config,
+                quant_config=quant_config,
                 prefix=f"{prefix}.txt_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
@@ -919,15 +794,11 @@ class QwenImageTransformerBlock(nn.Module):
                 dim=dim,
                 dim_out=dim,
                 activation_fn="gelu-approximate",
-                quant_config=quant_config,
-                prefix=f"{prefix}.img_mlp",
             )
             self.txt_mlp = FeedForward(
                 dim=dim,
                 dim_out=dim,
                 activation_fn="gelu-approximate",
-                quant_config=quant_config,
-                prefix=f"{prefix}.txt_mlp",
             )
 
         if nunchaku_enabled:
@@ -959,77 +830,102 @@ class QwenImageTransformerBlock(nn.Module):
 
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
-            actual_batch = x.shape[0]
-            shift0, shift1 = (
-                shift[:actual_batch],
-                shift[actual_batch : 2 * actual_batch],
-            )
-            scale0, scale1 = (
-                scale[:actual_batch],
-                scale[actual_batch : 2 * actual_batch],
-            )
-            gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
-            if _is_cuda:
-                if is_scale_residual:
-                    x = gate_x * x + residual_x
-                    residual_out = x
+            # ROCm currently fails to compile the select01 Triton kernel, so
+            # keep using the torch.where fallback there.
+            if x.is_cuda and not current_platform.is_hip():
+                actual_batch = x.shape[0]
+                shift0, shift1 = (
+                    shift[:actual_batch],
+                    shift[actual_batch : 2 * actual_batch],
+                )
+                scale0, scale1 = (
+                    scale[:actual_batch],
+                    scale[actual_batch : 2 * actual_batch],
+                )
+                gate0, gate1 = (
+                    gate[:actual_batch],
+                    gate[actual_batch : 2 * actual_batch],
+                )
                 if not x.is_contiguous():
                     x = x.contiguous()
                 if not index.is_contiguous():
                     index = index.contiguous()
-                # TODO: fuse norm with above select01 kernel, workaround now
-                x = apply_layernorm_only(x, norm_module)
-                x, gate_result = fuse_scale_shift_gate_select01_kernel(
-                    x,
-                    scale0=scale0.contiguous(),
-                    shift0=shift0.contiguous(),
-                    gate0=gate0.contiguous(),
-                    scale1=scale1.contiguous(),
-                    shift1=shift1.contiguous(),
-                    gate1=gate1.contiguous(),
-                    index=index,
-                )
                 if is_scale_residual:
+                    if not residual_x.is_contiguous():
+                        residual_x = residual_x.contiguous()
+                    if not gate_x.is_contiguous():
+                        gate_x = gate_x.contiguous()
+                    x, residual_out, gate_result = (
+                        fuse_residual_layernorm_scale_shift_gate_select01_kernel(
+                            x,
+                            residual=residual_x,
+                            residual_gate=gate_x,
+                            weight=getattr(norm_module.norm, "weight", None),
+                            bias=getattr(norm_module.norm, "bias", None),
+                            scale0=scale0.contiguous(),
+                            shift0=shift0.contiguous(),
+                            gate0=gate0.contiguous(),
+                            scale1=scale1.contiguous(),
+                            shift1=shift1.contiguous(),
+                            gate1=gate1.contiguous(),
+                            index=index,
+                            eps=norm_module.eps,
+                        )
+                    )
                     return x, residual_out, gate_result
                 else:
+                    x, gate_result = fuse_layernorm_scale_shift_gate_select01_kernel(
+                        x,
+                        weight=getattr(norm_module.norm, "weight", None),
+                        bias=getattr(norm_module.norm, "bias", None),
+                        scale0=scale0.contiguous(),
+                        shift0=shift0.contiguous(),
+                        gate0=gate0.contiguous(),
+                        scale1=scale1.contiguous(),
+                        shift1=shift1.contiguous(),
+                        gate1=gate1.contiguous(),
+                        index=index,
+                        eps=norm_module.eps,
+                    )
                     return x, gate_result
             else:
-                mask = (index == 0).unsqueeze(-1)
+                actual_batch = x.shape[0]
+                shift0, shift1 = (
+                    shift[:actual_batch],
+                    shift[actual_batch : 2 * actual_batch],
+                )
+                scale0, scale1 = (
+                    scale[:actual_batch],
+                    scale[actual_batch : 2 * actual_batch],
+                )
+                gate0, gate1 = (
+                    gate[:actual_batch],
+                    gate[actual_batch : 2 * actual_batch],
+                )
+                index = index.to(dtype=torch.bool).unsqueeze(-1)
                 shift_result = torch.where(
-                    mask, shift0.unsqueeze(1), shift1.unsqueeze(1)
+                    index, shift1.unsqueeze(1), shift0.unsqueeze(1)
                 )
                 scale_result = torch.where(
-                    mask, scale0.unsqueeze(1), scale1.unsqueeze(1)
+                    index, scale1.unsqueeze(1), scale0.unsqueeze(1)
                 )
-                gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
-                if is_scale_residual:
-                    modulated, residual_out = norm_module(
-                        residual=residual_x,
-                        x=x,
-                        gate=gate_x,
-                        shift=shift_result,
-                        scale=scale_result,
-                    )
-                    return modulated, residual_out, gate_result
-                else:
-                    modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
-                    return modulated, gate_result
+                gate_result = torch.where(index, gate1.unsqueeze(1), gate0.unsqueeze(1))
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
-            if is_scale_residual:
-                modulated, residual_out = norm_module(
-                    residual=residual_x,
-                    x=x,
-                    gate=gate_x,
-                    shift=shift_result,
-                    scale=scale_result,
-                )
-                return modulated, residual_out, gate_result
-            else:
-                modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
-                return modulated, gate_result
+        if is_scale_residual:
+            modulated, residual_out = norm_module(
+                residual=residual_x,
+                x=x,
+                gate=gate_x,
+                shift=shift_result,
+                scale=scale_result,
+            )
+            return modulated, residual_out, gate_result
+        else:
+            modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
+            return modulated, gate_result
 
     def forward(
         self,
@@ -1040,11 +936,11 @@ class QwenImageTransformerBlock(nn.Module):
         temb_txt_silu: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        modulate_index: Optional[List[int]] = None,
+        modulate_index: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params = self.img_mod[1](temb_img_silu)[0]  # [B, 6*dim]
-        txt_mod_params = self.txt_mod[1](temb_txt_silu)[0]  # [B, 6*dim]
+        img_mod_params, _ = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
+        txt_mod_params, _ = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
 
         if (
             self.quant_config is not None
@@ -1107,7 +1003,7 @@ class QwenImageTransformerBlock(nn.Module):
             gate_x=img_gate1,
             residual_x=hidden_states,
         )
-        img_mlp_output = self.img_mlp(img_modulated2)[0]
+        img_mlp_output = self.img_mlp(img_modulated2)
 
         if img_mlp_output.dim() == 2:
             img_mlp_output = img_mlp_output.unsqueeze(0)
@@ -1123,7 +1019,7 @@ class QwenImageTransformerBlock(nn.Module):
             scale=txt_scale2,
         )
         txt_gate2 = txt_gate2_raw.unsqueeze(1)
-        txt_mlp_output = self.txt_mlp(txt_modulated2)[0]
+        txt_mlp_output = self.txt_mlp(txt_modulated2)
 
         if txt_mlp_output.dim() == 2:
             txt_mlp_output = txt_mlp_output.unsqueeze(0)
@@ -1256,11 +1152,23 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
+        sp_world_size = get_sp_world_size()
+
         modulate_index_list = []
         for sample in img_shapes:
             first_size = sample[0][0] * sample[0][1] * sample[0][2]
             total_size = sum(s[0] * s[1] * s[2] for s in sample)
-            idx = (torch.arange(total_size, device=device) >= first_size).int()
+            if sp_world_size > 1:
+                first_local_size = _local_seq_len(first_size, sp_world_size)
+                tail_local_size = _local_seq_len(total_size - first_size, sp_world_size)
+                idx = torch.cat(
+                    [
+                        torch.zeros(first_local_size, device=device, dtype=torch.int),
+                        torch.ones(tail_local_size, device=device, dtype=torch.int),
+                    ]
+                )
+            else:
+                idx = (torch.arange(total_size, device=device) >= first_size).int()
             modulate_index_list.append(idx)
 
         modulate_index = torch.stack(modulate_index_list)

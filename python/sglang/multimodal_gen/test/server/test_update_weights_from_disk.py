@@ -139,6 +139,7 @@ import functools
 import os
 import random
 import shutil
+import sys
 import tempfile
 import threading
 from collections.abc import Callable
@@ -159,7 +160,14 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerManager,
 )
-from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port, is_in_ci
+from sglang.multimodal_gen.test.test_utils import (
+    DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_QWEN_IMAGE_2512_MODEL_NAME_FOR_TEST,
+    DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+    get_dynamic_server_port,
+    is_in_ci,
+)
 
 logger = init_logger(__name__)
 
@@ -175,12 +183,12 @@ _DIFFERING_MODULES: list[str] = [_TRANSFORMER_MODULE, _VAE_MODULE]
 
 _ALL_MODEL_PAIRS: list[tuple[str, str]] = [
     (
-        "black-forest-labs/FLUX.2-klein-base-4B",
-        "black-forest-labs/FLUX.2-klein-4B",
+        DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
+        DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
     ),
     (
-        "Qwen/Qwen-Image",
-        "Qwen/Qwen-Image-2512",
+        DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+        DEFAULT_QWEN_IMAGE_2512_MODEL_NAME_FOR_TEST,
     ),
 ]
 
@@ -664,4 +672,4 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

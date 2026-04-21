@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=77, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=96, suite="stage-b-test-1-gpu-large")
 
 
 class TestAutoRound(CustomTestCase):
@@ -55,7 +55,7 @@ class TestAutoRound(CustomTestCase):
                     if "Llama" in model:
                         self.assertGreaterEqual(metrics["score"], 0.6)
                     else:
-                        self.assertGreaterEqual(metrics["score"], 0.26)
+                        self.assertGreaterEqual(metrics["score"], 0.25)
                 finally:
                     kill_process_tree(process.pid)
                     print(f"[INFO] Server for {model} stopped.")

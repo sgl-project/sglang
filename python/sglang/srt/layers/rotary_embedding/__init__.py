@@ -8,6 +8,15 @@ from sglang.srt.layers.rotary_embedding.mrope import (
     MRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb
+from sglang.srt.layers.rotary_embedding.yarn import (
+    yarn_find_correction_range,
+    yarn_get_mscale_simple,
+    yarn_linear_ramp_mask,
+)
+
+_yarn_find_correction_range = yarn_find_correction_range
+_yarn_get_mscale = yarn_get_mscale_simple
+_yarn_linear_ramp_mask = yarn_linear_ramp_mask
 
 __all__ = [
     "RotaryEmbedding",
@@ -16,4 +25,7 @@ __all__ = [
     "MRotaryEmbedding",
     "Ernie4_5_VLRotaryEmbedding",
     "apply_rotary_pos_emb",
+    "_yarn_find_correction_range",
+    "_yarn_get_mscale",
+    "_yarn_linear_ramp_mask",
 ]
