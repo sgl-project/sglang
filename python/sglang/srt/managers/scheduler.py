@@ -592,12 +592,6 @@ class Scheduler(
             self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
-            # AND user flag with parser flag: MiniMax-style interleaved
-            # thinking opts out even when --strip-thinking-cache is set.
-            self.server_args.strip_thinking_cache = (
-                self.server_args.strip_thinking_cache
-                and reasoning_parser.detector.strip_thinking_cache
-            )
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)

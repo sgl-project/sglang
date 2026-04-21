@@ -436,8 +436,6 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
-    # Set via --strip-thinking-cache; scheduler init ANDs with parser flag so
-    # parsers like MiniMax-append-think (thinking in normal_text) opt out.
     strip_thinking_cache: bool = False
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None

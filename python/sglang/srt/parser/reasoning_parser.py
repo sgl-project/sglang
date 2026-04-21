@@ -19,11 +19,6 @@ class StreamingParseResult:
 class BaseReasoningFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
-    # True if thinking goes to `reasoning_text` and is dropped from multi-turn
-    # prompts (DeepSeek-R1 convention); caching it creates dead branches.
-    # False if thinking is in `normal_text` and fed back every turn (MiniMax).
-    strip_thinking_cache: bool = True
-
     def __init__(
         self,
         think_start_token: str,
@@ -399,9 +394,6 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     """
     Append `<think>` token to the beginning of the text.
     """
-
-    # Thinking is in normal_text and fed back every turn; keep in cache.
-    strip_thinking_cache = False
 
     def __init__(
         self,
