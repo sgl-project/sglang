@@ -873,14 +873,14 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if _is_npu:
-            s = self.forward_prepare_npu(
+        if not _is_npu:
+            s = self.forward_prepare(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
         else:
-            s = self.forward_prepare(
+            s = self.forward_prepare_npu(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
