@@ -74,8 +74,8 @@ EXPLICIT = {
     "/supported_models/text_generation/index": "/docs/supported-models",
 
     # diffusion → sglang-diffusion (file renames snake_case → kebab-case)
-    "/diffusion": "/docs/sglang-diffusion/index",
-    "/diffusion/index": "/docs/sglang-diffusion/index",
+    "/diffusion": "/docs/sglang-diffusion/installation",
+    "/diffusion/index": "/docs/sglang-diffusion/installation",
     "/diffusion/installation": "/docs/sglang-diffusion/installation",
     "/diffusion/environment_variables": "/docs/sglang-diffusion/environment-variables",
     "/diffusion/ci_perf": "/docs/sglang-diffusion/ci-performance",
@@ -88,16 +88,16 @@ EXPLICIT = {
     "/diffusion/performance/index": "/docs/sglang-diffusion/performance-optimization",
     "/diffusion/performance/profiling": "/docs/sglang-diffusion/profiling",
     # Diffusion pages dropped
-    "/diffusion/api/post_processing": "/docs/sglang-diffusion/index",
-    "/diffusion/compatibility_matrix": "/docs/sglang-diffusion/index",
-    "/diffusion/contributing": "/docs/sglang-diffusion/index",
-    "/diffusion/development": "/docs/sglang-diffusion/index",
-    "/diffusion/disaggregation": "/docs/sglang-diffusion/index",
+    "/diffusion/api/post_processing": "/docs/sglang-diffusion/installation",
+    "/diffusion/compatibility_matrix": "/docs/sglang-diffusion/installation",
+    "/diffusion/contributing": "/docs/sglang-diffusion/installation",
+    "/diffusion/development": "/docs/sglang-diffusion/installation",
+    "/diffusion/disaggregation": "/docs/sglang-diffusion/installation",
     "/diffusion/performance/ring_sp_performance": "/docs/sglang-diffusion/performance-optimization",
-    "/diffusion/quantization": "/docs/sglang-diffusion/index",
-    "/diffusion/reference": "/docs/sglang-diffusion/index",
-    "/diffusion/support_new_models": "/docs/sglang-diffusion/index",
-    "/diffusion/usage": "/docs/sglang-diffusion/index",
+    "/diffusion/quantization": "/docs/sglang-diffusion/installation",
+    "/diffusion/reference": "/docs/sglang-diffusion/installation",
+    "/diffusion/support_new_models": "/docs/sglang-diffusion/installation",
+    "/diffusion/usage": "/docs/sglang-diffusion/installation",
 
     # basic_usage dropped pages
     "/basic_usage/deepseek_ocr": "/docs/basic_usage/overview",

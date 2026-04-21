@@ -282,7 +282,7 @@
     },
     {
       "source": "/diffusion/api/post_processing.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/diffusion/ci_perf.html",
@@ -290,19 +290,19 @@
     },
     {
       "source": "/diffusion/compatibility_matrix.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/diffusion/contributing.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/diffusion/development.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/diffusion/disaggregation.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/diffusion/environment_variables.html",
@@ -310,7 +310,7 @@
     },
     {
       "source": "/diffusion/index.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/diffusion/installation.html",
@@ -346,27 +346,23 @@
     },
     {
       "source": "/diffusion/quantization.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/diffusion/reference.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/diffusion/support_new_models.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/diffusion/usage.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     },
     {
       "source": "/get_started/install.html",
       "destination": "/docs/get-started/installation"
-    },
-    {
-      "source": "/index.html",
-      "destination": "/"
     },
     {
       "source": "/platforms/amd_gpu.html",
@@ -594,7 +590,7 @@
     },
     {
       "source": "/diffusion.html",
-      "destination": "/docs/sglang-diffusion/index"
+      "destination": "/docs/sglang-diffusion/installation"
     }
   ],
   "colors": {
