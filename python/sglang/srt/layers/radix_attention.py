@@ -23,6 +23,7 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.model_executor.breakable_cuda_graph.bcg_attention import bcg_unified_attention_with_output
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -121,8 +122,6 @@ class RadixAttention(nn.Module):
             else:
                 output = torch.empty_like(q)
             if get_global_server_args().enable_breakable_cuda_graph:
-                from sglang.srt.model_executor.breakable_cuda_graph.bcg_attention import bcg_unified_attention_with_output
-
                 bcg_unified_attention_with_output(
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs
                 )

@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.layers.radix_attention import unified_attention_with_output
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -89,6 +88,9 @@ def _bcg_attention_body(
 
     n = _mla_dispatch_to_mha(forward_batch, save_kv_cache, k_rope, query)
     if n is None:
+        # Deferred to avoid the radix_attention <-> bcg_attention import cycle.
+        from sglang.srt.layers.radix_attention import unified_attention_with_output
+
         unified_attention_with_output(
             query, key, value, output, save_kv_cache, layer_id,
             q_rope=q_rope, k_rope=k_rope, sinks=sinks,
