@@ -1870,6 +1870,7 @@ def initialize_model_parallel(
                 )
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
+
         _ATTN_TP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -1888,8 +1889,12 @@ def initialize_model_parallel(
 
     global _MOE_DP
     assert _MOE_DP is None, "moe data parallel group is already initialized"
-    # gpus_per_pp_stage = tensor_model_parallel_size * attention_context_model_parallel_size
-    if moe_dp_size == tensor_model_parallel_size:
+    if attn_cp_size > moe_dp_size:
+        # When moe_dp_size < attn_cp_size, CP ranks must share tokens before MoE.
+        # The MOE_DP group includes these CP partners, so the existing DP
+        # allgather/scatter handles the token sharing.
+        _MOE_DP = _ATTN_CP
+    elif moe_dp_size == tensor_model_parallel_size:
         _MOE_DP = _TP
     else:
         group_ranks = []
@@ -2204,6 +2209,12 @@ def destroy_model_parallel():
     _MOE_TP = None
 
     global _ATTN_CP
+    global _MOE_DP
+    # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
+    # Only destroy if not aliasing another group.
+    if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
+        _MOE_DP.destroy()
+    _MOE_DP = None
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None
@@ -2212,11 +2223,6 @@ def destroy_model_parallel():
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
-
-    global _MOE_DP
-    if _MOE_DP:
-        _MOE_DP.destroy()
-    _MOE_DP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
