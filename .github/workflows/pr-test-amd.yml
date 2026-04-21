@@ -167,7 +167,7 @@ jobs:
   sgl-kernel-unit-test-amd:
     needs: [check-changes, call-gate]
     if: |
-      always() &&
+      always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
         (
@@ -228,7 +228,7 @@ jobs:
   sgl-kernel-unit-test-2-gpu-amd:
     needs: [check-changes, call-gate]
     if: |
-      always() &&
+      always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
         (
@@ -282,7 +282,7 @@ jobs:
   stage-a-test-1-gpu-small-amd:
     needs: [check-changes, call-gate]
     if: |
-      always() &&
+      always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd,')) ||
         (
@@ -322,7 +322,7 @@ jobs:
   jit-kernel-unit-test-amd:
     needs: [check-changes, call-gate]
     if: |
-      always() &&
+      always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
         (
@@ -586,7 +586,7 @@ jobs:
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes, call-gate]
     if: |
-      always() &&
+      always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
         (
@@ -717,7 +717,7 @@ jobs:
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes, call-gate]
     if: |
-      always() &&
+      always() && !cancelled() &&
       (
         (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
         (
