@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Generate Mintlify docs.json redirects from old Sphinx paths to new Mintlify paths."""
+
 from __future__ import annotations
 
 import json
