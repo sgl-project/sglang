@@ -107,11 +107,11 @@ git push origin my-changes
 
 ## Acknowledgements
 
-Thank you to all the authors who contributed to the original documentation in [`sglang/docs/`](https://github.com/sgl-project/sglang/tree/main/docs) and the original cookbook in [`sgl-cookbook`](https://github.com/sgl-project/sgl-cookbook). The migration to the new Mintlify-based documentation was led by the following [ACM_VIT](https://github.com/ACM-VIT) students:
+Thank you to all the authors who contributed to the original documentation in [`sglang/docs/`](https://github.com/sgl-project/sglang/tree/main/docs) and the original cookbook in [`sgl-cookbook`](https://github.com/sgl-project/sgl-cookbook). The migration to the new Mintlify-based documentation was led by the following [ACM-VIT](https://github.com/ACM-VIT) students:
 
 [@Adhyan Jain](https://github.com/Adhyan-Jain), [@Maitri-shah29](https://github.com/Maitri-shah29), [@architnigam](https://github.com/architnigam), [@Nakul-Sinha](https://github.com/Nakul-Sinha), [@divyamagrawal06](https://github.com/divyamagrawal06), [@A-Taman](https://github.com/A-Taman), [@nimeshas](https://github.com/nimeshas), [@IshhanKheria](https://github.com/IshhanKheria), [@Krishang-Zinzuwadia](https://github.com/Krishang-Zinzuwadia), [@pokymono](https://github.com/pokymono), [@Ishitajoshii](https://github.com/Ishitajoshii), [@AdityaVKochar](https://github.com/AdityaVKochar)
 
-Advised by [@adarshxs](https://github.com/adarshxs) (ACM_VIT) and [@wisclmy0611](https://github.com/wisclmy0611), [@Richardczl98](https://github.com/Richardczl98) (LMSYS).
+Advised by [@adarshxs](https://github.com/adarshxs) (ACM-VIT) and [@wisclmy0611](https://github.com/wisclmy0611), [@Richardczl98](https://github.com/Richardczl98) (LMSYS).
 
 ## Community
 
