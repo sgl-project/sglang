@@ -279,9 +279,6 @@ def npu_fused_moe_without_routing_weights_bf16(
 ):
     from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
 
-    if hidden_states.dtype != torch.bfloat16:
-        hidden_states = hidden_states.to(torch.bfloat16)
-
     # gmm1: gate_up_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
