@@ -1,0 +1,518 @@
+---
+title: Devstral 2 (Mistral)
+metatags:
+    description: "Deploy Devstral 2 agentic coding models with SGLang - optimized for tool use, codebase exploration, and multi-file edits with 256K context."
+---
+
+## 1. Model Introduction
+
+**Devstral 2** is an agentic LLM family for software engineering tasks. It is designed for agentic workflows such as tool use, codebase exploration, and multi-file edits, and achieves strong performance on **SWE-bench**.
+
+The **Devstral 2 Instruct** checkpoints are instruction-tuned **FP8** models, making them a good fit for chat, tool-using agents, and instruction-following SWE workloads.
+
+**Key Features:**
+
+- **Agentic coding**: Optimized for tool-driven coding and software engineering agents
+- **Improved performance**: A step up compared to earlier Devstral models
+- **Better generalization**: More robust across diverse prompts and coding environments
+- **Long context**: Up to a **256K** context window
+
+**Use Cases:**
+AI code assistants, agentic coding, and software engineering tasks that require deep codebase understanding and tool integration.
+
+For enterprises requiring specialized capabilities (increased context, domain-specific knowledge, etc.), please reach out to Mistral.
+
+**Models:**
+
+- **Collection**: [mistralai/devstral-2 (Hugging Face)](https://huggingface.co/collections/mistralai/devstral-2)
+- **FP8 Instruct**:
+  - **[mistralai/Devstral-2-123B-Instruct-2512](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512)**
+  - **[mistralai/Devstral-Small-2-24B-Instruct-2512](https://huggingface.co/mistralai/Devstral-Small-2-24B-Instruct-2512)**
+
+---
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
+
+<Warning title="Transformers version requirement">
+Devstral 2 requires a recent `transformers`. Please verify `transformers >= 5.0.0.rc`:
+
+```shell Command
+python -c "import transformers; print(transformers.__version__)"
+```
+
+If your version is lower, upgrade:
+
+```shell Command
+pip install -U --pre "transformers>=5.0.0rc0"
+```
+</Warning>
+
+---
+
+## 3. Model Deployment
+
+### 3.1 Basic configuration
+
+**Interactive Command Generator**: Use the configuration selector below to generate a launch command for Devstral Small 2 (24B) or Devstral 2 (123B).
+
+<Note>
+The TP size is set to the minimum required for the selected model size.
+</Note>
+
+
+import { Devstral2Deployment } from "/src/snippets/autoregressive/devstral-2-deployment.jsx";
+
+<Devstral2Deployment />
+
+### 3.2 Configuration tips
+
+- **Context length vs memory**: Devstral 2 advertises a long context window; if you are memory-constrained, start by lowering `--context-length` (for example `32768`) and increase once things are stable.
+- **FP8 checkpoints**: Both Devstral Small 2 and Devstral 2 are published as **FP8** weights. If you hit kernel / dtype issues, try a newer SGLang build and recent CUDA drivers.
+
+---
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage (OpenAI-Compatible API)
+
+SGLang exposes an OpenAI-compatible endpoint. Example:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+resp = client.chat.completions.create(
+    model="mistralai/Devstral-Small-2-24B-Instruct-2512",
+    messages=[
+        {"role": "system", "content": "You are a helpful coding assistant."},
+        {"role": "user", "content": "Write a Python function that retries a request with exponential backoff."},
+    ],
+    temperature=0.2,
+    max_tokens=512,
+)
+
+print(resp.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text Output
+  Here's a Python function that implements exponential backoff for retrying a request. This function uses the `requests` library to make HTTP requests and includes error handling for common HTTP and connection errors.
+
+  ```python
+  import time
+  import requests
+  from requests.exceptions import RequestException
+
+  def retry_with_exponential_backoff(
+      url,
+      max_retries=3,
+      initial_delay=1,
+      backoff_factor=2,
+      method="GET",
+      **kwargs
+  ):
+      """
+      Retry a request with exponential backoff.
+
+      Parameters:
+      - url: The URL to request.
+      - max_retries: Maximum number of retry attempts (default: 3).
+      - initial_delay: Initial delay in seconds (default: 1).
+      - backoff_factor: Multiplier for the delay between retries (default: 2).
+      - method: HTTP method to use (default: "GET").
+      - **kwargs: Additional arguments to pass to the request function (e.g., headers, data, etc.).
+
+      Returns:
+      - Response object if the request succeeds.
+      - Raises an exception if all retries fail.
+      """
+      retry_count = 0
+      delay = initial_delay
+
+      while retry_count < max_retries:
+          try:
+              response = requests.request(method, url, **kwargs)
+              # Check if the response status code indicates success
+              if response.status_code < 400:
+                  return response
+              else:
+                  raise RequestException(f"HTTP {response.status_code}: {response.text}")
+
+          except RequestException as e:
+              if retry_count == max_retries - 1:
+                  raise Exception(f"All retries failed. Last error: {e}")
+
+              print(f"Attempt {retry_count + 1} failed. Retrying in {delay} seconds...")
+              time.sleep(delay)
+...
+```
+
+### 4.2 Tool calling (optional)
+
+Devstral 2 supports tool calling capabilities. Enable the tool call parser:
+
+```shell Command
+python -m sglang.launch_server \
+  --model mistralai/Devstral-2-123B-Instruct-2512 \
+  --tp 2 \
+  --tool-call-parser mistral
+```
+
+**Python Example (with Thinking Process):**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="mistralai/Devstral-2-123B-Instruct-2512",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    temperature=0.7,
+    stream=True
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+tool_calls_accumulator = {}
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Accumulate tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================\n", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                index = tool_call.index
+                if index not in tool_calls_accumulator:
+                    tool_calls_accumulator[index] = {
+                        'name': None,
+                        'arguments': ''
+                    }
+
+                if tool_call.function:
+                    if tool_call.function.name:
+                        tool_calls_accumulator[index]['name'] = tool_call.function.name
+                    if tool_call.function.arguments:
+                        tool_calls_accumulator[index]['arguments'] += tool_call.function.arguments
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+# Print accumulated tool calls
+for index, tool_call in sorted(tool_calls_accumulator.items()):
+    print(f"🔧 Tool Call: {tool_call['name']}")
+    print(f"   Arguments: {tool_call['arguments']}")
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+🔧 Tool Call: get_weather
+   Arguments: {"location": "Beijing"}
+```
+
+
+## AMD GPU Support
+
+## 1. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+
+### 1.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+### 1.2 Advanced Usage
+
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path mistralai/Devstral-2-123B-Instruct-2512 \
+  --tp 8 \
+  --trust-remote-code \
+  --port 8888
+```
+
+## 2.Benchmark
+
+### 5.1 Benchmark Commands
+
+**Scenario 1: Chat (1K/1K) - Most Important**
+
+- **Model Deployment**
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path mistralai/Devstral-2-123B-Instruct-2512 \
+  --tp 8 \
+  --trust-remote-code \
+  --port 8888
+```
+
+- Low Concurrency (Latency-Optimized)
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --model mistralai/Devstral-2-123B-Instruct-2512 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf \
+  --port 8888
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  94.30
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total input vision tokens:               0
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4206
+Request throughput (req/s):              0.11
+Input token throughput (tok/s):          64.70
+Output token throughput (tok/s):         44.75
+Peak output token throughput (tok/s):    82.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          109.44
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   9427.59
+Median E2E Latency (ms):                 5637.23
+---------------Time to First Token----------------
+Mean TTFT (ms):                          4253.85
+Median TTFT (ms):                        116.95
+P99 TTFT (ms):                           37764.48
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          12.28
+Median TPOT (ms):                        12.29
+P99 TPOT (ms):                           12.30
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           12.29
+Median ITL (ms):                         12.29
+P95 ITL (ms):                            12.38
+P99 ITL (ms):                            12.42
+Max ITL (ms):                            12.90
+==================================================
+```
+
+- Medium Concurrency (Balanced)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model mistralai/Devstral-2-123B-Instruct-2512 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf \
+  --port 8888
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  52.11
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total input vision tokens:               0
+Total generated tokens:                  40805
+Total generated tokens (retokenized):    40761
+Request throughput (req/s):              1.54
+Input token throughput (tok/s):          761.31
+Output token throughput (tok/s):         783.13
+Peak output token throughput (tok/s):    1120.00
+Peak concurrent requests:                20
+Total token throughput (tok/s):          1544.44
+Concurrency:                             13.60
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   8856.19
+Median E2E Latency (ms):                 9314.71
+---------------Time to First Token----------------
+Mean TTFT (ms):                          398.80
+Median TTFT (ms):                        127.81
+P99 TTFT (ms):                           1500.32
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          17.32
+Median TPOT (ms):                        16.90
+P99 TPOT (ms):                           32.78
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           16.61
+Median ITL (ms):                         14.26
+P95 ITL (ms):                            15.07
+P99 ITL (ms):                            114.46
+Max ITL (ms):                            1224.45
+==================================================
+```
+
+- High Concurrency (Throughput-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model mistralai/Devstral-2-123B-Instruct-2512 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100 \
+  --request-rate inf \
+  --port 8888
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  116.08
+Total input tokens:                      249831
+Total input text tokens:                 249831
+Total input vision tokens:               0
+Total generated tokens:                  252662
+Total generated tokens (retokenized):    252523
+Request throughput (req/s):              4.31
+Input token throughput (tok/s):          2152.21
+Output token throughput (tok/s):         2176.60
+Peak output token throughput (tok/s):    3600.00
+Peak concurrent requests:                107
+Total token throughput (tok/s):          4328.81
+Concurrency:                             92.42
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   21456.71
+Median E2E Latency (ms):                 20126.82
+---------------Time to First Token----------------
+Mean TTFT (ms):                          291.60
+Median TTFT (ms):                        199.24
+P99 TTFT (ms):                           866.02
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          42.42
+Median TPOT (ms):                        45.18
+P99 TPOT (ms):                           53.32
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           41.97
+Median ITL (ms):                         27.59
+P95 ITL (ms):                            130.43
+P99 ITL (ms):                            137.87
+Max ITL (ms):                            616.73
+==================================================
+```
+
+
+
+#### 5.2 Understanding the Results
+
+**Key Metrics:**
+
+- **Request Throughput (req/s)**: Number of requests processed per second
+- **Output Token Throughput (tok/s)**: Total tokens generated per second
+- **Mean TTFT (ms)**: Time to First Token - measures responsiveness
+- **Mean TPOT (ms)**: Time Per Output Token - measures generation speed
+- **Mean ITL (ms)**: Inter-Token Latency - measures streaming consistency
+
+**Why These Configurations Matter:**
+
+- **1K/1K (Chat)**: Represents the most common conversational AI workload. This is the highest priority scenario for most deployments.
+- **1K/8K (Reasoning)**: Tests long-form generation capabilities crucial for complex reasoning, code generation, and detailed explanations.
+- **8K/1K (Summarization)**: Evaluates performance with large context inputs, essential for RAG systems, document Q&A, and summarization tasks.
+- **Variable Concurrency**: Captures the Pareto frontier - the optimal trade-off between throughput and latency at different load levels. Low concurrency shows best-case latency, high concurrency shows maximum throughput.
+
+**Interpreting Results:**
+
+- Compare your results against baseline numbers for your hardware
+- Higher throughput at same latency = better performance
+- Lower TTFT = more responsive user experience
+- Lower TPOT = faster generation speed
+
+### 5.3 Accuracy Benchmark
+
+Document model accuracy on standard benchmarks:
+
+#### 5.3.1 GSM8K Benchmark
+
+- Benchmark Command
+
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py \
+  --num-shots 8 \
+  --num-questions 1316 \
+  --parallel 1316 \
+  --port 8888
+```
+
+**Test Results:**
+
+```text Output
+Accuracy: 0.922
+Invalid: 0.000
+Latency: 35.800 s
+Output throughput: 4507.697 token/s
+```

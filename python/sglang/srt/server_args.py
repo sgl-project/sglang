@@ -509,6 +509,8 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -3455,6 +3457,22 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_adaptive:
+            if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+                logger.warning(
+                    "speculative_adaptive is only supported with EAGLE/EAGLE3 and topk=1. "
+                    f"Current algorithm={self.speculative_algorithm}. "
+                    "Falling back to static params."
+                )
+                self.speculative_adaptive = False
+            elif self.speculative_eagle_topk != 1:
+                logger.warning(
+                    "speculative_adaptive is only supported with topk=1. "
+                    f"Current topk={self.speculative_eagle_topk}. "
+                    "Falling back to static params."
+                )
+                self.speculative_adaptive = False
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -5289,6 +5307,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
             help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
+        )
+        parser.add_argument(
+            "--speculative-adaptive",
+            action="store_true",
+            help="Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
+            default=ServerArgs.speculative_adaptive,
+        )
+        parser.add_argument(
+            "--speculative-adaptive-config",
+            type=str,
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs ",
+            default=ServerArgs.speculative_adaptive_config,
         )
 
         # Multi-layer Eagle speculative decoding
