@@ -13,6 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
@@ -30,7 +31,6 @@ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
-from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
 
 if is_flashinfer_available():
     import flashinfer

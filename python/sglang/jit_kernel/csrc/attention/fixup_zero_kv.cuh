@@ -6,6 +6,7 @@
 // Uses vectorised float4 stores for bandwidth efficiency.
 
 #include <sgl_kernel/tensor.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
@@ -20,8 +21,8 @@ constexpr int kFixupBlockSize = 256;
 // `ptr` must be 16-byte aligned (guaranteed by PyTorch allocator).
 template <typename T>
 __device__ __forceinline__ void vec_zero_fill(T* ptr, int n) {
-  constexpr int kVec = 16 / sizeof(T);             // elements per float4
-  const int n_vec = n / kVec;                       // full vectors
+  constexpr int kVec = 16 / sizeof(T);  // elements per float4
+  const int n_vec = n / kVec;           // full vectors
   float4* dst4 = reinterpret_cast<float4*>(ptr);
   const float4 z4 = make_float4(0.f, 0.f, 0.f, 0.f);
   for (int i = threadIdx.x; i < n_vec; i += blockDim.x) {
@@ -36,7 +37,7 @@ __device__ __forceinline__ void vec_zero_fill(T* ptr, int n) {
 
 // Fill `n` float elements with -inf using float4 stores.
 __device__ __forceinline__ void vec_neginf_fill(float* ptr, int n) {
-  constexpr int kVec = 4;                           // float4 = 4 floats
+  constexpr int kVec = 4;  // float4 = 4 floats
   const int n_vec = n / kVec;
   float4* dst4 = reinterpret_cast<float4*>(ptr);
   const float ninf = -INFINITY;
