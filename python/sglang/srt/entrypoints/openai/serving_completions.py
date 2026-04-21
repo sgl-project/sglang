@@ -67,12 +67,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
-        # NOTE: with openai API, the prompt's logprobs are always not computed
-        if request.echo and request.logprobs:
-            logger.warning(
-                "Echo is not compatible with logprobs. "
-                "To compute logprobs of input prompt, please use the native /generate API."
-            )
         # Process prompt
         prompt = request.prompt
         if self.template_manager.completion_template_name is not None:
