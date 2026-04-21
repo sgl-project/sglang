@@ -145,7 +145,7 @@ class RadixKey:
     def _check_compatible(self, other: "RadixKey") -> None:
         if self.extra_key != other.extra_key:
             raise ValueError(
-                f"match should be run on the same extra key, but got "
+                f"RadixKey operations require matching extra_key, but got "
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
