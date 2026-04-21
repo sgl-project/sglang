@@ -18,6 +18,13 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
+def tensor_model_parallel_tree_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across model parallel group in fixed tree order."""
+    from sglang.srt.tp_invariant_ops import tree_all_reduce_sum
+
+    return tree_all_reduce_sum(input_, device_group=get_tp_group().device_group)
+
+
 def tensor_model_parallel_fused_allreduce_rmsnorm(
     input_: torch.Tensor,
     residual_inp_: torch.Tensor,
