@@ -41,6 +41,7 @@ class PoolName(str, Enum):
 
     KV = "kv"
     MAMBA = "mamba"
+    SWA = "swa"
     INDEXER = "indexer"
 
     def __str__(self) -> str:
@@ -73,6 +74,8 @@ class PoolTransfer:
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
+    # SWA LOAD_BACK only: trailing-token count needing an SWA device slot.
+    swa_suffix_tokens: int = 0
 
 
 @dataclass
