@@ -219,7 +219,9 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 f"/{len(wheel_builds)} success) - will use full rerun"
             )
         except Exception as e:
-            print(f"Failed to check kernel wheel status: {e} - falling back to full rerun")
+            print(
+                f"Failed to check kernel wheel status: {e} - falling back to full rerun"
+            )
 
     # Rerun workflows with conclusion=failure or conclusion=skipped.
     #
