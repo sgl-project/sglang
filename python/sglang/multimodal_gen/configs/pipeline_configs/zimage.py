@@ -361,9 +361,14 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        prompt_embeds = (
+            batch.negative_prompt_embeds[0]
+            if batch.negative_prompt_embeds is not None
+            else batch.prompt_embeds[0]
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
-                batch.prompt_embeds[0],
+                prompt_embeds,
                 batch.width,
                 batch.height,
                 device,
