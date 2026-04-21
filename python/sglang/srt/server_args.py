@@ -3470,15 +3470,11 @@ class ServerArgs:
                     "(only topk=1 is supported)"
                 )
             elif self.enable_dp_attention:
-                # Per-rank local accept_lengths diverge across DP ranks, producing
-                # different EMA decisions and mismatched CUDA graph shapes.
                 unsupported_reason = (
                     "enable_dp_attention=True is not supported "
                     "(adaptive tier decisions are not synchronized across DP ranks)"
                 )
             elif not self.disable_overlap_schedule:
-                # Worker factory selects EAGLEWorkerV2 when overlap is on, and
-                # AdaptiveController is only wired into EAGLEWorker v1.
                 unsupported_reason = (
                     "the overlap scheduler (spec v2) is enabled "
                     "(adaptive is only implemented for EAGLEWorker v1)"
@@ -3489,15 +3485,11 @@ class ServerArgs:
                     "(MultiLayerEagleWorker does not implement adaptive)"
                 )
             elif self.enable_two_batch_overlap:
-                # TboAttnBackend wraps the target attn_backend; adaptive state
-                # swap would replace it with a raw backend and break TBO.
                 unsupported_reason = (
                     "enable_two_batch_overlap=True is not supported "
                     "(adaptive state swap would discard the TboAttnBackend wrapper)"
                 )
             elif self.enable_pdmux:
-                # pdmux maintains decode_attn_backend_group alongside attn_backend;
-                # adaptive only swaps attn_backend, leaving the group stale.
                 unsupported_reason = (
                     "enable_pdmux=True is not supported "
                     "(adaptive state swap does not update decode_attn_backend_group)"
