@@ -67,6 +67,7 @@ try:
 except ImportError as e:
     SafeTensorsFileLoader = SingleGroup = None
 
+
 logger = logging.getLogger(__name__)
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).

@@ -30,6 +30,7 @@ class LoadFormat(str, enum.Enum):
     RDMA = "rdma"
     LOCAL_CACHED = "local_cached"
     FASTSAFETENSORS = "fastsafetensors"
+    MX_GDS = "mx_gds"
     PRIVATE = "private"
     RUNAI_STREAMER = "runai_streamer"
 

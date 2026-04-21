@@ -3153,6 +3153,11 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 
+    if load_config.load_format == LoadFormat.MX_GDS:
+        from modelexpress.sglang_gds_loader import create_sglang_gds_loader_class
+
+        return create_sglang_gds_loader_class()(load_config)
+
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization
