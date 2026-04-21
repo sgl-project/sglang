@@ -545,6 +545,114 @@ class TestSWA(unittest.TestCase):
         #   tail range [5:]     -> 1
         self.assertEqual(freed_lens, [4, 1])
 
+    def _build_allocator(self, size: int = 32, size_swa: int = 16, page_size: int = 1):
+        head_num = 8
+        head_dim = 128
+        num_layers = 8
+        global_interval = 4
+        device = get_device()
+        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
+        full_attention_layer_ids_set = set(full_attention_layer_ids)
+        swa_attention_layer_ids = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids_set
+        ]
+        pool = SWAKVPool(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+        )
+        return SWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size_swa,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+
+    def test_alloc_full_with_suffix_swa_basic(self):
+        """Suffix alloc returns N full slots and K SWA slots; mapping reflects the split."""
+        alloc = self._build_allocator(size=32, size_swa=16)
+        full0 = alloc.full_available_size()
+        swa0 = alloc.swa_available_size()
+
+        n_full, n_swa = 5, 3
+        result = alloc.alloc_full_with_suffix_swa(n_full, n_swa)
+        self.assertIsNotNone(result)
+        full_indices, swa_indices = result
+        self.assertEqual(len(full_indices), n_full)
+        self.assertEqual(len(swa_indices), n_swa)
+        self.assertEqual(alloc.full_available_size(), full0 - n_full)
+        self.assertEqual(alloc.swa_available_size(), swa0 - n_swa)
+
+        # Prefix slots map to 0 (no SWA pair); suffix slots map to swa_indices.
+        prefix_full = full_indices[: n_full - n_swa]
+        suffix_full = full_indices[-n_swa:]
+        self.assertTrue(
+            torch.all(alloc.full_to_swa_index_mapping[prefix_full] == 0).item()
+        )
+        self.assertTrue(
+            torch.equal(
+                alloc.full_to_swa_index_mapping[suffix_full].to(swa_indices.dtype),
+                swa_indices,
+            )
+        )
+
+    def test_alloc_full_with_suffix_swa_no_leak_on_free(self):
+        """Freeing all alloc'd slots must restore both pools to their starting size."""
+        alloc = self._build_allocator(size=32, size_swa=16)
+        full0 = alloc.full_available_size()
+        swa0 = alloc.swa_available_size()
+
+        n_full, n_swa = 6, 2
+        full_indices, _ = alloc.alloc_full_with_suffix_swa(n_full, n_swa)
+
+        # free_swa(full_indices) skips slots that map to 0 and frees the rest.
+        alloc.free_swa(full_indices)
+        alloc.full_attn_allocator.free(full_indices)
+
+        self.assertEqual(alloc.full_available_size(), full0)
+        self.assertEqual(alloc.swa_available_size(), swa0)
+
+    def test_alloc_full_with_suffix_swa_zero_suffix(self):
+        """n_swa_suffix=0 returns an empty SWA tensor and leaves the SWA pool untouched."""
+        alloc = self._build_allocator(size=32, size_swa=16)
+        swa0 = alloc.swa_available_size()
+
+        result = alloc.alloc_full_with_suffix_swa(4, 0)
+        self.assertIsNotNone(result)
+        full_indices, swa_indices = result
+        self.assertEqual(len(full_indices), 4)
+        self.assertEqual(len(swa_indices), 0)
+        self.assertEqual(alloc.swa_available_size(), swa0)
+        self.assertTrue(
+            torch.all(alloc.full_to_swa_index_mapping[full_indices] == 0).item()
+        )
+
+    def test_alloc_full_with_suffix_swa_oom_rolls_back(self):
+        """When SWA cannot satisfy the suffix, FULL must not be left allocated."""
+        alloc = self._build_allocator(size=32, size_swa=4)
+        full0 = alloc.full_available_size()
+        swa0 = alloc.swa_available_size()
+
+        # Drain the SWA pool to force OOM on the suffix step.
+        drain = alloc.swa_attn_allocator.alloc(swa0)
+        self.assertIsNotNone(drain)
+        self.assertEqual(alloc.swa_available_size(), 0)
+
+        result = alloc.alloc_full_with_suffix_swa(3, 2)
+        self.assertIsNone(result)
+        # FULL pool should be untouched after the rollback.
+        self.assertEqual(alloc.full_available_size(), full0)
+
 
 if __name__ == "__main__":
     unittest.main()
