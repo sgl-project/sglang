@@ -51,11 +51,18 @@ def _variant_sort_key(v: str) -> tuple:
 
 
 def _read_first_record(path: Path) -> Dict[str, Any] | None:
+    """Return the first JSON object in the file.
+
+    Handles both JSONL (one record per line) and pretty-printed JSON
+    (a single multi-line object), using raw_decode to consume the first
+    top-level value regardless of newlines.
+    """
     with open(path) as f:
-        line = f.readline().strip()
-    if not line:
+        text = f.read().lstrip()
+    if not text:
         return None
-    return json.loads(line)
+    obj, _ = json.JSONDecoder().raw_decode(text)
+    return obj
 
 
 def _row_from_record(
