@@ -73,9 +73,15 @@ def _make_tokenize_only_lm(tokenizer, enable_thinking: bool):
             self.batch_size_per_gpu = 1
 
         def apply_chat_template(self, chat_history, add_generation_prompt: bool = True) -> str:
-            kwargs = dict(tokenize=False, add_generation_prompt=add_generation_prompt)
-            if self.enable_thinking:
-                kwargs["enable_thinking"] = True
+            # Always pass enable_thinking explicitly — omitting it lets
+            # Qwen3's template leave <think> open, so calibration prompts
+            # would drift from bench_eval's (which should now also pass
+            # enable_thinking=False for non-thinking runs).
+            kwargs = dict(
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=self.enable_thinking,
+            )
             prompt = self.tokenizer.apply_chat_template(chat_history, **kwargs)
             bos = getattr(self.tokenizer, "bos_token", None)
             if bos and prompt.startswith(bos):

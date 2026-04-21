@@ -75,9 +75,16 @@ class BenchServingLM(LM):
     # ---- chat template ---------------------------------------------------
 
     def apply_chat_template(self, chat_history, add_generation_prompt: bool = True) -> str:
-        kwargs = dict(tokenize=False, add_generation_prompt=add_generation_prompt)
-        if self.enable_thinking:
-            kwargs["enable_thinking"] = True
+        # Always pass enable_thinking explicitly. Qwen3's chat template leaves
+        # <|im_start|>assistant\n open when the kwarg is omitted, which lets
+        # the model emit its own <think>...</think> → runaway outputs in
+        # "non-thinking" runs. Passing False emits a sealed empty think block
+        # so the model outputs the answer directly.
+        kwargs = dict(
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=self.enable_thinking,
+        )
         prompt = self.tokenizer.apply_chat_template(chat_history, **kwargs)
         bos = getattr(self.tokenizer, "bos_token", None)
         if bos and prompt.startswith(bos):
