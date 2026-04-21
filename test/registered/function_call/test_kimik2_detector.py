@@ -293,6 +293,40 @@ class TestKimiK2DetectorSpecialTokenLeakage(unittest.TestCase):
         text = "Hello world, this is normal text."
         self.assertEqual(_strip_special_tokens(text), text)
 
+    def test_non_streaming_empty_tool_section_keeps_plain_content(self):
+        """Non-stream parsing should not drop plain text wrapped by empty tool markers."""
+        detector = KimiK2FuncDetector()
+        text = "<|tool_calls_section_begin|>plain text<|tool_calls_section_end|>"
+
+        result = detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "plain text")
+
+    def test_streaming_empty_tool_section_emits_plain_content(self):
+        """A closed tool section with no actual tool call should stream back plain content."""
+        detector = KimiK2FuncDetector()
+        result = detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>plain text<|tool_calls_section_end|>",
+            self.tools,
+        )
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "plain text")
+        self.assertEqual(detector._buffer, "")
+
+    def test_flush_remaining_text_recovers_buffered_plain_content(self):
+        """Stop-time flushing should recover buffered plain text with no tool call start."""
+        detector = KimiK2FuncDetector()
+        result = detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>plain text", self.tools
+        )
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(detector.flush_remaining_text(), "plain text")
+        self.assertEqual(detector._buffer, "")
+
 
 # ============================================================
 # Part 2: KimiK2ReasoningDetector tests

@@ -116,6 +116,11 @@ class KimiK2Detector(BaseFormatDetector):
                     )
                 )
 
+            if not tool_calls:
+                return StreamingParseResult(
+                    normal_text=_strip_special_tokens(text), calls=[]
+                )
+
             content = text[: text.find(self.bot_token)]
             return StreamingParseResult(normal_text=content, calls=tool_calls)
 
@@ -148,6 +153,14 @@ class KimiK2Detector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
+            if self.tool_call_start_token not in current_text:
+                if self.eot_token in current_text:
+                    self._buffer = ""
+                    return StreamingParseResult(
+                        normal_text=_strip_special_tokens(current_text)
+                    )
+                return StreamingParseResult(normal_text="", calls=calls)
+
             match = self.stream_tool_call_portion_regex.search(current_text)
             if match:
                 function_id = match.group("tool_call_id")
@@ -241,6 +254,18 @@ class KimiK2Detector(BaseFormatDetector):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
+
+    def flush_remaining_text(self) -> str:
+        """
+        Flush buffered plain content when Kimi emits tool-section markers but
+        never starts a real tool call.
+        """
+        if not self._buffer or self.tool_call_start_token in self._buffer:
+            return ""
+
+        remaining_text = _strip_special_tokens(self._buffer)
+        self._buffer = ""
+        return remaining_text
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
