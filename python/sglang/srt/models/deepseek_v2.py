@@ -89,6 +89,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -592,11 +593,14 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-        # DWDP path: extend (prefill) batches only
+        # DWDP path: prefill uses multi-B prefetched peer weights. Decode
+        # falls through to forward_normal; LayerCommunicator's alt mode set
+        # provides the FULL-pipeline allgather/reduce_scatterv around it,
+        # since per-layer IPC prefetch sync cannot be hidden at 1 token/seq.
         if (
             self._dwdp_enabled
             and forward_batch is not None
-            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_decode_or_idle()
         ):
             return self.forward_dwdp(
                 hidden_states, forward_batch, gemm_output_zero_allocator
@@ -716,6 +720,7 @@ class DeepseekV2MoE(nn.Module):
             and not should_allreduce_fusion
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and not should_use_dp_reduce_scatterv()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -804,6 +809,7 @@ class DeepseekV2MoE(nn.Module):
             and not should_allreduce_fusion
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and not should_use_dp_reduce_scatterv()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states

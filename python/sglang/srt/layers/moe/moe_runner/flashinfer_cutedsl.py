@@ -249,6 +249,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         getattr(server_args, "cuda_graph_max_bs", None) or 512,
         getattr(server_args, "chunked_prefill_size", None) or 8192,
     )
+    if server_args.enable_dp_attention:
+        max_num_tokens *= server_args.dp_size
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
@@ -257,15 +259,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     # inference_mode), so we must opt out here.
     from sglang.srt.layers.moe.dwdp import enable_dwdp
 
-    if enable_dwdp():
-        # DWDP: wrapper sees all routed experts, offset=0
-        num_local_experts_for_wrapper = layer._num_global_routed
-        local_expert_offset_for_wrapper = 0
-    else:
-        num_local_experts_for_wrapper = layer.num_local_experts
-        local_expert_offset_for_wrapper = (
-            layer.moe_ep_rank * layer.num_local_experts
-        )
+    num_local_experts_ep = layer.num_local_experts
+    local_expert_offset_ep = layer.moe_ep_rank * layer.num_local_experts
 
     with torch.inference_mode(False):
         layer._cutedsl_wrapper = CuteDslMoEWrapper(
@@ -275,11 +270,25 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             intermediate_size=layer.intermediate_size_per_partition,
             use_cuda_graph=use_cuda_graph,
             max_num_tokens=max_num_tokens,
-            num_local_experts=num_local_experts_for_wrapper,
-            local_expert_offset=local_expert_offset_for_wrapper,
+            num_local_experts=num_local_experts_ep,
+            local_expert_offset=local_expert_offset_ep,
             output_dtype=layer.moe_runner_config.params_dtype,
             device=str(layer.w13_weight.device),
         )
+
+        if enable_dwdp():
+            layer._cutedsl_dwdp_wrapper = CuteDslMoEWrapper(
+                num_experts=layer.num_experts,
+                top_k=top_k,
+                hidden_size=layer.hidden_size,
+                intermediate_size=layer.intermediate_size_per_partition,
+                use_cuda_graph=False,
+                max_num_tokens=max_num_tokens,
+                num_local_experts=layer._num_global_routed,
+                local_expert_offset=0,
+                output_dtype=layer.moe_runner_config.params_dtype,
+                device=str(layer.w13_weight.device),
+            )
 
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
         resolve_cutedsl_standard_scales(layer)
@@ -345,6 +354,15 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     topk_weights = topk_output.topk_weights
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
+
+    # CuteDSL moe_sort launches kernels with grid derived from num_tokens and
+    # fails with cudaErrorInvalidConfiguration when num_tokens == 0 (empty
+    # idle-forward batches under DP attention). Short-circuit with an empty
+    # output of the correct shape/dtype/device.
+    if hidden_states.shape[0] == 0:
+        return StandardCombineInput(
+            hidden_states=torch.empty_like(hidden_states)
+        )
 
     x_fp4, x_sf = fp4_quantize(
         hidden_states,

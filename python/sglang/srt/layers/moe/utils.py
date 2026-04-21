@@ -303,6 +303,11 @@ def should_use_dp_reduce_scatterv():
     Use reduce_scatterv in the standard dispatcher's combine() for DP attention
     with EP, replacing the default all-reduce + dp_scatter path.
     Only changes the combine (post-kernel) communication; dispatch is unchanged.
+
+    DWDP: deliberately NOT excluded here. When DWDP is enabled, LayerCommunicator
+    keeps two mode sets; the alt (decode) set runs the FULL EP pipeline and needs
+    reduce_scatterv. The DWDP prefill path (forward_dwdp) does not call
+    tensor_model_parallel_all_reduce, so this flag being True has no effect there.
     """
     return (
         not should_use_flashinfer_cutlass_moe_fp4_allgather()

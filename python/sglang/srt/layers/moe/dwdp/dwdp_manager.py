@@ -126,7 +126,18 @@ class DwdpLayerHandleCollector:
         self._ipc_mappings: List[int] = []  # base ptrs to close on cleanup
 
     def register(self, **kwargs: torch.Tensor) -> None:
-        """Register local weight tensors for this layer."""
+        """Register local weight tensors for this layer.
+
+        Tensors are stored as-is without forcing contiguity. MMA-layout
+        scale factor tensors are strided views over a contiguous physical
+        storage whose outermost dim is the expert dim; calling
+        ``.contiguous()`` would repack them in logical-row-major order,
+        scattering experts across memory and breaking both kernel reads
+        and per-expert IPC slicing. The underlying storage is contiguous
+        starting at ``data_ptr()`` with experts as the outermost physical
+        dim, so IPC D2D copies remain a single ``cudaMemcpyAsync`` per
+        expert range.
+        """
         for name in WEIGHT_PARAM_NAMES:
             if name in kwargs:
                 self.local_weights[name] = kwargs[name]
@@ -144,7 +155,7 @@ class DwdpLayerHandleCollector:
             err, alloc_base, alloc_size = cuda_driver.cuMemGetAddressRange(data_ptr)
             assert err == cuda_driver.CUresult.CUDA_SUCCESS, f"cuMemGetAddressRange failed: {err}"
             offset = data_ptr - int(alloc_base)
-            handles[name] = (bytes(handle), offset)
+            handles[name] = (bytes(handle.reserved), offset)
         return handles
 
     def open_peer_handles(
@@ -168,8 +179,9 @@ class DwdpLayerHandleCollector:
                 assert err == cudart.cudaError_t.cudaSuccess, (
                     f"cudaIpcOpenMemHandle failed for peer {peer_rank} param {name}: {err}"
                 )
-                self._ipc_mappings.append(int(base_ptr))
-                self.peer_base_ptrs[(peer_rank, name)] = int(base_ptr) + offset
+                base_ptr_int = int(base_ptr)
+                self._ipc_mappings.append(base_ptr_int)
+                self.peer_base_ptrs[(peer_rank, name)] = base_ptr_int + offset
 
     def cleanup(self) -> None:
         """Close all IPC memory mappings."""
@@ -254,39 +266,48 @@ class DwdpManager:
     # ----- Phase 3: IPC Exchange -----
 
     def exchange_ipc_handles(self) -> None:
-        """AllGather IPC handles across DWDP group and open peer mappings."""
+        """AllGather IPC handles across DWDP group and store them.
+
+        IPC handles are stored as bytes and opened lazily to avoid
+        exceeding the CUDA driver's per-process IPC mapping limit.
+        """
         from sglang.srt.distributed.parallel_state import get_dwdp_group
 
         group = get_dwdp_group()
+        self._all_handles: Dict[int, list] = {}
 
         for layer_id, collector in self.layer_handles.items():
             local_handles = collector.get_ipc_handles()
-            # AllGather handles across DWDP group
             all_handles = [None] * self.dwdp_size
             dist.all_gather_object(all_handles, local_handles, group=group.cpu_group)
-            collector.open_peer_handles(all_handles, self.dwdp_rank)
+            self._all_handles[layer_id] = all_handles
 
         logger.info(
-            f"DWDP IPC handles exchanged for {len(self.layer_handles)} MoE layers"
+            f"DWDP IPC handles exchanged (lazy open) for "
+            f"{len(self.layer_handles)} MoE layers"
         )
 
     def init_prefetch_buffers(self) -> None:
         """Allocate double-buffered prefetch buffers."""
         from sglang.srt.layers.moe.dwdp.prefetch_buffer import DwdpPrefetchBuffer
 
-        # Collect param shapes/dtypes from the first registered layer
+        # Collect shapes/strides/dtypes from the first registered layer.
+        # Strides are needed so the prefetch buffer can reconstruct the
+        # kernel-expected strided view (e.g. MMA-layout scale factors).
         first_collector = next(iter(self.layer_handles.values()))
-        param_shapes = {}
+        param_full_shapes = {}
+        param_full_strides = {}
         param_dtypes = {}
         for name, tensor in first_collector.local_weights.items():
-            # Shape per expert: tensor shape is [num_experts_per_worker, ...]
-            param_shapes[name] = tensor.shape[1:]  # drop expert dim
+            param_full_shapes[name] = tensor.shape
+            param_full_strides[name] = tensor.stride()
             param_dtypes[name] = tensor.dtype
 
         self._prefetch_buffer = DwdpPrefetchBuffer(
             layout=self.layout,
             num_moe_layers=self.num_moe_layers,
-            param_shapes=param_shapes,
+            param_full_shapes=param_full_shapes,
+            param_full_strides=param_full_strides,
             param_dtypes=param_dtypes,
             device=next(iter(first_collector.local_weights.values())).device,
         )
@@ -299,20 +320,37 @@ class DwdpManager:
 
     # ----- Phase 4: Forward Pass Operations -----
 
+    def _get_peer_handles(self, layer_id: int) -> Dict[int, Dict[str, tuple]]:
+        """Get peer IPC handle bytes for a layer, excluding self."""
+        all_handles = self._all_handles[layer_id]
+        peer_handles = {}
+        for rank, handles in enumerate(all_handles):
+            if rank != self.dwdp_rank:
+                peer_handles[rank] = handles
+        return peer_handles
+
     def prefetch_first_layers(self) -> None:
         """Async prefetch weights for the first 2 MoE layers.
 
-        Called at the start of forward_extend(). Dense layers 0..first_k_dense_replace-1
-        provide the compute overlap window.
+        Called at the start of every forward pass (extend/decode/idle)
+        so that the ping-pong buffers hold the first two MoE layers'
+        peer weights. Otherwise the buffers retain data from the end
+        of the previous forward, where the last prefetches wrote the
+        tail-layer weights into both slots.
+
+        The prefetch stream is made to wait on the default stream first
+        to avoid racing against any still-in-flight compute from the
+        previous forward that may be reading these same buffers.
         """
         assert self._prefetch_buffer is not None
-        # Prefetch moe_layer_idx 0 -> buf[0], moe_layer_idx 1 -> buf[1]
+        prefetch_stream = self._prefetch_buffer.prefetch_stream
+        prefetch_stream.wait_stream(torch.cuda.current_stream(prefetch_stream.device))
         for moe_idx in range(min(2, self.num_moe_layers)):
             layer_id = self.first_k_dense_replace + moe_idx
             if layer_id in self.layer_handles:
                 self._prefetch_buffer.prefetch_layer(
                     moe_layer_idx=moe_idx,
-                    layer_handles=self.layer_handles[layer_id],
+                    peer_handles=self._get_peer_handles(layer_id),
                 )
 
     def get_weight_view(self, layer_id: int) -> NvFp4WeightView:
@@ -364,7 +402,7 @@ class DwdpManager:
             if next_layer_id in self.layer_handles:
                 self._prefetch_buffer.prefetch_layer(
                     moe_layer_idx=next_moe_idx,
-                    layer_handles=self.layer_handles[next_layer_id],
+                    peer_handles=self._get_peer_handles(next_layer_id),
                 )
 
     # ----- Phase 5: Cleanup -----

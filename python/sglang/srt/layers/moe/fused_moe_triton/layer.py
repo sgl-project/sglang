@@ -1083,8 +1083,9 @@ class FusedMoE(torch.nn.Module):
         )
 
         # Build CuteDslFp4MoeQuantInfo with multi-B List[Tensor] weights
+        # Use the DWDP wrapper (num_local_experts = all routed experts)
         quant_info = CuteDslFp4MoeQuantInfo(
-            wrapper=self._cutedsl_wrapper,
+            wrapper=self._cutedsl_dwdp_wrapper,
             w13_weight=weight_view.w13_weights,
             w2_weight=weight_view.w2_weights,
             w13_weight_sf=weight_view.w13_weight_sfs,

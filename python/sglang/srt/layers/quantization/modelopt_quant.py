@@ -1709,12 +1709,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         elif self.enable_flashinfer_cutedsl_moe:
             # CuteDSL standard path uses a single scalar input scale (all experts).
+            # Both w13 and w2 must be scalarized to the GLOBAL max so that the
+            # per-expert alphas stored in g1_alphas/g2_alphas match the scalar
+            # fc2_input_scale / used_input_scale consumed by the kernel. This is
+            # load-bearing for the DWDP path, which routes tokens through peer
+            # experts using the registered g*_alphas directly; any per-expert
+            # variation here would desync with the (scalar) fc2_input_scale.
             w13_input_scale = (
                 layer.w13_input_scale.max()
                 .to(torch.float32)
                 .repeat(layer.w13_input_scale.shape[0])
             )
-            w2_input_scale = layer.w2_input_scale
+            w2_input_scale = (
+                layer.w2_input_scale.max()
+                .to(torch.float32)
+                .repeat(layer.w2_input_scale.shape[0])
+            )
 
             def _slice_scale(w):
                 assert w.shape == (layer.num_experts,)
