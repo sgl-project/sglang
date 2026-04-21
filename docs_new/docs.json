@@ -1089,7 +1089,6 @@
             "group": "SGLang Diffusion",
             "icon": "sparkles",
             "pages": [
-              "sglang-diffusion/intro",
               "docs/sglang-diffusion/index",
               "docs/sglang-diffusion/installation",
               "docs/sglang-diffusion/compatibility_matrix",
