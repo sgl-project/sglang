@@ -48,6 +48,7 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == 'true' }}
+  SGLANG_DISABLE_CUDNN: "1"
 
 jobs:
   compute-diffusion-partitions:
