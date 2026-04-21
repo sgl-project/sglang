@@ -1,7 +1,13 @@
 """Cross-framework comparison benchmark for diffusion serving.
 
 Launches servers (SGLang, vLLM-Omni, LightX2V) for each test case, sends a
-single request, measures end-to-end latency, and writes comparison-results.json.
+single request, measures latency, and writes comparison-results.json.
+
+Primary metric ``latency_s`` is **client wall-clock** time (submit through
+completion) for every framework so cross-framework speed comparisons are
+apples-to-apples. For SGLang, when ``perf_dump_path`` is used and the server
+writes a perf JSON, ``server_latency_s`` records server-reported duration as a
+separate optional field.
 
 Usage:
     # Full run (requires GPU)
@@ -492,8 +498,12 @@ def _read_perf_dump(perf_dump_path: str, timeout: float = 10.0) -> float | None:
 
 def send_image_request_sglang(
     base_url: str, case: dict, perf_dump_path: str | None = None
-) -> float:
-    """Send a single T2I request via SGLang's /v1/images/generations."""
+) -> tuple[float, float | None]:
+    """Send a single T2I request via SGLang's /v1/images/generations.
+
+    Returns (client_wall_clock_s, server_perf_dump_s_or_none). Primary latency
+    for cross-framework comparison is the client time; server time is optional.
+    """
     payload = _build_sglang_payload(case)
     if perf_dump_path:
         payload["perf_dump_path"] = perf_dump_path
@@ -510,22 +520,26 @@ def send_image_request_sglang(
     if "data" not in data or len(data["data"]) == 0:
         raise RuntimeError(f"Image request returned no data: {data}")
 
+    server_latency: float | None = None
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
-        if server_latency is not None:
-            print(
-                f"  Image generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
-            )
-            return server_latency
-    print(f"  Image generated in {client_latency:.2f}s")
-    return client_latency
+    if server_latency is not None:
+        print(
+            f"  Image generated in {client_latency:.2f}s (client E2E), "
+            f"server perf_dump={server_latency:.2f}s"
+        )
+    else:
+        print(f"  Image generated in {client_latency:.2f}s (client E2E)")
+    return client_latency, server_latency
 
 
 def send_video_request_sglang(
     base_url: str, case: dict, perf_dump_path: str | None = None
-) -> float:
-    """Send a single T2V request via SGLang's /v1/videos (async)."""
+) -> tuple[float, float | None]:
+    """Send a single T2V request via SGLang's /v1/videos (async).
+
+    Returns (client_wall_clock_s, server_perf_dump_s_or_none).
+    """
     payload = _build_sglang_payload(case)
     if perf_dump_path:
         payload["perf_dump_path"] = perf_dump_path
@@ -561,22 +575,26 @@ def send_video_request_sglang(
 
     client_latency = time.time() - start
 
+    server_latency: float | None = None
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
-        if server_latency is not None:
-            print(
-                f"  Video generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
-            )
-            return server_latency
-    print(f"  Video generated in {client_latency:.2f}s")
-    return client_latency
+    if server_latency is not None:
+        print(
+            f"  Video generated in {client_latency:.2f}s (client E2E), "
+            f"server perf_dump={server_latency:.2f}s"
+        )
+    else:
+        print(f"  Video generated in {client_latency:.2f}s (client E2E)")
+    return client_latency, server_latency
 
 
 def send_image_conditioned_request_sglang(
     base_url: str, case: dict, config: dict, perf_dump_path: str | None = None
-) -> float:
-    """Send an image-conditioned request (edit/I2V/TI2V) via SGLang multipart API."""
+) -> tuple[float, float | None]:
+    """Send an image-conditioned request (edit/I2V/TI2V) via SGLang multipart API.
+
+    Returns (client_wall_clock_s, server_perf_dump_s_or_none).
+    """
     task = case["task"]
     ref_bytes = _get_ref_image_bytes(config)
 
@@ -647,16 +665,19 @@ def send_image_conditioned_request_sglang(
 
     client_latency = time.time() - start
 
+    server_latency: float | None = None
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
-        if server_latency is not None:
-            print(
-                f"  Generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
-            )
-            return server_latency
-    print(f"  Generated in {client_latency:.2f}s (sglang, image-conditioned)")
-    return client_latency
+    if server_latency is not None:
+        print(
+            f"  Generated in {client_latency:.2f}s (client E2E, image-conditioned), "
+            f"server perf_dump={server_latency:.2f}s"
+        )
+    else:
+        print(
+            f"  Generated in {client_latency:.2f}s (client E2E, sglang image-conditioned)"
+        )
+    return client_latency, server_latency
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +731,7 @@ def send_request_vllm_omni(base_url: str, case: dict, config: dict) -> float:
     choices = data.get("choices", [])
     if not choices:
         raise RuntimeError(f"vLLM-Omni request returned no choices: {data}")
-    print(f"  Generated in {latency:.2f}s (vllm-omni)")
+    print(f"  Generated in {latency:.2f}s (vllm-omni, client E2E)")
     return latency
 
 
@@ -795,7 +816,7 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
             raise TimeoutError(f"LightX2V task timed out after {REQUEST_TIMEOUT}s")
 
     latency = time.time() - start
-    print(f"  Generated in {latency:.2f}s (lightx2v)")
+    print(f"  Generated in {latency:.2f}s (lightx2v, client E2E)")
     return latency
 
 
@@ -810,12 +831,16 @@ def send_request(
     framework: str = "sglang",
     config: dict | None = None,
     perf_dump_path: str | None = None,
-) -> float:
+) -> tuple[float, float | None]:
+    """Dispatch request; return (client_latency_s, server_latency_s_or_none).
+
+    ``server_latency_s`` is only set for SGLang when perf_dump is read successfully.
+    """
     config = config or {}
     if framework == "vllm-omni":
-        return send_request_vllm_omni(base_url, case, config)
+        return send_request_vllm_omni(base_url, case, config), None
     elif framework == "lightx2v":
-        return send_request_lightx2v(base_url, case, config)
+        return send_request_lightx2v(base_url, case, config), None
     # SGLang — use OpenAI-compatible endpoints with optional perf log
     task = case["task"]
     if case.get("reference_image"):
@@ -845,7 +870,7 @@ def run_single(
     framework_bin_dir: str | None = None,
 ) -> dict:
     """Run a single (case, framework) combination. Returns result dict."""
-    result = {
+    result: dict = {
         "case_id": case["id"],
         "framework": framework,
         "model": case["model"],
@@ -877,7 +902,7 @@ def run_single(
         env.pop("PYTHONPATH", None)
     env.update(fw_cfg.get("extra_env", {}))
 
-    # perf_dump_path for SGLang server-side timing (passed in request, zero overhead when None)
+    # perf_dump_path: SGLang writes perf JSON; we record server_latency_s alongside client E2E
     perf_dump_path = None
     if framework == "sglang":
         perf_dump_path = os.path.join(str(log_dir), f"perf_{case['id']}_measured.json")
@@ -934,14 +959,16 @@ def run_single(
             except Exception as e:
                 print(f"  Warmup request {wi} failed (non-fatal): {e}")
 
-        # Measured request — pass perf_dump_path for SGLang server-side timing
+        # Measured request — perf_dump_path yields optional server_latency_s for SGLang
         if perf_dump_path and os.path.exists(perf_dump_path):
             os.remove(perf_dump_path)
         print("  Sending measured request...")
-        latency = send_request(
+        client_lat, server_lat = send_request(
             base_url, case, framework, config, perf_dump_path=perf_dump_path
         )
-        result["latency_s"] = round(latency, 3)
+        result["latency_s"] = round(client_lat, 3)
+        if server_lat is not None:
+            result["server_latency_s"] = round(server_lat, 3)
 
     except Exception as e:
         result["error"] = str(e)
@@ -1188,7 +1215,13 @@ def run_comparison(
     print("SUMMARY")
     print(f"{'='*60}")
     for r in results:
-        lat = f"{r['latency_s']:.2f}s" if r["latency_s"] else r.get("error", "N/A")
+        if r["latency_s"] is not None:
+            lat = f"{r['latency_s']:.2f}s"
+            srv = r.get("server_latency_s")
+            if srv is not None:
+                lat += f" (srv {srv:.2f}s)"
+        else:
+            lat = r.get("error", "N/A")
         print(f"  {r['case_id']:30s} | {r['framework']:12s} | {lat}")
 
     if cleanup_framework_venvs:
