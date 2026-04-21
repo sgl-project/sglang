@@ -39,18 +39,16 @@ LOG2E = tl.constexpr(1.4426950408889634)
 # ===-----------------------------------------------------------------------===#
 #
 # Every layout the kernels consume is built here as a @gluon.constexpr_function
-# (evaluated at JIT compile time, no runtime cost). Kernels either:
-#   - call the individual factories directly (current callers), or
-#   - call `build_extend_layouts(...)` for the full aggregate (post-refactor
-#     callers — returns a flat tuple covering every layout the unified kernels
-#     consume in a single compile-time call).
+# (evaluated at JIT compile time, no runtime cost). Kernels call the individual
+# factories directly.
 #
 # For symmetric attention, V is the transpose of K^T: every basis ``[a, b]``
 # is mirrored to ``[b, a]`` and the tile shape swaps ``[D, N]`` <-> ``[N, D]``.
 # The `_kt_*_bases` functions are the single source of truth; public
 # `make_v_*` helpers transpose them. The FP8 kernel's BF16-extend V layout
 # diverges in three corners (num_warps, BLOCK_DV, BLOCK_N) to relieve LDS
-# pressure — `make_fp8_bf16_v_*` handle that.
+# pressure — `make_fp8_bf16_v_*` (and its aliases `make_fp8_v_*` /
+# `make_fp8_extend_v_*`) handle that.
 
 
 @gluon.constexpr_function
@@ -397,72 +395,289 @@ def make_fp8_bf16_v_dll(num_warps, BLOCK_DV, BLOCK_N):
     )
 
 
+# ===-----------------------------------------------------------------------===#
+# FP8 prefix async-DMA layout factories
+#
+# The FP8 kernel runs two async-DMA streams: prefix (FP8 K/V loads, 1 byte)
+# and extend (BF16 K/V loads, 2 bytes). The prefix stream packs more elements
+# per vector register along the major axis, so its DistributedLinearLayouts
+# differ from the BF16 factories above. Offset bases coincide with BF16 for
+# K^T; V and KPE use their own ladders.
+#
+#   Factory                              | Used for
+#   -------------------------------------|-------------------------------------
+#   make_fp8_kt_dll                      | FP8 prefix K^T DLL   (D>=128; D<128 falls back to BF16)
+#   make_fp8_v_dll                       | FP8 prefix V   DLL
+#   make_fp8_v_offset_bases              | FP8 prefix V   offset bases (alias)
+#   make_fp8_kpe_offset_bases / _dll     | FP8 prefix KPE (DeepSeek rotary K)
+#   make_fp8_extend_v_dll                | FP8 kernel BF16 extend V DLL (alias for make_fp8_bf16_v_dll)
+#   make_fp8_extend_kpe_offset_bases/_dll| FP8 kernel BF16 extend KPE (4-warp only)
+#   make_ext_kt_offset_bases / _dll      | BF16 extend K^T when EXT_BLOCK_N != BLOCK_N (rare)
+#   make_ext_v_offset_bases  / _dll      | BF16 extend V   when EXT_BLOCK_N != BLOCK_N (rare)
+# ===-----------------------------------------------------------------------===#
+
+
 @gluon.constexpr_function
-def build_extend_layouts(
-    BLOCK_M, BLOCK_N, BLOCK_DMODEL, BLOCK_DV, num_warps,
-    IS_FP8, include_ext_v_fp8=False,
-):
-    """Aggregate factory: every layout the unified kernels consume in one call.
+def make_fp8_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N):
+    """Async DMA DLL for FP8 prefix K^T tile [BLOCK_DMODEL, BLOCK_N].
 
-    Returns a flat tuple that unified BF16/FP8 kernels destructure at the top
-    of their body, replacing ~8 hand-wired `make_*` calls with one.
-
-    Tuple order (fixed; unified-kernel bodies unpack by position):
-      (  0) mma                        : MFMA accumulator
-      (  1) q_dot                      : BF16 Q dot-operand (operand 0)
-      (  2) kt_dot                     : BF16 K^T dot-operand (operand 1)
-      (  3) p_dot                      : BF16 P dot-operand (operand 0)
-      (  4) v_dot                      : BF16 V dot-operand (operand 1)
-      (  5) fp8_q_dot                  : FP8 Q dot-operand   (None if !IS_FP8)
-      (  6) fp8_kt_dot                 : FP8 K^T dot-operand (None if !IS_FP8)
-      (  7) fp8_p_dot                  : FP8 P dot-operand   (None if !IS_FP8)
-      (  8) fp8_v_dot                  : FP8 V dot-operand   (None if !IS_FP8)
-      (  9) blocked                    : output blocked layout
-      ( 10) offs_m_layout              : 1-D slice (dim=1)
-      ( 11) offs_d_layout              : 1-D slice (dim=0)
-      ( 12) mma_offs_n_col             : mma slice (dim=0)
-      ( 13) mma_offs_m_row             : mma slice (dim=1)
-      ( 14) mma_m_layout               : mma slice (dim=1, duplicate alias)
-      ( 15) kt_offset_bases            : offset bases for K^T padded SMEM
-      ( 16) kt_dll                     : DLL for K^T async DMA
-      ( 17) v_offset_bases             : offset bases for V padded SMEM
-      ( 18) v_dll                      : DLL for V async DMA
-      ( 19) ext_v_offset_bases         : FP8 BF16-extend V offset bases (None if !IS_FP8 or !include_ext_v_fp8)
-      ( 20) ext_v_dll                  : FP8 BF16-extend V DLL           (None if !IS_FP8 or !include_ext_v_fp8)
-
-    MFMA instr-shape is 16x16x32 with k_widths (qk, pv) = (8, 4) for BF16 and
-    (16, 8) for the FP8 prefix dots (standard CDNA4 defaults for D>=64).
+    FP8 packs 8 elements per vector register along D (1 byte each = 8 bytes,
+    matches a dword load). For D<128 the partition matches BF16 KT, so we
+    delegate to ``make_kt_dll`` in that case.
     """
-    mma, q_dot, kt_dot, p_dot, v_dot = make_mfma_dot_layouts(
-        num_warps, 16, 16, 32, 8, 4,
+    is_4w = num_warps < 8
+    if BLOCK_DMODEL < 128:
+        return make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+    if is_4w:
+        if BLOCK_DMODEL >= 256:
+            reg  = [[1,0],[2,0],[4,0],[0,4],[0,8]]
+            lane = [[8,0],[16,0],[32,0],[64,0],[128,0],[0,16]]
+            warp = [[0,1],[0,2]]
+        else:  # D=128
+            if BLOCK_N >= 128:
+                reg  = [[1,0],[2,0],[4,0],[8,0],[0,4],[0,8]]
+                lane = [[16,0],[32,0],[64,0],[0,16],[0,32],[0,64]]
+                warp = [[0,1],[0,2]]
+            else:
+                reg  = [[1,0],[2,0],[4,0],[8,0],[0,8]]
+                lane = [[16,0],[32,0],[64,0],[0,1],[0,2],[0,4]]
+                warp = [[0,16],[0,32]]
+    else:  # 8-warp
+        if BLOCK_DMODEL >= 256:
+            reg  = [[1,0],[2,0],[4,0],[0,8]]
+            lane = [[8,0],[16,0],[32,0],[64,0],[128,0],[0,16]]
+            warp = [[0,1],[0,2],[0,4]]
+        else:  # D=128
+            if BLOCK_N >= 128:
+                reg  = [[1,0],[2,0],[4,0],[8,0],[0,8]]
+                lane = [[16,0],[32,0],[64,0],[0,16],[0,32],[0,64]]
+                warp = [[0,1],[0,2],[0,4]]
+            else:
+                reg  = [[1,0],[2,0],[4,0],[8,0]]
+                lane = [[16,0],[32,0],[64,0],[0,1],[0,2],[0,4]]
+                warp = [[0,8],[0,16],[0,32]]
+    return DistributedLinearLayout(
+        reg_bases=reg, lane_bases=lane, warp_bases=warp,
+        block_bases=[], shape=[BLOCK_DMODEL, BLOCK_N],
     )
-    if IS_FP8:
-        fp8_q, fp8_kt, fp8_p, fp8_v = make_fp8_dot_layouts(mma, 16, 8)
-    else:
-        fp8_q = None
-        fp8_kt = None
-        fp8_p = None
-        fp8_v = None
-    blocked, offs_m_ly, offs_d_ly, mma_n_col, mma_m_row, mma_m_ly = (
-        make_blocked_and_slice_layouts(num_warps, mma)
+
+
+@gluon.constexpr_function
+def make_fp8_v_dll(num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N):
+    """Async DMA DLL for FP8 prefix V tile [BLOCK_N, BLOCK_DV].
+
+    The 8-warp layout depends on (D, Dv, N) jointly because K^T shared-memory
+    pressure (driven by D) constrains the V warp partition. For D<128 this
+    matches BF16 V, so we delegate to ``make_v_dll``. The 4-warp path depends
+    on (Dv, N) only.
+    """
+    if BLOCK_DMODEL < 128:
+        return make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+    is_4w = num_warps < 8
+    if is_4w:
+        if BLOCK_DV >= 256:
+            if BLOCK_N >= 128:
+                reg  = [[0,1],[0,2],[0,4],[0,8],[4,0],[8,0],[64,0]]
+                lane = [[0,16],[0,32],[0,64],[0,128],[16,0],[32,0]]
+            else:
+                reg  = [[0,1],[0,2],[0,4],[4,0],[8,0]]
+                lane = [[0,8],[0,16],[0,32],[0,64],[0,128],[16,0]]
+            warp = [[1,0],[2,0]]
+        else:  # Dv<256
+            if BLOCK_N >= 128:
+                reg  = [[0,1],[0,2],[0,4],[0,8],[4,0],[8,0]]
+                lane = [[0,16],[0,32],[0,64],[16,0],[32,0],[64,0]]
+                warp = [[1,0],[2,0]]
+            else:
+                reg  = [[0,1],[0,2],[0,4],[0,8],[8,0]]
+                lane = [[0,16],[0,32],[0,64],[1,0],[2,0],[4,0]]
+                warp = [[16,0],[32,0]]
+    else:  # 8-warp
+        if BLOCK_DMODEL >= 256:
+            if BLOCK_DV >= 256:
+                reg  = [[0,1],[0,2],[0,4],[8,0]]
+                lane = [[0,8],[0,16],[0,32],[0,64],[0,128],[16,0]]
+            else:
+                reg  = [[0,1],[0,2],[0,4],[8,0]]
+                lane = [[0,8],[0,16],[0,32],[0,64],[16,0],[32,0]]
+            warp = [[1,0],[2,0],[4,0]]
+        else:  # D=128  (Dv=128 implied at every callsite)
+            if BLOCK_N >= 128:
+                reg  = [[0,1],[0,2],[0,4],[0,8],[8,0]]
+                lane = [[0,16],[0,32],[0,64],[16,0],[32,0],[64,0]]
+                warp = [[1,0],[2,0],[4,0]]
+            else:
+                reg  = [[0,1],[0,2],[0,4],[0,8]]
+                lane = [[0,16],[0,32],[0,64],[1,0],[2,0],[4,0]]
+                warp = [[8,0],[16,0],[32,0]]
+    return DistributedLinearLayout(
+        reg_bases=reg, lane_bases=lane, warp_bases=warp,
+        block_bases=[], shape=[BLOCK_N, BLOCK_DV],
     )
-    kt_ob = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
-    kt_dll = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
-    v_ob = make_v_offset_bases(BLOCK_DV, BLOCK_N)
-    v_dll = make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
-    if IS_FP8 and include_ext_v_fp8:
-        ext_v_ob = make_fp8_bf16_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
-        ext_v_dll = make_fp8_bf16_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+
+
+# FP8 prefix V uses the same offset bases as the FP8 kernel's BF16 extend V
+# tile -- the FP8 vs BF16 distinction shows up only in the DLL partition.
+make_fp8_v_offset_bases = make_fp8_bf16_v_offset_bases
+
+# Alias: the FP8 kernel's BF16-extend V tile. Semantically the FP8 kernel's
+# "extend" counterpart to ``make_fp8_v_dll``.
+make_fp8_extend_v_dll = make_fp8_bf16_v_dll
+
+
+@gluon.constexpr_function
+def make_fp8_kpe_offset_bases(num_warps, BLOCK_DPE, BLOCK_N):
+    """Offset bases for FP8 prefix KPE tile (DeepSeek rotary K positional)."""
+    is_4w = num_warps < 8
+    if is_4w:
+        if BLOCK_DPE >= 64:
+            if BLOCK_N >= 128:
+                return make_offset_bases(32, [4,8,16,32], [1,2,64], 0)
+            return make_offset_bases(32, [4,8,16], [1,2,32], 0)
+        if BLOCK_DPE >= 32:
+            return make_offset_bases(16, [16,32], [1,2,4,8], 0)
+        return make_offset_bases(8, [16,32], [1,2,4,8], 0)
+    # 8-warp
+    if BLOCK_DPE >= 64:
+        return make_offset_bases(32, [4,8,16], [1,2,32], 0)
+    if BLOCK_DPE >= 32:
+        return make_offset_bases(16, [4,8,16], [1,2,32], 0)
+    return make_offset_bases(8, [4,8,16], [1,2,32], 0)
+
+
+@gluon.constexpr_function
+def make_fp8_kpe_dll(num_warps, BLOCK_DPE, BLOCK_N):
+    """Async DMA DLL for FP8 prefix KPE tile [BLOCK_DPE, BLOCK_N]."""
+    is_4w = num_warps < 8
+    shape = [BLOCK_DPE, BLOCK_N]
+    if is_4w:
+        if BLOCK_DPE >= 64:
+            if BLOCK_N >= 128:
+                reg  = [[1,0],[2,0],[4,0],[32,0],[0,64]]
+                lane = [[0,4],[0,8],[0,16],[0,32],[8,0],[16,0]]
+            else:
+                reg  = [[1,0],[2,0],[4,0],[0,32]]
+                lane = [[8,0],[16,0],[32,0],[0,4],[0,8],[0,16]]
+            warp = [[0,1],[0,2]]
+        elif BLOCK_DPE >= 32:
+            reg  = [[1,0],[2,0],[0,4]]
+            lane = [[4,0],[8,0],[16,0],[0,8],[0,16],[0,32]]
+            warp = [[0,1],[0,2]]
+        else:
+            reg  = [[1,0],[0,4]]
+            lane = [[2,0],[4,0],[8,0],[0,8],[0,16],[0,32]]
+            warp = [[0,1],[0,2]]
     else:
-        ext_v_ob = None
-        ext_v_dll = None
-    return (
-        mma, q_dot, kt_dot, p_dot, v_dot,
-        fp8_q, fp8_kt, fp8_p, fp8_v,
-        blocked, offs_m_ly, offs_d_ly,
-        mma_n_col, mma_m_row, mma_m_ly,
-        kt_ob, kt_dll, v_ob, v_dll,
-        ext_v_ob, ext_v_dll,
+        # 8-warp warp stride is uniform across DPE sizes
+        warp = [[0,1],[0,2],[0,32]]
+        if BLOCK_DPE >= 64:
+            reg  = [[1,0],[2,0],[4,0]]
+            lane = [[8,0],[16,0],[32,0],[0,4],[0,8],[0,16]]
+        elif BLOCK_DPE >= 32:
+            reg  = [[1,0],[2,0]]
+            lane = [[4,0],[8,0],[16,0],[0,4],[0,8],[0,16]]
+        else:
+            reg  = [[1,0]]
+            lane = [[2,0],[4,0],[8,0],[0,4],[0,8],[0,16]]
+    return DistributedLinearLayout(
+        reg_bases=reg, lane_bases=lane, warp_bases=warp,
+        block_bases=[], shape=shape,
+    )
+
+
+@gluon.constexpr_function
+def make_fp8_extend_kpe_offset_bases(num_warps, BLOCK_DPE, BLOCK_N):
+    """Offset bases for the FP8 kernel's BF16 extend KPE tile. 4-warp only.
+
+    The 8-warp paths always run with ``BLOCK_DPE == 0`` so they never ask for
+    this layout (the kernel falls through to ``kt_async_layout`` instead).
+    """
+    if BLOCK_DPE >= 64:
+        if BLOCK_N >= 128:
+            return make_offset_bases(32, [8,16,32,64], [1,2,4], 0)
+        return make_offset_bases(32, [8,16,32], [1,2,4], 0)
+    if BLOCK_DPE >= 32:
+        if BLOCK_N >= 128:
+            return make_offset_bases(16, [8,16,32,64], [1,2,4], 0)
+        return make_offset_bases(16, [8,16,32], [1,2,4], 0)
+    return make_offset_bases(16, [8,16,32], [1,2,4], 0)
+
+
+@gluon.constexpr_function
+def make_fp8_extend_kpe_dll(num_warps, BLOCK_DPE, BLOCK_N):
+    """Async DMA DLL for the FP8 kernel's BF16 extend KPE tile. 4-warp only."""
+    shape = [BLOCK_DPE, BLOCK_N]
+    warp = [[0,1],[0,2]]
+    lane_n = [[0,8],[0,16],[0,32]]
+    if BLOCK_DPE >= 64:
+        if BLOCK_N >= 128:
+            reg = [[1,0],[2,0],[4,0],[0,4],[0,64]]
+        else:
+            reg = [[1,0],[2,0],[4,0],[0,4]]
+        lane = [[8,0],[16,0],[32,0]] + lane_n
+    elif BLOCK_DPE >= 32:
+        if BLOCK_N >= 128:
+            reg = [[1,0],[2,0],[0,4],[0,64]]
+        else:
+            reg = [[1,0],[2,0],[0,4]]
+        lane = [[4,0],[8,0],[16,0]] + lane_n
+    else:
+        reg = [[1,0],[2,0],[0,4]]
+        lane = [[4,0],[8,0],[16,0]] + lane_n
+    return DistributedLinearLayout(
+        reg_bases=reg, lane_bases=lane, warp_bases=warp,
+        block_bases=[], shape=shape,
+    )
+
+
+@gluon.constexpr_function
+def make_ext_kt_offset_bases(num_warps, BLOCK_DMODEL, EXT_BLOCK_N):
+    """BF16 extend K^T offset bases for ``EXT_BLOCK_N != BLOCK_N`` (rare).
+
+    Used only inside the FP8 kernel's 4-warp DMA path when the extend tile
+    size differs from the prefix tile size. All other extend paths reuse
+    ``make_kt_offset_bases``.
+    """
+    if BLOCK_DMODEL >= 256:
+        return make_offset_bases(128, [16,32], [1,2,4,8], 0)
+    return make_offset_bases(64, [16,32], [1,2,4,8], 0)
+
+
+@gluon.constexpr_function
+def make_ext_kt_dll(num_warps, BLOCK_DMODEL, EXT_BLOCK_N):
+    """BF16 extend K^T DLL for ``EXT_BLOCK_N != BLOCK_N`` (rare)."""
+    if BLOCK_DMODEL >= 256:
+        reg = [[1,0],[2,0],[4,0],[128,0],[0,4],[0,8]]
+    else:
+        reg = [[1,0],[2,0],[4,0],[0,4],[0,8]]
+    lane = [[8,0],[16,0],[32,0],[64,0],[0,16],[0,32]]
+    warp = [[0,1],[0,2]]
+    return DistributedLinearLayout(
+        reg_bases=reg, lane_bases=lane, warp_bases=warp,
+        block_bases=[], shape=[BLOCK_DMODEL, EXT_BLOCK_N],
+    )
+
+
+@gluon.constexpr_function
+def make_ext_v_offset_bases(num_warps, BLOCK_DV, EXT_BLOCK_N):
+    """BF16 extend V offset bases for ``EXT_BLOCK_N != BLOCK_N`` (rare)."""
+    if BLOCK_DV >= 256:
+        return make_offset_bases(128, [16,32], [1,2,4,8], 1)
+    return make_offset_bases(64, [16,32], [1,2,4,8], 1)
+
+
+@gluon.constexpr_function
+def make_ext_v_dll(num_warps, BLOCK_DV, EXT_BLOCK_N):
+    """BF16 extend V DLL for ``EXT_BLOCK_N != BLOCK_N`` (rare)."""
+    if BLOCK_DV >= 256:
+        reg = [[0,1],[0,2],[0,4],[0,128],[4,0],[8,0]]
+    else:
+        reg = [[0,1],[0,2],[0,4],[4,0],[8,0]]
+    lane = [[0,8],[0,16],[0,32],[0,64],[16,0],[32,0]]
+    warp = [[1,0],[2,0]]
+    return DistributedLinearLayout(
+        reg_bases=reg, lane_bases=lane, warp_bases=warp,
+        block_bases=[], shape=[EXT_BLOCK_N, BLOCK_DV],
     )
 
 

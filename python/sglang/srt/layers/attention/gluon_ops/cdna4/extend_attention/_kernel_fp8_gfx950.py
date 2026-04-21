@@ -1,16 +1,35 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FP8 KV Gluon extend-attention kernel for symmetric head dims (Lq == Lv).
+"""Unified FP8 KV Gluon extend-attention kernel for gfx950 (symmetric heads).
 
-FP8 variant: prefix phase uses native FP8 MFMA on FP8 KV cache buffers,
-extend phase uses BF16. Two-phase shared memory allocation.
-Handles D=64, D=128, D=256 where BLOCK_DPE is always 0.
+Prefix phase uses native FP8 MFMA on FP8 KV cache buffers; extend phase
+uses BF16 on the live Q / K / V extend tensors. Two-phase shared memory
+allocation covers the different layout requirements of each phase.
+
+One @gluon.jit entry folds the basic (3D grid, one CTA per tile),
+persistent-CTA, and split-K paths behind three constexpr gates:
+
+    IS_PERSISTENT   : False = basic 3D grid, True = CTA tile-sweep loop
+    SPLIT_K         : 1     = no split, >1 = partition prefix KV range + reduce
+    V_PRELOAD       : pre-load V tiles (experimental; default False)
+
+Supports BLOCK_DMODEL=64 and 128 only. FP8 D=256 is unsupported on gfx950
+(MFMA_F8 at D>=256 hits an unrealized_conversion_cast in the LLVM backend
+that cannot be materialized); a `gl.static_assert` at the top of the
+kernel body enforces this. The dispatcher also refuses FP8 D=256 at
+launch time.
+
+Prefix dispatch mirrors the BF16 unified kernel: the basic path splits
+into unmasked bulk + masked tail (pipelined runs on the BLOCK_N-aligned
+interior, short cleans up the remainder), while the persistent path
+keeps the straight pattern because split-K re-partitioned prefixes are
+naturally unaligned and applying the split there regresses perf.
 """
 
 from ._common import *  # noqa: F403
 # ===-----------------------------------------------------------------------===#
-# Unified FP8 Kernel (basic + persistent via IS_PERSISTENT constexpr)
+# Unified FP8 Kernel (basic + persistent + split-K via constexpr gates)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -79,6 +98,33 @@ def gluon_extend_attn_fwd(
 ):
     num_warps: gl.constexpr = gl.num_warps()
     PFX_SMEM_TY: gl.constexpr = K_Buffer.dtype.element_ty
+
+    # FP8 D=256 hard guard: MFMA_F8 at D>=256 hits an unrealized_conversion_cast
+    # in the LLVM backend on gfx950. The dispatcher should never route D=256
+    # here, but fail compilation loudly if it does.
+    tl.static_assert(
+        BLOCK_DMODEL != 256,
+        "FP8 D=256 is unsupported on gfx950 (MFMA_F8 unrealized_conversion_cast). "
+        "Use BF16 KV cache for D=256 models (Gemma3 etc) or set "
+        "SGLANG_GLUON_FP8_KV_FORCE_BF16=1.",
+    )
+
+    # Basic-path safety rail: the 4-warp / 8-warp DMA layouts in the
+    # IS_PERSISTENT=False branches below assume BLOCK_DMODEL >= 128. With
+    # D<128 + NS>=2 the v_async_layout register bases overflow tensor rows
+    # and LLVM fails with unrealized_conversion_cast. Persistent path has
+    # a dedicated D<128 branch and does not need the gate.
+    if not IS_PERSISTENT:
+        tl.static_assert(
+            not (num_warps == 4 and NUM_STAGES >= 2 and BLOCK_DMODEL < 128),
+            "FP8 basic: NUM_STAGES>=2 requires BLOCK_DMODEL>=128 on 4-warp path. "
+            "Use NUM_STAGES=1 or route to persistent kernel for D<128.",
+        )
+        tl.static_assert(
+            not (num_warps == 8 and BLOCK_DMODEL < 128),
+            "FP8 basic: 8-warp DMA path is incomplete for BLOCK_DMODEL<128. "
+            "Route to persistent kernel which has a dedicated D<128 branch.",
+        )
 
     # layouts
     threads_per_warp: gl.constexpr = 64
@@ -256,59 +302,31 @@ def gluon_extend_attn_fwd(
 
         if USE_SERIAL:
             if NUM_STAGES >= 2 and BLOCK_DMODEL >= 128:
-                # 4-warp DMA path
-                if BLOCK_DMODEL >= 256:
-                    kt_offset_bases: gl.constexpr = make_offset_bases(128, [16], [1, 2, 4, 8], 0)
-                    kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, BLOCK_N], [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]], [[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16], ], [[0, 1], [0, 2]])
-                else:
-                    if BLOCK_N >= 128:
-                        kt_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32, 64], [1, 2, 4, 8], 0)
-                        kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, BLOCK_N], [[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]], [[16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 64]], [[0, 1], [0, 2]])
-                    else:
-                        kt_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32], [1, 2, 4, 8], 0)
-                        kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, BLOCK_N], [[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]], [[16, 0], [32, 0], [64, 0], [0, 1], [0, 2], [0, 4]], [[0, 16], [0, 32]])
+                # 4-warp DMA path -- layouts via _common.make_fp8_{kt,v,kpe}_*
+                # (see that module for per-(NW,D,Dv,N) base tables).
+                kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
+                kt_async_layout: gl.constexpr = make_fp8_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+                v_offset_bases: gl.constexpr = make_fp8_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
+                v_async_layout: gl.constexpr = make_fp8_v_dll(num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N)
 
-                if BLOCK_DV >= 256:
-                    if BLOCK_N >= 128:
-                        v_offset_bases: gl.constexpr = make_offset_bases(128, [16, 32, 64], [1, 2, 4, 8], 1)
-                        v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0], [64, 0]], [[0, 16], [0, 32], [0, 64], [0, 128], [16, 0], [32, 0]], [[1, 0], [2, 0]])
-                    else:
-                        v_offset_bases: gl.constexpr = make_offset_bases(128, [16], [1, 2, 4, 8], 1)
-                        v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]], [[0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [16, 0]], [[1, 0], [2, 0]])
-                else:
-                    if BLOCK_N >= 128:
-                        v_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32, 64], [1, 2, 4, 8], 1)
-                        v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0]], [[0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0]], [[1, 0], [2, 0]])
-                    else:
-                        v_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32], [1, 2, 4, 8], 1)
-                        v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [0, 8], [8, 0]], [[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]], [[16, 0], [32, 0]])
-
-                bf16_kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
+                # BF16 extend: shares the FP8 offset-bases ladder; the DLL differs.
+                bf16_kt_offset_bases: gl.constexpr = kt_offset_bases
                 bf16_kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
-                bf16_v_offset_bases: gl.constexpr = make_fp8_bf16_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
-                bf16_v_async_layout: gl.constexpr = make_fp8_bf16_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+                bf16_v_offset_bases: gl.constexpr = v_offset_bases
+                bf16_v_async_layout: gl.constexpr = make_fp8_extend_v_dll(num_warps, BLOCK_DV, BLOCK_N)
 
                 if BLOCK_DPE == 0:
                     bf16_kpe_async_layout: gl.constexpr = bf16_kt_async_layout
                     bf16_kpe_offset_bases: gl.constexpr = bf16_kt_offset_bases
-                elif BLOCK_DPE >= 64 and BLOCK_N >= 128:
-                    bf16_kpe_offset_bases: gl.constexpr = make_offset_bases(32, [8, 16, 32, 64], [1, 2, 4], 0)
-                    bf16_kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [2, 0], [4, 0], [0, 4], [0, 64]], [[8, 0], [16, 0], [32, 0], [0, 8], [0, 16], [0, 32]], [[0, 1], [0, 2]])
-                elif BLOCK_DPE >= 64:
-                    bf16_kpe_offset_bases: gl.constexpr = make_offset_bases(32, [8, 16, 32], [1, 2, 4], 0)
-                    bf16_kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [2, 0], [4, 0], [0, 4]], [[8, 0], [16, 0], [32, 0], [0, 8], [0, 16], [0, 32]], [[0, 1], [0, 2]])
-                elif BLOCK_DPE >= 32 and BLOCK_N >= 128:
-                    bf16_kpe_offset_bases: gl.constexpr = make_offset_bases(16, [8, 16, 32, 64], [1, 2, 4], 0)
-                    bf16_kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [2, 0], [0, 4], [0, 64]], [[4, 0], [8, 0], [16, 0], [0, 8], [0, 16], [0, 32]], [[0, 1], [0, 2]])
                 else:
-                    bf16_kpe_offset_bases: gl.constexpr = make_offset_bases(16, [8, 16, 32], [1, 2, 4], 0)
-                    bf16_kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [2, 0], [0, 4]], [[4, 0], [8, 0], [16, 0], [0, 8], [0, 16], [0, 32]], [[0, 1], [0, 2]])
+                    bf16_kpe_offset_bases: gl.constexpr = make_fp8_extend_kpe_offset_bases(num_warps, BLOCK_DPE, BLOCK_N)
+                    bf16_kpe_async_layout: gl.constexpr = make_fp8_extend_kpe_dll(num_warps, BLOCK_DPE, BLOCK_N)
 
-                # FP8 prefix smem: 1024-byte interval for 128-bit direct-to-LDS
+                # FP8 prefix SMEM: 1024-byte interval for 128-bit direct-to-LDS.
                 fp8_kt_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], kt_offset_bases, [[1024, ASYNC_PAD_K], [2048, 32]])
                 fp8_v_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], v_offset_bases, [[1024, ASYNC_PAD_V], [2048, 32]])
-                # BF16 extend smem: standard 512-byte interval, using BF16 offset bases
-                # When EXT_BLOCK_N != BLOCK_N, define separate extend layouts
+                # BF16 extend SMEM: standard 512-byte interval; extend tile may
+                # differ from prefix tile, in which case EXT-specific factories.
                 if EXT_BLOCK_N == BLOCK_N:
                     ext_kt_offset_bases: gl.constexpr = bf16_kt_offset_bases
                     ext_kt_async_layout: gl.constexpr = bf16_kt_async_layout
@@ -317,18 +335,10 @@ def gluon_extend_attn_fwd(
                     ext_kpe_offset_bases: gl.constexpr = bf16_kpe_offset_bases
                     ext_kpe_async_layout: gl.constexpr = bf16_kpe_async_layout
                 else:
-                    if BLOCK_DMODEL >= 256:
-                        ext_kt_offset_bases: gl.constexpr = make_offset_bases(128, [16, 32], [1, 2, 4, 8], 0)
-                        ext_kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, EXT_BLOCK_N], [[1, 0], [2, 0], [4, 0], [128, 0], [0, 4], [0, 8]], [[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]], [[0, 1], [0, 2]])
-                    else:
-                        ext_kt_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32], [1, 2, 4, 8], 0)
-                        ext_kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, EXT_BLOCK_N], [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]], [[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]], [[0, 1], [0, 2]])
-                    if BLOCK_DV >= 256:
-                        ext_v_offset_bases: gl.constexpr = make_offset_bases(128, [16, 32], [1, 2, 4, 8], 1)
-                        ext_v_async_layout: gl.constexpr = make_dll([EXT_BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [0, 128], [4, 0], [8, 0]], [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]], [[1, 0], [2, 0]])
-                    else:
-                        ext_v_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32], [1, 2, 4, 8], 1)
-                        ext_v_async_layout: gl.constexpr = make_dll([EXT_BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]], [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]], [[1, 0], [2, 0]])
+                    ext_kt_offset_bases: gl.constexpr = make_ext_kt_offset_bases(num_warps, BLOCK_DMODEL, EXT_BLOCK_N)
+                    ext_kt_async_layout: gl.constexpr = make_ext_kt_dll(num_warps, BLOCK_DMODEL, EXT_BLOCK_N)
+                    ext_v_offset_bases: gl.constexpr = make_ext_v_offset_bases(num_warps, BLOCK_DV, EXT_BLOCK_N)
+                    ext_v_async_layout: gl.constexpr = make_ext_v_dll(num_warps, BLOCK_DV, EXT_BLOCK_N)
                     ext_kpe_offset_bases: gl.constexpr = bf16_kpe_offset_bases
                     ext_kpe_async_layout: gl.constexpr = bf16_kpe_async_layout
 
@@ -352,18 +362,8 @@ def gluon_extend_attn_fwd(
                 )
 
                 if ASYNC_KPE:
-                    if BLOCK_DPE >= 64 and BLOCK_N >= 128:
-                        kpe_offset_bases: gl.constexpr = make_offset_bases(32, [4, 8, 16, 32], [1, 2, 64], 0)
-                        kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [2, 0], [4, 0], [32, 0], [0, 64]], [[0, 4], [0, 8], [0, 16], [0, 32], [8, 0], [16, 0]], [[0, 1], [0, 2]])
-                    elif BLOCK_DPE >= 64:
-                        kpe_offset_bases: gl.constexpr = make_offset_bases(32, [4, 8, 16], [1, 2, 32], 0)
-                        kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [2, 0], [4, 0], [0, 32]], [[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]], [[0, 1], [0, 2]])
-                    elif BLOCK_DPE >= 32:
-                        kpe_offset_bases: gl.constexpr = make_offset_bases(16, [16, 32], [1, 2, 4, 8], 0)
-                        kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [2, 0], [0, 4]], [[4, 0], [8, 0], [16, 0], [0, 8], [0, 16], [0, 32]], [[0, 1], [0, 2]])
-                    else:
-                        kpe_offset_bases: gl.constexpr = make_offset_bases(8, [16, 32], [1, 2, 4, 8], 0)
-                        kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [0, 4]], [[2, 0], [4, 0], [8, 0], [0, 8], [0, 16], [0, 32]], [[0, 1], [0, 2]])
+                    kpe_offset_bases: gl.constexpr = make_fp8_kpe_offset_bases(num_warps, BLOCK_DPE, BLOCK_N)
+                    kpe_async_layout: gl.constexpr = make_fp8_kpe_dll(num_warps, BLOCK_DPE, BLOCK_N)
                     fp8_kpe_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DPE, BLOCK_N], kpe_offset_bases, [[1024, ASYNC_PAD_K], [2048, 32]])
                     kpe_smem = gl.allocate_shared_memory(
                         PFX_SMEM_TY,
@@ -387,11 +387,19 @@ def gluon_extend_attn_fwd(
                 fp8_qpe_dot = gl.convert_layout(qpe.to(tl.float8e4nv), fp8_q_dot_layout)
                 q_dot = gl.convert_layout(q, q_dot_layout)
 
-                # prefix phase uses FP8 dot layouts for native FP8 MFMA
+                # prefix phase uses FP8 dot layouts for native FP8 MFMA.
+                # Basic path (IS_PERSISTENT=False) splits into unmasked bulk
+                # + masked tail; persistent keeps the straight pattern to
+                # avoid the split-K re-partition regression (see BF16 kernel).
                 if pfx_seq_len > 0:
-                    n_prefix_blocks = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
+                    if IS_PERSISTENT:
+                        pfx_full_len = pfx_seq_len
+                        n_full_prefix = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
+                    else:
+                        pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
+                        n_full_prefix = pfx_seq_len // BLOCK_N
                     n_extend_est = (seq_len_extend + BLOCK_N - 1) // BLOCK_N
-                    use_pipe_prefix = n_prefix_blocks >= NUM_STAGES
+                    use_pipe_prefix = n_full_prefix >= NUM_STAGES
                     if LOGIT_CAP > 0:
                         use_pipe_prefix = use_pipe_prefix and (n_extend_est < NUM_STAGES)
                     if use_pipe_prefix:
@@ -406,7 +414,7 @@ def gluon_extend_attn_fwd(
                             kv_indices,
                             pfx_kv_start,
                             cur_kv_head,
-                            pfx_seq_len,
+                            pfx_full_len,
                             stride_buf_kbs,
                             stride_buf_kh,
                             stride_buf_vbs,
@@ -494,6 +502,56 @@ def gluon_extend_attn_fwd(
                             mma_layout,
                             mma_offs_n_col,
                             V_PRELOAD=V_PRELOAD,
+                        )
+                    if use_pipe_prefix and pfx_seq_len > pfx_full_len:
+                        acc, l_i, m_i = attn_fwd_inner_prefix_short(
+                            acc,
+                            l_i,
+                            m_i,
+                            fp8_q_dot,
+                            fp8_qpe_dot,
+                            K_Buffer,
+                            V_Buffer,
+                            kv_indices,
+                            pfx_kv_start,
+                            cur_kv_head,
+                            pfx_seq_len,
+                            stride_buf_kbs,
+                            stride_buf_kh,
+                            stride_buf_vbs,
+                            stride_buf_vh,
+                            kt_smem,
+                            v_smem,
+                            qk_scale,
+                            LOGIT_CAP,
+                            xai_temperature_reg,
+                            XAI_TEMPERATURE_LEN,
+                            pfx_q_abs_pos,
+                            SLIDING_WINDOW_SIZE,
+                            Mask,
+                            pfx_mask_base,
+                            mask_row_stride,
+                            q_extend_offs,
+                            USE_CUSTOM_MASK,
+                            SKIP_PREFIX_CUSTOM_MASK,
+                            ENABLE_PREFIX_UNMASKED,
+                            BLOCK_M,
+                            BLOCK_N,
+                            BLOCK_DMODEL,
+                            ACTUAL_BLOCK_DMODEL,
+                            BLOCK_DPE,
+                            ACTUAL_BLOCK_DPE,
+                            BLOCK_DV,
+                            ACTUAL_BLOCK_DV,
+                            kt_async_layout,
+                            v_async_layout,
+                            fp8_kt_dot_layout,
+                            fp8_p_dot_layout,
+                            fp8_v_dot_layout,
+                            mma_layout,
+                            mma_offs_n_col,
+                            V_PRELOAD=V_PRELOAD,
+                            block_start=n_full_prefix,
                         )
 
                 # Transition FP8 prefix smem -> BF16 extend smem
@@ -1003,35 +1061,22 @@ def gluon_extend_attn_fwd(
             # 8-warp DMA path
 
             if BLOCK_DMODEL >= 128:
-                if BLOCK_DMODEL >= 256:
-                    kt_offset_bases: gl.constexpr = make_offset_bases(128, [16], [1, 2, 4, 8], 0)
-                    kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, BLOCK_N], [[1, 0], [2, 0], [4, 0], [0, 8]], [[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16], ], [[0, 1], [0, 2], [0, 4]])
-                    if BLOCK_DV >= 256:
-                        v_offset_bases: gl.constexpr = make_offset_bases(128, [16], [1, 2, 4, 8], 1)
-                        v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [8, 0]], [[0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [16, 0], ], [[1, 0], [2, 0], [4, 0]])
-                    else:
-                        v_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32], [1, 2, 4, 8], 1)
-                        v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [8, 0]], [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]], [[1, 0], [2, 0], [4, 0]])
-                else:
-                    if BLOCK_N >= 128:
-                        kt_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32, 64], [1, 2, 4, 8], 0)
-                        v_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32, 64], [1, 2, 4, 8], 1)
-                        kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, BLOCK_N], [[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]], [[16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 64]], [[0, 1], [0, 2], [0, 4]])
-                        v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [0, 8], [8, 0]], [[0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0]], [[1, 0], [2, 0], [4, 0]])
-                    else:
-                        kt_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32], [1, 2, 4, 8], 0)
-                        v_offset_bases: gl.constexpr = make_offset_bases(64, [16, 32], [1, 2, 4, 8], 1)
-                        kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, BLOCK_N], [[1, 0], [2, 0], [4, 0], [8, 0]], [[16, 0], [32, 0], [64, 0], [0, 1], [0, 2], [0, 4]], [[0, 8], [0, 16], [0, 32]])
-                        v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [0, 8]], [[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]], [[8, 0], [16, 0], [32, 0]])
+                # Layouts from _common factory (FP8 prefix + BF16 extend).
+                kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
+                kt_async_layout: gl.constexpr = make_fp8_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+                v_offset_bases: gl.constexpr = make_fp8_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
+                v_async_layout: gl.constexpr = make_fp8_v_dll(num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N)
 
-                # FP8 prefix smem: 1024-byte interval for 128-bit direct-to-LDS
+                # BF16 extend: shares FP8 offset-bases ladder; DLL differs.
+                bf16_kt_offset_bases: gl.constexpr = kt_offset_bases
+                bf16_kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+                bf16_v_offset_bases: gl.constexpr = v_offset_bases
+                bf16_v_async_layout: gl.constexpr = make_fp8_extend_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+
+                # FP8 prefix smem: 1024-byte interval for 128-bit direct-to-LDS.
                 fp8_kt_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], kt_offset_bases, [[1024, ASYNC_PAD_K], [2048, 32]])
                 fp8_v_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], v_offset_bases, [[1024, ASYNC_PAD_V], [2048, 32]])
-                bf16_kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
-                bf16_kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
-                bf16_v_offset_bases: gl.constexpr = make_fp8_bf16_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
-                bf16_v_async_layout: gl.constexpr = make_fp8_bf16_v_dll(num_warps, BLOCK_DV, BLOCK_N)
-                # BF16 extend smem: standard 512-byte interval, using BF16 offset bases
+                # BF16 extend smem: standard 512-byte interval.
                 bf16_kt_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], bf16_kt_offset_bases, [[512, ASYNC_PAD_K]])
                 bf16_v_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], bf16_v_offset_bases, [[512, ASYNC_PAD_V]])
                 if BLOCK_DPE == 0:
@@ -1055,15 +1100,8 @@ def gluon_extend_attn_fwd(
                 )
 
                 if ASYNC_KPE:
-                    if BLOCK_DPE >= 64:
-                        kpe_offset_bases: gl.constexpr = make_offset_bases(32, [4, 8, 16], [1, 2, 32], 0)
-                        kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [2, 0], [4, 0]], [[8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16]], [[0, 1], [0, 2], [0, 32]])
-                    elif BLOCK_DPE >= 32:
-                        kpe_offset_bases: gl.constexpr = make_offset_bases(16, [4, 8, 16], [1, 2, 32], 0)
-                        kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0], [2, 0]], [[4, 0], [8, 0], [16, 0], [0, 4], [0, 8], [0, 16]], [[0, 1], [0, 2], [0, 32]])
-                    else:
-                        kpe_offset_bases: gl.constexpr = make_offset_bases(8, [4, 8, 16], [1, 2, 32], 0)
-                        kpe_async_layout: gl.constexpr = make_dll([BLOCK_DPE, BLOCK_N], [[1, 0]], [[2, 0], [4, 0], [8, 0], [0, 4], [0, 8], [0, 16]], [[0, 1], [0, 2], [0, 32]])
+                    kpe_offset_bases: gl.constexpr = make_fp8_kpe_offset_bases(num_warps, BLOCK_DPE, BLOCK_N)
+                    kpe_async_layout: gl.constexpr = make_fp8_kpe_dll(num_warps, BLOCK_DPE, BLOCK_N)
                     fp8_kpe_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DPE, BLOCK_N], kpe_offset_bases, [[1024, ASYNC_PAD_K], [2048, 32]])
                     kpe_smem = gl.allocate_shared_memory(
                         PFX_SMEM_TY,
@@ -1087,9 +1125,16 @@ def gluon_extend_attn_fwd(
                 fp8_qpe_dot = gl.convert_layout(qpe.to(tl.float8e4nv), fp8_q_dot_layout)
                 q_dot = gl.convert_layout(q, q_dot_layout)
 
-                # prefix dispatch -- FP8 dot layouts for native FP8 MFMA
-                n_prefix_blocks = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
-                if n_prefix_blocks >= NUM_STAGES:
+                # prefix dispatch -- FP8 dot layouts for native FP8 MFMA.
+                # Basic path splits unmasked bulk + masked tail; persistent
+                # path keeps the straight pattern (see FP8 site 1 comment).
+                if IS_PERSISTENT:
+                    pfx_full_len = pfx_seq_len
+                    n_full_prefix = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
+                else:
+                    pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
+                    n_full_prefix = pfx_seq_len // BLOCK_N
+                if n_full_prefix >= NUM_STAGES:
                     if NUM_STAGES >= 3:
                         acc, l_i, m_i = attn_fwd_inner_prefix_pipelined_scalar_mask(
                             acc,
@@ -1102,7 +1147,7 @@ def gluon_extend_attn_fwd(
                             kv_indices,
                             pfx_kv_start,
                             cur_kv_head,
-                            pfx_seq_len,
+                            pfx_full_len,
                             stride_buf_kbs,
                             stride_buf_kh,
                             stride_buf_vbs,
@@ -1154,7 +1199,7 @@ def gluon_extend_attn_fwd(
                             kv_indices,
                             pfx_kv_start,
                             cur_kv_head,
-                            pfx_seq_len,
+                            pfx_full_len,
                             stride_buf_kbs,
                             stride_buf_kh,
                             stride_buf_vbs,
@@ -1193,6 +1238,56 @@ def gluon_extend_attn_fwd(
                             mma_layout,
                             mma_offs_n_col,
                             ASYNC_KPE,
+                        )
+                    if pfx_seq_len > pfx_full_len:
+                        acc, l_i, m_i = attn_fwd_inner_prefix_short(
+                            acc,
+                            l_i,
+                            m_i,
+                            fp8_q_dot,
+                            fp8_qpe_dot,
+                            K_Buffer,
+                            V_Buffer,
+                            kv_indices,
+                            pfx_kv_start,
+                            cur_kv_head,
+                            pfx_seq_len,
+                            stride_buf_kbs,
+                            stride_buf_kh,
+                            stride_buf_vbs,
+                            stride_buf_vh,
+                            kt_smem,
+                            v_smem,
+                            qk_scale,
+                            LOGIT_CAP,
+                            xai_temperature_reg,
+                            XAI_TEMPERATURE_LEN,
+                            pfx_q_abs_pos,
+                            SLIDING_WINDOW_SIZE,
+                            Mask,
+                            pfx_mask_base,
+                            mask_row_stride,
+                            q_extend_offs,
+                            USE_CUSTOM_MASK,
+                            SKIP_PREFIX_CUSTOM_MASK,
+                            ENABLE_PREFIX_UNMASKED,
+                            BLOCK_M,
+                            BLOCK_N,
+                            BLOCK_DMODEL,
+                            ACTUAL_BLOCK_DMODEL,
+                            BLOCK_DPE,
+                            ACTUAL_BLOCK_DPE,
+                            BLOCK_DV,
+                            ACTUAL_BLOCK_DV,
+                            kt_async_layout,
+                            v_async_layout,
+                            fp8_kt_dot_layout,
+                            fp8_p_dot_layout,
+                            fp8_v_dot_layout,
+                            mma_layout,
+                            mma_offs_n_col,
+                            V_PRELOAD=V_PRELOAD,
+                            block_start=n_full_prefix,
                         )
                 elif pfx_seq_len > 0:
                     acc, l_i, m_i = attn_fwd_inner_prefix_short(
@@ -1505,25 +1600,20 @@ def gluon_extend_attn_fwd(
                     )
 
             else:
-                # 8-warp BLOCK_DMODEL < 128
-                if BLOCK_N >= 128:
-                    kt_offset_bases: gl.constexpr = make_offset_bases(32, [16, 32, 64], [1, 2, 4, 8], 0)
-                    v_offset_bases: gl.constexpr = make_offset_bases(32, [16, 32, 64], [1, 2, 4, 8], 1)
-                    kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, BLOCK_N], [[1, 0], [2, 0], [4, 0], [0, 64]], [[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 1]], [[0, 2], [0, 4], [0, 8]])
-                    v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4], [64, 0]], [[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [1, 0]], [[2, 0], [4, 0], [8, 0]])
-                else:
-                    kt_offset_bases: gl.constexpr = make_offset_bases(32, [16, 32], [1, 2, 4, 8], 0)
-                    v_offset_bases: gl.constexpr = make_offset_bases(32, [16, 32], [1, 2, 4, 8], 1)
-                    kt_async_layout: gl.constexpr = make_dll([BLOCK_DMODEL, BLOCK_N], [[1, 0], [2, 0], [4, 0]], [[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 1]], [[0, 2], [0, 4], [0, 8]])
-                    v_async_layout: gl.constexpr = make_dll([BLOCK_N, BLOCK_DV], [[0, 1], [0, 2], [0, 4]], [[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [1, 0]], [[2, 0], [4, 0], [8, 0]])
+                # 8-warp BLOCK_DMODEL < 128 -- FP8 prefix layouts match BF16
+                # at D<128 (same 1/2-byte-per-register partition), so both the
+                # FP8 and BF16 DLLs come from the standard factories below.
+                kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
+                kt_async_layout: gl.constexpr = make_fp8_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+                v_offset_bases: gl.constexpr = make_fp8_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
+                v_async_layout: gl.constexpr = make_fp8_v_dll(num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N)
 
-                # FP8 prefix smem: 1024-byte interval for 128-bit direct-to-LDS
                 fp8_kt_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], kt_offset_bases, [[1024, ASYNC_PAD_K], [2048, 32]])
                 fp8_v_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], v_offset_bases, [[1024, ASYNC_PAD_V], [2048, 32]])
-                bf16_kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
+                bf16_kt_offset_bases: gl.constexpr = kt_offset_bases
                 bf16_kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
-                bf16_v_offset_bases: gl.constexpr = make_fp8_bf16_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
-                bf16_v_async_layout: gl.constexpr = make_fp8_bf16_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+                bf16_v_offset_bases: gl.constexpr = v_offset_bases
+                bf16_v_async_layout: gl.constexpr = make_fp8_extend_v_dll(num_warps, BLOCK_DV, BLOCK_N)
                 # BF16 extend smem: standard 512-byte interval, using BF16 offset bases
                 bf16_kt_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], bf16_kt_offset_bases, [[512, ASYNC_PAD_K]])
                 bf16_v_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], bf16_v_offset_bases, [[512, ASYNC_PAD_V]])
@@ -1559,9 +1649,16 @@ def gluon_extend_attn_fwd(
                 fp8_qpe_dot = gl.convert_layout(qpe.to(tl.float8e4nv), fp8_q_dot_layout)
                 q_dot = gl.convert_layout(q, q_dot_layout)
 
-                # prefix -- FP8 dot layouts for native FP8 MFMA
-                n_prefix_blocks = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
-                if n_prefix_blocks >= NUM_STAGES:
+                # prefix -- FP8 dot layouts for native FP8 MFMA.
+                # Basic path splits unmasked bulk + masked tail; persistent
+                # path keeps the straight pattern (see FP8 site 1 comment).
+                if IS_PERSISTENT:
+                    pfx_full_len = pfx_seq_len
+                    n_full_prefix = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
+                else:
+                    pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
+                    n_full_prefix = pfx_seq_len // BLOCK_N
+                if n_full_prefix >= NUM_STAGES:
                     acc, l_i, m_i = attn_fwd_inner_prefix_pipelined(
                         acc,
                         l_i,
@@ -1573,7 +1670,7 @@ def gluon_extend_attn_fwd(
                         kv_indices,
                         pfx_kv_start,
                         cur_kv_head,
-                        pfx_seq_len,
+                        pfx_full_len,
                         stride_buf_kbs,
                         stride_buf_kh,
                         stride_buf_vbs,
@@ -1661,6 +1758,56 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         V_PRELOAD=V_PRELOAD,
+                    )
+                if n_full_prefix >= NUM_STAGES and pfx_seq_len > pfx_full_len:
+                    acc, l_i, m_i = attn_fwd_inner_prefix_short(
+                        acc,
+                        l_i,
+                        m_i,
+                        fp8_q_dot,
+                        fp8_qpe_dot,
+                        K_Buffer,
+                        V_Buffer,
+                        kv_indices,
+                        pfx_kv_start,
+                        cur_kv_head,
+                        pfx_seq_len,
+                        stride_buf_kbs,
+                        stride_buf_kh,
+                        stride_buf_vbs,
+                        stride_buf_vh,
+                        kt_smem,
+                        v_smem,
+                        qk_scale,
+                        LOGIT_CAP,
+                        xai_temperature_reg,
+                        XAI_TEMPERATURE_LEN,
+                        pfx_q_abs_pos,
+                        SLIDING_WINDOW_SIZE,
+                        Mask,
+                        pfx_mask_base,
+                        mask_row_stride,
+                        q_extend_offs,
+                        USE_CUSTOM_MASK,
+                        SKIP_PREFIX_CUSTOM_MASK,
+                        ENABLE_PREFIX_UNMASKED,
+                        BLOCK_M,
+                        BLOCK_N,
+                        BLOCK_DMODEL,
+                        ACTUAL_BLOCK_DMODEL,
+                        BLOCK_DPE,
+                        ACTUAL_BLOCK_DPE,
+                        BLOCK_DV,
+                        ACTUAL_BLOCK_DV,
+                        kt_async_layout,
+                        v_async_layout,
+                        fp8_kt_dot_layout,
+                        fp8_p_dot_layout,
+                        fp8_v_dot_layout,
+                        mma_layout,
+                        mma_offs_n_col,
+                        V_PRELOAD=V_PRELOAD,
+                        block_start=n_full_prefix,
                     )
 
                 # After prefix, before extend - transition FP8 smem -> BF16 smem

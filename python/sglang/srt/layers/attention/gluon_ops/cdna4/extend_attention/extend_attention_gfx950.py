@@ -46,12 +46,12 @@ from ._launch_helpers import (
     _resolve_qk_split_dims,
     _ensure_dummy_mask_tensors,
 )
-from ._fp8_kv_extend_symmetric_gfx950 import (
+from ._kernel_fp8_gfx950 import (
     gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric_fp8,
 )
-from ._fp8_kv_extend_basic_gfx950 import (
-    gluon_extend_attn_fwd_basic as _gluon_extend_attn_fwd_fp8_basic,
-)
+# Unified FP8 kernel also serves the basic (non-persistent) fast-path via
+# IS_PERSISTENT=False.
+_gluon_extend_attn_fwd_fp8_basic = _gluon_extend_attn_fwd_symmetric_fp8
 
 _dummy_cm = None
 _dummy_mi = None
@@ -262,11 +262,13 @@ def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
 def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
     """FP8 twin of :func:`_make_fast_runner`.
 
-    The FP8 kernel signature carries extra constexprs
+    The FP8 unified kernel signature carries the FP8-specific constexprs
     (``SKIP_PREFIX_CUSTOM_MASK``, ``ENABLE_MASK_SPLIT``, ``BLOCK_DPE``/``DV``,
-    ``EXT_BLOCK_N``/``EXT_NUM_STAGES``, ``ASYNC_PAD_K``/``V``) so the arg list
-    is longer; order below matches the ``@gluon.jit`` definition in
-    ``_fp8_kv_extend_basic_gfx950.py``.
+    ``EXT_BLOCK_N``/``EXT_NUM_STAGES``, ``ASYNC_PAD_K``/``V``) plus the
+    persistent-superset runtime args (num_heads, n_m_tiles, total_valid_tiles,
+    total_programs, partial_out, partial_lse, tile_done) and constexprs
+    (IS_PERSISTENT, SPLIT_K, V_PRELOAD). With IS_PERSISTENT=False DCE drops
+    every access to the persistent-only args.
     """
     from triton.runtime import driver as _triton_driver
     from triton import knobs as _triton_knobs
@@ -328,6 +330,11 @@ def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
             sinks, HAS_SINK,
             LOGIT_CAP, XAI_TEMPERATURE_LEN, SLIDING_WINDOW_SIZE,
             v_scale,
+            # Persistent-path runtime args (DCE'd under IS_PERSISTENT=False).
+            0, 0, 0, 0,  # num_heads, n_m_tiles, total_valid_tiles, total_programs
+            _dummy_partial_out, _dummy_partial_lse, _dummy_tile_done,
+            # Persistent-path constexprs.
+            False, 1, False,  # IS_PERSISTENT, SPLIT_K, V_PRELOAD
         )
 
     return _fast_run_fp8
@@ -1259,6 +1266,18 @@ def gluon_extend_attention_fwd(
                 is_causal, sliding_window_size, logit_cap,
                 xai_temperature_len, sinks is not None, _cfg_for_log,
             )
+        # Both BF16 and FP8 unified kernels take the persistent-superset
+        # signature. IS_PERSISTENT=False collapses the outer tile loop to a
+        # single pass and DCE eliminates every access to the persistent-only
+        # runtime args, so integer zeros for scalars and 1-element module
+        # dummies for the pointer workspaces are sufficient. Persistent args
+        # go in via kwargs because the signature interleaves constexprs
+        # between the stride block and the persistent-only runtime block.
+        #
+        # BF16 has cum_tiles_per_batch / actual_batch_size / MAX_BATCH_LOG2 /
+        # TILE_MAP_MODE (persistent scheduling variants); FP8 does not need
+        # those because its persistent scheduler is simpler (modulo arith
+        # over total_programs).
         if _kv_is_fp8:
             _compiled = _kernel_fn.run(
                 q_extend, k_extend, v_extend, o_extend,
@@ -1266,16 +1285,14 @@ def gluon_extend_attention_fwd(
                 qo_indptr, kv_indptr, kv_indices,
                 _dummy_cm, _dummy_mi[: q_extend.shape[0] + 1], _wkvo,
                 *_frozen_scalars, *_frozen_strides,
+                num_heads=0, n_m_tiles=0,
+                total_valid_tiles=0, total_programs=0,
+                partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
+                tile_done=_dummy_tile_done,
+                IS_PERSISTENT=False, SPLIT_K=1, V_PRELOAD=False,
                 grid=_frozen_grid, **_frozen_kw,
             )
         else:
-            # BF16 unified kernel takes the persistent-superset signature.
-            # IS_PERSISTENT=False collapses the outer tile loop to 1 pass and
-            # DCE's every access to the persistent-only runtime args, so we
-            # pass integer zeros for scalar shapes and module-level dummy
-            # tensors for the pointer workspaces. Persistent runtime args are
-            # passed as kwargs because the kernel signature interleaves
-            # constexprs between the stride block and the persistent block.
             _compiled = _kernel_fn.run(
                 q_extend, k_extend, v_extend, o_extend,
                 k_buffer, v_buffer,
@@ -1570,6 +1587,10 @@ def gluon_extend_attention_fwd(
     } if _kv_is_fp8 else {}
 
     if _kv_is_fp8:
+        # FP8 unified kernel: persistent-superset signature; IS_PERSISTENT=False
+        # collapses to the basic 3D-grid body. Pass persistent runtime args as
+        # kwargs (signature interleaves constexprs between the stride block
+        # and the persistent-only runtime block).
         _kernel_fn.run(
             q_extend, k_extend, v_extend, o_extend,
             k_buffer, v_buffer,
@@ -1590,6 +1611,11 @@ def gluon_extend_attention_fwd(
             XAI_TEMPERATURE_LEN=xai_temperature_len,
             SLIDING_WINDOW_SIZE=sliding_window_size,
             v_scale=v_scale,
+            num_heads=0, n_m_tiles=0,
+            total_valid_tiles=0, total_programs=0,
+            partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
+            tile_done=_dummy_tile_done,
+            IS_PERSISTENT=False, SPLIT_K=1, V_PRELOAD=False,
             num_warps=num_warps, num_stages=1,
             waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
             matrix_instr_nonkdim=32,
