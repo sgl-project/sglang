@@ -45,6 +45,9 @@ from ._launch_helpers import (
     _get_num_CUs,
     _resolve_qk_split_dims,
     _ensure_dummy_mask_tensors,
+    _ensure_cum_tiles,
+    _effective_tile_map_mode,
+    _DEFAULT_MAX_BATCH_LOG2,
 )
 from ._kernel_fp8_gfx950 import (
     gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric_fp8,
@@ -716,6 +719,7 @@ def gluon_extend_attention_fwd(
     _force_use_persistent=None,
     _force_use_splitk=None,
     _force_block_n=None,
+    _force_prefix_mask_mode=None,
     _ck_v_preload=False,
     _mask_split_ext_threshold=1024,
     min_len_extend=None,
@@ -835,6 +839,7 @@ def gluon_extend_attention_fwd(
         and _force_num_warps is None
         and _force_num_stages is None
         and _force_waves_per_eu is None
+        and _force_prefix_mask_mode is None
         and not _cache_exclude_pfx_skew
         and not DEBUG.disable_cfg_cache
     )
@@ -1386,6 +1391,7 @@ def gluon_extend_attention_fwd(
             NUM_STAGES=_force_num_stages or 2,
             _force_waves_per_eu=_force_waves_per_eu,
             total_prefix_len=total_prefix_len,
+            _force_prefix_mask_mode=_force_prefix_mask_mode,
         )
         return
 
@@ -1423,6 +1429,7 @@ def gluon_extend_attention_fwd(
             _force_block_n=_force_block_n,
             min_len_extend=min_len_extend,
             total_prefix_len=total_prefix_len,
+            _force_prefix_mask_mode=_force_prefix_mask_mode,
         )
         return
 
@@ -1616,6 +1623,7 @@ def gluon_extend_attention_fwd(
             partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
             tile_done=_dummy_tile_done,
             IS_PERSISTENT=False, SPLIT_K=1, V_PRELOAD=False,
+            PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
             num_warps=num_warps, num_stages=1,
             waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
             matrix_instr_nonkdim=32,
@@ -1652,6 +1660,7 @@ def gluon_extend_attention_fwd(
             tile_done=_dummy_tile_done,
             cum_tiles_per_batch=_dummy_cum_tiles, actual_batch_size=0,
             IS_PERSISTENT=False, SPLIT_K=1, MAX_BATCH_LOG2=8, TILE_MAP_MODE=0,
+            PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
             num_warps=num_warps, num_stages=1,
             waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
             matrix_instr_nonkdim=32,
@@ -1697,6 +1706,8 @@ def _launch_persistent_fp8(
     min_len_extend=None,
     SPLIT_K=1,
     total_prefix_len=None,
+    _force_prefix_mask_mode=None,
+    _force_tile_map_mode=1,  # WCA inline scan (fast, no CPU sync)
 ):
     """Launch the FP8 persistent-CTA kernel, managing split-K workspace
     and the dummy mask tensors when ``USE_CUSTOM_MASK`` is False."""
@@ -1768,7 +1779,26 @@ def _launch_persistent_fp8(
 
     device = q_extend.device
     n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
-    total_output_tiles = batch_size * head_num * n_m_tiles
+
+    # Tight sync-free upper bound on sum(ceil(ext_i / BM)). For heterogeneous
+    # batches this is 3-4x smaller than ``batch * ceil(max_ext/BM)`` -- cuts
+    # WCA empty-slot scans proportionally without a .item() sync. Mirrors the
+    # BF16 launcher (see ``_launch_helpers._launch_persistent``).
+    total_extend_rows = q_extend.shape[0]
+    total_output_tiles_tight = (
+        (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
+    ) * head_num
+
+    TILE_MAP_MODE = _effective_tile_map_mode(_force_tile_map_mode)
+    if TILE_MAP_MODE == 1:
+        # WCA inline-scan: tolerates empty slots; tight bound keeps the
+        # grid small enough that the linear O(B) prologue stays cheap.
+        total_output_tiles = total_output_tiles_tight
+        cum_tiles_per_batch = _ensure_splitk_dummy(device)
+    else:
+        total_output_tiles = total_output_tiles_tight
+        cum_tiles_per_batch = _ensure_cum_tiles(qo_indptr, BLOCK_M, head_num, batch_size)
+
     if total_output_tiles == 0:
         return
 
@@ -1857,9 +1887,14 @@ def _launch_persistent_fp8(
         partial_out=partial_out,
         partial_lse=partial_lse,
         tile_done=tile_done,
+        cum_tiles_per_batch=cum_tiles_per_batch,
+        actual_batch_size=batch_size,
         IS_PERSISTENT=True,
         SPLIT_K=SPLIT_K,
         V_PRELOAD=False,
+        MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
+        TILE_MAP_MODE=TILE_MAP_MODE,
+        PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
         num_warps=num_warps,
         num_stages=1,
         waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
@@ -1878,6 +1913,8 @@ def _launch_splitk_fp8(
     BLOCK_M, BLOCK_N, num_warps, NUM_STAGES,
     _force_waves_per_eu=None,
     total_prefix_len=None,
+    _force_prefix_mask_mode=None,
+    _force_tile_map_mode=1,  # WCA inline scan (fast, no CPU sync)
 ):
     """Pick ``SPLIT_K`` and delegate to ``_launch_persistent_fp8``; falls
     back to SPLIT_K=1 when the tiles-per-CU / pfx-per-BN heuristics
@@ -1917,6 +1954,8 @@ def _launch_splitk_fp8(
             xai_temperature_len=xai_temperature_len,
             sliding_window_size=sliding_window_size,
             window_kv_offsets=window_kv_offsets,
+            _force_prefix_mask_mode=_force_prefix_mask_mode,
+            _force_tile_map_mode=_force_tile_map_mode,
         )
         return
 
@@ -1950,4 +1989,6 @@ def _launch_splitk_fp8(
         _force_num_stages=NUM_STAGES,
         _force_waves_per_eu=_force_waves_per_eu,
         SPLIT_K=SPLIT_K,
+        _force_prefix_mask_mode=_force_prefix_mask_mode,
+        _force_tile_map_mode=_force_tile_map_mode,
     )

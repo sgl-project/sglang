@@ -88,6 +88,7 @@ def gluon_extend_attn_fwd(
     SPLIT_K: gl.constexpr = 1,  #
     MAX_BATCH_LOG2: gl.constexpr = 8,  # max batches supported by binary search (=256) (mode 0)
     TILE_MAP_MODE: gl.constexpr = 0,  # 0=binary search on cum_tiles, 1=WCA inline linear scan
+    PREFIX_MASK_MODE: gl.constexpr = 0,  # 0=auto (scalar on persistent, pipelined on basic), 1=force scalar_mask, 2=force pipelined
 ):
     # Experimental flags that are always False in production after tuning.
     # Kept as constexprs here so dead-code elimination removes the unused
@@ -1042,7 +1043,15 @@ def gluon_extend_attn_fwd(
                     pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
                     n_full_prefix = pfx_seq_len // BLOCK_N
                 if n_full_prefix >= NUM_STAGES:
-                    if NUM_STAGES >= 3:
+                    # PREFIX_MASK_MODE: 0=auto, 1=force scalar_mask, 2=force pipelined.
+                    # Auto picks scalar_mask on persistent path (geomean 0.82x,
+                    # up to 0.47x on big-ragged D=128) and pipelined on basic
+                    # (scalar and pipelined are within 0.3% on basic -- bench
+                    # bench_scalar_mask.py Apr 2026).
+                    _use_scalar_mask: gl.constexpr = (PREFIX_MASK_MODE == 1) or (
+                        PREFIX_MASK_MODE == 0 and IS_PERSISTENT
+                    )
+                    if _use_scalar_mask:
                         acc, l_i, m_i = attn_fwd_inner_prefix_pipelined_scalar_mask(
                             acc,
                             l_i,

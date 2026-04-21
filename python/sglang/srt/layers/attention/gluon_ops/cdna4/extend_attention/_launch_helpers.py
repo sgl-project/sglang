@@ -60,6 +60,7 @@ def _make_persistent_fast_runner(compiled_kernel, frozen_kw: dict):
     SPLIT_K = frozen_kw['SPLIT_K']
     MAX_BATCH_LOG2 = frozen_kw['MAX_BATCH_LOG2']
     TILE_MAP_MODE = frozen_kw['TILE_MAP_MODE']
+    PREFIX_MASK_MODE = frozen_kw['PREFIX_MASK_MODE']
 
     def _fast_run(
         q, k, v, o, kb, vb,
@@ -96,7 +97,7 @@ def _make_persistent_fast_runner(compiled_kernel, frozen_kw: dict):
             total_valid_tiles, total_programs,
             partial_out, partial_lse, tile_done,
             cum_tiles_per_batch, actual_batch_size,
-            IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2, TILE_MAP_MODE,
+            IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2, TILE_MAP_MODE, PREFIX_MASK_MODE,
         )
 
     return _fast_run
@@ -127,6 +128,7 @@ def _persistent_cache_key(Lq, frozen_kw: dict, dtypes: tuple = ()) -> tuple:
         frozen_kw['SPLIT_K'],
         frozen_kw['MAX_BATCH_LOG2'],
         frozen_kw['TILE_MAP_MODE'],
+        frozen_kw['PREFIX_MASK_MODE'],
         frozen_kw['_num_warps'],
         dtypes,
     )
@@ -371,6 +373,7 @@ def _launch_persistent(
     min_len_extend=None,
     total_prefix_len=None,
     _force_tile_map_mode=1,  # WCA inline scan (fast, no CPU sync)
+    _force_prefix_mask_mode=None,
 ):
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
@@ -549,6 +552,7 @@ def _launch_persistent(
         'SPLIT_K': SPLIT_K,
         'MAX_BATCH_LOG2': _DEFAULT_MAX_BATCH_LOG2,
         'TILE_MAP_MODE': TILE_MAP_MODE,
+        'PREFIX_MASK_MODE': _force_prefix_mask_mode or 0,
         '_num_warps': num_warps,
     }
     _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
@@ -619,6 +623,7 @@ def _launch_persistent(
         SPLIT_K=SPLIT_K,
         MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
         TILE_MAP_MODE=TILE_MAP_MODE,
+        PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
         grid=grid,
         num_warps=num_warps,
         num_stages=1,
@@ -649,6 +654,7 @@ def _launch_splitk(
     _force_waves_per_eu=None,
     total_prefix_len=None,
     _force_tile_map_mode=1,  # WCA inline scan (fast, no CPU sync)
+    _force_prefix_mask_mode=None,
 ):
     """Split-K persistent kernel: partitions prefix across CTAs, then reduces."""
     head_num = q_extend.shape[1]
@@ -684,6 +690,7 @@ def _launch_splitk(
             sliding_window_size=sliding_window_size,
             window_kv_offsets=window_kv_offsets,
             _force_tile_map_mode=_force_tile_map_mode,
+            _force_prefix_mask_mode=_force_prefix_mask_mode,
         )
         return
 
@@ -755,6 +762,7 @@ def _launch_splitk(
         'SPLIT_K': SPLIT_K,
         'MAX_BATCH_LOG2': _DEFAULT_MAX_BATCH_LOG2,
         'TILE_MAP_MODE': TILE_MAP_MODE,
+        'PREFIX_MASK_MODE': _force_prefix_mask_mode or 0,
         '_num_warps': num_warps,
     }
     _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
@@ -809,6 +817,7 @@ def _launch_splitk(
         IS_PERSISTENT=True, SPLIT_K=SPLIT_K,
         MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
         TILE_MAP_MODE=TILE_MAP_MODE,
+        PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
         grid=grid,
         num_warps=num_warps, num_stages=1,
         waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,

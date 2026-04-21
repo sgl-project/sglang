@@ -92,9 +92,14 @@ def gluon_extend_attn_fwd(
     partial_out,  #       workspace for split-K partials
     partial_lse,  #       workspace for split-K LSE
     tile_done,  #         int32 atomic counter per output tile (split-K)
+    cum_tiles_per_batch,  # int32 ptr of size batch_size+1, prefix-sum of ceil(ext_lens/BLOCK_M) (mode 0)
+    actual_batch_size,  # int32 scalar -- batch count (scan bound / binary-search upper)
     IS_PERSISTENT: gl.constexpr = False,  #
     SPLIT_K: gl.constexpr = 1,  #
     V_PRELOAD: gl.constexpr = False,  #
+    MAX_BATCH_LOG2: gl.constexpr = 8,  # max batches supported by binary search (=256) (mode 0)
+    TILE_MAP_MODE: gl.constexpr = 1,  # 0=binary search on cum_tiles, 1=WCA inline linear scan (default)
+    PREFIX_MASK_MODE: gl.constexpr = 0,  # 0=auto (scalar on persistent, pipelined on basic), 1=force scalar_mask, 2=force pipelined
 ):
     num_warps: gl.constexpr = gl.num_warps()
     PFX_SMEM_TY: gl.constexpr = K_Buffer.dtype.element_ty
@@ -154,13 +159,26 @@ def gluon_extend_attn_fwd(
     USE_SERIAL: gl.constexpr = num_warps < 8
     qk_scale = sm_scale * LOG2E
 
+    # Unified loop: basic = 1 iteration (exits via return), persistent = CTA tile loop
     if IS_PERSISTENT:
         cta_id = gl.program_id(0)
         tile_idx = cta_id
+        if TILE_MAP_MODE == 1:
+            # WCA: Python computed the exact total_valid_tiles via one CPU sync on
+            # qo_indptr. The kernel honors that count directly. No cum_tiles tensor
+            # read needed here -- the inline scan (below) walks qo_indptr per tile.
+            actual_total_valid_tiles = total_valid_tiles
+        else:
+            # cum_tiles mode: derive exact count from the Python-prepped prefix sum
+            # (no CPU sync; the tensor is built on device via torch.cumsum).
+            _actual_total_seq_tiles = gl.load(cum_tiles_per_batch + actual_batch_size).to(tl.int32)
+            actual_total_valid_tiles = num_heads * _actual_total_seq_tiles * SPLIT_K
     else:
         tile_idx = 0
+        actual_total_valid_tiles = 1  # unused in non-persistent branch
 
-    while tile_idx < (total_valid_tiles if IS_PERSISTENT else 1):
+    while tile_idx < (actual_total_valid_tiles if IS_PERSISTENT else 1):
+        # Per-tile scheduling
         if not IS_PERSISTENT:
             cur_seq = gl.program_id(0)
             cur_head = gl.program_id(1)
@@ -182,22 +200,75 @@ def gluon_extend_attn_fwd(
                 output_tile = tile_idx
                 k_split_id = 0
 
-            tiles_per_seq = num_heads * n_m_tiles
-            cur_seq = output_tile // tiles_per_seq
-            rem = output_tile % tiles_per_seq
-            cur_head = rem // n_m_tiles
-            cur_block_m = rem % n_m_tiles
-            cur_kv_head = cur_head // kv_group_num
+            if TILE_MAP_MODE == 1:
+                # WCA: inline serial scan over qo_indptr to find the (seq, head,
+                # block_m) for this output_tile. Grid is sized to the upper bound
+                # ``batch_size * num_heads * max_n_m_tiles`` (sync-free launch), so
+                # some CTAs may pop an over-provisioned slot for which no seq
+                # has enough tiles. In that case the scan reaches cur_seq ==
+                # actual_batch_size with found=0 and we mark the tile invalid.
+                # Linear O(B) scan; trivial for typical serving batches (B<=32).
+                cur_seq = 0
+                cum_tiles = 0
+                found = 0
+                while (cur_seq < actual_batch_size) & (found == 0):
+                    _s_start = gl.load(qo_indptr + cur_seq)
+                    _s_end = gl.load(qo_indptr + cur_seq + 1)
+                    s_ext = (_s_end - _s_start).to(tl.int32)
+                    s_tiles = tl.maximum((s_ext + BLOCK_M - 1) // BLOCK_M, 0) * num_heads
+                    next_cum = cum_tiles + s_tiles
+                    if next_cum > output_tile:
+                        found = 1
+                    else:
+                        cum_tiles = next_cum
+                        cur_seq = cur_seq + 1
+                is_valid_tile = found == 1
+                # Clamp cur_seq to [0, actual_batch_size-1] so the subsequent
+                # qo_indptr / kv_indptr loads stay in bounds for invalid tiles.
+                cur_seq = tl.minimum(cur_seq, actual_batch_size - 1)
+                local_tile = output_tile - cum_tiles
+                seq_ext_len = (gl.load(qo_indptr + cur_seq + 1) - gl.load(qo_indptr + cur_seq)).to(tl.int32)
+                tiles_per_head = tl.maximum((seq_ext_len + BLOCK_M - 1) // BLOCK_M, 1)
+                cur_head = local_tile // tiles_per_head
+                cur_block_m = local_tile % tiles_per_head
+                cur_kv_head = cur_head // kv_group_num
 
-            cur_seq_q_start_idx = gl.load(qo_indptr + cur_seq)
-            seq_len_extend = (gl.load(qo_indptr + cur_seq + 1) - cur_seq_q_start_idx).to(tl.int32)
+                cur_seq_q_start_idx = gl.load(qo_indptr + cur_seq)
+                seq_len_extend = tl.where(is_valid_tile, seq_ext_len, 0)
 
-            is_valid_tile = cur_block_m * BLOCK_M < seq_len_extend
-            seq_len_extend = tl.where(is_valid_tile, seq_len_extend, 0)
+                cur_seq_kv_start_idx = gl.load(kv_indptr + cur_seq)
+                seq_len_prefix_raw = (gl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx).to(tl.int32)
+                seq_len_prefix = tl.where(is_valid_tile, seq_len_prefix_raw, 0)
+            else:
+                # cum_tiles binary search: MAX_BATCH_LOG2-step static loop over
+                # the GPU-resident prefix-sum tensor, no CPU sync required.
+                cur_seq = 0
+                for _sb in gl.static_range(MAX_BATCH_LOG2):
+                    step = 1 << (MAX_BATCH_LOG2 - 1 - _sb)
+                    _mid = cur_seq + step
+                    if _mid <= actual_batch_size:
+                        _cum_mid = gl.load(cum_tiles_per_batch + _mid).to(tl.int32)
+                        if num_heads * _cum_mid <= output_tile:
+                            cur_seq = _mid
 
-            cur_seq_kv_start_idx = gl.load(kv_indptr + cur_seq)
-            seq_len_prefix_raw = (gl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx).to(tl.int32)
-            seq_len_prefix = tl.where(is_valid_tile, seq_len_prefix_raw, 0)
+                _cum_cur = gl.load(cum_tiles_per_batch + cur_seq).to(tl.int32)
+                _cum_next = gl.load(cum_tiles_per_batch + cur_seq + 1).to(tl.int32)
+                tiles_this_seq = _cum_next - _cum_cur
+                base_tile = num_heads * _cum_cur
+                local = output_tile - base_tile
+                cur_head = local // tiles_this_seq
+                cur_block_m = local % tiles_this_seq
+                cur_kv_head = cur_head // kv_group_num
+
+                cur_seq_q_start_idx = gl.load(qo_indptr + cur_seq)
+                seq_len_extend = (gl.load(qo_indptr + cur_seq + 1) - cur_seq_q_start_idx).to(tl.int32)
+
+                is_valid_tile = cur_block_m * BLOCK_M < seq_len_extend
+                seq_len_extend = tl.where(is_valid_tile, seq_len_extend, 0)
+
+                cur_seq_kv_start_idx = gl.load(kv_indptr + cur_seq)
+                seq_len_prefix_raw = (gl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx).to(tl.int32)
+                seq_len_prefix = tl.where(is_valid_tile, seq_len_prefix_raw, 0)
 
         if USE_CUSTOM_MASK:
             mask_base_idx = gl.load(MaskIndptr + cur_seq).to(tl.int64)
@@ -1135,7 +1206,14 @@ def gluon_extend_attn_fwd(
                     pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
                     n_full_prefix = pfx_seq_len // BLOCK_N
                 if n_full_prefix >= NUM_STAGES:
-                    if NUM_STAGES >= 3:
+                    # PREFIX_MASK_MODE: 0=auto, 1=force scalar_mask, 2=force pipelined.
+                    # Auto picks scalar on persistent (parity-to-wins with FP8
+                    # per bench_scalar_mask.py --fp8 Apr 2026), pipelined on
+                    # basic (near-identical but pipelined has a tiny edge).
+                    _use_scalar_mask: gl.constexpr = (PREFIX_MASK_MODE == 1) or (
+                        PREFIX_MASK_MODE == 0 and IS_PERSISTENT
+                    )
+                    if _use_scalar_mask:
                         acc, l_i, m_i = attn_fwd_inner_prefix_pipelined_scalar_mask(
                             acc,
                             l_i,
