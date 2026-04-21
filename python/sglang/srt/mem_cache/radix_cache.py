@@ -34,10 +34,10 @@ import torch
 logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
-    MEDIUM_GPU,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    StorageMedium,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -122,6 +122,12 @@ class RadixKey:
         preview = self.token_ids[:10]
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
+    def page_aligned(self, page_size: int) -> "RadixKey":
+        if page_size == 1:
+            return self
+        aligned_len = len(self) // page_size * page_size
+        return self[:aligned_len]
+
     def maybe_to_bigram_view(
         self,
         is_eagle: bool,
@@ -134,24 +140,6 @@ class RadixKey:
             if value is not None:
                 value = value[: len(self)]
         return self, value
-
-
-def page_align_keys(key: list, page_size: int, is_bigram: bool = False) -> list:
-    """Truncate a raw token list so the resulting RadixKey length is page-aligned.
-
-    In bigram mode, logical length = len(key) - 1, and we must keep one extra
-    boundary token so that bigram_count == aligned.
-    """
-    if page_size == 1:
-        return key
-    if is_bigram:
-        logical_len = len(key) - 1 if len(key) > 0 else 0
-        aligned = logical_len // page_size * page_size
-        if aligned == 0:
-            return []
-        return key[: aligned + 1]
-    page_aligned_len = len(key) // page_size * page_size
-    return key[:page_aligned_len]
 
 
 class TreeNode:
@@ -504,9 +492,7 @@ class RadixCache(BasePrefixCache):
         if self.disable or len(key) == 0:
             return empty_match_result()
 
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
+        key = key.page_aligned(self.page_size)
 
         if len(key) == 0:
             return empty_match_result()
@@ -531,12 +517,13 @@ class RadixCache(BasePrefixCache):
         priority = params.priority
         chunked = params.chunked
 
-        if value is None:
-            # Debug/test fallback: use token ids themselves as values. Truncate
-            # to the logical key length so bigram mode gets len(key) entries.
-            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
-
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+        else:
+            # Debug/test fallback: use token ids themselves as values.
+            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)
@@ -560,9 +547,11 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        keys = page_align_keys(token_ids, self.page_size, is_bigram=self.is_eagle)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
-        values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        key_len = len(radix_key)
+        values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -577,11 +566,11 @@ class RadixCache(BasePrefixCache):
             )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : len(radix_key)]
+                kv_indices[req.cache_protected_len : key_len]
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[len(radix_key) :])
+        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -596,8 +585,9 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        keys = page_align_keys(token_ids, self.page_size, is_bigram=self.is_eagle)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
@@ -908,9 +898,14 @@ class RadixCache(BasePrefixCache):
                 stack.append(child)
         return total_size
 
-    def _record_store_event(self, node: TreeNode):
+    def _record_store_event(self, node: TreeNode, medium=None):
         # One BlockStored per ``page_size`` chunk.
+        # ``medium`` defaults to StorageMedium.GPU but callers may override
+        # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
         if self.enable_kv_cache_events:
+            if medium is None:
+                medium = StorageMedium.GPU
+
             # Compute hash_value lazily if not already set
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
@@ -947,16 +942,21 @@ class RadixCache(BasePrefixCache):
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
                         lora_id=None,
-                        medium=MEDIUM_GPU,
+                        medium=medium,
                     )
                 )
 
                 parent_block_hash = block_hash
                 page_index += 1
 
-    def _record_remove_event(self, node: TreeNode):
+    def _record_remove_event(self, node: TreeNode, medium=None):
         # One BlockRemoved per chunk.
+        # ``medium`` defaults to StorageMedium.GPU but callers may override for
+        # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
         if self.enable_kv_cache_events:
+            if medium is None:
+                medium = StorageMedium.GPU
+
             # Compute hash_value lazily if not already set (must match what was stored)
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
@@ -971,7 +971,7 @@ class RadixCache(BasePrefixCache):
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
                 self.kv_event_queue.append(
-                    BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_GPU)
+                    BlockRemoved(block_hashes=[block_hash], medium=medium)
                 )
 
                 page_index += 1

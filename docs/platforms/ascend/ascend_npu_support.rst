@@ -4,6 +4,7 @@ Ascend NPUs
 .. toctree::
    :maxdepth: 1
 
+   ascend_npu_quick_start.md
    ascend_npu.md
    ascend_npu_support_features.md
    ascend_npu_support_models.md
