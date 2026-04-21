@@ -645,6 +645,12 @@ class Req(ReqDllmMixin):
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
 
+        # When True and reasoning_tokens > 0, output tokens (thinking + answer)
+        # are excluded from the radix cache on finish. Off by default; opt in
+        # via SGLANG_STRIP_THINKING_CACHE and a parser whose detector allows
+        # stripping (see scheduler init).
+        self.strip_thinking_cache = False
+
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
             sampling_params = copy.copy(sampling_params)
@@ -903,13 +909,21 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    def _cache_commit_len(self) -> int:
+        # When stripping thinking, only the prompt prefix is handed to the tree;
+        # thinking + answer tokens are reported as overallocated instead so the
+        # existing free-overallocated path reclaims them. See #22373.
+        if self.strip_thinking_cache and self.reasoning_tokens > 0:
+            return min(self.kv_committed_len, len(self.origin_input_ids))
+        return self.kv_committed_len
+
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
         assert (
             not self.kv_committed_freed
         ), f"Committed KV cache already freed ({self.kv_committed_len=})"
         self.kv_committed_freed = True
-        return self.kv_committed_len
+        return self._cache_commit_len()
 
     def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
         """Return the range of over-allocated KV cache and mark them as freed."""
@@ -921,7 +935,7 @@ class Req(ReqDllmMixin):
             not self.kv_overallocated_freed
         ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
         self.kv_overallocated_freed = True
-        return self.kv_committed_len, self.kv_allocated_len
+        return self._cache_commit_len(), self.kv_allocated_len
 
     def update_spec_acceptance_histogram(self, accepted_draft_tokens: int):
         """Update the speculative decoding acceptance histogram.

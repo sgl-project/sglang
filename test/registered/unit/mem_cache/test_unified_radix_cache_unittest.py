@@ -485,6 +485,50 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), aligned_len)
         tree.sanity_check()
 
+    def test_cache_finished_req_strips_thinking(self):
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+
+        req = self._make_req(req_to_token_pool)
+        prompt_ids = self._make_seq(1, 3)
+        output_ids = self._make_seq(2000, 7)
+        req.origin_input_ids = prompt_ids
+        req.output_ids = output_ids
+        req.fill_ids = prompt_ids + output_ids
+        kv_len = len(req.fill_ids)
+        kv_indices = self._alloc(allocator, kv_len)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req.kv_committed_len = kv_len
+        req.kv_allocated_len = kv_len
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        if self.cfg.has_mamba:
+            req.mamba_last_track_seqlen = kv_len
+        req.reasoning_tokens = 1
+        req.strip_thinking_cache = True
+
+        avail_before = allocator.available_size()
+        tree.cache_finished_req(req, is_insert=True)
+        start_p, end_p = req.pop_overallocated_kv_cache()
+        if ps > 1:
+            start_p = ((start_p + ps - 1) // ps) * ps
+        if start_p < end_p:
+            allocator.free(
+                req_to_token_pool.req_to_token[req.req_pool_idx][start_p:end_p]
+            )
+
+        prompt_aligned = (len(prompt_ids) // ps) * ps
+        # Thinking+answer must not be reachable past the prompt.
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(prompt_ids + output_ids)))
+        self.assertEqual(len(m.device_indices), prompt_aligned)
+        # Only prompt-aligned pages remain owned by the tree.
+        self.assertEqual(
+            allocator.available_size(), avail_before + kv_len - prompt_aligned
+        )
+        tree.sanity_check()
+
     def test_cache_finished_req_no_insert(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         req = self._make_req(req_to_token_pool)

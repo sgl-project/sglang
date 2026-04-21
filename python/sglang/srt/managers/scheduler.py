@@ -592,6 +592,13 @@ class Scheduler(
             self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
+            # Feature must be explicitly enabled via env var; AND-gate with the
+            # parser's own cacheability flag (MiniMax-style interleaved
+            # thinking should not be stripped even when the env is on).
+            self.model_config.strip_thinking_cache = (
+                envs.SGLANG_STRIP_THINKING_CACHE.get()
+                and reasoning_parser.detector.strip_thinking_cache
+            )
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
@@ -1883,6 +1890,9 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
+            req.strip_thinking_cache = getattr(
+                self.model_config, "strip_thinking_cache", False
+            )
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
