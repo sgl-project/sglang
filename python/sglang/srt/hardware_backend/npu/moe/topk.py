@@ -118,9 +118,11 @@ def fused_topk_npu(
                 topk_weights,
                 topk_weights.new_full(
                     (topk_weights.shape[0], n),
-                    1.0 / topk_config.routed_scaling_factor
-                    if topk_config.routed_scaling_factor
-                    else 1.0,
+                    (
+                        1.0 / topk_config.routed_scaling_factor
+                        if topk_config.routed_scaling_factor
+                        else 1.0
+                    ),
                 ),
             ],
             dim=-1,
@@ -149,9 +151,7 @@ def fused_topk_npu(
             topk_config,
         )
 
-        get_global_expert_distribution_recorder().on_select_experts(
-            topk_ids=topk_ids
-        )
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     else:
         if expert_location_dispatch_info is not None:
             topk_ids = topk_ids_logical_to_physical(
