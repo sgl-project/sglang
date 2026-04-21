@@ -116,19 +116,20 @@ class RadixAttention(nn.Module):
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            if get_global_server_args().enable_breakable_cuda_graph:
-                from sglang.srt.model_executor.breakable_cuda_graph.bcg_attention import breakable_extend_forward
-
-                return breakable_extend_forward(
-                    self, q, k, v, forward_batch, save_kv_cache, **kwargs
-                )
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:
                 output = torch.empty_like(q)
-            unified_attention_with_output(
-                q, k, v, output, save_kv_cache, self.layer_id, **kwargs
-            )
+            if get_global_server_args().enable_breakable_cuda_graph:
+                from sglang.srt.model_executor.breakable_cuda_graph.bcg_attention import bcg_unified_attention_with_output
+
+                bcg_unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
+            else:
+                unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
             return output
         else:
             return forward_batch.attn_backend.forward(

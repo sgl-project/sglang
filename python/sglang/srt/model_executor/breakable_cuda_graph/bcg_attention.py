@@ -11,12 +11,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Attention entry points for the breakable CUDA graph (BCG) runner.
+"""Attention entry point for the breakable CUDA graph (BCG) runner.
 
-Keeps radix_attention.py clean: when BCG is enabled, ``RadixAttention.forward``
-delegates its extend path to :func:`breakable_extend_forward` here. The body
-shares its output-copy logic with PCG's ``unified_attention_with_output`` —
-BCG only adds an MLA-model MHA-chunk shape fixup on top.
+:func:`bcg_unified_attention_with_output` mirrors
+:func:`sglang.srt.layers.radix_attention.unified_attention_with_output` exactly
+at the call site; internally it installs a graph break so the attention call
+runs eagerly at every replay, and delegates the common path back to
+``unified_attention_with_output``. BCG only adds an MLA-model MHA-chunk shape
+fixup on top.
 """
 
 from __future__ import annotations
@@ -33,36 +35,82 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-__all__ = ["breakable_extend_forward", "breakable_unified_attention_with_output"]
+__all__ = ["bcg_unified_attention_with_output"]
 
 
-def breakable_extend_forward(
-    attention_layer: "RadixAttention",
-    q: torch.Tensor,
-    k: Optional[torch.Tensor],
-    v: Optional[torch.Tensor],
-    forward_batch: "ForwardBatch",
+def bcg_unified_attention_with_output(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
     save_kv_cache: bool,
-    **kwargs,
-):
-    """BCG extend-path entry for ``RadixAttention.forward``."""
-    if attention_layer.qk_head_dim != attention_layer.v_head_dim:
-        output = q.new_empty(
-            (q.shape[0], attention_layer.tp_q_head_num * attention_layer.v_head_dim)
-        )
-    else:
-        output = torch.empty_like(q)
-    breakable_unified_attention_with_output(
-        q,
-        k,
-        v,
-        output,
-        save_kv_cache,
-        attention_layer.layer_id,
-        _attention_layer=attention_layer,
-        **kwargs,
+    layer_id: int,
+    *,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+) -> None:
+    """BCG counterpart of :func:`unified_attention_with_output`."""
+    global _breakable_attention_fn
+    if _breakable_attention_fn is None:
+        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import eager_on_graph
+
+        _breakable_attention_fn = eager_on_graph(True)(_bcg_attention_body)
+    _breakable_attention_fn(
+        query, key, value, output, save_kv_cache, layer_id,
+        q_rope=q_rope, k_rope=k_rope, sinks=sinks,
     )
-    return output
+
+
+# Lazy-init: wrapped with eager_on_graph(True) on first use to avoid
+# import-time dependency on breakable_cuda_graph (which requires cuda.bindings).
+_breakable_attention_fn = None
+
+
+def _bcg_attention_body(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    *,
+    q_rope: Optional[torch.Tensor] = None,
+    k_rope: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+) -> None:
+    """Body invoked at every replay of the BCG attention break point.
+
+    Non-MLA-chunk path delegates to PCG's ``unified_attention_with_output`` so
+    the backend-call / output-copy logic is shared.
+    """
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+
+    n = _mla_dispatch_to_mha(forward_batch, save_kv_cache, k_rope, query)
+    if n is None:
+        unified_attention_with_output(
+            query, key, value, output, save_kv_cache, layer_id,
+            q_rope=q_rope, k_rope=k_rope, sinks=sinks,
+        )
+        return
+
+    # MLA-model MHA chunk path: needs real-size slicing and chunked-prefix
+    # merge. ``attention_layers[layer_id]`` stores attn_mqa (the MLA absorbed
+    # layer); attn_mha is reachable via the sibling pointer stashed by the
+    # MLA model's forward method.
+    attention_layer = context.attention_layers[layer_id]._bcg_mha_layer
+    kwargs = {}
+    if q_rope is not None:
+        kwargs["q_rope"] = q_rope
+    if k_rope is not None:
+        kwargs["k_rope"] = k_rope
+    if sinks is not None:
+        kwargs["sinks"] = sinks
+    ret = _bcg_mha_attention(
+        query, key, value, attention_layer, forward_batch, save_kv_cache, n, kwargs
+    )
+    output[:n].view(ret.shape).copy_(ret)
 
 
 def _mla_dispatch_to_mha(
@@ -140,86 +188,3 @@ def _bcg_mha_attention(
     forward_batch.mha_one_shot = True
 
     return ret
-
-
-def _bcg_attention_body(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    save_kv_cache: bool,
-    layer_id: int,
-    *,
-    q_rope: Optional[torch.Tensor] = None,
-    k_rope: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
-    _attention_layer: Optional["RadixAttention"] = None,
-) -> None:
-    """BCG attention break body. On the non-MLA-chunk path this delegates to
-    :func:`unified_attention_with_output` so PCG and BCG share the same
-    backend-call / output-copy logic.
-    """
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-
-    n = _mla_dispatch_to_mha(forward_batch, save_kv_cache, k_rope, query)
-    if n is None:
-        unified_attention_with_output(
-            query, key, value, output, save_kv_cache, layer_id,
-            q_rope=q_rope, k_rope=k_rope, sinks=sinks,
-        )
-        return
-
-    # MLA-model MHA-chunk path: needs real-size slicing and the chunked-prefix
-    # merge, plus the correct RadixAttention instance (attn_mha shares layer_id
-    # with attn_mqa, so context.attention_layers[layer_id] is wrong here).
-    attention_layer = (
-        _attention_layer
-        if _attention_layer is not None
-        else context.attention_layers[layer_id]
-    )
-    kwargs = {}
-    if q_rope is not None:
-        kwargs["q_rope"] = q_rope
-    if k_rope is not None:
-        kwargs["k_rope"] = k_rope
-    if sinks is not None:
-        kwargs["sinks"] = sinks
-    ret = _bcg_mha_attention(
-        query, key, value, attention_layer, forward_batch, save_kv_cache, n, kwargs
-    )
-    output[:n].view(ret.shape).copy_(ret)
-
-
-# Lazy-init: wrapped with eager_on_graph(True) on first use to avoid
-# import-time dependency on breakable_cuda_graph (which requires cuda.bindings).
-_breakable_attention_fn = None
-
-
-def breakable_unified_attention_with_output(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    save_kv_cache: bool,
-    layer_id: int,
-    *,
-    q_rope: Optional[torch.Tensor] = None,
-    k_rope: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
-    _attention_layer: Optional["RadixAttention"] = None,
-) -> None:
-    """BCG counterpart of :func:`unified_attention_with_output`.
-
-    Inserts a graph break so the attention call runs eagerly at every replay,
-    then shares the PCG body for the common non-MLA-chunk path.
-    """
-    global _breakable_attention_fn
-    if _breakable_attention_fn is None:
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import eager_on_graph
-
-        _breakable_attention_fn = eager_on_graph(True)(_bcg_attention_body)
-    _breakable_attention_fn(
-        query, key, value, output, save_kv_cache, layer_id,
-        q_rope=q_rope, k_rope=k_rope, sinks=sinks, _attention_layer=_attention_layer,
-    )
