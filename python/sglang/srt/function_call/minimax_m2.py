@@ -352,7 +352,16 @@ class MinimaxM2Detector(BaseFormatDetector):
         Non-string types (int/number/bool/object/array) must be buffered until
         </parameter> so that type conversion can happen on the complete value.
         """
-        non_string = {"integer", "int", "number", "float", "boolean", "bool", "object", "array"}
+        non_string = {
+            "integer",
+            "int",
+            "number",
+            "float",
+            "boolean",
+            "bool",
+            "object",
+            "array",
+        }
         normalized = [t.lower() for t in param_types]
         return not any(t in non_string for t in normalized)
 
@@ -418,8 +427,17 @@ class MinimaxM2Detector(BaseFormatDetector):
             return None
 
         type_priority = [
-            "integer", "int", "number", "float", "boolean", "bool",
-            "object", "array", "string", "str", "text",
+            "integer",
+            "int",
+            "number",
+            "float",
+            "boolean",
+            "bool",
+            "object",
+            "array",
+            "string",
+            "str",
+            "text",
         ]
 
         for param_type in type_priority:
