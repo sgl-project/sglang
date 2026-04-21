@@ -1008,16 +1008,12 @@ class MooncakeKVManager(CommonKVManager):
                 logger.warning(
                     f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(dst_state_indices)}"
                 )
-                prefill_state_indices = prefill_state_indices[
-                    : len(dst_state_indices)
-                ]
+                prefill_state_indices = prefill_state_indices[: len(dst_state_indices)]
             elif len(prefill_state_indices) < len(dst_state_indices):
                 logger.warning(
                     f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(dst_state_indices)}"
                 )
-                dst_state_indices = dst_state_indices[
-                    : len(prefill_state_indices)
-                ]
+                dst_state_indices = dst_state_indices[: len(prefill_state_indices)]
             # Reuse _send_kvcache_generic interface to send extra pool data
             prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
             dst_state_indices = np.array(dst_state_indices, dtype=np.int32)
