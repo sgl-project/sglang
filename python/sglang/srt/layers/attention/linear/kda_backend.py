@@ -252,6 +252,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            lower_bound=getattr(layer, "lower_bound", None),
         )
 
         return core_attn_out

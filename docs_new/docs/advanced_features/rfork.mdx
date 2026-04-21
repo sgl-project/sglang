@@ -5,7 +5,7 @@ metatags:
 ---
 R-Fork (Tensor Remote Fork) is a novel weight loading methodology that leverages efficient inter-node GPU-to-GPU data transfer path to load tensors from a running SGLang instance to a new instance with zero-copy. It can significantly optimize the SGLang instance boot-up time by reducing model weights loading from several minutes to mere seconds.
 
-To learn more details about R-Fork, please check **[R-Fork blog](https://lmsys.org/blog/2025-12-10-rfork/)**
+To learn more details about R-Fork, please check **<a href="https://lmsys.org/blog/2025-12-10-rfork/"> R-Fork blog </a>**
 
 ## Usage
 
@@ -27,25 +27,29 @@ To learn more details about R-Fork, please check **[R-Fork blog](https://lmsys.o
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>remote-instance-weight-loader-backend</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`nccl` or `transfer_engine`, default value is `nccl`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>nccl</code>, <code>transfer_engine</code>, or <code>modelexpress</code>. Default is <code>nccl</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>remote-instance-weight-loader-seed-instance-ip</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>IP address of the seed instance who will provide the model weight</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>IP address of the seed instance who will provide the model weight. Used by <code>nccl</code> and <code>transfer_engine</code> backends.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>remote-instance-weight-loader-seed-instance-service-port</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>the port that the seed instance's HTTP server is listening on</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>the port that the seed instance's HTTP server is listening on. Used by <code>nccl</code> and <code>transfer_engine</code> backends.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>remote-instance-weight-loader-send-weights-group-ports</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>the list of available ports on the seed instance that will be used to build NCCL communication groups between seed and client instance. This argument is only needed by `nccl` backend.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>the list of available ports on the seed instance that will be used to build NCCL communication groups between seed and client instance. Only needed by <code>nccl</code> backend.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>remote-instance-weight-loader-start-seed-via-transfer-engine</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>set to start seed service that supports TransferEngine as backend. It is needed for seed instances when using `transfer_engine` as backend.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>set to start seed service that supports TransferEngine as backend. Needed for seed instances when using <code>transfer_engine</code> as backend.</td>
     </tr>
-  </tbody>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>modelexpress-config</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON config for <code>modelexpress</code> backend. Keys: <code>"url"</code> (required, gRPC host:port of ModelExpress server), <code>"model_name"</code> (optional, defaults to <code>--model-path</code>), <code>"source"</code> (optional bool, <code>true</code> for seed mode).</td>
+    </tr>
+</tbody>
 </table>
 
 ### NCCL as backend
@@ -80,3 +84,25 @@ python -m sglang.launch_server [args] \
   --remote-instance-weight-loader-seed-instance-service-port [seed_instance_service_port] \
   --remote-instance-weight-loader-backend transfer_engine
 ```
+
+### ModelExpress as backend
+
+[ModelExpress](https://github.com/ai-dynamo/modelexpress) is a coordination service that manages P2P weight transfer metadata. It removes the need for direct seed IP/port configuration by providing a centralized registry that seeds publish to and clients discover from. Under the hood it uses TransferEngine (Mooncake) for the actual RDMA data transfer.
+
+A running ModelExpress server is required. See the [ModelExpress documentation](https://github.com/ai-dynamo/modelexpress) for setup instructions.
+
+seed instance:
+```bash Command
+python -m sglang.launch_server [args] \
+  --modelexpress-config '{"url": "[modelexpress_grpc_host:port]", "model_name": "[model_name]", "source": true}'
+```
+
+client instance:
+```bash Command
+python -m sglang.launch_server [args] \
+  --load-format remote_instance \
+  --remote-instance-weight-loader-backend modelexpress \
+  --modelexpress-config '{"url": "[modelexpress_grpc_host:port]", "model_name": "[model_name]"}'
+```
+
+The seed publishes its TransferEngine session ID and tensor layout to ModelExpress. The client queries ModelExpress to discover the seed, then pulls weights directly via RDMA. This enables dynamic seed discovery without hardcoding IPs, and supports multiple models through a single ModelExpress instance.
