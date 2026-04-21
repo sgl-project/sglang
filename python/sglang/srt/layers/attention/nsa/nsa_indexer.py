@@ -92,7 +92,7 @@ if _is_cuda:
     ) -> None:
         assert (
             _is_cuda
-        ), "Internal error: piecewise cuda graph is only supported on CUDA"
+        ), "Internal error: piecewise CUDA graph is only supported on CUDA"
         from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
         forward_batch = get_forward_context().forward_batch
@@ -101,7 +101,7 @@ if _is_cuda:
             layer_id, forward_batch
         )
 
-        # slice off padding from piecewise cuda graph
+        # slice off padding from piecewise CUDA graph
         extend_num_tokens = forward_batch.extend_num_tokens
 
         indexer._store_index_k_cache(
@@ -857,7 +857,7 @@ class Indexer(MultiPlatformOp):
     ) -> torch.Tensor:
         assert (
             not is_in_piecewise_cuda_graph()
-        ), "NSA CP path (_get_topk_ragged_with_cp) not supported under piecewise CUDA graph"
+        ), "NSA context parallel (_get_topk_ragged_with_cp) not supported under piecewise CUDA graph"
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
@@ -1089,9 +1089,7 @@ class Indexer(MultiPlatformOp):
         key: torch.Tensor,
         *,
         act_quant=None,  # fallback only
-        out_cache_loc: Optional[
-            torch.Tensor
-        ] = None,  # override for PCG (sliced to real tokens)
+        out_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Store NSA indexer K cache for current step.
@@ -1099,7 +1097,7 @@ class Indexer(MultiPlatformOp):
         Preferred: fused_store_index_k_cache(key, cache, out_cache_loc, page_size)
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
 
-        out_cahce_loc will default to forward_batch.out_cache_loc if not provided.
+        out_cache_loc will default to forward_batch.out_cache_loc if not provided.
         """
 
         if out_cache_loc is None:
@@ -1146,13 +1144,12 @@ class Indexer(MultiPlatformOp):
         assert act_quant is not None
         k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
-        out_loc = out_cache_loc
-        if not out_loc.is_contiguous():
-            out_loc = out_loc.contiguous()
+        if not out_cache_loc.is_contiguous():
+            out_cache_loc = out_cache_loc.contiguous()
 
         forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
             layer_id=layer_id,
-            loc=out_loc,
+            loc=out_cache_loc,
             index_k=k_fp8,
             index_k_scale=k_scale,
         )
@@ -1178,7 +1175,7 @@ class Indexer(MultiPlatformOp):
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        # In PCG mode, metadata is fetched inside split ops via get_forward_context() to
+        # In piecewise CUDA graph mode, metadata is fetched inside custom ops via get_forward_context() to
         # prevent Dynamo from guarding on forward_metadata identity (which changes each
         # replay when init_forward_metadata creates a new ForwardMetadata object).
         if not is_in_piecewise_cuda_graph():
@@ -1266,7 +1263,7 @@ class Indexer(MultiPlatformOp):
                 )
             else:
                 # piecewise CUDA graph need to split graph on store_k_cache and mqa_logits,
-                # so cannot use dual stream and delay store_k_cache after weights proj.
+                # so delay store_k_cache after weights proj.
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
@@ -1322,9 +1319,8 @@ class Indexer(MultiPlatformOp):
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
         if _is_cuda or _is_hip:
-            # In PCG, any access to seq_lens_cpu creates a Dynamo shape guard on
-            # seq_lens_cpu.shape[0] == batch_size, which fails when serving batches
-            # larger than the bs=1 used during capture. PCG never has empty batches.
+            # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
+            # Piecewise CUDA graph never has empty batches.
             if not is_in_piecewise_cuda_graph():
                 assert forward_batch.seq_lens_cpu is not None
                 if len(forward_batch.seq_lens_cpu) == 0:

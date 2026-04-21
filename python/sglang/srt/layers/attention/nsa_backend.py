@@ -2111,9 +2111,9 @@ class NativeSparseAttnBackend(
         )
         out_kernel = out
         if forward_batch.forward_mode.is_extend_without_speculative():
-            # In piecewise cudagraph, input tensors (q, block_tables) are padded to static_num_tokens
-            # but seq_lens only covers the real token count. Slice to real tokens before the
-            # FMHA kernel to avoid invalid (-1) block index accesses on padding rows.
+            # Piecewise CUDA graph pads tensors (q, block_tables) to static_num_tokens
+            # but seq_lens covers only the real batch. Slice to real tokens to avoid
+            # invalid block index accesses on padding rows.
             # out is kept at full batch_size for the caller; out_kernel is the slice the kernel writes into.
             real_batch_size = seq_lens.shape[0]
             if real_batch_size < batch_size:
