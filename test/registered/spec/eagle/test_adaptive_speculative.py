@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -58,32 +59,33 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
             cls.adaptive_config_path = f.name
 
         try:
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--trust-remote-code",
-                    "--attention-backend",
-                    "triton",
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-draft-model-path",
-                    cls.draft_model,
-                    "--speculative-num-steps",
-                    "1",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
-                    "2",
-                    "--speculative-adaptive",
-                    "--speculative-adaptive-config",
-                    cls.adaptive_config_path,
-                    "--skip-server-warmup",
-                    "--mem-fraction-static",
-                    "0.7",
-                ],
-            )
+            with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+                cls.process = popen_launch_server(
+                    cls.model,
+                    cls.base_url,
+                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    other_args=[
+                        "--trust-remote-code",
+                        "--attention-backend",
+                        "triton",
+                        "--speculative-algorithm",
+                        "EAGLE",
+                        "--speculative-draft-model-path",
+                        cls.draft_model,
+                        "--speculative-num-steps",
+                        "1",
+                        "--speculative-eagle-topk",
+                        "1",
+                        "--speculative-num-draft-tokens",
+                        "2",
+                        "--speculative-adaptive",
+                        "--speculative-adaptive-config",
+                        cls.adaptive_config_path,
+                        "--skip-server-warmup",
+                        "--mem-fraction-static",
+                        "0.7",
+                    ],
+                )
         except Exception:
             os.unlink(cls.adaptive_config_path)
             raise
