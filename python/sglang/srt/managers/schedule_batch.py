@@ -597,6 +597,7 @@ class Req(ReqDllmMixin):
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
         return_pooled_hidden_states: bool = False,
+        multi_item_delimiter_indices: Optional[List[int]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -614,6 +615,7 @@ class Req(ReqDllmMixin):
         self.session = session
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
+        self.multi_item_delimiter_indices = multi_item_delimiter_indices
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -903,13 +905,20 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    def _cache_commit_len(self) -> int:
+        # Report only the prompt prefix so thinking + answer fall into the
+        # overallocated range and are reclaimed by release_kv_cache. #22373.
+        if get_global_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
+            return min(self.kv_committed_len, len(self.origin_input_ids))
+        return self.kv_committed_len
+
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
         assert (
             not self.kv_committed_freed
         ), f"Committed KV cache already freed ({self.kv_committed_len=})"
         self.kv_committed_freed = True
-        return self.kv_committed_len
+        return self._cache_commit_len()
 
     def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
         """Return the range of over-allocated KV cache and mark them as freed."""
@@ -921,7 +930,7 @@ class Req(ReqDllmMixin):
             not self.kv_overallocated_freed
         ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
         self.kv_overallocated_freed = True
-        return self.kv_committed_len, self.kv_allocated_len
+        return self._cache_commit_len(), self.kv_allocated_len
 
     def update_spec_acceptance_histogram(self, accepted_draft_tokens: int):
         """Update the speculative decoding acceptance histogram.
@@ -1441,6 +1450,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # Multi-item scoring delimiter indices (set during prepare_for_extend)
+    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
+
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
@@ -1816,6 +1828,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
+
+        # Pre-compute delimiter indices as CPU tensors for MIS.
+        # When --enable-mis is on, every request in the batch is expected to
+        # carry delimiter indices (the score endpoint always produces MIS-structured
+        # requests). Consumers index this list without None-checking.
+        if get_global_server_args().enable_mis and any(
+            r.multi_item_delimiter_indices is not None for r in reqs
+        ):
+            assert all(
+                r.multi_item_delimiter_indices is not None for r in reqs
+            ), "MIS batch must have delimiter indices on every request"
+            self.multi_item_delimiter_indices = [
+                torch.tensor(r.multi_item_delimiter_indices, dtype=torch.int64)
+                for r in reqs
+            ]
+        else:
+            self.multi_item_delimiter_indices = None
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
@@ -2464,6 +2493,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
+            multi_item_delimiter_indices=self.multi_item_delimiter_indices,
             dimensions=self.dimensions,
             return_pooled_hidden_states=self.return_pooled_hidden_states,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
@@ -2664,6 +2694,9 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
+    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
 
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
