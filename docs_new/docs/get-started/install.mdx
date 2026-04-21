@@ -142,7 +142,7 @@ To deploy on Kubernetes or 12+ clouds, you can use [SkyPilot](https://github.com
 1. Install SkyPilot and set up Kubernetes cluster or cloud access: see [SkyPilot's documentation](https://skypilot.readthedocs.io/en/latest/getting-started/installation.html).
 2. Deploy on your own infra with a single command and get the HTTP API endpoint:
 
-<Accordion title="SkyPilot YAML: sglang.yaml">
+<Accordion title={<>SkyPilot YAML: <code>sglang.yaml</code></>}>
 
 ```yaml Config
 # sglang.yaml
@@ -189,7 +189,7 @@ To host a model with your own container, follow the following steps:
 1. Build a docker container with [sagemaker.Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/sagemaker.Dockerfile) alongside the [serve](https://github.com/sgl-project/sglang/blob/main/docker/serve) script.
 2. Push your container onto AWS ECR.
 
-<Accordion title="Dockerfile Build Script: build-and-push.sh">
+<Accordion title={<>Dockerfile Build Script: <code>build-and-push.sh</code></>}>
 
 ```bash Command
 #!/bin/bash
