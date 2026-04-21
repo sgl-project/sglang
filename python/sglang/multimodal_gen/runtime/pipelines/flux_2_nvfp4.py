@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import glob
+import hashlib
 import os
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, cast
@@ -36,6 +38,73 @@ def _find_mixed_safetensors(local_dir: str) -> str | None:
     return mixed_files[0] if mixed_files else None
 
 
+def _build_supplemental_safetensors_dir(mixed_file: str) -> str | None:
+    """Return a directory containing the mixed file (symlinked) plus a
+    supplemental safetensors with any tensors present in the companion
+    non-mixed file but absent from the mixed file.
+
+    The FLUX.2-dev-NVFP4 mixed checkpoint omits ``input_scale`` tensors for
+    ``txt_mlp`` layers even though those layers are quantized as NVFP4.
+    Without the correct calibrated scale the runtime initialises them to 1.0,
+    producing catastrophically wrong activation quantisation.  This function
+    extracts the missing tensors from the companion ``*.safetensors`` file so
+    that both files can be passed to the loader without triggering the
+    duplicate-key guard.
+    """
+    try:
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+    except ImportError:
+        return None
+
+    mixed_dir = os.path.dirname(mixed_file)
+    mixed_name = os.path.basename(mixed_file)
+
+    if not mixed_name.endswith("-mixed.safetensors"):
+        return None
+
+    base_name = mixed_name[: -len("-mixed.safetensors")] + ".safetensors"
+    non_mixed_path = os.path.join(mixed_dir, base_name)
+    if not os.path.isfile(non_mixed_path):
+        return None
+
+    # Deterministic temp dir keyed on the mixed file path so we only create it once.
+    h = hashlib.sha256(mixed_file.encode()).hexdigest()[:16]
+    supp_dir = os.path.join(tempfile.gettempdir(), f"sglang_nvfp4_supp_{h}")
+
+    mixed_link = os.path.join(supp_dir, mixed_name)
+    supp_path = os.path.join(supp_dir, "supplemental.safetensors")
+
+    if os.path.isfile(supp_path) and os.path.exists(mixed_link):
+        return supp_dir
+
+    with safe_open(mixed_file, framework="pt", device="cpu") as f:
+        mixed_keys = set(f.keys())
+
+    extra_tensors = {}
+    with safe_open(non_mixed_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if key not in mixed_keys:
+                extra_tensors[key] = f.get_tensor(key)
+
+    if not extra_tensors:
+        return None
+
+    os.makedirs(supp_dir, exist_ok=True)
+
+    if not os.path.exists(mixed_link):
+        os.symlink(mixed_file, mixed_link)
+
+    save_file(extra_tensors, supp_path)
+    logger.info(
+        "Supplemented mixed NVFP4 checkpoint with %d missing tensor(s) from %s → %s",
+        len(extra_tensors),
+        os.path.basename(non_mixed_path),
+        supp_dir,
+    )
+    return supp_dir
+
+
 def _resolve_nvfp4_transformer_weights_path(
     server_args: ServerArgs, model_path: str
 ) -> str:
@@ -46,6 +115,9 @@ def _resolve_nvfp4_transformer_weights_path(
     mixed_file = _find_mixed_safetensors(local_nvfp4_path)
     if mixed_file is not None:
         logger.info("Using mixed-precision NVFP4 weights: %s", mixed_file)
+        supp_dir = _build_supplemental_safetensors_dir(mixed_file)
+        if supp_dir is not None:
+            return supp_dir
         return mixed_file
 
     logger.warning(
