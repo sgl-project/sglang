@@ -11,6 +11,14 @@
     {
       "source": "/docs/references/learn_more",
       "destination": "/"
+    },
+    {
+      "source": "/docs/hardware-platforms/nvidia",
+      "destination": "/docs/hardware-platforms/nvidia_jetson"
+    },
+    {
+      "source": "/docs/hardware-platforms/nvidia-jetson",
+      "destination": "/docs/hardware-platforms/nvidia_jetson"
     }
   ],
   "colors": {
@@ -46,7 +54,7 @@
             "icon": "play",
             "pages": [
               "index",
-              "docs/get-started/installation",
+              "docs/get-started/install",
               "docs/get-started/quickstart",
               "docs/basic_usage/send_request"
             ]
@@ -147,32 +155,32 @@
               {
                 "group": "Text Generation",
                 "pages": [
-                  "docs/supported-models/large-language-models",
-                  "docs/supported-models/vision-language-models",
-                  "docs/supported-models/diffusion-language-models"
+                  "docs/supported-models/generative_models",
+                  "docs/supported-models/multimodal_language_models",
+                  "docs/supported-models/diffusion_language_models"
                 ]
               },
               {
                 "group": "Retrieval and Ranking",
                 "pages": [
-                  "docs/supported-models/embedding-models",
-                  "docs/supported-models/rerank-models",
-                  "docs/supported-models/classification-models"
+                  "docs/supported-models/embedding_models",
+                  "docs/supported-models/rerank_models",
+                  "docs/supported-models/classify_models"
                 ]
               },
               {
                 "group": "Specialized Models",
                 "pages": [
-                  "docs/supported-models/reward-models"
+                  "docs/supported-models/reward_models"
                 ]
               },
               {
                 "group": "Extending SGLang",
                 "pages": [
-                  "docs/supported-models/new-model-support",
-                  "docs/supported-models/transformers-fallback",
+                  "docs/supported-models/support_new_models",
+                  "docs/supported-models/transformers_fallback",
                   "docs/supported-models/modelscope",
-                  "docs/supported-models/mindspore-models"
+                  "docs/supported-models/mindspore_models"
                 ]
               }
             ]
@@ -187,7 +195,7 @@
                 "group": "Development",
                 "pages": [
                   "docs/developer_guide/development_guide_using_docker",
-                  "docs/developer_guide/JIT_kernels"
+                  "docs/developer_guide/development_jit_kernel_guide"
                 ]
               },
               {
@@ -248,34 +256,34 @@
             "pages": [
               "docs/hardware-platforms/overview",
               "docs/hardware-platforms/nvidia-gpus",
-              "docs/hardware-platforms/amd-gpus",
-              "docs/hardware-platforms/apple-metal",
+              "docs/hardware-platforms/amd_gpu",
+              "docs/hardware-platforms/apple_metal",
               {
                 "group": "Ascend NPUs",
                 "pages": [
-                  "docs/hardware-platforms/ascend-npus/Best-Practice-on-Ascend-NPU",
-                  "docs/hardware-platforms/ascend-npus/Contribution-Guide",
-                  "docs/hardware-platforms/ascend-npus/DeepSeek-Examples",
-                  "docs/hardware-platforms/ascend-npus/Environment-Variables",
-                  "docs/hardware-platforms/ascend-npus/GLM-5",
-                  "docs/hardware-platforms/ascend-npus/MindSpore-Models",
-                  "docs/hardware-platforms/ascend-npus/Quantization",
-                  "docs/hardware-platforms/ascend-npus/Qwen3-Examples",
-                  "docs/hardware-platforms/ascend-npus/Qwen3.5",
-                  "docs/hardware-platforms/ascend-npus/Ring-SP-Performance",
-                  "docs/hardware-platforms/ascend-npus/SGLang-installation-with-NPUs-support",
-                  "docs/hardware-platforms/ascend-npus/Support-Features-on-Ascend-NPU",
-                  "docs/hardware-platforms/ascend-npus/Support-Models-on-Ascend-NPU"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
+                  "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
+                  "docs/hardware-platforms/ascend-npus/mindspore_backend",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_quantization",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_features",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_models"
                 ]
               },
-              "docs/hardware-platforms/cpu-server",
+              "docs/hardware-platforms/cpu_server",
               {
                 "group": "Edge & Embedded",
                 "pages": [
-                  "docs/hardware-platforms/nvidia-jetson"
+                  "docs/hardware-platforms/nvidia_jetson"
                 ]
               },
-              "docs/hardware-platforms/mthreads-gpu",
+              "docs/hardware-platforms/mthreads_gpu",
               "docs/hardware-platforms/tpu",
               "docs/hardware-platforms/xpu",
               "docs/hardware-platforms/plugin"
@@ -507,41 +515,41 @@
               "sglang-diffusion/intro",
               "docs/sglang-diffusion/index",
               "docs/sglang-diffusion/installation",
-              "docs/sglang-diffusion/supported-models",
+              "docs/sglang-diffusion/compatibility_matrix",
               "docs/sglang-diffusion/disaggregation",
               "docs/sglang-diffusion/quantization",
               {
                 "group": "Usage",
                 "pages": [
                   "docs/sglang-diffusion/api/cli",
-                  "docs/sglang-diffusion/api/openai-api",
-                  "docs/sglang-diffusion/api/post-processing"
+                  "docs/sglang-diffusion/api/openai_api",
+                  "docs/sglang-diffusion/api/post_processing"
                 ]
               },
               {
                 "group": "Performance Optimization",
                 "pages": [
                   "docs/sglang-diffusion/performance-optimization",
-                  "docs/sglang-diffusion/ring-sp-performance",
-                  "docs/sglang-diffusion/attention-backends",
+                  "docs/sglang-diffusion/ring_sp_performance",
+                  "docs/sglang-diffusion/attention_backends",
                   "docs/sglang-diffusion/profiling",
-                  "docs/sglang-diffusion/ci-performance"
+                  "docs/sglang-diffusion/ci_perf"
                 ]
               },
               {
                 "group": "Caching Strategies",
                 "pages": [
                   "docs/sglang-diffusion/caching-acceleration",
-                  "docs/sglang-diffusion/cache-dit",
-                  "docs/sglang-diffusion/tea-cache"
+                  "docs/sglang-diffusion/cache_dit",
+                  "docs/sglang-diffusion/teacache"
                 ]
               },
               {
                 "group": "References",
                 "pages": [
-                  "docs/sglang-diffusion/environment-variables",
-                  "docs/sglang-diffusion/supported-models",
-                  "docs/sglang-diffusion/support-new-models",
+                  "docs/sglang-diffusion/environment_variables",
+                  "docs/sglang-diffusion/compatibility_matrix",
+                  "docs/sglang-diffusion/support_new_models",
                   "docs/sglang-diffusion/contributing"
                 ]
               }

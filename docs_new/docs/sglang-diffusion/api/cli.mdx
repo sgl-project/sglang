@@ -64,7 +64,7 @@ sglang serve \
   --port 30010
 ```
 
-For request and response examples, see [OpenAI-Compatible API](./openai-api).
+For request and response examples, see [OpenAI-Compatible API](./openai_api).
 
 <Tip>
 Use `sglang generate --help` and `sglang serve --help` for the full argument list. The CLI help output is the source of truth for exhaustive flags.
@@ -91,7 +91,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--height &#123;HEIGHT&#125;`, `--width &#123;WIDTH&#125;`, `--num-frames &#123;N&#125;`, `--fps &#123;FPS&#125;`
 - `--output-path &#123;PATH&#125;`, `--output-file-name &#123;NAME&#125;`, `--save-output`, `--return-frames`
 
-For frame interpolation and upscaling, see [Post-Processing](./post-processing).
+For frame interpolation and upscaling, see [Post-Processing](./post_processing).
 
 ### Quantized transformers
 
@@ -155,7 +155,7 @@ sglang generate \
 HTTP server-only arguments are ignored by `sglang generate`.
 </Note>
 
-For diffusers pipelines, Cache-DiT can be enabled with `SGLANG_CACHE_DIT_ENABLED=true` or `--cache-dit-config`. See [Cache-DiT](../cache-dit).
+For diffusers pipelines, Cache-DiT can be enabled with `SGLANG_CACHE_DIT_ENABLED=true` or `--cache-dit-config`. See [Cache-DiT](../cache_dit).
 
 ## Serve
 
@@ -184,7 +184,7 @@ export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
 export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 ```
 
-See [Environment Variables](../environment-variables) for the full set of storage options.
+See [Environment Variables](../environment_variables) for the full set of storage options.
 
 ## Component Path Overrides
 
