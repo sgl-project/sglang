@@ -305,6 +305,11 @@ _NEGOTIATE_TEST_CASES = [
     ),
     # max_delay_ms wall-clock timeout: once a single queue-trigger delay
     # exceeds the cap, prefill must be force-released.
+    # Call sequence:
+    #   1) queue_condition holds but skip_first_delayer consumes it
+    #      (no state recorded, falls through to allow)
+    #   2) queue_condition holds -> delay, records start_time in state
+    #   3) after sleeping past max_delay_ms, elapsed >= cap -> force release
     NegotiateTestCase(
         name="queue_trigger_wall_clock_timeout",
         max_delay_passes=100,
@@ -312,6 +317,14 @@ _NEGOTIATE_TEST_CASES = [
         queue_min_ratio=0.5,
         max_delay_ms=50,
         calls=[
+            NegotiateCall(
+                prefillable=[True, True, True, True],
+                token_usage=[0.9, 0.9, 0.9, 0.9],
+                running_batch=[100, 100, 100, 100],
+                max_prefill_bs=[80, 80, 80, 80],
+                waiting_queue_len=[10, 10, 10, 10],
+                max_running_requests=1024,
+            ),
             NegotiateCall(
                 prefillable=[True, True, True, True],
                 token_usage=[0.9, 0.9, 0.9, 0.9],
