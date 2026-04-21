@@ -260,7 +260,7 @@ class UMBPStore(HiCacheStorage):
         master_address = extra.get("master_address", _optional_env_str("UMBP_MASTER_ADDRESS"))
         if master_address and UMBPDistributedConfig is not None:
             dist_cfg = UMBPDistributedConfig()
-            dist_cfg.master_address = str(master_address)
+            dist_cfg.master_config.master_address = str(master_address)
 
             node_address = extra.get("node_address", _optional_env_str("UMBP_NODE_ADDRESS"))
             if node_address is None:
@@ -272,16 +272,16 @@ class UMBPStore(HiCacheStorage):
                     "node_address",
                     str,
                 )
-            dist_cfg.node_address = node_address
+            dist_cfg.master_config.node_address = node_address
 
             node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
             if node_id is None:
-                dist_cfg.node_id = (
+                dist_cfg.master_config.node_id = (
                     f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
                     f":pp{self.pp_rank}:tp{self.local_rank}"
                 )
             else:
-                dist_cfg.node_id = _select_rank_config_value(
+                dist_cfg.master_config.node_id = _select_rank_config_value(
                     node_id,
                     unique_rank,
                     "node_id",
@@ -289,7 +289,7 @@ class UMBPStore(HiCacheStorage):
                 )
 
             if "auto_heartbeat" in extra:
-                dist_cfg.auto_heartbeat = _bool_from_any(extra["auto_heartbeat"])
+                dist_cfg.master_config.auto_heartbeat = _bool_from_any(extra["auto_heartbeat"])
 
             io_engine_host = extra.get(
                 "io_engine_host", _optional_env_str("UMBP_IO_ENGINE_HOST")
@@ -303,13 +303,13 @@ class UMBPStore(HiCacheStorage):
                     "io_engine_host",
                     str,
                 )
-            dist_cfg.io_engine_host = io_engine_host
+            dist_cfg.io_engine.host = io_engine_host
 
             io_engine_port = extra.get(
                 "io_engine_port", _optional_env_str("UMBP_IO_ENGINE_PORT")
             )
             if io_engine_port is not None:
-                dist_cfg.io_engine_port = _select_rank_config_value(
+                dist_cfg.io_engine.port = _select_rank_config_value(
                     io_engine_port,
                     unique_rank,
                     "io_engine_port",
@@ -345,8 +345,12 @@ class UMBPStore(HiCacheStorage):
             #   1. extra_config["dram_page_size"] — explicit operator override
             #      (escape hatch for debugging / forced experiments).
             #   2. derived from mem_pool_host (the normal production path).
-            #   3. left at mori-side default (2 MiB) when neither is available;
-            #      the partial-tail safety net in PoolClient still handles it.
+            #   3. left at 0 when neither source is available; mori's
+            #      UMBPDistributedConfig.dram_page_size defaults to 0, which
+            #      delegates to the master-side ClientRegistryConfig
+            #      .default_dram_page_size (2 MiB by default). The
+            #      partial-tail safety net in PoolClient handles any
+            #      size mismatch.
             page_byte_size = None
             if "dram_page_size" in extra:
                 page_byte_size = int(extra["dram_page_size"])
@@ -401,11 +405,11 @@ class UMBPStore(HiCacheStorage):
             logger.info(
                 "UMBPStore distributed mode: master=%s, node_id=%s, node_addr=%s, "
                 "io=%s:%s, peer_port=%s",
-                dist_cfg.master_address,
-                dist_cfg.node_id,
-                dist_cfg.node_address,
-                dist_cfg.io_engine_host,
-                dist_cfg.io_engine_port,
+                dist_cfg.master_config.master_address,
+                dist_cfg.master_config.node_id,
+                dist_cfg.master_config.node_address,
+                dist_cfg.io_engine.host,
+                dist_cfg.io_engine.port,
                 dist_cfg.peer_service_port,
             )
 
