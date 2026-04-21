@@ -163,6 +163,7 @@ def chunk_local_cumsum_scalar(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ) -> torch.Tensor:
     if head_first:
         B, H, T = g.shape
@@ -172,9 +173,8 @@ def chunk_local_cumsum_scalar(
         chunk_size.bit_length() - 1
     ), "chunk_size must be a power of 2"
     BT = chunk_size
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
@@ -206,17 +206,15 @@ def chunk_local_cumsum_vector(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ) -> torch.Tensor:
     if head_first:
         B, H, T, S = g.shape
     else:
         B, T, H, S = g.shape
     BT = chunk_size
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     assert chunk_size == 2 ** (
         chunk_size.bit_length() - 1
@@ -258,6 +256,7 @@ def chunk_local_cumsum(
     cu_seqlens: Optional[torch.Tensor] = None,
     head_first: bool = False,
     output_dtype: Optional[torch.dtype] = torch.float,
+    chunk_indices: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
@@ -273,6 +272,7 @@ def chunk_local_cumsum(
             cu_seqlens=cu_seqlens,
             head_first=head_first,
             output_dtype=output_dtype,
+            chunk_indices=chunk_indices,
         )
     elif len(g.shape) == 4:
         return chunk_local_cumsum_vector(
@@ -283,6 +283,7 @@ def chunk_local_cumsum(
             cu_seqlens=cu_seqlens,
             head_first=head_first,
             output_dtype=output_dtype,
+            chunk_indices=chunk_indices,
         )
     else:
         raise ValueError(

@@ -2193,6 +2193,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.disable_flashinfer_autotune:
             return False
 
+        # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
+        # be autotuned -- its _dummy_run would dispatch more tokens per rank than
+        # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
+        # Read server_args directly to avoid depending on initialize_moe_config()
+        # having already populated the MoE backend globals.
+        if (
+            self.server_args.moe_runner_backend == "flashinfer_cutedsl"
+            and self.server_args.moe_a2a_backend == "deepep"
+        ):
+            return False
+
         backend_str = self.server_args.moe_runner_backend
 
         # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
