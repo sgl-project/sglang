@@ -830,8 +830,6 @@ class MiniMaxM2Attention(nn.Module):
     ):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.use_qk_norm:
-            # q = self.q_norm(q.contiguous())
-            # k = self.k_norm(k.contiguous())
             cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
             cos, sin = cos_sin.chunk(2, dim=-1)
             q, k, v = split_qkv_tp_rmsnorm_rope(
