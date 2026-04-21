@@ -18,7 +18,7 @@
 import logging
 from contextlib import nullcontext
 from functools import lru_cache
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union, List
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import triton
