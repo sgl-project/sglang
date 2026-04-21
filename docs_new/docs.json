@@ -17,6 +17,16 @@
       "destination": "/cookbook/intro"
     },
     {
+      "source": "/whl",
+      "destination": "https://sgl-project.github.io/whl/",
+      "permanent": false
+    },
+    {
+      "source": "/whl/:path*",
+      "destination": "https://sgl-project.github.io/whl/:path*",
+      "permanent": false
+    },
+    {
       "source": "/index.html",
       "destination": "/"
     },
