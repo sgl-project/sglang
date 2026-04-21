@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    build_mamba_hybrid_stack,
+    attach_hybrid_pool_to_mamba_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import (
     LRUList,
@@ -135,7 +135,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        build_mamba_hybrid_stack(
+        attach_hybrid_pool_to_mamba_cache(
             self,
             params,
             server_args,
@@ -483,13 +483,10 @@ class HiMambaRadixCache(MambaRadixCache):
             or node == self.root_node
             or node.host_ref_counter > 0
             or node.host_mamba_ref_counter > 0
+            or len(node.children) > 0
         ):
             self.evictable_full_host_leaves.discard(node)
             return
-        for child in node.children.values():
-            if child.evicted and child.backuped:
-                self.evictable_full_host_leaves.discard(node)
-                return
         self.evictable_full_host_leaves.add(node)
 
     def _free_device_mamba(self, node: TreeNode) -> int:
