@@ -266,11 +266,9 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER = EnvFloat(1.0)
-    # When enabled, reasoning-model requests (with --reasoning-parser) skip
-    # inserting output tokens (thinking + answer) into the radix cache on
-    # finish, keeping only the prompt prefix. Off by default: changing cache
-    # contents is a behavior change; turn on after validating against your
-    # client-side prompt construction.
+    # Strip reasoning-model output (thinking + answer) from radix cache on
+    # finish; keep only the prompt prefix. Opt-in: changing cache contents
+    # is a behavior change.
     SGLANG_STRIP_THINKING_CACHE = EnvBool(False)
 
     # Test: pd-disaggregation

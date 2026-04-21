@@ -592,9 +592,8 @@ class Scheduler(
             self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
-            # Feature must be explicitly enabled via env var; AND-gate with the
-            # parser's own cacheability flag (MiniMax-style interleaved
-            # thinking should not be stripped even when the env is on).
+            # AND env with parser flag: MiniMax-style interleaved thinking
+            # opts out even when the env is on.
             self.model_config.strip_thinking_cache = (
                 envs.SGLANG_STRIP_THINKING_CACHE.get()
                 and reasoning_parser.detector.strip_thinking_cache

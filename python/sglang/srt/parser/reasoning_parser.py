@@ -19,13 +19,9 @@ class StreamingParseResult:
 class BaseReasoningFormatDetector:
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
-    # Whether thinking tokens should be stripped from the radix cache when a
-    # request finishes. True for parsers that route thinking to `reasoning_text`
-    # (DeepSeek-R1 convention): clients drop thinking from multi-turn prompts,
-    # so keeping it in the cache produces dead branches. False for parsers that
-    # route thinking into `normal_text` (e.g. MiniMaxAppendThinkDetector): the
-    # thinking text is part of the assistant message that gets fed back, so it
-    # must stay cached for prefix matching to work.
+    # True if thinking goes to `reasoning_text` and is dropped from multi-turn
+    # prompts (DeepSeek-R1 convention); caching it creates dead branches.
+    # False if thinking is in `normal_text` and fed back every turn (MiniMax).
     strip_thinking_cache: bool = True
 
     def __init__(
@@ -404,8 +400,7 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     Append `<think>` token to the beginning of the text.
     """
 
-    # Thinking is emitted as normal_text here and is expected to appear in the
-    # assistant message fed back next turn, so it must stay in the cache.
+    # Thinking is in normal_text and fed back every turn; keep in cache.
     strip_thinking_cache = False
 
     def __init__(

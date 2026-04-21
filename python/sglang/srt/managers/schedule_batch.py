@@ -645,10 +645,8 @@ class Req(ReqDllmMixin):
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
 
-        # When True and reasoning_tokens > 0, output tokens (thinking + answer)
-        # are excluded from the radix cache on finish. Off by default; opt in
-        # via SGLANG_STRIP_THINKING_CACHE and a parser whose detector allows
-        # stripping (see scheduler init).
+        # Wired by scheduler from SGLANG_STRIP_THINKING_CACHE + parser flag.
+        # When True and reasoning_tokens > 0, output skips the radix cache.
         self.strip_thinking_cache = False
 
         # Sampling info
@@ -910,9 +908,8 @@ class Req(ReqDllmMixin):
         return self.output_ids
 
     def _cache_commit_len(self) -> int:
-        # When stripping thinking, only the prompt prefix is handed to the tree;
-        # thinking + answer tokens are reported as overallocated instead so the
-        # existing free-overallocated path reclaims them. See #22373.
+        # Report only the prompt prefix so thinking + answer fall into the
+        # overallocated range and are reclaimed by release_kv_cache. #22373.
         if self.strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv_committed_len, len(self.origin_input_ids))
         return self.kv_committed_len
