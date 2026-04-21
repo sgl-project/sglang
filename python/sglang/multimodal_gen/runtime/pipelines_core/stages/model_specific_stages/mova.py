@@ -17,6 +17,7 @@ import os
 from collections.abc import Iterable
 
 import torch
+import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
@@ -66,7 +67,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.utils.common import get_compiler_backend
 
+_is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
 
 
@@ -200,28 +203,44 @@ class MOVADenoisingStage(PipelineStage):
             partial = (1 - guidance_scale) * neg
         return cfg_model_parallel_all_reduce(partial)
 
-    def compile_module_with_torch_compile(self, module, server_args: ServerArgs):
-        if not server_args.enable_torch_compile or module is None:
-            return module
-        if not hasattr(module, "forward"):
-            return module
-        try:
-            import torch._inductor.config as _inductor_cfg
+    def _maybe_enable_torch_compile(self, module: nn.Module, server_args: ServerArgs):
+        """
+        Compile a module with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object is not a nn.Module.
+        """
+        if not server_args.enable_torch_compile or not isinstance(module, nn.Module):
+            return
+        compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
 
-            _inductor_cfg.reorder_for_compute_comm_overlap = True
-        except ImportError:
-            pass
-        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
-        logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
-        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
-        setattr(module, "forward", compiled_forward)
-        return module
+        if current_platform.is_npu():
+            backend = get_compiler_backend()
+            compile_kwargs["backend"] = backend
+            compile_kwargs["dynamic"] = False
+            logger.info(
+                "Compiling %s with torchair backend on NPU",
+                module.__class__.__name__,
+            )
+        else:
+            try:
+                import torch._inductor.config as _inductor_cfg
+
+                _inductor_cfg.reorder_for_compute_comm_overlap = True
+            except ImportError:
+                pass
+            mode = os.environ.get(
+                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            )
+            compile_kwargs["mode"] = mode
+            logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
+
+        # TODO(triple-mu): support customized fullgraph and dynamic in the future
+        module.compile(**compile_kwargs)
 
     def _maybe_compile_dits(self, server_args: ServerArgs):
         if self._torch_compiled or not server_args.enable_torch_compile:
             return
         for module in filter(None, [self.video_dit, self.video_dit_2, self.audio_dit]):
-            self.compile_module_with_torch_compile(module, server_args)
+            self._maybe_enable_torch_compile(module, server_args)
         self._torch_compiled = True
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -310,8 +329,8 @@ class MOVADenoisingStage(PipelineStage):
 
     def _manage_device_placement(
         self,
-        model_to_use: torch.nn.Module | None,
-        model_to_offload: torch.nn.Module | None,
+        model_to_use: nn.Module | None,
+        model_to_offload: nn.Module | None,
         server_args: ServerArgs,
     ):
         if not server_args.dit_cpu_offload:
@@ -347,6 +366,11 @@ class MOVADenoisingStage(PipelineStage):
         self._manage_device_placement(current_model, model_to_offload, server_args)
         return current_model
 
+    def _ensure_shared_models_on_device(self, server_args: ServerArgs):
+        """Ensure shared denoising modules are on the active device when cpu offload is enabled."""
+        self._manage_device_placement(self.audio_dit, None, server_args)
+        self._manage_device_placement(self.dual_tower_bridge, None, server_args)
+
     def _apply_guidance_rescale(
         self,
         noise_pred,
@@ -376,7 +400,7 @@ class MOVADenoisingStage(PipelineStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         self._maybe_compile_dits(server_args)
-        self._manage_device_placement(self.audio_dit, None, server_args)
+        self._ensure_shared_models_on_device(server_args)
 
         paired_timesteps = batch.paired_timesteps
         if paired_timesteps is None:
@@ -397,7 +421,7 @@ class MOVADenoisingStage(PipelineStage):
             getattr(batch, "extra_step_kwargs", None) or {},
         )
 
-        timings = getattr(batch, "timings", None)
+        metrics = getattr(batch, "metrics", None)
         perf_dump_path_provided = getattr(batch, "perf_dump_path", None) is not None
 
         with self.progress_bar(total=total_steps) as progress_bar:
@@ -405,8 +429,9 @@ class MOVADenoisingStage(PipelineStage):
                 with StageProfiler(
                     f"denoising_step_{idx_step}",
                     logger=logger,
-                    timings=timings,
+                    metrics=metrics,
                     perf_dump_path_provided=perf_dump_path_provided,
+                    record_as_step=True,
                 ):
                     pair_t = paired_timesteps[idx_step]
                     if getattr(pair_t, "shape", None) == (2,):
@@ -691,7 +716,14 @@ class MOVADenoisingStage(PipelineStage):
 
         # Build visual freqs for full sequence
         visual_dit._init_freqs()
-        visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            visual_freqs = tuple(
+                freq.to(device=visual_x.device, dtype=torch.complex64)
+                for freq in visual_dit.freqs
+            )
+        else:
+            visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
         visual_freqs = (
             torch.cat(
                 [
@@ -711,18 +743,24 @@ class MOVADenoisingStage(PipelineStage):
 
         # Build audio freqs for full sequence
         self.audio_dit._init_freqs()
-        audio_freqs = (
-            torch.cat(
-                [
-                    self.audio_dit.freqs[0][:f].view(f, -1).expand(f, -1),
-                    self.audio_dit.freqs[1][:f].view(f, -1).expand(f, -1),
-                    self.audio_dit.freqs[2][:f].view(f, -1).expand(f, -1),
-                ],
-                dim=-1,
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            audio_freqs = tuple(
+                freq.to(device=audio_x.device, dtype=torch.complex64)
+                for freq in self.audio_dit.freqs
             )
-            .reshape(full_audio_seq_len, 1, -1)
-            .to(audio_x.device)
-        )
+        else:
+            audio_freqs = tuple(
+                freq.to(audio_x.device) for freq in self.audio_dit.freqs
+            )
+        audio_freqs = torch.cat(
+            [
+                audio_freqs[0][:f].view(f, -1).expand(f, -1),
+                audio_freqs[1][:f].view(f, -1).expand(f, -1),
+                audio_freqs[2][:f].view(f, -1).expand(f, -1),
+            ],
+            dim=-1,
+        ).reshape(full_audio_seq_len, 1, -1)
 
         # Shard sequences for SP
         visual_x, visual_pad_len = self._shard_sequence_for_sp(visual_x, dim=1)
@@ -906,6 +944,6 @@ class MOVADecodingStage(PipelineStage):
             output=video,
             audio=audio,
             audio_sample_rate=getattr(self.audio_vae, "sample_rate", None),
-            timings=batch.timings,
+            metrics=batch.metrics,
         )
         return output_batch

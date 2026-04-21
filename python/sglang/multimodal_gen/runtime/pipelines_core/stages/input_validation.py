@@ -4,6 +4,7 @@
 """
 Input validation stage for diffusion pipelines.
 """
+
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
@@ -78,6 +79,11 @@ class InputValidationStage(PipelineStage):
         # Create generators based on generator_device parameter
         # Note: This will overwrite any existing batch.generator
         generator_device = batch.generator_device
+        if generator_device is None:
+            generator_device = (
+                getattr(server_args.pipeline_config, "generator_device", None)
+                or current_platform.device_type
+            )
 
         if generator_device == "cpu":
             device_str = "cpu"
@@ -128,8 +134,13 @@ class InputValidationStage(PipelineStage):
             # adjust output image size
             if calculated_size is not None:
                 calculated_width, calculated_height = calculated_size
-                width = batch.width or calculated_width
-                height = batch.height or calculated_height
+                explicit_fields = set(batch.extra.get("explicit_fields", []))
+                width_is_explicit = "width" in explicit_fields
+                height_is_explicit = "height" in explicit_fields
+
+                width = batch.width if width_is_explicit else calculated_width
+                height = batch.height if height_is_explicit else calculated_height
+
                 multiple_of = (
                     server_args.pipeline_config.vae_config.get_vae_scale_factor() * 2
                 )
@@ -139,6 +150,8 @@ class InputValidationStage(PipelineStage):
                 batch.height = height
 
         elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
+            if server_args.pipeline_config.skip_input_image_preprocess:
+                return
             # duplicate with vae_image_processor
             # further processing for ti2v task
             if isinstance(
@@ -158,7 +171,7 @@ class InputValidationStage(PipelineStage):
 
             scale = max(ow / iw, oh / ih)
             img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-            logger.debug("resized img height: %s, img width: %s", img.height, img.width)
+            logger.debug("resized condition image to: %sx%s", img.height, img.width)
 
             # center-crop
             x1 = (img.width - ow) // 2
@@ -188,8 +201,30 @@ class InputValidationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
+
+            # User-specified width/height controls the target area (scale),
+            # capped by max_area. Aspect ratio always comes from the
+            # condition image for I2V.
+            if batch.width is not None or batch.height is not None:
+                # If one dimension is provided, calculate the other based on the image's aspect ratio.
+                if batch.width is None:
+                    batch.width = round(batch.height / aspect_ratio)
+                elif batch.height is None:
+                    batch.height = round(batch.width * aspect_ratio)
+
+                target_area = min(batch.width * batch.height, max_area)
+                if batch.width * batch.height > max_area:
+                    logger.warning(
+                        "Requested resolution %dx%d exceeds max_area %d, "
+                        "clamping to max_area",
+                        batch.width,
+                        batch.height,
+                        max_area,
+                    )
+            else:
+                target_area = max_area
             width, height = self._calculate_dimensions_from_area(
-                max_area, aspect_ratio, mod_value
+                target_area, aspect_ratio, mod_value
             )
 
             batch.condition_image = batch.condition_image.resize((width, height))
@@ -238,8 +273,21 @@ class InputValidationStage(PipelineStage):
 
         self._generate_seeds(batch, server_args)
 
-        # Ensure prompt is properly formatted
-        if batch.prompt is None and batch.prompt_embeds is None:
+        if (
+            server_args.pipeline_config.task_type == ModelTaskType.I2M
+            and batch.num_inference_steps is None
+            and hasattr(server_args.pipeline_config, "shape_num_inference_steps")
+        ):
+            batch.num_inference_steps = (
+                server_args.pipeline_config.shape_num_inference_steps
+            )
+
+        # Ensure prompt is properly formatted (I2M can be image-only)
+        if (
+            server_args.pipeline_config.task_type != ModelTaskType.I2M
+            and batch.prompt is None
+            and batch.prompt_embeds is None
+        ):
             raise ValueError("Either `prompt` or `prompt_embeds` must be provided")
 
         # Ensure negative prompt is properly formatted if using classifier-free guidance
@@ -296,9 +344,10 @@ class InputValidationStage(PipelineStage):
                 )
                 batch.original_condition_image_size = image.size
 
-            self.preprocess_condition_image(
-                batch, server_args, condition_image_width, condition_image_height
-            )
+            if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+                self.preprocess_condition_image(
+                    batch, server_args, condition_image_width, condition_image_height
+                )
 
         # if height or width is not specified at this point, set default to 720p
         default_height = 720
@@ -320,16 +369,24 @@ class InputValidationStage(PipelineStage):
         result.add_check(
             "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
         )
-        result.add_check(
-            "prompt_or_embeds",
-            None,
-            lambda _: V.string_or_list_strings(batch.prompt)
-            or V.list_not_empty(batch.prompt_embeds),
-        )
+        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+            result.add_check(
+                "prompt_or_embeds",
+                None,
+                lambda _: V.string_or_list_strings(batch.prompt)
+                or V.list_not_empty(batch.prompt_embeds),
+            )
 
-        result.add_check(
-            "num_inference_steps", batch.num_inference_steps, V.positive_int
-        )
+        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+            result.add_check(
+                "num_inference_steps", batch.num_inference_steps, V.positive_int
+            )
+        else:
+            result.add_check(
+                "num_inference_steps",
+                batch.num_inference_steps,
+                lambda x: x is None or V.positive_int(x),
+            )
         result.add_check(
             "guidance_scale",
             batch.guidance_scale,

@@ -14,6 +14,7 @@
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
+use smg_mesh::OptionalMeshSyncManager;
 use uuid::Uuid;
 
 use crate::{
@@ -22,7 +23,6 @@ use crate::{
         worker::{HealthChecker, RuntimeType, WorkerType},
         ConnectionMode, Worker,
     },
-    mesh::OptionalMeshSyncManager,
     observability::metrics::Metrics,
 };
 

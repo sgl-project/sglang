@@ -53,6 +53,7 @@ class ModelTaskType(Enum):
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
     TI2I = auto()  # Image to Image or Text-Image to Image
+    I2M = auto()  # Image to Mesh
 
     def is_image_gen(self) -> bool:
         return (
@@ -62,7 +63,11 @@ class ModelTaskType(Enum):
         )
 
     def requires_image_input(self) -> bool:
-        return self == ModelTaskType.I2V or self == ModelTaskType.I2I
+        return (
+            self == ModelTaskType.I2V
+            or self == ModelTaskType.I2I
+            or self == ModelTaskType.I2M
+        )
 
     def accepts_image_input(self) -> bool:
         return (
@@ -70,9 +75,12 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.I2I
             or self == ModelTaskType.TI2I
             or self == ModelTaskType.TI2V
+            or self == ModelTaskType.I2M
         )
 
     def data_type(self) -> DataType:
+        if self == ModelTaskType.I2M:
+            return DataType.MESH
         if self.is_image_gen():
             return DataType.IMAGE
         else:
@@ -87,10 +95,6 @@ class STA_Mode(str, Enum):
     STA_TUNING = "STA_tuning"
     STA_TUNING_CFG = "STA_tuning_cfg"
     NONE = None
-
-
-def preprocess_text(prompt: str) -> str:
-    return prompt
 
 
 def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
@@ -147,12 +151,12 @@ def maybe_unpad_latents(latents, batch):
     return latents
 
 
-# config for a single pipeline
 @dataclass
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
     task_type: ModelTaskType = ModelTaskType.I2I
+    skip_input_image_preprocess: bool = False
 
     model_path: str = ""
     pipeline_config_path: str | None = None
@@ -164,6 +168,7 @@ class PipelineConfig:
     # controls the timestep embedding generation
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0
+    generator_device: str | None = None
     flow_shift: float | None = None
     disable_autocast: bool = False
 
@@ -175,6 +180,7 @@ class PipelineConfig:
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
     vae_tiling: bool = True
+    vae_slicing: bool = False
     vae_sp: bool = True
 
     # Image encoder configuration
@@ -196,8 +202,8 @@ class PipelineConfig:
     def postprocess_image(self, image):
         return image.last_hidden_state
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,)
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,)
     )
 
     # get prompt_embeds from encoder output
@@ -231,6 +237,19 @@ class PipelineConfig:
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return sigmas
+
+    def get_classifier_free_guidance_scale(self, batch, guidance_scale: float) -> float:
+        return guidance_scale
+
+    def postprocess_cfg_noise(
+        self,
+        batch,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        # Model-specific CFG variants can override this hook
+        # e.g. Qwen-Image's true-CFG norm matching.
+        return noise_pred
 
     ## For ImageVAEEncodingStage
     def preprocess_condition_image(
@@ -304,6 +323,9 @@ class PipelineConfig:
 
         return shape
 
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        return prompt_dtype
+
     def allow_set_num_frames(self):
         return False
 
@@ -329,29 +351,99 @@ class PipelineConfig:
     def postprocess_vae_encode(self, image_latents, vae):
         return image_latents
 
+    # called after postprocess_vae_encode, before generic scale/shift
+    def normalize_vae_encode(self, image_latents, vae):
+        return None
+
     # called after scale_and_shift, before vae decoding
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
-    def gather_latents_for_sp(self, latents):
+    @staticmethod
+    def _gather_sp_tensor(tensor: torch.Tensor, *, dim: int) -> torch.Tensor:
+        """All-gather an SP-sharded tensor along the specified logical dimension."""
+        return sequence_model_parallel_all_gather(tensor.contiguous(), dim=dim)
+
+    @staticmethod
+    def _trim_sp_gather_padding(
+        tensor: torch.Tensor, *, orig_len: int | None, dim: int
+    ) -> torch.Tensor:
+        """Trim padding introduced before SP sharding back to the original length."""
+        if orig_len is None:
+            return tensor
+        orig_len = int(orig_len)
+        if orig_len <= 0 or tensor.shape[dim] <= orig_len:
+            return tensor
+        slices = [slice(None)] * tensor.ndim
+        slices[dim] = slice(orig_len)
+        return tensor[tuple(slices)]
+
+    def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
-        latents = sequence_model_parallel_all_gather(latents, dim=2)
-        return latents
+        return self._gather_sp_tensor(latents, dim=2)
+
+    def can_shard_audio_latents_for_sp(self, audio_latents) -> bool:
+        """Return whether this pipeline uses packed audio latents that can be SP-sharded."""
+        return False
+
+    def shard_audio_latents_for_sp(self, batch, audio_latents):
+        """Shard packed audio latents for SP. Pipelines without packed audio latents should return the input unchanged."""
+        return audio_latents, False
+
+    def gather_audio_latents_for_sp(self, audio_latents, batch):
+        """Gather SP-sharded audio latents back to full sequence length."""
+        return audio_latents
+
+    def prepare_video_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        latent_model_input,
+        *,
+        num_frames,
+        height,
+        width,
+    ):
+        """Prepare model-side video RoPE coordinates for the local SP shard when the pipeline requires them."""
+        return None
+
+    def prepare_audio_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        audio_latent_model_input,
+        *,
+        num_frames,
+    ):
+        """Prepare model-side audio RoPE coordinates for the local SP shard when the pipeline requires them."""
+        return None
+
+    def gather_noise_pred_for_sp(self, batch, noise_pred):
+        noise_pred = self.gather_latents_for_sp(noise_pred)
+        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
+        if raw_latent_shape is not None and noise_pred.dim() == 3:
+            noise_pred = self._trim_sp_gather_padding(
+                noise_pred, orig_len=raw_latent_shape[1], dim=1
+            )
+        return noise_pred
 
     def preprocess_vae_image(self, batch, vae_image_processor):
         pass
 
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models
-        if batch.enable_sequence_shard:
-            return latents, False
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if batch.enable_sequence_shard and sp_world_size > 1:
+            return latents, False
         if latents.dim() != 5:
             return latents, False
         time_dim = latents.shape[2]
 
         # Pad to next multiple of SP degree if needed
         if time_dim > 0 and time_dim % sp_world_size != 0:
+            logger.debug(
+                "Padding latents to next multiple of SP degree, performance is sub-optimal"
+            )
             pad_len = sp_world_size - (time_dim % sp_world_size)
             pad = torch.zeros(
                 (*latents.shape[:2], pad_len, *latents.shape[3:]),
@@ -366,6 +458,33 @@ class PipelineConfig:
         ).contiguous()
         sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
         return sharded_tensor, True
+
+    def get_text_encoder_attention_mask(
+        self, text_inputs: dict, encoder_index: int
+    ) -> "torch.Tensor | None":
+        """Return the attention mask for the given text encoder.
+
+        Override to suppress (return None) or modify the mask per model.
+        """
+        return text_inputs.get("attention_mask")
+
+    def get_text_encoder_pooler_output(
+        self, outputs: "BaseEncoderOutput", encoder_index: int
+    ) -> "torch.Tensor | None":
+        """Return the pooler output for the given text encoder, or None to skip.
+
+        Override for models that need pooled embeddings (e.g. FLUX v1, SD3).
+        """
+        return None
+
+    def select_vae_weight_files(
+        self,
+        safetensors_list: list[str],
+        component_model_path: str,
+        component_name: str,
+        vae_precision: str,
+    ) -> list[str]:
+        return safetensors_list
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds
@@ -385,6 +504,12 @@ class PipelineConfig:
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
+
+    def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
+        raise NotImplementedError("not yet implemented")
+
+    def gather_dit_env_static_for_sp(self, batch, cond_kwargs: dict | None):
+        return cond_kwargs
 
     @staticmethod
     def add_cli_args(
@@ -424,6 +549,13 @@ class PipelineConfig:
             default=PipelineConfig.flow_shift,
             help="Flow shift parameter",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}resolution",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}resolution",
+            default=None,
+            help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
+        )
 
         # DiT configuration
         parser.add_argument(
@@ -450,6 +582,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
             default=PipelineConfig.vae_tiling,
             help="Enable VAE tiling",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}vae-slicing",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}vae_slicing",
+            default=PipelineConfig.vae_slicing,
+            help="Enable VAE slicing",
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-sp",
@@ -527,7 +666,7 @@ class PipelineConfig:
         cls, kwargs: dict[str, Any], config_cli_prefix: str = ""
     ) -> "PipelineConfig":
         """
-        Load PipelineConfig from kwargs Dictionary.
+        Load PipelineConfig from kwargs Dictionary, as part of the ServerArg initialization process
         kwargs: dictionary of kwargs
         config_cli_prefix: prefix of CLI arguments for this PipelineConfig instance
         """
@@ -571,7 +710,11 @@ class PipelineConfig:
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
-                model_info = get_model_info(model_path, backend=kwargs.get("backend"))
+                model_info = get_model_info(
+                    model_path,
+                    backend=kwargs.get("backend"),
+                    model_id=kwargs.get("model_id"),
+                )
                 if model_info is None:
                     from sglang.multimodal_gen.registry import (
                         _PIPELINE_CONFIG_REGISTRY,
@@ -587,7 +730,11 @@ class PipelineConfig:
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
         else:
-            model_info = get_model_info(model_path, backend=kwargs.get("backend"))
+            model_info = get_model_info(
+                model_path,
+                backend=kwargs.get("backend"),
+                model_id=kwargs.get("model_id"),
+            )
             if model_info is None:
                 raise ValueError(
                     f"Could not get model info for '{model_path}'. "
@@ -596,6 +743,12 @@ class PipelineConfig:
             # 1.5. Adjust pipeline config for fine-tuned VAE if needed
             pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
+        if vae_path is None:
+            component_paths = kwargs.get(
+                prefix_with_dot + "component_paths"
+            ) or kwargs.get("component_paths")
+            if isinstance(component_paths, dict):
+                vae_path = component_paths.get("vae")
 
         # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
         if (
@@ -742,10 +895,9 @@ class ImagePipelineConfig(PipelineConfig):
         sharded_tensor = sharded_tensor[:, rank_in_sp_group, :, :]
         return sharded_tensor, True
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         # For image latents [B, S_local, D], gather along sequence dim=1
-        latents = sequence_model_parallel_all_gather(latents, dim=1)
-        return latents
+        return self._gather_sp_tensor(latents, dim=1)
 
     def _unpad_and_unpack_latents(self, latents, batch):
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
@@ -760,6 +912,49 @@ class ImagePipelineConfig(PipelineConfig):
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
         return latents, batch_size, channels, height, width
+
+
+@dataclass
+class SpatialImagePipelineConfig(ImagePipelineConfig):
+    """Base config for spatial image pipelines (e.g. GLM-Image) with 4D latents (B, C, H', W').
+
+    Overrides shard_latents_for_sp / gather_latents_for_sp to shard along the height dimension
+    so that each SP rank gets (B, C, H'_local, W') instead of using the token-style (B, S, C) path.
+    """
+
+    def shard_latents_for_sp(self, batch, latents):
+        # 4D latents (B, C, H', W') -> shard along H' (dim=2); otherwise fall back to base (B, S, C)
+        sp_world_size = get_sp_world_size()
+        if sp_world_size <= 1:
+            return latents, False
+        if latents.dim() != 4:
+            return super().shard_latents_for_sp(batch, latents)
+
+        # (B, C, H', W')
+        _, _, h_lat, w_lat = latents.shape
+        if h_lat % sp_world_size != 0:
+            pad_len = sp_world_size - (h_lat % sp_world_size)
+            pad = torch.zeros(
+                (latents.shape[0], latents.shape[1], pad_len, latents.shape[3]),
+                dtype=latents.dtype,
+                device=latents.device,
+            )
+            latents = torch.cat([latents, pad], dim=2)
+            h_lat = latents.shape[2]
+        rank_in_sp_group = get_sp_parallel_rank()
+        chunk_size = h_lat // sp_world_size
+        h0 = rank_in_sp_group * chunk_size
+        h1 = h0 + chunk_size
+        sharded = latents[:, :, h0:h1, :].contiguous()
+        return sharded, True
+
+    def gather_latents_for_sp(self, latents, batch=None):
+        if get_sp_world_size() <= 1:
+            return latents
+        if latents.dim() != 4:
+            return super().gather_latents_for_sp(latents, batch=batch)
+        # Gather along dim=2 (H') to match shard_latents_for_sp
+        return self._gather_sp_tensor(latents, dim=2)
 
 
 @dataclass

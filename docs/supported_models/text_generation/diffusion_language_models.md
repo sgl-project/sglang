@@ -1,7 +1,5 @@
 # Diffusion Language Models
 
-> This page covers **text generation** using diffusion-based LLMs. For **image and video generation**, see [Diffusion Models](../image_generation/diffusion_models.md).
-
 Diffusion language models have shown promise for non-autoregressive text generation with parallel decoding capabilities. Unlike auto-regressive language models, different diffusion language models require different decoding strategies.
 
 ## Example Launch Command
@@ -109,3 +107,5 @@ Below the supported models are summarized in a table.
 | Model Family               | Example Model                | Description                                                                                          |
 | -------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------- |
 | **LLaDA2.0 (mini, flash)** | `inclusionAI/LLaDA2.0-flash` | LLaDA2.0-flash is a diffusion language model featuring a 100B Mixture-of-Experts (MoE) architecture. |
+| **SDAR (JetLM)**           | `JetLM/SDAR-8B-Chat`         | SDAR series diffusion language model (Chat), dense architecture.                                 |
+| **SDAR (JetLM)**           | `JetLM/SDAR-30B-A3B-Chat`    | SDAR series diffusion language model (Chat), MoE architecture.                                   |

@@ -478,13 +478,20 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
+    # StreamingSession.cache_finished_req handles speculative tail trim
+    # and bookkeeping flag sync internally, then sets req_pool_idx = None.
+    if req.req_pool_idx is None:
+        return
+
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
-    if spec_algo is None:
+    # strip_thinking_cache intentionally reports output tokens as overallocated
+    # so they fall into the free path below (#22373).
+    if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
@@ -508,20 +515,5 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     tree_cache.req_to_token_pool.free(req)
 
 
-def available_and_evictable_str(tree_cache) -> str:
-    token_to_kv_pool_allocator = tree_cache.token_to_kv_pool_allocator
-    if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-        full_available_size = token_to_kv_pool_allocator.full_available_size()
-        swa_available_size = token_to_kv_pool_allocator.swa_available_size()
-        full_evictable_size = tree_cache.full_evictable_size()
-        swa_evictable_size = tree_cache.swa_evictable_size()
-        return (
-            f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
-            f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-            f"Full LRU list evictable size: {tree_cache.full_lru_list_evictable_size()}\n"
-            f"SWA LRU list evictable size: {tree_cache.swa_lru_list_evictable_size()}\n"
-        )
-    else:
-        available_size = token_to_kv_pool_allocator.available_size()
-        evictable_size = tree_cache.evictable_size()
-        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
+    return tree_cache.available_and_evictable_str()

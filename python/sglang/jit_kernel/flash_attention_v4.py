@@ -4,10 +4,10 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernel_api_logging import debug_kernel_api
+
 try:
-    from sglang.jit_kernel.flash_attention.cute import (
-        flash_attn_varlen_func as _flash_attn_varlen_func,
-    )
+    from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
 except Exception as _e:  # pragma: no cover
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
@@ -19,6 +19,7 @@ def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+@debug_kernel_api
 def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -41,12 +42,11 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_softmax_lse: bool = False,
-    **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
             "Vendored FlashAttention CUTE is not available (cannot import "
-            "sglang.jit_kernel.flash_attention.cute). Please check your source tree."
+            "flash_attn.cute). Please check your source tree."
         ) from _flash_attn_import_error
 
     q, k, v = [_maybe_contiguous(t) for t in (q, k, v)]
@@ -82,6 +82,7 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
+        return_lse=return_softmax_lse,
     )
 
     if return_softmax_lse:
@@ -91,6 +92,7 @@ def flash_attn_varlen_func(
     return result
 
 
+@debug_kernel_api
 def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,

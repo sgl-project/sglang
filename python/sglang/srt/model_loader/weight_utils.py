@@ -1,10 +1,13 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
+
+import collections
 import concurrent.futures
 import fnmatch
 import glob
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -36,6 +39,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_world_group,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
@@ -55,6 +59,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
 )
+from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
 
 try:
@@ -64,20 +69,17 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
-
-def enable_hf_transfer():
-    """automatically activates hf_transfer"""
-    if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
-        try:
-            # enable hf hub transfer if available
-            import hf_transfer  # type: ignore # noqa
-
-            huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
-        except ImportError:
-            pass
+# Block size for sequential checkpoint prefetch reads (page cache warming).
+_PREFETCH_BLOCK_SIZE = None
 
 
-enable_hf_transfer()
+def _get_prefetch_block_size() -> int:
+    global _PREFETCH_BLOCK_SIZE
+    if _PREFETCH_BLOCK_SIZE is None:
+        from sglang.srt.environ import envs
+
+        _PREFETCH_BLOCK_SIZE = envs.SGLANG_PREFETCH_BLOCK_SIZE_MB.get() * 1024 * 1024
+    return _PREFETCH_BLOCK_SIZE
 
 
 # use system-level temp directory for file locks, so that multiple users
@@ -138,12 +140,10 @@ def convert_bin_to_safetensor_file(
     sf_size = os.stat(sf_filename).st_size
     pt_size = os.stat(pt_filename).st_size
     if (sf_size - pt_size) / pt_size > 0.01:
-        raise RuntimeError(
-            f"""The file size different is more than 1%:
+        raise RuntimeError(f"""The file size different is more than 1%:
          - {sf_filename}: {sf_size}
          - {pt_filename}: {pt_size}
-         """
-        )
+         """)
 
     # check if the tensors are the same
     reloaded = safetensors.torch.load_file(sf_filename)
@@ -197,6 +197,8 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        if not isinstance(hf_quant_config, dict):
+            hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
 
@@ -562,9 +564,9 @@ def download_safetensors_index_file_from_hf(
         # If file not found on remote or locally, we should not fail since
         # only some models will have index_file.
         except huggingface_hub.utils.EntryNotFoundError:
-            logger.info("No %s found in remote.", index_file)
+            logger.debug("No %s found in remote.", index_file)
         except huggingface_hub.utils.LocalEntryNotFoundError:
-            logger.info("No %s found in local cache.", index_file)
+            logger.debug("No %s found in local cache.", index_file)
 
 
 # For models like Mistral-7B-v0.3, there are both sharded
@@ -616,7 +618,11 @@ def maybe_add_mtp_safetensors(
     """
     # Only apply for GLM4Moe architecture with nextn layers
     arch = getattr(hf_config, "architectures", [None])[0]
-    num_nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+    num_nextn_layers = getattr(
+        getattr(hf_config, "text_config", hf_config),
+        "num_nextn_predict_layers",
+        getattr(hf_config, "num_nextn_predict_layers", 0),
+    )
     if not (
         arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
         and num_nextn_layers > 0
@@ -707,40 +713,127 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
-def decrypt(fn, key):
-    raise NotImplementedError()
+def _prefetch_checkpoint_file(file_path: str) -> None:
+    """Prefetch a checkpoint file into the OS page cache.
+
+    Reads the file sequentially in 16 MB blocks so the kernel caches its pages
+    before workers load the same file via mmap.
+    """
+    with open(file_path, "rb") as f:
+        while f.read(_get_prefetch_block_size()):
+            pass
 
 
-def safetensors_encrypted_weights_iterator(
-    hf_weights_files: List[str],
-    is_all_weights_sharded: bool = False,
-    decryption_key: Optional[str] = None,
-):
-    raise NotImplementedError()
+def _prefetch_all_checkpoints(
+    sorted_files: List[str],
+    num_threads: int = 4,
+) -> None:
+    """Start prefetching checkpoint files into page cache in a background thread.
+
+    When multiple ranks on the same node load the same checkpoint (e.g.
+    DP-attention), each rank independently mmaps the same files, causing
+    redundant NFS/Lustre reads. By distributing the prefetch across ranks
+    (each rank reads 1/Nth of the shards), the total network I/O is reduced
+    from N * checkpoint_size to 1 * checkpoint_size, with subsequent
+    mmap accesses hitting the shared OS page cache.
+
+    The prefetch runs in a background thread so that loading can start
+    immediately and benefit from pages that have already been cached,
+    rather than blocking until all files are prefetched. This pipelining
+    naturally adapts to any RAM size — even if the full checkpoint does
+    not fit in page cache, the prefetch thread stays ahead of the loader.
+    """
+    import asyncio
+    import threading
+    import time
+
+    # Use node-local rank so that each node independently prefetches the
+    # full checkpoint into its own page cache. Global rank would split files
+    # across nodes, but page cache is not shared across nodes.
+    if torch.distributed.is_initialized():
+        world_group = get_world_group()
+        local_rank = world_group.local_rank
+        local_world_size = world_group.local_size or world_group.world_size
+    else:
+        local_rank = 0
+        local_world_size = 1
+
+    my_files = sorted_files[local_rank::local_world_size]
+    total_for_rank = len(my_files)
+
+    logger.info(
+        "Rank %d: prefetching %d/%d checkpoint shards into page cache "
+        "(background, %d local ranks sharing the work, %d threads per rank)...",
+        local_rank,
+        total_for_rank,
+        len(sorted_files),
+        local_world_size,
+        num_threads,
+    )
+
+    async def _prefetch_all() -> None:
+        semaphore = asyncio.Semaphore(num_threads)
+        completed = 0
+        next_log_pct = 10
+
+        async def prefetch_one(path: str) -> None:
+            nonlocal completed, next_log_pct
+            try:
+                async with semaphore:
+                    await asyncio.to_thread(_prefetch_checkpoint_file, path)
+                completed += 1
+                if total_for_rank > 0 and next_log_pct <= 100:
+                    pct = 100 * completed / total_for_rank
+                    if pct >= next_log_pct:
+                        logger.info(
+                            "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
+                            local_rank,
+                            next_log_pct,
+                            completed,
+                            total_for_rank,
+                        )
+                        next_log_pct += 10
+            except Exception:
+                logger.warning(
+                    "Failed to prefetch checkpoint file %r.",
+                    path,
+                    exc_info=True,
+                )
+
+        await asyncio.gather(*(prefetch_one(p) for p in my_files))
+
+    def _run_prefetch() -> None:
+        start = time.perf_counter()
+        asyncio.run(_prefetch_all())
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "Rank %d: prefetching checkpoint files into page cache "
+            "finished in %.2fs",
+            local_rank,
+            elapsed,
+        )
+
+    threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
-    is_all_weights_sharded: bool = False,
-    decryption_key: Optional[str] = None,
     disable_mmap: bool = False,
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files.
-
-    If is_all_weights_sharded is True, it uses more optimize read by reading an
-    entire file instead of reading each tensor one by one.
-    """
-    if decryption_key:
-        yield from safetensors_encrypted_weights_iterator(
-            hf_weights_files, is_all_weights_sharded, decryption_key
-        )
-        return
-
+    """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+
+    sorted_files = sorted(hf_weights_files)
+
+    if prefetch and not disable_mmap:
+        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+
     for st_file in tqdm(
-        hf_weights_files,
+        sorted_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
         bar_format=BAR_FORMAT,
@@ -749,8 +842,8 @@ def safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
-                for name, param in result.items():
-                    yield name, param
+                for name in sorted(result.keys()):
+                    yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
@@ -814,25 +907,10 @@ def fastsafetensors_weights_iterator(
 
 def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
-    is_all_weights_sharded: bool = False,
-    decryption_key: Optional[str] = None,
-    max_workers: int = 4,
+    max_workers: int,
     disable_mmap: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Multi-Thread iterate over the weights in the model safetensor files.
-
-    If is_all_weights_sharded is True, it uses more optimize read by reading an
-    entire file instead of reading each tensor one by one.
-    """
-    if decryption_key:
-        logger.warning(
-            "Multi-Thread loading is not working for encrypted safetensor weights."
-        )
-        yield from safetensors_encrypted_weights_iterator(
-            hf_weights_files, is_all_weights_sharded, decryption_key
-        )
-        return
-
+    """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -861,6 +939,69 @@ def multi_thread_safetensors_weights_iterator(
             state_dict = future.result()
             for name, param in state_dict.items():
                 yield name, param
+
+
+def buffered_multi_thread_safetensors_weights_iterator(
+    hf_weights_files: List[str],
+    max_workers: int,
+    disable_mmap: bool = False,
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Multi-threaded safetensor loader with bounded memory via a sliding window.
+
+    At most (max_workers + 1) shard files are in-flight at any time:
+    max_workers loading concurrently + 1 prefetched and ready to yield.
+    Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+    """
+    sorted_files = sorted(hf_weights_files)
+    if prefetch and not disable_mmap:
+        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+    enable_tqdm = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+
+    def _load_file(st_file: str):
+        if disable_mmap:
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
+        else:
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
+        return result
+
+    # Sliding window: max_workers loading + 1 prefetched.
+    buffer_size = max_workers + 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        file_iter = iter(sorted_files)
+        pending: collections.deque = collections.deque()
+
+        # Seed the buffer.
+        for st_file in itertools.islice(file_iter, buffer_size):
+            pending.append(executor.submit(_load_file, st_file))
+
+        with tqdm(
+            total=len(hf_weights_files),
+            desc="Multi-thread loading shards",
+            disable=not enable_tqdm,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        ) as pbar:
+            while pending:
+                future = pending.popleft()
+                state_dict = future.result()
+                del future  # let GC reclaim the Future's internal result
+
+                # Replenish: submit the next file to keep the buffer full.
+                next_file = next(file_iter, None)
+                if next_file is not None:
+                    pending.append(executor.submit(_load_file, next_file))
+
+                for name in sorted(state_dict.keys()):
+                    yield name, state_dict[name]
+                del state_dict
+                pbar.update(1)
 
 
 def _load_pt_file(bin_file: str) -> dict:
@@ -904,7 +1045,7 @@ def pt_weights_iterator(
 
 def multi_thread_pt_weights_iterator(
     hf_weights_files: List[str],
-    max_workers: int = 4,
+    max_workers: int,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model bin/pt files."""
     enable_tqdm = (
@@ -1077,7 +1218,7 @@ def composed_weight_loader(
 
 
 def runai_safetensors_weights_iterator(
-    hf_weights_files: List[str],
+    hf_weights_files: List[str], is_distributed: bool = False, device: str = "cpu"
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     from runai_model_streamer import SafetensorsStreamer
@@ -1085,17 +1226,30 @@ def runai_safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+    device = device if is_distributed and is_cuda_alike() else "cpu"
 
     with SafetensorsStreamer() as streamer:
-        for st_file in tqdm(
+
+        streamer.stream_files(
             hf_weights_files,
+            device=device,
+            is_distributed=is_distributed,
+        )
+        total_tensors = sum(
+            len(tensors_meta)
+            for tensors_meta in streamer.files_to_tensors_metadata.values()
+        )
+
+        tensor_iter = tqdm(
+            streamer.get_tensors(),
+            total=total_tensors,
             desc="Loading safetensors using Runai Model Streamer",
-            disable=not enable_tqdm,
             bar_format=BAR_FORMAT,
-            position=tqdm._get_free_pos(),
-        ):
-            streamer.stream_file(st_file)
-            yield from streamer.get_tensors()
+            disable=not enable_tqdm,
+            mininterval=2,
+        )
+
+        yield from tensor_iter
 
 
 def set_runai_streamer_env(load_config: LoadConfig):
@@ -1192,17 +1346,22 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
         return remapped_name
 
     possible_scale_names = [".k_scale", ".v_scale"]
-    modelopt_scale_names = [".self_attn.k_proj.k_scale", ".self_attn.v_proj.v_scale"]
+    # Patterns where modelopt stores scales under k_proj/v_proj
+    # but the model expects them under attn (RadixAttention)
+    modelopt_attn_prefixes = [".self_attn.", ".mixer."]
     for scale_name in possible_scale_names:
         if name.endswith(scale_name):
-            # Check and remap the name based on modelopt scale names
-            if any(
-                modelopt_scale_name in name
-                for modelopt_scale_name in modelopt_scale_names
-            ):
+            # Check if this is a modelopt-style scale under k_proj/v_proj
+            matched_prefix = None
+            for attn_prefix in modelopt_attn_prefixes:
+                if f"{attn_prefix}{scale_name[1]}_proj{scale_name}" in name:
+                    matched_prefix = attn_prefix
+                    break
+
+            if matched_prefix is not None:
                 remapped_name = name.replace(
-                    f".self_attn.{scale_name[1]}_proj{scale_name}",
-                    f".self_attn.attn{scale_name}",
+                    f"{matched_prefix}{scale_name[1]}_proj{scale_name}",
+                    f"{matched_prefix}attn{scale_name}",
                 )
             else:
                 remapped_name = name.replace(scale_name, f".attn{scale_name}")

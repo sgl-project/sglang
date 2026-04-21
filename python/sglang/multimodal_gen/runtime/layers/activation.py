@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/activation.py
 """Custom activation functions."""
+
 import math
 from typing import Any
 
@@ -54,6 +55,9 @@ class SiluAndMul(CustomOp):
         out = torch_npu.npu_swiglu(x)
         return out
 
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.SwishGLU()(x)
+
 
 @CustomOp.register("gelu_and_mul")
 class GeluAndMul(CustomOp):
@@ -93,6 +97,9 @@ class NewGELU(CustomOp):
     def forward_cuda(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         c = math.sqrt(2.0 / math.pi)
@@ -106,6 +113,9 @@ class QuickGELU(CustomOp):
         super().__init__()
 
     def forward_cuda(self, *args, **kwargs) -> Any:
+        return self.forward_native(*args, **kwargs)
+
+    def forward_xpu(self, *args, **kwargs) -> Any:
         return self.forward_native(*args, **kwargs)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:

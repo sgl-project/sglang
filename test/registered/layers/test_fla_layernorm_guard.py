@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import sys
 from dataclasses import dataclass
 
 import pytest
@@ -10,12 +11,15 @@ import torch.nn.functional as F
 from sglang.srt.layers.attention.fla.layernorm_gated import (
     _layer_norm_fwd as layer_norm_fwd,
 )
-from sglang.srt.layers.attention.fla.layernorm_gated import layernorm_fn, rms_norm_ref
+from sglang.srt.layers.attention.fla.layernorm_gated import (
+    layernorm_fn,
+    rms_norm_ref,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=60,
-    suite="stage-b-test-large-2-gpu",
+    suite="stage-b-test-2-gpu-large",
     disabled="Temporarily disabled",
 )
 
@@ -388,4 +392,4 @@ def _layernorm_guard_misc_worker(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

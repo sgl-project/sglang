@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -40,11 +41,13 @@ class LayerwiseOffloadManager:
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
-        self.enabled = bool(enabled and torch.cuda.is_available())
+        self.enabled = bool(enabled and torch.get_device_module().is_available())
         if not self.enabled:
             return
-        self.device = torch.device("cuda", torch.cuda.current_device())
-        self.copy_stream = torch.cuda.Stream()
+        self.device = torch.device(
+            current_platform.device_type, torch.get_device_module().current_device()
+        )
+        self.copy_stream = torch.get_device_module().Stream()
 
         self._layer_name_re = re.compile(
             rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
@@ -53,16 +56,20 @@ class LayerwiseOffloadManager:
         # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
         # stores the consolidated weight from a same layer, of same dtype
         self._consolidated_cpu_weights: Dict[int, Dict[torch.dtype, torch.Tensor]] = {}
+        # layer_idx -> {name: pinned_cpu_tensor_with_original_stride}
+        # stores tensors whose original non-contiguous stride/layout must be preserved
+        self._strided_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
         # layer_idx -> {name: {dtype, offset, numel, shape}}
         # stores the offset and numel of each weight from a same layer, of same dtype
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
         # layer indices that are already in gpu
         self._gpu_layers: Set[int] = set()
-        # layer_idx -> torch.cuda.Event for fine-grained sync, to make sure the weight is resident in pre-hook
-        self._prefetch_events: Dict[int, torch.cuda.Event] = {}
+        # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
+        self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
+        self._offload_placeholders: Dict[torch.dtype, torch.Tensor] = {}
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
 
@@ -76,6 +83,28 @@ class LayerwiseOffloadManager:
             return int(m.group(2))
         except Exception:
             return None
+
+    def _get_shared_empty_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+        placeholder = self._offload_placeholders.get(dtype)
+        if placeholder is None:
+            placeholder = torch.empty((1,), device=self.device, dtype=dtype)
+            self._offload_placeholders[dtype] = placeholder
+        return placeholder
+
+    @staticmethod
+    def _get_alignment_numel(dtype: torch.dtype, alignment_bytes: int = 32) -> int:
+        element_size = torch.empty((), dtype=dtype).element_size()
+        return max(1, alignment_bytes // element_size)
+
+    @classmethod
+    def _align_numel_offset(
+        cls, offset: int, dtype: torch.dtype, alignment_bytes: int = 32
+    ) -> int:
+        alignment_numel = cls._get_alignment_numel(dtype, alignment_bytes)
+        remainder = offset % alignment_numel
+        if remainder == 0:
+            return offset
+        return offset + alignment_numel - remainder
 
     @torch.compiler.disable
     def _initialize(self) -> None:
@@ -99,10 +128,49 @@ class LayerwiseOffloadManager:
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
+            self._strided_cpu_weights[layer_idx] = {}
             self._weight_metadata[layer_idx] = {}
 
             for dtype, weights in dtype_to_params.items():
-                total_numel = sum(t.numel() for _, t in weights)
+                contiguous_weights: List[Tuple[str, torch.Tensor]] = []
+                for name, weight in weights:
+                    if weight.is_contiguous():
+                        contiguous_weights.append((name, weight))
+                        continue
+
+                    # Preserve non-contiguous layouts such as the transposed FP8
+                    # weight views expected by CUTLASS kernels.
+                    cpu_tensor = torch.empty_strided(
+                        size=weight.shape,
+                        stride=weight.stride(),
+                        dtype=dtype,
+                        pin_memory=self.pin_cpu_memory,
+                    )
+                    cpu_tensor.copy_(weight)
+                    self._strided_cpu_weights[layer_idx][name] = cpu_tensor
+                    self._weight_metadata[layer_idx][name] = {
+                        "dtype": dtype,
+                        "shape": weight.shape,
+                        "stride": weight.stride(),
+                        "preserve_strides": True,
+                    }
+                    weight.data = self._get_shared_empty_tensor(dtype)
+
+                if not contiguous_weights:
+                    continue
+
+                current_offset = 0
+                aligned_offsets: Dict[str, int] = {}
+                for name, weight in contiguous_weights:
+                    # Some fused diffusion kernels require tensor base pointers to
+                    # satisfy a 32-byte alignment contract. Reusing one flat buffer
+                    # is still fine, but each logical tensor slice must start on an
+                    # aligned offset inside that buffer.
+                    current_offset = self._align_numel_offset(current_offset, dtype)
+                    aligned_offsets[name] = current_offset
+                    current_offset += weight.numel()
+
+                total_numel = current_offset
 
                 # create concatenated CPU buffer (in pinned memory)
                 cpu_buffer = torch.empty(
@@ -110,8 +178,8 @@ class LayerwiseOffloadManager:
                 )
 
                 # offload weights to the buffer
-                current_offset = 0
-                for name, weight in weights:
+                for name, weight in contiguous_weights:
+                    current_offset = aligned_offsets[name]
                     numel = weight.numel()
                     cpu_buffer[current_offset : current_offset + numel].copy_(
                         weight.flatten()
@@ -121,9 +189,11 @@ class LayerwiseOffloadManager:
                         "offset": current_offset,
                         "numel": numel,
                         "shape": weight.shape,
+                        "stride": weight.stride(),
+                        "preserve_strides": False,
                     }
 
-                    weight.data = torch.empty((1,), device=self.device, dtype=dtype)
+                    weight.data = self._get_shared_empty_tensor(dtype)
 
                     current_offset += numel
 
@@ -144,7 +214,7 @@ class LayerwiseOffloadManager:
         for i in range(self.prefetch_size):
             self.prefetch_layer(i, non_blocking=non_blocking)
         if not non_blocking and self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
     def get_target_with_name(self, name: str) -> torch.Tensor:
         """get the target model weight/buffer to be replaced"""
@@ -167,11 +237,11 @@ class LayerwiseOffloadManager:
             return
         if layer_idx not in self._consolidated_cpu_weights:
             return
-        self.copy_stream.wait_stream(torch.cuda.current_stream())
+        self.copy_stream.wait_stream(torch.get_device_module().current_stream())
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
-        with torch.cuda.stream(self.copy_stream):
+        with torch.get_device_module().stream(self.copy_stream):
             for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
                 gpu_buffer = torch.empty(
                     cpu_buffer.shape, dtype=dtype, device=self.device
@@ -179,21 +249,38 @@ class LayerwiseOffloadManager:
                 gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
                 gpu_buffers[dtype] = gpu_buffer
 
-        # record the prefetch event of this layer
-        event = torch.cuda.Event()
+            # restore model's weights by their metadata using the same copy stream
+            # so the recorded event covers both flat-buffer and stride-preserving copies.
+            for name, meta in self._weight_metadata[layer_idx].items():
+                target = self.get_target_with_name(name)
+                if meta.get("preserve_strides", False):
+                    # Recreate the original view layout instead of flatten+view.
+                    # ModelOpt FP8 relies on a transposed runtime weight layout,
+                    # so preserving stride is part of correctness, not just an
+                    # optimization detail.
+                    cpu_tensor = self._strided_cpu_weights[layer_idx][name]
+                    gpu_tensor = torch.empty_strided(
+                        size=meta["shape"],
+                        stride=meta["stride"],
+                        dtype=meta["dtype"],
+                        device=self.device,
+                    )
+                    gpu_tensor.copy_(cpu_tensor, non_blocking=non_blocking)
+                    target.data = gpu_tensor
+                    continue
+
+                dtype = meta["dtype"]
+                gpu_buffer = gpu_buffers[dtype]
+
+                # map the parameter's data to the correct slice of the GPU buffer
+                target.data = gpu_buffer[
+                    meta["offset"] : meta["offset"] + meta["numel"]
+                ].view(meta["shape"])
+
+        # record the prefetch event of this layer after all copies are enqueued
+        event = torch.get_device_module().Event()
         event.record(self.copy_stream)
         self._prefetch_events[layer_idx] = event
-
-        # restore model's weights by their metadata using gpu buffer
-        for name, meta in self._weight_metadata[layer_idx].items():
-            dtype = meta["dtype"]
-            gpu_buffer = gpu_buffers[dtype]
-
-            # map the parameter's data to the correct slice of the GPU buffer
-            target = self.get_target_with_name(name)
-            target.data = gpu_buffer[
-                meta["offset"] : meta["offset"] + meta["numel"]
-            ].view(meta["shape"])
 
         self._gpu_layers.add(layer_idx)
 
@@ -209,15 +296,13 @@ class LayerwiseOffloadManager:
         # clear prefetch event, since it's useless and needs to be reset
         self._prefetch_events.pop(layer_idx, None)
 
-        if layer_idx <= 0:
-            return
-
         if layer_idx not in self._gpu_layers:
             return
 
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
-            target.data = torch.empty((1,), device=self.device, dtype=meta["dtype"])
+            # Wraparound prefetch will reload the layer when it is needed again
+            target.data = self._get_shared_empty_tensor(meta["dtype"])
 
         self._gpu_layers.discard(layer_idx)
 
@@ -226,7 +311,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in list(self._gpu_layers):
             self.release_layer(layer_idx)
@@ -237,7 +322,7 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in range(self.num_layers):
             if layer_idx not in self._gpu_layers:
@@ -252,11 +337,15 @@ class LayerwiseOffloadManager:
             return
 
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         # Collect current GPU weights and write back to CPU buffer
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
+            if meta.get("preserve_strides", False):
+                self._strided_cpu_weights[layer_idx][name].copy_(target.data.cpu())
+                continue
+
             gpu_weight = target.data.flatten().cpu()
 
             dtype = meta["dtype"]
@@ -271,10 +360,103 @@ class LayerwiseOffloadManager:
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in list(self._gpu_layers):
             self.sync_layer_to_cpu(layer_idx)
+
+    @torch.compiler.disable
+    def update_cpu_weights(
+        self, weight_dict: Dict[str, torch.Tensor]
+    ) -> Set[str] | None:
+        """Update consolidated CPU buffers with new weights.
+
+        When layerwise offload (--dit-layerwise-offload) is enabled, the
+        offload manager replaces GPU parameters with small torch.empty((1,))
+        placeholders while real weights live in consolidated pinned CPU
+        buffers.
+
+        The refit process writes new weights directly into the CPU buffers,
+        bypassing the placeholders.  For any layer that happens to be resident
+        on the GPU at update time, the live GPU tensor is also updated.
+
+        Args:
+            weight_dict: Mapping of parameter name to new weight tensor.
+
+        Returns:
+            Set of parameter names that were successfully updated.
+
+        Raises:
+            ValueError: If a weight's shape does not match the recorded
+                metadata (i.e., the real shape, not the placeholder shape).
+        """
+        if not self.enabled:
+            return None
+
+        updated_names: Set[str] = set()
+        for name, loaded_weight in weight_dict.items():
+            layer_idx = self._match_layer_idx(name)
+            if layer_idx is None:
+                continue
+            meta_layer = self._weight_metadata.get(layer_idx)
+            if meta_layer is None or name not in meta_layer:
+                continue
+
+            meta = meta_layer[name]
+            if tuple(meta["shape"]) != tuple(loaded_weight.shape):
+                raise ValueError(
+                    f"Shape mismatch for {name}: "
+                    f"expected={tuple(meta['shape'])}, "
+                    f"loaded={tuple(loaded_weight.shape)}"
+                )
+
+            dtype = meta["dtype"]
+            if meta.get("preserve_strides", False):
+                self._strided_cpu_weights[layer_idx][name].copy_(
+                    loaded_weight.to(dtype=dtype)
+                )
+            else:
+                offset = meta["offset"]
+                numel = meta["numel"]
+                cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+                cpu_buffer[offset : offset + numel].copy_(
+                    loaded_weight.to(dtype=dtype).flatten()
+                )
+
+            # If this layer is currently on GPU, update the live parameter.
+            if layer_idx in self._gpu_layers:
+                target = self.get_target_with_name(name)
+                target.data.copy_(loaded_weight.to(dtype=target.dtype))
+
+            updated_names.add(name)
+
+        return updated_names
+
+    def iter_cpu_weights(self):
+        """Yield (name, tensor) pairs from consolidated CPU buffers.
+
+        This reconstructs the original weight tensors (with correct shapes)
+        from the flat CPU buffers using stored metadata.  Unlike
+        model.named_parameters(), which returns (1,) placeholders
+        when offload is enabled, this method returns the real weights and
+        can be used for checksum computation.
+        """
+        for layer_idx in sorted(self._weight_metadata):
+            for name, meta in self._weight_metadata[layer_idx].items():
+                if meta.get("preserve_strides", False):
+                    # Some quantized weights rely on a non-contiguous layout.
+                    # Yield the strided tensor directly instead of rebuilding it
+                    # from the flat buffer, which would silently lose the
+                    # original stride information.
+                    yield name, self._strided_cpu_weights[layer_idx][name]
+                    continue
+
+                dtype = meta["dtype"]
+                offset = meta["offset"]
+                numel = meta["numel"]
+                shape = meta["shape"]
+                cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+                yield name, cpu_buffer[offset : offset + numel].reshape(shape)
 
     def register_forward_hooks(self) -> None:
         if not self.enabled:
@@ -288,7 +470,9 @@ class LayerwiseOffloadManager:
                 if i == 0:
                     self.prepare_for_next_req(non_blocking=False)
                 if i in self._prefetch_events:
-                    torch.cuda.current_stream().wait_event(self._prefetch_events[i])
+                    torch.get_device_module().current_stream().wait_event(
+                        self._prefetch_events[i]
+                    )
 
                 # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
                 if i % self.prefetch_size == 0:
@@ -383,3 +567,32 @@ class OffloadableDiTMixin:
                 manager.sync_all_layers_to_cpu()
                 manager.release_all()
                 manager.register_forward_hooks()
+
+
+def iter_materialized_weights(module: torch.nn.Module):
+    """Yield (name, tensor) pairs with materialized weights, even under offload.
+
+    When layerwise offload is active, module.named_parameters() returns
+    (1,) placeholders for offloaded layers.  This function reads the
+    actual data from the offload manager's CPU buffers and chains it with
+    the non-offloaded parameters.
+    """
+    offload_managers: list = []
+    if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
+        offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
+
+    if not offload_managers:
+        yield from module.named_parameters()
+        return
+
+    # Collect offloaded names and their real tensors from CPU buffers.
+    offloaded_names: set[str] = set()
+    for manager in offload_managers:
+        for name, tensor in manager.iter_cpu_weights():
+            offloaded_names.add(name)
+            yield name, tensor
+
+    # Yield non-offloaded parameters (e.g. final norms, embeddings).
+    for name, param in module.named_parameters():
+        if name not in offloaded_names:
+            yield name, param

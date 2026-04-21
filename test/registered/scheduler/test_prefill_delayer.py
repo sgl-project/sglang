@@ -3,7 +3,6 @@ import os
 import re
 import time
 import unittest
-from collections import defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
@@ -11,7 +10,6 @@ from typing import List, Optional
 import openai
 import requests
 import torch
-import torch.multiprocessing as mp
 
 from sglang.bench_serving import run_benchmark
 from sglang.srt.managers.prefill_delayer import PrefillDelayer
@@ -25,6 +23,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     get_benchmark_args,
     popen_launch_server,
+    run_distributed_test,
 )
 
 register_cuda_ci(
@@ -54,13 +53,8 @@ class NegotiateTestCase:
     expected_reason: str
 
 
-def _run_negotiate_test(rank, world_size, test_cases, results_queue, port):
-    torch.distributed.init_process_group(
-        backend="gloo",
-        init_method=f"tcp://127.0.0.1:{port}",
-        world_size=world_size,
-        rank=rank,
-    )
+def _run_negotiate_test(rank, test_cases):
+    world_size = torch.distributed.get_world_size()
     cpu_group = torch.distributed.new_group(backend="gloo")
 
     for case in test_cases:
@@ -83,9 +77,10 @@ def _run_negotiate_test(rank, world_size, test_cases, results_queue, port):
                 token_usage=call.token_usage[rank],
             )
 
-        results_queue.put((rank, case.name, result.output_allow, result.output_reason))
-
-    torch.distributed.destroy_process_group()
+        assert (result.output_allow, result.output_reason) == (
+            case.expected_allow,
+            case.expected_reason,
+        ), f"Case {case.name} rank {rank}"
 
 
 _NEGOTIATE_TEST_CASES = [
@@ -210,38 +205,12 @@ _NEGOTIATE_TEST_CASES = [
 
 class TestPrefillDelayerNegotiate(unittest.TestCase):
     def test_negotiate(self):
-        world_size = 4
-        test_cases = _NEGOTIATE_TEST_CASES
-
-        ctx = mp.get_context("spawn")
-        results_queue = ctx.Queue()
-        port = 29500 + os.getpid() % 1000
-
-        processes = []
-        for rank in range(world_size):
-            p = ctx.Process(
-                target=_run_negotiate_test,
-                args=(rank, world_size, test_cases, results_queue, port),
-            )
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
-
-        results = defaultdict(dict)
-        for _ in range(world_size * len(test_cases)):
-            rank, case_name, output_allow, output_reason = results_queue.get()
-            results[case_name][rank] = (output_allow, output_reason)
-
-        for case in test_cases:
-            for rank in range(world_size):
-                output_allow, output_reason = results[case.name][rank]
-                self.assertEqual(
-                    (output_allow, output_reason),
-                    (case.expected_allow, case.expected_reason),
-                    f"Case {case.name} rank {rank}",
-                )
+        run_distributed_test(
+            _run_negotiate_test,
+            world_size=4,
+            backend="gloo",
+            test_cases=_NEGOTIATE_TEST_CASES,
+        )
 
 
 # ============================ E2E Tests ============================
@@ -459,10 +428,10 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
 
 
 class TestPrefillDelayerAccuracy(CustomTestCase):
-    def test_1_mgsm_en_has_prefill_delayer(self):
+    def test_1_gsm8k_has_prefill_delayer(self):
         self._run_accuracy_test(prefill_delayer=True)
 
-    def test_2_mgsm_en_no_prefill_delayer(self):
+    def test_2_gsm8k_no_prefill_delayer(self):
         self._run_accuracy_test(prefill_delayer=False)
 
     def _run_accuracy_test(self, prefill_delayer: bool):
@@ -485,14 +454,14 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
             args = SimpleNamespace(
                 base_url=base_url,
                 model=model,
-                eval_name="mgsm_en",
+                eval_name="gsm8k",
                 num_examples=None,
                 num_threads=1024,
             )
             metrics = run_eval(args)
-            print(f"=== mgsm_en ({prefill_delayer=}) ===")
+            print(f"=== gsm8k ({prefill_delayer=}) ===")
             print(f"{metrics=}")
-            self.assertGreater(metrics["score"], 0.87)
+            self.assertGreater(metrics["score"], 0.57)
         finally:
             kill_process_tree(process.pid)
 
