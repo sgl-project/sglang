@@ -42,7 +42,7 @@ def fused_topk_npu(
     if not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
-            k=topk_config.top_k,
+            k=k,
         )
 
         if renormalize:
@@ -79,7 +79,7 @@ def fused_topk_npu(
     ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
-            k=topk_config.top_k,
+            k=k,
             bias=correction_bias.to(torch.float32),
             renorm=0,
             norm_type=1,
@@ -118,7 +118,9 @@ def fused_topk_npu(
                 topk_weights,
                 topk_weights.new_full(
                     (topk_weights.shape[0], n),
-                    1.0 / topk_config.routed_scaling_factor,
+                    1.0 / topk_config.routed_scaling_factor
+                    if topk_config.routed_scaling_factor
+                    else 1.0,
                 ),
             ],
             dim=-1,
@@ -131,9 +133,6 @@ def fused_topk_npu(
             )
             topk_ids = torch.cat([routed_cols, topk_ids[:, -n:]], dim=-1)
 
-        get_global_expert_distribution_recorder().on_select_experts(
-            topk_ids=topk_ids
-        )
         if (cap := get_global_experts_capturer()) is not None:
             cap.capture(
                 layer_id=layer_id,
@@ -148,6 +147,10 @@ def fused_topk_npu(
             topk_config.num_fused_shared_experts,
             router_logits.shape[1],
             topk_config,
+        )
+
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=topk_ids
         )
     else:
         if expert_location_dispatch_info is not None:
