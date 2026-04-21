@@ -34,10 +34,10 @@ import torch
 logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
-    MEDIUM_GPU,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    StorageMedium,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -898,9 +898,14 @@ class RadixCache(BasePrefixCache):
                 stack.append(child)
         return total_size
 
-    def _record_store_event(self, node: TreeNode):
+    def _record_store_event(self, node: TreeNode, medium=None):
         # One BlockStored per ``page_size`` chunk.
+        # ``medium`` defaults to StorageMedium.GPU but callers may override
+        # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
         if self.enable_kv_cache_events:
+            if medium is None:
+                medium = StorageMedium.GPU
+
             # Compute hash_value lazily if not already set
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
@@ -937,16 +942,21 @@ class RadixCache(BasePrefixCache):
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
                         lora_id=None,
-                        medium=MEDIUM_GPU,
+                        medium=medium,
                     )
                 )
 
                 parent_block_hash = block_hash
                 page_index += 1
 
-    def _record_remove_event(self, node: TreeNode):
+    def _record_remove_event(self, node: TreeNode, medium=None):
         # One BlockRemoved per chunk.
+        # ``medium`` defaults to StorageMedium.GPU but callers may override for
+        # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
         if self.enable_kv_cache_events:
+            if medium is None:
+                medium = StorageMedium.GPU
+
             # Compute hash_value lazily if not already set (must match what was stored)
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
@@ -961,7 +971,7 @@ class RadixCache(BasePrefixCache):
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
                 self.kv_event_queue.append(
-                    BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_GPU)
+                    BlockRemoved(block_hashes=[block_hash], medium=medium)
                 )
 
                 page_index += 1
