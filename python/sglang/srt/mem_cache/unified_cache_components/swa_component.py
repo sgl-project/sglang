@@ -11,8 +11,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     InsertResult,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
     ComponentType,
     EvictLayer,
     TreeComponent,
@@ -46,6 +48,8 @@ class SWAComponent(TreeComponent):
         ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(cache.token_to_kv_pool_allocator)}"
         super().__init__(cache, params)
         self.sliding_window_size = params.sliding_window_size
+        # HiCache state: set to host SWA pool when HiCache enabled
+        self._swa_kv_pool_host = None
 
     component_type = ComponentType.SWA
 
@@ -60,7 +64,10 @@ class SWAComponent(TreeComponent):
         state = {"len": float("inf")}
 
         def validator(node: UnifiedTreeNode) -> bool:
-            if node.component_data[ct].value is None:
+            cd = node.component_data[ct]
+            # HiCache: a host-only tombstone is a valid match boundary too
+            # — load_back will restore SWA from host before use.
+            if cd.value is None and cd.host_value is None:
                 state["len"] = 0
                 return False
             state["len"] += len(node.key)
@@ -192,23 +199,44 @@ class SWAComponent(TreeComponent):
         node: UnifiedTreeNode,
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
-        if target is EvictLayer.HOST:
-            return 0, 0  # TODO:SWA has no host layer currently
+        ct = self.component_type
+        cd = node.component_data[ct]
+        freed = 0
+        host_freed = 0
 
-        swa_value = node.component_data[self.component_type].value
-        if swa_value is None:
-            return 0, 0
-        # Direct swa_attn_allocator.free(swa_value) would double-free
-        # free_swa(full_value) has the mapping guard to avoid double-free
-        # TODO: decoupling full and swa free, need further discussion on mapping necessity
-        self.cache.token_to_kv_pool_allocator.free_swa(
-            node.component_data[BASE_COMPONENT_TYPE].value
-        )
-        freed = len(swa_value)
-        self.cache.component_evictable_size_[self.component_type] -= freed
-        if target is EvictLayer.DEVICE:
-            node.component_data[self.component_type].value = None
-        return freed, 0
+        # Device layer
+        if EvictLayer.DEVICE in target and cd.value is not None:
+            # Direct swa_attn_allocator.free(swa_value) would double-free.
+            # free_swa(full_value) uses the mapping guard (filters VOID=0)
+            # to avoid double-free when SWA was never allocated for some
+            # FULL slots (split alloc by alloc_full_with_suffix_swa).
+            self.cache.token_to_kv_pool_allocator.free_swa(
+                node.component_data[BASE_COMPONENT_TYPE].value
+            )
+            freed = len(cd.value)
+            self.cache.component_evictable_size_[ct] -= freed
+            cd.value = None
+
+        # Host layer
+        host_lru = self.cache.host_lru_lists[ct]
+        if EvictLayer.HOST in target and cd.host_value is not None:
+            host_freed = len(cd.host_value)
+            if self._swa_kv_pool_host is not None:
+                self._swa_kv_pool_host.free(cd.host_value)
+            cd.host_value = None
+            if host_lru.in_list(node):
+                host_lru.remove_node(node)
+
+        # After device tombstone: if host_value remains, move into host LRU
+        if (
+            target is EvictLayer.DEVICE
+            and cd.value is None
+            and cd.host_value is not None
+        ):
+            if not host_lru.in_list(node):
+                host_lru.insert_mru(node)
+
+        return freed, host_freed
 
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
@@ -304,3 +332,114 @@ class SWAComponent(TreeComponent):
         if is_finished:
             insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
         return None
+
+    # ---- HiCache Hooks ----
+
+    def build_hicache_transfers(
+        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+    ) -> Optional[list[PoolTransfer]]:
+        ct = self.component_type
+
+        if phase == CacheTransferPhase.BACKUP_HOST:
+            cd = node.component_data[ct]
+            if cd.value is None:
+                return None
+            # cd.value already holds SWA-pool indices (translated at insert time).
+            # Host pool indexing wants int64.
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    device_indices=cd.value.to(torch.int64),
+                )
+            ]
+
+        if phase == CacheTransferPhase.LOAD_BACK:
+            # Walk the evicted chain leaf→root, collecting SWA host_values until
+            # the accumulated tokens cover sliding_window_size. By INV-2 SWA
+            # host_value occupies a contiguous suffix of the chain — once we
+            # hit a node with host_value=None, no SWA above remains either.
+            collected_leaf_first: list[torch.Tensor] = []
+            nodes_leaf_first: list = []
+            n_swa = 0
+            cur = node
+            while cur.evicted:
+                cd = cur.component_data[ct]
+                if cd.host_value is None:
+                    break
+                collected_leaf_first.append(cd.host_value)
+                nodes_leaf_first.append(cur)
+                n_swa += len(cd.host_value)
+                if n_swa >= self.sliding_window_size:
+                    break
+                cur = cur.parent
+            if not collected_leaf_first:
+                return None
+            collected_leaf_first.reverse()
+            nodes_leaf_first.reverse()
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.cat(collected_leaf_first),
+                    device_indices=None,
+                    swa_suffix_tokens=n_swa,
+                    nodes_to_load=nodes_leaf_first,
+                )
+            ]
+
+        return None
+
+    def commit_hicache_transfer(
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        transfers: list[PoolTransfer] = (),
+    ) -> None:
+        ct = self.component_type
+
+        if phase == CacheTransferPhase.BACKUP_HOST:
+            if transfers and transfers[0].host_indices is not None:
+                cd = node.component_data[ct]
+                if cd.host_value is None:
+                    cd.host_value = transfers[0].host_indices.clone()
+            return
+
+        if phase == CacheTransferPhase.LOAD_BACK:
+            if not transfers or transfers[0].device_indices is None:
+                return
+            xfer = transfers[0]
+            device_indices = xfer.device_indices
+            host_lru = self.cache.host_lru_lists[ct]
+            offset = 0
+            for n in xfer.nodes_to_load or []:
+                cd_n = n.component_data[ct]
+                n_tokens = len(cd_n.host_value)
+                cd_n.value = device_indices[offset : offset + n_tokens].clone()
+                offset += n_tokens
+                if host_lru.in_list(n):
+                    host_lru.remove_node(n)
+                self.cache.lru_lists[ct].insert_mru(n)
+                self.cache.component_evictable_size_[ct] += n_tokens
+            assert offset == xfer.swa_suffix_tokens
+            return
+
+    def drive_host_eviction(
+        self, num_tokens: int, tracker: dict[ComponentType, int]
+    ) -> None:
+        """Evict SWA host resources.
+        Internal nodes: private tombstone (free SWA host only).
+        Host leaves: atomic eviction via _evict_host_leaf."""
+        ct = self.component_type
+        host_lru = self.cache.host_lru_lists[ct]
+        x = host_lru.get_lru_no_lock()
+        while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
+            x_next = host_lru.get_prev_no_lock(x)
+            cd = x.component_data[ct]
+            if x in self.cache.evictable_host_leaves:
+                self.cache._evict_host_leaf(x, tracker)
+            else:
+                assert cd.host_value is not None
+                self.cache._evict_component_and_detach_lru(
+                    x, self, target=EvictLayer.HOST, tracker=tracker
+                )
+                self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
+            x = x_next
