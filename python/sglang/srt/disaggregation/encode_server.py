@@ -18,6 +18,7 @@ import zmq
 import zmq.asyncio
 from fastapi import FastAPI
 from fastapi.responses import ORJSONResponse, Response
+from transformers import AutoProcessor
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -55,7 +56,6 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket,
 )
-from transformers import AutoProcessor
 
 logger = logging.getLogger(__name__)
 
