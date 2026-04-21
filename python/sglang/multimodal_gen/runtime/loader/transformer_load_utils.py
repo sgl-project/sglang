@@ -488,14 +488,17 @@ def _resolve_quant_config(
     quant_config = get_quant_config(
         hf_config, component_model_path, server_args=server_args
     )
+    if quant_config is None and server_args.transformer_weights_path:
+        quant_config = _resolve_quant_config_from_transformer_override(
+            server_args.transformer_weights_path
+        )
+
     quant_config_name = _get_quant_config_name(quant_config)
 
-    if quant_config is not None or not server_args.transformer_weights_path:
+    # Only return early if we have a definitive non-NVFP4 config.
+    # NVFP4 requires inference from shards, and None requires metadata probing.
+    if quant_config is not None and quant_config_name != "modelopt_fp4":
         return quant_config
-
-    quant_config = _resolve_quant_config_from_transformer_override(
-        server_args.transformer_weights_path
-    )
 
     inferred_nvfp4_config = None
     if quant_config is None or quant_config_name == "modelopt_fp4":
