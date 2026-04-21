@@ -333,9 +333,7 @@ class TestMiMoDetectorDetectAndParse(CustomTestCase):
 
     def test_parameterless_function_call(self):
         # <function=name></function> with no <parameter=...> — valid call, empty args.
-        text = (
-            "<tool_call><function=execute_bash></function></tool_call>"
-        )
+        text = "<tool_call><function=execute_bash></function></tool_call>"
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "execute_bash")
@@ -420,15 +418,12 @@ class TestMiMoDetectorStreaming(CustomTestCase):
     def test_incomplete_call_completes_on_next_chunk(self):
         detector = MiMoDetector()
         r1 = detector.parse_streaming_increment(
-            "<tool_call><function=execute_bash>"
-            "<parameter=command>ls</parameter>",
+            "<tool_call><function=execute_bash>" "<parameter=command>ls</parameter>",
             self.tools,
         )
         self.assertEqual(len(r1.calls), 0)
 
-        r2 = detector.parse_streaming_increment(
-            "</function></tool_call>", self.tools
-        )
+        r2 = detector.parse_streaming_increment("</function></tool_call>", self.tools)
         self.assertEqual(len(r2.calls), 1)
         self.assertEqual(r2.calls[0].name, "execute_bash")
 
