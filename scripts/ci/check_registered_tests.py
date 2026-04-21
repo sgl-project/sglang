@@ -34,7 +34,7 @@ def main() -> int:
     errors = []
     for f in files:
         try:
-            registries = ci_register.ut_parse_one_file(f)
+            registries, _has_main_entry = ci_register.ut_parse_one_file(f)
             if len(registries) == 0:
                 errors.append(f)
         except Exception:

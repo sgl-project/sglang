@@ -1,0 +1,520 @@
+---
+title: "DeepSeek-V3"
+metatags:
+    description: "Deploy DeepSeek-V3 MoE model with SGLang - efficient architecture with strong reasoning, coding, and tool-augmented capabilities."
+---
+
+
+## 1. Model Introduction
+
+[DeepSeek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3) is a large-scale Mixture-of-Experts (MoE) language model developed by DeepSeek, designed to deliver strong general-purpose reasoning, coding, and tool-augmented capabilities with high training and inference efficiency. As the latest generation in the DeepSeek model family, DeepSeek V3 introduces systematic architectural and training innovations that significantly improve performance across reasoning, mathematics, coding, and long-context understanding, while maintaining a competitive compute cost.
+
+Key highlights include:
+
+- **Efficient MoE architecture**: DeepSeek V3 adopts a fine-grained Mixture-of-Experts design with a large number of experts and sparse activation, enabling high model capacity while keeping inference and training costs manageable.
+- **Advanced reasoning and coding**: The model demonstrates strong performance on mathematical reasoning, logical inference, and real-world coding benchmarks, benefiting from improved data curation and training strategies.
+- **Long-context capability**: DeepSeek V3 supports extended context lengths, allowing it to handle long documents, complex multi-step reasoning, and agent-style workflows more effectively.
+- **Tool use and function calling**: The model is trained to support structured outputs and tool invocation, enabling seamless integration with external tools and agent frameworks during inference.
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
+
+import { DeepSeekV3Deployment } from "/src/snippets/autoregressive/deepseek-v3-deployment.jsx";
+
+<DeepSeekV3Deployment />
+
+### 3.2 Configuration Tips
+For more detailed configuration tips, please refer to [DeepSeek-V3 Usage](../../../docs/basic_usage/deepseek_v3).
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [Basic API Usage](../../../docs/get-started/quickstart)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Reasoning Parser
+
+DeepSeek-V3 supports reasoning mode. Enable the reasoning parser during deployment to separate the thinking and content sections:
+
+```shell Command
+python -m sglang.launch_server \
+  --model deepseek-ai/DeepSeek-V3 \
+  --reasoning-parser deepseek-v3 \
+  --tp 8
+```
+
+**Streaming with Thinking Process:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Enable streaming to see the thinking process in real-time
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V3",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    temperature=0.7,
+    max_tokens=2048,
+    extra_body = {"chat_template_kwargs": {"thinking": True}},
+    stream=True
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+To determine 15% of a number, follow these steps:
+
+**Step 1: Understand the Problem**
+You need to find 15% of a given number. Let's assume the number is 240 for this example.
+
+**Step 2: Convert the Percentage to a Decimal**
+To work with percentages in calculations, convert the percentage to its decimal form. To do this, divide the percentage by 100.
+
+\[ 15\% = \frac{15}{100} = 0.15 \]
+
+**Step 3: Multiply the Decimal by the Number**
+Now, multiply the decimal form of the percentage by the number you want to find the percentage of.
+
+\[ 0.15 \times 240 \]
+
+**Step 4: Perform the Multiplication**
+Calculate the product:
+
+\[ 0.15 \times 240 = 36 \]
+
+**Step 5: Conclusion**
+Therefore, 15% of 240 is:
+
+\boxed{36}
+
+The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
+```
+
+**Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
+
+#### 4.2.2 Tool Calling
+
+DeepSeek-V3 supports tool calling capabilities. Enable the tool call parser:
+
+**Deployment Command:**
+
+```shell Command
+python -m sglang.launch_server \
+  --model deepseek-ai/DeepSeek-V3 \
+  --tool-call-parser deepseekv3 \
+  --reasoning-parser deepseek-v3 \
+  --chat-template ./examples/chat_template/tool_chat_template_deepseekv3.jinja \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+
+**Python Example (with Thinking Process):**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V3",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    extra_body = {"chat_template_kwargs": {"thinking": True}},
+    temperature=0.7,
+    stream=True
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+tool_calls_accumulator = {}
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Accumulate tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================\n", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                index = tool_call.index
+                if index not in tool_calls_accumulator:
+                    tool_calls_accumulator[index] = {
+                        'name': None,
+                        'arguments': ''
+                    }
+
+                if tool_call.function:
+                    if tool_call.function.name:
+                        tool_calls_accumulator[index]['name'] = tool_call.function.name
+                    if tool_call.function.arguments:
+                        tool_calls_accumulator[index]['arguments'] += tool_call.function.arguments
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+# Print accumulated tool calls
+for index, tool_call in sorted(tool_calls_accumulator.items()):
+    print(f"🔧 Tool Call: {tool_call['name']}")
+    print(f"   Arguments: {tool_call['arguments']}")
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather
+```json
+{"location": "Beijing", "unit": "celsius"}
+```<｜tool▁call▁end｜><｜tool▁calls▁end｜>
+```
+
+**Note:**
+
+- The reasoning parser shows how the model decides to use a tool
+- Tool calls are clearly marked with the function name and arguments
+- You can then execute the function and send the result back to continue the conversation
+
+**Handling Tool Call Results:**
+
+Please attach the code blocks below to the previous Python script.
+
+```python Example
+# After getting the tool call, execute the function
+def get_weather(location, unit="celsius"):
+    # Your actual weather API call here
+    return f"The weather in {location} is 22°{unit[0].upper()} and sunny."
+
+# Send tool result back to the model
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Beijing", "unit": "celsius"}'
+            }
+        }]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": get_weather("Beijing", "celsius")
+    }
+]
+
+final_response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-V3",
+    messages=messages,
+    temperature=0.7
+)
+
+print(final_response.choices[0].message.content)
+# Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: AMD MI300X GPU (8x)
+- Model: DeepSeek-V3
+- Tensor Parallelism: 8
+- sglang version: 0.5.7
+
+We use SGLang's built-in benchmarking tool to conduct performance evaluation on the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset. This dataset contains real conversation data and can better reflect performance in actual use scenarios. To simulate real-world usage patterns, we configure each request with 1024 input tokens and 1024 output tokens, representing typical medium-length conversations with detailed responses.
+
+#### 5.1.1 Latency-Sensitive Benchmark
+
+- Model Deployment Command:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3 \
+  --tp 8 \
+  --dp 8 \
+  --enable-dp-attention \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --model deepseek-ai/DeepSeek-V3 \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  81.27
+Total input tokens:                      1972
+Total input text tokens:                 1972
+Total input vision tokens:               0
+Total generated tokens:                  2784
+Total generated tokens (retokenized):    2774
+Request throughput (req/s):              0.12
+Input token throughput (tok/s):          24.27
+Output token throughput (tok/s):         34.26
+Peak output token throughput (tok/s):    65.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          58.52
+Concurrency:                             1.00
+Accept length:                           2.61
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   8123.17
+Median E2E Latency (ms):                 7982.65
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1080.76
+Median TTFT (ms):                        1248.82
+P99 TTFT (ms):                           1896.37
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          25.04
+Median TPOT (ms):                        24.76
+P99 TPOT (ms):                           32.09
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           25.41
+Median ITL (ms):                         20.14
+P95 ITL (ms):                            60.28
+P99 ITL (ms):                            60.99
+Max ITL (ms):                            61.49
+==================================================
+```
+
+#### 5.1.2 Throughput-Sensitive Benchmark
+
+- Model Deployment Command:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3 \
+  --tp 8 \
+  --ep 8 \
+  --dp 8 \
+  --enable-dp-attention \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --model deepseek-ai/DeepSeek-V3 \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  406.16
+Total input tokens:                      301701
+Total input text tokens:                 301701
+Total input vision tokens:               0
+Total generated tokens:                  188375
+Total generated tokens (retokenized):    187542
+Request throughput (req/s):              2.46
+Input token throughput (tok/s):          742.81
+Output token throughput (tok/s):         463.80
+Peak output token throughput (tok/s):    1299.00
+Peak concurrent requests:                109
+Total token throughput (tok/s):          1206.61
+Concurrency:                             87.53
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   35552.98
+Median E2E Latency (ms):                 21466.07
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1521.51
+Median TTFT (ms):                        476.80
+P99 TTFT (ms):                           8329.50
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          214.73
+Median TPOT (ms):                        152.00
+P99 TPOT (ms):                           1155.85
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           182.10
+Median ITL (ms):                         79.18
+P95 ITL (ms):                            398.60
+P99 ITL (ms):                            1488.96
+Max ITL (ms):                            43465.60
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 GSM8K Benchmark
+
+- **Benchmark Command:**
+
+```shell Command
+python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 8000
+```
+
+- **Test Results**:
+  - DeepSeek-V3
+    ```text Output
+    Accuracy: 0.960
+    Invalid: 0.000
+    Latency: 32.450 s
+    Output throughput: 614.211 token/s
+    ```
+
+#### 5.2.2 MMLU Benchmark
+
+- **Benchmark Command:**
+
+```shell Command
+cd sglang
+bash benchmark/mmlu/download_data.sh
+python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 8000
+```
+
+- **Test Results**:
+  - DeepSeek-V3
+    ```text Output
+    subject: abstract_algebra, #q:100, acc: 0.800
+    subject: anatomy, #q:135, acc: 0.874
+    subject: astronomy, #q:152, acc: 0.928
+    subject: business_ethics, #q:100, acc: 0.880
+    subject: clinical_knowledge, #q:265, acc: 0.928
+    subject: college_biology, #q:144, acc: 0.965
+    subject: college_chemistry, #q:100, acc: 0.670
+    subject: college_computer_science, #q:100, acc: 0.840
+    subject: college_mathematics, #q:100, acc: 0.800
+    subject: college_medicine, #q:173, acc: 0.861
+    Total latency: 58.339
+    Average accuracy: 0.871
+    ```
