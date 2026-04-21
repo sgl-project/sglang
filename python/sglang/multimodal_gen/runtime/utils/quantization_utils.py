@@ -428,6 +428,7 @@ def _build_nvfp4_config_from_safetensors_files(
                 "group_size": group_size,
                 "ignore": exclude_modules,
                 "checkpoint_uses_packed_qkv": checkpoint_uses_packed_qkv,
+                "swap_weight_nibbles": True,  # BFL NVFP4 checkpoints pack: low nibble = odd col, high nibble = even col; swap needed so CUTLASS sees low nibble as element-0
             }
         )
         logger.info(
