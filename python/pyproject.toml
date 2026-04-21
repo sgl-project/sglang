@@ -86,11 +86,6 @@ name = "pypi"
 url = "https://pypi.org/simple"
 default = true
 
-[[tool.uv.index]]
-name = "torch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
 # To be removed after pypi sglang-kernel uses cu130
 [[tool.uv.index]]
 name = "sglang-kernel-cu130"
@@ -98,9 +93,6 @@ url = "https://docs.sglang.ai/whl/cu130/"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "torch-cu130" }
-torchvision = { index = "torch-cu130" }
-torchaudio = { index = "torch-cu130" }
 sglang-kernel = { index = "sglang-kernel-cu130" }
 
 [project.optional-dependencies]
