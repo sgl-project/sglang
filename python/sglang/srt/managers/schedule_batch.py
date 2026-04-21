@@ -110,16 +110,6 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 
-# Scheduler-owned: set once at init from SGLANG_STRIP_THINKING_CACHE AND parser
-# flag. Read by Req._cache_commit_len.
-_strip_thinking_cache_enabled: bool = False
-
-
-def set_strip_thinking_cache(enabled: bool) -> None:
-    global _strip_thinking_cache_enabled
-    _strip_thinking_cache_enabled = enabled
-
-
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -916,7 +906,7 @@ class Req(ReqDllmMixin):
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
-        if _strip_thinking_cache_enabled and self.reasoning_tokens > 0:
+        if get_global_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv_committed_len, len(self.origin_input_ids))
         return self.kv_committed_len
 

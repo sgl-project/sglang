@@ -162,7 +162,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
-    set_strip_thinking_cache,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -593,10 +592,10 @@ class Scheduler(
             self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
-            # AND env with parser flag: MiniMax-style interleaved thinking
-            # opts out even when the env is on.
-            set_strip_thinking_cache(
-                envs.SGLANG_STRIP_THINKING_CACHE.get()
+            # AND user flag with parser flag: MiniMax-style interleaved
+            # thinking opts out even when --strip-thinking-cache is set.
+            self.server_args.strip_thinking_cache = (
+                self.server_args.strip_thinking_cache
                 and reasoning_parser.detector.strip_thinking_cache
             )
 

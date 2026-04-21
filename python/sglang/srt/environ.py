@@ -266,10 +266,6 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER = EnvFloat(1.0)
-    # Strip reasoning-model output (thinking + answer) from radix cache on
-    # finish; keep only the prompt prefix. Opt-in: changing cache contents
-    # is a behavior change.
-    SGLANG_STRIP_THINKING_CACHE = EnvBool(False)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")

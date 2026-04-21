@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req, set_strip_thinking_cache
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -30,7 +30,11 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllo
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -508,13 +512,13 @@ class UnifiedRadixCacheSuite:
             req.mamba_last_track_seqlen = kv_len
         req.reasoning_tokens = 1
 
-        set_strip_thinking_cache(True)
+        get_global_server_args().strip_thinking_cache = True
         try:
             avail_before = allocator.available_size()
             tree.cache_finished_req(req, is_insert=True)
             start_p, end_p = req.pop_overallocated_kv_cache()
         finally:
-            set_strip_thinking_cache(False)
+            get_global_server_args().strip_thinking_cache = False
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
         if start_p < end_p:
