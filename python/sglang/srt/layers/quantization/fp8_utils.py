@@ -80,12 +80,14 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
 
 if _use_aiter:
     import aiter
-
-    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
     from aiter import (
-        gemm_a8w8_blockscale_bpreshuffle as gemm_a8w8_blockscale_bpreshuffle,
+        gemm_a8w8_blockscale_bpreshuffle,
+        gemm_a8w8_bpreshuffle,
+        get_hip_quant,
     )
-    from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
+    from aiter.ops.triton.gemm_a8w8_blockscale import (
+        gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+    )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -751,13 +753,6 @@ def aiter_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    def _to_bpreshuffle_x_scale_layout(x_scale_tensor: torch.Tensor) -> torch.Tensor:
-        # Keep (m, k_group) shape while switching to the transposed-major storage
-        # expected by AITER blockscale_bpreshuffle kernels.
-        return (
-            x_scale_tensor.transpose(-1, -2).contiguous().view(*x_scale_tensor.shape)
-        )
-
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -770,26 +765,22 @@ def aiter_w8a8_block_fp8_linear(
     else:
         q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
 
-    if x_scale.ndim == 2:
-        m, k = q_input.shape
-        k_groups = ceil_div(k, block_size[1])
-        expected_shape = (m, k_groups)
-        transposed_shape = (k_groups, m)
-        # Prefer the canonical (m, k_groups) interpretation first. When m == k_groups
-        # both layouts have identical shape and cannot be disambiguated by shape alone.
-        if x_scale.shape == expected_shape:
-            pass
-        elif x_scale.shape == transposed_shape:
-            x_scale = x_scale.transpose(-1, -2).contiguous()
-        else:
-            raise ValueError(
-                "AITER blockscale_bpreshuffle expects input scales with shape "
-                f"(m, k//block_k) or (k//block_k, m), got {tuple(x_scale.shape)}; "
-                f"expected {expected_shape} (or {transposed_shape})."
-            )
-        x_scale = _to_bpreshuffle_x_scale_layout(x_scale)
+    n, k = weight.shape
 
-    output = gemm_a8w8_blockscale_bpreshuffle(
+    if _use_aiter_gfx95:
+        use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+    else:
+        use_triton = True
+
+    if use_triton:
+        gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
+    else:
+        # gfx95 fallback path for shapes without a tuned triton config.
+        # Requires the weight to be preshuffled at load time (see
+        # ``Fp8LinearMethod.process_weights_after_loading_block_quant``).
+        gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
+
+    output = gemm_a8w8_blockscale_op(
         q_input,
         weight,
         x_scale,
