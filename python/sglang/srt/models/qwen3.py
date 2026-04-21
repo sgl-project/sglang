@@ -15,6 +15,10 @@ from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.on_policy_utils import (
+    get_on_policy_rms_norm_kwargs,
+    should_force_bfloat16_dense_tensor_math,
+)
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -102,13 +106,8 @@ class Qwen3Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        norm_kwargs = (
-            dict(
-                cast_x_before_out_mul=True,
-                fp32_residual=False,
-            )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
+        norm_kwargs = get_on_policy_rms_norm_kwargs(
+            weight_dtype=torch.float32,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
@@ -267,8 +266,8 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_global_server_args().rl_on_policy_target is not None:
-            hidden_states = hidden_states.bfloat16()
+        if should_force_bfloat16_dense_tensor_math():
+            hidden_states = hidden_states.to(torch.bfloat16)
 
         save_kv_cache = True
         use_aiter_fused = (
@@ -297,7 +296,7 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        if should_force_bfloat16_dense_tensor_math():
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -343,13 +342,10 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        norm_kwargs = (
-            dict(
-                cast_x_before_out_mul=True,
-                fp32_residual=False,
-            )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
+        norm_kwargs = get_on_policy_rms_norm_kwargs(
+            weight_dtype=torch.float32,
+            override_orig_dtype=torch.float32,
+            fp32_residual=True,
         )
         self.input_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs

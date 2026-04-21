@@ -4,7 +4,6 @@ from typing import Iterable, Optional
 import torch
 import torch.distributed as dist
 
-
 _TP_INVARIANT_MODE = False
 _TORCH_LIBRARY_HANDLES = []
 _MATMUL_K_BLOCK = 128
@@ -140,8 +139,7 @@ def _validate_moe_tree_reduce_inputs(
 ) -> tuple[int, int, int]:
     if input.dim() != 3:
         raise ValueError(
-            "input must have shape [tokens, topk, hidden], "
-            f"got {tuple(input.shape)}"
+            "input must have shape [tokens, topk, hidden], " f"got {tuple(input.shape)}"
         )
     if curr_topk_ids.dim() != 2:
         raise ValueError(
@@ -203,9 +201,7 @@ def moe_sum_tree_reduce(
 def _register_torch_ops() -> None:
     try:
         def_lib = torch.library.Library("tp_inv_ops", "DEF")
-        def_lib.define(
-            "matmul_tp_inv(Tensor a, Tensor b, Tensor? bias=None) -> Tensor"
-        )
+        def_lib.define("matmul_tp_inv(Tensor a, Tensor b, Tensor? bias=None) -> Tensor")
         _TORCH_LIBRARY_HANDLES.append(def_lib)
     except RuntimeError as exc:
         if "already" not in str(exc).lower():

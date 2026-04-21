@@ -23,13 +23,11 @@ from sglang.srt.layers.on_policy_utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
 
 
 def _run_server_args_script(argv: list[str]) -> dict[str, object]:
-    stubbed_imports = textwrap.dedent(
-        """
+    stubbed_imports = textwrap.dedent("""
         import argparse
         import importlib.machinery
         import json
@@ -115,8 +113,7 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
                 }
             )
         )
-        """
-    )
+        """)
 
     env = dict(os.environ)
     pythonpath = env.get("PYTHONPATH")
@@ -223,21 +220,22 @@ class TestDefaultPathUnchanged(unittest.TestCase):
     def test_default_args_row_linear_uses_quant_method(self):
         self.assertFalse(
             should_use_tp_invariant_row_linear(
-                256, server_args=self.default_args, row_linear_enable_inv=True,
+                256,
+                server_args=self.default_args,
+                row_linear_enable_inv=True,
             )
         )
 
     def test_default_args_tree_allreduce_not_selected(self):
         self.assertFalse(
             should_use_tp_invariant_tree_all_reduce(
-                server_args=self.default_args, accl_binary_tree_enabled=False,
+                server_args=self.default_args,
+                accl_binary_tree_enabled=False,
             )
         )
 
     def test_default_args_reduce_scatter_available(self):
-        self.assertFalse(
-            should_disable_reduce_scatter_for_on_policy(self.default_args)
-        )
+        self.assertFalse(should_disable_reduce_scatter_for_on_policy(self.default_args))
 
     def test_default_args_mlp_fusion_available(self):
         self.assertFalse(
@@ -245,9 +243,7 @@ class TestDefaultPathUnchanged(unittest.TestCase):
         )
 
     def test_default_args_flashinfer_fusion_available(self):
-        self.assertFalse(
-            should_disable_flashinfer_allreduce_fusion(self.default_args)
-        )
+        self.assertFalse(should_disable_flashinfer_allreduce_fusion(self.default_args))
 
     def test_default_server_args_cli_no_on_policy_flags(self):
         result = _run_server_args_script(
@@ -378,7 +374,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
                     self.assertEqual(
                         os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"], "0"
                     )
-                    self.assertEqual(os.environ["SGLANG_DISABLE_CUSTOM_ALL_REDUCE"], "0")
+                    self.assertEqual(
+                        os.environ["SGLANG_DISABLE_CUSTOM_ALL_REDUCE"], "0"
+                    )
                     batch_mod.disable_batch_invariant_mode.assert_called_once()
                     tp_mod.disable_tp_invariant_mode.assert_called_once()
 
@@ -400,22 +398,30 @@ class TestOnPolicyHelpers(unittest.TestCase):
 
         self.assertFalse(
             should_use_tp_invariant_row_linear(
-                64, server_args=server_args, row_linear_enable_inv=True,
+                64,
+                server_args=server_args,
+                row_linear_enable_inv=True,
             ),
         )
         self.assertTrue(
             should_use_tp_invariant_row_linear(
-                128, server_args=server_args, row_linear_enable_inv=True,
+                128,
+                server_args=server_args,
+                row_linear_enable_inv=True,
             ),
         )
         self.assertFalse(
             should_use_tp_invariant_row_linear(
-                300, server_args=server_args, row_linear_enable_inv=True,
+                300,
+                server_args=server_args,
+                row_linear_enable_inv=True,
             ),
         )
         self.assertTrue(
             should_use_tp_invariant_row_linear(
-                3584, server_args=server_args, row_linear_enable_inv=True,
+                3584,
+                server_args=server_args,
+                row_linear_enable_inv=True,
             ),
         )
 
@@ -423,7 +429,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
         server_args = SimpleNamespace(rl_on_policy_target="fsdp_tp")
         self.assertFalse(
             should_use_tp_invariant_row_linear(
-                256, server_args=server_args, row_linear_enable_inv=False,
+                256,
+                server_args=server_args,
+                row_linear_enable_inv=False,
             )
         )
 

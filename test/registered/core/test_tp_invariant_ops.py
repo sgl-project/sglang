@@ -31,12 +31,11 @@ from sglang.srt.tp_invariant_ops import (
     tree_all_reduce_sum,
 )
 from sglang.srt.tp_invariant_ops.tp_invariant_ops import (
+    _MATMUL_K_BLOCK,
     _fixed_tree_sum_tensors,
     _is_power_of_two,
-    _MATMUL_K_BLOCK,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
-
 
 register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
 register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-8-gpu-h200")
@@ -530,14 +529,20 @@ class TestMoeReduceSlotInvariance(unittest.TestCase):
 
         out_a = torch.zeros(4, 256, dtype=torch.bfloat16)
         moe_sum_tree_reduce(
-            input=values, output=out_a, curr_topk_ids=ids,
-            routed_scaling_factor=0.5, E=4,
+            input=values,
+            output=out_a,
+            curr_topk_ids=ids,
+            routed_scaling_factor=0.5,
+            E=4,
         )
 
         out_b = torch.zeros(4, 256, dtype=torch.bfloat16)
         moe_sum_tree_reduce(
-            input=values, output=out_b, curr_topk_ids=ids,
-            routed_scaling_factor=0.5, E=4,
+            input=values,
+            output=out_b,
+            curr_topk_ids=ids,
+            routed_scaling_factor=0.5,
+            E=4,
         )
 
         self.assertTrue(torch.equal(out_a, out_b))
@@ -592,8 +597,10 @@ class TestMoeReduceOrderMatters(unittest.TestCase):
         )
 
         slot_order_sum = (
-            input_tensor[0, 0] + input_tensor[0, 1]
-            + input_tensor[0, 2] + input_tensor[0, 3]
+            input_tensor[0, 0]
+            + input_tensor[0, 1]
+            + input_tensor[0, 2]
+            + input_tensor[0, 3]
         )
         self.assertNotEqual(output[0, 0].item(), slot_order_sum[0].item())
 
@@ -647,36 +654,47 @@ class TestEdgeCases(unittest.TestCase):
         output = torch.empty(1, 2, dtype=torch.float32)
 
         moe_sum_tree_reduce(
-            input=input_tensor, output=output, curr_topk_ids=curr_topk_ids,
-            routed_scaling_factor=1.0, E=1,
+            input=input_tensor,
+            output=output,
+            curr_topk_ids=curr_topk_ids,
+            routed_scaling_factor=1.0,
+            E=1,
         )
         expected = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
         torch.testing.assert_close(output, expected)
 
     def test_moe_sum_tree_reduce_single_topk(self):
         input_tensor = torch.tensor(
-            [[[10.0, 20.0]], [[30.0, 40.0]]], dtype=torch.float32,
+            [[[10.0, 20.0]], [[30.0, 40.0]]],
+            dtype=torch.float32,
         )
         curr_topk_ids = torch.tensor([[1], [0]], dtype=torch.int64)
         output = torch.empty(2, 2, dtype=torch.float32)
 
         moe_sum_tree_reduce(
-            input=input_tensor, output=output, curr_topk_ids=curr_topk_ids,
-            routed_scaling_factor=0.5, E=2,
+            input=input_tensor,
+            output=output,
+            curr_topk_ids=curr_topk_ids,
+            routed_scaling_factor=0.5,
+            E=2,
         )
         expected = torch.tensor([[5.0, 10.0], [15.0, 20.0]], dtype=torch.float32)
         torch.testing.assert_close(output, expected)
 
     def test_moe_sum_tree_reduce_all_remote(self):
         input_tensor = torch.tensor(
-            [[[99.0, 99.0], [99.0, 99.0]]], dtype=torch.float32,
+            [[[99.0, 99.0], [99.0, 99.0]]],
+            dtype=torch.float32,
         )
         curr_topk_ids = torch.tensor([[-1, -1]], dtype=torch.int64)
         output = torch.empty(1, 2, dtype=torch.float32)
 
         moe_sum_tree_reduce(
-            input=input_tensor, output=output, curr_topk_ids=curr_topk_ids,
-            routed_scaling_factor=1.0, E=2,
+            input=input_tensor,
+            output=output,
+            curr_topk_ids=curr_topk_ids,
+            routed_scaling_factor=1.0,
+            E=2,
         )
         expected = torch.zeros(1, 2, dtype=torch.float32)
         torch.testing.assert_close(output, expected)
@@ -684,14 +702,18 @@ class TestEdgeCases(unittest.TestCase):
     def test_moe_sum_tree_reduce_duplicate_expert_ids(self):
         """Same expert in multiple slots: both contributions must be summed."""
         input_tensor = torch.tensor(
-            [[[10.0, 20.0], [30.0, 40.0]]], dtype=torch.float32,
+            [[[10.0, 20.0], [30.0, 40.0]]],
+            dtype=torch.float32,
         )
         curr_topk_ids = torch.tensor([[0, 0]], dtype=torch.int64)
         output = torch.empty(1, 2, dtype=torch.float32)
 
         moe_sum_tree_reduce(
-            input=input_tensor, output=output, curr_topk_ids=curr_topk_ids,
-            routed_scaling_factor=1.0, E=2,
+            input=input_tensor,
+            output=output,
+            curr_topk_ids=curr_topk_ids,
+            routed_scaling_factor=1.0,
+            E=2,
         )
         expected = torch.tensor([[40.0, 60.0]], dtype=torch.float32)
         torch.testing.assert_close(output, expected)
@@ -714,33 +736,41 @@ class TestInputValidation(unittest.TestCase):
     def test_moe_rejects_wrong_input_dims(self):
         with self.assertRaisesRegex(ValueError, "tokens, topk, hidden"):
             moe_sum_tree_reduce(
-                input=torch.zeros(4, 8), output=torch.zeros(4, 8),
+                input=torch.zeros(4, 8),
+                output=torch.zeros(4, 8),
                 curr_topk_ids=torch.zeros(4, 2, dtype=torch.int64),
-                routed_scaling_factor=1.0, E=2,
+                routed_scaling_factor=1.0,
+                E=2,
             )
 
     def test_moe_rejects_wrong_topk_ids_dims(self):
         with self.assertRaisesRegex(ValueError, "tokens, topk"):
             moe_sum_tree_reduce(
-                input=torch.zeros(4, 2, 8), output=torch.zeros(4, 8),
+                input=torch.zeros(4, 2, 8),
+                output=torch.zeros(4, 8),
                 curr_topk_ids=torch.zeros(4, dtype=torch.int64),
-                routed_scaling_factor=1.0, E=2,
+                routed_scaling_factor=1.0,
+                E=2,
             )
 
     def test_moe_rejects_shape_mismatch_between_input_and_ids(self):
         with self.assertRaisesRegex(ValueError, "must match"):
             moe_sum_tree_reduce(
-                input=torch.zeros(4, 2, 8), output=torch.zeros(4, 8),
+                input=torch.zeros(4, 2, 8),
+                output=torch.zeros(4, 8),
                 curr_topk_ids=torch.zeros(4, 3, dtype=torch.int64),
-                routed_scaling_factor=1.0, E=2,
+                routed_scaling_factor=1.0,
+                E=2,
             )
 
     def test_moe_rejects_wrong_output_shape(self):
         with self.assertRaisesRegex(ValueError, "output must have shape"):
             moe_sum_tree_reduce(
-                input=torch.zeros(4, 2, 8), output=torch.zeros(4, 4),
+                input=torch.zeros(4, 2, 8),
+                output=torch.zeros(4, 4),
                 curr_topk_ids=torch.zeros(4, 2, dtype=torch.int64),
-                routed_scaling_factor=1.0, E=2,
+                routed_scaling_factor=1.0,
+                E=2,
             )
 
     def test_is_power_of_two_helper(self):
@@ -783,7 +813,9 @@ class TestDistributedTreeAllReduce(unittest.TestCase):
             value = torch.full((4,), float(rank + 1), device=device)
             actual = tree_all_reduce_sum(value)
             expected = torch.full(
-                (4,), float(world_size * (world_size + 1) // 2), device=device,
+                (4,),
+                float(world_size * (world_size + 1) // 2),
+                device=device,
             )
 
             torch.testing.assert_close(actual, expected)
