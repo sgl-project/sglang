@@ -108,7 +108,7 @@ def unpack_and_dequant_kcache(
     shape = data.shape
     num_groups = shape[2] // group_size
     data = data.view(shape[:2] + (num_groups, group_size) + shape[3:])
-    data = data.to(torch.float16)
+    data = data.to(scale.dtype)
     data = data * scale + mn
     return data.view(shape)
 
@@ -124,7 +124,7 @@ def unpack_and_dequant_vcache(
     shape = data.shape
     num_groups = shape[-1] // group_size
     data = data.view(shape[:-1] + (num_groups, group_size))
-    data = data.to(torch.float16)
+    data = data.to(scale.dtype)
     data = data * scale + mn
     return data.view(shape)
 
