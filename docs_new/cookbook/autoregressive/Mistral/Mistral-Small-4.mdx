@@ -1,0 +1,393 @@
+---
+title: Mistral Small 4
+metatags:
+    description: "Deploy Mistral Small 4 with SGLang - unified hybrid model combining instruct, reasoning, and agentic capabilities with multimodal support."
+---
+
+import { MistralSmall4Deployment } from '/src/snippets/autoregressive/mistral-small-4-deployment.jsx';
+
+## 1. Model Introduction
+
+**Mistral Small 4** is a powerful hybrid model from Mistral AI that unifies the capabilities of three different model families — **Instruct**, **Reasoning** (formerly called Magistral), and **Agentic (formerly called Devstral)** — into a single, unified model.
+
+With its multimodal capabilities, efficient MoE architecture, and flexible mode switching, Mistral Small 4 is a versatile general-purpose model for virtually any task. In a latency-optimized setup, it achieves a 40% reduction in end-to-end completion time; in a throughput-optimized setup, it delivers 3× more requests per second compared to Mistral Small 3.
+
+**Key Features:**
+
+- **Hybrid Reasoning**: Switch between instant reply mode and deep reasoning/thinking mode — reasoning effort is configurable per request
+- **Vision**: Accepts both text and image inputs, providing insights based on visual content
+- **Function Calling**: Native tool calling and JSON output support with best-in-class agentic capabilities
+- **Multilingual**: Supports dozens of languages including English, French, Spanish, German, Chinese, Japanese, Korean, Arabic, and more
+- **Context Window**: 256K context window
+- **Efficient MoE**: 119B total parameters, 128 experts, 4 active per token (6.5B activated parameters)
+- **Apache 2.0 License**: Open-source, usable and modifiable for commercial and non-commercial purposes
+- Reasoning effort supported are only **"none" and "high"**
+
+**Architecture:**
+
+- Same general architecture as Mistral 3
+- MoE: 128 experts, 4 active per token
+- 119B total parameters, 6.5B activated per token
+- Multimodal input: text + image
+
+**Models:**
+
+- **[mistralai/Mistral-Small-4-119B-2603](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603)** (FP8)
+- **[mistralai/Mistral-Small-4-119B-2603-NVFP4](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603-NVFP4)**
+- **[mistralai/Leanstral-2603](https://huggingface.co/mistralai/Leanstral-2603)** — same architecture, use the same launch commands as Mistral-Small-4-119B-2603
+- **[mistralai/Mistral-Small-4-119B-2603-eagle](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603-eagle)** — EAGLE speculative decoding weights for faster inference
+
+---
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
+
+<Info>
+Mistral Small 4 support landed in [sgl-project/sglang#20708](https://github.com/sgl-project/sglang/pull/20708) and has been merged into `main`. A model-specific Docker image is no longer required. Use the standard SGLang installation methods from the [official installation guide](../../../docs/get-started/installation).
+</Info>
+
+---
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to generate a launch command for Mistral Small 4.
+
+<MistralSmall4Deployment />
+
+### 3.2 Configuration Tips
+
+- **Tensor Parallelism**: Mistral Small 4 FP8 (~119 GB) requires tp=2 on Hopper (H100/H200), tp=1 on Blackwell (B200/B300). NVFP4 (~60 GB, Blackwell only) runs with tp=1.
+- **Reasoning effort**: Reasoning depth is configurable per request via `reasoning_effort` (`"none"`, `"high"`). No restart required — toggle per call.
+- **Context length vs memory**: The model has a 256K context window. If you are memory-constrained, lower `--context-length` (e.g. `32768`) and increase once things are stable.
+- **Tool calling**: Enable `--tool-call-parser mistral` to activate native function calling support.
+- **Reasoning parser**: Enable `--reasoning-parser mistral` to separate `reasoning_content` from the main response content.
+- **Speculative decoding (EAGLE)**: Enable with `--speculative-algorithm EAGLE --speculative-draft-model-path mistralai/Mistral-Small-4-119B-2603-eagle` using the [EAGLE weights](https://huggingface.co/mistralai/Mistral-Small-4-119B-2603-eagle) for lower latency.
+
+---
+
+## 4. Model Invocation
+
+### 4.1 Thinking Mode
+
+Mistral Small 4 is a hybrid reasoning model. By default, it does not produce a default reasoning response. Use `--reasoning_effort high` to toggle reasoning on.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="mistralai/Mistral-Small-4-119B-2603",
+    messages=[
+        {"role": "user", "content": "Solve step by step: what is 17 × 23 + 144 / 12?"},
+    ],
+    extra_body={"reasoning_effort": "high"},
+)
+
+print("Reasoning:", response.choices[0].message.reasoning_content)
+print("Answer:", response.choices[0].message.content)
+```
+
+**Output:**
+
+```text Output
+Reasoning: First, I'll break down the problem into two parts: the multiplication and
+the division. According to the order of operations (PEMDAS/BODMAS), multiplication and
+division are performed from left to right before addition.
+
+17 × 23 = 17 × (20 + 3) = (17 × 20) + (17 × 3) = 340 + 51 = 391
+144 / 12 = 12
+
+Finally, add the results: 391 + 12 = 403
+
+Answer: The solution to the problem is as follows:
+
+1. First, perform the multiplication: 17 × 23.
+   - 17 × 20 = 340
+   - 17 × 3 = 51
+   - 340 + 51 = 391
+
+2. Then, perform the division: 144 / 12 = 12.
+
+3. Finally, add the results:
+   - 391 + 12 = 403
+
+**Answer:** \boxed{403}
+```
+
+### 4.2 Instruct Mode (Reasoning Off)
+
+To skip the reasoning trace and get a fast direct response, set `reasoning_effort` to `"none"`:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="mistralai/Mistral-Small-4-119B-2603",
+    messages=[
+        {"role": "user", "content": "Write a Python function to reverse a string."},
+    ],
+    extra_body={"reasoning_effort": "none"},
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output:**
+
+````text Output
+# Python Function to Reverse a String
+
+Here are several ways to write a Python function to reverse a string:
+
+## Method 1: Using String Slicing (Most Pythonic)
+```python
+def reverse_string(s):
+    """Reverse a string using slicing."""
+    return s[::-1]
+```
+
+## Method 2: Using a Loop
+```python Example
+def reverse_string(s):
+    """Reverse a string using a loop."""
+    reversed_str = ""
+    for char in s:
+        reversed_str = char + reversed_str
+    return reversed_str
+```
+
+## Method 3: Using reversed() function
+```python Example
+def reverse_string(s):
+    """Reverse a string using reversed() function."""
+    return ''.join(reversed(s))
+```
+
+The first method using string slicing (`s[::-1]`) is generally the most efficient and
+recommended approach in Python.
+
+Example usage:
+```python Example
+original = "Hello, World!"
+reversed_str = reverse_string(original)
+print(reversed_str)  # Output: "!dlroW ,olleH"
+```
+````
+
+### 4.3 Streaming with Reasoning
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+stream = client.chat.completions.create(
+    model="mistralai/Mistral-Small-4-119B-2603",
+    messages=[
+        {"role": "user", "content": "Explain the difference between async and threading in Python."},
+    ],
+    extra_body={"reasoning_effort": "high"},
+    stream=True,
+)
+
+print("=== Reasoning ===")
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+        print(delta.reasoning_content, end="", flush=True)
+    elif delta.content:
+        print("\n=== Response ===")
+        print(delta.content, end="", flush=True)
+print()
+```
+
+**Output:**
+
+```text Output
+=== Reasoning ===
+Okay, the user is asking about the difference between async and threading in Python.
+I need to break this down clearly, covering the key aspects of both, like their
+purposes, performance characteristics, and use cases...
+=== Response ===
+In Python, **`async`/`asyncio`** and **`threading`** are two different concurrency
+models, each suited for specific use cases. Here's a breakdown of their key differences:
+
+### 1. Model of Concurrency
+- **Threading**: Based on preemptive multitasking using OS threads.
+- **Async** (`asyncio`): Based on cooperative multitasking. Tasks voluntarily yield...
+```
+
+### 4.4 Tool Calling
+
+Mistral Small 4 supports native function calling. Enable with `--tool-call-parser mistral`:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="mistralai/Mistral-Small-4-119B-2603",
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=tools,
+    tool_choice="auto",
+)
+
+tool_calls = response.choices[0].message.tool_calls
+for tc in tool_calls:
+    print(f"Tool: {tc.function.name}")
+    print(f"Args: {tc.function.arguments}")
+```
+
+**Output:**
+
+```text Output
+Tool: get_weather
+Args: {"location": "Paris"}
+```
+
+### 4.5 Vision (Image Input)
+
+Mistral Small 4 accepts image inputs alongside text:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="mistralai/Mistral-Small-4-119B-2603",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe what you see in this image."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"},
+                },
+            ],
+        }
+    ],
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output:**
+
+```text Output
+The image is a copyright symbol, represented by a stylized version of the lowercase
+letter "c" inside a circle. The "c" is depicted in a white or light-colored font, and
+the circle is orange. The design is simple yet striking, using oval and elliptical
+shapes to create a distinct symbol which signifies copyright protection.
+```
+
+---
+
+## 5. Benchmarks
+
+### 5.1 Accuracy Benchmarks
+
+#### GSM8K
+
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py --port 30000
+```
+
+**Results:**
+
+```text Output
+TODO
+```
+
+#### MMLU
+
+```bash Command
+python3 benchmark/mmlu/bench_sglang.py --port 30000
+```
+
+**Results:**
+
+```text Output
+TODO
+```
+
+### 5.2 Speed Benchmarks
+
+#### Latency (Low Concurrency)
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --port 30000
+```
+
+**Results:**
+
+```text Output
+TODO
+```
+
+#### Throughput (High Concurrency)
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --num-prompts 1000 \
+  --max-concurrency 100 \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --port 30000
+```
+
+**Results:**
+
+```text Output
+TODO
+```
