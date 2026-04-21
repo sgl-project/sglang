@@ -161,6 +161,7 @@ class NgramVerifyInput(SpecInput):
         accept_index_cpu = self.accepted_indices.tolist()
         predict_cpu = self.predict.tolist()
         has_finished = False
+        think_end_id = batch.model_config.think_end_id
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -170,6 +171,8 @@ class NgramVerifyInput(SpecInput):
                     break
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
+                if req.require_reasoning and think_end_id is not None:
+                    req.update_reasoning_tokens(id, think_end_id)
                 req.check_finished()
                 if req.finished():
                     has_finished = True

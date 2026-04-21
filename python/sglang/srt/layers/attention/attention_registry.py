@@ -1,6 +1,10 @@
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.configs.linear_attn_model_registry import (
+    get_linear_attn_config,
+    import_backend_class,
+)
 from sglang.srt.utils import get_device_capability, is_musa
 
 _is_musa = is_musa()
@@ -94,16 +98,9 @@ def create_triton_backend(runner):
         "Cross attention is not supported in the triton attention backend. "
         "Please use `--attention-backend flashinfer`."
     )
-    if runner.server_args.enable_double_sparsity:
-        from sglang.srt.layers.attention.double_sparsity_backend import (
-            DoubleSparseAttnBackend,
-        )
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
-        return DoubleSparseAttnBackend(runner)
-    else:
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-        return TritonAttnBackend(runner)
+    return TritonAttnBackend(runner)
 
 
 @register_attention_backend("torch_native")
@@ -136,15 +133,21 @@ def create_flashattention_v3_backend(runner):
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        return FlashAttentionBackend(runner)
     else:
-        assert major >= 3 and minor >= 1, (
+        assert major == 3 and minor >= 1, (
             "FlashAttention v3 Backend requires MP>=31. "
             "Please use `--attention-backend triton`."
         )
+        from sglang.srt.hardware_backend.musa.attention import (
+            MusaFlashAttentionBackend,
+        )
 
-    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-
-    return FlashAttentionBackend(runner)
+        return MusaFlashAttentionBackend(runner)
 
 
 @register_attention_backend("fa4")
@@ -234,9 +237,17 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.hybrid_lightning_config is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
-            raise ValueError(
-                "Expected hybrid GDN or NemotronH models, but got unknown model."
-            )
+            spec_result = get_linear_attn_config(runner.model_config.hf_config)
+            if spec_result is not None:
+                spec, _ = spec_result
+                BackendClass = import_backend_class(spec.backend_class_name)
+                linear_attn_backend = BackendClass(runner)
+            else:
+                raise ValueError(
+                    "Expected hybrid GDN or NemotronH models, but got unknown model. "
+                    "If this is a custom hybrid model, use register_linear_attn_model() "
+                    "from sglang.srt.configs.linear_attn_model_registry."
+                )
         full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(
             full_attn_backend, linear_attn_backend, full_attn_layers

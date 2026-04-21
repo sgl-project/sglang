@@ -7,8 +7,13 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
@@ -377,6 +382,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 deterministic=True,
             )
 
+            # Sync sampling results across TP ranks: different GPUs may
+            # produce slightly different target_probs due to floating-point
+            # non-determinism in softmax/top_k/top_p, causing different
+            # sampled tokens. Broadcast from rank 0 to ensure consistency.
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(accept_length, src=0)
+
         if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
             accept_index = generate_simulated_accept_index(
@@ -392,6 +411,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
         has_finished = False
+        think_end_id = batch.model_config.think_end_id
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -403,21 +423,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 num_accepted += 1
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
+                if req.require_reasoning and think_end_id is not None:
+                    req.update_reasoning_tokens(id, think_end_id)
                 req.check_finished()
+                if not req.finished() and req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(id)
+                    except ValueError as e:
+                        logger.info(
+                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                        )
+                        raise e
+                    req.check_finished()
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
                     accept_index[i, j + 1 :] = -1
                     break
-                else:
-                    if req.grammar is not None:
-                        try:
-                            req.grammar.accept_token(id)
-                        except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                            )
-                            raise e
             # Update KV cache tracking for the accepted tokens
             req.kv_committed_len += num_accepted
             req.kv_allocated_len = req.kv_committed_len

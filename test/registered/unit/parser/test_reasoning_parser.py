@@ -5,6 +5,7 @@ import unittest
 from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
+    Gemma4Detector,
     Glm45Detector,
     KimiDetector,
     KimiK2Detector,
@@ -16,7 +17,7 @@ from sglang.srt.parser.reasoning_parser import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
 
 
 class TestStreamingParseResult(CustomTestCase):
@@ -586,6 +587,141 @@ class TestNemotron3Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
+class TestGemma4Detector(CustomTestCase):
+    def setUp(self):
+        self.detector = Gemma4Detector()
+
+    def test_init(self):
+        """Test Gemma4Detector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<|channel>")
+        self.assertEqual(self.detector.think_end_token, "<channel|>")
+        self.assertEqual(self.detector.think_start_self_label, "thought\n")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertTrue(self.detector.stream_reasoning)
+
+    def test_detect_and_parse_complete_reasoning(self):
+        """Test parsing complete Gemma4 reasoning block (think_start_self_label is stripped)."""
+        text = "<|channel>thought\nLet me think about this<channel|>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think about this")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_without_thinking(self):
+        """Test parsing without thinking (enable_thinking=False case)."""
+        text = "Direct answer without thinking."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_detect_and_parse_reasoning_only(self):
+        """Test parsing when output is all reasoning (no end token yet)."""
+        text = "<|channel>thought\nStill thinking..."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Still thinking...")
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_complete_flow(self):
+        """Test streaming parse of Gemma4 reasoning flow."""
+        chunks = [
+            "<|channel>",
+            "thought\nreasoning content",
+            "<channel|>",
+            "final answer",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk)
+            all_reasoning += result.reasoning_text
+            all_normal += result.normal_text
+        self.assertIn("reasoning content", all_reasoning)
+        self.assertIn("final answer", all_normal)
+
+    def test_streaming_full_start_sequence(self):
+        """Test streaming with the full start sequence (token + self_label)."""
+        # Gemma4 start sequence is "<|channel>thought\n", not just "<|channel>"
+        result = self.detector.parse_streaming_increment("<|channel>thought\n")
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertTrue(self.detector._in_reasoning)
+
+        result = self.detector.parse_streaming_increment("reasoning content")
+        self.assertEqual(result.reasoning_text, "reasoning content")
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_partial_start_buffered(self):
+        """Test that partial start sequence is buffered."""
+        # "<|channel>" alone is a prefix of "<|channel>thought\n", so it's buffered
+        result = self.detector.parse_streaming_increment("<|channel>")
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_streaming_end_token_mid_chunk(self):
+        """Test end token arriving in the same chunk as reasoning content."""
+        self.detector.parse_streaming_increment("<|channel>thought\n")
+        result = self.detector.parse_streaming_increment(
+            "some reasoning<channel|>the answer"
+        )
+        self.assertEqual(result.reasoning_text, "some reasoning")
+        self.assertEqual(result.normal_text, "the answer")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_streaming_split_end_token(self):
+        """Test end token split across two chunks."""
+        self.detector.parse_streaming_increment("<|channel>thought\n")
+        self.detector.parse_streaming_increment("reasoning content")
+
+        result1 = self.detector.parse_streaming_increment("<chan")
+        self.assertEqual(result1.normal_text, "")
+
+        result2 = self.detector.parse_streaming_increment("nel|>final answer")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertIn("final answer", result2.normal_text)
+
+    def test_streaming_self_label_split_across_chunks(self):
+        """Test self_label ('thought\\n') arriving separately from start token."""
+        result1 = self.detector.parse_streaming_increment("<|channel>")
+        self.assertEqual(result1.reasoning_text, "")
+        self.assertEqual(result1.normal_text, "")
+
+        result2 = self.detector.parse_streaming_increment("thought\n")
+        self.assertTrue(self.detector._in_reasoning)
+
+        result3 = self.detector.parse_streaming_increment("reasoning here")
+        self.assertEqual(result3.reasoning_text, "reasoning here")
+
+    def test_streaming_force_reasoning(self):
+        """Test streaming with force_reasoning=True (no start token needed)."""
+        detector = Gemma4Detector(force_reasoning=True)
+
+        result1 = detector.parse_streaming_increment("reasoning content")
+        self.assertEqual(result1.reasoning_text, "reasoning content")
+        self.assertEqual(result1.normal_text, "")
+
+        result2 = detector.parse_streaming_increment("<channel|>the answer")
+        self.assertFalse(detector._in_reasoning)
+        self.assertIn("the answer", result2.normal_text)
+
+    def test_streaming_multiple_reasoning_chunks(self):
+        """Test reasoning content arriving in many small chunks."""
+        self.detector.parse_streaming_increment("<|channel>thought\n")
+
+        all_reasoning = ""
+        for chunk in ["Think", "ing ", "step ", "by ", "step."]:
+            result = self.detector.parse_streaming_increment(chunk)
+            all_reasoning += result.reasoning_text
+            self.assertEqual(result.normal_text, "")
+        self.assertEqual(all_reasoning, "Thinking step by step.")
+
+    def test_force_reasoning(self):
+        """Test Gemma4Detector with force_reasoning=True."""
+        detector = Gemma4Detector(force_reasoning=True)
+        text = "This should be reasoning<channel|>The answer."
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "This should be reasoning")
+        self.assertEqual(result.normal_text, "The answer.")
+
+
 class TestReasoningParser(CustomTestCase):
     def test_init_valid_model(self):
         """Test initialization with valid model types."""
@@ -603,6 +739,9 @@ class TestReasoningParser(CustomTestCase):
 
         parser = ReasoningParser("glm45")
         self.assertIsInstance(parser.detector, Glm45Detector)
+
+        parser = ReasoningParser("gemma4")
+        self.assertIsInstance(parser.detector, Gemma4Detector)
 
     def test_init_invalid_model(self):
         """Test initialization with invalid model type."""
@@ -780,6 +919,35 @@ class TestIntegrationScenarios(CustomTestCase):
 
         self.assertIn("analyze", all_reasoning)
         self.assertIn("multiple factors", all_reasoning)
+        self.assertIn("42", all_normal)
+
+    def test_gemma4_complete_response(self):
+        """Test complete Gemma4 response parsing (think_start_self_label stripped)."""
+        parser = ReasoningParser("gemma4")
+        text = "<|channel>thought\nI need to solve x + 2 = 5. Subtracting 2: x = 3.<channel|>The answer is x = 3."
+        reasoning, normal = parser.parse_non_stream(text)
+        self.assertIn("x = 3", reasoning)
+        self.assertNotIn("thought\n", reasoning)
+        self.assertEqual(normal, "The answer is x = 3.")
+
+    def test_gemma4_streaming_scenario(self):
+        """Test Gemma4 streaming scenario."""
+        parser = ReasoningParser("gemma4")
+        chunks = [
+            "<|channel>",
+            "thought\nLet me analyze.",
+            " Multiple factors.",
+            "<channel|>",
+            "The solution is 42.",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+        self.assertIn("analyze", all_reasoning)
+        self.assertIn("Multiple factors", all_reasoning)
         self.assertIn("42", all_normal)
 
     def test_empty_reasoning_blocks(self):

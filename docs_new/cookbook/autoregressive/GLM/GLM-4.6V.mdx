@@ -1,0 +1,382 @@
+---
+title: GLM-4.6V
+metatags:
+    description: "Deploy GLM-4.6V vision-language model with SGLang - native function calling, 128K context, multimodal document understanding and frontend replication."
+---
+
+## 1. Model Introduction
+
+GLM-4.6V series model includes two versions: GLM-4.6V (106B), a foundation model designed for cloud and high-performance cluster scenarios, and GLM-4.6V-Flash (9B), a lightweight model optimized for local deployment and low-latency applications. GLM-4.6V scales its context window to 128k tokens in training, and achieves SoTA performance in visual understanding among models of similar parameter scales. Crucially, GLM team integrated native Function Calling capabilities for the first time. This effectively bridges the gap between "visual perception" and "executable action" providing a unified technical foundation for multimodal agents in real-world business scenarios.
+
+Beyond achieves SoTA performance across major multimodal benchmarks at comparable model scales. GLM-4.6V introduces several key features:
+
+- **Native Multimodal Function Calling** Enables native vision-driven tool use. Images, screenshots, and document pages can be passed directly as tool inputs without text conversion, while visual outputs (charts, search images, rendered pages) are interpreted and integrated into the reasoning chain. This closes the loop from perception to understanding to execution. Please refer to this [example](#tool-call-example).
+- **Interleaved Image-Text Content Generation** Supports high-quality mixed media creation from complex multimodal inputs. GLM-4.6V takes a multimodal context—spanning documents, user inputs, and tool-retrieved images—and synthesizes coherent, interleaved image-text content tailored to the task. During generation it can actively call search and retrieval tools to gather and curate additional text and visuals, producing rich, visually grounded content.
+- **Multimodal Document Understanding** GLM-4.6V can process up to 128K tokens of multi-document or long-document input, directly interpreting richly formatted pages as images. It understands text, layout, charts, tables, and figures jointly, enabling accurate comprehension of complex, image-heavy documents without requiring prior conversion to plain text.
+- **Frontend Replication & Visual Editing** Reconstructs pixel-accurate HTML/CSS from UI screenshots and supports natural-language-driven edits. It detects layout, components, and styles visually, generates clean code, and applies iterative visual modifications through simple user instructions.
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+### 2.1 Docker Installation (Recommended)
+
+```shell Command
+docker pull lmsysorg/sglang:latest
+```
+
+**Advantages:**
+
+- Ready to use out of the box, no manual environment configuration needed
+- Avoids dependency conflict issues
+- Easy to migrate between different environments
+
+### 2.2 Build from Source
+
+If you need to use the latest development version or require custom modifications, you can build from source:
+
+```bash Command
+# Install SGLang using UV (recommended)
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+uv venv
+source .venv/bin/activate
+uv pip install -e "python[all]" --index-url=https://pypi.org/simple
+pip install nvidia-cudnn-cu12==9.16.0.29
+# Install ffmpeg to support video input
+sudo apt update
+sudo apt install ffmpeg
+```
+
+**Use Cases:**
+
+- Need to customize and modify SGLang source code
+- Want to use the latest development features
+- Participate in SGLang project development
+
+For general installation instructions, you can also refer to the [official SGLang installation guide](../../../docs/get-started/installation).
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the interactive configuration generator below to customize your deployment settings. Select your hardware platform, model size, quantization method, and other options to generate the appropriate launch command.
+
+import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deployment.jsx";
+
+<GLM46VDeployment />
+
+### 3.2 Configuration Tips
+- **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
+- **TP=8 Configuration**: When using Tensor Parallelism (TP) of 8, the vision attention's 12 heads cannot be evenly divided. You can resolve this by adding `--mm-enable-dp-encoder` (which the generator above handles automatically).
+- **Fast Model Loading**: For large models (like the 106B version), you can speed up model loading by using `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
+- For more detailed configuration tips, please refer to [GLM-4.5V/GLM-4.6V Usage](../../../docs/basic_usage/glmv).
+
+## 4. Example APIs
+
+### Image Input Example
+
+#### API Payload
+```python Example
+curl_command = f"""
+curl -s http://localhost:{30000}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{{
+    "model": "default",
+    "messages": [
+      {{
+        "role": "user",
+        "content": [
+          {{
+            "type": "image_url",
+            "image_url": {{
+              "url": "/home/jobuser/sgl_logo.png"
+            }}
+          }},
+          {{
+            "type": "text",
+            "text": "What is the image"
+          }}
+        ]
+      }}
+    ],
+    "temperature": "0",
+    "max_completion_tokens": "1000",
+    "max_tokens": "1000"
+  }}'
+"""
+
+response = subprocess.check_output(curl_command, shell=True).decode()
+print(response)
+```
+
+#### API Response
+```text Output
+{"id":"b61596ca71394dd699fd8abd4f650c44","object":"chat.completion","created":1765259019,"model":"default","choices":[{"index":0,"message":{"role":"assistant","content":"The image is a logo featuring the text \"SGL\" (in a bold, orange-brown font) alongside a stylized icon. The icon includes a network-like structure with circular nodes (suggesting connectivity or a tree/graph structure) and a tag with \"</>\" (a common symbol for coding, web development, or software). The color scheme uses warm orange-brown tones with a black background, giving it a tech-focused, modern aesthetic (likely representing a company, project, or tool related to software, web development, or digital technology).<|begin_of_box|>SGL logo (stylized text + network/coding icon)<|end_of_box|>","reasoning_content":"Okay, let's see. The image has a logo with the text \"SGL\" and a little icon on the left. The icon looks like a network or a tree structure with circles, and there's a tag with \"</>\" which is a common symbol for coding or web development. The colors are orange and brown tones, with a black background. So probably a logo for a company or project named SGL, maybe related to software, web development, or a tech company.","tool_calls":null},"logprobs":null,"finish_reason":"stop","matched_stop":151336}],"usage":{"prompt_tokens":2222,"total_tokens":2448,"completion_tokens":226,"prompt_tokens_details":null,"reasoning_tokens":0},"metadata":{"weight_version":"default"}}
+```
+
+### Video Input Example
+
+#### API Payload
+```python Example
+curl_command = f"""
+curl -s http://localhost:{30000}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{{
+    "model": "default",
+    "messages": [
+      {{
+        "role": "user",
+        "content": [
+          {{
+            "type": "video_url",
+            "video_url": {{
+              "url": "/home/jobuser/jobs_presenting_ipod.mp4"
+            }}
+          }},
+          {{
+            "type": "text",
+            "text": "What is the image"
+          }}
+        ]
+      }}
+    ],
+    "temperature": "0",
+    "max_completion_tokens": "1000",
+    "max_tokens": "1000"
+  }}'
+"""
+
+response = subprocess.check_output(curl_command, shell=True).decode()
+print(response)
+```
+
+#### API Response
+```text Output
+{"id":"520e0a079e5d4b17b82a6af619315a97","object":"chat.completion","created":1765259029,"model":"default","choices":[{"index":0,"message":{"role":"assistant","content":"The image is a still from a presentation by a man on a stage. He is pointing to a small pocket on his jeans and asking the audience what the pocket is for. The video is being shared by Evan Carmichael. The man then reveals that the pocket is for an iPod Nano.","reasoning_content":"Based on the visual evidence in the video, here is a breakdown of what is being shown:\n\n*   **Subject:** The video features a man on a stage, giving a presentation. He is wearing a black t-shirt and dark jeans.\n*   **Action:** The man is pointing to a pocket on his jeans. He is asking the audience a question about the purpose of this pocket.\n*   **Context:** The presentation is being filmed, and the video is being shared by \"Evan Carmichael,\" a well-known motivational speaker and content creator. The source of the clip is credited to \"JoshuaG.\"\n*   **Reveal:** The man then reveals the answer to his question. He pulls a small, white, rectangular device out of the pocket. He identifies this device as an \"iPod Nano.\"\n\nIn summary, the image is a still from a presentation where a speaker is explaining the purpose of the small pocket found on many pairs of jeans.","tool_calls":null},"logprobs":null,"finish_reason":"stop","matched_stop":151336}],"usage":{"prompt_tokens":30276,"total_tokens":30532,"completion_tokens":256,"prompt_tokens_details":null,"reasoning_tokens":0},"metadata":{"weight_version":"default"}}
+```
+
+### Tool Call Example
+
+#### API Payload
+```python Example
+from openai import OpenAI
+import argparse
+import sys
+import base64
+
+def image_to_base64(image_path):
+    """Convert image file to base64 data URL format for OpenAI API"""
+    with open(image_path, 'rb') as image_file:
+        image_data = image_file.read()
+        base64_string = base64.b64encode(image_data).decode('utf-8')
+        return f"data:image/png;base64,{base64_string}"
+
+openai_api_key = "EMPTY"
+openai_api_base = "http://127.0.0.1:30000/v1"
+client = OpenAI(api_key=openai_api_key, base_url=openai_api_base)
+
+
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current temperature for a given location.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City and country e.g. Beijing, China",
+                    }
+                },
+                "required": ["location"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
+
+
+messages = [
+    {
+        "role": "user",
+        "content": "Please help me check today’s weather in Beijing, and tell me whether the tool returned an image."
+    },
+    {
+        "role": "assistant",
+        "tool_calls": [
+            {
+                "id": "call_bk32t88BGpSdbtDgzT044Rh4",
+                "type": "function",
+                "function": {
+                    "name": 'get_weather',
+                    "arguments": '{"location":"Beijing, China"}'
+                }
+            }
+        ]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_bk32t88BGpSdbtDgzT044Rh4",
+        "content": [
+            {
+                "type": "text",
+                "text": "Weather report generated: Beijing, November 7, 2025, sunny, temperature 2°C."
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                     "url": "/home/jobuser/sgl_logo.png"
+                }
+            }
+        ]
+    },
+]
+
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.6V",
+    messages=messages,
+    timeout=900,
+    tools=tools
+)
+print(response.choices[0].message.content.strip())
+```
+
+#### Output
+
+```text Output
+The weather in Beijing today (November 7, 2025) is sunny with a temperature of 2°C.
+
+Yes, the tool returned an image (the SGL logo).
+```
+
+## 5. Benchmark
+
+### 5.1. Text Benchmark: Latency, Throughput and Accuracy
+
+#### Command
+```shell Command
+python3 ./benchmark/gsm8k/bench_sglang.py
+```
+#### Result Output
+```text Output
+Accuracy: 0.925
+Invalid: 0.000
+Latency: 15.327 s
+Output throughput: 1788.375 token/s
+```
+
+### 5.2. Multimodal Benchmark - Latency and Throughput
+
+#### Command
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --port 30000 \
+  --model zai-org/GLM-4.6V \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 128 \
+  --max-concurrency 8
+```
+
+#### Result Output
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 8
+Successful requests:                     128
+Benchmark duration (s):                  89.27
+Total input tokens:                      315390
+Total input text tokens:                 8702
+Total input vision tokens:               306688
+Total generated tokens:                  66020
+Total generated tokens (retokenized):    31037
+Request throughput (req/s):              1.43
+Input token throughput (tok/s):          3533.17
+Output token throughput (tok/s):         739.59
+Peak output token throughput (tok/s):    823.00
+Peak concurrent requests:                12
+Total token throughput (tok/s):          4272.76
+Concurrency:                             7.67
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   5349.20
+Median E2E Latency (ms):                 5380.98
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1724.04
+Median TTFT (ms):                        1688.16
+P99 TTFT (ms):                           6152.34
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.15
+Median TPOT (ms):                        7.77
+P99 TPOT (ms):                           23.97
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           10.00
+Median ITL (ms):                         8.44
+P95 ITL (ms):                            9.23
+P99 ITL (ms):                            116.02
+Max ITL (ms):                            173.48
+==================================================
+```
+
+
+### 5.3. Multimodal Accuracy Benchmark - MMMU
+
+#### Command
+```shell Command
+python3 benchmark/mmmu/bench_sglang.py --response-answer-regex "<\|begin_of_box\|>(.*)<\|end_of_box\|>" --port 30000 --concurrency 64 --extra-request-body '{"max_tokens": 4096}'
+```
+
+#### Result Output
+```text Output
+Benchmark time: 487.2229107860476
+answers saved to: ./answer_sglang.json
+Evaluating...
+answers saved to: ./answer_sglang.json
+{'Accounting': {'acc': 0.962, 'num': 26},
+ 'Agriculture': {'acc': 0.5, 'num': 30},
+ 'Architecture_and_Engineering': {'acc': 0.733, 'num': 15},
+ 'Art': {'acc': 0.833, 'num': 30},
+ 'Art_Theory': {'acc': 0.9, 'num': 30},
+ 'Basic_Medical_Science': {'acc': 0.733, 'num': 30},
+ 'Biology': {'acc': 0.586, 'num': 29},
+ 'Chemistry': {'acc': 0.654, 'num': 26},
+ 'Clinical_Medicine': {'acc': 0.633, 'num': 30},
+ 'Computer_Science': {'acc': 0.76, 'num': 25},
+ 'Design': {'acc': 0.867, 'num': 30},
+ 'Diagnostics_and_Laboratory_Medicine': {'acc': 0.633, 'num': 30},
+ 'Economics': {'acc': 0.862, 'num': 29},
+ 'Electronics': {'acc': 0.5, 'num': 18},
+ 'Energy_and_Power': {'acc': 0.875, 'num': 16},
+ 'Finance': {'acc': 0.857, 'num': 28},
+ 'Geography': {'acc': 0.714, 'num': 28},
+ 'History': {'acc': 0.767, 'num': 30},
+ 'Literature': {'acc': 0.897, 'num': 29},
+ 'Manage': {'acc': 0.759, 'num': 29},
+ 'Marketing': {'acc': 1.0, 'num': 26},
+ 'Materials': {'acc': 0.833, 'num': 18},
+ 'Math': {'acc': 0.76, 'num': 25},
+ 'Mechanical_Engineering': {'acc': 0.619, 'num': 21},
+ 'Music': {'acc': 0.286, 'num': 28},
+ 'Overall': {'acc': 0.761, 'num': 803},
+ 'Overall-Art and Design': {'acc': 0.729, 'num': 118},
+ 'Overall-Business': {'acc': 0.884, 'num': 138},
+ 'Overall-Health and Medicine': {'acc': 0.773, 'num': 150},
+ 'Overall-Humanities and Social Science': {'acc': 0.78, 'num': 118},
+ 'Overall-Science': {'acc': 0.728, 'num': 136},
+ 'Overall-Tech and Engineering': {'acc': 0.671, 'num': 143},
+ 'Pharmacy': {'acc': 0.933, 'num': 30},
+ 'Physics': {'acc': 0.929, 'num': 28},
+ 'Psychology': {'acc': 0.733, 'num': 30},
+ 'Public_Health': {'acc': 0.933, 'num': 30},
+ 'Sociology': {'acc': 0.724, 'num': 29}}
+eval out saved to ./val_sglang.json
+Overall accuracy: 0.761
+```

@@ -21,7 +21,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -156,10 +156,11 @@ class TestMamba(unittest.TestCase):
         print(
             f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
         )
+        key = RadixKey(req1_token_ids)
         result = tree.insert(
             InsertParams(
-                key=RadixKey(req1_token_ids),
-                value=req1_kv_indices,
+                key=key,
+                value=req1_kv_indices[: len(key)],
                 mamba_value=req1.mamba_pool_idx.unsqueeze(0),
             )
         )
@@ -173,10 +174,11 @@ class TestMamba(unittest.TestCase):
         print(
             f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
         )
+        key = RadixKey(req2_token_ids)
         result = tree.insert(
             InsertParams(
-                key=RadixKey(req2_token_ids),
-                value=req2_kv_indices,
+                key=key,
+                value=req2_kv_indices[: len(key)],
                 mamba_value=req2.mamba_pool_idx.unsqueeze(0),
             )
         )
@@ -191,10 +193,11 @@ class TestMamba(unittest.TestCase):
         print(
             f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
         )
+        key = RadixKey(req3_token_ids)
         result = tree.insert(
             InsertParams(
-                key=RadixKey(req3_token_ids),
-                value=req3_kv_indices,
+                key=key,
+                value=req3_kv_indices[: len(key)],
                 mamba_value=req3.mamba_pool_idx.unsqueeze(0),
             )
         )
@@ -208,10 +211,11 @@ class TestMamba(unittest.TestCase):
         print(
             f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
         )
+        key = RadixKey(req4_token_ids)
         result = tree.insert(
             InsertParams(
-                key=RadixKey(req4_token_ids),
-                value=req4_kv_indices,
+                key=key,
+                value=req4_kv_indices[: len(key)],
                 mamba_value=req4.mamba_pool_idx.unsqueeze(0),
             )
         )
@@ -400,10 +404,11 @@ class TestMamba(unittest.TestCase):
 
         # Step 1: Insert [1,2,3] to create first node
         req1 = make_dummy_req()
+        key1 = RadixKey([1, 2, 3])
         tree.insert(
             InsertParams(
-                key=RadixKey([1, 2, 3]),
-                value=allocator.alloc(3),
+                key=key1,
+                value=allocator.alloc(3)[: len(key1)],
                 mamba_value=req1.mamba_pool_idx.unsqueeze(0),
             )
         )
@@ -412,10 +417,11 @@ class TestMamba(unittest.TestCase):
         # Step 2: Insert [1,2,3,4,5,6,7] with prev_prefix_len=0 (free all matched)
         # Creates tree: [1,2,3] -> [4,5,6,7]
         req2 = make_dummy_req()
+        key2 = RadixKey([1, 2, 3, 4, 5, 6, 7])
         result = tree.insert(
             InsertParams(
-                key=RadixKey([1, 2, 3, 4, 5, 6, 7]),
-                value=allocator.alloc(7),
+                key=key2,
+                value=allocator.alloc(7)[: len(key2)],
                 mamba_value=req2.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=0,
             )
@@ -429,10 +435,11 @@ class TestMamba(unittest.TestCase):
         # Matched prefix = 7 (across two nodes: [1,2,3] len=3, [4,5,6,7] len=4)
         # Protected [0..1], freed [2..6] = 5 slots, new [7] = 1 slot stored
         req3 = make_dummy_req()
+        key3 = RadixKey([1, 2, 3, 4, 5, 6, 7, 8])
         result = tree.insert(
             InsertParams(
-                key=RadixKey([1, 2, 3, 4, 5, 6, 7, 8]),
-                value=allocator.alloc(8),
+                key=key3,
+                value=allocator.alloc(8)[: len(key3)],
                 mamba_value=req3.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=2,
             )
@@ -445,10 +452,11 @@ class TestMamba(unittest.TestCase):
         # Step 4: Insert [1,2,3,4,5,6,7,8,9] with prev_prefix_len=8 (covers all matched)
         # Matched prefix = 8, prev_prefix_len=8 => nothing freed
         req4 = make_dummy_req()
+        key4 = RadixKey([1, 2, 3, 4, 5, 6, 7, 8, 9])
         result = tree.insert(
             InsertParams(
-                key=RadixKey([1, 2, 3, 4, 5, 6, 7, 8, 9]),
-                value=allocator.alloc(9),
+                key=key4,
+                value=allocator.alloc(9)[: len(key4)],
                 mamba_value=req4.mamba_pool_idx.unsqueeze(0),
                 prev_prefix_len=8,
             )

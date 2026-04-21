@@ -4,6 +4,8 @@ import os
 import subprocess
 from functools import lru_cache
 
+from huggingface_hub import HfApi
+
 from sglang.srt.environ import envs
 from sglang.utils import (
     has_diffusion_overlay_registry_match,
@@ -23,6 +25,16 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
     return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
+def _is_registered_diffusion_model(model_path: str) -> bool:
+    try:
+        from sglang.multimodal_gen.registry import has_registered_diffusion_model_path
+    except ImportError:
+        # if diffusion dependencies are not installed
+        return False
+
+    return has_registered_diffusion_model_path(model_path)
+
+
 def _is_diffusers_model_dir(model_dir: str) -> bool:
     """Check if a local directory contains a valid diffusers model_index.json."""
     config_path = os.path.join(model_dir, "model_index.json")
@@ -35,11 +47,22 @@ def _is_diffusers_model_dir(model_dir: str) -> bool:
     return "_diffusers_version" in config
 
 
+def _is_gated_diffusion_repo(repo_id: str) -> bool:
+    """Query HF model card metadata to check if a gated repo is a diffusers model."""
+    try:
+        info = HfApi().model_info(repo_id)
+        return getattr(info, "library_name", None) == "diffusers"
+    except Exception:
+        return False
+
+
 def get_is_diffusion_model(model_path: str) -> bool:
     """Detect whether model_path points to a diffusion model.
 
     For local directories, checks the filesystem directly.
     For HF/ModelScope model IDs, attempts to fetch only model_index.json.
+    For gated repos where file download fails, falls back to HF model card
+    metadata (library_name == "diffusers").
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
     """
@@ -53,6 +76,9 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return is_known_non_diffusers_diffusion_model(model_path)
 
     if is_known_non_diffusers_diffusion_model(model_path):
+        return True
+
+    if _is_registered_diffusion_model(model_path):
         return True
 
     try:

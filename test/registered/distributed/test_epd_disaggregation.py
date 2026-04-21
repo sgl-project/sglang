@@ -33,9 +33,10 @@ from sglang.test.vlm_utils import (
 
 # Omni model for local testing; override via env var EPD_OMNI_MODEL
 DEFAULT_OMNI_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 
 
-register_cuda_ci(est_time=150, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=97, suite="stage-c-test-4-gpu-h100")
 
 
 @unittest.skipIf(
@@ -811,6 +812,189 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
 
         # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
         self.assertGreater(mmmu_accuracy, 0.40)
+
+
+@unittest.skipIf(
+    is_in_ci(),
+    "Qwen3.5 EPD image/video test runs locally only",
+)
+class TestEPDDisaggregationQwen35(PDDisaggregationServerBase):
+    """EPD disaggregation test for Qwen3.5 image and video requests."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.process_encode = None
+        cls.model = QWEN35_27B_MODEL
+        cls.encode_port = f"{int(cls.lb_port) + 300}"
+        cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
+        cls.language_url = cls.prefill_url
+        cls.image_man_ironing = IMAGE_MAN_IRONING_URL
+        cls.video_jobs = VIDEO_JOBS_URL
+
+        print(
+            f"Setting up Qwen3.5 encoder disaggregation: model={cls.model}, "
+            f"encode={cls.encode_port}, language={cls.prefill_port}"
+        )
+
+        cls.start_encode()
+        cls.start_prefill()
+
+        cls.wait_server_ready(cls.encode_url + "/health", process=cls.process_encode)
+        cls.wait_server_ready(cls.language_url + "/health", process=cls.process_prefill)
+
+        cls.api_key = "sk-123456"
+
+    @classmethod
+    def start_encode(cls):
+        encode_args = [
+            "--trust-remote-code",
+            "--encoder-only",
+            "--encoder-transfer-backend",
+            "zmq_to_scheduler",
+            "--tp",
+            "1",
+            "--port",
+            cls.encode_port,
+            "--reasoning-parser",
+            "qwen3",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true,"num_threads": 64}',
+        ]
+        cls.process_encode = popen_launch_server(
+            cls.model,
+            base_url=cls.encode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=encode_args,
+        )
+
+    @classmethod
+    def start_prefill(cls):
+        language_args = [
+            "--trust-remote-code",
+            "--language-only",
+            "--encoder-urls",
+            cls.encode_url,
+            "--encoder-transfer-backend",
+            "zmq_to_scheduler",
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+            "--port",
+            cls.prefill_port,
+            "--reasoning-parser",
+            "qwen3",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true,"num_threads": 64}',
+        ]
+        cls.process_prefill = popen_launch_server(
+            cls.model,
+            base_url=cls.language_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=language_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process_lb:
+            kill_process_tree(cls.process_lb.pid)
+        if cls.process_decode:
+            kill_process_tree(cls.process_decode.pid)
+        if cls.process_prefill:
+            kill_process_tree(cls.process_prefill.pid)
+        if cls.process_encode:
+            kill_process_tree(cls.process_encode.pid)
+
+    def _client(self):
+        return openai.Client(api_key=self.api_key, base_url=f"{self.language_url}/v1")
+
+    def test_image(self):
+        client = self._client()
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": self.image_man_ironing},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in a sentence.",
+                        },
+                    ],
+                },
+            ],
+            temperature=0,
+            max_tokens=256,
+            extra_body={"reasoning_effort": "none"},
+        )
+        text = response.choices[0].message.content
+        print(f"[Qwen3.5 EPD] Image response:\n{text}")
+        self.assertIsNotNone(text)
+        self.assertGreater(len(text), 0)
+
+        text_lower = text.lower()
+        self.assertTrue(
+            any(w in text_lower for w in ("man", "person", "driver")),
+            f"Image response should mention a person: {text}",
+        )
+        self.assertTrue(
+            any(w in text_lower for w in ("iron", "cloth", "hang", "holding")),
+            f"Image response should mention ironing/clothes: {text}",
+        )
+
+    def test_video(self):
+        client = self._client()
+        response = client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe the video."},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": self.video_jobs},
+                        },
+                    ],
+                },
+            ],
+            max_tokens=1024,
+            stream=False,
+        )
+        text = response.choices[0].message.content
+        print(f"[Qwen3.5 EPD] Video response:\n{text}")
+        self.assertIsNotNone(text)
+        self.assertGreater(len(text), 0)
+
+        text_lower = text.lower()
+        self.assertTrue(
+            any(
+                w in text_lower
+                for w in ("ipod", "device", "microphone", "smartphone", "phone")
+            ),
+            f"Video response should mention a device: {text}",
+        )
+        self.assertTrue(
+            any(
+                w in text_lower
+                for w in (
+                    "man",
+                    "person",
+                    "individual",
+                    "speaker",
+                    "presenter",
+                    "steve",
+                    "hand",
+                    "hands",
+                )
+            ),
+            f"Video response should mention a person: {text}",
+        )
 
 
 class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):

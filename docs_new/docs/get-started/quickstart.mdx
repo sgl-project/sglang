@@ -1,0 +1,332 @@
+---
+title: "Quickstart"
+description: "Get up and running with SGLang in minutes: install, launch a server, and send your first request."
+---
+
+## Overview
+
+This guide walks you through the entire flow of getting started with SGLang:
+
+1. **Install** SGLang
+2. **Launch** an inference server
+3. **Send requests** using cURL, OpenAI Python client, Python `requests`, or the native SGLang API
+
+By the end, you'll have a working SGLang server responding to your prompts.
+
+---
+
+## Prerequisites
+
+- **Python**: 3.9 or higher
+- **GPU**: NVIDIA GPU with CUDA support (sm75 and above, e.g., T4, A10, A100, L4, L40S, H100)
+- **OS**: Linux (recommended)
+
+<Note>
+For other platforms, see the dedicated guides for [AMD GPUs](../hardware-platforms/amd-gpus), [Intel Xeon CPUs](../hardware-platforms/cpu-server), [Google TPUs](../hardware-platforms/tpu), [NVIDIA Jetson](../hardware-platforms/nvidia), [Ascend NPUs](../hardware-platforms/ascend-npus/SGLang-installation-with-NPUs-support), and [Intel XPU](../hardware-platforms/xpu).
+</Note>
+
+---
+
+## Installation
+
+<Tabs>
+  <Tab title="Pip / uv (Recommended)">
+    We recommend using **uv** for faster installation:
+
+```bash
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+```
+  </Tab>
+  <Tab title="From Source">
+```bash
+# Clone and install from source
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+pip install --upgrade pip
+pip install -e "python"
+```
+  </Tab>
+  <Tab title="Docker">
+    The Docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang/tags).
+
+    Replace `<secret>` with your [Hugging Face token](https://huggingface.co/docs/hub/en/security-tokens):
+
+    ```bash
+    docker run --gpus all \
+        --shm-size 32g \
+        -p 30000:30000 \
+        -v ~/.cache/huggingface:/root/.cache/huggingface \
+        --env "HF_TOKEN=<secret>" \
+        --ipc=host \
+        lmsysorg/sglang:latest \
+        python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
+    ```
+
+    For production deployments, use the smaller **runtime** variant (~40% size reduction):
+
+    ```bash
+    docker run --gpus all \
+        --shm-size 32g \
+        -p 30000:30000 \
+        -v ~/.cache/huggingface:/root/.cache/huggingface \
+        --env "HF_TOKEN=<secret>" \
+        --ipc=host \
+        lmsysorg/sglang:latest-runtime \
+        python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 30000
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+If you encounter `OSError: CUDA_HOME environment variable is not set`, set it with:
+```bash
+export CUDA_HOME=/usr/local/cuda-<your-cuda-version>
+```
+</Tip>
+
+---
+
+## Launch a Server
+
+Start the SGLang server with a model. Here we use `qwen/qwen2.5-0.5b-instruct` as a lightweight example:
+
+```bash
+python3 -m sglang.launch_server --model-path qwen/qwen2.5-0.5b-instruct --host 0.0.0.0 --port 30000
+```
+
+Wait until you see `The server is fired up and ready to roll!` in the terminal output.
+
+<Note>
+Once the server is running, API documentation is available at:
+- **Swagger UI**: `http://localhost:30000/docs`
+- **ReDoc**: `http://localhost:30000/redoc`
+- **OpenAPI Spec**: `http://localhost:30000/openapi.json`
+</Note>
+
+<Info>
+The server automatically applies the chat template from the Hugging Face tokenizer. You can override it with `--chat-template` when launching.
+</Info>
+
+---
+
+## Send Requests
+
+SGLang is fully **OpenAI API-compatible**, so you can use the same tools and libraries you already know.
+
+### Using cURL
+
+```bash
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen/qwen2.5-0.5b-instruct",
+    "messages": [
+      {"role": "user", "content": "What is the capital of France?"}
+    ]
+  }'
+```
+
+### Using OpenAI Python Client
+
+Install the OpenAI Python library if you haven't:
+
+```bash
+pip install openai
+```
+
+Then send a request:
+
+```python Example
+import openai
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="qwen/qwen2.5-0.5b-instruct",
+    messages=[
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0,
+    max_tokens=64,
+)
+
+print(response.choices[0].message.content)
+```
+
+#### Streaming
+
+```python Example
+import openai
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="qwen/qwen2.5-0.5b-instruct",
+    messages=[
+        {"role": "user", "content": "List 3 countries and their capitals."},
+    ],
+    temperature=0,
+    max_tokens=64,
+    stream=True,
+)
+
+for chunk in response:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+```
+
+### Using Python Requests
+
+```python Example
+import requests
+
+url = "http://localhost:30000/v1/chat/completions"
+
+data = {
+    "model": "qwen/qwen2.5-0.5b-instruct",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+}
+
+response = requests.post(url, json=data)
+print(response.json())
+```
+
+### Using the Native `/generate` API
+
+SGLang also provides a native `/generate` endpoint for more flexibility.
+
+```python Example
+import requests
+
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "The capital of France is",
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 32,
+        },
+    },
+)
+
+print(response.json())
+```
+
+#### Streaming with `/generate`
+
+```python Example
+import requests
+import json
+
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "The capital of France is",
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 32,
+        },
+        "stream": True,
+    },
+    stream=True,
+)
+
+prev = 0
+for chunk in response.iter_lines(decode_unicode=False):
+    chunk = chunk.decode("utf-8")
+    if chunk and chunk.startswith("data:"):
+        if chunk == "data: [DONE]":
+            break
+        data = json.loads(chunk[5:].strip("\n"))
+        output = data["text"]
+        print(output[prev:], end="", flush=True)
+        prev = len(output)
+```
+
+---
+
+## Offline Batch Inference (No Server)
+
+SGLang also supports offline batch inference using the `Engine` class directly -- no HTTP server required.
+
+```python Example
+import sglang as sgl
+
+llm = sgl.Engine(model_path="qwen/qwen2.5-0.5b-instruct")
+
+prompts = [
+    "Hello, my name is",
+    "The president of the United States is",
+    "The capital of France is",
+    "The future of AI is",
+]
+
+sampling_params = {"temperature": 0.8, "top_p": 0.95}
+
+outputs = llm.generate(prompts, sampling_params)
+
+for prompt, output in zip(prompts, outputs):
+    print(f"Prompt: {prompt}\nGenerated text: {output['text']}\n")
+
+llm.shutdown()
+```
+
+---
+
+## Common Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="CUDA_HOME not set">
+    Set the `CUDA_HOME` environment variable to your CUDA install root:
+    ```bash
+    export CUDA_HOME=/usr/local/cuda-<your-cuda-version>
+    ```
+  </Accordion>
+  <Accordion title="FlashInfer issues on sm75+ devices">
+    Switch to alternative backends by adding these flags when launching the server:
+    ```bash
+    --attention-backend triton --sampling-backend pytorch
+    ```
+  </Accordion>
+  <Accordion title="Reinstalling FlashInfer">
+    ```bash
+    pip3 install --upgrade flashinfer-python --force-reinstall --no-deps
+    rm -rf ~/.cache/flashinfer
+    ```
+  </Accordion>
+  <Accordion title="ptxas error on B300/GB300 (sm_103a)">
+    ```bash
+    export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+{/*
+WIP, TBD linked later
+## What's Next?
+
+<CardGroup cols={2}>
+  <Card title="OpenAI-Compatible APIs" href="/basic_usage/openai_api_completions">
+    Explore the full Chat Completions and Completions APIs, including multi-turn conversations.
+  </Card>
+  <Card title="Vision Language Models" href="/basic_usage/openai_api_vision">
+    Send image inputs alongside text using OpenAI-compatible vision APIs.
+  </Card>
+  <Card title="Sampling Parameters" href="/basic_usage/sampling_params">
+    Fine-tune generation with temperature, top-p, frequency penalty, and more.
+  </Card>
+  <Card title="Server Arguments" href="/advanced_features/server_arguments">
+    Customize server behavior with advanced launch arguments like tensor parallelism.
+  </Card>
+  <Card title="Structured Outputs" href="/advanced_features/structured_outputs">
+    Constrain model output to JSON, regex, or EBNF grammars.
+  </Card>
+  <Card title="Ollama-Compatible API" href="/basic_usage/ollama_api">
+    Use the familiar Ollama CLI and Python library with SGLang as the backend.
+  </Card>
+</CardGroup>
+*/}

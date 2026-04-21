@@ -42,6 +42,9 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
+    ErnieImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinPipelineConfig,
     Flux2PipelineConfig,
@@ -65,6 +68,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
+    StableDiffusion3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
@@ -74,8 +80,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
+    Flux2SamplingParams,
     FluxSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
@@ -89,7 +97,10 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
-from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2 import (
+    LTX2SamplingParams,
+    LTX23SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -101,6 +112,9 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
+    StableDiffusion3SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
@@ -154,7 +168,18 @@ def _discover_and_register_pipelines():
         package.__path__, package.__name__ + "."
     ):
         if not ispkg:
-            pipeline_module = importlib.import_module(module_name)
+            try:
+                pipeline_module = importlib.import_module(module_name)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping pipeline module %s during discovery due to import failure: %s",
+                    module_name,
+                    exc,
+                )
+                logger.debug(
+                    "Pipeline import failure details for %s", module_name, exc_info=True
+                )
+                continue
             if hasattr(pipeline_module, "EntryClass"):
                 entry_cls = pipeline_module.EntryClass
                 entry_cls_list = (
@@ -262,6 +287,29 @@ def _normalize_hf_cache_path(path: str) -> str:
     We match registered repo ids like ``org/repo`` against cache fragments like ``models--org--repo`` that appear in snapshot/blob paths.
     """
     return os.path.normpath(path).lower().replace("\\", "/")
+
+
+def has_registered_diffusion_model_path(model_path: str) -> bool:
+    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+
+    if model_path in _MODEL_HF_PATH_TO_NAME:
+        return True
+
+    model_short_name = get_model_short_name(model_path.lower())
+    for registered_model_hf_id in all_model_hf_paths:
+        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
+        if registered_model_name in model_short_name:
+            return True
+
+    normalized_model_path = _normalize_hf_cache_path(model_path)
+    for registered_model_hf_id in all_model_hf_paths:
+        cache_repo_fragment = (
+            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
+        )
+        if cache_repo_fragment in normalized_model_path:
+            return True
+
+    return False
 
 
 @lru_cache(maxsize=1)
@@ -570,9 +618,18 @@ def _register_configs():
     register_configs(
         sampling_param_cls=LTX2SamplingParams,
         pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower(),
+            lambda path: "ltx-2" in path.lower() and "ltx-2.3" not in path.lower(),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LTX23SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.3"],
+        model_detectors=[
+            lambda path: "ltx-2.3" in path.lower(),
         ],
     )
 
@@ -721,7 +778,7 @@ def _register_configs():
         ],
     )
     register_configs(
-        sampling_param_cls=FluxSamplingParams,
+        sampling_param_cls=Flux2SamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
@@ -798,6 +855,26 @@ def _register_configs():
         hf_model_paths=["Qwen/Qwen-Image-Layered"],
         model_detectors=[lambda hf_id: "qwen-image-layered" in hf_id.lower()],
     )
+    register_configs(
+        sampling_param_cls=StableDiffusion3SamplingParams,
+        pipeline_config_cls=StableDiffusion3PipelineConfig,
+        hf_model_paths=[
+            "stabilityai/stable-diffusion-3-medium",
+            "stabilityai/stable-diffusion-3-medium-diffusers",
+            "stabilityai/stable-diffusion-3.5-medium",
+            "stabilityai/stable-diffusion-3.5-medium-diffusers",
+            "stabilityai/stable-diffusion-3.5-large",
+            "stabilityai/stable-diffusion-3.5-large-diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: "stable-diffusion-3-medium" in hf_id.lower()
+            or "stable-diffusion-3.5-medium" in hf_id.lower()
+            or "stable-diffusion-3.5-large" in hf_id.lower()
+            or "sd3-medium" in hf_id.lower()
+            or "sd3.5-medium" in hf_id.lower()
+            or "sd3.5-large" in hf_id.lower()
+        ],
+    )
 
     register_configs(
         sampling_param_cls=GlmImageSamplingParams,
@@ -863,6 +940,19 @@ def _register_configs():
         hf_model_paths=[
             "FireRedTeam/FireRed-Image-Edit-1.0",
             "FireRedTeam/FireRed-Image-Edit-1.1",
+        ],
+    )
+
+    # ErnieImage
+    register_configs(
+        sampling_param_cls=ErnieImageSamplingParams,
+        pipeline_config_cls=ErnieImagePipelineConfig,
+        hf_model_paths=[
+            "baidu/ERNIE-Image",
+            "baidu/ERNIE-Image-Turbo",
+        ],
+        model_detectors=[
+            lambda hf_id: "ernie-image" in hf_id.lower(),
         ],
     )
 

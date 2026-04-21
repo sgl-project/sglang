@@ -39,7 +39,12 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         super().__init__(max_loras_per_batch, device)
 
     def run_lora_a_sgemm(
-        self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        stack_num: int = 1,
+        *args,
+        **kwargs,
     ) -> torch.Tensor:
         output_tensor = sgemm_lora_a_fwd(
             inputs=x,
@@ -48,7 +53,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             seg_len_tensor=self.batch_info.seg_lens_cpu,
             lora_ranks=self.batch_info.lora_ranks_cpu,
             scaling_tensor=self.batch_info.scalings_cpu,
-            num_slices=1,
+            num_slices=stack_num,
         )
 
         return output_tensor

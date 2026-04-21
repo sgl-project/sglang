@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.utils.common import get_compiler_backend
 
+_is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
 
 
@@ -715,7 +716,14 @@ class MOVADenoisingStage(PipelineStage):
 
         # Build visual freqs for full sequence
         visual_dit._init_freqs()
-        visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            visual_freqs = tuple(
+                freq.to(device=visual_x.device, dtype=torch.complex64)
+                for freq in visual_dit.freqs
+            )
+        else:
+            visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
         visual_freqs = (
             torch.cat(
                 [
@@ -735,18 +743,24 @@ class MOVADenoisingStage(PipelineStage):
 
         # Build audio freqs for full sequence
         self.audio_dit._init_freqs()
-        audio_freqs = (
-            torch.cat(
-                [
-                    self.audio_dit.freqs[0][:f].view(f, -1).expand(f, -1),
-                    self.audio_dit.freqs[1][:f].view(f, -1).expand(f, -1),
-                    self.audio_dit.freqs[2][:f].view(f, -1).expand(f, -1),
-                ],
-                dim=-1,
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            audio_freqs = tuple(
+                freq.to(device=audio_x.device, dtype=torch.complex64)
+                for freq in self.audio_dit.freqs
             )
-            .reshape(full_audio_seq_len, 1, -1)
-            .to(audio_x.device)
-        )
+        else:
+            audio_freqs = tuple(
+                freq.to(audio_x.device) for freq in self.audio_dit.freqs
+            )
+        audio_freqs = torch.cat(
+            [
+                audio_freqs[0][:f].view(f, -1).expand(f, -1),
+                audio_freqs[1][:f].view(f, -1).expand(f, -1),
+                audio_freqs[2][:f].view(f, -1).expand(f, -1),
+            ],
+            dim=-1,
+        ).reshape(full_audio_seq_len, 1, -1)
 
         # Shard sequences for SP
         visual_x, visual_pad_len = self._shard_sequence_for_sp(visual_x, dim=1)
