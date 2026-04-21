@@ -7,14 +7,12 @@ from __future__ import annotations
 import pytest
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.test.server.gpu_cases import ONE_GPU_CASES_C
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
 )
-from sglang.multimodal_gen.test.server.testcase_configs import (
-    ONE_GPU_CASES_C,
-    DiffusionTestCase,
-)
+from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
 

@@ -1193,8 +1193,26 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # PR #20978 pads max_bs beyond pool_size for higher cuda-graph
+        # coverage. Reallocate indptr buffers so they fit the padded max_bs.
+        # See: https://github.com/sgl-project/sglang/pull/20978
+        if max_bs + 1 > self.kv_indptr.shape[0]:
+            self.kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self.qo_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self.mask_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int64, device=self.device
+            )
+            if hasattr(self, "qo_indptr_"):
+                self.qo_indptr_ = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=self.device
+                )
+
         self.cuda_graph_kv_last_page_len = torch.ones(
-            max_bs, dtype=torch.int, device=self.device
+            max_bs, dtype=torch.int32, device=self.device
         )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (

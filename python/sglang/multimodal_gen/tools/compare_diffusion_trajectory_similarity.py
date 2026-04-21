@@ -23,8 +23,10 @@ Example:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -299,18 +301,7 @@ def build_sampling_kwargs(
     return kwargs
 
 
-def run_variant(
-    *,
-    server_kwargs: dict[str, Any],
-    sampling_kwargs: dict[str, Any],
-):
-    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-        DiffGenerator,
-    )
-
-    with DiffGenerator.from_pretrained(local_mode=True, **server_kwargs) as generator:
-        result = generator.generate(sampling_params_kwargs=sampling_kwargs)
-
+def _normalize_single_result(result: Any):
     if isinstance(result, list):
         if len(result) != 1:
             raise ValueError(
@@ -320,6 +311,114 @@ def run_variant(
     if result is None:
         raise RuntimeError("Generation returned no result.")
     return result
+
+
+def _clear_diffusion_fp4_backend_caches() -> None:
+    from sglang.multimodal_gen.runtime.layers.quantization import (
+        modelopt_quant as diffusion_modelopt_quant,
+    )
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    diffusion_modelopt_quant._get_fp4_gemm_op.cache_clear()
+    current_platform.__class__.get_modelopt_fp4_gemm_op.cache_clear()
+    current_platform.__class__.get_modelopt_flashinfer_fp4_backend.cache_clear()
+
+
+@contextlib.contextmanager
+def override_diffusion_fp4_backend(backend: str | None):
+    env_name = "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+    previous = os.environ.get(env_name)
+
+    if backend is None:
+        os.environ.pop(env_name, None)
+    else:
+        os.environ[env_name] = backend
+
+    _clear_diffusion_fp4_backend_caches()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = previous
+        _clear_diffusion_fp4_backend_caches()
+
+
+def _extract_total_duration_ms(result: Any) -> float | None:
+    metrics = getattr(result, "metrics", None)
+    if not isinstance(metrics, dict):
+        return None
+    total_duration_ms = metrics.get("total_duration_ms")
+    if total_duration_ms is None:
+        return None
+    return float(total_duration_ms)
+
+
+def run_variant(
+    *,
+    server_kwargs: dict[str, Any],
+    sampling_kwargs: dict[str, Any],
+    fp4_gemm_backend: str | None,
+    warmup_runs: int,
+    measure_runs: int,
+):
+    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+        DiffGenerator,
+    )
+
+    if warmup_runs < 0:
+        raise ValueError("warmup_runs must be >= 0.")
+    if measure_runs <= 0:
+        raise ValueError("measure_runs must be >= 1.")
+
+    with override_diffusion_fp4_backend(fp4_gemm_backend):
+        with DiffGenerator.from_pretrained(
+            local_mode=True, **server_kwargs
+        ) as generator:
+            for _ in range(warmup_runs):
+                _normalize_single_result(
+                    generator.generate(sampling_params_kwargs=sampling_kwargs)
+                )
+
+            measured_results = []
+            for _ in range(measure_runs):
+                measured_results.append(
+                    _normalize_single_result(
+                        generator.generate(sampling_params_kwargs=sampling_kwargs)
+                    )
+                )
+
+    final_result = measured_results[-1]
+    generation_times = [float(result.generation_time) for result in measured_results]
+    peak_memories = [float(result.peak_memory_mb) for result in measured_results]
+    total_duration_ms = [
+        duration
+        for duration in (
+            _extract_total_duration_ms(result) for result in measured_results
+        )
+        if duration is not None
+    ]
+
+    return {
+        "result": final_result,
+        "fp4_gemm_backend": fp4_gemm_backend or "default",
+        "warmup_runs": warmup_runs,
+        "measure_runs": measure_runs,
+        "generation_time_s": generation_times[-1],
+        "avg_generation_time_s": sum(generation_times) / len(generation_times),
+        "per_run_generation_time_s": generation_times,
+        "peak_memory_mb": peak_memories[-1],
+        "max_peak_memory_mb": max(peak_memories) if peak_memories else 0.0,
+        "per_run_peak_memory_mb": peak_memories,
+        "total_duration_ms": total_duration_ms[-1] if total_duration_ms else None,
+        "avg_total_duration_ms": (
+            sum(total_duration_ms) / len(total_duration_ms)
+            if total_duration_ms
+            else None
+        ),
+        "per_run_total_duration_ms": total_duration_ms,
+    }
 
 
 def _to_jsonable(result: dict[str, Any]) -> dict[str, Any]:
@@ -353,6 +452,22 @@ def main() -> None:
     parser.add_argument("--trajectory-step-index", type=int, default=-1)
     parser.add_argument("--reference-transformer-path")
     parser.add_argument("--candidate-transformer-path")
+    parser.add_argument(
+        "--reference-fp4-gemm-backend",
+        help=(
+            "Optional NVFP4 GEMM backend override for the reference run, e.g. "
+            "'flashinfer_trtllm'."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-fp4-gemm-backend",
+        help=(
+            "Optional NVFP4 GEMM backend override for the candidate run, e.g. "
+            "'flashinfer_trtllm'."
+        ),
+    )
+    parser.add_argument("--warmup-runs", type=int, default=0)
+    parser.add_argument("--measure-runs", type=int, default=1)
     parser.add_argument(
         "--reference-component-path",
         action="append",
@@ -423,22 +538,36 @@ def main() -> None:
         output_dir=str(save_root / "candidate") if save_root else None,
     )
 
-    reference = run_variant(
+    reference_run = run_variant(
         server_kwargs=ref_server_kwargs,
         sampling_kwargs=ref_sampling_kwargs,
+        fp4_gemm_backend=args.reference_fp4_gemm_backend,
+        warmup_runs=args.warmup_runs,
+        measure_runs=args.measure_runs,
     )
-    candidate = run_variant(
+    candidate_run = run_variant(
         server_kwargs=cand_server_kwargs,
         sampling_kwargs=cand_sampling_kwargs,
+        fp4_gemm_backend=args.candidate_fp4_gemm_backend,
+        warmup_runs=args.warmup_runs,
+        measure_runs=args.measure_runs,
     )
+    reference = reference_run["result"]
+    candidate = candidate_run["result"]
 
     result = {
         "model_path": args.model_path,
         "prompt": args.prompt,
         "seed": args.seed,
+        "warmup_runs": args.warmup_runs,
+        "measure_runs": args.measure_runs,
         "server_kwargs": {
             "reference": ref_server_kwargs,
             "candidate": cand_server_kwargs,
+        },
+        "backend_overrides": {
+            "reference_fp4_gemm_backend": reference_run["fp4_gemm_backend"],
+            "candidate_fp4_gemm_backend": candidate_run["fp4_gemm_backend"],
         },
         "sampling_kwargs": {
             "width": args.width,
@@ -449,15 +578,13 @@ def main() -> None:
             "guidance_scale_2": args.guidance_scale_2,
         },
         "reference_generation": {
-            "generation_time_s": reference.generation_time,
-            "peak_memory_mb": reference.peak_memory_mb,
-            "output_file_path": reference.output_file_path,
-        },
+            key: value for key, value in reference_run.items() if key != "result"
+        }
+        | {"output_file_path": reference.output_file_path},
         "candidate_generation": {
-            "generation_time_s": candidate.generation_time,
-            "peak_memory_mb": candidate.peak_memory_mb,
-            "output_file_path": candidate.output_file_path,
-        },
+            key: value for key, value in candidate_run.items() if key != "result"
+        }
+        | {"output_file_path": candidate.output_file_path},
         "trajectory_metrics": summarize_trajectory_metrics(
             reference.trajectory_latents,
             candidate.trajectory_latents,
@@ -483,6 +610,12 @@ def main() -> None:
                 "output_json": str(output_json),
                 "trajectory_selected_step": result["trajectory_metrics"][
                     "selected_step_index"
+                ],
+                "reference_avg_generation_time_s": result["reference_generation"][
+                    "avg_generation_time_s"
+                ],
+                "candidate_avg_generation_time_s": result["candidate_generation"][
+                    "avg_generation_time_s"
                 ],
                 "trajectory_cosine": selected["cosine_similarity"],
                 "trajectory_mae": selected["mae"],
