@@ -4,7 +4,7 @@ For each mc in MC_LIST, reads `<cfg_dir>/mc{mc}/heter_config.json` (the
 per-mc base assignment produced by `gen_heter_configs.py`) and emits 11
 dispatch variants into `<cfg_dir>/mc{mc}/variants/`:
 
-  - hot0..hot100  (policy=random, 6 hot_pcts {0,20,40,60,80,100})
+  - hot0..hot100  (policy=expert_load, 6 hot_pcts {0,20,40,60,80,100})
   - thr32..thr512 (policy=expert_batch, 5 thresholds {32,64,128,256,512})
 
 All variants share the same int4-only / heter experts from the base; only
@@ -58,7 +58,7 @@ def main() -> int:
 
         for hot_pct in HOT_PCTS:
             cfg = copy.deepcopy(base)
-            cfg["policy"] = "random"
+            cfg["policy"] = "expert_load"
             cfg.pop("policy_params", None)
             hot_r = hot_pct / 100.0
             cold_r = 1.0 - hot_r
