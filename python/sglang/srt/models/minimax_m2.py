@@ -92,8 +92,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_compiler_backend,
     is_cuda,
-    is_npu,
     is_non_idle_and_non_empty,
+    is_npu,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
