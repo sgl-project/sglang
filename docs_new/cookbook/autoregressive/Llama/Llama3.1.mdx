@@ -1,0 +1,644 @@
+---
+title: Llama-3.1
+metatags:
+    description: "Deploy Llama 3.1 (8B/70B/405B) with SGLang - 128K context, tool use, multilingual support, and speculative decoding optimization."
+---
+## 1. Model Introduction
+
+Llama 3.1 is a collection of pretrained and instruction tuned generative models, released in July 2024 by Meta. These models are available in 8B, 70B and 405B sizes, with the 405B variant being the most capable fully-open source model at the time.
+
+These models bring open intelligence to all, with several new features and improvements:
+
+- **Stronger General Intelligence**: These models showcase significant improvements in coding, state-of-the-art tool use, and overall stronger reasoning capabilities.
+- **Extended Context Length**: Llama 3.1 extends the context length to 128K tokens to improve performance over long context tasks such as summarization and code reasoning.
+- **Tool Use**: Llama 3.1 is trained to interact with a search engine, python interpreter and mathematical engine, and also improves zero-shot tool use capabilities to interact with potentially unseen tools.
+- **Multilinguality**: Llama 3.1 supports 7 languages in addition to English: French, German, Hindi, Italian, Portuguese, Spanish, and Thai.
+
+For further details, please refer to the [Llama 3.1 blog](https://ai.meta.com/blog/meta-llama-3-1/) and the [Llama 3.1 model card](https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/MODEL_CARD.md).note
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to generate a launch command for Llama 3.1 collection of models.
+
+import { Llama31Deployment } from "/src/snippets/autoregressive/llama31-deployment.jsx";
+
+<Llama31Deployment />
+### 3.2 Configuration Tips
+
+**Speculative Decoding (NVIDIA GPUs):**
+
+- Using Speculative Decoding for latency-sensitive scenarios:
+  - `--speculative-algorithm EAGLE3`: Speculative decoding algorithm
+  - `--speculative-num-steps 3`: Number of speculative verification rounds
+  - `--speculative-eagle-topk 1`: Top-k sampling for draft tokens
+  - `--speculative-num-draft-tokens 4`: Number of draft tokens per step
+  - `--speculative-draft-model-path`: The path of the draft model weights. This can be a local folder or a Hugging Face repo ID such as [`yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B).
+
+**AMD GPU Deployment:**
+
+- **Hardware-Aware TP**: MI355X (256GB memory) supports lower TP values compared to MI300X/MI325X (192GB)
+- **Verified TP Configurations**:
+  - MI300X/MI325X: 405B BF16 (TP=8), 405B FP8 (TP=4), 70B/8B (TP=1)
+  - MI355X: 405B BF16 (TP=4), 405B FP8 (TP=2), 70B/8B (TP=1)
+- **FP8 Model Variants**:
+  - 405B: Use Meta's official `meta-llama/Llama-3.1-405B-Instruct-FP8`
+  - 70B/8B: Use AMD's optimized `amd/Llama-3.1-{size}-Instruct-FP8-KV`
+- **Tool Calling**: Enable with `--tool-call-parser llama3` for Instruct models
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+SGLang exposes an OpenAI-compatible endpoint. First, start the server
+
+```shell Command
+sglang serve \
+  --model-path  Meta-Llama/Llama-3.1-405B-Instruct \
+  --tp 8
+```
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY",
+)
+
+resp = client.chat.completions.create(
+    model="Meta-Llama/Llama-3.1-405B-Instruct",
+    messages=[
+        {"role": "system", "content": "You are a helpful coding assistant."},
+        {"role": "user", "content": "Write a Python function that retries a request with exponential backoff."},
+    ],
+    temperature=0.2,
+    max_tokens=512,
+)
+
+print(resp.choices[0].message.content)
+```
+
+**Output Example:**
+
+````text Output
+**Exponential Backoff Retry Function in Python**
+=====================================================
+
+Below is a Python function that uses the `requests` library to retry a request with exponential backoff.
+
+```python
+import requests
+import time
+import random
+
+def exponential_backoff_retry(url, method, retries=3, backoff_factor=1, max_delay=60):
+    """
+    Retry a request with exponential backoff.
+
+    Args:
+        url (str): The URL to make the request to.
+        method (str): The HTTP method to use (e.g. 'GET', 'POST', etc.).
+        retries (int): The number of retries to attempt. Defaults to 3.
+        backoff_factor (int): The factor to multiply the delay by for each retry. Defaults to 1.
+        max_delay (int): The maximum delay to wait between retries in seconds. Defaults to 60.
+
+    Returns:
+        The response object from the successful request.
+    """
+
+    delay = 1
+    for attempt in range(retries + 1):
+        try:
+            response = requests.request(method, url)
+            response.raise_for_status()  # Raise an exception for HTTP errors
+            return response
+        except requests.RequestException as e:
+            if attempt < retries:
+                # Calculate the delay for this retry
+                delay = min(delay * backoff_factor, max_delay)
+                # Add a random jitter to the delay to prevent thundering herd problem
+                delay += random.uniform(0, delay * 0.1)
+                # Wait for the calculated delay before retrying
+                time.sleep(delay)
+            else:
+                # If all retries have failed, raise the exception
+                raise e
+...
+````
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Tool Calling
+
+Llama3 supports tool calling capabilities. First, start the server with tool call parser enabled:
+
+```shell Command
+sglang serve \
+  --model-path  Meta-Llama/Llama-3.1-405B-Instruct \
+  --tool-call-parser llama3 \
+  --tp 8
+```
+
+**Python Example**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(api_key="None", base_url=f"http://0.0.0.0:8000/v1")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather in a given location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "The city to find the weather for, e.g. 'San Francisco'",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "description": "The unit to fetch the temperature in",
+                        "enum": ["celsius", "fahrenheit"],
+                    },
+                },
+                "required": ["city", "unit"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="meta-llama/Llama-3.1-405B-Instruct",
+    messages=[
+        {
+            "role": "user",
+            "content": "What's the weather like in Boston today?",
+        }
+    ],
+    temperature=0.7,
+    stream=True,
+    tools=tools,
+)
+
+
+arguments = []
+
+tool_calls_accumulator = {}
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            for tool_call in delta.tool_calls:
+                index = tool_call.index
+                if index not in tool_calls_accumulator:
+                    tool_calls_accumulator[index] = {
+                        'name': None,
+                        'arguments': ''
+                    }
+
+                if tool_call.function:
+                    if tool_call.function.name:
+                        tool_calls_accumulator[index]['name'] = tool_call.function.name
+                    if tool_call.function.arguments:
+                        tool_calls_accumulator[index]['arguments'] += tool_call.function.arguments
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+# Print accumulated tool calls
+for index, tool_call in sorted(tool_calls_accumulator.items()):
+    print(f"🔧 Tool Call: {tool_call['name']}")
+    print(f"   Arguments: {tool_call['arguments']}")
+
+print()
+```
+
+Reference: [SGLang Tool Parser Documentation](../../../docs/advanced_features/tool_parser#OpenAI-Compatible-API)
+
+**Output Example**
+
+```text Output
+🔧 Tool Call: get_weather
+   Arguments: {"city": "Boston", "unit": "fahrenheit"}
+```
+
+**Handling Tool Call Results**
+After getting the tool call, you can execute the function:
+
+```python Example
+def get_weather(location, unit="celsius"):
+    # Your actual weather API call here
+    return f"The weather in {location} is 22°{unit[0].upper()} and sunny."
+
+# Send tool result back to the model
+messages = [
+    {"role": "user", "content": "What's the weather like in Boston today?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Boston", "unit": "fahrenheit"}'
+            }
+        }]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": get_weather("Boston", "fahrenheit")
+    }
+]
+
+final_response = client.chat.completions.create(
+    model="Meta-Llama/Llama-3.1-405B-Instruct",
+    messages=messages,
+    temperature=0.7
+)
+
+print(final_response.choices[0].message.content)
+# Output: "The current weather in Boston is **22°C** and **sunny**. A perfect day to spend outside"
+```
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA A100 GPU (8x)
+- Model: Meta-Llama/Llama-3.1-70B
+- Tensor Parallelism: 8
+- sglang version: 0.5.6
+
+We use SGLang's built-in benchmarking tool to conduct performance evaluation on the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset. This dataset contains real conversation data and can better reflect performance in actual use scenarios.
+
+#### 5.1.1 Standard Scenario Benchmark
+
+- Model Deployment Command:
+
+```shell Command
+sglang serve \
+  --model-path Meta-Llama/Llama-3.1-70B \
+  --tp 8
+```
+
+##### 5.1.1.1 Low Concurrency
+
+- Benchmark Command:
+
+```shell Command
+sglang serve \
+  --backend sglang \
+  --model Meta-Llama/Llama-3.1-70B \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- Test Results:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  79.81
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total input vision tokens:               0
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4208
+Request throughput (req/s):              0.13
+Input token throughput (tok/s):          76.44
+Output token throughput (tok/s):         52.88
+Peak output token throughput (tok/s):    54.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          129.32
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   7977.81
+Median E2E Latency (ms):                 6373.48
+---------------Time to First Token----------------
+Mean TTFT (ms):                          131.61
+Median TTFT (ms):                        131.77
+P99 TTFT (ms):                           163.88
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          18.63
+Median TPOT (ms):                        18.63
+P99 TPOT (ms):                           18.65
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           18.64
+Median ITL (ms):                         18.64
+P95 ITL (ms):                            18.69
+P99 ITL (ms):                            18.74
+Max ITL (ms):                            21.95
+==================================================
+```
+
+##### 5.1.1.2 Medium Concurrency
+
+```shell Command
+sglang serve \
+  --backend sglang \
+  --model-path Meta-Llama/Llama-3.1-70B \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16
+```
+
+- Test Results:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  79.47
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total input vision tokens:               0
+Total generated tokens:                  40805
+Total generated tokens (retokenized):    38450
+Request throughput (req/s):              1.01
+Input token throughput (tok/s):          499.17
+Output token throughput (tok/s):         513.48
+Peak output token throughput (tok/s):    674.00
+Peak concurrent requests:                20
+Total token throughput (tok/s):          1012.65
+Concurrency:                             13.47
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   13376.67
+Median E2E Latency (ms):                 14130.48
+---------------Time to First Token----------------
+Mean TTFT (ms):                          264.84
+Median TTFT (ms):                        147.02
+P99 TTFT (ms):                           791.93
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          26.09
+Median TPOT (ms):                        26.08
+P99 TPOT (ms):                           34.65
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           25.76
+Median ITL (ms):                         23.95
+P95 ITL (ms):                            24.72
+P99 ITL (ms):                            98.32
+Max ITL (ms):                            478.92
+==================================================
+```
+
+##### 5.1.1.3 High Concurrency
+
+```shell Command
+sglang serve \
+  --backend sglang \
+  --model-path Meta-Llama/Llama-3.1-70B \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100
+```
+
+- Test Results:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  131.64
+Total input tokens:                      249831
+Total input text tokens:                 249831
+Total input vision tokens:               0
+Total generated tokens:                  252662
+Total generated tokens (retokenized):    243641
+Request throughput (req/s):              3.80
+Input token throughput (tok/s):          1897.87
+Output token throughput (tok/s):         1919.38
+Peak output token throughput (tok/s):    3100.00
+Peak concurrent requests:                107
+Total token throughput (tok/s):          3817.25
+Concurrency:                             89.70
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   23616.71
+Median E2E Latency (ms):                 22770.44
+---------------Time to First Token----------------
+Mean TTFT (ms):                          245.98
+Median TTFT (ms):                        184.22
+P99 TTFT (ms):                           1251.67
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          47.19
+Median TPOT (ms):                        48.67
+P99 TPOT (ms):                           56.37
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           46.34
+Median ITL (ms):                         33.46
+P95 ITL (ms):                            108.61
+P99 ITL (ms):                            166.11
+Max ITL (ms):                            1107.09
+==================================================
+```
+
+#### 5.1.2 Summarization Scenario Benchmark
+
+##### 5.1.2.1 Low Concurrency
+
+```shell Command
+sglang serve \
+  --backend sglang \
+  --model-path Meta-Llama/Llama-3.1-70B\
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  83.25
+Total input tokens:                      41941
+Total input text tokens:                 41941
+Total input vision tokens:               0
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4220
+Request throughput (req/s):              0.12
+Input token throughput (tok/s):          503.77
+Output token throughput (tok/s):         50.69
+Peak output token throughput (tok/s):    54.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          554.46
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   8322.45
+Median E2E Latency (ms):                 6873.36
+---------------Time to First Token----------------
+Mean TTFT (ms):                          395.25
+Median TTFT (ms):                        318.02
+P99 TTFT (ms):                           850.80
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          18.80
+Median TPOT (ms):                        18.81
+P99 TPOT (ms):                           19.03
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           18.83
+Median ITL (ms):                         18.81
+P95 ITL (ms):                            19.06
+P99 ITL (ms):                            19.08
+Max ITL (ms):                            23.08
+==================================================
+```
+
+##### 5.1.2.2 Medium Concurrency
+
+```shell Command
+sglang serve \
+  --backend sglang \
+  --model-path Meta-Llama/Llama-3.1-70B \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  107.12
+Total input tokens:                      300020
+Total input text tokens:                 300020
+Total input vision tokens:               0
+Total generated tokens:                  41669
+Total generated tokens (retokenized):    41603
+Request throughput (req/s):              0.75
+Input token throughput (tok/s):          2800.81
+Output token throughput (tok/s):         389.00
+Peak output token throughput (tok/s):    624.00
+Peak concurrent requests:                19
+Total token throughput (tok/s):          3189.81
+Concurrency:                             14.18
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   18988.30
+Median E2E Latency (ms):                 20290.66
+---------------Time to First Token----------------
+Mean TTFT (ms):                          603.42
+Median TTFT (ms):                        531.82
+P99 TTFT (ms):                           2607.95
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          36.94
+Median TPOT (ms):                        36.73
+P99 TPOT (ms):                           79.19
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           35.36
+Median ITL (ms):                         25.72
+P95 ITL (ms):                            27.07
+P99 ITL (ms):                            439.74
+Max ITL (ms):                            2529.51
+==================================================
+```
+
+##### 5.1.2.3 High Concurrency
+
+```shell Command
+sglang serve \
+  --backend sglang \
+  --model-path Meta-Llama/Llama-3.1-70B \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 320 \
+  --max-concurrency 64
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  215.66
+Total input tokens:                      1273893
+Total input text tokens:                 1273893
+Total input vision tokens:               0
+Total generated tokens:                  170000
+Total generated tokens (retokenized):    169035
+Request throughput (req/s):              1.48
+Input token throughput (tok/s):          5906.92
+Output token throughput (tok/s):         788.27
+Peak output token throughput (tok/s):    1920.00
+Peak concurrent requests:                69
+Total token throughput (tok/s):          6695.19
+Concurrency:                             60.01
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   40443.85
+Median E2E Latency (ms):                 39813.12
+---------------Time to First Token----------------
+Mean TTFT (ms):                          633.32
+Median TTFT (ms):                        616.38
+P99 TTFT (ms):                           1912.97
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          74.95
+Median TPOT (ms):                        82.85
+P99 TPOT (ms):                           118.46
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           75.08
+Median ITL (ms):                         34.12
+P95 ITL (ms):                            261.18
+P99 ITL (ms):                            828.12
+Max ITL (ms):                            1970.03
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+#### 5.2.1 GSM8K Benchmark
+
+- **Benchmark Command:**
+
+```shell Command
+python3 -m sglang.test.few_shot_gsm8k --num-questions 200
+```
+
+- **Results**:
+
+```text Output
+Accuracy: 0.830
+Invalid: 0.000
+Latency: 11.794 s
+Output throughput: 1406.961 token/s
+```

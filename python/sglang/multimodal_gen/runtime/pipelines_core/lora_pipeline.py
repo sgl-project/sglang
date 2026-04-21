@@ -69,6 +69,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+
         # Initialize all mutable instance attributes to avoid sharing across instances
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}

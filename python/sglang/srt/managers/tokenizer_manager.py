@@ -76,7 +76,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
-from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
+from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
@@ -212,7 +212,7 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
-class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
+class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(
@@ -313,7 +313,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 self.processor = _processor
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-                self._initialize_multi_item_delimiter_text()
         else:
             self.mm_processor = self.processor = None
 
@@ -326,7 +325,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-                self._initialize_multi_item_delimiter_text()
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
@@ -1007,6 +1005,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
+                multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1032,6 +1031,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
+                return_pooled_hidden_states=obj.return_pooled_hidden_states,
+                multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
@@ -1776,6 +1777,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
+                if (
+                    recv_obj.pooled_hidden_states is not None
+                    and recv_obj.pooled_hidden_states[i] is not None
+                ):
+                    out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
