@@ -31,6 +31,14 @@ class TestMLA(CustomTestCase, MGSMEnMixin):
                 "--trust-remote-code",
                 "--kv-cache-dtype",
                 "fp8_e5m2",
+                # Pin MoE expert dispatch and kernel reduction order so MGSM
+                # scores don't drift across runs. The eval already uses greedy
+                # decoding, but FP8 dequant + non-deterministic MoE top-k
+                # tie-breaks produce ~1–3 point swings without this flag and
+                # straddle the 0.8 threshold. With deterministic inference,
+                # the score becomes a fixed function of (model, weights, CUDA
+                # stack), so threshold-edge flakes stop being random noise.
+                "--enable-deterministic-inference",
             ],
         )
 
