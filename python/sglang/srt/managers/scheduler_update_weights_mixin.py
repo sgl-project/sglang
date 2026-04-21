@@ -52,7 +52,9 @@ class SchedulerUpdateWeightsMixin:
         if success and self.draft_worker is not None:
             success, message = self.draft_worker.update_weights_from_disk(recv_req)
         if tp_success and recv_req.flush_cache:
-            flush_cache_success = self.flush_cache(empty_cache=recv_req.torch_empty_cache)
+            flush_cache_success = self.flush_cache(
+                empty_cache=recv_req.torch_empty_cache
+            )
             assert flush_cache_success, "Cache flush failed after updating weights"
         if not success:
             logger.error(message)
@@ -118,7 +120,9 @@ class SchedulerUpdateWeightsMixin:
         if success and self.draft_worker is not None:
             success, message = self.draft_worker.update_weights_from_ipc(recv_req)
         if tp_success and recv_req.flush_cache:
-            flush_cache_success = self.flush_cache(empty_cache=recv_req.torch_empty_cache)
+            flush_cache_success = self.flush_cache(
+                empty_cache=recv_req.torch_empty_cache
+            )
             assert flush_cache_success, "Cache flush failed after updating weights"
         if not success:
             logger.error(message)
