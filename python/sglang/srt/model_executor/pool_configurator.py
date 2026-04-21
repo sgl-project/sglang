@@ -40,8 +40,7 @@ class MemoryPoolConfig:
         if self.max_total_num_tokens <= 0:
             msg = (
                 "Not enough memory to allocate KV cache.\n"
-                "Possible fixes: increase --mem-fraction-static, "
-                "reduce --chunked-prefill-size, or reduce --max-running-requests."
+                "Please try to increase --mem-fraction-static."
             )
             if self.mem_fraction_static is not None:
                 msg += f"\nCurrent --mem-fraction-static={self.mem_fraction_static}"

@@ -4231,8 +4231,9 @@ class ServerArgs:
             help=(
                 "Fraction of GPU memory for model weights + KV cache pool. "
                 "The remainder (1 - value) is reserved for activations and CUDA graphs. "
-                "Decrease if OOM during forward pass or CUDA graph capture; "
-                "increase if KV cache is too small at startup."
+                "Increase when SGLang has the GPU to itself and KV cache is too small at startup. "
+                "Decrease when a co-tenant process shares the GPU and causes activation OOM "
+                "(e.g., sibling process memory grew after SGLang booted)."
             ),
         )
         parser.add_argument(

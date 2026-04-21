@@ -214,12 +214,9 @@ def alloc_token_slots(
 
     if out_cache_loc is None:
         error_msg = (
-            f"Out of memory when allocating KV cache tokens.\n"
-            f"Tried to allocate {num_tokens} tokens.\n"
-            f"{available_and_evictable_str(tree_cache)}\n"
-            f"Possible fixes:\n"
-            f"  - Reduce --max-running-requests or request batch size\n"
-            f"  - Increase --mem-fraction-static to give more memory to KV cache"
+            f"Out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {num_tokens} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
         )
         logger.error(error_msg)
         if tree_cache is not None:
@@ -285,12 +282,9 @@ def alloc_paged_token_slots_extend(
 
     if out_cache_loc is None:
         error_msg = (
-            f"Prefill out of memory.\n"
-            f"Tried to allocate {extend_num_tokens} tokens.\n"
-            f"{available_and_evictable_str(tree_cache)}\n"
-            f"Possible fixes:\n"
-            f"  - Reduce --chunked-prefill-size or --max-running-requests\n"
-            f"  - Increase --mem-fraction-static to give more memory to KV cache"
+            f"Prefill out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {extend_num_tokens} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
         )
         logger.error(error_msg)
         if tree_cache is not None:
@@ -414,12 +408,9 @@ def alloc_paged_token_slots_decode(
 
     if out_cache_loc is None:
         error_msg = (
-            f"Decode out of memory.\n"
-            f"Tried to allocate {len(seq_lens) * token_per_req} tokens.\n"
-            f"{available_and_evictable_str(tree_cache)}\n"
-            f"Possible fixes:\n"
-            f"  - Reduce --max-running-requests to limit concurrent decodes\n"
-            f"  - Increase --mem-fraction-static to give more memory to KV cache"
+            f"Decode out of memory. Try to lower your batch size.\n"
+            f"Try to allocate {len(seq_lens) * token_per_req} tokens.\n"
+            f"{available_and_evictable_str(tree_cache)}"
         )
         logger.error(error_msg)
         if tree_cache is not None:
