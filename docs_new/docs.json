@@ -13,6 +13,10 @@
       "destination": "/"
     },
     {
+      "source": "/cookbook",
+      "destination": "/cookbook/intro"
+    },
+    {
       "source": "/index.html",
       "destination": "/"
     },
