@@ -86,14 +86,7 @@ name = "pypi"
 url = "https://pypi.org/simple"
 default = true
 
-# To be removed after pypi sglang-kernel uses cu130
-[[tool.uv.index]]
-name = "sglang-kernel-cu130"
-url = "https://docs.sglang.ai/whl/cu130/"
-explicit = true
-
 [tool.uv.sources]
-sglang-kernel = { index = "sglang-kernel-cu130" }
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
