@@ -53,6 +53,9 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
+from sglang.srt.layers.on_policy_utils import (
+    patch_prefill_only_deterministic_inference_for_cuda_graph,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -65,6 +68,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -802,19 +806,36 @@ class CudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
-                    self.stream = graph_capture_context.stream
-                    _capture_one_stream()
-            else:
-                set_pdmux_status(False)
-                for i, sg in enumerate(self.stream_groups):
-                    with graph_capture(
-                        stream=sg[1]
-                    ) as graph_capture_context, profile_context as prof:
+        try:
+            global_server_args = get_global_server_args()
+        except ValueError:
+            global_server_args = None
+
+        with patch_prefill_only_deterministic_inference_for_cuda_graph(
+            self.model_runner.server_args,
+            attn_backend=getattr(self.model_runner, "attn_backend", None),
+            global_server_args=global_server_args,
+            dvr_target_verify_cuda_graph=getattr(
+                self.model_runner, "enable_dvr_target_verify_cuda_graph", False
+            ),
+        ):
+            with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+                if not self.enable_pdmux:
+                    with (
+                        graph_capture() as graph_capture_context,
+                        profile_context as prof,
+                    ):
                         self.stream = graph_capture_context.stream
-                        _capture_one_stream(i)
+                        _capture_one_stream()
+                else:
+                    set_pdmux_status(False)
+                    for i, sg in enumerate(self.stream_groups):
+                        with (
+                            graph_capture(stream=sg[1]) as graph_capture_context,
+                            profile_context as prof,
+                        ):
+                            self.stream = graph_capture_context.stream
+                            _capture_one_stream(i)
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)

@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_tree_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -56,6 +57,11 @@ from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_una
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
+from sglang.srt.layers.on_policy_utils import (
+    should_disable_mlp_allreduce_fusion_for_on_policy,
+    should_disable_reduce_scatter_for_on_policy,
+    should_use_tp_invariant_tree_all_reduce,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -599,6 +605,9 @@ class LayerCommunicator:
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
+        if should_disable_reduce_scatter_for_on_policy():
+            return False
+
         if not self.allow_reduce_scatter:
             return False
         if (
@@ -617,6 +626,9 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
+        if should_disable_mlp_allreduce_fusion_for_on_policy():
+            return False
+
         if (
             is_dp_attention_enabled()
             and self._speculative_algo is not None
@@ -883,9 +895,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                hidden_states = attention_tensor_model_parallel_all_reduce(
-                    hidden_states
-                )
+                if should_use_tp_invariant_tree_all_reduce():
+                    hidden_states = tensor_model_parallel_tree_all_reduce(hidden_states)
+                else:
+                    hidden_states = attention_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
