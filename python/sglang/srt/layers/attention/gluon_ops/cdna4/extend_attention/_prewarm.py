@@ -589,12 +589,12 @@ def prewarm_extend_attention(
 
     # Phase 2b: FP8 KV pass. Reuses the same dispatch plumbing with
     # FP8 K/V buffers. The FP8 basic/persistent kernels have an extra
-    # constexpr set (BLOCK_DPE, BLOCK_DV, EXT_BLOCK_N, EXT_NUM_STAGES,
-    # ASYNC_PAD_K, ASYNC_PAD_V) that the dispatcher fills in from its
-    # own tables, so driving the live dispatch is the cheapest way to
-    # cover every FP8 variant without duplicating the dispatch logic
-    # here. Live Q/K/V extend tensors stay BF16 to match what SGLang
-    # passes at runtime (the FP8 path only FP8-casts the KV cache).
+    # constexpr set (BLOCK_DV, EXT_BLOCK_N, EXT_NUM_STAGES, ASYNC_PAD_K,
+    # ASYNC_PAD_V) that the dispatcher fills in from its own tables, so
+    # driving the live dispatch is the cheapest way to cover every FP8
+    # variant without duplicating the dispatch logic here. Live Q/K/V
+    # extend tensors stay BF16 to match what SGLang passes at runtime
+    # (the FP8 path only FP8-casts the KV cache).
     phase2b_time = 0.0
     if _do_fp8_pass:
         phase2b_start = time.time()

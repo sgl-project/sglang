@@ -409,9 +409,7 @@ def make_fp8_bf16_v_dll(num_warps, BLOCK_DV, BLOCK_N):
 #   make_fp8_kt_dll                      | FP8 prefix K^T DLL   (D>=128; D<128 falls back to BF16)
 #   make_fp8_v_dll                       | FP8 prefix V   DLL
 #   make_fp8_v_offset_bases              | FP8 prefix V   offset bases (alias)
-#   make_fp8_kpe_offset_bases / _dll     | FP8 prefix KPE (DeepSeek rotary K)
 #   make_fp8_extend_v_dll                | FP8 kernel BF16 extend V DLL (alias for make_fp8_bf16_v_dll)
-#   make_fp8_extend_kpe_offset_bases/_dll| FP8 kernel BF16 extend KPE (4-warp only)
 #   make_ext_kt_offset_bases / _dll      | BF16 extend K^T when EXT_BLOCK_N != BLOCK_N (rare)
 #   make_ext_v_offset_bases  / _dll      | BF16 extend V   when EXT_BLOCK_N != BLOCK_N (rare)
 # ===-----------------------------------------------------------------------===#
@@ -523,111 +521,6 @@ make_fp8_v_offset_bases = make_fp8_bf16_v_offset_bases
 # Alias: the FP8 kernel's BF16-extend V tile. Semantically the FP8 kernel's
 # "extend" counterpart to ``make_fp8_v_dll``.
 make_fp8_extend_v_dll = make_fp8_bf16_v_dll
-
-
-@gluon.constexpr_function
-def make_fp8_kpe_offset_bases(num_warps, BLOCK_DPE, BLOCK_N):
-    """Offset bases for FP8 prefix KPE tile (DeepSeek rotary K positional)."""
-    is_4w = num_warps < 8
-    if is_4w:
-        if BLOCK_DPE >= 64:
-            if BLOCK_N >= 128:
-                return make_offset_bases(32, [4,8,16,32], [1,2,64], 0)
-            return make_offset_bases(32, [4,8,16], [1,2,32], 0)
-        if BLOCK_DPE >= 32:
-            return make_offset_bases(16, [16,32], [1,2,4,8], 0)
-        return make_offset_bases(8, [16,32], [1,2,4,8], 0)
-    # 8-warp
-    if BLOCK_DPE >= 64:
-        return make_offset_bases(32, [4,8,16], [1,2,32], 0)
-    if BLOCK_DPE >= 32:
-        return make_offset_bases(16, [4,8,16], [1,2,32], 0)
-    return make_offset_bases(8, [4,8,16], [1,2,32], 0)
-
-
-@gluon.constexpr_function
-def make_fp8_kpe_dll(num_warps, BLOCK_DPE, BLOCK_N):
-    """Async DMA DLL for FP8 prefix KPE tile [BLOCK_DPE, BLOCK_N]."""
-    is_4w = num_warps < 8
-    shape = [BLOCK_DPE, BLOCK_N]
-    if is_4w:
-        if BLOCK_DPE >= 64:
-            if BLOCK_N >= 128:
-                reg  = [[1,0],[2,0],[4,0],[32,0],[0,64]]
-                lane = [[0,4],[0,8],[0,16],[0,32],[8,0],[16,0]]
-            else:
-                reg  = [[1,0],[2,0],[4,0],[0,32]]
-                lane = [[8,0],[16,0],[32,0],[0,4],[0,8],[0,16]]
-            warp = [[0,1],[0,2]]
-        elif BLOCK_DPE >= 32:
-            reg  = [[1,0],[2,0],[0,4]]
-            lane = [[4,0],[8,0],[16,0],[0,8],[0,16],[0,32]]
-            warp = [[0,1],[0,2]]
-        else:
-            reg  = [[1,0],[0,4]]
-            lane = [[2,0],[4,0],[8,0],[0,8],[0,16],[0,32]]
-            warp = [[0,1],[0,2]]
-    else:
-        # 8-warp warp stride is uniform across DPE sizes
-        warp = [[0,1],[0,2],[0,32]]
-        if BLOCK_DPE >= 64:
-            reg  = [[1,0],[2,0],[4,0]]
-            lane = [[8,0],[16,0],[32,0],[0,4],[0,8],[0,16]]
-        elif BLOCK_DPE >= 32:
-            reg  = [[1,0],[2,0]]
-            lane = [[4,0],[8,0],[16,0],[0,4],[0,8],[0,16]]
-        else:
-            reg  = [[1,0]]
-            lane = [[2,0],[4,0],[8,0],[0,4],[0,8],[0,16]]
-    return DistributedLinearLayout(
-        reg_bases=reg, lane_bases=lane, warp_bases=warp,
-        block_bases=[], shape=shape,
-    )
-
-
-@gluon.constexpr_function
-def make_fp8_extend_kpe_offset_bases(num_warps, BLOCK_DPE, BLOCK_N):
-    """Offset bases for the FP8 kernel's BF16 extend KPE tile. 4-warp only.
-
-    The 8-warp paths always run with ``BLOCK_DPE == 0`` so they never ask for
-    this layout (the kernel falls through to ``kt_async_layout`` instead).
-    """
-    if BLOCK_DPE >= 64:
-        if BLOCK_N >= 128:
-            return make_offset_bases(32, [8,16,32,64], [1,2,4], 0)
-        return make_offset_bases(32, [8,16,32], [1,2,4], 0)
-    if BLOCK_DPE >= 32:
-        if BLOCK_N >= 128:
-            return make_offset_bases(16, [8,16,32,64], [1,2,4], 0)
-        return make_offset_bases(16, [8,16,32], [1,2,4], 0)
-    return make_offset_bases(16, [8,16,32], [1,2,4], 0)
-
-
-@gluon.constexpr_function
-def make_fp8_extend_kpe_dll(num_warps, BLOCK_DPE, BLOCK_N):
-    """Async DMA DLL for the FP8 kernel's BF16 extend KPE tile. 4-warp only."""
-    shape = [BLOCK_DPE, BLOCK_N]
-    warp = [[0,1],[0,2]]
-    lane_n = [[0,8],[0,16],[0,32]]
-    if BLOCK_DPE >= 64:
-        if BLOCK_N >= 128:
-            reg = [[1,0],[2,0],[4,0],[0,4],[0,64]]
-        else:
-            reg = [[1,0],[2,0],[4,0],[0,4]]
-        lane = [[8,0],[16,0],[32,0]] + lane_n
-    elif BLOCK_DPE >= 32:
-        if BLOCK_N >= 128:
-            reg = [[1,0],[2,0],[0,4],[0,64]]
-        else:
-            reg = [[1,0],[2,0],[0,4]]
-        lane = [[4,0],[8,0],[16,0]] + lane_n
-    else:
-        reg = [[1,0],[2,0],[0,4]]
-        lane = [[4,0],[8,0],[16,0]] + lane_n
-    return DistributedLinearLayout(
-        reg_bases=reg, lane_bases=lane, warp_bases=warp,
-        block_bases=[], shape=shape,
-    )
 
 
 @gluon.constexpr_function
@@ -955,160 +848,6 @@ def issue_async_load_v_extend(
 
 
 @gluon.jit
-def add_qk_dpe_prefix_from_kv(
-    qk,
-    qpe_dot,
-    K_Buffer,
-    kv_indices,
-    kv_start,
-    start_n,
-    cur_kv_head,
-    seq_len_prefix,
-    stride_buf_kbs,
-    stride_buf_kh,
-    BLOCK_N: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr,
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,
-    kt_dot_layout: gl.constexpr,
-):
-    if BLOCK_DPE > 0:
-        offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(dim=0, parent=kt_dot_layout))
-        offs_dpe = gl.arange(0, BLOCK_DPE)
-        n_idx = start_n + offs_n
-        mask_n = n_idx < seq_len_prefix
-        kv_locs = gl.load(kv_indices + kv_start + n_idx, mask=mask_n, other=0).to(tl.int32)
-        kpe_ptrs = (
-            K_Buffer
-            + kv_locs[None, :] * stride_buf_kbs
-            + cur_kv_head * stride_buf_kh
-            + BLOCK_DMODEL
-            + offs_dpe[:, None]
-        )
-        kpe_mask = mask_n[None, :]
-        if ACTUAL_BLOCK_DPE != BLOCK_DPE:
-            kpe_mask = kpe_mask & (offs_dpe[:, None] < ACTUAL_BLOCK_DPE)
-        kpe = gl.load(kpe_ptrs, mask=kpe_mask, other=0.0)
-        kpe_dot = gl.convert_layout(kpe, kt_dot_layout)
-        qk = do_mma(qpe_dot, kpe_dot, qk)
-    return qk
-
-
-@gluon.jit
-def add_qk_dpe_extend_from_base(
-    qk,
-    qpe_dot,
-    k_base,
-    start_n,
-    seq_len_extend,
-    stride_kbs,
-    BLOCK_N: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr,
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,
-    kt_dot_layout: gl.constexpr,
-):
-    if BLOCK_DPE > 0:
-        offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(dim=0, parent=kt_dot_layout))
-        offs_dpe = gl.arange(0, BLOCK_DPE)
-        kpe_ptrs = (
-            k_base
-            + (start_n + offs_n[None, :]) * stride_kbs
-            + BLOCK_DMODEL
-            + offs_dpe[:, None]
-        )
-        kpe_mask = (start_n + offs_n[None, :]) < seq_len_extend
-        if ACTUAL_BLOCK_DPE != BLOCK_DPE:
-            kpe_mask = kpe_mask & (offs_dpe[:, None] < ACTUAL_BLOCK_DPE)
-        kpe = gl.load(kpe_ptrs, mask=kpe_mask, other=0.0)
-        kpe_dot = gl.convert_layout(kpe, kt_dot_layout)
-        qk = do_mma(qpe_dot, kpe_dot, qk)
-    return qk
-
-
-@gluon.jit
-def issue_async_load_kpe_extend(
-    kpe_smem,
-    k_base,
-    start_n,
-    seq_len_extend,
-    stride_kbs,
-    BLOCK_N: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr,
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,
-    kpe_async_layout: gl.constexpr,
-):
-    """Async DMA load of transposed K_DPE [BLOCK_DPE, BLOCK_N] into shared memory."""
-    if BLOCK_DPE > 0:
-        kpe_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=kpe_async_layout)
-        kpe_offs_n_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=kpe_async_layout)
-        kpe_offs_d = gl.arange(0, BLOCK_DPE, layout=kpe_offs_d_layout)
-        kpe_offs_n = gl.arange(0, BLOCK_N, layout=kpe_offs_n_layout)
-        kpe_offsets = (
-            (kpe_offs_d[:, None] + BLOCK_DMODEL)
-            + (start_n + kpe_offs_n[None, :]) * stride_kbs
-        ).to(tl.int32)
-        kpe_mask = (start_n + kpe_offs_n[None, :]) < seq_len_extend
-        if ACTUAL_BLOCK_DPE != BLOCK_DPE:
-            kpe_mask = kpe_mask & (kpe_offs_d[:, None] < ACTUAL_BLOCK_DPE)
-        _buffer_load_to_shared_cast_safe(
-            kpe_smem, k_base, kpe_offsets, mask=kpe_mask, other=0.0
-        )
-
-
-@gluon.jit
-def issue_async_load_kpe_prefix(
-    kpe_smem,
-    k_prefix_base,
-    kv_indices,
-    kv_start,
-    start_n,
-    seq_len_prefix,
-    stride_buf_kbs,
-    BLOCK_N: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr,
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,
-    kpe_async_layout: gl.constexpr,
-):
-    """Async DMA load of transposed K_DPE [BLOCK_DPE, BLOCK_N] from prefix (scattered)."""
-    if BLOCK_DPE > 0:
-        kpe_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=kpe_async_layout)
-        kpe_offs_n_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=kpe_async_layout)
-        kpe_offs_d = gl.arange(0, BLOCK_DPE, layout=kpe_offs_d_layout)
-        kpe_offs_n = gl.arange(0, BLOCK_N, layout=kpe_offs_n_layout)
-        n_idx = start_n + kpe_offs_n
-        mask_n = n_idx < seq_len_prefix
-        kv_locs = gl.load(kv_indices + kv_start + n_idx, mask=mask_n, other=0).to(tl.int32)
-        kpe_offsets = (
-            (kpe_offs_d[:, None] + BLOCK_DMODEL)
-            + kv_locs[None, :] * stride_buf_kbs
-        ).to(tl.int32)
-        kpe_mask = mask_n[None, :]
-        if ACTUAL_BLOCK_DPE != BLOCK_DPE:
-            kpe_mask = kpe_mask & (kpe_offs_d[:, None] < ACTUAL_BLOCK_DPE)
-        _buffer_load_to_shared_cast_safe(
-            kpe_smem, k_prefix_base, kpe_offsets, mask=kpe_mask, other=0.0
-        )
-
-
-@gluon.jit
-def add_qk_dpe_from_shared(
-    qk,
-    qpe_dot,
-    kpe_smem,
-    kt_dot_layout: gl.constexpr,
-    BLOCK_DPE: gl.constexpr,
-):
-    """Accumulate Q_DPE x K_DPE from pipelined shared memory into qk."""
-    if BLOCK_DPE > 0:
-        kpe_dot = kpe_smem.load(kt_dot_layout)
-        qk = do_mma(qpe_dot, kpe_dot, qk)
-    return qk
-
-
-@gluon.jit
 def compute_softmax_prefix(
     acc,
     l_i,
@@ -1413,7 +1152,6 @@ def attn_fwd_inner_prefix_pipelined(
     l_i,
     m_i,
     q_dot,  #
-    qpe_dot,  #
     K_Buffer,
     V_Buffer,
     kv_indices,  #
@@ -1425,7 +1163,6 @@ def attn_fwd_inner_prefix_pipelined(
     stride_buf_vbs,
     stride_buf_vh,  #
     kt_smem,
-    kpe_smem,
     v_smem,  #
     qk_scale,
     LOGIT_CAP: gl.constexpr,  #
@@ -1444,25 +1181,19 @@ def attn_fwd_inner_prefix_pipelined(
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
     ACTUAL_BLOCK_DV: gl.constexpr,  #
     NUM_STAGES: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
-    kpe_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
     kt_dot_layout: gl.constexpr,
     p_dot_layout: gl.constexpr,
     v_dot_layout: gl.constexpr,  #
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,  #
-    ASYNC_KPE: gl.constexpr = False,
     SCALAR_MASK: gl.constexpr = False,  # True: _hot DMA with scalar seq>0 mask (fewer insts, +22% geomean on persistent)
 ):
-    HAS_DPE: gl.constexpr = BLOCK_DPE > 0
-    USE_ASYNC_KPE: gl.constexpr = HAS_DPE and ASYNC_KPE
-    STREAMS: gl.constexpr = 3 if USE_ASYNC_KPE else 2
+    STREAMS: gl.constexpr = 2
     # warp_pipeline_stage requires >=2 physical LDS buffers. With NS=1 the
     # stage_idx collapses to 0, and iter N's DMA write to smem[0] races
     # iter N+1's relaxed read from smem[0] because membarFilter skips
@@ -1499,21 +1230,6 @@ def attn_fwd_inner_prefix_pipelined(
             ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
         )
-        if USE_ASYNC_KPE:
-            issue_async_load_kpe_prefix(
-                kpe_smem.index(stage),
-                k_prefix_base,
-                kv_indices,
-                kv_start,
-                pf_init_n,
-                seq_len_prefix,
-                stride_buf_kbs,
-                BLOCK_N,
-                BLOCK_DMODEL,
-                BLOCK_DPE,
-                ACTUAL_BLOCK_DPE,
-                kpe_async_layout,
-            )
         issue_async_load_v_prefix(
             v_smem.index(stage),
             v_prefix_base,
@@ -1560,18 +1276,6 @@ def attn_fwd_inner_prefix_pipelined(
             start_n = (block_n * BLOCK_N).to(tl.int32)
             qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
             qk = do_mma(q_dot, kt_dot, qk)
-            if USE_ASYNC_KPE:
-                qk = add_qk_dpe_from_shared(
-                    qk, qpe_dot, kpe_smem.index(stage_idx), kt_dot_layout,
-                    BLOCK_DPE,
-                )
-            elif HAS_DPE:
-                qk = add_qk_dpe_prefix_from_kv(
-                    qk, qpe_dot, K_Buffer, kv_indices, kv_start, start_n,
-                    cur_kv_head, seq_len_prefix, stride_buf_kbs, stride_buf_kh,
-                    BLOCK_N, BLOCK_DMODEL, BLOCK_DPE, ACTUAL_BLOCK_DPE,
-                    kt_dot_layout,
-                )
 
         cdna4_async.wait_group(WAIT_V)
 
@@ -1602,22 +1306,6 @@ def attn_fwd_inner_prefix_pipelined(
                     BLOCK_DMODEL,
                     ACTUAL_BLOCK_DMODEL,
                     kt_async_layout,
-                )
-            if USE_ASYNC_KPE:
-                pf_start_kpe = (block_n + NUM_STAGES) * BLOCK_N
-                issue_async_load_kpe_prefix(
-                    kpe_smem.index(stage_idx),
-                    k_prefix_base,
-                    kv_indices,
-                    kv_start,
-                    pf_start_kpe,
-                    seq_len_prefix,
-                    stride_buf_kbs,
-                    BLOCK_N,
-                    BLOCK_DMODEL,
-                    BLOCK_DPE,
-                    ACTUAL_BLOCK_DPE,
-                    kpe_async_layout,
                 )
 
         with warp_pipeline_stage("compute1", priority=0):
@@ -1707,18 +1395,6 @@ def attn_fwd_inner_prefix_pipelined(
         )
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot_tail, qk)
-        if USE_ASYNC_KPE:
-            qk = add_qk_dpe_from_shared(
-                qk, qpe_dot, kpe_smem.index(stage_idx), kt_dot_layout,
-                BLOCK_DPE,
-            )
-        elif HAS_DPE:
-            qk = add_qk_dpe_prefix_from_kv(
-                qk, qpe_dot, K_Buffer, kv_indices, kv_start, start_n,
-                cur_kv_head, seq_len_prefix, stride_buf_kbs, stride_buf_kh,
-                BLOCK_N, BLOCK_DMODEL, BLOCK_DPE, ACTUAL_BLOCK_DPE,
-                kt_dot_layout,
-            )
 
         acc, l_i, m_i, p = compute_softmax_prefix(
             acc,
@@ -1763,7 +1439,6 @@ def attn_fwd_inner_prefix_short(
     l_i,
     m_i,
     q_dot,  #
-    qpe_dot,  #
     K_Buffer,
     V_Buffer,
     kv_indices,  #
@@ -1793,8 +1468,6 @@ def attn_fwd_inner_prefix_short(
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
     ACTUAL_BLOCK_DV: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
@@ -1851,24 +1524,6 @@ def attn_fwd_inner_prefix_short(
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
-        if BLOCK_DPE > 0:
-            qk = add_qk_dpe_prefix_from_kv(
-                qk,
-                qpe_dot,
-                K_Buffer,
-                kv_indices,
-                kv_start,
-                start_n,
-                cur_kv_head,
-                seq_len_prefix,
-                stride_buf_kbs,
-                stride_buf_kh,
-                BLOCK_N,
-                BLOCK_DMODEL,
-                BLOCK_DPE,
-                ACTUAL_BLOCK_DPE,
-                kt_dot_layout,
-            )
 
         acc, l_i, m_i, p = compute_softmax_prefix(
             acc,
@@ -1912,7 +1567,6 @@ def attn_fwd_inner_prefix_dma_simple(
     l_i,
     m_i,
     q_dot,  #
-    qpe_dot,  #
     K_Buffer,
     V_Buffer,
     kv_indices,  #
@@ -1924,7 +1578,6 @@ def attn_fwd_inner_prefix_dma_simple(
     stride_buf_vbs,
     stride_buf_vh,  #
     kt_smem,
-    kpe_smem,
     v_smem,  #
     qk_scale,
     LOGIT_CAP: gl.constexpr,  #
@@ -1943,24 +1596,18 @@ def attn_fwd_inner_prefix_dma_simple(
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
     ACTUAL_BLOCK_DV: gl.constexpr,  #
     NUM_STAGES: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
-    kpe_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
     kt_dot_layout: gl.constexpr,
     p_dot_layout: gl.constexpr,
     v_dot_layout: gl.constexpr,  #
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,  #
-    ASYNC_KPE: gl.constexpr = True,
 ):
-    HAS_DPE: gl.constexpr = BLOCK_DPE > 0
-    USE_ASYNC_KPE: gl.constexpr = HAS_DPE and ASYNC_KPE
-    STREAMS: gl.constexpr = 3 if USE_ASYNC_KPE else 2
+    STREAMS: gl.constexpr = 2
 
     n_prefix_blocks = (seq_len_prefix + BLOCK_N - 1) // BLOCK_N
     k_prefix_base = K_Buffer + cur_kv_head * stride_buf_kh
@@ -1999,21 +1646,6 @@ def attn_fwd_inner_prefix_dma_simple(
             ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
         )
-        if USE_ASYNC_KPE:
-            issue_async_load_kpe_prefix(
-                kpe_smem.index(stage),
-                k_prefix_base,
-                kv_indices,
-                kv_start,
-                pf_init_n,
-                seq_len_prefix,
-                stride_buf_kbs,
-                BLOCK_N,
-                BLOCK_DMODEL,
-                BLOCK_DPE,
-                ACTUAL_BLOCK_DPE,
-                kpe_async_layout,
-            )
         issue_dma_v_prefix_from_locs(
             v_smem.index(stage),
             v_prefix_base,
@@ -2061,18 +1693,6 @@ def attn_fwd_inner_prefix_dma_simple(
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
-        if USE_ASYNC_KPE:
-            qk = add_qk_dpe_from_shared(
-                qk, qpe_dot, kpe_smem.index(stage_idx), kt_dot_layout,
-                BLOCK_DPE,
-            )
-        elif HAS_DPE:
-            qk = add_qk_dpe_prefix_from_kv(
-                qk, qpe_dot, K_Buffer, kv_indices, kv_start, start_n,
-                cur_kv_head, seq_len_prefix, stride_buf_kbs, stride_buf_kh,
-                BLOCK_N, BLOCK_DMODEL, BLOCK_DPE, ACTUAL_BLOCK_DPE,
-                kt_dot_layout,
-            )
 
         cdna4_async.wait_group(WAIT_V)
         v_dot = cdna4_async.load_shared_relaxed(v_smem.index(stage_idx), v_dot_layout)
@@ -2091,22 +1711,6 @@ def attn_fwd_inner_prefix_dma_simple(
             ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
         )
-        if USE_ASYNC_KPE:
-            pf_start_kpe = (block_n + NUM_STAGES) * BLOCK_N
-            issue_async_load_kpe_prefix(
-                kpe_smem.index(stage_idx),
-                k_prefix_base,
-                kv_indices,
-                kv_start,
-                pf_start_kpe,
-                seq_len_prefix,
-                stride_buf_kbs,
-                BLOCK_N,
-                BLOCK_DMODEL,
-                BLOCK_DPE,
-                ACTUAL_BLOCK_DPE,
-                kpe_async_layout,
-            )
 
         acc, l_i, m_i, p = compute_softmax_prefix(
             acc,
@@ -2173,18 +1777,6 @@ def attn_fwd_inner_prefix_dma_simple(
         )
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot_tail, qk)
-        if USE_ASYNC_KPE:
-            qk = add_qk_dpe_from_shared(
-                qk, qpe_dot, kpe_smem.index(stage_idx), kt_dot_layout,
-                BLOCK_DPE,
-            )
-        elif HAS_DPE:
-            qk = add_qk_dpe_prefix_from_kv(
-                qk, qpe_dot, K_Buffer, kv_indices, kv_start, start_n,
-                cur_kv_head, seq_len_prefix, stride_buf_kbs, stride_buf_kh,
-                BLOCK_N, BLOCK_DMODEL, BLOCK_DPE, ACTUAL_BLOCK_DPE,
-                kt_dot_layout,
-            )
 
         acc, l_i, m_i, p = compute_softmax_prefix(
             acc,
@@ -2234,7 +1826,6 @@ def attn_fwd_inner_extend_dma(
     l_i,
     m_i,
     q_dot,  #
-    qpe_dot,  #
     k_base,
     v_base,  #
     cur_block_m,
@@ -2244,7 +1835,6 @@ def attn_fwd_inner_extend_dma(
     block_start,
     block_end,  #
     kt_smem,
-    kpe_smem,
     v_smem,  #
     qk_scale,
     LOGIT_CAP: gl.constexpr,  #
@@ -2262,13 +1852,10 @@ def attn_fwd_inner_extend_dma(
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
     ACTUAL_BLOCK_DV: gl.constexpr,  #
     NUM_STAGES: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
-    kpe_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
     kt_dot_layout: gl.constexpr,
     p_dot_layout: gl.constexpr,
@@ -2276,12 +1863,9 @@ def attn_fwd_inner_extend_dma(
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,
     mma_offs_m_row: gl.constexpr,  #
-    ASYNC_KPE: gl.constexpr = True,
     SKIP_BOUNDS_CHECK: gl.constexpr = False,
 ):
-    HAS_DPE: gl.constexpr = BLOCK_DPE > 0
-    USE_ASYNC_KPE: gl.constexpr = HAS_DPE and ASYNC_KPE
-    STREAMS: gl.constexpr = 3 if USE_ASYNC_KPE else 2
+    STREAMS: gl.constexpr = 2
     cdna4_async.wait_group(0)
 
     for stage in gl.static_range(NUM_STAGES):
@@ -2298,19 +1882,6 @@ def attn_fwd_inner_extend_dma(
             kt_async_layout,
             SKIP_BOUNDS_CHECK,
         )
-        if USE_ASYNC_KPE:
-            issue_async_load_kpe_extend(
-                kpe_smem.index(stage),
-                k_base,
-                pf_start_n,
-                seq_len_extend,
-                stride_kbs,
-                BLOCK_N,
-                BLOCK_DMODEL,
-                BLOCK_DPE,
-                ACTUAL_BLOCK_DPE,
-                kpe_async_layout,
-            )
         issue_async_load_v_extend(
             v_smem.index(stage),
             v_base,
@@ -2337,17 +1908,6 @@ def attn_fwd_inner_extend_dma(
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
-        if USE_ASYNC_KPE:
-            qk = add_qk_dpe_from_shared(
-                qk, qpe_dot, kpe_smem.index(stage_idx), kt_dot_layout,
-                BLOCK_DPE,
-            )
-        elif HAS_DPE:
-            qk = add_qk_dpe_extend_from_base(
-                qk, qpe_dot, k_base, start_n, seq_len_extend, stride_kbs,
-                BLOCK_N, BLOCK_DMODEL, BLOCK_DPE, ACTUAL_BLOCK_DPE,
-                kt_dot_layout,
-            )
 
         cdna4_async.wait_group(WAIT_V)
         v_dot = cdna4_async.load_shared_relaxed(v_smem.index(stage_idx), v_dot_layout)
@@ -2363,19 +1923,6 @@ def attn_fwd_inner_extend_dma(
             kt_async_layout,
             SKIP_BOUNDS_CHECK,
         )
-        if USE_ASYNC_KPE:
-            issue_async_load_kpe_extend(
-                kpe_smem.index(stage_idx),
-                k_base,
-                future_start_n,
-                seq_len_extend,
-                stride_kbs,
-                BLOCK_N,
-                BLOCK_DMODEL,
-                BLOCK_DPE,
-                ACTUAL_BLOCK_DPE,
-                kpe_async_layout,
-            )
 
         acc, l_i, m_i, p = compute_softmax_extend(
             acc,
@@ -2435,17 +1982,6 @@ def attn_fwd_inner_extend_dma(
         )
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot_tail, qk)
-        if USE_ASYNC_KPE:
-            qk = add_qk_dpe_from_shared(
-                qk, qpe_dot, kpe_smem.index(stage_idx), kt_dot_layout,
-                BLOCK_DPE,
-            )
-        elif HAS_DPE:
-            qk = add_qk_dpe_extend_from_base(
-                qk, qpe_dot, k_base, start_n, seq_len_extend, stride_kbs,
-                BLOCK_N, BLOCK_DMODEL, BLOCK_DPE, ACTUAL_BLOCK_DPE,
-                kt_dot_layout,
-            )
 
         p, alpha, m_new = compute_softmax_extend_part0(
             m_i,
@@ -2490,7 +2026,6 @@ def attn_fwd_inner_extend_pipelined(
     l_i,
     m_i,
     q_dot,  #
-    qpe_dot,  #
     k_base,
     v_base,  #
     cur_block_m,
@@ -2500,7 +2035,6 @@ def attn_fwd_inner_extend_pipelined(
     block_start,
     block_end,  #
     kt_smem,
-    kpe_smem,
     v_smem,  #
     qk_scale,
     LOGIT_CAP: gl.constexpr,  #
@@ -2518,13 +2052,10 @@ def attn_fwd_inner_extend_pipelined(
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
     ACTUAL_BLOCK_DV: gl.constexpr,  #
     NUM_STAGES: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
-    kpe_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
     kt_dot_layout: gl.constexpr,
     p_dot_layout: gl.constexpr,
@@ -2532,12 +2063,9 @@ def attn_fwd_inner_extend_pipelined(
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,
     mma_offs_m_row: gl.constexpr,  #
-    ASYNC_KPE: gl.constexpr = False,
     SKIP_BOUNDS_CHECK: gl.constexpr = False,
 ):
-    HAS_DPE: gl.constexpr = BLOCK_DPE > 0
-    USE_ASYNC_KPE: gl.constexpr = HAS_DPE and ASYNC_KPE
-    STREAMS: gl.constexpr = 3 if USE_ASYNC_KPE else 2
+    STREAMS: gl.constexpr = 2
     # warp_pipeline_stage requires >=2 physical LDS buffers. With NS=1 the
     # stage_idx collapses to 0, and iter N's DMA write to smem[0] races
     # iter N+1's relaxed read from smem[0] because membarFilter skips
@@ -2565,19 +2093,6 @@ def attn_fwd_inner_extend_pipelined(
             kt_async_layout,
             SKIP_BOUNDS_CHECK,
         )
-        if USE_ASYNC_KPE:
-            issue_async_load_kpe_extend(
-                kpe_smem.index(stage),
-                k_base,
-                pf_start_n,
-                seq_len_extend,
-                stride_kbs,
-                BLOCK_N,
-                BLOCK_DMODEL,
-                BLOCK_DPE,
-                ACTUAL_BLOCK_DPE,
-                kpe_async_layout,
-            )
         issue_async_load_v_extend(
             v_smem.index(stage),
             v_base,
@@ -2605,17 +2120,6 @@ def attn_fwd_inner_extend_pipelined(
             future_start_n = ((block_n + NUM_STAGES) * BLOCK_N).to(tl.int32)
             qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
             qk = do_mma(q_dot, kt_dot, qk)
-            if USE_ASYNC_KPE:
-                qk = add_qk_dpe_from_shared(
-                    qk, qpe_dot, kpe_smem.index(stage_idx), kt_dot_layout,
-                    BLOCK_DPE,
-                )
-            elif HAS_DPE:
-                qk = add_qk_dpe_extend_from_base(
-                    qk, qpe_dot, k_base, start_n, seq_len_extend, stride_kbs,
-                    BLOCK_N, BLOCK_DMODEL, BLOCK_DPE, ACTUAL_BLOCK_DPE,
-                    kt_dot_layout,
-                )
             p, alpha, m_new = compute_softmax_extend_part0(
                 m_i,
                 qk,
@@ -2659,19 +2163,6 @@ def attn_fwd_inner_extend_pipelined(
                 kt_async_layout,
                 SKIP_BOUNDS_CHECK,
             )
-            if USE_ASYNC_KPE:
-                issue_async_load_kpe_extend(
-                    kpe_smem.index(stage_idx),
-                    k_base,
-                    future_start_n,
-                    seq_len_extend,
-                    stride_kbs,
-                    BLOCK_N,
-                    BLOCK_DMODEL,
-                    BLOCK_DPE,
-                    ACTUAL_BLOCK_DPE,
-                    kpe_async_layout,
-                )
 
         with warp_pipeline_stage("dot2a", priority=0):
             acc, l_i, m_i = compute_softmax_extend_part1(
@@ -2713,17 +2204,6 @@ def attn_fwd_inner_extend_pipelined(
         )
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot_tail, qk)
-        if USE_ASYNC_KPE:
-            qk = add_qk_dpe_from_shared(
-                qk, qpe_dot, kpe_smem.index(stage_idx), kt_dot_layout,
-                BLOCK_DPE,
-            )
-        elif HAS_DPE:
-            qk = add_qk_dpe_extend_from_base(
-                qk, qpe_dot, k_base, start_n, seq_len_extend, stride_kbs,
-                BLOCK_N, BLOCK_DMODEL, BLOCK_DPE, ACTUAL_BLOCK_DPE,
-                kt_dot_layout,
-            )
 
         p, alpha, m_new = compute_softmax_extend_part0(
             m_i,
@@ -2773,7 +2253,6 @@ def attn_fwd_inner_prefix_serial(
     l_i,
     m_i,
     q_dot,  #
-    qpe_dot,  #
     K_Buffer,
     V_Buffer,
     kv_indices,  #
@@ -2785,7 +2264,6 @@ def attn_fwd_inner_prefix_serial(
     stride_buf_vbs,
     stride_buf_vh,  #
     kt_serial_smem,
-    kt_dpe_serial_smem,
     v_serial_smem,  #
     qk_scale,
     LOGIT_CAP: gl.constexpr,  #
@@ -2804,8 +2282,6 @@ def attn_fwd_inner_prefix_serial(
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
     ACTUAL_BLOCK_DV: gl.constexpr,  #
     kt_blocked_layout: gl.constexpr,
@@ -2817,14 +2293,9 @@ def attn_fwd_inner_prefix_serial(
     mma_offs_n_col: gl.constexpr,  #
     V_PRELOAD: gl.constexpr = False,  #
 ):
-    HAS_DPE: gl.constexpr = BLOCK_DPE > 0
     kt_offs_d = gl.arange(
         0, BLOCK_DMODEL, layout=gl.SliceLayout(dim=1, parent=kt_blocked_layout)
     )
-    if HAS_DPE:
-        kt_dpe_offs_d = gl.arange(
-            0, BLOCK_DPE, layout=gl.SliceLayout(dim=1, parent=kt_blocked_layout)
-        )
     kt_offs_n = gl.arange(
         0, BLOCK_N, layout=gl.SliceLayout(dim=0, parent=kt_blocked_layout)
     )
@@ -2858,20 +2329,6 @@ def attn_fwd_inner_prefix_serial(
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
-        if BLOCK_DPE > 0:
-            kt_dpe_ptrs = (
-                k_prefix_base
-                + BLOCK_DMODEL
-                + kt_dpe_offs_d[:, None]
-                + kv_locs_k[None, :] * stride_buf_kbs
-            )
-            kt_dpe_mask = mask_n_k[None, :]
-            if ACTUAL_BLOCK_DPE != BLOCK_DPE:
-                kt_dpe_mask = kt_dpe_mask & (kt_dpe_offs_d[:, None] < ACTUAL_BLOCK_DPE)
-            kt_dpe_global = gl.load(kt_dpe_ptrs, mask=kt_dpe_mask, other=0.0)
-            kt_dpe_serial_smem.store(kt_dpe_global)
-            kt_dpe_dot = kt_dpe_serial_smem.load(kt_dot_layout)
-            qk = do_mma(qpe_dot, kt_dpe_dot, qk)
 
         if V_PRELOAD:
             n_idx_v = start_n + v_offs_n
@@ -2942,7 +2399,6 @@ def attn_fwd_inner_extend_serial(
     l_i,
     m_i,
     q_dot,  #
-    qpe_dot,  #
     k_extend_base,
     v_extend_base,  #
     cur_block_m,
@@ -2952,7 +2408,6 @@ def attn_fwd_inner_extend_serial(
     block_start,
     block_end,  #
     kt_serial_smem,
-    kt_dpe_serial_smem,
     v_serial_smem,  #
     qk_scale,
     LOGIT_CAP: gl.constexpr,  #
@@ -2970,8 +2425,6 @@ def attn_fwd_inner_extend_serial(
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
     ACTUAL_BLOCK_DV: gl.constexpr,  #
     kt_blocked_layout: gl.constexpr,
@@ -2984,14 +2437,9 @@ def attn_fwd_inner_extend_serial(
     mma_offs_m_row: gl.constexpr,  #
     V_PRELOAD: gl.constexpr = False,  #
 ):
-    HAS_DPE: gl.constexpr = BLOCK_DPE > 0
     kt_offs_d = gl.arange(
         0, BLOCK_DMODEL, layout=gl.SliceLayout(dim=1, parent=kt_blocked_layout)
     )
-    if HAS_DPE:
-        kt_dpe_offs_d = gl.arange(
-            0, BLOCK_DPE, layout=gl.SliceLayout(dim=1, parent=kt_blocked_layout)
-        )
     kt_offs_n = gl.arange(
         0, BLOCK_N, layout=gl.SliceLayout(dim=0, parent=kt_blocked_layout)
     )
@@ -3017,20 +2465,6 @@ def attn_fwd_inner_extend_serial(
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
-        if BLOCK_DPE > 0:
-            kt_dpe_ptrs = (
-                k_extend_base
-                + BLOCK_DMODEL
-                + kt_dpe_offs_d[:, None]
-                + (start_n + kt_offs_n[None, :]) * stride_kbs
-            )
-            kt_dpe_mask = (start_n + kt_offs_n[None, :]) < seq_len_extend
-            if ACTUAL_BLOCK_DPE != BLOCK_DPE:
-                kt_dpe_mask = kt_dpe_mask & (kt_dpe_offs_d[:, None] < ACTUAL_BLOCK_DPE)
-            kt_dpe_global = gl.load(kt_dpe_ptrs, mask=kt_dpe_mask, other=0.0)
-            kt_dpe_serial_smem.store(kt_dpe_global)
-            kt_dpe_dot = kt_dpe_serial_smem.load(kt_dot_layout)
-            qk = do_mma(qpe_dot, kt_dpe_dot, qk)
 
         if V_PRELOAD:
             v_ptrs = (
@@ -3101,7 +2535,6 @@ def attn_fwd_inner_extend_short(
     l_i,
     m_i,
     q_dot,  #
-    qpe_dot,  #
     k_base,
     v_base,  #
     cur_block_m,
@@ -3128,8 +2561,6 @@ def attn_fwd_inner_extend_short(
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
     ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
-    BLOCK_DPE: gl.constexpr,
-    ACTUAL_BLOCK_DPE: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
     ACTUAL_BLOCK_DV: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
@@ -3201,20 +2632,6 @@ def attn_fwd_inner_extend_short(
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
-        if BLOCK_DPE > 0:
-            qk = add_qk_dpe_extend_from_base(
-                qk,
-                qpe_dot,
-                k_base,
-                start_n,
-                seq_len_extend,
-                stride_kbs,
-                BLOCK_N,
-                BLOCK_DMODEL,
-                BLOCK_DPE,
-                ACTUAL_BLOCK_DPE,
-                kt_dot_layout,
-            )
 
         acc, l_i, m_i, p = compute_softmax_extend(
             acc,

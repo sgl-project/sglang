@@ -266,7 +266,7 @@ def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
     """FP8 twin of :func:`_make_fast_runner`.
 
     The FP8 unified kernel signature carries the FP8-specific constexprs
-    (``SKIP_PREFIX_CUSTOM_MASK``, ``ENABLE_MASK_SPLIT``, ``BLOCK_DPE``/``DV``,
+    (``SKIP_PREFIX_CUSTOM_MASK``, ``ENABLE_MASK_SPLIT``, ``BLOCK_DV``,
     ``EXT_BLOCK_N``/``EXT_NUM_STAGES``, ``ASYNC_PAD_K``/``V``) plus the
     persistent-superset runtime args (num_heads, n_m_tiles, total_valid_tiles,
     total_programs, partial_out, partial_lse, tile_done) and constexprs
@@ -295,8 +295,6 @@ def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
     BLOCK_N = frozen_kw['BLOCK_N']
     BLOCK_DMODEL = frozen_kw['BLOCK_DMODEL']
     ACTUAL_BLOCK_DMODEL = frozen_kw['ACTUAL_BLOCK_DMODEL']
-    BLOCK_DPE = frozen_kw['BLOCK_DPE']
-    ACTUAL_BLOCK_DPE = frozen_kw['ACTUAL_BLOCK_DPE']
     BLOCK_DV = frozen_kw['BLOCK_DV']
     ACTUAL_BLOCK_DV = frozen_kw['ACTUAL_BLOCK_DV']
     NUM_STAGES = frozen_kw['NUM_STAGES']
@@ -327,7 +325,7 @@ def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
             IS_CAUSAL, USE_CUSTOM_MASK, SKIP_PREFIX_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED, ENABLE_MASK_SPLIT,
             BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-            BLOCK_DPE, ACTUAL_BLOCK_DPE, BLOCK_DV, ACTUAL_BLOCK_DV,
+            BLOCK_DV, ACTUAL_BLOCK_DV,
             NUM_STAGES, EXT_BLOCK_N, EXT_NUM_STAGES,
             ASYNC_PAD_K, ASYNC_PAD_V,
             sinks, HAS_SINK,
@@ -1229,7 +1227,6 @@ def gluon_extend_attention_fwd(
             "EXT_BLOCK_N": _EXT_BN, "EXT_NUM_STAGES": _EXT_NS,
             "SKIP_PREFIX_CUSTOM_MASK": True,
             "ENABLE_MASK_SPLIT": Lq < 256,
-            "BLOCK_DPE": 0, "ACTUAL_BLOCK_DPE": 0,
             "BLOCK_DV": _BLOCK_DMODEL, "ACTUAL_BLOCK_DV": Lq,
             "ASYNC_PAD_K": _PAD_K, "ASYNC_PAD_V": _PAD_V,
         } if _kv_is_fp8 else {}
@@ -1588,7 +1585,6 @@ def gluon_extend_attention_fwd(
         "EXT_BLOCK_N": EXT_BLOCK_N, "EXT_NUM_STAGES": EXT_NUM_STAGES,
         "SKIP_PREFIX_CUSTOM_MASK": skip_prefix_custom_mask,
         "ENABLE_MASK_SPLIT": Lq < 256,
-        "BLOCK_DPE": 0, "ACTUAL_BLOCK_DPE": 0,
         "BLOCK_DV": BLOCK_DMODEL, "ACTUAL_BLOCK_DV": Lq,
         "ASYNC_PAD_K": 16, "ASYNC_PAD_V": 16,
     } if _kv_is_fp8 else {}
@@ -1865,8 +1861,6 @@ def _launch_persistent_fp8(
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=BLOCK_DMODEL,
         ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
-        BLOCK_DPE=0,
-        ACTUAL_BLOCK_DPE=0,
         BLOCK_DV=BLOCK_DV,
         ACTUAL_BLOCK_DV=Lq,
         NUM_STAGES=NUM_STAGES,

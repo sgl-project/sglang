@@ -17,8 +17,9 @@ functionally identical to the pre-refactor basic kernel. When True, the
 same body services persistent / split-K / WCA launches.
 
 The following constexprs are derived internally (not accepted as parameters):
-BLOCK_DPE/ACTUAL_BLOCK_DPE (0), BLOCK_DV/ACTUAL_BLOCK_DV (=BLOCK_DMODEL),
-ENABLE_MASK_SPLIT/SKIP_PREFIX_CUSTOM_MASK (True), ASYNC_PAD_K/V (from BLOCK_DMODEL).
+BLOCK_DV/ACTUAL_BLOCK_DV (=BLOCK_DMODEL), ENABLE_MASK_SPLIT/SKIP_PREFIX_CUSTOM_MASK
+(True), ASYNC_PAD_K/V (from BLOCK_DMODEL). BLOCK_DPE is not present -- DeepSeek/MLA
+will use a separate kernel.
 
 Prefix dispatch uses the "unmasked bulk + masked tail" split across all 3
 paths (dma_simple / pipelined / serial): pipelined runs on the BLOCK_N-aligned
@@ -114,8 +115,6 @@ def gluon_extend_attn_fwd(
     mma_offs_m_row: gl.constexpr = _blk[4]
     mma_m_layout: gl.constexpr = _blk[5]
 
-    BLOCK_DPE: gl.constexpr = 0
-    ACTUAL_BLOCK_DPE: gl.constexpr = 0
     BLOCK_DV: gl.constexpr = BLOCK_DMODEL
     ACTUAL_BLOCK_DV: gl.constexpr = ACTUAL_BLOCK_DMODEL
     ENABLE_MASK_SPLIT: gl.constexpr = ACTUAL_BLOCK_DMODEL < 256
@@ -266,8 +265,6 @@ def gluon_extend_attn_fwd(
         if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
             q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
         q = gl.load(q_ptrs, mask=q_mask, other=0.0)
-        qpe = q
-        qpe_dot = gl.convert_layout(qpe, q_dot_layout)
 
         # softmax state
         m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=mma_m_layout)
@@ -353,9 +350,6 @@ def gluon_extend_attn_fwd(
                     layout=v_smem_layout,
                 )
 
-                kpe_smem = kt_smem
-                kpe_async_layout: gl.constexpr = kt_async_layout
-
                 if is_valid_tile:
                     for _s in gl.static_range(NUM_STAGES):
                         v_zero = gl.zeros(
@@ -390,7 +384,6 @@ def gluon_extend_attn_fwd(
                             l_i,
                             m_i,
                             q_dot,
-                            qpe_dot,
                             K_Buffer,
                             V_Buffer,
                             kv_indices,
@@ -402,7 +395,6 @@ def gluon_extend_attn_fwd(
                             stride_buf_vbs,
                             stride_buf_vh,
                             kt_smem,
-                            kpe_smem,
                             v_smem,
                             qk_scale,
                             LOGIT_CAP,
@@ -421,20 +413,16 @@ def gluon_extend_attn_fwd(
                             BLOCK_N,
                             BLOCK_DMODEL,
                             ACTUAL_BLOCK_DMODEL,
-                            BLOCK_DPE,
-                            ACTUAL_BLOCK_DPE,
                             BLOCK_DV,
                             ACTUAL_BLOCK_DV,
                             NUM_STAGES,
                             kt_async_layout,
-                            kpe_async_layout,
                             v_async_layout,
                             kt_dot_layout,
                             p_dot_layout,
                             v_dot_layout,
                             mma_layout,
                             mma_offs_n_col,
-                            False,
                         )
                     else:
                         acc, l_i, m_i = attn_fwd_inner_prefix_short(
@@ -442,7 +430,6 @@ def gluon_extend_attn_fwd(
                             l_i,
                             m_i,
                             q_dot,
-                            qpe_dot,
                             K_Buffer,
                             V_Buffer,
                             kv_indices,
@@ -472,8 +459,6 @@ def gluon_extend_attn_fwd(
                             BLOCK_N,
                             BLOCK_DMODEL,
                             ACTUAL_BLOCK_DMODEL,
-                            BLOCK_DPE,
-                            ACTUAL_BLOCK_DPE,
                             BLOCK_DV,
                             ACTUAL_BLOCK_DV,
                             kt_async_layout,
@@ -491,7 +476,6 @@ def gluon_extend_attn_fwd(
                             l_i,
                             m_i,
                             q_dot,
-                            qpe_dot,
                             K_Buffer,
                             V_Buffer,
                             kv_indices,
@@ -521,8 +505,6 @@ def gluon_extend_attn_fwd(
                             BLOCK_N,
                             BLOCK_DMODEL,
                             ACTUAL_BLOCK_DMODEL,
-                            BLOCK_DPE,
-                            ACTUAL_BLOCK_DPE,
                             BLOCK_DV,
                             ACTUAL_BLOCK_DV,
                             kt_async_layout,
@@ -585,7 +567,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -595,7 +576,6 @@ def gluon_extend_attn_fwd(
                         0,
                         n_full_blocks,
                         kt_smem,
-                        kpe_smem,
                         v_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -613,13 +593,10 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
-                        kpe_async_layout,
                         v_async_layout,
                         kt_dot_layout,
                         p_dot_layout,
@@ -627,7 +604,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        False,
                         SKIP_BOUNDS_CHECK=True,
                     )
                 elif n_full_blocks > 0:
@@ -636,7 +612,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -663,8 +638,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_async_layout,
@@ -685,7 +658,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -695,7 +667,6 @@ def gluon_extend_attn_fwd(
                         masked_start,
                         n_extend_blocks,
                         kt_smem,
-                        kpe_smem,
                         v_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -713,13 +684,10 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
-                        kpe_async_layout,
                         v_async_layout,
                         kt_dot_layout,
                         p_dot_layout,
@@ -727,7 +695,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        False,
                     )
                 elif remaining_blocks > 0:
                     acc, l_i, m_i = attn_fwd_inner_extend_short(
@@ -735,7 +702,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -762,8 +728,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_async_layout,
@@ -789,7 +753,6 @@ def gluon_extend_attn_fwd(
                     [BLOCK_DMODEL, BLOCK_N],
                     layout=kt_serial_smem_layout,
                 )
-                kt_dpe_serial_smem = kt_serial_smem
                 v_serial_smem = gl.allocate_shared_memory(
                     Q_Extend.dtype.element_ty,
                     [BLOCK_N, BLOCK_DV],
@@ -803,7 +766,6 @@ def gluon_extend_attn_fwd(
 
                 q_smem.store(q)
                 q_dot = q_smem.load(q_dot_layout)
-                qpe_dot = gl.convert_layout(qpe, q_dot_layout)
 
                 if pfx_seq_len > 0:
                     acc, l_i, m_i = attn_fwd_inner_prefix_serial(
@@ -811,7 +773,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         K_Buffer,
                         V_Buffer,
                         kv_indices,
@@ -823,7 +784,6 @@ def gluon_extend_attn_fwd(
                         stride_buf_vbs,
                         stride_buf_vh,
                         kt_serial_smem,
-                        kt_dpe_serial_smem,
                         v_serial_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -842,8 +802,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_blocked_layout,
@@ -902,7 +860,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -912,7 +869,6 @@ def gluon_extend_attn_fwd(
                         0,
                         n_full_blocks,
                         kt_serial_smem,
-                        kt_dpe_serial_smem,
                         v_serial_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -930,8 +886,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_blocked_layout,
@@ -951,7 +905,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -961,7 +914,6 @@ def gluon_extend_attn_fwd(
                         masked_start,
                         n_extend_blocks,
                         kt_serial_smem,
-                        kt_dpe_serial_smem,
                         v_serial_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -979,8 +931,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_blocked_layout,
@@ -1016,9 +966,6 @@ def gluon_extend_attn_fwd(
                     [NUM_STAGES, BLOCK_N, BLOCK_DV],
                     layout=v_async_smem_layout,
                 )
-
-                kpe_smem = kt_smem
-                kpe_async_layout: gl.constexpr = kt_async_layout
 
                 if is_valid_tile:
                     for _s in gl.static_range(NUM_STAGES):
@@ -1056,7 +1003,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         K_Buffer,
                         V_Buffer,
                         kv_indices,
@@ -1068,7 +1014,6 @@ def gluon_extend_attn_fwd(
                         stride_buf_vbs,
                         stride_buf_vh,
                         kt_smem,
-                        kpe_smem,
                         v_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -1087,20 +1032,16 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
-                        kpe_async_layout,
                         v_async_layout,
                         kt_dot_layout,
                         p_dot_layout,
                         v_dot_layout,
                         mma_layout,
                         mma_offs_n_col,
-                        False,
                         _use_scalar_mask,
                     )
                     if pfx_seq_len > pfx_full_len:
@@ -1109,7 +1050,6 @@ def gluon_extend_attn_fwd(
                             l_i,
                             m_i,
                             q_dot,
-                            qpe_dot,
                             K_Buffer,
                             V_Buffer,
                             kv_indices,
@@ -1139,8 +1079,6 @@ def gluon_extend_attn_fwd(
                             BLOCK_N,
                             BLOCK_DMODEL,
                             ACTUAL_BLOCK_DMODEL,
-                            BLOCK_DPE,
-                            ACTUAL_BLOCK_DPE,
                             BLOCK_DV,
                             ACTUAL_BLOCK_DV,
                             kt_async_layout,
@@ -1159,7 +1097,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         K_Buffer,
                         V_Buffer,
                         kv_indices,
@@ -1189,8 +1126,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_async_layout,
@@ -1250,7 +1185,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -1260,7 +1194,6 @@ def gluon_extend_attn_fwd(
                         0,
                         n_full_blocks,
                         kt_smem,
-                        kpe_smem,
                         v_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -1278,13 +1211,10 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
-                        kpe_async_layout,
                         v_async_layout,
                         kt_dot_layout,
                         p_dot_layout,
@@ -1292,7 +1222,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        False,
                     )
                 elif n_full_blocks > 0:
                     acc, l_i, m_i = attn_fwd_inner_extend_short(
@@ -1300,7 +1229,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -1327,8 +1255,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_async_layout,
@@ -1349,7 +1275,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -1359,7 +1284,6 @@ def gluon_extend_attn_fwd(
                         masked_start,
                         n_extend_blocks,
                         kt_smem,
-                        kpe_smem,
                         v_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -1377,13 +1301,10 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
-                        kpe_async_layout,
                         v_async_layout,
                         kt_dot_layout,
                         p_dot_layout,
@@ -1391,7 +1312,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        False,
                     )
                 elif remaining_blocks > 0:
                     acc, l_i, m_i = attn_fwd_inner_extend_short(
@@ -1399,7 +1319,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -1426,8 +1345,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_async_layout,
@@ -1462,9 +1379,6 @@ def gluon_extend_attn_fwd(
                     layout=v_async_smem_layout,
                 )
 
-                kpe_smem = kt_smem
-                kpe_async_layout: gl.constexpr = kt_async_layout
-
                 if is_valid_tile:
                     for _s in gl.static_range(NUM_STAGES):
                         v_zero = gl.zeros(
@@ -1487,12 +1401,14 @@ def gluon_extend_attn_fwd(
                     pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
                     n_full_prefix = pfx_seq_len // BLOCK_N
                 if n_full_prefix >= NUM_STAGES:
+                    _use_scalar_mask: gl.constexpr = (PREFIX_MASK_MODE == 1) or (
+                        PREFIX_MASK_MODE == 0 and IS_PERSISTENT
+                    )
                     acc, l_i, m_i = attn_fwd_inner_prefix_pipelined(
                         acc,
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         K_Buffer,
                         V_Buffer,
                         kv_indices,
@@ -1504,7 +1420,6 @@ def gluon_extend_attn_fwd(
                         stride_buf_vbs,
                         stride_buf_vh,
                         kt_smem,
-                        kpe_smem,
                         v_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -1523,20 +1438,17 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
-                        kpe_async_layout,
                         v_async_layout,
                         kt_dot_layout,
                         p_dot_layout,
                         v_dot_layout,
                         mma_layout,
                         mma_offs_n_col,
-                        False,
+                        _use_scalar_mask,
                     )
                 elif pfx_seq_len > 0:
                     acc, l_i, m_i = attn_fwd_inner_prefix_short(
@@ -1544,7 +1456,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         K_Buffer,
                         V_Buffer,
                         kv_indices,
@@ -1574,8 +1485,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_async_layout,
@@ -1593,7 +1502,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         K_Buffer,
                         V_Buffer,
                         kv_indices,
@@ -1623,8 +1531,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_async_layout,
@@ -1685,7 +1591,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -1695,7 +1600,6 @@ def gluon_extend_attn_fwd(
                         0,
                         n_full_blocks,
                         kt_smem,
-                        kpe_smem,
                         v_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -1713,13 +1617,10 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
-                        kpe_async_layout,
                         v_async_layout,
                         kt_dot_layout,
                         p_dot_layout,
@@ -1727,7 +1628,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        False,
                     )
                 elif n_full_blocks > 0:
                     acc, l_i, m_i = attn_fwd_inner_extend_short(
@@ -1735,7 +1635,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -1762,8 +1661,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_async_layout,
@@ -1784,7 +1681,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -1794,7 +1690,6 @@ def gluon_extend_attn_fwd(
                         masked_start,
                         n_extend_blocks,
                         kt_smem,
-                        kpe_smem,
                         v_smem,
                         qk_scale,
                         LOGIT_CAP,
@@ -1812,13 +1707,10 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
-                        kpe_async_layout,
                         v_async_layout,
                         kt_dot_layout,
                         p_dot_layout,
@@ -1826,7 +1718,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        False,
                     )
                 elif remaining_blocks > 0:
                     acc, l_i, m_i = attn_fwd_inner_extend_short(
@@ -1834,7 +1725,6 @@ def gluon_extend_attn_fwd(
                         l_i,
                         m_i,
                         q_dot,
-                        qpe_dot,
                         k_extend_base,
                         v_extend_base,
                         cur_block_m,
@@ -1861,8 +1751,6 @@ def gluon_extend_attn_fwd(
                         BLOCK_N,
                         BLOCK_DMODEL,
                         ACTUAL_BLOCK_DMODEL,
-                        BLOCK_DPE,
-                        ACTUAL_BLOCK_DPE,
                         BLOCK_DV,
                         ACTUAL_BLOCK_DV,
                         kt_async_layout,
