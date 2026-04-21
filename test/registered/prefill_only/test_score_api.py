@@ -3,15 +3,16 @@
 Two test classes, each with its own server instance:
 
   TestCausalLMScoringHTTP    — basic endpoint: schema defaults, response
-                               structure, error rejection (no MIS delimiter)
-  TestCausalLMMISScoringHTTP — MIS mode: validates --multi-item-scoring-delimiter
-                               CLI flag wiring and per-item output shape
+                               structure, error rejection (no MIS)
+  TestCausalLMMISScoringHTTP — MIS mode: validates --enable-mis CLI flag
+                               wiring and per-item output shape
 
 Engine-level correctness (numerical accuracy, batching, edge cases) lives in
 test_score_engine.py.  These tests focus on the HTTP integration seam:
 Pydantic schema defaults, FastAPI routing, and server argument wiring.
 """
 
+import os
 import unittest
 
 import requests
@@ -28,9 +29,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=70, suite="stage-b-test-1-gpu-small")
 
-_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST  # Llama-3.2-1B-Instruct
-# <|eot_id|> for Llama-3.x Instruct — used as MIS delimiter
-_LLAMA3_EOT_TOKEN_ID = 128009
+_MODEL = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +40,7 @@ _LLAMA3_EOT_TOKEN_ID = 128009
 class TestCausalLMScoringHTTP(CustomTestCase):
     """Validates /v1/score HTTP integration — schema, defaults, and error handling.
 
-    Starts a plain CausalLM server (no --multi-item-scoring-delimiter) to test
+    Starts a plain CausalLM server (no --enable-mis) to test
     the HTTP layer in isolation: response envelope shape, the apply_softmax
     default (False), and Pydantic validation errors on malformed input.
     """
@@ -139,12 +138,12 @@ class TestCausalLMScoringHTTP(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# MIS scoring (with --multi-item-scoring-delimiter)
+# MIS scoring (with --enable-mis)
 # ---------------------------------------------------------------------------
 
 
 class TestCausalLMMISScoringHTTP(CustomTestCase):
-    """Validates /v1/score with --multi-item-scoring-delimiter.
+    """Validates /v1/score with --enable-mis.
 
     Confirms that the CLI flag is correctly wired into ServerArgs and that the
     endpoint returns one probability vector per item when items are
@@ -163,8 +162,9 @@ class TestCausalLMMISScoringHTTP(CustomTestCase):
                 "--disable-radix-cache",
                 "--chunked-prefill-size",
                 "-1",
-                "--multi-item-scoring-delimiter",
-                str(_LLAMA3_EOT_TOKEN_ID),
+                "--enable-mis",
+                "--attention-backend",
+                "flashinfer",
             ],
         )
 
