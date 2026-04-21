@@ -2,7 +2,6 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
-#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -17,28 +16,28 @@
 namespace {
 
 template <typename T, int VEC_SIZE_IN_BYTE>
-struct FusedAddRMSNormQuantVecTypeTrait;
+struct VecTypeTrait;
 
 template <>
-struct FusedAddRMSNormQuantVecTypeTrait<bf16_t, 16> {
+struct VecTypeTrait<bf16_t, 16> {
   using packed_t = packed_t<bf16_t>;
   using vec_t = device::AlignedVector<packed_t, 4>;
 };
 
 template <>
-struct FusedAddRMSNormQuantVecTypeTrait<fp16_t, 16> {
+struct VecTypeTrait<fp16_t, 16> {
   using packed_t = packed_t<fp16_t>;
   using vec_t = device::AlignedVector<packed_t, 4>;
 };
 
 template <>
-struct FusedAddRMSNormQuantVecTypeTrait<bf16_t, 32> {
+struct VecTypeTrait<bf16_t, 32> {
   using packed_t = packed_t<bf16_t>;
   using vec_t = device::AlignedVector<packed_t, 8>;
 };
 
 template <>
-struct FusedAddRMSNormQuantVecTypeTrait<fp16_t, 32> {
+struct VecTypeTrait<fp16_t, 32> {
   using packed_t = packed_t<fp16_t>;
   using vec_t = device::AlignedVector<packed_t, 8>;
 };
@@ -58,8 +57,8 @@ __global__ void fused_add_rmsnorm_quant_reg_kernel(
 
   __shared__ float shared_memory[32];  // Used for CTA reduce
 
-  using vec_t = typename FusedAddRMSNormQuantVecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
-  using packed_t = typename FusedAddRMSNormQuantVecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
+  using vec_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
+  using packed_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
   vec_t v;         // Save input
   vec_t v_res;     // Save residual
   vec_t v_weight;  // Save weight
@@ -175,11 +174,9 @@ struct FusedAddRMSNormQuantKernel {
         .with_device(device)
         .verify(scale);
 
-    auto cc_major = host::runtime::get_cc_major(device.unwrap().device_id);
     int hidden_size = static_cast<int>(D.unwrap());
-    if ((cc_major <= 9 && hidden_size <= 8192) || (cc_major >= 10 && hidden_size <= 12288)) {
-      int max_vec_size_byte = cc_major >= 10 ? 32 : 16;
-      int elements_in_vec = max_vec_size_byte / sizeof(DType);
+    if (hidden_size <= (device::kMaxVecBytes == 32 ? 12288 : 8192)) {
+      int elements_in_vec = device::kMaxVecBytes / sizeof(DType);
       int vec_hidden_size = hidden_size / elements_in_vec;
       uint threads = (vec_hidden_size + 31) / 32 * 32;
 
@@ -192,8 +189,7 @@ struct FusedAddRMSNormQuantKernel {
           elements_in_vec);
 
       // Launch kernel
-      auto kernel = max_vec_size_byte == 32 ? fused_add_rmsnorm_quant_reg_kernel<DType, 32>
-                                            : fused_add_rmsnorm_quant_reg_kernel<DType, 16>;
+      auto kernel = fused_add_rmsnorm_quant_reg_kernel<DType, device::kMaxVecBytes>;
       LaunchKernel(static_cast<uint>(N.unwrap()), threads, device.unwrap())
           .enable_pdl(false)(
               kernel,

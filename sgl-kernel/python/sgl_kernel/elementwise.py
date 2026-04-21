@@ -162,31 +162,6 @@ def fused_add_rmsnorm(
         _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
 
 
-def rms_norm_static_fp8_quant(
-    out: torch.Tensor,
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    epsilon: float = 1e-6,
-) -> None:
-    torch.ops.sgl_kernel.rms_norm_static_fp8_quant.default(
-        out, input, weight, scale, epsilon
-    )
-
-
-def fused_add_rms_norm_static_fp8_quant(
-    out: torch.Tensor,
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    epsilon: float = 1e-6,
-):
-    torch.ops.sgl_kernel.fused_add_rms_norm_static_fp8_quant.default(
-        out, input, residual, weight, scale, epsilon
-    )
-
-
 def gemma_rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
