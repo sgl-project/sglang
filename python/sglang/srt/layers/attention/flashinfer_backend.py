@@ -141,6 +141,10 @@ def _spec_prefix_lens(
     if forward_mode.is_target_verify():
         return seq_lens
     if forward_mode.is_draft_extend():
+        assert (spec_info.accept_length <= seq_lens).all(), (
+            "accept_length must be <= seq_lens "
+            "(invariant from prepare_extend_after_decode)"
+        )
         return seq_lens - spec_info.accept_length
     raise ValueError(f"_spec_prefix_lens called with unsupported mode: {forward_mode}")
 
