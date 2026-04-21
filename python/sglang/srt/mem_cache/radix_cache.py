@@ -69,24 +69,9 @@ if TYPE_CHECKING:
 
 
 class RadixKey:
-    """Abstract base; concrete ``PlainKey`` / ``BigramKey`` own the is-bigram semantics.
+    """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    ``RadixKey(tokens, extra_key, is_bigram=...)`` dispatches via ``__new__`` to the
-    right subclass for backward compatibility; new code may use the subclasses directly.
-    """
-
-    __slots__ = ("token_ids", "extra_key")
-    is_bigram: bool  # overridden per subclass
-
-    def __new__(
-        cls,
-        token_ids: List[int] = (),
-        extra_key: Optional[str] = None,
-        is_bigram: bool = False,
-    ):
-        if cls is RadixKey:
-            cls = BigramKey if is_bigram else PlainKey
-        return object.__new__(cls)
+    __slots__ = ("token_ids", "extra_key", "is_bigram")
 
     def __init__(
         self,
@@ -94,23 +79,49 @@ class RadixKey:
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
+        # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
+        # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
+        # bigram view over token_ids: length = max(0, len(token_ids) - 1)
+        self.is_bigram = is_bigram
+
+    def __len__(self) -> int:
+        if self.is_bigram:
+            n = len(self.token_ids)
+            return n - 1 if n > 0 else 0
+        return len(self.token_ids)
+
+    def __iter__(self) -> Iterator:
+        if self.is_bigram:
+            t = self.token_ids
+            for i in range(len(t) - 1):
+                yield (t[i], t[i + 1])
+        else:
+            yield from self.token_ids
+
+    def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
+        # Normalize int -> 1-element slice so the rest handles one shape.
+        if isinstance(idx, int):
+            if idx < 0:
+                idx += len(self)
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f"RadixKey index out of range: {idx}")
+            idx = slice(idx, idx + 1)
+        start, stop, step = idx.indices(len(self))
+        if step != 1:
+            raise ValueError("RadixKey slice step must be 1")
+
+        if self.is_bigram:
+            # bigrams [start, stop) span raw tokens [start, stop + 1);
+            # empty slice -> empty raw tokens (not a dangling boundary token).
+            raw = self.token_ids[start : stop + 1] if stop > start else []
+            return RadixKey(raw, self.extra_key, is_bigram=True)
+        return RadixKey(self.token_ids[start:stop], self.extra_key)
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
-        tail = "..." if len(self.token_ids) > 10 else ""
-        return (
-            f"{type(self).__name__}(extra_key={self.extra_key!r}, "
-            f"token_ids={preview}{tail})"
-        )
-
-    def _check_compatible(self, other: "RadixKey") -> None:
-        if self.extra_key != other.extra_key:
-            raise ValueError(
-                f"RadixKey operations require matching extra_key, but got "
-                f"{self.extra_key=} != {other.extra_key=}"
-            )
+        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
     def page_aligned(self, page_size: int) -> "RadixKey":
         if page_size == 1:
@@ -123,68 +134,38 @@ class RadixKey:
         is_eagle: bool,
         value: Optional[torch.Tensor] = None,
     ) -> Tuple["RadixKey", Optional[torch.Tensor]]:
-        """If ``is_eagle`` and ``self`` is a ``PlainKey``, return an equivalent
-        ``BigramKey`` (O(1) wrap over the same ``token_ids``) and a value
-        truncated to the bigram count. Idempotent on a ``BigramKey``."""
+        # O(1): flip the bigram flag instead of materializing a tuple list.
+        # value is paired with raw tokens and gets truncated to the bigram count.
         if is_eagle and not self.is_bigram:
-            new_key = BigramKey(self.token_ids, self.extra_key)
+            self.is_bigram = True
             if value is not None:
-                value = value[: len(new_key)]
-            return new_key, value
+                value = value[: len(self)]
         return self, value
 
-    # --- abstract ---
-    def __len__(self) -> int:
-        raise NotImplementedError
-
-    def __iter__(self) -> Iterator:
-        raise NotImplementedError
-
-    def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
-        raise NotImplementedError
+    def _check_compatible(self, other: "RadixKey") -> None:
+        if self.extra_key != other.extra_key:
+            raise ValueError(
+                f"RadixKey operations require matching extra_key, but got "
+                f"{self.extra_key=} != {other.extra_key=}"
+            )
 
     def match(self, other: "RadixKey", page_size: int = 1) -> int:
-        raise NotImplementedError
-
-    def child_key(self, page_size: int = 1):
-        raise NotImplementedError
-
-    def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
-        raise NotImplementedError
-
-
-def _normalize_index(idx, logical_len: int) -> slice:
-    """Accepts int or slice, returns slice(start, stop, 1) with raise on invalid int."""
-    if isinstance(idx, int):
-        if idx < 0:
-            idx += logical_len
-        if idx < 0 or idx >= logical_len:
-            raise IndexError(f"RadixKey index out of range: {idx}")
-        return slice(idx, idx + 1)
-    return idx
-
-
-class PlainKey(RadixKey):
-    __slots__ = ()
-    is_bigram = False
-
-    def __len__(self) -> int:
-        return len(self.token_ids)
-
-    def __iter__(self) -> Iterator:
-        return iter(self.token_ids)
-
-    def __getitem__(self, idx: Union[int, slice]) -> "PlainKey":
-        sl = _normalize_index(idx, len(self))
-        start, stop, step = sl.indices(len(self))
-        if step != 1:
-            raise ValueError("RadixKey slice step must be 1")
-        return PlainKey(self.token_ids[start:stop], self.extra_key)
-
-    def match(self, other: "RadixKey", page_size: int = 1) -> int:
+        """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
-        # page_size=1 collapses to element-wise comparison under the same loop.
+
+        if self.is_bigram:
+            # Walk raw tokens; L matching tokens imply L-1 matching bigrams.
+            i = 0
+            for a, b in zip(t0, t1):
+                if a != b:
+                    break
+                i += 1
+            matched = max(0, min(i - 1, len(self), len(other)))
+            # // page_size * page_size is a no-op for page_size=1.
+            return (matched // page_size) * page_size
+
+        # page_size=1 collapses to element-wise slice comparison under the same loop.
         min_len = min(len(self), len(other))
         i = 0
         while i < min_len:
@@ -194,74 +175,30 @@ class PlainKey(RadixKey):
         return i
 
     def child_key(self, page_size: int = 1):
+        """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
         t = self.token_ids
-        plain = t[0] if page_size == 1 else tuple(t[:page_size])
-        return plain if self.extra_key is None else (self.extra_key, plain)
-
-    def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
-        hasher = hashlib.sha256()
-        if prior_hash:
-            hasher.update(bytes.fromhex(prior_hash))
-        t = self.token_ids
-        for j in range(start, end):
-            hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
-        return hasher.hexdigest()
-
-
-class BigramKey(RadixKey):
-    """``token_ids`` holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
-
-    __slots__ = ()
-    is_bigram = True
-
-    def __len__(self) -> int:
-        n = len(self.token_ids)
-        return n - 1 if n > 0 else 0
-
-    def __iter__(self) -> Iterator:
-        t = self.token_ids
-        for i in range(len(t) - 1):
-            yield (t[i], t[i + 1])
-
-    def __getitem__(self, idx: Union[int, slice]) -> "BigramKey":
-        sl = _normalize_index(idx, len(self))
-        start, stop, step = sl.indices(len(self))
-        if step != 1:
-            raise ValueError("RadixKey slice step must be 1")
-        # bigrams [start, stop) span raw tokens [start, stop + 1);
-        # empty slice -> empty raw tokens (not a dangling boundary token).
-        raw = self.token_ids[start : stop + 1] if stop > start else []
-        return BigramKey(raw, self.extra_key)
-
-    def match(self, other: "RadixKey", page_size: int = 1) -> int:
-        self._check_compatible(other)
-        # Walk raw tokens; L matching tokens imply L-1 matching bigrams.
-        t0, t1 = self.token_ids, other.token_ids
-        i = 0
-        for a, b in zip(t0, t1):
-            if a != b:
-                break
-            i += 1
-        matched = max(0, min(i - 1, len(self), len(other)))
-        # // page_size * page_size is a no-op for page_size=1.
-        return (matched // page_size) * page_size
-
-    def child_key(self, page_size: int = 1):
-        t = self.token_ids
-        if page_size == 1:
-            plain = (t[0], t[1])
+        if self.is_bigram:
+            if page_size == 1:
+                plain = (t[0], t[1])
+            else:
+                plain = tuple((t[j], t[j + 1]) for j in range(page_size))
         else:
-            plain = tuple((t[j], t[j + 1]) for j in range(page_size))
+            plain = t[0] if page_size == 1 else tuple(t[:page_size])
         return plain if self.extra_key is None else (self.extra_key, plain)
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
+        """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
         hasher = hashlib.sha256()
         if prior_hash:
             hasher.update(bytes.fromhex(prior_hash))
         t = self.token_ids
-        for j in range(start, end):
-            hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
-            hasher.update(t[j + 1].to_bytes(4, byteorder="little", signed=False))
+        if self.is_bigram:
+            for j in range(start, end):
+                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
+                hasher.update(t[j + 1].to_bytes(4, byteorder="little", signed=False))
+        else:
+            for j in range(start, end):
+                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
         return hasher.hexdigest()
 
 
