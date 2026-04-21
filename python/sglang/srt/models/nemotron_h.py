@@ -429,30 +429,15 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        if get_global_server_args().enable_breakable_cuda_graph:
-            from sglang.srt.model_executor.breakable_piecewise_cuda_graph_runner import (
-                get_bridge_buffers,
+        if (
+            get_global_server_args().enable_breakable_cuda_graph
+            and get_forward_context() is not None
+        ):
+            output = torch.empty_like(hidden_states)
+            breakable_nemotron_mamba2_with_output(
+                hidden_states, output, self.layer_id
             )
-
-            bridges = get_bridge_buffers()
-            if bridges is not None and get_forward_context() is not None:
-                bridges.ensure_mamba_size(hidden_states.shape[1])
-                # Copy hidden_states into a bridge buffer (stable address
-                # outside the graph pool), run mamba eagerly via a non_graph
-                # break, then return the bridge output so downstream graph
-                # segments read from a stable address.
-                n = hidden_states.shape[0]
-                hidden_dim = hidden_states.shape[1]
-                bh = bridges.mamba_hidden.flatten()[: n * hidden_dim].view(
-                    n, hidden_dim
-                )
-                bo = bridges.mamba_output.flatten()[: n * hidden_dim].view(
-                    n, hidden_dim
-                )
-                bh.copy_(hidden_states)
-                del hidden_states
-                breakable_nemotron_mamba2_with_output(bh, bo, self.layer_id)
-                return bo, residual
+            return output, residual
 
         if is_in_piecewise_cuda_graph():
             output = torch.empty_like(hidden_states)

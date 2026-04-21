@@ -118,70 +118,29 @@ class RadixAttention(nn.Module):
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if get_global_server_args().enable_breakable_cuda_graph:
                 # When mha_return_lse is True (chunked prefix MHA), the backend
-                # returns a tuple (output, lse). The bridge/breakable path can't
+                # returns a tuple (output, lse). The breakable path can't
                 # propagate tuples, so call the backend directly.
                 if getattr(forward_batch, "mha_return_lse", False):
                     return forward_batch.attn_backend.forward(
                         q, k, v, self, forward_batch, save_kv_cache, **kwargs
                     )
 
-                from sglang.srt.model_executor.breakable_piecewise_cuda_graph_runner import (
-                    get_bridge_buffers,
+                output = (
+                    q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+                    if self.qk_head_dim != self.v_head_dim
+                    else torch.empty_like(q)
                 )
-
-                bridges = get_bridge_buffers()
-                if bridges is not None and "k_rope" not in kwargs:
-                    bridges.ensure_size(self)
-                    bq = bridges.q.flatten()[: q.numel()].view(q.shape)
-                    bk = (
-                        bridges.k.flatten()[: k.numel()].view(k.shape)
-                        if k is not None
-                        else None
-                    )
-                    bv = (
-                        bridges.v.flatten()[: v.numel()].view(v.shape)
-                        if v is not None
-                        else None
-                    )
-                    bq.copy_(q)
-                    if bk is not None:
-                        bk.copy_(k)
-                    if bv is not None:
-                        bv.copy_(v)
-                    n = q.shape[0]
-                    out_dim = self.tp_q_head_num * self.v_head_dim
-                    output = bridges.output.flatten()[: n * out_dim].view(
-                        n, out_dim
-                    )
-                    del q, k, v
-                    breakable_unified_attention_with_output(
-                        bq,
-                        bk,
-                        bv,
-                        output,
-                        save_kv_cache,
-                        self.layer_id,
-                        _attention_layer=self,
-                        **kwargs,
-                    )
-                    return output
-                else:
-                    output = (
-                        q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
-                        if self.qk_head_dim != self.v_head_dim
-                        else torch.empty_like(q)
-                    )
-                    breakable_unified_attention_with_output(
-                        q,
-                        k,
-                        v,
-                        output,
-                        save_kv_cache,
-                        self.layer_id,
-                        _attention_layer=self,
-                        **kwargs,
-                    )
-                    return output
+                breakable_unified_attention_with_output(
+                    q,
+                    k,
+                    v,
+                    output,
+                    save_kv_cache,
+                    self.layer_id,
+                    _attention_layer=self,
+                    **kwargs,
+                )
+                return output
             else:
                 if self.qk_head_dim != self.v_head_dim:
                     output = q.new_empty(

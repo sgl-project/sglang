@@ -66,77 +66,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-# Bridge buffers for reducing graph-owned persistent memory at break points.
-# Pre-allocated OUTSIDE graph capture so they're not graph-owned.
-# Reused across all layers (sequential execution) and all token sizes.
-_bridge_buffers = None
-
-
-def get_bridge_buffers():
-    return _bridge_buffers
-
-
-def set_bridge_buffers(buffers):
-    global _bridge_buffers
-    _bridge_buffers = buffers
-
-
-class BridgeBuffers:
-    """Shared tensors for q, k, v, output at graph break points.
-
-    Allocated outside graph capture so they're not graph-private. Reused
-    across all layers (sequential execution) and all token sizes.
-    Lazily sized on first use during warmup/capture — each RadixAttention
-    layer calls ensure_size() to grow buffers if its dims are larger than
-    what was previously allocated.
-    """
-
-    def __init__(self, max_tokens: int, device, dtype):
-        self.max_tokens = max_tokens
-        self.device = device
-        self.dtype = dtype
-        self.q = None
-        self.k = None
-        self.v = None
-        self.output = None
-        self.mamba_hidden = None
-        self.mamba_output = None
-
-    def ensure_size(self, layer: "RadixAttention"):
-        """Grow buffers if needed to fit this layer's dimensions."""
-        q_dim = layer.tp_q_head_num * layer.qk_head_dim
-        k_dim = layer.tp_k_head_num * layer.qk_head_dim
-        v_dim = layer.tp_v_head_num * layer.v_head_dim
-        out_dim = layer.tp_q_head_num * layer.v_head_dim
-
-        if self.q is None or self.q.shape[1] < q_dim:
-            self.q = torch.empty(
-                (self.max_tokens, q_dim), dtype=self.dtype, device=self.device
-            )
-        if self.k is None or self.k.shape[1] < k_dim:
-            self.k = torch.empty(
-                (self.max_tokens, k_dim), dtype=self.dtype, device=self.device
-            )
-        if self.v is None or self.v.shape[1] < v_dim:
-            self.v = torch.empty(
-                (self.max_tokens, v_dim), dtype=self.dtype, device=self.device
-            )
-        if self.output is None or self.output.shape[1] < out_dim:
-            self.output = torch.empty(
-                (self.max_tokens, out_dim), dtype=self.dtype, device=self.device
-            )
-
-    def ensure_mamba_size(self, hidden_size: int):
-        """Grow mamba buffers if needed."""
-        if self.mamba_hidden is None or self.mamba_hidden.shape[1] < hidden_size:
-            self.mamba_hidden = torch.empty(
-                (self.max_tokens, hidden_size), dtype=self.dtype, device=self.device
-            )
-            self.mamba_output = torch.empty(
-                (self.max_tokens, hidden_size), dtype=self.dtype, device=self.device
-            )
-
-
 class BreakablePiecewiseCudaGraphRunner:
     """Piecewise CUDA graph runner using breakable CUDA graph.
 
@@ -178,13 +107,6 @@ class BreakablePiecewiseCudaGraphRunner:
         self.attention_layers = model_runner.attention_layers
         self.moe_layers = model_runner.moe_layers
         self.moe_fusions = model_runner.moe_fusions
-
-        # Bridge buffers — one shared set, lazily sized on first use per layer
-        # during warmup/capture. Each RadixAttention layer calls ensure_size()
-        # in its forward to grow buffers if needed.
-        set_bridge_buffers(
-            BridgeBuffers(self.max_num_tokens, self.device, model_runner.dtype)
-        )
 
         with torch.device(self.device):
             self.static_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -381,10 +303,10 @@ class BreakablePiecewiseCudaGraphRunner:
                 self.graphs[num_tokens] = graph
                 self.output_buffers[num_tokens] = output
                 mem_after = torch.cuda.memory_allocated(self.device) / 1024**3
-                num_breaks = len(graph._exec) if hasattr(graph, '_exec') else 0
+                num_breaks = len(graph._break_fns)
                 logger.info(
                     f"[Breakable PCG] num_tokens={num_tokens}: "
-                    f"segments={num_breaks + 1}, "
+                    f"segments={len(graph._segments)}, "
                     f"breaks={num_breaks}, "
                     f"mem_delta={mem_after - mem_before:.3f} GB, "
                     f"mem_total={mem_after:.3f} GB"
@@ -465,7 +387,13 @@ class BreakablePiecewiseCudaGraphRunner:
             # For MHA layers: pre-compute BCG replay state once (instead of
             # per-layer in the break function). The break function reads
             # _bcg_mha_slice_n and _bcg_mha_has_prefix from forward_batch.
-            if hasattr(static_forward_batch, "set_attn_attend_prefix_cache"):
+            # Gate on MLATokenToKVPool: ForwardBatch always inherits
+            # set_attn_attend_prefix_cache from the Deepseek mixin, so hasattr
+            # alone matches non-MLA models too and would trigger the
+            # Deepseek-only prepare_chunked_prefix_cache_info assert on Qwen.
+            from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+            if isinstance(self.model_runner.token_to_kv_pool, MLATokenToKVPool):
                 has_prefix = (
                     static_forward_batch.extend_prefix_lens_cpu is not None
                     and any(static_forward_batch.extend_prefix_lens_cpu)
