@@ -171,14 +171,14 @@ def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
-    Reruns workflows with 'failure' conclusion.
+    Reruns workflows with 'failure' or 'skipped' conclusions.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    print("Permission granted. Triggering rerun of failed workflows.")
+    print("Permission granted. Triggering rerun of failed or skipped workflows.")
 
     # Check if PR has sgl-kernel changes - if so, we may need full reruns
     # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
@@ -221,25 +221,32 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         except Exception as e:
             print(f"Failed to check kernel wheel status: {e} - falling back to full rerun")
 
-    # Rerun workflows with conclusion=failure.
+    # Rerun workflows with conclusion=failure or conclusion=skipped.
     #
-    # rerun_failed_jobs() reruns failed jobs *and their dependent jobs*
-    # (GitHub API docs), which covers fast-fail cascades (those call
-    # core.setFailed(...) so their conclusion is "failure"). If the PR
-    # touches sgl-kernel and not all wheel builds are success yet, fall
-    # back to full rerun so cross-workflow artifact flow stays consistent
-    # (Build Wheel lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml).
+    # - failure: use rerun_failed_jobs() which reruns failed jobs *and their
+    #   dependent jobs* (GitHub API). Fast-fail cascades call
+    #   core.setFailed(...) so their conclusion is "failure" and are covered.
+    # - skipped: the entire run was skipped (no jobs ran), so there are no
+    #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
+    # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
+    #   builds are success yet, full-rerun failure runs too — Build Wheel
+    #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
+    #   rerun_failed_jobs() is scoped to a single workflow run.
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
 
     rerun_count = 0
     for run in runs:
-        if run.status != "completed" or run.conclusion != "failure":
+        if run.status != "completed":
+            continue
+        if run.conclusion not in ("failure", "skipped"):
             continue
 
-        print(f"Processing failed workflow: {run.name} (ID: {run.id})")
+        print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
         try:
-            if sgl_kernel_changes and not kernel_wheel_built:
-                print("  Full rerun (kernel wheel not fully built)")
+            if run.conclusion == "skipped" or (
+                sgl_kernel_changes and not kernel_wheel_built
+            ):
+                print("  Full rerun")
                 run.rerun()
             else:
                 print("  rerun_failed_jobs")
@@ -254,7 +261,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             comment.create_reaction("+1")
         return True
     else:
-        print("No failed workflows found to rerun.")
+        print("No failed or skipped workflows found to rerun.")
         return False
 
 
