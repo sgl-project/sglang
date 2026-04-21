@@ -57,7 +57,7 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_xpu.toml"
               - "test/**/!(*.md)"
-              - "sgl-kernel/**/*.!(md|txt)"
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
 

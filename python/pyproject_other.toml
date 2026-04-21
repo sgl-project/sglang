@@ -93,13 +93,13 @@ tracing = [
 srt_hip = [
   "sglang[runtime_common]",
   "torch",
-  "petit_kernel==0.0.3",
+  "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
 ]
 
 diffusion_hip = [
   "sglang[diffusion_common]",
-  "peft>=0.18.0",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
@@ -161,7 +161,7 @@ test = [
   "jsonlines",
   "matplotlib",
   "pandas",
-  "peft>=0.18.0",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "pytest",
   "sentence_transformers",
   "tabulate",

@@ -17,9 +17,9 @@ from pathlib import Path
 from diffusion_case_parser import (
     BASELINE_REL_PATH,
     RUN_SUITE_REL_PATH,
-    TESTCASE_CONFIG_REL_PATH,
     DiffusionSuiteInfo,
     collect_diffusion_suites,
+    resolve_case_config_path,
 )
 
 SUITE_OUTPUT_NAMES = {
@@ -35,6 +35,29 @@ class PartitionItem:
     item_id: str
     est_time: float
     used_fallback_estimate: bool = False
+
+
+def validate_suite_case_coverage(suites: dict[str, DiffusionSuiteInfo]) -> None:
+    """
+    Guardrail: dynamic diffusion suites must contain parametrized cases.
+    """
+    suites_with_no_cases = []
+    for suite_name in SUITE_OUTPUT_NAMES:
+        suite_info = suites.get(suite_name)
+        if suite_info is None:
+            print(f"Error: Required suite '{suite_name}' not found in parsed suites.")
+            sys.exit(1)
+        if len(suite_info.cases) == 0:
+            suites_with_no_cases.append(suite_name)
+
+    if suites_with_no_cases:
+        joined = ", ".join(suites_with_no_cases)
+        print(
+            "Error: Parsed zero parametrized cases for diffusion suites: "
+            f"{joined}. This usually means run_suite case imports changed but "
+            "diffusion parser logic was not updated."
+        )
+        sys.exit(1)
 
 
 def compute_partition_count(
@@ -229,22 +252,24 @@ def main():
     script_dir = Path(__file__).resolve().parent
     repo_root = script_dir.parent.parent.parent.parent
 
-    testcase_config_path = repo_root / TESTCASE_CONFIG_REL_PATH
     baseline_path = repo_root / BASELINE_REL_PATH
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
 
-    if not testcase_config_path.exists():
-        print(f"Error: Testcase config not found: {testcase_config_path}")
-        sys.exit(1)
     if not run_suite_path.exists():
         print(f"Error: Run suite not found: {run_suite_path}")
         sys.exit(1)
+    try:
+        case_config_path = resolve_case_config_path(repo_root, run_suite_path)
+    except (RuntimeError, FileNotFoundError) as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
 
     suites = collect_diffusion_suites(
-        testcase_config_path,
+        case_config_path,
         run_suite_path,
         baseline_path,
     )
+    validate_suite_case_coverage(suites)
 
     print("=== Diffusion Partition Computation ===")
     print(f"Min partition time: {args.min_time}s ({args.min_time/60:.1f} min)")

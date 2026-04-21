@@ -1,0 +1,323 @@
+---
+title: Classification Models
+---
+
+This document describes the `/v1/classify` API endpoint in SGLang, which is compatible with vLLM's classification API format.
+
+## Overview
+
+The classification API allows you to classify text inputs using classification models. This implementation follows the same format as vLLM's 0.7.0 classification API.
+
+## API endpoint
+
+```text Output
+POST /v1/classify
+```
+
+## Request format
+
+```json Config
+{
+  "model": "model_name",
+  "input": "text to classify"
+}
+```
+
+### Parameters
+
+<ParamField body="model" type="string" required>
+  The name of the classification model to use.
+</ParamField>
+
+<ParamField body="input" type="string" required>
+  The text to classify.
+</ParamField>
+
+<ParamField body="user" type="string">
+  User identifier for tracking.
+</ParamField>
+
+<ParamField body="rid" type="string">
+  Request ID for tracking.
+</ParamField>
+
+<ParamField body="priority" type="integer">
+  Request priority.
+</ParamField>
+
+## Response format
+
+```json Config
+{
+  "id": "classify-9bf17f2847b046c7b2d5495f4b4f9682",
+  "object": "list",
+  "created": 1745383213,
+  "model": "jason9693/Qwen2.5-1.5B-apeach",
+  "data": [
+    {
+      "index": 0,
+      "label": "Default",
+      "probs": [0.565970778465271, 0.4340292513370514],
+      "num_classes": 2
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "total_tokens": 10,
+    "completion_tokens": 0,
+    "prompt_tokens_details": null
+  }
+}
+```
+
+### Response fields
+
+<ResponseField name="id" type="string" required>
+  Unique identifier for the classification request.
+</ResponseField>
+
+<ResponseField name="object" type="string" required>
+  Always `"list"`.
+</ResponseField>
+
+<ResponseField name="created" type="integer" required>
+  Unix timestamp when the request was created.
+</ResponseField>
+
+<ResponseField name="model" type="string" required>
+  The model used for classification.
+</ResponseField>
+
+<ResponseField name="data" type="object[]" required>
+  Array of classification results.
+
+  <Expandable title="data fields">
+    <ResponseField name="index" type="integer">
+      Index of the result.
+    </ResponseField>
+
+    <ResponseField name="label" type="string">
+      Predicted class label.
+    </ResponseField>
+
+    <ResponseField name="probs" type="number[]">
+      Array of probabilities for each class.
+    </ResponseField>
+
+    <ResponseField name="num_classes" type="integer">
+      Total number of classes.
+    </ResponseField>
+
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="usage" type="object" required>
+  Token usage information.
+
+  <Expandable title="usage fields">
+    <ResponseField name="prompt_tokens" type="integer">
+      Number of input tokens.
+    </ResponseField>
+
+    <ResponseField name="total_tokens" type="integer">
+      Total number of tokens.
+    </ResponseField>
+
+    <ResponseField name="completion_tokens" type="integer">
+      Number of completion tokens (always `0` for classification).
+    </ResponseField>
+
+    <ResponseField name="prompt_tokens_details" type="object">
+      Additional token details (optional).
+    </ResponseField>
+
+  </Expandable>
+</ResponseField>
+
+## Example usage
+
+<Tabs>
+  <Tab title="curl">
+    ```bash Command
+    curl -v "http://127.0.0.1:8000/v1/classify" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "model": "jason9693/Qwen2.5-1.5B-apeach",
+        "input": "Loved the new café—coffee was great."
+      }'
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python Example
+    import requests
+    import json
+
+    # Make classification request
+    response = requests.post(
+        "http://127.0.0.1:8000/v1/classify",
+        headers={"Content-Type": "application/json"},
+        json={
+            "model": "jason9693/Qwen2.5-1.5B-apeach",
+            "input": "Loved the new café—coffee was great."
+        }
+    )
+
+    # Parse response
+    result = response.json()
+    print(json.dumps(result, indent=2))
+    ```
+
+  </Tab>
+</Tabs>
+
+## Supported models
+
+The classification API works with any classification model supported by SGLang, including:
+
+<Tabs>
+  <Tab title="Classification models (multi-class)">
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50.0%"}} />
+    <col style={{width: "50.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`LlamaForSequenceClassification`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multi-class classification</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`Qwen2ForSequenceClassification`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multi-class classification</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`Qwen3ForSequenceClassification`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multi-class classification</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`BertForSequenceClassification`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multi-class classification</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`Gemma2ForSequenceClassification`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multi-class classification</td>
+    </tr>
+  </tbody>
+</table>
+
+    <Note>
+      The API automatically uses the `id2label` mapping from the model's `config.json` file to provide meaningful label names instead of generic class names. If `id2label` is not available, it falls back to `LABEL_0`, `LABEL_1`, etc., or `Class_0`, `Class_1` as a last resort.
+    </Note>
+
+  </Tab>
+  <Tab title="Reward models (single score)">
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50.0%"}} />
+    <col style={{width: "50.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`InternLM2ForRewardModel`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Single reward score</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`Qwen2ForRewardModel`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Single reward score</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`LlamaForSequenceClassificationWithNormal_Weights`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Special reward model</td>
+    </tr>
+  </tbody>
+</table>
+
+    <Info>
+      The `/classify` endpoint in SGLang was originally designed for reward models but now supports all non-generative models. The `/v1/classify` endpoint provides a standardized vLLM-compatible interface for classification tasks.
+    </Info>
+
+  </Tab>
+</Tabs>
+
+## Error handling
+
+The API returns appropriate HTTP status codes and error messages:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Status code</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Meaning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`400 Bad Request`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Invalid request format or missing required fields</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`500 Internal Server Error`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Server-side processing error</td>
+    </tr>
+  </tbody>
+</table>
+
+Error response format:
+
+```json Config
+{
+  "error": "Error message",
+  "type": "error_type",
+  "code": 400
+}
+```
+
+## Implementation details
+
+<Accordion title="Rust model gateway">
+  Handles routing and request/response models in
+  `sgl-model-gateway/src/protocols/spec.rs`.
+</Accordion>
+
+<Accordion title="Python HTTP server">
+  Implements the actual endpoint in
+  `python/sglang/srt/entrypoints/http_server.py`.
+</Accordion>
+
+<Accordion title="Classification service">
+  Handles the classification logic in
+  `python/sglang/srt/entrypoints/openai/serving_classify.py`.
+</Accordion>
+
+## Testing
+
+Use the provided test script to verify the implementation:
+
+<CodeGroup>
+```bash Command
+python test_classify_api.py
+```
+</CodeGroup>
+
+## Compatibility
+
+<Check>
+  This implementation is compatible with vLLM's classification API format,
+  allowing seamless migration from vLLM to SGLang for classification tasks.
+</Check>
