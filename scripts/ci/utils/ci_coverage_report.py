@@ -35,7 +35,7 @@ def collect_all_tests(registered_dir: str) -> list[CIRegistry]:
 
     for file in sorted(files):
         try:
-            registries = ut_parse_one_file(file)
+            registries, _ = ut_parse_one_file(file)
             all_tests.extend(registries)
         except Exception as e:
             print(f"Warning: Failed to parse {file}: {e}", file=sys.stderr)

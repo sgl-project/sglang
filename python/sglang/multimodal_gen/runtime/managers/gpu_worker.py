@@ -223,13 +223,13 @@ class GPUWorker:
         req = batch[0]
         output_batch = None
         try:
-            if self.rank == 0:
+            if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
 
             # capture memory baseline before forward
-            if self.rank == 0 and req.metrics:
+            if self.rank == 0 and req.metrics and not current_platform.is_cpu():
                 baseline_snapshot = capture_memory_snapshot()
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
@@ -259,7 +259,11 @@ class GPUWorker:
                 output_batch = result
 
             # capture memory after forward (peak)
-            if self.rank == 0 and output_batch.metrics:
+            if (
+                self.rank == 0
+                and output_batch.metrics
+                and not current_platform.is_cpu()
+            ):
                 peak_snapshot = capture_memory_snapshot()
                 output_batch.metrics.record_memory_snapshot(
                     "after_forward", peak_snapshot
@@ -268,6 +272,7 @@ class GPUWorker:
             if (
                 self.rank == 0
                 and not req.suppress_logs
+                and not current_platform.is_cpu()
                 and logger.isEnabledFor(logging.DEBUG)
             ):
                 self.do_mem_analysis(output_batch)
