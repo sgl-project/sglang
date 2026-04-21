@@ -2328,10 +2328,20 @@ class ServerArgs:
                     self.disable_overlap_schedule = False
             else:
                 if not self.disable_radix_cache:
-                    raise ValueError(
-                        f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
-                        "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
-                    )
+                    if is_hip():
+                        # On ROCm, extra_buffer is unsupported.
+                        # Automatically disable radix cache instead.
+                        logger.warning(
+                            f"Speculative decoding for {model_arch} is not compatible "
+                            "with radix cache on ROCm devices. "
+                            "Automatically disabling radix cache."
+                        )
+                        self.disable_radix_cache = True
+                    else:
+                        raise ValueError(
+                            f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
+                            "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
+                        )
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
