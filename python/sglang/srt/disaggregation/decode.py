@@ -200,9 +200,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         # Each decode-side request slot may need one main mamba slot plus
         # extra tracking slots when extra_buffer is enabled.
         slots_per_req = 1 + (
-            self.mamba_ping_pong_track_buffer_size
-            if enable_mamba_extra_buffer
-            else 0
+            self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
         )
         max_slots_needed = (size + pre_alloc_size) * slots_per_req
         if mamba_size is not None:
