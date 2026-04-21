@@ -2395,7 +2395,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
-        if self.output_ids is not None:
+        # Batches can be merged across prefill/decode boundaries. A prepared
+        # decode batch has already moved its pending token ids into
+        # ``input_ids`` and cleared ``output_ids``, while prebuilt decode
+        # batches still populate ``output_ids``. Preserve whichever side still
+        # has pending token ids and concatenate only when both do.
+        if self.output_ids is None:
+            self.output_ids = other.output_ids
+        elif other.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
         self.mamba_track_indices = None
         self.mamba_track_mask = None
