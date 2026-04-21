@@ -95,7 +95,7 @@ def make_padded_smem(shape, offset_bases, padding_pairs):
     return PaddedSharedLayout(
         interval_padding_pairs=padding_pairs,
         offset_bases=offset_bases,
-        cga_layout=[],
+        block_bases=[],
         shape=shape,
     )
 

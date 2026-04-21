@@ -508,6 +508,31 @@ def _apply_fp8_overrides(Lq, batch_size, max_len_extend, pfx_bucket,
             # Decode / spec-verify / draft-extend on short-prefix
             # continuous batches: BM=64 NW=4 avoids pad-heavy tiles.
             BM, NW = 64, 4
+        elif batch_size >= 16 and max_len_extend <= 64:
+            # Small-batch decode-continuation bucket. With BM=128, Q tiles
+            # waste 50-87% of rows when max_ext < BM, which is exactly the
+            # pattern ShareGPT radix-on hammers (B in {16,32}, ext in
+            # {16,32,64}, pfx 512-2k). Pure-serial NW=4 NS=1 at BM=64
+            # closes the gap — sweep over 10 weak-bucket shapes moves
+            # this path from 0.66x-1.02x to 1.25x-1.55x vs Triton.
+            # Kernel body has the NW<8 serial branch guarded by
+            # `USE_SERIAL = num_warps < 8`; NS=1 skips the DMA pipeline.
+            BM, NW, NS = 64, 4, 1
+            EXT_NS = 1
+        elif (
+            batch_size >= 8
+            and max_len_extend <= 64
+            and pfx_bucket >= 3
+        ):
+            # Long-prefix short-extend at moderate batch (B=8 with pfx>=2k
+            # avg per seq). Same pad-waste argument as the B>=16 clause
+            # but the prefix is long enough that tile-utilisation on the
+            # prefix phase also matters. Sweep shows B=8 pfx=2k ext=64
+            # goes 0.64x -> 1.14x with this demotion; shorter prefixes
+            # at B=8 still win with the 8-warp default so we don't
+            # demote them.
+            BM, NW, NS = 64, 4, 1
+            EXT_NS = 1
         return BM, BN, NW, NS, EXT_BN, EXT_NS
 
     if Lq == 64:
@@ -735,6 +760,14 @@ def gluon_extend_attention_fwd(
     # Spec-decode-style small-ext + big-pfx-skew shapes look uniform but
     # the longest-prefix CTA dominates; WCA persistent regains ~1.77x,
     # so exclude them from the basic cache. D=128 only (below WCA branch).
+    #
+    # FP8 D=128 with ext<=64: after the small-bucket retune (basic gets
+    # BM=64 NW=4 NS=1 on B>=16 or B>=8+long-prefix), the basic path
+    # reaches 1.4x-1.5x vs Triton on uniform-ext shapes. The WCA
+    # persistent FP8 branch below lands at 0.64x-0.66x vs Triton on
+    # those same shapes — it's still the right path for genuinely
+    # skewed prefixes but we can't detect skew cheaply, so keep FP8
+    # uniform-ext short-extend shapes on basic where the retune wins.
     _cache_exclude_pfx_skew = (
         Lq == 128
         and batch_size >= 4
@@ -745,6 +778,7 @@ def gluon_extend_attention_fwd(
         ) >= batch_size * 2048
         and (_force_use_persistent is not False)
         and (_force_use_splitk is not False)
+        and not (_kv_is_fp8 and max_len_extend <= 64)
     )
     # Structural gate: no force_* overrides, no custom mask. Sinks and
     # window_kv_offsets are runtime args keyed via HAS_SINK /
@@ -871,6 +905,12 @@ def gluon_extend_attention_fwd(
         and batch_size >= 4
         and max_len_extend <= 128
         and _total_pfx_est_pre >= batch_size * 2048
+        # Mirror the _cache_exclude_pfx_skew guard: FP8 D=128 short-extend
+        # stays on basic after the small-bucket retune (1.4-1.5x vs
+        # Triton) instead of WCA persistent (0.64-0.66x vs Triton on the
+        # same shapes). Genuine pfx-skew would still benefit from WCA but
+        # we can't cheaply distinguish it from uniform at dispatch time.
+        and not (_kv_is_fp8 and Lq == 128 and max_len_extend <= 64)
     )
     _is_ragged = _is_ragged_ext or _is_ragged_pfx
 

@@ -305,6 +305,7 @@ def prewarm_for_model(
     num_kv_heads: int,
     is_causal_modes=(True,),
     hf_config=None,
+    kv_cache_dtype=None,
 ) -> None:
     """Warm the Gluon JIT cache at server boot.
 
@@ -313,11 +314,19 @@ def prewarm_for_model(
     per-layer pattern (sinks, alternating SWA, logit cap); without one
     we fall back to the generic (causal, full-attention) warm. No-op
     if the Gluon import failed.
+
+    ``kv_cache_dtype`` is ``model_runner.kv_cache_dtype``; if it's a
+    supported FP8 variant we also drive an FP8 Phase-2 pass so the
+    FP8 dispatch ladder (retuned for small-batch decode-continuation
+    at D=128) is compiled before first serving token. FP8 D=256 is
+    not supported on gfx950 and silently skips FP8 warming there.
     """
     if _PREWARM_FN is None:
         return
     if head_dim not in _GLUON_SUPPORTED_HEAD_DIMS:
         return
+
+    include_fp8 = kv_cache_dtype in _FP8_KV_DTYPES
 
     layer_spec = _build_layer_spec_from_hf_config(hf_config)
     key_layers = tuple(
@@ -326,7 +335,7 @@ def prewarm_for_model(
         for l in (layer_spec or [])
     )
     key = (head_dim, num_q_heads, num_kv_heads, tuple(sorted(is_causal_modes)),
-           key_layers)
+           key_layers, bool(include_fp8))
     if key in _PREWARMED_MODELS:
         return
     _PREWARMED_MODELS.add(key)
@@ -338,12 +347,13 @@ def prewarm_for_model(
                 head_dim=head_dim,
                 num_q_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
+                include_fp8=include_fp8,
                 parallel=8,
                 verbose=False,
             )
             logger.info(
                 f"Gluon prewarm D={head_dim} H={num_q_heads} kvH={num_kv_heads} "
-                f"(model-aware): {r['num_patterns']} patterns, "
+                f"fp8={include_fp8} (model-aware): {r['num_patterns']} patterns, "
                 f"{r['total_variants']} variants, {r['wall_time']:.1f}s"
             )
             return
@@ -359,12 +369,13 @@ def prewarm_for_model(
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
             is_causal_modes=is_causal_modes,
+            include_fp8=include_fp8,
             parallel=8,
             verbose=False,
         )
         logger.info(
-            f"Gluon prewarm D={head_dim} H={num_q_heads} kvH={num_kv_heads}: "
-            f"{r['num_variants']} variants in {r['wall_time']:.1f}s"
+            f"Gluon prewarm D={head_dim} H={num_q_heads} kvH={num_kv_heads} "
+            f"fp8={include_fp8}: {r['num_variants']} variants in {r['wall_time']:.1f}s"
         )
     except Exception as e:
         logger.warning(f"Gluon prewarm failed (non-fatal): {e!r}")

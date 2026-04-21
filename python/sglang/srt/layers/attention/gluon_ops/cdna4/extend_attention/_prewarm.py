@@ -14,12 +14,13 @@ runtime-cache population phase then routes one tiny dummy call through
 each unique config so the direct-HIPLauncher closures are installed.
 
 Callers: ``TritonAttnBackend.__init__`` invokes ``prewarm_for_model``
-with the model's HF config. FP8 kernels are populated lazily on the
-first live call (their shape space is small and the saturation
-warmup rounds in every serving bench already absorb the one-time
-JIT cost). The ``include_fp8`` parameter is reserved for a future
-Phase-1 FP8 warmup pass and currently raises ``NotImplementedError``
-if set to ``True``.
+with the model's HF config. Pass ``include_fp8=True`` for models that
+serve with FP8 KV cache (Llama FP8, Qwen FP8, etc) — it routes a
+second Phase-2 pass with FP8 KV buffers so the FP8 dispatch ladder
+(which demotes D=128 small-batch decode-continuation to BM=64 NW=4
+NS=1 after the FP8 retune) is compiled and cached before first serving
+token. FP8 D=256 is unsupported on gfx950 (MFMA_F8 hits an
+unrealized_conversion_cast in LLVM) and is silently skipped.
 """
 
 from __future__ import annotations
@@ -443,13 +444,11 @@ def prewarm_extend_attention(
     so threading gives near-linear speedup. ``parallel = 0`` is
     sequential. Returns a dict with timings and variant counts.
     """
-    if include_fp8:
-        raise NotImplementedError(
-            "include_fp8=True is reserved for a future Phase-1 FP8 warmup "
-            "pass. FP8 kernels are compiled lazily on the first live "
-            "call; the saturation warmup rounds in every standard serving "
-            "bench absorb this one-time cost. Pass include_fp8=False."
-        )
+    # FP8 D=256 is unsupported on gfx950 (MFMA_F8 hits an
+    # unrealized_conversion_cast the LLVM backend can't materialize).
+    # Silently downgrade to BF16-only warming so model presets with
+    # head_dim=256 keep working with include_fp8=True.
+    _do_fp8_pass = include_fp8 and head_dim != 256
 
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -569,6 +568,39 @@ def prewarm_extend_attention(
             logger.warning("prewarm phase 2 (real-launch) failed: %r", e)
     phase2_time = time.time() - phase2_start
 
+    # Phase 2b: FP8 KV pass. Reuses the same dispatch plumbing with
+    # FP8 K/V buffers. The FP8 basic/persistent kernels have an extra
+    # constexpr set (BLOCK_DPE, BLOCK_DV, EXT_BLOCK_N, EXT_NUM_STAGES,
+    # ASYNC_PAD_K, ASYNC_PAD_V) that the dispatcher fills in from its
+    # own tables, so driving the live dispatch is the cheapest way to
+    # cover every FP8 variant without duplicating the dispatch logic
+    # here. Live Q/K/V extend tensors stay BF16 to match what SGLang
+    # passes at runtime (the FP8 path only FP8-casts the KV cache).
+    phase2b_time = 0.0
+    if _do_fp8_pass:
+        phase2b_start = time.time()
+        try:
+            _populate_runtime_caches(
+                device=device,
+                dtype=dtype,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                is_causal_modes=is_causal_modes,
+                has_sink=has_sink,
+                sliding_window_size=sliding_window_size,
+                logit_cap=logit_cap,
+                xai_temperature_len=xai_temperature_len,
+                include_basic=include_basic,
+                include_persistent=include_persistent,
+                verbose=verbose,
+                kv_cache_dtype=torch.float8_e4m3fn,
+            )
+        except Exception as e:
+            if verbose:
+                logger.warning("prewarm phase 2b (FP8 real-launch) failed: %r", e)
+        phase2b_time = time.time() - phase2b_start
+
     wall_time = time.time() - wall_start
 
     result = {
@@ -576,17 +608,21 @@ def prewarm_extend_attention(
         "wall_time": wall_time,
         "sequential_time_est": seq_total,
         "phase2_time": phase2_time,
+        "phase2b_time": phase2b_time,
         "head_dim": head_dim,
         "parallel": parallel,
+        "fp8_pass": _do_fp8_pass,
     }
     if verbose:
         logger.info(
             "prewarm: done. %d variants in %.2fs wall "
-            "(phase1 compile %.2fs, phase2 real-launch %.2fs, seq estimate %.2fs)",
+            "(phase1 compile %.2fs, phase2 BF16 real-launch %.2fs, "
+            "phase2b FP8 real-launch %.2fs, seq estimate %.2fs)",
             len(work),
             wall_time,
-            wall_time - phase2_time,
+            wall_time - phase2_time - phase2b_time,
             phase2_time,
+            phase2b_time,
             seq_total,
         )
     return result
@@ -607,24 +643,36 @@ def _make_realistic_tensors(
     kv_pool_size: int,
     has_sink: bool,
     qo_indptr_dtype: torch.dtype = torch.int64,
+    kv_cache_dtype: Optional[torch.dtype] = None,
 ):
     """Tensors matching an attention backend's runtime extend call.
 
     Dtype contract varies by backend (triton_backend uses qo_indptr=int64,
     aiter_backend uses int32). ``_config_cache`` keys on the dtype triple,
     so each combo needs its own prewarm pass; ``qo_indptr_dtype`` selects.
+
+    ``kv_cache_dtype`` (default: same as ``dtype``) overrides the KV
+    *buffer* dtype. Live Q/K/V extend tensors are always the model dtype
+    (BF16) — the FP8 path only affects ``k_buffer`` / ``v_buffer``, which
+    is what the dispatcher keys ``_kv_is_fp8`` on.
     """
     total_ext = max(1, batch_size * max_ext)
     total_pfx = max(0, batch_size * max_pfx)
+    if kv_cache_dtype is None:
+        kv_cache_dtype = dtype
     q = torch.zeros((total_ext, num_q_heads, head_dim), dtype=dtype, device=device)
     k = torch.zeros((total_ext, num_kv_heads, head_dim), dtype=dtype, device=device)
     v = torch.zeros((total_ext, num_kv_heads, head_dim), dtype=dtype, device=device)
     o = torch.zeros((total_ext, num_q_heads, head_dim), dtype=dtype, device=device)
     kb = torch.zeros(
-        (max(2, kv_pool_size), num_kv_heads, head_dim), dtype=dtype, device=device
+        (max(2, kv_pool_size), num_kv_heads, head_dim),
+        dtype=kv_cache_dtype,
+        device=device,
     )
     vb = torch.zeros(
-        (max(2, kv_pool_size), num_kv_heads, head_dim), dtype=dtype, device=device
+        (max(2, kv_pool_size), num_kv_heads, head_dim),
+        dtype=kv_cache_dtype,
+        device=device,
     )
     qo_indptr = (
         torch.arange(0, batch_size + 1, dtype=qo_indptr_dtype, device=device) * max_ext
@@ -649,6 +697,7 @@ def _enumerate_basic_shape_reps(
     head_dim: int,
     sliding_window_size: int = -1,
     head_num: Optional[int] = None,
+    is_fp8: bool = False,
 ) -> list[tuple]:
     """One representative ``(batch_size, max_ext, total_prefix_len)``
     tuple per unique basic dispatch output.
@@ -657,6 +706,9 @@ def _enumerate_basic_shape_reps(
     cache-install branch inside ``gluon_extend_attention_fwd`` fires.
     ``head_num`` must match the live model — B=1 dispatch branches on
     H_q and mismatched warming would miss the live cache key.
+    ``is_fp8`` selects between the BF16 and FP8 dispatch ladders; they
+    emit different (BM,NW,NS) sets at D=128 (the FP8 ladder demotes on
+    the small-batch decode-continuation bucket added in the FP8 retune).
     """
     _gcfg = _get_basic_dispatch_config
     pfx_avg_for_bucket = {0: 0, 1: 256, 2: 1024, 3: 4096, 4: 16384}
@@ -669,7 +721,7 @@ def _enumerate_basic_shape_reps(
                     b,
                     e,
                     p,
-                    False,
+                    is_fp8,
                     sliding_window_size=sliding_window_size,
                     head_num=head_num,
                 )
@@ -698,10 +750,15 @@ def _warm_persistent_dispatch_cases(
     verbose: bool,
     qo_dt: torch.dtype,
     kv_pool_size: int,
+    kv_cache_dtype: Optional[torch.dtype] = None,
 ):
     """Run the 4 persistent-dispatch warmup cases for one
     ``(is_causal, qo_dt)`` combo. Split out so the outer loop can iterate
-    over ``qo_indptr`` dtypes without an extra indent level."""
+    over ``qo_indptr`` dtypes without an extra indent level.
+
+    ``kv_cache_dtype``: override for the KV cache buffer dtype (FP8
+    warmup passes it; BF16 default passes None).
+    """
     sm_scale_local = 1.0 / math.sqrt(head_dim)
 
     # Case 1: big-ext het -> WCA small / WCA default.
@@ -719,6 +776,7 @@ def _warm_persistent_dispatch_cases(
         pfx_per,
         kv_pool_size,
         has_sink,
+        kv_cache_dtype=kv_cache_dtype,
     )
     total_ext = sum(elens)
     qo_ip = torch.tensor(
@@ -776,6 +834,7 @@ def _warm_persistent_dispatch_cases(
         0,
         kv_pool_size,
         has_sink,
+        kv_cache_dtype=kv_cache_dtype,
     )
     total_ext = sum(elens)
     qo_ip = torch.tensor(
@@ -874,6 +933,7 @@ def _warm_persistent_dispatch_cases(
         0,
         kv_pool_size,
         has_sink,
+        kv_cache_dtype=kv_cache_dtype,
     )
     qo_ip = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(elens), 0).tolist()),
@@ -945,6 +1005,7 @@ def _warm_persistent_dispatch_cases(
             0,
             kv_pool_size,
             has_sink,
+            kv_cache_dtype=kv_cache_dtype,
         )
         qo_ip = torch.tensor(
             [0] + list(torch.cumsum(torch.tensor(elens), 0).tolist()),
@@ -1011,6 +1072,7 @@ def _populate_runtime_caches(
     include_persistent: bool,
     verbose: bool,
     qo_indptr_dtypes: Sequence[torch.dtype] = (torch.int64, torch.int32),
+    kv_cache_dtype: Optional[torch.dtype] = None,
 ):
     """Route a small real call through ``gluon_extend_attention_fwd``
     for each unique basic config and each persistent variant. Loads the
@@ -1021,13 +1083,27 @@ def _populate_runtime_caches(
     branch inside the dispatcher fires. Warms both int64 and int32
     ``qo_indptr`` conventions (triton_backend vs aiter_backend) since
     the cache keys on dtype.
+
+    ``kv_cache_dtype``: when an FP8 dtype (``torch.float8_e4m3fn``), the
+    KV cache buffers are allocated FP8 so the dispatcher takes the FP8
+    path; the live Q/K/V extend tensors stay at ``dtype`` (BF16) to
+    match what SGLang passes at runtime. ``None`` (default) keeps KV
+    buffers at ``dtype`` (BF16 pass).
     """
+    _is_fp8 = kv_cache_dtype is torch.float8_e4m3fn
+    if _is_fp8 and head_dim == 256:
+        # FP8 D=256 is unsupported (raises NotImplementedError inside
+        # the dispatcher — MFMA_F8 hits an unrealized_conversion_cast
+        # the LLVM backend can't materialize). Skip silently; the FP8
+        # precondition is enforced in the outer wrapper too.
+        return
     if include_basic:
         kv_pool_size = 64 * 1024
         shape_reps = _enumerate_basic_shape_reps(
             head_dim,
             sliding_window_size=sliding_window_size,
             head_num=num_q_heads,
+            is_fp8=_is_fp8,
         )
         for qo_dt in qo_indptr_dtypes:
             for is_causal in is_causal_modes:
@@ -1045,6 +1121,7 @@ def _populate_runtime_caches(
                             kv_pool_size,
                             has_sink,
                             qo_indptr_dtype=qo_dt,
+                            kv_cache_dtype=kv_cache_dtype,
                         )
                     )
                     try:
@@ -1076,12 +1153,13 @@ def _populate_runtime_caches(
                     except Exception as e:
                         if verbose:
                             logger.warning(
-                                "phase2 basic bs=%d ext=%d pfx=%d causal=%s qo_dt=%s failed: %r",
+                                "phase2 basic bs=%d ext=%d pfx=%d causal=%s qo_dt=%s fp8=%s failed: %r",
                                 bs,
                                 ext,
                                 pfx_total,
                                 is_causal,
                                 qo_dt,
+                                _is_fp8,
                                 e,
                             )
 
@@ -1104,6 +1182,7 @@ def _populate_runtime_caches(
                     verbose=verbose,
                     qo_dt=qo_dt,
                     kv_pool_size=kv_pool_size,
+                    kv_cache_dtype=kv_cache_dtype,
                 )
 
     torch.cuda.synchronize(device)

@@ -130,6 +130,13 @@ class TritonAttnBackend(AttentionBackend):
                         hf_config=getattr(
                             model_runner.model_config, "hf_config", None
                         ),
+                        # FP8 KV cache needs its own dispatch ladder compiled
+                        # up-front; the FP8 D=128 retune demotes the small
+                        # decode-continuation bucket to BM=64 NW=4 NS=1 and
+                        # those variants aren't in the BF16 phase-1 set.
+                        kv_cache_dtype=getattr(
+                            model_runner, "kv_cache_dtype", None
+                        ),
                     )
                 except Exception:
                     # Best-effort; first live calls will JIT as normal.
