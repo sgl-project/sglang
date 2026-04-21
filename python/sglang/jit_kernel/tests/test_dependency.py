@@ -11,3 +11,9 @@ register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
 def test_availability(name: str) -> None:
     # NOTE: the path resolution should not fail
     _REGISTERED_DEPENDENCIES[name]()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

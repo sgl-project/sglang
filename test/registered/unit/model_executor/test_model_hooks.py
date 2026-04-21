@@ -152,5 +152,6 @@ class TestAttachHooks(CustomTestCase):
 
 
 if __name__ == "__main__":
-    pass
-    # unittest.main()
+    import unittest
+
+    unittest.main()

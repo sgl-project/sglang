@@ -157,3 +157,9 @@ class TestMainBasic:
 
         captured: str = capsys.readouterr().out
         assert "Skip" in captured
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

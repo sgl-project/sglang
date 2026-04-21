@@ -1843,5 +1843,6 @@ class TestGlm4ComplexJsonSchema(unittest.TestCase):
         self.assertEqual(params["data"], "nested data")
         self.assertEqual(params["status"], "active")
 
-    if __name__ == "__main__":
-        unittest.main()
+
+if __name__ == "__main__":
+    unittest.main()

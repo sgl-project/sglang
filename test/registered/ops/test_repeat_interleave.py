@@ -146,3 +146,9 @@ class TestRepeatInterleave:
         assert torch.equal(
             out_torch.cpu(), out_numpy.cpu()
         ), f"Zero-repeat case mismatch: torch={out_torch}, numpy={out_numpy}"
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

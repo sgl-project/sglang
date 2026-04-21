@@ -172,3 +172,9 @@ def test_mrope(
 
     torch.testing.assert_close(query_native, query_cuda, atol=atol, rtol=rtol)
     torch.testing.assert_close(key_native, key_cuda, atol=atol, rtol=rtol)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

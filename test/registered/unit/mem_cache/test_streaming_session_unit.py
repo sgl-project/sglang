@@ -76,6 +76,7 @@ class _FakeReq:
         self.pop_overallocated_calls = 0
         self.to_finish = None
         self.finished_reason = None
+        self.finished_len = None
 
     def pop_committed_kv_cache(self):
         assert not self.kv_committed_freed
@@ -271,3 +272,11 @@ def test_trim_overshoot_postcondition():
     # Tail [38, 44) freed by _free_kv_aligned.
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(38, 44))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

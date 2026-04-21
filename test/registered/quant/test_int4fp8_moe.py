@@ -57,3 +57,9 @@ class TestMixtralAccuracy(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.56)
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()

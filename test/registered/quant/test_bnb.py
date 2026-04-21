@@ -308,3 +308,9 @@ class TestLanguageModel(CustomTestCase):
                     self.assertGreater(metrics["score"], 0.3)
                 finally:
                     kill_process_tree(process.pid)
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()

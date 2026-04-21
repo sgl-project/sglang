@@ -164,3 +164,9 @@ def test_patch_embed_linear_conv3d():
         f"Expected speedup >= {min_speedup:.3f}x, but got {speedup:.3f}x "
         f"(conv3d={conv_ms:.4f} ms, linear={linear_ms:.4f} ms)"
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
