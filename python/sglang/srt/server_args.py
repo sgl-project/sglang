@@ -30,6 +30,9 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.layers.on_policy_utils import (
+    should_disable_flashinfer_allreduce_fusion,
+)
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
@@ -180,7 +183,7 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -669,6 +672,7 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
+    enable_prefill_only_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
@@ -3454,6 +3458,9 @@ class ServerArgs:
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
+        if self.enable_prefill_only_deterministic_inference:
+            self.enable_deterministic_inference = True
+
         if self.rl_on_policy_target is not None:
             logger.warning(
                 "Enable deterministic inference because of rl_on_policy_target."
@@ -3464,6 +3471,16 @@ class ServerArgs:
             os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
             # TODO remove this environment variable as a whole
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+
+            if (
+                should_disable_flashinfer_allreduce_fusion(self)
+                and self.enable_flashinfer_allreduce_fusion
+            ):
+                self.enable_flashinfer_allreduce_fusion = False
+                logger.warning(
+                    "Disable flashinfer allreduce fusion because of "
+                    "rl_on_policy_target=fsdp_tp."
+                )
 
         if self.enable_deterministic_inference:
             if self.enable_aiter_allreduce_fusion:
@@ -5686,6 +5703,11 @@ class ServerArgs:
             "--enable-deterministic-inference",
             action="store_true",
             help="Enable deterministic inference mode with batch invariant ops.",
+        )
+        parser.add_argument(
+            "--enable-prefill-only-deterministic-inference",
+            action="store_true",
+            help="Enable prefill-only deterministic inference mode with batch invariant ops.",
         )
         parser.add_argument(
             "--rl-on-policy-target",

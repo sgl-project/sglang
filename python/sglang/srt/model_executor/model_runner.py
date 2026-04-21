@@ -116,6 +116,7 @@ from sglang.srt.layers.moe.routed_experts_capturer import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.layers.on_policy_utils import is_tp_invariant_target
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
@@ -631,6 +632,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
+        if is_tp_invariant_target(server_args):
+            from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
+
+            enable_tp_invariant_mode()
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
