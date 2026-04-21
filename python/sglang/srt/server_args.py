@@ -3150,10 +3150,6 @@ class ServerArgs:
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
-        # flashinfer_trtllm / flashinfer_mxfp4 use BypassedTopKOutput, which is
-        # handled by fused_moe_bypassed_piecewise_cuda_graph_impl (a registered
-        # custom op) — PCG-compatible, no disable needed.
-
     def _handle_a2a_moe(self):
         if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
             logger.warning(
