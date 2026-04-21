@@ -45,6 +45,7 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils.common import compute_start_loc_from_lens
 
 if is_cuda():
     from sgl_kernel import (
@@ -726,6 +727,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch.input_ids = self.verified_id
         batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
+        batch.extend_start_loc = compute_start_loc_from_lens(
+            batch.seq_lens.new_tensor(batch.extend_lens)
+        )
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend

@@ -62,7 +62,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, compute_start_loc_from_lens
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -567,6 +567,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
+                batch.extend_start_loc,
             )
             if ret.positions is None:
                 ret.positions = positions
@@ -1112,32 +1113,59 @@ def compute_position(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    extend_start_loc: Optional[torch.Tensor] = None,
 ):
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
             extend_seq_lens,
             extend_seq_lens_sum,
+            extend_start_loc,
         )
     else:
         positions, extend_start_loc = compute_position_torch(
-            extend_prefix_lens, extend_seq_lens
+            extend_prefix_lens, extend_seq_lens, extend_start_loc
         )
     return positions, extend_start_loc
 
 
+def _is_valid_extend_start_loc(
+    extend_start_loc: Optional[torch.Tensor],
+    extend_seq_lens: torch.Tensor,
+) -> bool:
+    if (
+        extend_start_loc is None
+        or extend_start_loc.shape[0] != extend_seq_lens.shape[0]
+        or extend_start_loc.device != extend_seq_lens.device
+    ):
+        return False
+    if extend_seq_lens.numel() <= 1:
+        return True
+    # For exclusive offsets, adjacent deltas must match per-request lengths.
+    return bool(
+        torch.equal(
+            extend_start_loc[1:].to(torch.int64)
+            - extend_start_loc[:-1].to(torch.int64),
+            extend_seq_lens[:-1].to(torch.int64),
+        )
+    )
+
+
 def compute_position_triton(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_sum,
+    extend_start_loc: Optional[torch.Tensor] = None,
 ):
     """Compute positions. It is a fused version of `compute_position_torch`."""
     batch_size = extend_seq_lens.shape[0]
     has_prefix = extend_prefix_lens.shape[0] == batch_size
 
+    if not _is_valid_extend_start_loc(extend_start_loc, extend_seq_lens):
+        extend_start_loc = compute_start_loc_from_lens(extend_seq_lens)
+
     positions = torch.empty(
         extend_seq_lens_sum, dtype=torch.int64, device=extend_seq_lens.device
-    )
-    extend_start_loc = torch.empty(
-        batch_size, dtype=torch.int32, device=extend_seq_lens.device
     )
 
     # Launch kernel
@@ -1166,10 +1194,7 @@ def compute_position_kernel(
     prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
     seq_len = tl.load(extend_seq_lens + pid)
 
-    # NOTE: This can be slow for large bs
-    cumsum_start = tl.cast(0, tl.int64)
-    for i in range(pid):
-        cumsum_start += tl.load(extend_seq_lens + i)
+    cumsum_start = tl.load(extend_start_loc + pid).to(tl.int64)
 
     num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
     for i in range(num_loop):
@@ -1179,11 +1204,12 @@ def compute_position_kernel(
             prefix_len + offset,
             mask=offset < seq_len,
         )
-    tl.store(extend_start_loc + pid, cumsum_start)
 
 
 def compute_position_torch(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_start_loc: Optional[torch.Tensor] = None,
 ):
     positions = torch.cat(
         [
@@ -1194,8 +1220,8 @@ def compute_position_torch(
         ],
         axis=0,
     )
-    extend_start_loc = torch.zeros_like(extend_seq_lens)
-    extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+    if not _is_valid_extend_start_loc(extend_start_loc, extend_seq_lens):
+        extend_start_loc = compute_start_loc_from_lens(extend_seq_lens)
     return positions.to(torch.int64), extend_start_loc
 
 

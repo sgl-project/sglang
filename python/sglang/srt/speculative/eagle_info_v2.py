@@ -35,7 +35,13 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import (
+    compute_start_loc_from_lens,
+    is_cuda,
+    is_hip,
+    is_npu,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -223,6 +229,11 @@ class EagleDraftInputV2Mixin:
         batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
+        batch.extend_start_loc = compute_start_loc_from_lens(
+            torch.tensor(
+                batch.extend_seq_lens, device=batch.seq_lens.device, dtype=torch.int32
+            )
+        )
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
         batch.forward_mode = (
             ForwardMode.IDLE
