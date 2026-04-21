@@ -99,26 +99,37 @@ class DFlashWorker:
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
-        supported_draft_backends = ("flashinfer", "fa3", "fa4")
+        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton")
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
-            draft_backend = "flashinfer"
+            # Use triton on ROCm (no FlashInfer), flashinfer on CUDA
+            import torch as _torch
+
+            draft_backend = "triton" if _torch.version.hip else "flashinfer"
         elif draft_backend == "trtllm_mha":
+            import torch as _torch
+
+            _fb = "triton" if _torch.version.hip else "flashinfer"
             logger.warning(
                 "DFLASH draft worker does not support 'trtllm_mha' because the "
                 "draft path requires non-causal attention. Falling back to "
-                "'flashinfer'."
+                "'%s'.",
+                _fb,
             )
-            draft_backend = "flashinfer"
+            draft_backend = _fb
         elif draft_backend not in supported_draft_backends:
+            import torch as _torch
+
+            _fb = "triton" if _torch.version.hip else "flashinfer"
             logger.warning(
                 "DFLASH draft worker only supports attention_backend in %s for now, "
-                "but got %r. Falling back to 'flashinfer'.",
+                "but got %r. Falling back to '%s'.",
                 supported_draft_backends,
                 draft_backend,
+                _fb,
             )
-            draft_backend = "flashinfer"
+            draft_backend = _fb
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None

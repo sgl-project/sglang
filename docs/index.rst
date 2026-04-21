@@ -46,6 +46,7 @@ Its core features include:
    advanced_features/attention_backend.md
    advanced_features/speculative_decoding.ipynb
    advanced_features/suffix_decoding
+   advanced_features/adaptive_speculative_decoding.md
    advanced_features/structured_outputs.ipynb
    advanced_features/structured_outputs_for_reasoning_models.ipynb
    advanced_features/tool_parser.ipynb

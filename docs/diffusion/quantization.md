@@ -187,6 +187,9 @@ sglang generate \
   over the compatibility `--model-path` flow.
 - For local directories, SGLang first looks for `*-mixed.safetensors`, then
   falls back to loading from the directory.
+- To force the generic diffusion ModelOpt FP4 path onto a specific FlashInfer
+  backend, set `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND`. Supported values
+  include `flashinfer_cudnn`, `flashinfer_cutlass`, and `flashinfer_trtllm`.
 - On disk, the quantization config stays `quant_method=modelopt` with
   `quant_algo=NVFP4`; the `modelopt-nvfp4` label here is again a documentation
   family name rather than a serialized config key.

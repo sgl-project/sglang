@@ -100,7 +100,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="v0.1.0"
+ARG MORI_COMMIT="v1.1.0"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5
@@ -380,17 +380,14 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       initramfs-tools \
   && rm -rf /var/lib/apt/lists/*; \
   \
-  # NIC backend deps
+  # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override).
+  # Only vendor packages are installed here for dlopen (e.g. libionic.so); no compile-time flags needed.
   case "${NIC_BACKEND}" in \
     # default: mlx5
     none) \
-      export USE_IONIC="OFF"; \
-      export USE_BNXT="OFF"; \
       ;; \
     # AMD NIC
     ainic) \
-      export USE_IONIC="ON"; \
-      export USE_BNXT="OFF"; \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
       rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
       curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
@@ -404,8 +401,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       ;; \
     # TODO: Add Broadcom bnxt packages/repos here later.
     # bnxt) \
-    #   export USE_IONIC="OFF"; \
-    #   export USE_BNXT="ON"; \
     #   echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here later."; \
     #   ;; \
     *) \
@@ -416,7 +411,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   \
   # Build/install MORI
   export MORI_GPU_ARCHS="${GPU_ARCH_LIST}"; \
-  echo "[MORI] MORI_GPU_ARCHS=${MORI_GPU_ARCHS} USE_IONIC=${USE_IONIC} USE_BNXT=${USE_BNXT}"; \
+  echo "[MORI] MORI_GPU_ARCHS=${MORI_GPU_ARCHS} NIC_BACKEND=${NIC_BACKEND}"; \
   rm -rf /sgl-workspace/mori; \
   git clone "${MORI_REPO}" /sgl-workspace/mori; \
   cd /sgl-workspace/mori; \
