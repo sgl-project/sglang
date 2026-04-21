@@ -876,7 +876,8 @@ class MooncakeKVManager(CommonKVManager):
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
         if (
-            self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK"
+            self.enable_custom_mem_pool
+            and self.custom_mem_pool_type in ("NVLINK", "INTRA_NODE_NVLINK")
         ) or envs.SGLANG_MOONCAKE_SEND_AUX_TCP.get():
             return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs)
 
