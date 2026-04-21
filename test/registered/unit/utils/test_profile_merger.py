@@ -221,11 +221,11 @@ class TestProfileMergerIntegration(unittest.TestCase):
         import inspect
 
         # Test TokenizerManager
-        from sglang.srt.managers.tokenizer_communicator_mixin import (
-            TokenizerCommunicatorMixin,
+        from sglang.srt.managers.tokenizer_control_mixin import (
+            TokenizerControlMixin,
         )
 
-        sig = inspect.signature(TokenizerCommunicatorMixin.start_profile)
+        sig = inspect.signature(TokenizerControlMixin.start_profile)
         self.assertIn("merge_profiles", sig.parameters)
 
         # Test SchedulerProfilerMixin
