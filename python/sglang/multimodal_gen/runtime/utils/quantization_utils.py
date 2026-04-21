@@ -11,6 +11,8 @@ from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -109,6 +111,16 @@ def find_quant_modelslim_config(model_config, component_model_path):
     return quant_cfg
 
 
+def resolve_runtime_quant_config(quantization_method: str) -> QuantizationConfig:
+    if quantization_method == "fp8":
+        logger.info("Runtime FP8 quantization enabled.")
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=False,
+            activation_scheme="dynamic",
+        )
+    return None
+
+
 def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
     for prefix, new_prefix in prefix_mapping.items():
         if key.startswith(prefix):
@@ -121,7 +133,12 @@ def get_quant_config(
     component_model_path: str,
     packed_modules_mapping: Dict[str, List[str]] = {},
     remap_prefix: Dict[str, str] | None = None,
+    server_args: ServerArgs | None = None,
 ) -> QuantizationConfig:
+
+    if server_args and server_args.quantization:
+        return resolve_runtime_quant_config(server_args.quantization)
+
     quant_cfg = find_quant_modelslim_config(model_config, component_model_path)
     if quant_cfg is not None:
         quant_cls = _load_quant_cls(quant_cfg)

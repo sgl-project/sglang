@@ -485,8 +485,18 @@ def _resolve_quant_config(
         arch_config, "reverse_param_names_mapping", None
     )
 
-    quant_config = get_quant_config(hf_config, component_model_path)
+    quant_config = get_quant_config(
+        hf_config, component_model_path, server_args=server_args
+    )
     quant_config_name = _get_quant_config_name(quant_config)
+
+    if quant_config is not None or not server_args.transformer_weights_path:
+        return quant_config
+
+    quant_config = _resolve_quant_config_from_transformer_override(
+        server_args.transformer_weights_path
+    )
+
     inferred_nvfp4_config = None
     if quant_config is None or quant_config_name == "modelopt_fp4":
         fallback_group_size = None
@@ -498,13 +508,7 @@ def _resolve_quant_config(
             reverse_param_names_mapping_dict,
             fallback_group_size,
         )
-    quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
-    if quant_config is not None or not server_args.transformer_weights_path:
-        return quant_config
 
-    quant_config = _resolve_quant_config_from_transformer_override(
-        server_args.transformer_weights_path
-    )
     quant_config = _merge_modelopt_fp4_configs(quant_config, inferred_nvfp4_config)
     if quant_config is not None:
         return quant_config

@@ -180,6 +180,8 @@ class ServerArgs(DisaggArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+    # runtime quantization method to apply
+    quantization: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -989,6 +991,15 @@ class ServerArgs(DisaggArgsMixin):
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+
+        parser.add_argument(
+            "--quantization",
+            type=str,
+            default=ServerArgs.quantization,
+            choices=["fp8"],
+            help="Apply runtime quantization to model weights. "
+            "Quantizes weights on-the-fly at load time, no pre-converted checkpoint needed.",
         )
 
         # Nunchaku SVDQuant quantization parameters
