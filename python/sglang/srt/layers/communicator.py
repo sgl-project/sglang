@@ -382,8 +382,10 @@ class LayerScatterModes:
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
             ):
                 return ScatterMode.SCATTERED
-            # NSA CP doesn't support MOE_FULL yet; fall back to FULL
-            if is_enable_moe_cp_allgather() and not is_nsa_enable_prefill_cp():
+            # NSA CP and MLA CP both don't support MOE_FULL yet; fall back to FULL.
+            if is_enable_moe_cp_allgather() and not (
+                is_nsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+            ):
                 return ScatterMode.MOE_FULL
             return ScatterMode.FULL
         else:

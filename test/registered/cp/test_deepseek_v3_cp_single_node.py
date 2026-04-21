@@ -5,9 +5,12 @@ and ``test_qwen3_30b.py`` (MHA CP) — one e2e file per CP flavor.
 Cheaper helper-level coverage lives in ``test_cp_utils.py`` and
 ``test_mla_cp_fa3_parity.py``.
 
-Topology: ``tp=8, dp=2, attn-cp=4``, FA3 backend — the same
-``attn_cp x dp`` layout NSA CP uses for DSv3.2. No MTP in this
-baseline (MTP x MLA CP is a follow-up).
+Topology: ``tp=8, dp=2, attn-cp=4``, FA3 backend. The last three
+knobs (``enable-dp-attention``, ``attn-cp-size``, plus DeepEP MoE
+with ``ep=8``, ``moe-dense-tp-size=1``) are auto-configured by
+``_handle_model_specific_adjustments`` — mirrors NSA CP's
+in-seq-split auto-config for DSv3.2. No MTP in this baseline
+(MTP x MLA CP is a follow-up).
 
 GSM8k threshold 0.935 matches the non-CP DSv3 baseline in
 ``test_deepseek_v3_basic.py`` / ``test_deepseek_v3_mtp.py``.
@@ -48,11 +51,8 @@ class TestDeepseekV3CPInSeqSplit(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--enable-dp-attention",
             "--dp",
             "2",
-            "--attn-cp-size",
-            "4",
             "--enable-prefill-context-parallel",
             "--attention-backend",
             "fa3",

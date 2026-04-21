@@ -52,7 +52,7 @@ def is_prefill_cp_in_seq_split():
 
 def is_mla_prefill_cp_enabled() -> bool:
     sa = get_global_server_args()
-    return sa.enable_prefill_context_parallel and sa.use_mla_backend()
+    return sa.enable_prefill_context_parallel and sa.use_mla_backend
 
 
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
