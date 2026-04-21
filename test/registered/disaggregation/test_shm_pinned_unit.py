@@ -11,6 +11,9 @@ from sglang.srt.disaggregation.shm_pinned.utils import (
     ShmPinnedInfo,
     calculate_slot_bytes,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
 def test_slot_meta_round_trip():
@@ -154,3 +157,9 @@ def test_transfer_engine_cpu_smoke(monkeypatch):
     finally:
         prefill_engine.close()
         decode_engine.close()
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
