@@ -17,12 +17,12 @@ import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import (
-    RadixCache,
-    RadixKey,
     InsertParams,
     MatchPrefixParams,
+    RadixCache,
+    RadixKey,
 )
-from sglang.test.test_utils import CustomTestCase, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +219,6 @@ class TestKVCacheCPUBackupIntegration(CustomTestCase):
     def test_kv_cache_cpu_backup_basic_no_crash(self):
         """Engine should start, release KV cache to CPU, resume, and generate correctly."""
         self._skip_if_no_memory_saver()
-        import sglang as sgl
         from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 
         engine = self._setup_engine(enable_kv_cache_cpu_backup=True)

@@ -201,7 +201,9 @@ class SchedulerUpdateWeightsMixin:
             ):
                 required_backup_bytes += (
                     self.tp_worker.model_runner.token_to_kv_pool.mem_usage
-                    * 1024 * 1024 * 1024
+                    * 1024
+                    * 1024
+                    * 1024
                 )
             if (
                 GPU_MEMORY_TYPE_WEIGHTS in tags
@@ -209,7 +211,9 @@ class SchedulerUpdateWeightsMixin:
             ):
                 required_backup_bytes += (
                     self.tp_worker.model_runner.weight_load_mem_usage
-                    * 1024 * 1024 * 1024
+                    * 1024
+                    * 1024
+                    * 1024
                 )
 
             if required_backup_bytes > 0:
@@ -237,9 +241,7 @@ class SchedulerUpdateWeightsMixin:
                         f"Free up host memory or disable the cpu-backup flags."
                     )
                     logger.error(msg)
-                    return ReleaseMemoryOccupationReqOutput(
-                        success=False, message=msg
-                    )
+                    return ReleaseMemoryOccupationReqOutput(success=False, message=msg)
                 warn_threshold = int(required_backup_bytes * 1.5)
                 if avail_bytes < warn_threshold:
                     logger.warning(
@@ -321,7 +323,9 @@ class SchedulerUpdateWeightsMixin:
                 and hasattr(self.tree_cache, "import_snapshot")
             ):
                 # Restore radix tree so that prefix cache hits work immediately after wakeup
-                success = self.tree_cache.import_snapshot(self.stashed_kv_radix_snapshot)
+                success = self.tree_cache.import_snapshot(
+                    self.stashed_kv_radix_snapshot
+                )
                 if success:
                     logger.info(
                         "KV cache CPU backup: radix tree snapshot restored after wakeup."

@@ -1900,7 +1900,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
                             (index_buf_size + page_size + 1) // self.page_size,
                             self.page_size
                             * (
-                                index_head_dim + index_head_dim // self.quant_block_size * 4
+                                index_head_dim
+                                + index_head_dim // self.quant_block_size * 4
                             ),
                         ),
                         dtype=self.index_k_with_scale_buffer_dtype,
