@@ -9,7 +9,6 @@ from sglang.test.test_utils import CustomTestCase
 
 flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
 
-
 torch.manual_seed(1234)
 
 
@@ -45,6 +44,37 @@ def flash_attn_varlen_ref(
 
     # [1, H, T, D] -> [T, H, D]
     return out.transpose(1, 2).squeeze(0)
+
+
+# faster version ref kernel for non varlen case
+def flash_attn_non_varlen_ref(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    is_causal,
+    enable_gqa,
+):
+    cu_q = cu_seqlens_q.tolist()
+    cu_k = cu_seqlens_k.tolist()
+    batch = len(cu_k) - 1
+
+    B_T, H, D = q.shape
+    T = B_T // batch
+
+    # [T, H, D] -> [1, H, T, D]
+    q, k, v = [x.reshape(batch, T, H, D).transpose(1, 2) for x in [q, k, v]]
+
+    out = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        is_causal=is_causal,
+        enable_gqa=enable_gqa,
+    )
+    # [B, H, T, D] -> [B * T, H, D]
+    return out.transpose(1, 2).reshape(batch * T, H, D)
 
 
 class TestFlashAttn(CustomTestCase):
@@ -109,6 +139,103 @@ class TestFlashAttn(CustomTestCase):
 
         atol = rtol = precision[dtype]
         torch.testing.assert_close(out_ref, out, atol=atol, rtol=rtol)
+
+    # test with large size to capture overflow issue
+    @parametrize(
+        batch=[4097],
+        max_seqlen_q=[4097],
+        max_seqlen_k=[4097],
+        num_heads=[4],
+        num_heads_kv=[4],
+        head_dim=[32],
+        head_dim_v=[32],
+        is_causal=[False],
+    )
+    def test_flash_attn_large_size(
+        self,
+        batch,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads,
+        num_heads_kv,
+        head_dim,
+        head_dim_v,
+        is_causal,
+    ):
+        dtype = torch.bfloat16
+
+        # test the non varlen case
+        seqlens_q = torch.full((batch,), max_seqlen_q, dtype=torch.int32)
+        seqlens_k = torch.full((batch,), max_seqlen_k, dtype=torch.int32)
+
+        cu_seqlens_q = torch.zeros((batch + 1,), dtype=torch.int32)
+        cu_seqlens_k = torch.zeros((batch + 1,), dtype=torch.int32)
+        cu_seqlens_q[1:] = torch.cumsum(seqlens_q, 0)
+        cu_seqlens_k[1:] = torch.cumsum(seqlens_k, 0)
+
+        sum_seqlen_q = seqlens_q.sum().item()
+        sum_seqlen_k = seqlens_k.sum().item()
+        q = torch.randn(sum_seqlen_q, num_heads, head_dim).to(dtype)
+        k = torch.randn(sum_seqlen_k, num_heads_kv, head_dim).to(dtype)
+        v = torch.randn(sum_seqlen_k, num_heads_kv, head_dim_v).to(dtype)
+
+        out_ref = flash_attn_non_varlen_ref(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            is_causal=is_causal,
+            enable_gqa=num_heads != num_heads_kv,
+        )
+
+        out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlens_q.max().item(),
+            seqlens_k.max().item(),
+            is_causal,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(out_ref, out, atol=atol, rtol=rtol)
+
+    def _test_flash_attn_large_seq_causal_mask_once(self, seqlens):
+        dtype = torch.bfloat16
+        num_heads = 8
+        num_heads_kv = 2
+        head_dim = 64
+
+        seqlens_t = torch.tensor(seqlens, dtype=torch.int32)
+        cu_seqlens = torch.zeros(len(seqlens) + 1, dtype=torch.int32)
+        cu_seqlens[1:] = torch.cumsum(seqlens_t, 0)
+        total = cu_seqlens[-1].item()
+        max_seqlen = seqlens_t.max().item()
+
+        q = torch.randn(total, num_heads, head_dim, dtype=dtype)
+        k = torch.randn(total, num_heads_kv, head_dim, dtype=dtype)
+        v = torch.randn(total, num_heads_kv, head_dim, dtype=dtype)
+
+        out_ref = flash_attn_varlen_ref(
+            q, k, v, cu_seqlens, cu_seqlens, is_causal=True, enable_gqa=True
+        )
+        out = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, True
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(out_ref, out, atol=atol, rtol=rtol)
+
+    def test_flash_attn_large_seq_causal_mask(self):
+        # Non-varlen path: single sequence, has_varlen_sequences returns False
+        # → dispatches to flash_attn_kernel_impl.
+        self._test_flash_attn_large_seq_causal_mask_once([5000])
+        # Varlen path: sequences with different lengths, has_varlen_sequences
+        # returns True → dispatches to flash_attn_varlen_kernel_impl
+        self._test_flash_attn_large_seq_causal_mask_once([5000, 4999])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import Optional, Union
 
 import torch
+from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
 
 try:
     from sgl_kernel import flash_ops
@@ -31,6 +32,7 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+@maybe_wrap_debug_kernel
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -225,6 +227,7 @@ def flash_attn_with_kvcache(
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 
 
+@maybe_wrap_debug_kernel
 def flash_attn_varlen_func(
     q,
     k,
@@ -309,3 +312,66 @@ def flash_attn_varlen_func(
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out
+
+
+def get_scheduler_metadata(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads: int,
+    num_heads_k: int,
+    headdim: int,
+    cache_seqlens: torch.Tensor,
+    qkv_dtype=torch.bfloat16,
+    headdim_v: Optional[int] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    max_seqlen_k_new: int = 0,
+    causal: bool = False,
+    window_size=(-1, -1),
+    attention_chunk: int = 0,
+    has_softcap: bool = False,
+    num_splits: int = 0,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+):
+    """Precompute FA3 tile scheduling metadata.
+
+    Call this once per batch (not per layer) and pass the result as
+    scheduler_metadata to flash_attn_with_kvcache / flash_attn_varlen_func.
+    This avoids the prepare_varlen_num_blocks kernel running on every layer.
+    """
+    cache_seqlens = maybe_contiguous(cache_seqlens)
+    if headdim_v is None:
+        headdim_v = headdim
+
+    return torch.ops.sgl_kernel.get_scheduler_metadata(
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_heads,
+        num_heads_k,
+        headdim,
+        headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_seqlens_k_new,
+        seqused_q,
+        leftpad_k,
+        page_size,
+        max_seqlen_k_new,
+        causal,
+        window_size[0],
+        window_size[1],
+        attention_chunk,
+        has_softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+    )

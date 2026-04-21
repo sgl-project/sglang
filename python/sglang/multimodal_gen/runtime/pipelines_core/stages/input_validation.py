@@ -79,6 +79,11 @@ class InputValidationStage(PipelineStage):
         # Create generators based on generator_device parameter
         # Note: This will overwrite any existing batch.generator
         generator_device = batch.generator_device
+        if generator_device is None:
+            generator_device = (
+                getattr(server_args.pipeline_config, "generator_device", None)
+                or current_platform.device_type
+            )
 
         if generator_device == "cpu":
             device_str = "cpu"
@@ -129,8 +134,13 @@ class InputValidationStage(PipelineStage):
             # adjust output image size
             if calculated_size is not None:
                 calculated_width, calculated_height = calculated_size
-                width = batch.width or calculated_width
-                height = batch.height or calculated_height
+                explicit_fields = set(batch.extra.get("explicit_fields", []))
+                width_is_explicit = "width" in explicit_fields
+                height_is_explicit = "height" in explicit_fields
+
+                width = batch.width if width_is_explicit else calculated_width
+                height = batch.height if height_is_explicit else calculated_height
+
                 multiple_of = (
                     server_args.pipeline_config.vae_config.get_vae_scale_factor() * 2
                 )
@@ -191,8 +201,30 @@ class InputValidationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
+
+            # User-specified width/height controls the target area (scale),
+            # capped by max_area. Aspect ratio always comes from the
+            # condition image for I2V.
+            if batch.width is not None or batch.height is not None:
+                # If one dimension is provided, calculate the other based on the image's aspect ratio.
+                if batch.width is None:
+                    batch.width = round(batch.height / aspect_ratio)
+                elif batch.height is None:
+                    batch.height = round(batch.width * aspect_ratio)
+
+                target_area = min(batch.width * batch.height, max_area)
+                if batch.width * batch.height > max_area:
+                    logger.warning(
+                        "Requested resolution %dx%d exceeds max_area %d, "
+                        "clamping to max_area",
+                        batch.width,
+                        batch.height,
+                        max_area,
+                    )
+            else:
+                target_area = max_area
             width, height = self._calculate_dimensions_from_area(
-                max_area, aspect_ratio, mod_value
+                target_area, aspect_ratio, mod_value
             )
 
             batch.condition_image = batch.condition_image.resize((width, height))

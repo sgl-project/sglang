@@ -457,7 +457,7 @@ def download_dataset(path: str, url: str) -> None:
     """Download a dataset from URL to path."""
     logger.info("Downloading dataset from %s", url)
     try:
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
 
         total_size = int(response.headers.get("content-length", 0))

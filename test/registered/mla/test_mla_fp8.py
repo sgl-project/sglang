@@ -1,9 +1,8 @@
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin
 from sglang.test.test_utils import (
     DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,11 +12,13 @@ from sglang.test.test_utils import (
 )
 
 # MLA FP8 KV cache test with MGSM evaluation
-register_cuda_ci(est_time=77, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=800, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=106, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=800, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestMLA(CustomTestCase):
+class TestMLA(CustomTestCase, MGSMEnMixin):
+    mgsm_en_score_threshold = 0.8
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST
@@ -30,24 +31,20 @@ class TestMLA(CustomTestCase):
                 "--trust-remote-code",
                 "--kv-cache-dtype",
                 "fp8_e5m2",
+                # Pin MoE expert dispatch and kernel reduction order so MGSM
+                # scores don't drift across runs. The eval already uses greedy
+                # decoding, but FP8 dequant + non-deterministic MoE top-k
+                # tie-breaks produce ~1–3 point swings without this flag and
+                # straddle the 0.8 threshold. With deterministic inference,
+                # the score becomes a fixed function of (model, weights, CUDA
+                # stack), so threshold-edge flakes stop being random noise.
+                "--enable-deterministic-inference",
             ],
         )
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        assert metrics["score"] >= 0.8
 
 
 if __name__ == "__main__":

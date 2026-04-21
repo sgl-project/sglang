@@ -25,11 +25,10 @@ runtime_common = [
   "build",
   "compressed-tensors",
   "datasets",
+  "easydict",
   "einops",
   "fastapi",
   "gguf",
-  "hf_transfer",
-  "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
@@ -59,11 +58,27 @@ runtime_common = [
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "transformers==4.57.1",
+  "mistral_common>=1.11.0",
+  "transformers==5.5.4",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
+  "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
+]
+
+diffusion_common = [
+  "PyYAML==6.0.1",
+  "cloudpickle",
+  "diffusers==0.37.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python-headless==4.10.0.84",
+  "remote-pdb",
+  "addict",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+  "xatlas",
 ]
 
 tracing = [
@@ -83,22 +98,12 @@ srt_hip = [
 ]
 
 diffusion_hip = [
-  "PyYAML==6.0.1",
-  "cloudpickle",
-  "diffusers==0.37.0",
-  "imageio==2.36.0",
-  "imageio-ffmpeg==0.5.1",
-  "moviepy>=2.0.0",
-  "opencv-python-headless==4.10.0.84",
-  "remote-pdb",
+  "sglang[diffusion_common]",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
   "cache-dit==1.1.8",
-  "addict",
-  "scikit-image==0.25.2",
-  "trimesh>=4.0.0",
-  "xatlas",
 ]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
@@ -110,28 +115,20 @@ srt_musa = [
     "sglang[runtime_common]",
     "torch",
     "torch_musa",
-    "torchada>=0.1.25",
+    "torchada>=0.1.48",
     "mthreads-ml-py",
+    "mate",
+    "mate-deep_gemm",
+    "mate-flash-attention",
     "numpy<2.0",
 ]
 
 diffusion_musa = [
-  "PyYAML==6.0.1",
-  "cloudpickle",
-  "diffusers==0.37.0",
-  "imageio==2.36.0",
-  "imageio-ffmpeg==0.5.1",
-  "moviepy>=2.0.0",
-  "opencv-python-headless==4.10.0.84",
-  "remote-pdb",
+  "sglang[diffusion_common]",
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
   "cache-dit==1.1.8",
-  "addict",
-  "scikit-image==0.25.2",
-  "trimesh>=4.0.0",
-  "xatlas",
 ]
 
 # https://docs.sglang.io/platforms/mps.md
@@ -141,20 +138,20 @@ srt_mps = [
     "torchao==0.9.0",
     "torchaudio==2.9.1",
     "torchvision",
+    "mlx",
+    "mlx-lm",
 ]
 
 diffusion_mps = [
-  "PyYAML==6.0.1",
+  "sglang[diffusion_common]",
   "cloudpickle==3.1.2",
-  "diffusers==0.37.0",
-  "imageio==2.36.0",
-  "imageio-ffmpeg==0.5.1",
-  "moviepy>=2.0.0",
-  "opencv-python-headless==4.10.0.84",
   "remote-pdb==2.1.0",
   "cache-dit==1.2.3",
   "addict==2.4.0",
   "av==16.1.0",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+  "xatlas",
 ]
 
 test = [
@@ -164,7 +161,7 @@ test = [
   "jsonlines",
   "matplotlib",
   "pandas",
-  "peft",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "pytest",
   "sentence_transformers",
   "tabulate",
@@ -218,4 +215,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+# Allow editable installs even when .git metadata is not available.
+fallback_version = "0.0.0.dev0"

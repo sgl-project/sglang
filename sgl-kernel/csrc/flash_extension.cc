@@ -61,6 +61,40 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       ") -> (Tensor, Tensor, Tensor, Tensor)");  // NEW return type: tuple of 4 tensors
 
   m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
+
+  /*
+   * From flash-attention: get_scheduler_metadata
+   * Precomputes tile scheduling for FA3 to avoid per-layer prepare_varlen_num_blocks calls.
+   */
+  m.def(
+      "get_scheduler_metadata("
+      "    int      batch_size,"
+      "    int      max_seqlen_q,"
+      "    int      max_seqlen_k,"
+      "    int      num_heads,"
+      "    int      num_heads_k,"
+      "    int      headdim,"
+      "    int      headdim_v,"
+      "    ScalarType qkv_dtype,"
+      "    Tensor   seqused_k,"         // b
+      "    Tensor?  cu_seqlens_q,"      // b+1
+      "    Tensor?  cu_seqlens_k,"      // b+1
+      "    Tensor?  cu_seqlens_k_new,"  // b+1
+      "    Tensor?  seqused_q,"         // b
+      "    Tensor?  leftpad_k,"         // b
+      "    int?     page_size,"
+      "    int      max_seqlen_k_new = 0,"
+      "    bool     is_causal = False,"
+      "    int      window_size_left = -1,"
+      "    int      window_size_right = -1,"
+      "    int      attention_chunk = 0,"
+      "    bool     has_softcap = False,"
+      "    int      num_splits = 0,"
+      "    bool?    pack_gqa = None,"
+      "    int      sm_margin = 0"
+      ") -> Tensor");
+
+  m.impl("get_scheduler_metadata", torch::kCUDA, make_pytorch_shim(&mha_fwd_get_scheduler_metadata));
 }
 
 REGISTER_EXTENSION(flash_ops)
