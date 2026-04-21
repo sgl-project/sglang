@@ -193,6 +193,18 @@ class BenchServingLM(LM):
             flush_cache=self.flush_cache,
             warmup_requests=self.warmup_requests,
         ))
+        # bench_serving's streaming OAI path never sets stream_options.include_usage,
+        # so usage.completion_tokens never arrives; output_lens falls back to the
+        # requested max_tokens (here max_gen_toks), making every entry look pinned
+        # at the cap. Retokenize client-side so downstream calibration (calib_kv)
+        # sees real output lengths. add_special_tokens=False matches the convention
+        # bench_serving.calculate_metrics uses for retokenized_output_lens.
+        texts = perf.get("generated_texts") or []
+        if texts:
+            perf["output_lens"] = [
+                len(self.tokenizer.encode(t, add_special_tokens=False))
+                for t in texts
+            ]
         self.last_perf = perf
         texts = list(perf["generated_texts"])
         if self.enable_thinking:
