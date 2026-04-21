@@ -88,20 +88,19 @@ class KimiK2Detector(BaseFormatDetector):
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
         try:
-            # there are two possible captures - between tags, or between a
-            # tag and end-of-string so the result of
-            # findall is an array of tuples where one is a function call and
-            # the other is None
-            function_call_tuples = self.tool_call_regex.findall(text)
-
-            logger.debug("function_call_tuples: %s", function_call_tuples)
-
+            tool_call_matches = list(self.tool_call_regex.finditer(text))
             tool_calls = []
-            for match in function_call_tuples:
-                function_id, function_args = match
+            normal_text_chunks = []
+            current_pos = 0
+            for match in tool_call_matches:
+                normal_text_chunks.append(_strip_special_tokens(text[current_pos:match.start()]))
+
+                function_id = match.group("tool_call_id")
+                function_args = match.group("function_arguments")
                 m = self.tool_call_id_regex.match(function_id)
                 if not m:
                     logger.warning("Unexpected tool_call_id format: %s", function_id)
+                    current_pos = match.end()
                     continue
                 function_name = m.group("name")
                 function_idx = int(m.group("index"))
@@ -115,14 +114,18 @@ class KimiK2Detector(BaseFormatDetector):
                         parameters=function_args,
                     )
                 )
+                current_pos = match.end()
+
+            normal_text_chunks.append(_strip_special_tokens(text[current_pos:]))
 
             if not tool_calls:
                 return StreamingParseResult(
                     normal_text=_strip_special_tokens(text), calls=[]
                 )
 
-            content = text[: text.find(self.bot_token)]
-            return StreamingParseResult(normal_text=content, calls=tool_calls)
+            return StreamingParseResult(
+                normal_text="".join(normal_text_chunks), calls=tool_calls
+            )
 
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")

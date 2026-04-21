@@ -824,14 +824,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Send any remaining tool call arguments when generation finishes
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
-                        if not has_tool_calls.get(index, False):
-                            remaining_normal_chunk = (
-                                self._check_for_unstreamed_normal_text(
-                                    parser, content, request, index
-                                )
+                        remaining_normal_chunk = (
+                            self._check_for_unstreamed_normal_text(
+                                parser, content, request, index
                             )
-                            if remaining_normal_chunk:
-                                yield remaining_normal_chunk
+                        )
+                        if remaining_normal_chunk:
+                            yield remaining_normal_chunk
                         remaining_chunk = self._check_for_unstreamed_tool_args(
                             parser, content, request, index
                         )
