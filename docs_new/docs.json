@@ -11,6 +11,586 @@
     {
       "source": "/docs/references/learn_more",
       "destination": "/"
+    },
+    {
+      "source": "/index.html",
+      "destination": "/"
+    },
+    {
+      "source": "/advanced_features/adaptive_speculative_decoding.html",
+      "destination": "/docs/advanced_features/speculative_decoding"
+    },
+    {
+      "source": "/advanced_features/attention_backend.html",
+      "destination": "/docs/advanced_features/attention_backend"
+    },
+    {
+      "source": "/advanced_features/breakable_cuda_graph.html",
+      "destination": "/docs/advanced_features/breakable_cuda_graph"
+    },
+    {
+      "source": "/advanced_features/checkpoint_engine.html",
+      "destination": "/docs/advanced_features/checkpoint_engine"
+    },
+    {
+      "source": "/advanced_features/cuda_graph_for_multi_modal_encoder.html",
+      "destination": "/docs/advanced_features/cuda_graph_for_multi_modal_encoder"
+    },
+    {
+      "source": "/advanced_features/deterministic_inference.html",
+      "destination": "/docs/advanced_features/deterministic_inference"
+    },
+    {
+      "source": "/advanced_features/dp_dpa_smg_guide.html",
+      "destination": "/docs/advanced_features/dp_dpa_smg_guide"
+    },
+    {
+      "source": "/advanced_features/dp_for_multi_modal_encoder.html",
+      "destination": "/docs/advanced_features/dp_for_multi_modal_encoder"
+    },
+    {
+      "source": "/advanced_features/epd_disaggregation.html",
+      "destination": "/docs/advanced_features/epd_disaggregation"
+    },
+    {
+      "source": "/advanced_features/expert_parallelism.html",
+      "destination": "/docs/advanced_features/expert_parallelism"
+    },
+    {
+      "source": "/advanced_features/forward_hooks.html",
+      "destination": "/docs/advanced_features/forward_hooks"
+    },
+    {
+      "source": "/advanced_features/hicache.html",
+      "destination": "/docs/advanced_features/hicache"
+    },
+    {
+      "source": "/advanced_features/hicache_best_practices.html",
+      "destination": "/docs/advanced_features/hicache_best_practices"
+    },
+    {
+      "source": "/advanced_features/hicache_design.html",
+      "destination": "/docs/advanced_features/hicache_design"
+    },
+    {
+      "source": "/advanced_features/hicache_storage_runtime_attach_detach.html",
+      "destination": "/docs/advanced_features/hicache_storage_runtime_attach_detach"
+    },
+    {
+      "source": "/advanced_features/hisparse_guide.html",
+      "destination": "/docs/advanced_features/overview"
+    },
+    {
+      "source": "/advanced_features/hyperparameter_tuning.html",
+      "destination": "/docs/advanced_features/hyperparameter_tuning"
+    },
+    {
+      "source": "/advanced_features/lora.html",
+      "destination": "/docs/advanced_features/lora"
+    },
+    {
+      "source": "/advanced_features/object_storage.html",
+      "destination": "/docs/advanced_features/object_storage"
+    },
+    {
+      "source": "/advanced_features/observability.html",
+      "destination": "/docs/advanced_features/observability"
+    },
+    {
+      "source": "/advanced_features/pd_disaggregation.html",
+      "destination": "/docs/advanced_features/pd_disaggregation"
+    },
+    {
+      "source": "/advanced_features/piecewise_cuda_graph.html",
+      "destination": "/docs/advanced_features/piecewise_cuda_graph"
+    },
+    {
+      "source": "/advanced_features/pipeline_parallelism.html",
+      "destination": "/docs/advanced_features/pipeline_parallelism"
+    },
+    {
+      "source": "/advanced_features/quantization.html",
+      "destination": "/docs/advanced_features/quantization"
+    },
+    {
+      "source": "/advanced_features/quantized_kv_cache.html",
+      "destination": "/docs/advanced_features/quantized_kv_cache"
+    },
+    {
+      "source": "/advanced_features/rfork.html",
+      "destination": "/docs/advanced_features/rfork"
+    },
+    {
+      "source": "/advanced_features/separate_reasoning.html",
+      "destination": "/docs/advanced_features/separate_reasoning"
+    },
+    {
+      "source": "/advanced_features/server_arguments.html",
+      "destination": "/docs/advanced_features/server_arguments"
+    },
+    {
+      "source": "/advanced_features/sgl_model_gateway.html",
+      "destination": "/docs/advanced_features/sgl_model_gateway"
+    },
+    {
+      "source": "/advanced_features/sglang_for_rl.html",
+      "destination": "/docs/advanced_features/sglang_for_rl"
+    },
+    {
+      "source": "/advanced_features/speculative_decoding.html",
+      "destination": "/docs/advanced_features/speculative_decoding"
+    },
+    {
+      "source": "/advanced_features/structured_outputs.html",
+      "destination": "/docs/advanced_features/structured_outputs"
+    },
+    {
+      "source": "/advanced_features/structured_outputs_for_reasoning_models.html",
+      "destination": "/docs/advanced_features/structured_outputs_for_reasoning_models"
+    },
+    {
+      "source": "/advanced_features/tool_parser.html",
+      "destination": "/docs/advanced_features/tool_parser"
+    },
+    {
+      "source": "/advanced_features/vlm_query.html",
+      "destination": "/docs/advanced_features/vlm_query"
+    },
+    {
+      "source": "/basic_usage/deepseek_ocr.html",
+      "destination": "/docs/basic_usage/overview"
+    },
+    {
+      "source": "/basic_usage/deepseek_v3.html",
+      "destination": "/docs/basic_usage/deepseek_v3"
+    },
+    {
+      "source": "/basic_usage/deepseek_v32.html",
+      "destination": "/docs/basic_usage/deepseek_v32"
+    },
+    {
+      "source": "/basic_usage/glm45.html",
+      "destination": "/docs/basic_usage/glm45"
+    },
+    {
+      "source": "/basic_usage/glmv.html",
+      "destination": "/docs/basic_usage/glmv"
+    },
+    {
+      "source": "/basic_usage/gpt_oss.html",
+      "destination": "/docs/basic_usage/gpt_oss"
+    },
+    {
+      "source": "/basic_usage/llama4.html",
+      "destination": "/docs/basic_usage/llama4"
+    },
+    {
+      "source": "/basic_usage/minimax_m2.html",
+      "destination": "/docs/basic_usage/minimax_m2"
+    },
+    {
+      "source": "/basic_usage/native_api.html",
+      "destination": "/docs/basic_usage/native_api"
+    },
+    {
+      "source": "/basic_usage/offline_engine_api.html",
+      "destination": "/docs/basic_usage/offline_engine_api"
+    },
+    {
+      "source": "/basic_usage/ollama_api.html",
+      "destination": "/docs/basic_usage/ollama_api"
+    },
+    {
+      "source": "/basic_usage/openai_api.html",
+      "destination": "/docs/basic_usage/openai_api"
+    },
+    {
+      "source": "/basic_usage/openai_api_completions.html",
+      "destination": "/docs/basic_usage/openai_api_completions"
+    },
+    {
+      "source": "/basic_usage/openai_api_embeddings.html",
+      "destination": "/docs/basic_usage/openai_api_embeddings"
+    },
+    {
+      "source": "/basic_usage/openai_api_vision.html",
+      "destination": "/docs/basic_usage/openai_api_vision"
+    },
+    {
+      "source": "/basic_usage/popular_model_usage.html",
+      "destination": "/docs/basic_usage/popular_model_usage"
+    },
+    {
+      "source": "/basic_usage/qwen3.html",
+      "destination": "/docs/basic_usage/qwen3"
+    },
+    {
+      "source": "/basic_usage/qwen3_5.html",
+      "destination": "/docs/basic_usage/qwen3"
+    },
+    {
+      "source": "/basic_usage/qwen3_vl.html",
+      "destination": "/docs/basic_usage/qwen3_vl"
+    },
+    {
+      "source": "/basic_usage/sampling_params.html",
+      "destination": "/docs/basic_usage/sampling_params"
+    },
+    {
+      "source": "/basic_usage/send_request.html",
+      "destination": "/docs/basic_usage/send_request"
+    },
+    {
+      "source": "/developer_guide/bench_serving.html",
+      "destination": "/docs/developer_guide/bench_serving"
+    },
+    {
+      "source": "/developer_guide/benchmark_and_profiling.html",
+      "destination": "/docs/developer_guide/benchmark_and_profiling"
+    },
+    {
+      "source": "/developer_guide/contribution_guide.html",
+      "destination": "/docs/developer_guide/contribution_guide"
+    },
+    {
+      "source": "/developer_guide/development_guide_using_docker.html",
+      "destination": "/docs/developer_guide/development_guide_using_docker"
+    },
+    {
+      "source": "/developer_guide/development_jit_kernel_guide.html",
+      "destination": "/docs/developer_guide/JIT_kernels"
+    },
+    {
+      "source": "/developer_guide/evaluating_new_models.html",
+      "destination": "/docs/developer_guide/evaluating_new_models"
+    },
+    {
+      "source": "/developer_guide/release_process.html",
+      "destination": "/docs/developer_guide/release_process"
+    },
+    {
+      "source": "/developer_guide/setup_github_runner.html",
+      "destination": "/docs/developer_guide/setup_github_runner"
+    },
+    {
+      "source": "/diffusion/api/cli.html",
+      "destination": "/docs/sglang-diffusion/api/cli"
+    },
+    {
+      "source": "/diffusion/api/openai_api.html",
+      "destination": "/docs/sglang-diffusion/api/openai-api"
+    },
+    {
+      "source": "/diffusion/api/post_processing.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/ci_perf.html",
+      "destination": "/docs/sglang-diffusion/ci-performance"
+    },
+    {
+      "source": "/diffusion/compatibility_matrix.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/contributing.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/development.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/disaggregation.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/environment_variables.html",
+      "destination": "/docs/sglang-diffusion/environment-variables"
+    },
+    {
+      "source": "/diffusion/index.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/installation.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/performance/attention_backends.html",
+      "destination": "/docs/sglang-diffusion/attention-backends"
+    },
+    {
+      "source": "/diffusion/performance/cache/cache_dit.html",
+      "destination": "/docs/sglang-diffusion/cache-dit"
+    },
+    {
+      "source": "/diffusion/performance/cache/index.html",
+      "destination": "/docs/sglang-diffusion/caching-acceleration"
+    },
+    {
+      "source": "/diffusion/performance/cache/teacache.html",
+      "destination": "/docs/sglang-diffusion/tea-cache"
+    },
+    {
+      "source": "/diffusion/performance/index.html",
+      "destination": "/docs/sglang-diffusion/performance-optimization"
+    },
+    {
+      "source": "/diffusion/performance/profiling.html",
+      "destination": "/docs/sglang-diffusion/profiling"
+    },
+    {
+      "source": "/diffusion/performance/ring_sp_performance.html",
+      "destination": "/docs/sglang-diffusion/performance-optimization"
+    },
+    {
+      "source": "/diffusion/quantization.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/reference.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/support_new_models.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/diffusion/usage.html",
+      "destination": "/docs/sglang-diffusion/installation"
+    },
+    {
+      "source": "/get_started/install.html",
+      "destination": "/docs/get-started/installation"
+    },
+    {
+      "source": "/platforms/amd_gpu.html",
+      "destination": "/docs/hardware-platforms/amd-gpus"
+    },
+    {
+      "source": "/platforms/apple_metal.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/ascend/ascend_contribution_guide.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu.html",
+      "destination": "/docs/hardware-platforms/ascend-npus/SGLang-installation-with-NPUs-support"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_best_practice.html",
+      "destination": "/docs/hardware-platforms/ascend-npus/Best-Practice-on-Ascend-NPU"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_deepseek_example.html",
+      "destination": "/docs/hardware-platforms/ascend-npus/DeepSeek-Examples"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_environment_variables.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_glm5_examples.html",
+      "destination": "/docs/hardware-platforms/ascend-npus/GLM-5"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_quantization.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_qwen3_5_examples.html",
+      "destination": "/docs/hardware-platforms/ascend-npus/Qwen3.5"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_qwen3_examples.html",
+      "destination": "/docs/hardware-platforms/ascend-npus/Qwen3-Examples"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_support.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_support_features.html",
+      "destination": "/docs/hardware-platforms/ascend-npus/Support-Features-on-Ascend-NPU"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_support_models.html",
+      "destination": "/docs/hardware-platforms/ascend-npus/Support-Models-on-Ascend-NPU"
+    },
+    {
+      "source": "/platforms/ascend/mindspore_backend.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/ascend_npu_ring_sp_performance.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/cpu_server.html",
+      "destination": "/docs/hardware-platforms/cpu-server"
+    },
+    {
+      "source": "/platforms/mthreads_gpu.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/nvidia_jetson.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/plugin.html",
+      "destination": "/docs/hardware-platforms/overview"
+    },
+    {
+      "source": "/platforms/tpu.html",
+      "destination": "/docs/hardware-platforms/tpu"
+    },
+    {
+      "source": "/platforms/xpu.html",
+      "destination": "/docs/hardware-platforms/xpu"
+    },
+    {
+      "source": "/references/custom_chat_template.html",
+      "destination": "/docs/references/custom_chat_template"
+    },
+    {
+      "source": "/references/environment_variables.html",
+      "destination": "/docs/references/environment_variables"
+    },
+    {
+      "source": "/references/faq.html",
+      "destination": "/docs/references/faq"
+    },
+    {
+      "source": "/references/frontend/choices_methods.html",
+      "destination": "/docs/references/frontend/choices_methods"
+    },
+    {
+      "source": "/references/frontend/frontend_index.html",
+      "destination": "/docs/references/frontend/frontend_index"
+    },
+    {
+      "source": "/references/frontend/frontend_tutorial.html",
+      "destination": "/docs/references/frontend/frontend_tutorial"
+    },
+    {
+      "source": "/references/learn_more.html",
+      "destination": "/"
+    },
+    {
+      "source": "/references/multi_node_deployment/deploy_on_k8s.html",
+      "destination": "/docs/references/multi_node_deployment/deploy_on_k8s"
+    },
+    {
+      "source": "/references/multi_node_deployment/lws_pd/lws_pd_deploy.html",
+      "destination": "/docs/references/multi_node_deployment/lws_pd/lws_pd_deploy"
+    },
+    {
+      "source": "/references/multi_node_deployment/multi_node.html",
+      "destination": "/docs/references/multi_node_deployment/multi_node"
+    },
+    {
+      "source": "/references/multi_node_deployment/multi_node_index.html",
+      "destination": "/docs/references/multi_node_deployment/multi_node_index"
+    },
+    {
+      "source": "/references/multi_node_deployment/rbg_pd/deepseekv32_pd.html",
+      "destination": "/docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd"
+    },
+    {
+      "source": "/references/post_training_integration.html",
+      "destination": "/docs/references/post_training_integration"
+    },
+    {
+      "source": "/references/production_metrics.html",
+      "destination": "/docs/references/production_metrics"
+    },
+    {
+      "source": "/references/production_request_trace.html",
+      "destination": "/docs/references/production_request_trace"
+    },
+    {
+      "source": "/references/release_lookup.html",
+      "destination": "/docs/references/overview"
+    },
+    {
+      "source": "/references/torch_compile_cache.html",
+      "destination": "/docs/references/torch_compile_cache"
+    },
+    {
+      "source": "/supported_models/extending/index.html",
+      "destination": "/docs/supported-models"
+    },
+    {
+      "source": "/supported_models/extending/mindspore_models.html",
+      "destination": "/docs/supported-models/mindspore-models"
+    },
+    {
+      "source": "/supported_models/extending/modelscope.html",
+      "destination": "/docs/supported-models/modelscope"
+    },
+    {
+      "source": "/supported_models/extending/support_new_models.html",
+      "destination": "/docs/supported-models/new-model-support"
+    },
+    {
+      "source": "/supported_models/extending/transformers_fallback.html",
+      "destination": "/docs/supported-models/transformers-fallback"
+    },
+    {
+      "source": "/supported_models/index.html",
+      "destination": "/docs/supported-models"
+    },
+    {
+      "source": "/supported_models/retrieval_ranking/classify_models.html",
+      "destination": "/docs/supported-models/classification-models"
+    },
+    {
+      "source": "/supported_models/retrieval_ranking/embedding_models.html",
+      "destination": "/docs/supported-models/embedding-models"
+    },
+    {
+      "source": "/supported_models/retrieval_ranking/index.html",
+      "destination": "/docs/supported-models"
+    },
+    {
+      "source": "/supported_models/retrieval_ranking/rerank_models.html",
+      "destination": "/docs/supported-models/rerank-models"
+    },
+    {
+      "source": "/supported_models/specialized/index.html",
+      "destination": "/docs/supported-models"
+    },
+    {
+      "source": "/supported_models/specialized/reward_models.html",
+      "destination": "/docs/supported-models/reward-models"
+    },
+    {
+      "source": "/supported_models/text_generation/diffusion_language_models.html",
+      "destination": "/docs/supported-models/diffusion-language-models"
+    },
+    {
+      "source": "/supported_models/text_generation/generative_models.html",
+      "destination": "/docs/supported-models/large-language-models"
+    },
+    {
+      "source": "/supported_models/text_generation/index.html",
+      "destination": "/docs/supported-models"
+    },
+    {
+      "source": "/supported_models/text_generation/multimodal_language_models.html",
+      "destination": "/docs/supported-models/vision-language-models"
+    },
+    {
+      "source": "/supported_models.html",
+      "destination": "/docs/supported-models"
+    },
+    {
+      "source": "/diffusion.html",
+      "destination": "/docs/sglang-diffusion/installation"
     }
   ],
   "colors": {

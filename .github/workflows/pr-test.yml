@@ -5,7 +5,7 @@ run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', 
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Run every 6 hours (UTC)
+    - cron: '0 1,9,17 * * *'  # Run 3x daily: 2am / 10am / 6pm Pacific (PDT)
   pull_request:
     branches: [main]
   workflow_dispatch:
