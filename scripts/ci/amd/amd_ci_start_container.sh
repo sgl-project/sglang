@@ -154,18 +154,15 @@ find_latest_image() {
     fi
   done
 
-  # Then try the local registry.
-  for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
-    echo "Checking for image: ${LOCAL_DOCKER_REGISTRY}/rocm/sgl-dev:${image_tag}" >&2
-    if docker manifest inspect --insecure "${LOCAL_DOCKER_REGISTRY}/rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
-      echo "Found available image: ${LOCAL_DOCKER_REGISTRY}/rocm/sgl-dev:${image_tag}" >&2
-      echo "${LOCAL_DOCKER_REGISTRY}/rocm/sgl-dev:${image_tag}"
-      return 0
-    fi
-  done
-
-  # Finally, try the public registry.
+  # If not found locally, fall back to pulling from public registry.
+  # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} here with
+  # `docker manifest inspect --insecure` because that command runs in the
+  # runner pod's network namespace, which on every observed AMD scale set
+  # cannot reach 172.29.8.23:5000 (every probe either fast-fails with TLS
+  # reject or hits a 30s TCP timeout, multiplied across 7 daily candidates).
+  # The actual local-registry pull still happens in the call site below via
+  # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
+  # docker daemon on the host and inherits its insecure-registries config.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
@@ -260,14 +257,17 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  echo "Pulling Docker image: ${IMAGE}"
-  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
-    # Local registry is on-LAN; no need to retry.
-    docker pull "${IMAGE}"
-    docker tag "${IMAGE}" "${IMAGE#${LOCAL_DOCKER_REGISTRY}/}"
-    IMAGE="${IMAGE#${LOCAL_DOCKER_REGISTRY}/}"
+  # Try the local docker registry first (avoids Docker Hub rate limits and is
+  # faster on the LAN); if that fails for any reason, fall back to the
+  # public registry with exponential-backoff retries. Capture stderr so the
+  # real failure reason (TLS handshake, 404, connection refused, etc.) is
+  # visible in the job log instead of being silently swallowed.
+  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
   else
-    # Public registry pulls can hit rate limits; retry with backoff.
+    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
     retry_with_backoff 6 docker pull "${IMAGE}"
   fi
 fi
