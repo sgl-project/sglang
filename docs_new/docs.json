@@ -18,7 +18,7 @@
     },
     {
       "source": "/advanced_features/adaptive_speculative_decoding.html",
-      "destination": "/docs/advanced_features/speculative_decoding"
+      "destination": "/docs/advanced_features/adaptive_speculative_decoding"
     },
     {
       "source": "/advanced_features/attention_backend.html",
@@ -78,7 +78,7 @@
     },
     {
       "source": "/advanced_features/hisparse_guide.html",
-      "destination": "/docs/advanced_features/overview"
+      "destination": "/docs/advanced_features/hisparse_guide"
     },
     {
       "source": "/advanced_features/hyperparameter_tuning.html",
@@ -158,7 +158,7 @@
     },
     {
       "source": "/basic_usage/deepseek_ocr.html",
-      "destination": "/docs/basic_usage/overview"
+      "destination": "/docs/basic_usage/deepseek_ocr"
     },
     {
       "source": "/basic_usage/deepseek_v3.html",
@@ -226,7 +226,7 @@
     },
     {
       "source": "/basic_usage/qwen3_5.html",
-      "destination": "/docs/basic_usage/qwen3"
+      "destination": "/docs/basic_usage/qwen3_5"
     },
     {
       "source": "/basic_usage/qwen3_vl.html",
@@ -258,7 +258,7 @@
     },
     {
       "source": "/developer_guide/development_jit_kernel_guide.html",
-      "destination": "/docs/developer_guide/JIT_kernels"
+      "destination": "/docs/developer_guide/development_jit_kernel_guide"
     },
     {
       "source": "/developer_guide/evaluating_new_models.html",
@@ -278,23 +278,23 @@
     },
     {
       "source": "/diffusion/api/openai_api.html",
-      "destination": "/docs/sglang-diffusion/api/openai-api"
+      "destination": "/docs/sglang-diffusion/api/openai_api"
     },
     {
       "source": "/diffusion/api/post_processing.html",
-      "destination": "/docs/sglang-diffusion/installation"
+      "destination": "/docs/sglang-diffusion/api/post_processing"
     },
     {
       "source": "/diffusion/ci_perf.html",
-      "destination": "/docs/sglang-diffusion/ci-performance"
+      "destination": "/docs/sglang-diffusion/ci_perf"
     },
     {
       "source": "/diffusion/compatibility_matrix.html",
-      "destination": "/docs/sglang-diffusion/installation"
+      "destination": "/docs/sglang-diffusion/compatibility_matrix"
     },
     {
       "source": "/diffusion/contributing.html",
-      "destination": "/docs/sglang-diffusion/installation"
+      "destination": "/docs/sglang-diffusion/contributing"
     },
     {
       "source": "/diffusion/development.html",
@@ -302,15 +302,15 @@
     },
     {
       "source": "/diffusion/disaggregation.html",
-      "destination": "/docs/sglang-diffusion/installation"
+      "destination": "/docs/sglang-diffusion/disaggregation"
     },
     {
       "source": "/diffusion/environment_variables.html",
-      "destination": "/docs/sglang-diffusion/environment-variables"
+      "destination": "/docs/sglang-diffusion/environment_variables"
     },
     {
       "source": "/diffusion/index.html",
-      "destination": "/docs/sglang-diffusion/installation"
+      "destination": "/docs/sglang-diffusion/index"
     },
     {
       "source": "/diffusion/installation.html",
@@ -318,11 +318,11 @@
     },
     {
       "source": "/diffusion/performance/attention_backends.html",
-      "destination": "/docs/sglang-diffusion/attention-backends"
+      "destination": "/docs/sglang-diffusion/attention_backends"
     },
     {
       "source": "/diffusion/performance/cache/cache_dit.html",
-      "destination": "/docs/sglang-diffusion/cache-dit"
+      "destination": "/docs/sglang-diffusion/cache_dit"
     },
     {
       "source": "/diffusion/performance/cache/index.html",
@@ -330,7 +330,7 @@
     },
     {
       "source": "/diffusion/performance/cache/teacache.html",
-      "destination": "/docs/sglang-diffusion/tea-cache"
+      "destination": "/docs/sglang-diffusion/teacache"
     },
     {
       "source": "/diffusion/performance/index.html",
@@ -342,11 +342,11 @@
     },
     {
       "source": "/diffusion/performance/ring_sp_performance.html",
-      "destination": "/docs/sglang-diffusion/performance-optimization"
+      "destination": "/docs/sglang-diffusion/ring_sp_performance"
     },
     {
       "source": "/diffusion/quantization.html",
-      "destination": "/docs/sglang-diffusion/installation"
+      "destination": "/docs/sglang-diffusion/quantization"
     },
     {
       "source": "/diffusion/reference.html",
@@ -354,7 +354,7 @@
     },
     {
       "source": "/diffusion/support_new_models.html",
-      "destination": "/docs/sglang-diffusion/installation"
+      "destination": "/docs/sglang-diffusion/support_new_models"
     },
     {
       "source": "/diffusion/usage.html",
@@ -362,87 +362,91 @@
     },
     {
       "source": "/get_started/install.html",
-      "destination": "/docs/get-started/installation"
+      "destination": "/docs/get-started/install"
     },
     {
       "source": "/platforms/amd_gpu.html",
-      "destination": "/docs/hardware-platforms/amd-gpus"
+      "destination": "/docs/hardware-platforms/amd_gpu"
     },
     {
       "source": "/platforms/apple_metal.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/apple_metal"
     },
     {
       "source": "/platforms/ascend/ascend_contribution_guide.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_contribution_guide"
     },
     {
       "source": "/platforms/ascend/ascend_npu.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/SGLang-installation-with-NPUs-support"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu"
     },
     {
       "source": "/platforms/ascend/ascend_npu_best_practice.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/Best-Practice-on-Ascend-NPU"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice"
     },
     {
       "source": "/platforms/ascend/ascend_npu_deepseek_example.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/DeepSeek-Examples"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example"
     },
     {
       "source": "/platforms/ascend/ascend_npu_environment_variables.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables"
     },
     {
       "source": "/platforms/ascend/ascend_npu_glm5_examples.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/GLM-5"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples"
     },
     {
       "source": "/platforms/ascend/ascend_npu_quantization.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_quantization"
+    },
+    {
+      "source": "/platforms/ascend/ascend_npu_quick_start.html",
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start"
     },
     {
       "source": "/platforms/ascend/ascend_npu_qwen3_5_examples.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/Qwen3.5"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples"
     },
     {
       "source": "/platforms/ascend/ascend_npu_qwen3_examples.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/Qwen3-Examples"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples"
     },
     {
       "source": "/platforms/ascend/ascend_npu_support.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start"
     },
     {
       "source": "/platforms/ascend/ascend_npu_support_features.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/Support-Features-on-Ascend-NPU"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_support_features"
     },
     {
       "source": "/platforms/ascend/ascend_npu_support_models.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/Support-Models-on-Ascend-NPU"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_support_models"
     },
     {
       "source": "/platforms/ascend/mindspore_backend.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/ascend-npus/mindspore_backend"
     },
     {
       "source": "/platforms/ascend_npu_ring_sp_performance.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance"
     },
     {
       "source": "/platforms/cpu_server.html",
-      "destination": "/docs/hardware-platforms/cpu-server"
+      "destination": "/docs/hardware-platforms/cpu_server"
     },
     {
       "source": "/platforms/mthreads_gpu.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/mthreads_gpu"
     },
     {
       "source": "/platforms/nvidia_jetson.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/nvidia_jetson"
     },
     {
       "source": "/platforms/plugin.html",
-      "destination": "/docs/hardware-platforms/overview"
+      "destination": "/docs/hardware-platforms/plugin"
     },
     {
       "source": "/platforms/tpu.html",
@@ -526,7 +530,7 @@
     },
     {
       "source": "/supported_models/extending/mindspore_models.html",
-      "destination": "/docs/supported-models/mindspore-models"
+      "destination": "/docs/supported-models/mindspore_models"
     },
     {
       "source": "/supported_models/extending/modelscope.html",
@@ -534,11 +538,11 @@
     },
     {
       "source": "/supported_models/extending/support_new_models.html",
-      "destination": "/docs/supported-models/new-model-support"
+      "destination": "/docs/supported-models/support_new_models"
     },
     {
       "source": "/supported_models/extending/transformers_fallback.html",
-      "destination": "/docs/supported-models/transformers-fallback"
+      "destination": "/docs/supported-models/transformers_fallback"
     },
     {
       "source": "/supported_models/index.html",
@@ -546,11 +550,11 @@
     },
     {
       "source": "/supported_models/retrieval_ranking/classify_models.html",
-      "destination": "/docs/supported-models/classification-models"
+      "destination": "/docs/supported-models/classify_models"
     },
     {
       "source": "/supported_models/retrieval_ranking/embedding_models.html",
-      "destination": "/docs/supported-models/embedding-models"
+      "destination": "/docs/supported-models/embedding_models"
     },
     {
       "source": "/supported_models/retrieval_ranking/index.html",
@@ -558,7 +562,7 @@
     },
     {
       "source": "/supported_models/retrieval_ranking/rerank_models.html",
-      "destination": "/docs/supported-models/rerank-models"
+      "destination": "/docs/supported-models/rerank_models"
     },
     {
       "source": "/supported_models/specialized/index.html",
@@ -566,15 +570,15 @@
     },
     {
       "source": "/supported_models/specialized/reward_models.html",
-      "destination": "/docs/supported-models/reward-models"
+      "destination": "/docs/supported-models/reward_models"
     },
     {
       "source": "/supported_models/text_generation/diffusion_language_models.html",
-      "destination": "/docs/supported-models/diffusion-language-models"
+      "destination": "/docs/supported-models/diffusion_language_models"
     },
     {
       "source": "/supported_models/text_generation/generative_models.html",
-      "destination": "/docs/supported-models/large-language-models"
+      "destination": "/docs/supported-models/generative_models"
     },
     {
       "source": "/supported_models/text_generation/index.html",
@@ -582,7 +586,7 @@
     },
     {
       "source": "/supported_models/text_generation/multimodal_language_models.html",
-      "destination": "/docs/supported-models/vision-language-models"
+      "destination": "/docs/supported-models/multimodal_language_models"
     },
     {
       "source": "/supported_models.html",
@@ -590,7 +594,7 @@
     },
     {
       "source": "/diffusion.html",
-      "destination": "/docs/sglang-diffusion/installation"
+      "destination": "/docs/sglang-diffusion/index"
     }
   ],
   "colors": {
@@ -833,19 +837,20 @@
               {
                 "group": "Ascend NPUs",
                 "pages": [
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
-                  "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
-                  "docs/hardware-platforms/ascend-npus/mindspore_backend",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_quantization",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_quick_start",
                   "docs/hardware-platforms/ascend-npus/ascend_npu",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_support_features",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_models"
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_models",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_quantization",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples",
+                  "docs/hardware-platforms/ascend-npus/mindspore_backend",
+                  "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables"
                 ]
               },
               "docs/hardware-platforms/cpu_server",
@@ -936,14 +941,14 @@
                     ]
                   },
                   {
-                "group": "Moonshotai",
-                "pages": [
-                  "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
-                  "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
-                  "cookbook/autoregressive/Moonshotai/Kimi-K2",
-                  "cookbook/autoregressive/Moonshotai/Kimi-Linear"
-                ]
-              },
+                    "group": "Moonshotai",
+                    "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
+                      "cookbook/autoregressive/Moonshotai/Kimi-K2",
+                      "cookbook/autoregressive/Moonshotai/Kimi-Linear"
+                    ]
+                  },
                   {
                     "group": "MiniMax",
                     "pages": [
