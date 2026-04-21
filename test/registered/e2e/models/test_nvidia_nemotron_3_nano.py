@@ -8,6 +8,8 @@ family tests; the external-draft paths are the new coverage in this file.
 import unittest
 
 from sglang.srt.utils import kill_process_tree
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
