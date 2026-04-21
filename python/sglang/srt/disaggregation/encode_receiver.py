@@ -343,7 +343,12 @@ class MultiModalEmbeddingData(EmbeddingData):
         return kwargs
 
     def add(self, embedding_data: EmbeddingData):
-        assert self.req_id == embedding_data.req_id
+        if self.req_id != embedding_data.req_id:
+            logger.warning(
+                f"Dropping embedding data with mismatched req_id: "
+                f"expected {self.req_id}, got {embedding_data.req_id}"
+            )
+            return False
         assert not self.ready_list[embedding_data.part_idx]
         pid = embedding_data.part_idx
         self.ready_list[pid] = True
@@ -520,6 +525,13 @@ class WaitingImageRequest:
                 self.status = WaitingImageRequestStatus.FAIL
                 self.recv_socket.close()
                 return
+
+            if recv_obj.req_id != self.recv_req.rid:
+                logger.warning(
+                    f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
+                    f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
+                )
+                continue
 
             buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
             recv_obj.embedding = (
