@@ -23,6 +23,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
+    PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
@@ -295,13 +296,34 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        # SWA is currently the only pool whose device alloc must be coupled
+        # with the FULL alloc (to write full_to_swa_index_mapping atomically).
+        # Other pools go through the generic _resolve_pool_transfers_allocation.
+        swa_xfer = None
+        if extra_pools:
+            for p in extra_pools:
+                if (
+                    p.name == PoolName.SWA
+                    and p.device_indices is None
+                    and p.host_indices is not None
+                ):
+                    swa_xfer = p
+                    break
+
         need_load_kv = host_indices.numel() > 0
-        if need_load_kv:
+        if not need_load_kv:
+            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        elif swa_xfer is not None:
+            result = self.mem_pool_device_allocator.alloc_full_with_suffix_swa(
+                len(host_indices), swa_xfer.swa_suffix_tokens
+            )
+            if result is None:
+                return None
+            device_indices, swa_xfer.device_indices = result
+        else:
             device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
-        else:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
 
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
