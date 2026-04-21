@@ -416,7 +416,11 @@ class SWARadixCache(BasePrefixCache):
         prev_prefix_len = params.prev_prefix_len
         swa_evicted_seqlen = params.swa_evicted_seqlen
 
-        if value is None:
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+        else:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len = self._insert_helper(
@@ -439,7 +443,9 @@ class SWARadixCache(BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
-        radix_key = self.make_radix_key(token_ids, req.extra_key)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
@@ -484,7 +490,9 @@ class SWARadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        radix_key = self.make_radix_key(token_ids, req.extra_key)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
 
@@ -820,9 +828,13 @@ class SWARadixCache(BasePrefixCache):
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
         """Preprocess the key before matching."""
         key = params.key
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
             return None
-        return key.page_aligned(self.page_size)
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return None
+        return key
 
     def _match_post_processor(
         self,

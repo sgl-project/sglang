@@ -28,13 +28,9 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
+    can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
-    prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -42,9 +38,16 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -99,7 +102,18 @@ class DeepseekModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        if quant_config is not None and quant_config.get_name() == "quark":
+            self.eh_proj = ReplicatedLinear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("eh_proj", prefix),
+            )
+        else:
+            self.eh_proj = nn.Linear(
+                2 * config.hidden_size, config.hidden_size, bias=False
+            )
 
         self.rot_weight = None
         if _is_npu:
@@ -164,21 +178,23 @@ class DeepseekModelNextN(nn.Module):
             hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
-            hidden_states = self.eh_proj(
-                torch.cat(
-                    (
-                        self.enorm(hidden_states),
-                        self.hnorm(
-                            forward_batch.spec_info.hidden_states
-                            if self.rot_weight is None
-                            else torch.matmul(
-                                forward_batch.spec_info.hidden_states, self.rot_weight
-                            )
-                        ),
+            eh_input = torch.cat(
+                (
+                    self.enorm(hidden_states),
+                    self.hnorm(
+                        forward_batch.spec_info.hidden_states
+                        if self.rot_weight is None
+                        else torch.matmul(
+                            forward_batch.spec_info.hidden_states, self.rot_weight
+                        )
                     ),
-                    dim=-1,
-                )
+                ),
+                dim=-1,
             )
+            if isinstance(self.eh_proj, ReplicatedLinear):
+                hidden_states, _ = self.eh_proj(eh_input)
+            else:
+                hidden_states = self.eh_proj(eh_input)
 
         if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
@@ -247,8 +263,20 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_rank = None
             self.cp_size = None
 
+        nextn_quant_config = quant_config
+        # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
+        if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
+            from sglang.srt.layers.quantization.quark.utils import (
+                should_ignore_layer,
+            )
+
+            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+            if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
+                nextn_quant_config = None
+
         self.model = DeepseekModelNextN(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config, nextn_quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -268,8 +296,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if self.nsa_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+            if can_nsa_cp_split(
+                len(input_ids), self.cp_size, self.use_nsa, forward_batch
+            ):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,

@@ -35,6 +35,10 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    normalize_flat_modelopt_quant_config,
+)
+
 INDEX_FILENAMES = [
     "model.safetensors.index.json",
     "diffusion_pytorch_model.safetensors.index.json",
@@ -467,6 +471,10 @@ def build_modelopt_fp8_transformer(
     effective_quant_config = json.loads(json.dumps(quant_config))
     if not quant_algo:
         effective_quant_config["quant_algo"] = "FP8"
+    effective_quant_config = (
+        normalize_flat_modelopt_quant_config(effective_quant_config)
+        or effective_quant_config
+    )
 
     auto_ignore_modules = sorted(
         {

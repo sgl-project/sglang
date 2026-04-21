@@ -1,0 +1,564 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "aspen",
+  "name": "SGLang Documentation",
+  "seo": {
+    "metatags": {
+      "google-site-verification": "bX3ofyYQhraIpAYf4DpyZQXZO_G4xLR_RqeBAKnJA7g"
+    }
+  },
+  "redirects": [
+    {
+      "source": "/docs/references/learn_more",
+      "destination": "/"
+    }
+  ],
+  "colors": {
+    "primary": "#d55816",
+    "light": "#d55816",
+    "dark": "#d55816"
+  },
+  "background": {
+    "decoration": "grid",
+    "color": {
+      "dark": "#1d1d1d",
+      "light": "#fffcfb"
+    }
+  },
+  "fonts": {
+    "heading": {
+      "family": "Inter",
+      "weight": 600
+    },
+    "body": {
+      "family": "Inter",
+      "weight": 400
+    }
+  },
+  "favicon": "/favicon.png",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Get Started",
+        "groups": [
+          {
+            "group": "Get Started",
+            "icon": "play",
+            "pages": [
+              "index",
+              "docs/get-started/installation",
+              "docs/get-started/quickstart",
+              "docs/basic_usage/send_request"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "User Guide",
+        "groups": [
+          {
+            "group": "Basic Usage",
+            "icon": "book-open",
+            "pages": [
+              "docs/basic_usage/overview",
+              {
+                "group": "OpenAI-Compatible APIs",
+                "pages": [
+                  "docs/basic_usage/openai_api",
+                  "docs/basic_usage/openai_api_completions",
+                  "docs/basic_usage/openai_api_vision",
+                  "docs/basic_usage/openai_api_embeddings"
+                ]
+              },
+              "docs/basic_usage/ollama_api",
+              "docs/basic_usage/offline_engine_api",
+              "docs/basic_usage/native_api",
+              "docs/basic_usage/sampling_params",
+              {
+                "group": "Popular Model Usage",
+                "pages": [
+                  "docs/basic_usage/popular_model_usage",
+                  "docs/basic_usage/deepseek_v3",
+                  "docs/basic_usage/deepseek_v32",
+                  "docs/basic_usage/glm45",
+                  "docs/basic_usage/glmv",
+                  "docs/basic_usage/gpt_oss",
+                  "docs/basic_usage/kimi_k2_5",
+                  "docs/basic_usage/minimax_m2",
+                  "docs/basic_usage/qwen3",
+                  "docs/basic_usage/qwen3_vl",
+                  "docs/basic_usage/llama4"
+                ]
+              }
+            ]
+          },
+          {
+            "group": "Advanced Features",
+            "icon": "gears",
+            "pages": [
+              "docs/advanced_features/overview",
+              "docs/advanced_features/server_arguments",
+              "docs/advanced_features/object_storage",
+              "docs/advanced_features/hyperparameter_tuning",
+              "docs/advanced_features/attention_backend",
+              "docs/advanced_features/speculative_decoding",
+              "docs/advanced_features/structured_outputs",
+              "docs/advanced_features/structured_outputs_for_reasoning_models",
+              "docs/advanced_features/tool_parser",
+              "docs/advanced_features/separate_reasoning",
+              "docs/advanced_features/quantization",
+              "docs/advanced_features/quantized_kv_cache",
+              "docs/advanced_features/dp_dpa_smg_guide",
+              "docs/advanced_features/expert_parallelism",
+              "docs/advanced_features/lora",
+              "docs/advanced_features/pd_disaggregation",
+              "docs/advanced_features/epd_disaggregation",
+              "docs/advanced_features/pipeline_parallelism",
+              {
+                "group": "Hierarchical KV Caching (HiCache)",
+                "pages": [
+                  "docs/advanced_features/hicache",
+                  "docs/advanced_features/hicache_best_practices",
+                  "docs/advanced_features/hicache_design",
+                  "docs/advanced_features/hicache_storage_runtime_attach_detach"
+                ]
+              },
+              "docs/advanced_features/vlm_query",
+              "docs/advanced_features/dp_for_multi_modal_encoder",
+              "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
+              "docs/advanced_features/breakable_cuda_graph",
+              "docs/advanced_features/piecewise_cuda_graph",
+              "docs/advanced_features/sgl_model_gateway",
+              "docs/advanced_features/deterministic_inference",
+              "docs/advanced_features/observability",
+              "docs/advanced_features/checkpoint_engine",
+              "docs/advanced_features/sglang_for_rl"
+            ]
+          },
+          {
+            "group": "Supported Models",
+            "icon": "cubes",
+            "pages": [
+              "docs/supported-models",
+              {
+                "group": "Text Generation",
+                "pages": [
+                  "docs/supported-models/large-language-models",
+                  "docs/supported-models/vision-language-models",
+                  "docs/supported-models/diffusion-language-models"
+                ]
+              },
+              {
+                "group": "Retrieval and Ranking",
+                "pages": [
+                  "docs/supported-models/embedding-models",
+                  "docs/supported-models/rerank-models",
+                  "docs/supported-models/classification-models"
+                ]
+              },
+              {
+                "group": "Specialized Models",
+                "pages": [
+                  "docs/supported-models/reward-models"
+                ]
+              },
+              {
+                "group": "Extending SGLang",
+                "pages": [
+                  "docs/supported-models/new-model-support",
+                  "docs/supported-models/transformers-fallback",
+                  "docs/supported-models/modelscope",
+                  "docs/supported-models/mindspore-models"
+                ]
+              }
+            ]
+          },
+          {
+            "group": "Developer Guide",
+            "icon": "code",
+            "pages": [
+              "docs/developer_guide/overview",
+              "docs/developer_guide/contribution_guide",
+              {
+                "group": "Development",
+                "pages": [
+                  "docs/developer_guide/development_guide_using_docker",
+                  "docs/developer_guide/JIT_kernels"
+                ]
+              },
+              {
+                "group": "Benchmarking",
+                "pages": [
+                  "docs/developer_guide/benchmark_and_profiling",
+                  "docs/developer_guide/bench_serving"
+                ]
+              },
+              "docs/developer_guide/evaluating_new_models"
+            ]
+          },
+          {
+            "group": "References",
+            "icon": "bookmark",
+            "pages": [
+              "docs/references/overview",
+              "docs/references/faq",
+              "docs/references/environment_variables",
+              "docs/references/production_metrics",
+              "docs/references/production_request_trace",
+              {
+                "group": "Multi-Node Deployment",
+                "pages": [
+                  "docs/references/multi_node_deployment/multi_node_index",
+                  "docs/references/multi_node_deployment/multi_node",
+                  "docs/references/multi_node_deployment/deploy_on_k8s",
+                  "docs/references/multi_node_deployment/lws_pd/lws_pd_deploy",
+                  "docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd"
+                ]
+              },
+              "docs/references/custom_chat_template",
+              {
+                "group": "Frontend Language",
+                "pages": [
+                  "docs/references/frontend/frontend_index",
+                  "docs/references/frontend/frontend_tutorial",
+                  "docs/references/frontend/choices_methods"
+                ]
+              },
+              {
+                "group": "Cookbook",
+                "pages": [
+                  "cookbook/base/reference/server_arguments"
+                ]
+              },
+              "docs/references/post_training_integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Hardware",
+        "groups": [
+          {
+            "group": "Hardware Platforms",
+            "icon": "microchip",
+            "pages": [
+              "docs/hardware-platforms/overview",
+              "docs/hardware-platforms/nvidia-gpus",
+              "docs/hardware-platforms/amd-gpus",
+              {
+                "group": "Ascend NPUs",
+                "pages": [
+                  "docs/hardware-platforms/ascend-npus/Best-Practice-on-Ascend-NPU",
+                  "docs/hardware-platforms/ascend-npus/DeepSeek-Examples",
+                  "docs/hardware-platforms/ascend-npus/GLM-5",
+                  "docs/hardware-platforms/ascend-npus/MindSpore-Models",
+                  "docs/hardware-platforms/ascend-npus/Qwen3-Examples",
+                  "docs/hardware-platforms/ascend-npus/Qwen3.5",
+                  "docs/hardware-platforms/ascend-npus/SGLang-installation-with-NPUs-support",
+                  "docs/hardware-platforms/ascend-npus/Support-Features-on-Ascend-NPU",
+                  "docs/hardware-platforms/ascend-npus/Support-Models-on-Ascend-NPU"
+                ]
+              },
+              "docs/hardware-platforms/cpu-server",
+              {
+                "group": "Edge & Embedded",
+                "pages": [
+                  "docs/hardware-platforms/nvidia"
+                ]
+              },
+              "docs/hardware-platforms/tpu",
+              "docs/hardware-platforms/xpu"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Cookbook",
+        "groups": [
+          {
+            "group": "Cookbook",
+            "icon": "book",
+            "pages": [
+              "cookbook/intro",
+              {
+                "group": "Autoregressive Models",
+                "pages": [
+                  "cookbook/autoregressive/intro",
+                  {
+                    "group": "Qwen",
+                    "pages": [
+                      "cookbook/autoregressive/Qwen/Qwen3.6",
+                      "cookbook/autoregressive/Qwen/Qwen3.5",
+                      "cookbook/autoregressive/Qwen/Qwen3",
+                      "cookbook/autoregressive/Qwen/Qwen3-Next",
+                      "cookbook/autoregressive/Qwen/Qwen3-Coder",
+                      "cookbook/autoregressive/Qwen/Qwen3-Coder-Next",
+                      "cookbook/autoregressive/Qwen/Qwen3-VL",
+                      "cookbook/autoregressive/Qwen/Qwen2.5-VL"
+                    ]
+                  },
+                  {
+                    "group": "DeepSeek",
+                    "pages": [
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V3_1",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V3",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-R1",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-Math-V2",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-OCR",
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-OCR-2"
+                    ]
+                  },
+                  {
+                    "group": "Llama",
+                    "pages": [
+                      "cookbook/autoregressive/Llama/Llama4",
+                      "cookbook/autoregressive/Llama/Llama3.3-70B",
+                      "cookbook/autoregressive/Llama/Llama3.1"
+                    ]
+                  },
+                  {
+                    "group": "GLM",
+                    "pages": [
+                      "cookbook/autoregressive/GLM/GLM-4.5",
+                      "cookbook/autoregressive/GLM/GLM-4.6",
+                      "cookbook/autoregressive/GLM/GLM-4.7",
+                      "cookbook/autoregressive/GLM/GLM-4.7-Flash",
+                      "cookbook/autoregressive/GLM/GLM-5",
+                      "cookbook/autoregressive/GLM/GLM-5.1",
+                      "cookbook/autoregressive/GLM/GLM-Glyph",
+                      "cookbook/autoregressive/GLM/GLM-OCR",
+                      "cookbook/autoregressive/GLM/GLM-4.5V",
+                      "cookbook/autoregressive/GLM/GLM-4.6V"
+                    ]
+                  },
+                  {
+                    "group": "Google",
+                    "pages": [
+                      "cookbook/autoregressive/Google/Gemma4"
+                    ]
+                  },
+                  {
+                    "group": "OpenAI",
+                    "pages": [
+                      "cookbook/autoregressive/OpenAI/GPT-OSS"
+                    ]
+                  },
+                  {
+                "group": "Moonshotai",
+                "pages": [
+                  "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
+                  "cookbook/autoregressive/Moonshotai/Kimi-K2.5",
+                  "cookbook/autoregressive/Moonshotai/Kimi-K2",
+                  "cookbook/autoregressive/Moonshotai/Kimi-Linear"
+                ]
+              },
+                  {
+                    "group": "MiniMax",
+                    "pages": [
+                      "cookbook/autoregressive/MiniMax/MiniMax-M2.7",
+                      "cookbook/autoregressive/MiniMax/MiniMax-M2",
+                      "cookbook/autoregressive/MiniMax/MiniMax-M2.5"
+                    ]
+                  },
+                  {
+                    "group": "NVIDIA",
+                    "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3-Nano",
+                      "cookbook/autoregressive/NVIDIA/Nemotron3-Super"
+                    ]
+                  },
+                  {
+                    "group": "Ernie",
+                    "pages": [
+                      "cookbook/autoregressive/Ernie/Ernie4.5",
+                      "cookbook/autoregressive/Ernie/Ernie4.5-VL"
+                    ]
+                  },
+                  {
+                    "group": "StepFun",
+                    "pages": [
+                      "cookbook/autoregressive/StepFun/Step3.5",
+                      "cookbook/autoregressive/StepFun/Step3-VL-10B"
+                    ]
+                  },
+                  {
+                    "group": "InclusionAI",
+                    "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
+                      "cookbook/autoregressive/InclusionAI/Ring-2.5-1T",
+                      "cookbook/autoregressive/InclusionAI/LLaDA-2.1"
+                    ]
+                  },
+                  {
+                    "group": "InternLM",
+                    "pages": [
+                      "cookbook/autoregressive/InternLM/Intern-S1"
+                    ]
+                  },
+                  {
+                    "group": "InternVL",
+                    "pages": [
+                      "cookbook/autoregressive/InternVL/InternVL3.5"
+                    ]
+                  },
+                  {
+                    "group": "Jina AI",
+                    "pages": [
+                      "cookbook/autoregressive/Jina/Jina-reranker-m0"
+                    ]
+                  },
+                  {
+                    "group": "Mistral",
+                    "pages": [
+                      "cookbook/autoregressive/Mistral/Ministral-3",
+                      "cookbook/autoregressive/Mistral/Mistral-Small-4",
+                      "cookbook/autoregressive/Mistral/Devstral-2"
+                    ]
+                  },
+                  {
+                    "group": "Xiaomi",
+                    "pages": [
+                      "cookbook/autoregressive/Xiaomi/MiMo-V2-Flash"
+                    ]
+                  },
+                  {
+                    "group": "FlashLabs",
+                    "pages": [
+                      "cookbook/autoregressive/FlashLabs/Chroma1.0"
+                    ]
+                  }
+                ]
+              },
+              {
+                "group": "Diffusion Models",
+                "pages": [
+                  "cookbook/diffusion/intro",
+                  {
+                    "group": "FLUX",
+                    "pages": [
+                      "cookbook/diffusion/FLUX/FLUX"
+                    ]
+                  },
+                  {
+                    "group": "Wan",
+                    "pages": [
+                      "cookbook/diffusion/Wan/Wan2.1",
+                      "cookbook/diffusion/Wan/Wan2.2"
+                    ]
+                  },
+                  {
+                    "group": "Qwen-Image",
+                    "pages": [
+                      "cookbook/diffusion/Qwen-Image/Qwen-Image",
+                      "cookbook/diffusion/Qwen-Image/Qwen-Image-Edit"
+                    ]
+                  },
+                  {
+                    "group": "Z-Image",
+                    "pages": [
+                      "cookbook/diffusion/Z-Image/Z-Image-Turbo"
+                    ]
+                  },
+                  {
+                    "group": "MOVA",
+                    "pages": [
+                      "cookbook/diffusion/MOVA/MOVA"
+                    ]
+                  }
+                ]
+              },
+              {
+                "group": "SpecBundle",
+                "pages": [
+                  "cookbook/specbundle/supported_models",
+                  "cookbook/specbundle/specbundle_usage"
+                ]
+              },
+              {
+                "group": "Benchmarks",
+                "pages": [
+                  "cookbook/base/benchmarks/autoregressive_model_benchmark",
+                  "cookbook/base/benchmarks/diffusion_model_benchmark"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "SGLang Diffusion",
+        "groups": [
+          {
+            "group": "SGLang Diffusion",
+            "icon": "sparkles",
+            "pages": [
+              "sglang-diffusion/intro",
+              "docs/sglang-diffusion/installation",
+              "docs/sglang-diffusion/supported-models",
+              {
+                "group": "Usage",
+                "pages": [
+                  "docs/sglang-diffusion/api/cli",
+                  "docs/sglang-diffusion/api/openai-api"
+                ]
+              },
+              {
+                "group": "Performance Optimization",
+                "pages": [
+                  "docs/sglang-diffusion/performance-optimization",
+                  "docs/sglang-diffusion/attention-backends",
+                  "docs/sglang-diffusion/profiling",
+                  "docs/sglang-diffusion/ci-performance"
+                ]
+              },
+              {
+                "group": "Caching Strategies",
+                "pages": [
+                  "docs/sglang-diffusion/caching-acceleration",
+                  "docs/sglang-diffusion/cache-dit",
+                  "docs/sglang-diffusion/tea-cache"
+                ]
+              },
+              {
+                "group": "References",
+                "pages": [
+                  "docs/sglang-diffusion/environment-variables",
+                  "docs/sglang-diffusion/supported-models"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": []
+    }
+  },
+  "logo": {
+    "light": "/logo/logo.png",
+    "dark": "/logo/logo.png"
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/sgl-project/sglang",
+      "x": "https://x.com/lmsysorg",
+      "linkedin": "https://www.linkedin.com/company/sgl-project/posts?feedView=all",
+      "slack": "https://slack.sglang.io/",
+      "discord": "https://discord.gg/4ugb2t6YY2"
+    }
+  }
+}

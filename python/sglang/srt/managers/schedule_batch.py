@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -95,8 +96,8 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
+    from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -989,9 +990,12 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            radix_key = tree_cache.make_radix_key(token_ids, self.extra_key)
             match_result = tree_cache.match_prefix(
-                MatchPrefixParams(key=radix_key, req=self, cow_mamba=cow_mamba)
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                    req=self,
+                    cow_mamba=cow_mamba,
+                )
             )
             (
                 self.prefix_indices,
@@ -2147,8 +2151,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
-        if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
-            self.nsa_cp_metadata = None
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path

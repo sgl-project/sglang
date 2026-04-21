@@ -547,10 +547,11 @@ class TestRadixCache(unittest.TestCase):
                 cache = RadixCache.create_simulated(page_size=page_size)
 
                 tokens = list(range(sequence_length))
+                key = RadixKey(tokens)
                 cache.insert(
                     InsertParams(
-                        key=RadixKey(tokens),
-                        value=torch.tensor(tokens, dtype=torch.int64),
+                        key=key,
+                        value=torch.tensor(tokens, dtype=torch.int64)[: len(key)],
                     )
                 )
 

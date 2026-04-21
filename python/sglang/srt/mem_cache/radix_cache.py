@@ -28,7 +28,7 @@ import sys
 import time
 from collections import defaultdict
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -98,13 +98,15 @@ class RadixKey:
             for i in range(len(t) - 1):
                 yield (t[i], t[i + 1])
         else:
-            return iter(self.token_ids)
+            yield from self.token_ids
 
     def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
         # Normalize int -> 1-element slice so the rest handles one shape.
         if isinstance(idx, int):
             if idx < 0:
                 idx += len(self)
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f"RadixKey index out of range: {idx}")
             idx = slice(idx, idx + 1)
         start, stop, step = idx.indices(len(self))
         if step != 1:
@@ -126,6 +128,19 @@ class RadixKey:
             return self
         aligned_len = len(self) // page_size * page_size
         return self[:aligned_len]
+
+    def maybe_to_bigram_view(
+        self,
+        is_eagle: bool,
+        value: Optional[torch.Tensor] = None,
+    ) -> Tuple["RadixKey", Optional[torch.Tensor]]:
+        # O(1): flip the bigram flag instead of materializing a tuple list.
+        # value is paired with raw tokens and gets truncated to the bigram count.
+        if is_eagle and not self.is_bigram:
+            self.is_bigram = True
+            if value is not None:
+                value = value[: len(self)]
+        return self, value
 
     def _check_compatible(self, other: "RadixKey") -> None:
         if self.extra_key != other.extra_key:
@@ -259,6 +274,7 @@ class TreeNode:
 def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
     """Compute SHA256-based hash values for position-aware identification."""
     hash_values = []
+
     parent_hash = None
     if node.parent is not None and node.parent.hash_value is not None:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
@@ -417,6 +433,7 @@ class RadixCache(BasePrefixCache):
                 subsequent match efficiency and does not duplicate data.
         """
         key = params.key
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
 
         def empty_match_result():
             return MatchResult(
@@ -432,9 +449,7 @@ class RadixCache(BasePrefixCache):
         if self.disable or len(key) == 0:
             return empty_match_result()
 
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
+        key = key.page_aligned(self.page_size)
 
         if len(key) == 0:
             return empty_match_result()
@@ -459,7 +474,11 @@ class RadixCache(BasePrefixCache):
         priority = params.priority
         chunked = params.chunked
 
-        if value is None:
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+        else:
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
@@ -485,7 +504,9 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        radix_key = self.make_radix_key(token_ids, req.extra_key)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
@@ -521,7 +542,9 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        radix_key = self.make_radix_key(token_ids, req.extra_key)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool

@@ -1,0 +1,2775 @@
+---
+title: "SGLang Model Gateway"
+metatags:
+    description: "SGLang Model Gateway: load balancing, PD disaggregation, multi-model routing, gRPC support, MCP integration, Kubernetes service discovery."
+---
+SGLang Model Gateway is a high-performance model-routing gateway for large-scale LLM deployments. It centralizes worker lifecycle management, balances traffic across heterogeneous protocols (HTTP, gRPC, OpenAI-compatible), and provides enterprise-ready control over history storage, MCP tooling, and privacy-sensitive workflows. The gateway is deeply optimized for the SGLang serving runtime, but can route to any OpenAI-compatible backend.
+
+***
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+   - [Control Plane](#control-plane)
+   - [Data Plane](#data-plane)
+   - [Storage and Privacy](#storage-and-privacy)
+3. [Installation](#installation)
+4. [Quick Start](#quick-start)
+5. [Deployment Modes](#deployment-modes)
+   - [Co-launch Router and Workers](#co-launch-router-and-workers)
+   - [Separate Launch (HTTP)](#separate-launch-http)
+   - [gRPC Launch](#grpc-launch)
+   - [Prefill-Decode Disaggregation](#prefill-decode-disaggregation)
+   - [OpenAI Backend Proxy](#openai-backend-proxy)
+   - [Multi-Model Inference Gateway](#multi-model-inference-gateway)
+6. [API Reference](#api-reference)
+   - [Inference Endpoints](#inference-endpoints)
+   - [Tokenization Endpoints](#tokenization-endpoints)
+   - [Parser Endpoints](#parser-endpoints)
+   - [Classification API](#classification-api)
+   - [Conversation and Response APIs](#conversation-and-response-apis)
+   - [Worker Management APIs](#worker-management-apis)
+   - [Admin and Health Endpoints](#admin-and-health-endpoints)
+7. [Load Balancing Policies](#load-balancing-policies)
+8. [Reliability and Flow Control](#reliability-and-flow-control)
+   - [Retries](#retries)
+   - [Circuit Breaker](#circuit-breaker)
+   - [Rate Limiting and Queuing](#rate-limiting-and-queuing)
+   - [Health Checks](#health-checks)
+9. [Reasoning Parser Integration](#reasoning-parser-integration)
+10. [Tool Call Parsing](#tool-call-parsing)
+11. [Tokenizer Management](#tokenizer-management)
+12. [MCP Integration](#mcp-integration)
+13. [Service Discovery (Kubernetes)](#service-discovery-kubernetes)
+14. [History and Data Connectors](#history-and-data-connectors)
+15. [WASM Middleware](#wasm-middleware)
+16. [Language Bindings](#language-bindings)
+17. [Security and Authentication](#security-and-authentication)
+    - [TLS (HTTPS) for Gateway Server](#tls-https-for-gateway-server)
+    - [mTLS for Worker Communication](#mtls-for-worker-communication)
+18. [Observability](#observability)
+    - [Prometheus Metrics](#prometheus-metrics)
+    - [OpenTelemetry Tracing](#opentelemetry-tracing)
+    - [Logging](#logging)
+19. [Production Recommendations](#production-recommendations)
+    - [Security Best Practices](#security-best-practices)
+    - [High Availability](#high-availability)
+    - [Performance](#performance)
+    - [Kubernetes Deployment](#kubernetes-deployment)
+    - [Monitoring with PromQL](#monitoring-with-promql)
+20. [Configuration Reference](#configuration-reference)
+21. [Troubleshooting](#troubleshooting)
+
+***
+## Overview
+
+- **Unified control plane** for registering, monitoring, and orchestrating regular, prefill, and decode workers across heterogeneous model fleets.
+- **Multi-protocol data plane** that routes traffic across HTTP, PD (prefill/decode), gRPC, and OpenAI-compatible backends with shared reliability primitives.
+- **Industry-first gRPC pipeline** with native Rust tokenization, reasoning parsers, and tool-call execution for high-throughput, OpenAI-compatible serving; supports both single-stage and PD topologies.
+- **Inference Gateway Mode (`--enable-igw`)** dynamically instantiates multiple router stacks (HTTP regular/PD, gRPC) and applies per-model policies for multi-tenant deployments.
+- **Conversation & responses connectors** centralize chat history inside the router so the same context can be reused across models and MCP loops without leaking data to upstream vendors (memory, none, Oracle ATP, PostgreSQL).
+- **Enterprise privacy**: agentic multi-turn `/v1/responses`, native MCP client (STDIO/HTTP/SSE/Streamable), and history storage all operate within the router boundary.
+- **Reliability core**: retries with jitter, worker-scoped circuit breakers, token-bucket rate limiting with queuing, background health checks, and cache-aware load monitoring.
+- **Comprehensive observability**: 40+ Prometheus metrics, OpenTelemetry distributed tracing, structured logging, and request ID propagation.
+
+***
+## Architecture
+
+### Control Plane
+
+- **Worker Manager** discovers capabilities (`/get_server_info`, `/get_model_info`), tracks load, and registers/removes workers in the shared registry.
+- **Job Queue** serializes add/remove requests and exposes status (`/workers/{worker_id}`) so clients can track onboarding progress.
+- **Load Monitor** feeds cache-aware and power-of-two policies with live worker load statistics.
+- **Health Checker** continuously probes workers and updates readiness, circuit breaker state, and router metrics.
+- **Tokenizer Registry** manages dynamically registered tokenizers with async loading from HuggingFace or local paths.
+
+### Data Plane
+
+- **HTTP routers** (regular & PD) implement `/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/v1/classify`, `/v1/tokenize`, `/v1/detokenize`, and associated admin endpoints.
+- **gRPC router** streams tokenized requests directly to SRT gRPC workers, running fully in Rust—tokenizer, reasoning parser, and tool parser all reside in-process. Supports both single-stage and PD routing, including embeddings and classification.
+- **OpenAI router** proxies OpenAI-compatible endpoints to external vendors (OpenAI, xAI, etc.) while keeping chat history and multi-turn orchestration local.
+
+### Storage and Privacy
+
+- Conversation and response history is stored at the router tier (memory, none, Oracle ATP, or PostgreSQL). The same history can power multiple models or MCP loops without sending data to upstream vendors.
+- `/v1/responses` agentic flows, MCP sessions, and conversation APIs share the same storage layer, enabling compliance for regulated workloads.
+
+***
+## Installation
+
+### Docker
+
+Pre-built Docker images are available on Docker Hub with multi-architecture support (x86_64 and ARM64):
+
+```bash Command
+docker pull lmsysorg/sgl-model-gateway:latest
+```
+
+### Prerequisites
+
+- **Rust and Cargo**
+  ```bash Command
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  source "$HOME/.cargo/env"
+  rustc --version
+  cargo --version
+  ```
+- **Python** with `pip` and virtualenv tooling available.
+
+### Rust Binary
+
+```bash Command
+cd sgl-model-gateway
+cargo build --release
+```
+
+### Python Package
+
+```bash Command
+pip install maturin
+
+# Fast development mode
+cd sgl-model-gateway/bindings/python
+maturin develop
+
+# Production build
+maturin build --release --out dist --features vendored-openssl
+pip install --force-reinstall dist/*.whl
+```
+
+***
+## Quick Start
+
+### Regular HTTP Routing
+
+```bash Command
+# Rust binary
+./target/release/sgl-model-gateway \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware
+
+# Python launcher
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 http://worker2:8000 \
+  --policy cache_aware
+```
+
+### gRPC Routing
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls grpc://127.0.0.1:20000 \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --reasoning-parser deepseek-r1 \
+  --tool-call-parser json \
+  --host 0.0.0.0 --port 8080
+```
+
+***
+## Deployment Modes
+
+### Co-launch Router and Workers
+
+Launch the router and a fleet of SGLang workers in one process:
+
+```bash Command
+python -m sglang_router.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --dp-size 4 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+Comprehensive example with router arguments (prefixed with `--router-`):
+
+```bash Command
+python -m sglang_router.launch_server \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --tp-size 1 \
+  --dp-size 8 \
+  --grpc-mode \
+  --log-level debug \
+  --router-prometheus-port 10001 \
+  --router-tool-call-parser llama \
+  --router-model-path meta-llama/Llama-3.1-8B-Instruct \
+  --router-policy round_robin \
+  --router-log-level debug
+```
+
+### Separate Launch (HTTP)
+
+Run workers independently and point the router at their HTTP endpoints:
+
+```bash Command
+# Worker nodes
+python -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8000
+python -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --port 8001
+
+# Router node
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 http://worker2:8001 \
+  --policy cache_aware \
+  --host 0.0.0.0 --port 30000
+```
+
+### gRPC Launch
+
+Use SRT gRPC workers to unlock the highest throughput and access native reasoning/tool pipelines:
+
+```bash Command
+# Workers expose gRPC endpoints
+python -m sglang.launch_server \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --grpc-mode \
+  --port 20000
+
+# Router
+python -m sglang_router.launch_router \
+  --worker-urls grpc://127.0.0.1:20000 \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --reasoning-parser deepseek-r1 \
+  --tool-call-parser json \
+  --host 0.0.0.0 --port 8080
+```
+
+The gRPC router supports both regular HTTP-equivalent serving and PD (prefill/decode) serving. Provide `--tokenizer-path` or `--model-path` (HuggingFace ID or local directory) whenever connection mode resolves to gRPC.
+
+### Prefill-Decode Disaggregation
+
+Split prefill and decode workers for PD-aware caching and balancing:
+
+```bash Command
+python -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://prefill1:30001 9001 \
+  --decode http://decode1:30011 \
+  --prefill-policy cache_aware \
+  --decode-policy power_of_two
+```
+
+Prefill entries accept an optional bootstrap port. PD mode merges prefill metadata with decode outputs and streams results back to the client.
+
+### OpenAI Backend Proxy
+
+Proxy OpenAI-compatible endpoints while keeping history and MCP sessions local:
+
+```bash Command
+python -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend memory
+```
+
+OpenAI backend mode expects exactly one `--worker-urls` entry per router instance.
+
+### Multi-Model Inference Gateway
+
+Enable IGW mode to route multiple models through a single router:
+
+```bash Command
+./target/release/sgl-model-gateway \
+  --enable-igw \
+  --policy cache_aware \
+  --max-concurrent-requests 512
+
+# Register workers dynamically
+curl -X POST http://localhost:30000/workers \
+  -H "Content-Type: application/json" \
+  -d '{
+        "url": "http://worker-a:8000",
+        "model_id": "mistral",
+        "priority": 10,
+        "labels": {"tier": "gold"}
+      }'
+```
+
+***
+## API Reference
+
+### Inference Endpoints
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Method</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Path</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/generate`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang generate API</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/chat/completions`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>OpenAI-compatible chat completions (streaming/tool calls)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/completions`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>OpenAI-compatible text completions</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/embeddings`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Embedding generation (HTTP and gRPC)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/rerank`, `/rerank`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Reranking requests</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/classify`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Text classification</td>
+    </tr>
+  </tbody>
+</table>
+
+### Tokenization Endpoints
+
+The gateway provides HTTP endpoints for text tokenization with batch support, designed to mirror the SGLang Python tokenization API.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Method</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Path</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/tokenize`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tokenize text to token IDs (single or batch)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/detokenize`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Convert token IDs back to text (single or batch)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/tokenizers`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Register a new tokenizer (async, returns job status)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/tokenizers`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>List all registered tokenizers</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/tokenizers/{id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Get tokenizer info by UUID</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/tokenizers/{id}/status`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Check async tokenizer loading status</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`DELETE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/tokenizers/{id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Remove a tokenizer from the registry</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Tokenize Request
+
+```json Config
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "prompt": "Hello, world!"
+}
+```
+
+#### Batch Tokenize Request
+
+```json Config
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "prompt": ["Hello", "World", "How are you?"]
+}
+```
+
+#### Tokenize Response
+
+```json Config
+{
+  "tokens": [15339, 11, 1917, 0],
+  "count": 4,
+  "char_count": 13
+}
+```
+
+#### Detokenize Request
+
+```json Config
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "tokens": [15339, 11, 1917, 0],
+  "skip_special_tokens": true
+}
+```
+
+#### Detokenize Response
+
+```json Config
+{
+  "text": "Hello, world!"
+}
+```
+
+#### Add Tokenizer (Async)
+
+```bash Command
+curl -X POST http://localhost:30000/v1/tokenizers \
+  -H "Content-Type: application/json" \
+  -d '{"name": "llama3", "source": "meta-llama/Llama-3.1-8B-Instruct"}'
+```
+
+Response:
+```json Config
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "message": "Tokenizer registration queued"
+}
+```
+
+Check status:
+```bash Command
+curl http://localhost:30000/v1/tokenizers/550e8400-e29b-41d4-a716-446655440000/status
+```
+
+### Parser Endpoints
+
+The gateway provides admin endpoints for parsing reasoning content and function calls from LLM outputs.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Method</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Path</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/parse/reasoning`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Separate reasoning (`&lt;think&gt;`) from normal text</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/parse/function_call`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Parse function/tool calls from text</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Separate Reasoning Request
+
+```json Config
+{
+  "text": "&lt;think&gt;Let me analyze this step by step...&lt;/think&gt;The answer is 42.",
+  "parser": "deepseek-r1"
+}
+```
+
+#### Response
+
+```json Config
+{
+  "normal_text": "The answer is 42.",
+  "reasoning_text": "Let me analyze this step by step..."
+}
+```
+
+#### Function Call Parsing
+
+```json Config
+{
+  "text": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"NYC\"}}",
+  "parser": "json"
+}
+```
+
+### Classification API
+
+The `/v1/classify` endpoint provides text classification using sequence classification models (e.g., `Qwen2ForSequenceClassification`, `BertForSequenceClassification`).
+
+#### Request
+
+```bash Command
+curl http://localhost:30000/v1/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jason9693/Qwen2.5-1.5B-apeach",
+    "input": "I love this product!"
+  }'
+```
+
+#### Response
+
+```json Config
+{
+  "id": "classify-a1b2c3d4-5678-90ab-cdef-1234567890ab",
+  "object": "list",
+  "created": 1767034308,
+  "model": "jason9693/Qwen2.5-1.5B-apeach",
+  "data": [
+    {
+      "index": 0,
+      "label": "positive",
+      "probs": [0.12, 0.88],
+      "num_classes": 2
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6,
+    "completion_tokens": 0,
+    "total_tokens": 6
+  }
+}
+```
+
+#### Response Fields
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Field</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`label`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Predicted class label (from model's `id2label` config, or `LABEL_N` fallback)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`probs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Probability distribution over all classes (softmax of logits)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`num_classes`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of classification classes</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Notes
+
+- Classification reuses the embedding backend—the scheduler returns logits which are converted to probabilities via softmax
+- Labels come from the model's HuggingFace config (`id2label` field); models without this mapping use generic labels (`LABEL_0`, `LABEL_1`, etc.)
+- Both HTTP and gRPC routers support classification
+
+### Conversation and Response APIs
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Method</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Path</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/responses`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Create background responses (agentic loops)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/responses/{id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Retrieve stored response</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/responses/{id}/cancel`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Cancel background response</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`DELETE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/responses/{id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Delete response</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/responses/{id}/input_items`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>List response input items</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/conversations`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Create conversation</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/conversations/{id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Get conversation</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/conversations/{id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Update conversation</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`DELETE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/conversations/{id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Delete conversation</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/conversations/{id}/items`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>List conversation items</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/conversations/{id}/items`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Add items to conversation</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/conversations/{id}/items/{item_id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Get conversation item</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`DELETE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/conversations/{id}/items/{item_id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Delete conversation item</td>
+    </tr>
+  </tbody>
+</table>
+
+### Worker Management APIs
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Method</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Path</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/workers`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Queue worker registration (returns 202 Accepted)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/workers`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>List workers with health, load, and policy metadata</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/workers/{worker_id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Inspect specific worker or job queue entry</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`PUT`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/workers/{worker_id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Queue worker update</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`DELETE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/workers/{worker_id}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Queue worker removal</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Add Worker
+
+```bash Command
+curl -X POST http://localhost:30000/workers \
+  -H "Content-Type: application/json" \
+  -d '{"url":"grpc://0.0.0.0:31000","worker_type":"regular"}'
+```
+
+#### List Workers
+
+```bash Command
+curl http://localhost:30000/workers
+```
+
+Response:
+```json Config
+{
+  "workers": [
+    {
+      "id": "2f3a0c3e-3a7b-4c3f-8c70-1b7d4c3a6e1f",
+      "url": "http://0.0.0.0:31378",
+      "model_id": "mistral",
+      "priority": 50,
+      "cost": 1.0,
+      "worker_type": "regular",
+      "is_healthy": true,
+      "load": 0,
+      "connection_mode": "Http"
+    }
+  ],
+  "total": 1,
+  "stats": {
+    "prefill_count": 0,
+    "decode_count": 0,
+    "regular_count": 1
+  }
+}
+```
+
+### Admin and Health Endpoints
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Method</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Path</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/liveness`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Health check (always returns OK)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/readiness`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Readiness check (checks healthy worker availability)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/health`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Alias for liveness</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/health_generate`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Health generate test</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/engine_metrics`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Engine-level metrics from workers</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/v1/models`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>List available models</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/get_model_info`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Get model information</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/get_server_info`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Get server information</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/flush_cache`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Clear all caches</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/get_loads`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Get all worker loads</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`POST`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/wasm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Upload WASM module</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`GET`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/wasm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>List WASM modules</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`DELETE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`/wasm/{module_uuid}`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Remove WASM module</td>
+    </tr>
+  </tbody>
+</table>
+
+***
+## Load Balancing Policies
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Policy</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Usage</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`random`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Uniform random selection</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy random`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`round_robin`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cycles through workers in order</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy round_robin`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`power_of_two`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Samples two workers and picks the lighter one</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy power_of_two`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`cache_aware`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Combines cache locality with load balancing (default)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy cache_aware`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`bucket`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Divides workers into load buckets with dynamic boundaries</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy bucket`</td>
+    </tr>
+  </tbody>
+</table>
+
+### Cache-Aware Policy Tuning
+
+```bash Command
+--cache-threshold 0.5 \
+--balance-abs-threshold 32 \
+--balance-rel-threshold 1.5 \
+--eviction-interval-secs 120 \
+--max-tree-size 67108864
+```
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cache-threshold`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Minimum prefix match ratio for cache hit</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--balance-abs-threshold`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>64</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Absolute load difference before rebalancing</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--balance-rel-threshold`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Relative load ratio before rebalancing</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--eviction-interval-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>120</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Cache eviction cadence in seconds</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-tree-size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>67108864</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum nodes in cache tree</td>
+    </tr>
+  </tbody>
+</table>
+
+***
+## Reliability and Flow Control
+
+### Retries
+
+Configure exponential backoff retries:
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 http://worker2:8001 \
+  --retry-max-retries 5 \
+  --retry-initial-backoff-ms 50 \
+  --retry-max-backoff-ms 30000 \
+  --retry-backoff-multiplier 1.5 \
+  --retry-jitter-factor 0.2
+```
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--retry-max-retries`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum retry attempts</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--retry-initial-backoff-ms`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Initial backoff duration (ms)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--retry-max-backoff-ms`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>5000</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum backoff duration (ms)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--retry-backoff-multiplier`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Exponential backoff multiplier</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--retry-jitter-factor`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Random jitter factor (0.0-1.0)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-retries`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Disable retries entirely</td>
+    </tr>
+  </tbody>
+</table>
+
+**Retryable Status Codes:** 408, 429, 500, 502, 503, 504
+
+### Circuit Breaker
+
+Per-worker circuit breakers prevent cascading failures:
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 http://worker2:8001 \
+  --cb-failure-threshold 5 \
+  --cb-success-threshold 2 \
+  --cb-timeout-duration-secs 30 \
+  --cb-window-duration-secs 60
+```
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cb-failure-threshold`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>5</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Consecutive failures to open circuit</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cb-success-threshold`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Successes to close from half-open</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cb-timeout-duration-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>30</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Time before half-open attempt</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cb-window-duration-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>60</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Failure counting window</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-circuit-breaker`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Disable circuit breaker</td>
+    </tr>
+  </tbody>
+</table>
+
+**Circuit Breaker States:**
+- **Closed**: Normal operation, requests allowed
+- **Open**: Failing, requests rejected immediately
+- **Half-Open**: Testing recovery, limited requests allowed
+
+### Rate Limiting and Queuing
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 http://worker2:8001 \
+  --max-concurrent-requests 256 \
+  --rate-limit-tokens-per-second 512 \
+  --queue-size 128 \
+  --queue-timeout-secs 30
+```
+
+Requests beyond the concurrency limit wait in a FIFO queue. Returns:
+- `429 Too Many Requests` when queue is full
+- `408 Request Timeout` when queue timeout expires
+
+### Health Checks
+
+```bash Command
+--health-check-interval-secs 30 \
+--health-check-timeout-secs 10 \
+--health-success-threshold 2 \
+--health-failure-threshold 3 \
+--health-check-endpoint /health
+```
+
+***
+## Reasoning Parser Integration
+
+The gateway includes built-in reasoning parsers for models that use Chain-of-Thought (CoT) reasoning with explicit thinking blocks.
+
+### Supported Parsers
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parser ID</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Model Family</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Think Tokens</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`deepseek-r1`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-R1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`&lt;think&gt;...&lt;/think&gt;` (initial reasoning)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`qwen3`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen-3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`&lt;think&gt;...&lt;/think&gt;`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`qwen3-thinking`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen-3 Thinking</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`&lt;think&gt;...&lt;/think&gt;` (initial reasoning)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`kimi`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi K2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unicode think tokens</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`glm45`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>GLM-4.5/4.6/4.7</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`&lt;think&gt;...&lt;/think&gt;`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`step3`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Step-3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`&lt;think&gt;...&lt;/think&gt;`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`minimax`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MiniMax</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`&lt;think&gt;...&lt;/think&gt;`</td>
+    </tr>
+  </tbody>
+</table>
+
+### Usage
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls grpc://127.0.0.1:20000 \
+  --model-path deepseek-ai/DeepSeek-R1 \
+  --reasoning-parser deepseek-r1
+```
+
+The gRPC router automatically:
+1. Detects reasoning blocks in streaming output
+2. Separates reasoning content from normal text
+3. Applies incremental streaming parsing with buffer management
+4. Handles partial token detection for correct streaming behavior
+
+***
+## Tool Call Parsing
+
+The gateway supports parsing function/tool calls from LLM outputs in multiple formats.
+
+### Supported Formats
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parser</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Format</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`json`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Standard JSON tool calls</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`python`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pythonic</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Python function call syntax</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`xml`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>XML</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>XML-formatted tool calls</td>
+    </tr>
+  </tbody>
+</table>
+
+### Usage
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls grpc://127.0.0.1:20000 \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --tool-call-parser json
+```
+
+***
+## Tokenizer Management
+
+### Tokenizer Sources
+
+The gateway supports multiple tokenizer backends:
+- **HuggingFace**: Load from HuggingFace Hub by model ID
+- **Local**: Load from local `tokenizer.json` or directory
+- **Tiktoken**: Auto-detect OpenAI GPT models (gpt-4, davinci, etc.)
+
+### Configuration
+
+```bash Command
+# HuggingFace model
+--model-path meta-llama/Llama-3.1-8B-Instruct
+
+# Local tokenizer
+--tokenizer-path /path/to/tokenizer.json
+
+# With chat template override
+--chat-template /path/to/template.jinja
+```
+
+### Tokenizer Caching
+
+Two-level caching for optimal performance:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Cache</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>L0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Exact match</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Whole-string caching for repeated prompts</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>L1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Prefix match</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Prefix boundary matching for incremental prompts</td>
+    </tr>
+  </tbody>
+</table>
+
+```bash Command
+--enable-l0-cache \
+--l0-max-entries 10000 \
+--enable-l1-cache \
+--l1-max-memory 52428800  # 50MB
+```
+
+***
+## MCP Integration
+
+The gateway provides native Model Context Protocol (MCP) client integration for tool execution.
+
+### Supported Transports
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Transport</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>STDIO</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Local process execution</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SSE</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Server-Sent Events (HTTP)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Streamable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bidirectional streaming</td>
+    </tr>
+  </tbody>
+</table>
+
+### Configuration
+
+```bash Command
+python -m sglang_router.launch_router \
+  --mcp-config-path /path/to/mcp-config.yaml \
+  --worker-urls http://worker1:8000
+```
+
+### MCP Configuration File
+
+```yaml Config
+servers:
+  - name: "filesystem"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    protocol: "stdio"
+    required: false
+
+  - name: "github"
+    url: "https://api.github.com/mcp"
+    token: "ghp_xxxxx"
+    protocol: "sse"
+    required: false
+
+  - name: "custom-tools"
+    url: "https://tools.example.com/mcp"
+    protocol: "streamable"
+    required: true
+
+pool:
+  max_connections: 100
+  idle_timeout: 300
+
+proxy:
+  http: "http://proxy.internal:8080"
+  https: "https://proxy.internal:8443"
+  no_proxy: "localhost,127.0.0.1,*.internal"
+
+inventory:
+  enable_refresh: true
+  tool_ttl: 300
+  refresh_interval: 300
+```
+
+***
+## Service Discovery (Kubernetes)
+
+Enable automatic worker discovery via Kubernetes pod selectors:
+
+```bash Command
+python -m sglang_router.launch_router \
+  --service-discovery \
+  --selector app=sglang-worker role=inference \
+  --service-discovery-namespace production \
+  --service-discovery-port 8000
+```
+
+### PD Mode Discovery
+
+```bash Command
+--pd-disaggregation \
+--prefill-selector app=sglang component=prefill \
+--decode-selector app=sglang component=decode \
+--service-discovery
+```
+
+Prefill pods can expose bootstrap ports via the `sglang.ai/bootstrap-port` annotation. RBAC must allow `get`, `list`, and `watch` on pods.
+
+***
+## History and Data Connectors
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Backend</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Usage</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`memory`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>In-memory storage (default)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--history-backend memory`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`none`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No persistence</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--history-backend none`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`oracle`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Oracle Autonomous Database</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--history-backend oracle`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`postgres`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PostgreSQL Database</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--history-backend postgres`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`redis`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Redis</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--history-backend redis`</td>
+    </tr>
+  </tbody>
+</table>
+
+### Oracle Configuration
+
+```bash Command
+# Connection descriptor
+export ATP_DSN="(description=(address=(protocol=tcps)(port=1522)(host=adb.region.oraclecloud.com))(connect_data=(service_name=service_name)))"
+
+# Or TNS alias (requires wallet)
+export ATP_TNS_ALIAS="sglroutertestatp_high"
+export ATP_WALLET_PATH="/path/to/wallet"
+
+# Credentials
+export ATP_USER="admin"
+export ATP_PASSWORD="secret"
+export ATP_POOL_MIN=4
+export ATP_POOL_MAX=32
+
+python -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend oracle
+```
+
+### PostgreSQL Configuration
+
+```bash Command
+export POSTGRES_DB_URL="postgres://user:password@host:5432/dbname"
+
+python -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend postgres
+```
+
+### Redis Configuration
+
+```bash Command
+export REDIS_URL="redis://localhost:6379"
+export REDIS_POOL_MAX=16
+export REDIS_RETENTION_DAYS=30
+
+python -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend redis \
+  --redis-retention-days 30
+```
+
+Use `--redis-retention-days -1` for persistent storage (default is 30 days).
+
+***
+## WASM Middleware
+
+The gateway supports WebAssembly (WASM) middleware modules for custom request/response processing. This enables organization-specific logic for authentication, rate limiting, billing, logging, and more—without modifying or recompiling the gateway.
+
+### Overview
+
+WASM middleware runs in a sandboxed environment with memory isolation, no network/filesystem access, and configurable resource limits.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Attach Point</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>When Executed</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Use Cases</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`OnRequest`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Before forwarding to workers</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Auth, rate limiting, request modification</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`OnResponse`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>After receiving worker response</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Logging, response modification, error handling</td>
+    </tr>
+  </tbody>
+</table>
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Action</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`Continue`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Proceed without modification</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`Reject(status)`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reject request with HTTP status code</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`Modify(...)`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Modify headers, body, or status</td>
+    </tr>
+  </tbody>
+</table>
+
+### Examples
+
+Complete working examples are available in `examples/wasm/`:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Example</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`auth/`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>API key authentication for protected routes</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`rate_limit/`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-client rate limiting (requests/minute)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`logging/`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Request tracking headers and response modification</td>
+    </tr>
+  </tbody>
+</table>
+
+The interface definition is located at `src/wasm/interface`.
+
+### Building Modules
+
+```bash Command
+# Prerequisites
+rustup target add wasm32-wasip2
+cargo install wasm-tools
+
+# Build
+cargo build --target wasm32-wasip2 --release
+
+# Convert to component format
+wasm-tools component new \
+  target/wasm32-wasip2/release/my_middleware.wasm \
+  -o my_middleware.component.wasm
+```
+
+### Deploying Modules
+
+```bash Command
+# Enable WASM support
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --enable-wasm
+
+# Upload module
+curl -X POST http://localhost:30000/wasm \
+  -H "Content-Type: application/json" \
+  -d '{
+    "modules": [{
+      "name": "auth-middleware",
+      "file_path": "/absolute/path/to/auth.component.wasm",
+      "module_type": "Middleware",
+      "attach_points": [{"Middleware": "OnRequest"}]
+    }]
+  }'
+
+# List modules
+curl http://localhost:30000/wasm
+
+# Remove module
+curl -X DELETE http://localhost:30000/wasm/{module_uuid}
+```
+
+### Runtime Configuration
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`max_memory_pages`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1024 (64MB)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum WASM memory</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`max_execution_time_ms`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1000</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Execution timeout</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`max_stack_size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1MB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Stack size limit</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`module_cache_size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>10</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Cached modules per worker</td>
+    </tr>
+  </tbody>
+</table>
+
+**Note:** Rate limiting state is per-worker thread and not shared across gateway replicas. For production, consider implementing rate limiting at a shared layer (e.g., Redis)
+
+***
+## Language Bindings
+
+SGLang Model Gateway provides official language bindings for Python and Go, enabling integration with different technology stacks and organizational requirements.
+
+### Python Bindings
+
+The Python bindings provide a PyO3-based wrapper around the Rust gateway library. This is a straightforward binding that calls the gateway server startup from Python.
+
+#### Installation
+
+```bash Command
+# From PyPI
+pip install sglang-router
+
+# Development build
+cd sgl-model-gateway/bindings/python
+pip install maturin && maturin develop --features vendored-openssl
+```
+
+#### Usage
+
+The Python bindings are used throughout this documentation. See the [Quick Start](#quick-start) and [Deployment Modes](#deployment-modes) sections for detailed examples.
+
+Key components:
+- `RouterArgs` dataclass with 50+ configuration options
+- `Router.from_args()` for programmatic startup
+- CLI commands: `smg launch`, `smg server`, `python -m sglang_router.launch_router`
+
+### Go Bindings
+
+The Go bindings provide a high-performance gRPC client library for organizations with Go-based infrastructure. This is ideal for:
+
+- Integration with internal Go services and tooling
+- High-performance client applications
+- Building custom OpenAI-compatible proxy servers
+
+#### Architecture
+
+```text Output
++-------------------------------------------+
+|           High-Level Go API               |
+|   (client.go - OpenAI-style interface)    |
++-------------------------------------------+
+|              gRPC Layer                   |
++-------------------------------------------+
+|           Rust FFI Layer                  |
+|   (Tokenization, Parsing, Conversion)     |
++-------------------------------------------+
+```
+
+**Key Features:**
+- Native Rust tokenization via FFI (thread-safe, lock-free)
+- Full streaming support with context cancellation
+- Configurable channel buffer sizes for high concurrency
+- Built-in tool call parsing and chat template application
+
+#### Installation
+
+```bash Command
+# Build the FFI library first
+cd sgl-model-gateway/bindings/golang
+make build && make lib
+
+# Then use in your Go project
+go get github.com/sgl-project/sgl-go-sdk
+```
+
+**Requirements:** Go 1.24+, Rust toolchain
+
+#### Examples
+
+Complete working examples are available in `bindings/golang/examples/`:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Example</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`simple/`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Non-streaming chat completion</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`streaming/`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Streaming chat completion with SSE</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`oai_server/`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Full OpenAI-compatible HTTP server</td>
+    </tr>
+  </tbody>
+</table>
+
+```bash Command
+# Run examples
+cd sgl-model-gateway/bindings/golang/examples/simple && ./run.sh
+cd sgl-model-gateway/bindings/golang/examples/streaming && ./run.sh
+cd sgl-model-gateway/bindings/golang/examples/oai_server && ./run.sh
+```
+
+#### Testing
+
+```bash Command
+cd sgl-model-gateway/bindings/golang
+
+# Unit tests
+go test -v ./...
+
+# Integration tests (requires running SGLang server)
+export SGL_GRPC_ENDPOINT=grpc://localhost:20000
+export SGL_TOKENIZER_PATH=/path/to/tokenizer
+go test -tags=integration -v ./...
+```
+
+### Comparison
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Feature</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Python</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Go</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Primary Use**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Gateway server launcher</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>gRPC client library</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**CLI Support**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Full CLI (smg, sglang-router)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Library only</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**K8s Discovery**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Native support</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A (client library)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**PD Mode**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Built-in</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A (client library)</td>
+    </tr>
+  </tbody>
+</table>
+
+**When to Use Python:** Launching and managing the gateway server, service discovery, PD disaggregation.
+
+**When to Use Go:** Building custom client applications, integration with Go microservices, OpenAI-compatible proxy servers
+
+***
+## Security and Authentication
+
+### Router API Key
+
+```bash Command
+python -m sglang_router.launch_router \
+  --api-key "your-router-api-key" \
+  --worker-urls http://worker1:8000
+```
+
+Clients must supply `Authorization: Bearer <key>` for protected endpoints.
+
+### Worker API Keys
+
+```bash Command
+# Add worker with explicit key
+curl -H "Authorization: Bearer router-key" \
+  -X POST http://localhost:8080/workers \
+  -H "Content-Type: application/json" \
+  -d '{"url":"http://worker:8000","api_key":"worker-key"}'
+```
+
+### Security Configurations
+
+1. **No Authentication** (default): Use only in trusted environments
+2. **Router-only Authentication**: Clients authenticate to router
+3. **Worker-only Authentication**: Router open, workers require keys
+4. **Full Authentication**: Both router and workers protected
+
+### TLS (HTTPS) for Gateway Server
+
+Enable TLS to serve the gateway over HTTPS:
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --tls-cert-path /path/to/server.crt \
+  --tls-key-path /path/to/server.key
+```
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tls-cert-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to server certificate (PEM format)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tls-key-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to server private key (PEM format)</td>
+    </tr>
+  </tbody>
+</table>
+
+Both parameters must be provided together. The gateway uses rustls with the ring crypto provider for TLS termination. If TLS is not configured, the gateway falls back to plain HTTP.
+
+### mTLS for Worker Communication
+
+Enable mutual TLS (mTLS) for secure communication with workers in HTTP mode:
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls https://worker1:8443 https://worker2:8443 \
+  --client-cert-path /path/to/client.crt \
+  --client-key-path /path/to/client.key \
+  --ca-cert-path /path/to/ca.crt
+```
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--client-cert-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to client certificate for mTLS (PEM format)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--client-key-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to client private key for mTLS (PEM format)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ca-cert-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to CA certificate for verifying worker TLS (PEM format, repeatable)</td>
+    </tr>
+  </tbody>
+</table>
+
+**Key Points:**
+- Client certificate and key must be provided together
+- Multiple CA certificates can be added with multiple `--ca-cert-path` flags
+- Uses rustls backend when TLS is configured
+- Single HTTP client is created for all workers (assumes single security domain)
+- TCP keepalive (30 seconds) is enabled for long-lived connections
+
+### Full TLS Configuration Example
+
+Gateway HTTPS + Worker mTLS + API Key authentication:
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls https://worker1:8443 https://worker2:8443 \
+  --tls-cert-path /etc/certs/server.crt \
+  --tls-key-path /etc/certs/server.key \
+  --client-cert-path /etc/certs/client.crt \
+  --client-key-path /etc/certs/client.key \
+  --ca-cert-path /etc/certs/ca.crt \
+  --api-key "secure-api-key" \
+  --policy cache_aware
+```
+
+***
+## Observability
+
+### Prometheus Metrics
+
+Enable with `--prometheus-host`/`--prometheus-port` (defaults to `0.0.0.0:29000`).
+
+#### Metric Categories (40+ metrics)
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Layer</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Prefix</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Metrics</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HTTP</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`smg_http_*`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`requests_total`, `request_duration_seconds`, `responses_total`, `connections_active`, `rate_limit_total`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Router</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`smg_router_*`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`requests_total`, `request_duration_seconds`, `request_errors_total`, `stage_duration_seconds`, `upstream_responses_total`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Inference</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`smg_router_*`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`ttft_seconds`, `tpot_seconds`, `tokens_total`, `generation_duration_seconds`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Worker</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`smg_worker_*`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pool_size`, `connections_active`, `requests_active`, `health_checks_total`, `selection_total`, `errors_total`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Circuit Breaker</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`smg_worker_cb_*`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`state`, `transitions_total`, `outcomes_total`, `consecutive_failures`, `consecutive_successes`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Retry</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`smg_worker_*`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`retries_total`, `retries_exhausted_total`, `retry_backoff_seconds`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Discovery</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`smg_discovery_*`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`registrations_total`, `deregistrations_total`, `sync_duration_seconds`, `workers_discovered`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MCP</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`smg_mcp_*`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`tool_calls_total`, `tool_duration_seconds`, `servers_active`, `tool_iterations_total`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Database</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`smg_db_*`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`operations_total`, `operation_duration_seconds`, `connections_active`, `items_stored`</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Key Inference Metrics (gRPC mode)
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Metric</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`smg_router_ttft_seconds`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Histogram</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Time to first token</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`smg_router_tpot_seconds`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Histogram</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Time per output token</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`smg_router_tokens_total`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Counter</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Total tokens (input/output)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`smg_router_generation_duration_seconds`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Histogram</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>End-to-end generation time</td>
+    </tr>
+  </tbody>
+</table>
+
+#### Duration Buckets
+
+1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 15s, 30s, 45s, 60s, 90s, 120s, 180s, 240s
+
+### OpenTelemetry Tracing
+
+Enable distributed tracing with OTLP export:
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --enable-trace \
+  --otlp-traces-endpoint localhost:4317
+```
+
+#### Features
+
+- OTLP/gRPC exporter (default port 4317)
+- W3C Trace Context propagation for HTTP and gRPC
+- Batch span processing (500ms delay, 64 span batch size)
+- Custom filtering to reduce noise
+- Trace context injection into upstream worker requests
+- Service name: `sgl-router`
+
+### Logging
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --log-level debug \
+  --log-dir ./router_logs
+```
+
+Structured tracing with optional file sink. Log levels: `debug`, `info`, `warn`, `error`.
+
+### Request ID Propagation
+
+```bash Command
+--request-id-headers x-request-id x-trace-id x-correlation-id
+```
+
+Responses include `x-request-id` header for correlation.
+
+***
+## Production Recommendations
+
+This section provides guidance for deploying SGLang Model Gateway in production environments.
+
+### Security Best Practices
+
+**Always enable TLS in production:**
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls https://worker1:8443 https://worker2:8443 \
+  --tls-cert-path /etc/certs/server.crt \
+  --tls-key-path /etc/certs/server.key \
+  --client-cert-path /etc/certs/client.crt \
+  --client-key-path /etc/certs/client.key \
+  --ca-cert-path /etc/certs/ca.crt \
+  --api-key "${ROUTER_API_KEY}"
+```
+
+**Security Checklist:**
+- Enable TLS for gateway HTTPS termination
+- Enable mTLS for worker communication when workers are on untrusted networks
+- Set `--api-key` to protect router endpoints
+- Use Kubernetes Secrets or a secrets manager for credentials
+- Rotate certificates and API keys periodically
+- Restrict network access with firewalls or network policies
+
+### High Availability
+
+**Scaling Strategy:**
+
+The gateway supports running multiple replicas behind a load balancer for high availability. However, there are important considerations:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Component</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Shared Across Replicas</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Impact</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Worker Registry</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No (independent)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Each replica discovers workers independently</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Radix Cache Tree</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No (independent)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Cache hits may decrease by 10-20%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Circuit Breaker State</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No (independent)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Each replica tracks failures independently</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Rate Limiting</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No (independent)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Limits apply per-replica, not globally</td>
+    </tr>
+  </tbody>
+</table>
+
+**Recommendations:**
+
+1. **Prefer horizontal scaling over vertical scaling**: Deploy multiple smaller gateway replicas rather than one large instance with excessive CPU and memory. This provides:
+   - Better fault tolerance (single replica failure doesn't take down the gateway)
+   - More predictable resource usage
+   - Easier capacity planning
+
+2. **Use Kubernetes Service Discovery**: Let the gateway automatically discover and manage workers:
+   ```bash Command
+   python -m sglang_router.launch_router \
+     --service-discovery \
+     --selector app=sglang-worker \
+     --service-discovery-namespace production
+   ```
+
+3. **Accept cache efficiency trade-off**: With multiple replicas, the cache-aware routing policy's radix tree is not synchronized across replicas. This means:
+   - Each replica builds its own cache tree
+   - Requests from the same user may hit different replicas
+   - Expected cache hit rate reduction: **10-20%**
+   - This is often acceptable given the HA benefits
+
+4. **Configure session affinity (optional)**: If cache efficiency is critical, configure your load balancer for session affinity based on a consistent hash of the request (e.g., user ID or API key).
+
+**Example HA Architecture:**
+```text Output
+                    +-------------------+
+                    |   Load Balancer   |
+                    |     (L4/L7)       |
+                    +---------+---------+
+                              |
+          +-------------------+-------------------+
+          |                   |                   |
+          v                   v                   v
+    +-----------+       +-----------+       +-----------+
+    |  Gateway  |       |  Gateway  |       |  Gateway  |
+    | Replica 1 |       | Replica 2 |       | Replica 3 |
+    +-----+-----+       +-----+-----+       +-----+-----+
+          |                   |                   |
+          +-------------------+-------------------+
+                              |
+          +-------------------+-------------------+
+          |                   |                   |
+          v                   v                   v
+    +-----------+       +-----------+       +-----------+
+    |  Worker   |       |  Worker   |       |  Worker   |
+    |   Pod 1   |       |   Pod 2   |       |   Pod N   |
+    +-----------+       +-----------+       +-----------+
+```
+
+### Performance
+
+**Use gRPC mode for high throughput:**
+
+gRPC mode provides the highest performance for SGLang workers:
+
+```bash Command
+# Start workers in gRPC mode
+python -m sglang.launch_server \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --grpc-mode \
+  --port 20000
+
+# Configure gateway for gRPC
+python -m sglang_router.launch_router \
+  --worker-urls grpc://worker1:20000 grpc://worker2:20000 \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --policy cache_aware
+```
+
+**Performance Benefits of gRPC:**
+- Native Rust tokenization (no Python overhead)
+- Streaming with lower latency
+- Built-in reasoning parser execution
+- Tool call parsing in the gateway
+- Reduced serialization overhead
+
+**Tuning Recommendations:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Recommendation</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Reason</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`cache_aware`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Best for repeated prompts, ~30% latency reduction</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-concurrent-requests`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2-4x worker count</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Prevent overload while maximizing throughput</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--queue-size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2x max-concurrent</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Buffer for burst traffic</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--request-timeout-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Based on max generation length</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Prevent stuck requests</td>
+    </tr>
+  </tbody>
+</table>
+
+### Kubernetes Deployment
+
+**Pod Labeling for Service Discovery:**
+
+For the gateway to discover workers automatically, label your worker pods consistently:
+
+```yaml Config
+# Worker Deployment (Regular Mode)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang-worker
+  namespace: production
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: sglang-worker
+      component: inference
+  template:
+    metadata:
+      labels:
+        app: sglang-worker
+        component: inference
+        model: llama-3-8b
+    spec:
+      containers:
+      - name: worker
+        image: lmsysorg/sglang:latest
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 20000
+          name: grpc
+```
+
+**Gateway configuration for discovery:**
+```bash Command
+python -m sglang_router.launch_router \
+  --service-discovery \
+  --selector app=sglang-worker component=inference \
+  --service-discovery-namespace production \
+  --service-discovery-port 8000
+```
+
+**PD (Prefill/Decode) Mode Labeling:**
+
+```yaml Config
+# Prefill Worker
+metadata:
+  labels:
+    app: sglang-worker
+    component: prefill
+  annotations:
+    sglang.ai/bootstrap-port: "9001"
+
+# Decode Worker
+metadata:
+  labels:
+    app: sglang-worker
+    component: decode
+```
+
+**Gateway configuration for PD discovery:**
+```bash Command
+python -m sglang_router.launch_router \
+  --service-discovery \
+  --pd-disaggregation \
+  --prefill-selector app=sglang-worker component=prefill \
+  --decode-selector app=sglang-worker component=decode \
+  --service-discovery-namespace production
+```
+
+**RBAC Requirements:**
+
+The gateway needs permissions to watch pods:
+
+```yaml Config
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sglang-gateway
+  namespace: production
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+***
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sglang-gateway
+  namespace: production
+subjects:
+- kind: ServiceAccount
+  name: sglang-gateway
+  namespace: production
+roleRef:
+  kind: Role
+  name: sglang-gateway
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### Monitoring with PromQL
+
+Configure Prometheus to scrape the gateway metrics endpoint (default: `:29000/metrics`).
+
+**Essential Dashboards:**
+
+**1. Request Rate and Latency:**
+```sql Example
+# Request rate by endpoint
+sum(rate(smg_http_requests_total[5m])) by (path, method)
+
+# P50 latency
+histogram_quantile(0.50, sum(rate(smg_http_request_duration_seconds_bucket[5m])) by (le))
+
+# P99 latency
+histogram_quantile(0.99, sum(rate(smg_http_request_duration_seconds_bucket[5m])) by (le))
+
+# Error rate
+sum(rate(smg_http_responses_total{status=~"5.."}[5m])) / sum(rate(smg_http_responses_total[5m]))
+```
+
+**2. Worker Health:**
+```sql Example
+# Healthy workers
+sum(smg_worker_pool_size)
+
+# Active connections per worker
+smg_worker_connections_active
+
+# Worker health check failures
+sum(rate(smg_worker_health_checks_total{result="failure"}[5m])) by (worker_id)
+```
+
+**3. Circuit Breaker Status:**
+```sql Example
+# Circuit breaker states (0=closed, 1=open, 2=half-open)
+smg_worker_cb_state
+
+# Circuit breaker transitions
+sum(rate(smg_worker_cb_transitions_total[5m])) by (worker_id, from_state, to_state)
+
+# Workers with open circuits
+count(smg_worker_cb_state == 1)
+```
+
+**4. Inference Performance (gRPC mode):**
+```sql Example
+# Time to first token (P50)
+histogram_quantile(0.50, sum(rate(smg_router_ttft_seconds_bucket[5m])) by (le, model))
+
+# Time per output token (P99)
+histogram_quantile(0.99, sum(rate(smg_router_tpot_seconds_bucket[5m])) by (le, model))
+
+# Token throughput
+sum(rate(smg_router_tokens_total[5m])) by (model, direction)
+
+# Generation duration P95
+histogram_quantile(0.95, sum(rate(smg_router_generation_duration_seconds_bucket[5m])) by (le))
+```
+
+**5. Rate Limiting and Queuing:**
+```sql Example
+# Rate limit rejections
+sum(rate(smg_http_rate_limit_total{decision="rejected"}[5m]))
+
+# Queue depth (if using concurrency limiting)
+smg_worker_requests_active
+
+# Retry attempts
+sum(rate(smg_worker_retries_total[5m])) by (worker_id)
+
+# Exhausted retries (failures after all retries)
+sum(rate(smg_worker_retries_exhausted_total[5m]))
+```
+
+**6. MCP Tool Execution:**
+```sql Example
+# Tool call rate
+sum(rate(smg_mcp_tool_calls_total[5m])) by (server, tool)
+
+# Tool latency P95
+histogram_quantile(0.95, sum(rate(smg_mcp_tool_duration_seconds_bucket[5m])) by (le, tool))
+
+# Active MCP server connections
+smg_mcp_servers_active
+```
+
+**Alerting Rules Example:**
+
+```yaml Config
+groups:
+- name: sglang-gateway
+  rules:
+  - alert: HighErrorRate
+    expr: |
+      sum(rate(smg_http_responses_total{status=~"5.."}[5m]))
+      / sum(rate(smg_http_responses_total[5m])) > 0.05
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "High error rate on SGLang Gateway"
+
+  - alert: CircuitBreakerOpen
+    expr: count(smg_worker_cb_state == 1) > 0
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Worker circuit breaker is open"
+
+  - alert: HighLatency
+    expr: |
+      histogram_quantile(0.99, sum(rate(smg_http_request_duration_seconds_bucket[5m])) by (le)) > 30
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "P99 latency exceeds 30 seconds"
+
+  - alert: NoHealthyWorkers
+    expr: sum(smg_worker_pool_size) == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "No healthy workers available"
+```
+
+***
+## Configuration Reference
+
+### Core Settings
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--host`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>127.0.0.1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Router host</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--port`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>30000</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Router port</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--worker-urls`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>list</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[]</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Worker URLs (HTTP or gRPC)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>cache_aware</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Routing policy</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-concurrent-requests`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>-1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Concurrency limit (-1 disables)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--request-timeout-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>600</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Request timeout</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-payload-size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>256MB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum request payload</td>
+    </tr>
+  </tbody>
+</table>
+
+### Prefill/Decode
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--pd-disaggregation`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>flag</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable PD mode</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>list</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[]</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Prefill URLs + optional bootstrap ports</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--decode`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>list</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[]</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode URLs</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-policy`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>None</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override policy for prefill nodes</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--decode-policy`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>None</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override policy for decode nodes</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--worker-startup-timeout-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>600</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Worker init timeout</td>
+    </tr>
+  </tbody>
+</table>
+
+### Kubernetes Discovery
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--service-discovery`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>flag</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable discovery</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--selector`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>list</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Label selectors (key=value)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-selector` / `--decode-selector`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>list</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>PD mode selectors</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--service-discovery-namespace`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Namespace to watch</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--service-discovery-port`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Worker port (default 80)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--bootstrap-port-annotation`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Annotation for bootstrap ports</td>
+    </tr>
+  </tbody>
+</table>
+
+### TLS Configuration
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tls-cert-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Server certificate for gateway HTTPS (PEM)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--tls-key-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Server private key for gateway HTTPS (PEM)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--client-cert-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Client certificate for worker mTLS (PEM)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--client-key-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Client private key for worker mTLS (PEM)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ca-cert-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>str</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>CA certificate for verifying workers (PEM, repeatable)</td>
+    </tr>
+  </tbody>
+</table>
+
+***
+## Troubleshooting
+
+### Workers Never Ready
+
+Increase `--worker-startup-timeout-secs` or ensure health probes respond before router startup.
+
+### Load Imbalance / Hot Workers
+
+Inspect `smg_router_requests_total` by worker and tune cache-aware thresholds (`--balance-*`, `--cache-threshold`).
+
+### Circuit Breaker Flapping
+
+Increase `--cb-failure-threshold` or extend the timeout/window durations. Consider temporarily disabling retries.
+
+### Queue Overflow (429)
+
+Increase `--queue-size` or reduce client concurrency. Ensure `--max-concurrent-requests` matches downstream capacity.
+
+### Memory Growth
+
+Reduce `--max-tree-size` or lower `--eviction-interval-secs` for more aggressive cache pruning.
+
+### Debugging
+
+```bash Command
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --log-level debug \
+  --log-dir ./router_logs
+```
+
+### gRPC Connection Issues
+
+Ensure workers are started with `--grpc-mode` and verify `--model-path` or `--tokenizer-path` is provided to the router.
+
+### Tokenizer Loading Failures
+
+Check HuggingFace Hub credentials (`HF_TOKEN` environment variable) for private models. Verify local paths are accessible.
+
+***
+SGLang Model Gateway continues to evolve alongside the SGLang runtime. Keep CLI flags, integrations, and documentation aligned when adopting new features or contributing improvements.

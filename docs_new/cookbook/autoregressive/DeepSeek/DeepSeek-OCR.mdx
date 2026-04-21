@@ -1,0 +1,204 @@
+---
+title: DeepSeek-OCR
+metatags:
+    description: "Deploy DeepSeek-OCR with SGLang - high-accuracy text extraction from images and documents for OCR tasks."
+---
+
+## 1. Model Introduction
+
+[DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-OCR) is DeepSeek's advanced OCR (Optical Character Recognition) model designed for high-accuracy text extraction from images. The model is optimized for various document processing and image-to-text conversion tasks.
+
+**Key Features:**
+
+- **Advanced OCR**: High-accuracy text recognition from images and documents
+- **Multi-Modality**: Supports various image formats and document types
+
+**Available Models:**
+
+- **Base Model**: [deepseek-ai/DeepSeek-OCR](https://huggingface.co/deepseek-ai/DeepSeek-OCR) - Recommended for OCR tasks
+
+**License:**
+To use DeepSeek-OCR, you must agree to DeepSeek's Community License. See [LICENSE](https://huggingface.co/deepseek-ai/DeepSeek-OCR/blob/main/LICENSE) for details.
+
+For more details, please refer to the [official DeepSeek-OCR repository](https://github.com/deepseek-ai/DeepSeek-OCR).
+
+## 2. SGLang Installation
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/installation) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and deployment strategy.
+
+import { DeepSeekOCRDeployment } from "/src/snippets/autoregressive/deepseek-ocr-deployment.jsx";
+
+<DeepSeekOCRDeployment />
+
+### 3.2 Configuration Tips
+
+For more detailed configuration tips, please refer to [DeepSeek V3/V3.1/R1 Usage](../../../docs/basic_usage/deepseek_v3).
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: AMD MI300X GPU (1x)
+- Model: DeepSeek-OCR
+- Tensor Parallelism: 1
+- sglang version: 0.5.7
+
+We use SGLang's built-in benchmarking tool to conduct performance evaluation on the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset. This dataset contains real conversation data and can better reflect performance in actual use scenarios. To simulate real-world usage patterns, we configure each request with 1024 input tokens and 1024 output tokens, representing typical medium-length conversations with detailed responses.
+
+#### 5.1.1 Latency-Sensitive Benchmark
+
+- Model Deployment Command:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-OCR \
+  --tp 1 \
+  --dtype float16 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --model deepseek-ai/DeepSeek-OCR \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  4.45
+Total input tokens:                      1972
+Total input text tokens:                 1972
+Total input vision tokens:               0
+Total generated tokens:                  2784
+Total generated tokens (retokenized):    2770
+Request throughput (req/s):              2.25
+Input token throughput (tok/s):          442.89
+Output token throughput (tok/s):         625.26
+Peak output token throughput (tok/s):    635.00
+Peak concurrent requests:                4
+Total token throughput (tok/s):          1068.16
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   443.32
+Median E2E Latency (ms):                 493.29
+---------------Time to First Token----------------
+Mean TTFT (ms):                          21.59
+Median TTFT (ms):                        20.89
+P99 TTFT (ms):                           24.81
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          1.47
+Median TPOT (ms):                        1.52
+P99 TPOT (ms):                           1.53
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           1.52
+Median ITL (ms):                         1.51
+P95 ITL (ms):                            1.76
+P99 ITL (ms):                            1.93
+Max ITL (ms):                            8.28
+==================================================
+```
+
+#### 5.1.2 Throughput-Sensitive Benchmark
+
+- Model Deployment Command:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-OCR \
+  --tp 1 \
+  --ep 1 \
+  --dp 1 \
+  --enable-dp-attention \
+  --dtype float16 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --model deepseek-ai/DeepSeek-OCR \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  16.24
+Total input tokens:                      301698
+Total input text tokens:                 301698
+Total input vision tokens:               0
+Total generated tokens:                  188375
+Total generated tokens (retokenized):    186927
+Request throughput (req/s):              61.59
+Input token throughput (tok/s):          18582.90
+Output token throughput (tok/s):         11602.84
+Peak output token throughput (tok/s):    15479.00
+Peak concurrent requests:                179
+Total token throughput (tok/s):          30185.75
+Concurrency:                             85.53
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1388.60
+Median E2E Latency (ms):                 901.43
+---------------Time to First Token----------------
+Mean TTFT (ms):                          73.36
+Median TTFT (ms):                        50.21
+P99 TTFT (ms):                           349.53
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.42
+Median TPOT (ms):                        7.31
+P99 TPOT (ms):                           27.99
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           7.04
+Median ITL (ms):                         4.62
+P95 ITL (ms):                            21.11
+P99 ITL (ms):                            36.92
+Max ITL (ms):                            172.15
+==================================================
+```

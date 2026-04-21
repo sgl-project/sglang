@@ -8,10 +8,14 @@ import torch
 from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
+    get_attn_tp_group,
+    get_moe_ep_group,
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
+    get_moe_tp_group,
+    get_tp_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_flashinfer_available
@@ -20,7 +24,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 logger = logging.getLogger(__name__)
 
 _flashinfer_comm = None
-_workspace_manager = None
+_TorchDistBackend = None
 _flashinfer_allreduce_unavailable = False
 _posix_transport_override_logged = False
 
@@ -111,6 +115,43 @@ if is_flashinfer_available():
             "implementation"
         )
 
+    try:
+        from flashinfer.comm.mnnvl import TorchDistBackend
+
+        class _FixedTorchDistBackend(TorchDistBackend):
+            """Workaround for FlashInfer TorchDistBackend issues.
+
+            1. bcast fix: TorchDistBackend.bcast passes the in-group rank
+               directly as `src` to broadcast_object_list, which expects a
+               global rank.
+            2. Graph-capture fix: initialize with NCCL device_group (so
+               the backend derives correct device_idx / GPU mapping), but
+               broadcast via GLOO cpu_group (to avoid NCCL collectives
+               that interfere with CUDA graph capture).
+            """
+
+            def __init__(self, device_group, cpu_group):
+                super().__init__(group=device_group)
+                self._cpu_group = cpu_group
+
+            def bcast(self, data, root):
+                import torch.distributed as dist
+
+                group_ranks = dist.get_process_group_ranks(self._cpu_group)
+                global_root = group_ranks[root]
+                object_list = [data]
+                dist.broadcast_object_list(
+                    object_list, src=global_root, group=self._cpu_group
+                )
+                return object_list[0]
+
+        _TorchDistBackend = _FixedTorchDistBackend
+    except ImportError:
+        logger.debug(
+            "flashinfer.comm.mnnvl.TorchDistBackend is not available, "
+            "allreduce fusion will use the default process group"
+        )
+
 
 def is_flashinfer_allreduce_unavailable() -> bool:
     return _flashinfer_allreduce_unavailable
@@ -121,6 +162,7 @@ class FlashInferWorkspaceManager:
         self.workspace = None
         self.world_size = None
         self.rank = None
+        self.group = None
         self.max_token_num = None
         self.hidden_dim = None
         self.dtype = None
@@ -134,6 +176,8 @@ class FlashInferWorkspaceManager:
         hidden_dim: int,
         dtype: torch.dtype,
         use_oneshot: Optional[bool] = None,
+        device_group: Optional["torch.distributed.ProcessGroup"] = None,
+        cpu_group: Optional["torch.distributed.ProcessGroup"] = None,
     ):
         """Initialize workspace"""
         if _flashinfer_comm is None:
@@ -144,15 +188,26 @@ class FlashInferWorkspaceManager:
 
         self.cleanup()
         try:
+            kwargs = dict(
+                backend="trtllm",
+                world_size=world_size,
+                rank=rank,
+                max_token_num=max_token_num,
+                hidden_dim=hidden_dim,
+                dtype=dtype,
+                force_oneshot_support=bool(use_oneshot),
+            )
+            if (
+                _TorchDistBackend is not None
+                and device_group is not None
+                and cpu_group is not None
+            ):
+                kwargs["comm_backend"] = _TorchDistBackend(
+                    device_group=device_group, cpu_group=cpu_group
+                )
             with _flashinfer_posix_fd_transport_override_if_needed():
                 self.workspace = _flashinfer_comm.create_allreduce_fusion_workspace(
-                    backend="trtllm",
-                    world_size=world_size,
-                    rank=rank,
-                    max_token_num=max_token_num,
-                    hidden_dim=hidden_dim,
-                    dtype=dtype,
-                    force_oneshot_support=bool(use_oneshot),
+                    **kwargs
                 )
         except Exception as e:
             global _flashinfer_allreduce_unavailable
@@ -167,6 +222,7 @@ class FlashInferWorkspaceManager:
 
         self.world_size = world_size
         self.rank = rank
+        self.group = (device_group, cpu_group)
         self.max_token_num = max_token_num
         self.hidden_dim = hidden_dim
         self.dtype = dtype
@@ -211,12 +267,51 @@ class FlashInferWorkspaceManager:
                 self.initialized = False
                 self.world_size = None
                 self.rank = None
+                self.group = None
                 self.max_token_num = None
                 self.hidden_dim = None
                 self.dtype = None
 
 
-_workspace_manager = FlashInferWorkspaceManager()
+_attn_tp_workspace_manager = FlashInferWorkspaceManager()
+_moe_tp_workspace_manager = FlashInferWorkspaceManager()
+
+
+def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
+    return (
+        _attn_tp_workspace_manager if use_attn_tp_group else _moe_tp_workspace_manager
+    )
+
+
+def _sync_allreduce_unavailable_across_tp():
+    """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
+
+    If workspace initialization fails on any rank, all ranks must agree to
+    disable fusion. Otherwise ranks diverge during CUDA graph capture: some
+    use FlashInfer fusion (skipping custom allreduce), others fall back to
+    standard allreduce (calling register_buffer collectives), causing a hang
+    in register_graph_buffers.
+    """
+    global _flashinfer_allreduce_unavailable
+    try:
+        import torch.distributed as dist
+
+        tp_group = get_tp_group()
+        if tp_group.world_size <= 1:
+            return
+        flag = torch.tensor(
+            [1 if _flashinfer_allreduce_unavailable else 0],
+            dtype=torch.int32,
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=tp_group.cpu_group)
+        if flag.item() > 0 and not _flashinfer_allreduce_unavailable:
+            _flashinfer_allreduce_unavailable = True
+            logger.warning(
+                "FlashInfer allreduce fusion disabled globally because "
+                "workspace initialization failed on at least one rank."
+            )
+    except Exception as e:
+        logger.debug(f"Failed to sync flashinfer unavailable flag: {e}")
 
 
 def ensure_workspace_initialized(
@@ -234,46 +329,67 @@ def ensure_workspace_initialized(
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
+    tp_coordinator = get_tp_group()
+
     if use_attn_tp_group:
         world_size = get_attn_tensor_model_parallel_world_size()
         rank = get_attn_tensor_model_parallel_rank()
+        coordinator = get_attn_tp_group()
     else:
-        # If MoE expert parallel world size > 1, use expert parallel group
-        # Otherwise, use tensor parallel group
-        # The two values cannot be larger than 1 at the same time
         if get_moe_expert_parallel_world_size() > 1:
             world_size = get_moe_expert_parallel_world_size()
             rank = get_moe_expert_parallel_rank()
+            coordinator = get_moe_ep_group()
         else:
             world_size = get_moe_tensor_parallel_world_size()
             rank = get_moe_tensor_parallel_rank()
+            coordinator = get_moe_tp_group()
+
+    # When the sub-group IS the full TP group, pass None so the workspace
+    # uses the default process group directly (no TorchDistBackend needed).
+    # For true sub-groups, use NCCL device_group for GPU/device mapping and
+    # GLOO cpu_group for metadata broadcasts (avoids NCCL collectives that
+    # interfere with CUDA graph capture).
+    if coordinator.device_group is tp_coordinator.device_group:
+        device_group = None
+        cpu_group = None
+    else:
+        device_group = coordinator.device_group
+        cpu_group = coordinator.cpu_group
 
     if world_size <= 1:
         return False
 
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
     token_num = token_num or max_token_num
+    group_key = (device_group, cpu_group)
 
     if (
-        not _workspace_manager.initialized
-        or _workspace_manager.world_size != world_size
-        or _workspace_manager.rank != rank
-        or not _workspace_manager.is_buffer_size_sufficient(
+        not workspace_manager.initialized
+        or workspace_manager.world_size != world_size
+        or workspace_manager.rank != rank
+        or workspace_manager.group != group_key
+        or not workspace_manager.is_buffer_size_sufficient(
             token_num=token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
             use_oneshot=use_oneshot,
         )
     ):
-        _workspace_manager.initialize(
+        workspace_manager.initialize(
             world_size=world_size,
             rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
             use_oneshot=use_oneshot,
+            device_group=device_group,
+            cpu_group=cpu_group,
         )
 
-    return _workspace_manager.initialized
+        _sync_allreduce_unavailable_across_tp()
+
+    return workspace_manager.initialized
 
 
 def fake_flashinfer_allreduce_residual_rmsnorm(
@@ -368,9 +484,10 @@ def flashinfer_allreduce_residual_rmsnorm(
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
 
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
     _flashinfer_comm.allreduce_fusion(
         input=input_tensor,
-        workspace=_workspace_manager.workspace,
+        workspace=workspace_manager.workspace,
         pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
         launch_with_pdl=True,
         residual_out=residual_out,
@@ -385,7 +502,46 @@ def flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def pre_initialize_workspaces(
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    use_oneshot: Optional[bool] = None,
+):
+    """Pre-initialize flashinfer workspaces before CUDA graph capture.
+
+    This must be called before graph capture to avoid collective operations
+    (broadcasts, barriers) inside the graph capture context, which can
+    deadlock with custom_all_reduce.register_graph_buffers.
+    """
+    if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
+        return
+
+    # Initialize MoE workspace
+    ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=False,
+    )
+
+    # Initialize attention workspace
+    ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=True,
+    )
+
+
 def cleanup_flashinfer_workspace():
-    global _workspace_manager
-    if _workspace_manager is not None:
-        _workspace_manager.cleanup()
+    global _attn_tp_workspace_manager, _moe_tp_workspace_manager
+    if _attn_tp_workspace_manager is not None:
+        _attn_tp_workspace_manager.cleanup()
+    if (
+        _moe_tp_workspace_manager is not None
+        and _moe_tp_workspace_manager is not _attn_tp_workspace_manager
+    ):
+        _moe_tp_workspace_manager.cleanup()
