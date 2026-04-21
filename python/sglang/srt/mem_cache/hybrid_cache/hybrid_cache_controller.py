@@ -296,9 +296,9 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
-        # SWA is currently the only pool whose device alloc must be coupled
-        # with the FULL alloc (to write full_to_swa_index_mapping atomically).
-        # Other pools go through the generic _resolve_pool_transfers_allocation.
+        # SWA needs FULL+SWA device alloc coupled in one call so that
+        # full_to_swa_index_mapping is written atomically. Other pools fall
+        # through to the generic per pool alloc below.
         swa_xfer = None
         if extra_pools:
             for p in extra_pools:

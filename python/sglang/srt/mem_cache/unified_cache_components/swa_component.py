@@ -206,10 +206,9 @@ class SWAComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            # Direct swa_attn_allocator.free(swa_value) would double-free.
-            # free_swa(full_value) uses the mapping guard (filters VOID=0)
-            # to avoid double-free when SWA was never allocated for some
-            # FULL slots (split alloc by alloc_full_with_suffix_swa).
+            # Pass full indices to free_swa so slots with no SWA pair are
+            # skipped. Freeing swa_value directly would double free those
+            # entries since they all map to the same sentinel slot.
             self.cache.token_to_kv_pool_allocator.free_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
@@ -354,10 +353,9 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            # Walk the evicted chain leaf→root, collecting SWA host_values until
-            # the accumulated tokens cover sliding_window_size. By INV-2 SWA
-            # host_value occupies a contiguous suffix of the chain — once we
-            # hit a node with host_value=None, no SWA above remains either.
+            # Walk the evicted chain leaf to root, collecting SWA host_values
+            # until they cover sliding_window_size. SWA host data is always a
+            # contiguous suffix, so the first None ends the walk.
             collected_leaf_first: list[torch.Tensor] = []
             nodes_leaf_first: list = []
             n_swa = 0

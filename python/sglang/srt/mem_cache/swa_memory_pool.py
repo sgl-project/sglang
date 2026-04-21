@@ -103,8 +103,7 @@ class SWAKVPool(KVCache):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
-        # Layer-wise wait happens at this wrapper level; inner pools must not
-        # re-wait, otherwise we'd double-block on the same producer event.
+        # Wait happens at this wrapper. Inner pools must not wait again.
         self.layer_transfer_counter = layer_transfer_counter
         self.full_kv_pool.register_layer_transfer_counter(None)
         self.swa_kv_pool.register_layer_transfer_counter(None)
@@ -508,10 +507,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(full_indices)
             return None
 
-        # Defensive VOID write for the prefix: don't rely on the implicit
-        # "freshly-allocated full idx already maps to 0" invariant maintained
-        # by free_swa, so a future code path that breaks it can't silently
-        # corrupt this allocator.
+        # Prefix slots have no SWA pair. Write 0 into the mapping for them.
+        # free_swa filters out the 0 entries to skip them on free.
         if _is_npu:
             full_idx64 = full_indices.to(torch.int64)
             self.full_to_swa_index_mapping[full_idx64[:-n_swa_suffix]] = 0
