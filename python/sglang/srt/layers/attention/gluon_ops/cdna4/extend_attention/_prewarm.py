@@ -36,10 +36,8 @@ import triton
 
 logger = logging.getLogger(__name__)
 
-from ._bf16_extend_gfx950 import gluon_extend_attn_fwd as _kfn_basic
-from ._bf16_extend_persistent_gfx950 import (
-    gluon_extend_attn_fwd_persistent as _kfn_persistent,
-)
+from ._kernel_bf16_gfx950 import gluon_extend_attn_fwd as _kfn_basic
+from ._kernel_bf16_gfx950 import gluon_extend_attn_fwd as _kfn_persistent
 from ._launch_helpers import _resolve_qk_split_dims
 from .extend_attention_gfx950 import (
     _get_basic_dispatch_config,
@@ -234,6 +232,12 @@ def _warm_basic_variant(
     q, k, v, o = tensors["q"], tensors["k"], tensors["v"], tensors["o"]
     kb, vb = tensors["kb"], tensors["vb"]
 
+    # Unified BF16 kernel: basic-path compile uses IS_PERSISTENT=False and
+    # passes dummy tensors/scalars for the persistent-only runtime args.
+    # DCE drops every access to them, so the compiled AMDGCN matches the
+    # pre-refactor basic variant. Persistent runtime args are passed as
+    # kwargs since the signature interleaves constexprs between the stride
+    # block and the persistent-only runtime block.
     return _kfn_basic.run(
         q,
         k,
@@ -275,6 +279,19 @@ def _warm_basic_variant(
         XAI_TEMPERATURE_LEN=xai_temperature_len,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         v_scale=1.0,
+        num_heads=1,
+        n_m_tiles=1,
+        total_valid_tiles=1,
+        total_programs=1,
+        partial_out=tensors["partial_out"],
+        partial_lse=tensors["partial_lse"],
+        tile_done=tensors["tile_done"],
+        cum_tiles_per_batch=tensors["cum_tiles_per_batch"],
+        actual_batch_size=1,
+        IS_PERSISTENT=False,
+        SPLIT_K=1,
+        MAX_BATCH_LOG2=8,
+        TILE_MAP_MODE=0,
         num_warps=NW,
         num_stages=1,
         waves_per_eu=2,

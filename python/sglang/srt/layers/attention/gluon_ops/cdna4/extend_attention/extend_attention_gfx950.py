@@ -31,7 +31,7 @@ import os
 import torch
 import triton
 
-from ._bf16_extend_gfx950 import (
+from ._kernel_bf16_gfx950 import (
     gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric,
 )
 from ._debug import DEBUG
@@ -61,6 +61,15 @@ _dummy_wkvo_size = 0
 # Singleton passed to the kernel when HAS_SINK=False (HIPLauncher arg list
 # is fixed; the kernel body never loads from it and DCE eliminates the path).
 _dummy_sinks = None
+# Singletons passed to the unified BF16 kernel when IS_PERSISTENT=False.
+# Triton specializes CompiledKernel on pointer element dtype, so they must
+# match the live tensor dtypes on the persistent path (fp32 / int32). The
+# kernel body gates every access on `if IS_PERSISTENT:` so these are never
+# dereferenced in the basic path; allocating 1 element is sufficient.
+_dummy_partial_out = None
+_dummy_partial_lse = None
+_dummy_tile_done = None
+_dummy_cum_tiles = None
 
 _LOGGED_FP8_KV_MODE = False
 logger = logging.getLogger(__name__)
@@ -135,6 +144,7 @@ def _ensure_dummies(device, mi_size, wkvo_size):
     """Lazy-init module-level singleton dummy tensors on first use."""
     global _dummy_cm, _dummy_mi, _dummy_mi_size, _dummy_wkvo, _dummy_wkvo_size
     global _dummy_sinks
+    global _dummy_partial_out, _dummy_partial_lse, _dummy_tile_done, _dummy_cum_tiles
     if _dummy_cm is None:
         _dummy_cm = torch.empty(0, dtype=torch.uint8, device=device)
     if _dummy_mi is None or _dummy_mi_size < mi_size:
@@ -145,6 +155,14 @@ def _ensure_dummies(device, mi_size, wkvo_size):
         _dummy_wkvo_size = wkvo_size
     if _dummy_sinks is None:
         _dummy_sinks = torch.zeros(1, dtype=torch.bfloat16, device=device)
+    if _dummy_partial_out is None:
+        _dummy_partial_out = torch.empty(1, dtype=torch.float32, device=device)
+    if _dummy_partial_lse is None:
+        _dummy_partial_lse = torch.empty(1, dtype=torch.float32, device=device)
+    if _dummy_tile_done is None:
+        _dummy_tile_done = torch.zeros(1, dtype=torch.int32, device=device)
+    if _dummy_cum_tiles is None:
+        _dummy_cum_tiles = torch.zeros(1, dtype=torch.int32, device=device)
 
 
 # User-facing safety rail: route FP8 KV through the BF16 kernels (pays a
@@ -157,12 +175,24 @@ _cached_num_xcds = {}
 
 
 def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
-    """Build a HIPLauncher-direct closure for the BF16 basic kernel.
+    """Build a HIPLauncher-direct closure for the BF16 unified kernel on the
+    basic path (IS_PERSISTENT=False).
 
     Once dispatch has picked a config, all constexprs are fixed; only the
     tensors, sm_scale, 12 stride ints, and grid change per call. Baking the
     constexprs into a closure avoids Triton's JITFunction specialization
     pass on every launch.
+
+    The unified kernel signature carries the persistent-only runtime args
+    (num_heads, n_m_tiles, total_valid_tiles, total_programs, partial_out,
+    partial_lse, tile_done, cum_tiles_per_batch, actual_batch_size) and the
+    persistent-only constexprs (IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2,
+    TILE_MAP_MODE) as a superset over the pre-refactor basic signature.
+    With IS_PERSISTENT=False the scheduling preamble collapses to a single
+    pass and every access to those args is DCE'd away, so we pass integer
+    zeros for the scalars and 1-element module-level dummy tensors for the
+    pointers (Triton specializes on pointer element dtype; dtypes must
+    match the persistent-path fp32 / int32 choice).
 
     Assumes ``knobs.runtime.launch_enter_hook`` / ``launch_exit_hook`` are
     ``None`` at construction time. Callers that later install a profiler
@@ -218,6 +248,12 @@ def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
             sinks, HAS_SINK,
             LOGIT_CAP, XAI_TEMPERATURE_LEN, SLIDING_WINDOW_SIZE,
             v_scale,
+            # Persistent-path runtime args -- DCE'd under IS_PERSISTENT=False.
+            0, 0, 0, 0,  # num_heads, n_m_tiles, total_valid_tiles, total_programs
+            _dummy_partial_out, _dummy_partial_lse, _dummy_tile_done,
+            _dummy_cum_tiles, 0,  # actual_batch_size=0
+            # Persistent-path constexprs.
+            False, 1, 8, 0,  # IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2, TILE_MAP_MODE
         )
 
     return _fast_run
@@ -1223,14 +1259,37 @@ def gluon_extend_attention_fwd(
                 is_causal, sliding_window_size, logit_cap,
                 xai_temperature_len, sinks is not None, _cfg_for_log,
             )
-        _compiled = _kernel_fn.run(
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            _dummy_cm, _dummy_mi[: q_extend.shape[0] + 1], _wkvo,
-            *_frozen_scalars, *_frozen_strides,
-            grid=_frozen_grid, **_frozen_kw,
-        )
+        if _kv_is_fp8:
+            _compiled = _kernel_fn.run(
+                q_extend, k_extend, v_extend, o_extend,
+                k_buffer, v_buffer,
+                qo_indptr, kv_indptr, kv_indices,
+                _dummy_cm, _dummy_mi[: q_extend.shape[0] + 1], _wkvo,
+                *_frozen_scalars, *_frozen_strides,
+                grid=_frozen_grid, **_frozen_kw,
+            )
+        else:
+            # BF16 unified kernel takes the persistent-superset signature.
+            # IS_PERSISTENT=False collapses the outer tile loop to 1 pass and
+            # DCE's every access to the persistent-only runtime args, so we
+            # pass integer zeros for scalar shapes and module-level dummy
+            # tensors for the pointer workspaces. Persistent runtime args are
+            # passed as kwargs because the kernel signature interleaves
+            # constexprs between the stride block and the persistent block.
+            _compiled = _kernel_fn.run(
+                q_extend, k_extend, v_extend, o_extend,
+                k_buffer, v_buffer,
+                qo_indptr, kv_indptr, kv_indices,
+                _dummy_cm, _dummy_mi[: q_extend.shape[0] + 1], _wkvo,
+                *_frozen_scalars, *_frozen_strides,
+                num_heads=0, n_m_tiles=0,
+                total_valid_tiles=0, total_programs=0,
+                partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
+                tile_done=_dummy_tile_done,
+                cum_tiles_per_batch=_dummy_cum_tiles, actual_batch_size=0,
+                IS_PERSISTENT=False, SPLIT_K=1, MAX_BATCH_LOG2=8, TILE_MAP_MODE=0,
+                grid=_frozen_grid, **_frozen_kw,
+            )
 
         # Install the direct-HIPLauncher closure for future calls with
         # matching (config, shape, dtype) — including the indptr/indices
@@ -1510,32 +1569,69 @@ def gluon_extend_attention_fwd(
         "ASYNC_PAD_K": 16, "ASYNC_PAD_V": 16,
     } if _kv_is_fp8 else {}
 
-    _kernel_fn.run(
-        q_extend, k_extend, v_extend, o_extend,
-        k_buffer, v_buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        custom_mask, mask_indptr, window_kv_offsets,
-        sm_scale, kv_group_num,
-        _q_s0, _q_s1, _k_s0, _k_s1, _v_s0, _v_s1,
-        _o_s0, _o_s1, _kb_s0, _kb_s1, _vb_s0, _vb_s1,
-        IS_CAUSAL=is_causal,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
-        NUM_STAGES=NUM_STAGES,
-        **_kernel_extra_full,
-        Sinks=sinks, HAS_SINK=sinks is not None,
-        LOGIT_CAP=logit_cap,
-        XAI_TEMPERATURE_LEN=xai_temperature_len,
-        SLIDING_WINDOW_SIZE=sliding_window_size,
-        v_scale=v_scale,
-        num_warps=num_warps, num_stages=1,
-        waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
-        matrix_instr_nonkdim=32,
-        grid=(batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M)),
-        warmup=False,
-    )
+    if _kv_is_fp8:
+        _kernel_fn.run(
+            q_extend, k_extend, v_extend, o_extend,
+            k_buffer, v_buffer,
+            qo_indptr, kv_indptr, kv_indices,
+            custom_mask, mask_indptr, window_kv_offsets,
+            sm_scale, kv_group_num,
+            _q_s0, _q_s1, _k_s0, _k_s1, _v_s0, _v_s1,
+            _o_s0, _o_s1, _kb_s0, _kb_s1, _vb_s0, _vb_s1,
+            IS_CAUSAL=is_causal,
+            USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+            ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+            BLOCK_DMODEL=BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
+            NUM_STAGES=NUM_STAGES,
+            **_kernel_extra_full,
+            Sinks=sinks, HAS_SINK=sinks is not None,
+            LOGIT_CAP=logit_cap,
+            XAI_TEMPERATURE_LEN=xai_temperature_len,
+            SLIDING_WINDOW_SIZE=sliding_window_size,
+            v_scale=v_scale,
+            num_warps=num_warps, num_stages=1,
+            waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
+            matrix_instr_nonkdim=32,
+            grid=(batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M)),
+            warmup=False,
+        )
+    else:
+        # BF16 unified kernel: persistent-superset signature; IS_PERSISTENT=False
+        # collapses to the basic 3D-grid body. Pass persistent runtime args
+        # as kwargs since the signature interleaves constexprs between the
+        # stride block and the persistent-only runtime block.
+        _kernel_fn.run(
+            q_extend, k_extend, v_extend, o_extend,
+            k_buffer, v_buffer,
+            qo_indptr, kv_indptr, kv_indices,
+            custom_mask, mask_indptr, window_kv_offsets,
+            sm_scale, kv_group_num,
+            _q_s0, _q_s1, _k_s0, _k_s1, _v_s0, _v_s1,
+            _o_s0, _o_s1, _kb_s0, _kb_s1, _vb_s0, _vb_s1,
+            IS_CAUSAL=is_causal,
+            USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+            ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+            BLOCK_DMODEL=BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
+            NUM_STAGES=NUM_STAGES,
+            Sinks=sinks, HAS_SINK=sinks is not None,
+            LOGIT_CAP=logit_cap,
+            XAI_TEMPERATURE_LEN=xai_temperature_len,
+            SLIDING_WINDOW_SIZE=sliding_window_size,
+            v_scale=v_scale,
+            num_heads=0, n_m_tiles=0,
+            total_valid_tiles=0, total_programs=0,
+            partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
+            tile_done=_dummy_tile_done,
+            cum_tiles_per_batch=_dummy_cum_tiles, actual_batch_size=0,
+            IS_PERSISTENT=False, SPLIT_K=1, MAX_BATCH_LOG2=8, TILE_MAP_MODE=0,
+            num_warps=num_warps, num_stages=1,
+            waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
+            matrix_instr_nonkdim=32,
+            grid=(batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M)),
+            warmup=False,
+        )
 
 
 # FP8 persistent / split-K launchers.

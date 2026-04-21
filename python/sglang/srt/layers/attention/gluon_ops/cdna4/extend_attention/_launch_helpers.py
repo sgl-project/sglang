@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Python-side launch helpers for the persistent BF16 attention kernel.
+"""Python-side launch helpers for the unified BF16 attention kernel.
 
 ``_launch_persistent`` and ``_launch_splitk`` both wrap
-``gluon_extend_attn_fwd_persistent`` with tile-scheduling and split-K
-workspace management, and share a single ``_persistent_fast_cache`` of
-direct-HIPLauncher closures.
+``gluon_extend_attn_fwd`` (unified kernel, IS_PERSISTENT=True path) with
+tile-scheduling and split-K workspace management, and share a single
+``_persistent_fast_cache`` of direct-HIPLauncher closures.
 """
 
 import math
@@ -14,9 +14,7 @@ import math
 import torch
 import triton
 
-from ._bf16_extend_persistent_gfx950 import (
-    gluon_extend_attn_fwd_persistent as _bf16_kernel,
-)
+from ._kernel_bf16_gfx950 import gluon_extend_attn_fwd as _bf16_kernel
 from ._debug import DEBUG
 
 

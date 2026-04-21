@@ -1,34 +1,40 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Persistent / Split-K Gluon extend-attention kernel for gfx950 (BF16 path).
+"""Unified Gluon extend-attention kernel for gfx950 (BF16 path).
 
-Symmetric heads only (D64, D128, D256). This file contains the persistent CTA
-scheduling and split-K variants, which require additional runtime arguments for
-tile management and partial-reduction workspaces.
+Symmetric heads only (D64, D128, D256). One @gluon.jit entry folds the
+basic (3D grid, one CTA per (seq, head, m_tile)), persistent-CTA, and
+split-K paths behind three constexpr gates:
 
-The following constexprs are derived internally (same as the basic kernel):
+    IS_PERSISTENT   : False = basic 3D grid, True = CTA tile-sweep loop
+    SPLIT_K         : 1     = no split, >1 = partition prefix KV range + reduce
+    TILE_MAP_MODE   : 0     = cum_tiles binary search, 1 = WCA inline linear scan
+
+When IS_PERSISTENT=False, the scheduling preamble collapses to a 1-iteration
+loop and the split-K + tile-map branches DCE away, leaving a kernel that is
+functionally identical to the pre-refactor basic kernel. When True, the
+same body services persistent / split-K / WCA launches.
+
+The following constexprs are derived internally (not accepted as parameters):
 BLOCK_DPE/ACTUAL_BLOCK_DPE (0), BLOCK_DV/ACTUAL_BLOCK_DV (=BLOCK_DMODEL),
 ENABLE_MASK_SPLIT/SKIP_PREFIX_CUSTOM_MASK (True), ASYNC_PAD_K/V (from BLOCK_DMODEL).
 
-The basic (non-persistent) kernel lives in ``_bf16_extend_gfx950.py``.
+Prefix dispatch uses the "unmasked bulk + masked tail" split across all 3
+paths (dma_simple / pipelined / serial): pipelined runs on the BLOCK_N-aligned
+interior (no per-step tail masking), then a single `prefix_short` call cleans
+up the partial tail when `pfx_seq_len % BLOCK_N != 0`. This avoids the
+tail-masking overhead the naive "call pipelined on everything" pattern pays.
 """
 
 from ._common import *  # noqa: F403
-from ._layouts import (
-    make_mfma_dot_layouts, make_blocked_and_slice_layouts,
-    SERIAL_KT_SMEM, SERIAL_V_SMEM, SERIAL_Q_SMEM, make_serial_kt_blocked,
-    make_padded_smem, make_dll, make_offset_bases,
-    make_kt_offset_bases, make_kt_dll, make_v_offset_bases, make_v_dll,
-)
-
 # ===-----------------------------------------------------------------------===#
-# Persistent / Split-K Kernel
+# Unified BF16 Kernel
 # ===-----------------------------------------------------------------------===#
 
 
 @gluon.jit
-def gluon_extend_attn_fwd_persistent(
+def gluon_extend_attn_fwd(
     Q_Extend,
     K_Extend,
     V_Extend,
@@ -361,11 +367,20 @@ def gluon_extend_attn_fwd_persistent(
 
                 q_dot = gl.convert_layout(q, q_dot_layout)
 
-                # prefix (same as v1)
+                # prefix -- basic path (IS_PERSISTENT=False) splits into
+                # unmasked bulk + masked tail; persistent path keeps the
+                # original "pipelined handles tail internally" pattern to
+                # avoid the +10-15% regression on split-K re-partitioned
+                # prefixes where the last split is naturally unaligned.
                 if pfx_seq_len > 0:
-                    n_prefix_blocks = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
+                    if IS_PERSISTENT:
+                        pfx_full_len = pfx_seq_len
+                        n_full_prefix = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
+                    else:
+                        pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
+                        n_full_prefix = pfx_seq_len // BLOCK_N
                     n_extend_est = (seq_len_extend + BLOCK_N - 1) // BLOCK_N
-                    use_pipe_prefix = n_prefix_blocks >= NUM_STAGES
+                    use_pipe_prefix = n_full_prefix >= NUM_STAGES
                     if LOGIT_CAP > 0:
                         use_pipe_prefix = use_pipe_prefix and (n_extend_est < NUM_STAGES)
                     if use_pipe_prefix:
@@ -380,7 +395,7 @@ def gluon_extend_attn_fwd_persistent(
                             kv_indices,
                             pfx_kv_start,
                             cur_kv_head,
-                            pfx_seq_len,
+                            pfx_full_len,
                             stride_buf_kbs,
                             stride_buf_kh,
                             stride_buf_vbs,
@@ -468,6 +483,56 @@ def gluon_extend_attn_fwd_persistent(
                             mma_layout,
                             mma_offs_n_col,
                             V_PRELOAD=V_PRELOAD,
+                        )
+                    if use_pipe_prefix and pfx_seq_len > pfx_full_len:
+                        acc, l_i, m_i = attn_fwd_inner_prefix_short(
+                            acc,
+                            l_i,
+                            m_i,
+                            q_dot,
+                            qpe_dot,
+                            K_Buffer,
+                            V_Buffer,
+                            kv_indices,
+                            pfx_kv_start,
+                            cur_kv_head,
+                            pfx_seq_len,
+                            stride_buf_kbs,
+                            stride_buf_kh,
+                            stride_buf_vbs,
+                            stride_buf_vh,
+                            kt_smem,
+                            v_smem,
+                            qk_scale,
+                            LOGIT_CAP,
+                            xai_temperature_reg,
+                            XAI_TEMPERATURE_LEN,
+                            pfx_q_abs_pos,
+                            SLIDING_WINDOW_SIZE,
+                            Mask,
+                            pfx_mask_base,
+                            mask_row_stride,
+                            q_extend_offs,
+                            USE_CUSTOM_MASK,
+                            SKIP_PREFIX_CUSTOM_MASK,
+                            ENABLE_PREFIX_UNMASKED,
+                            BLOCK_M,
+                            BLOCK_N,
+                            BLOCK_DMODEL,
+                            ACTUAL_BLOCK_DMODEL,
+                            BLOCK_DPE,
+                            ACTUAL_BLOCK_DPE,
+                            BLOCK_DV,
+                            ACTUAL_BLOCK_DV,
+                            kt_async_layout,
+                            v_async_layout,
+                            kt_dot_layout,
+                            p_dot_layout,
+                            v_dot_layout,
+                            mma_layout,
+                            mma_offs_n_col,
+                            V_PRELOAD=V_PRELOAD,
+                            block_start=n_full_prefix,
                         )
 
                 cdna4_async.wait_group(0)
@@ -966,9 +1031,17 @@ def gluon_extend_attn_fwd_persistent(
 
                 q_dot = gl.convert_layout(q, q_dot_layout)
 
-                # prefix dispatch (same as v1)
-                n_prefix_blocks = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
-                if n_prefix_blocks >= NUM_STAGES:
+                # prefix dispatch -- basic path splits into unmasked bulk
+                # + masked tail; persistent path uses the original straight
+                # pattern (pipelined handles tail masking internally) to
+                # avoid perf regression on split-K unaligned partitions.
+                if IS_PERSISTENT:
+                    pfx_full_len = pfx_seq_len
+                    n_full_prefix = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
+                else:
+                    pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
+                    n_full_prefix = pfx_seq_len // BLOCK_N
+                if n_full_prefix >= NUM_STAGES:
                     if NUM_STAGES >= 3:
                         acc, l_i, m_i = attn_fwd_inner_prefix_pipelined_scalar_mask(
                             acc,
@@ -981,7 +1054,7 @@ def gluon_extend_attn_fwd_persistent(
                             kv_indices,
                             pfx_kv_start,
                             cur_kv_head,
-                            pfx_seq_len,
+                            pfx_full_len,
                             stride_buf_kbs,
                             stride_buf_kh,
                             stride_buf_vbs,
@@ -1033,7 +1106,7 @@ def gluon_extend_attn_fwd_persistent(
                             kv_indices,
                             pfx_kv_start,
                             cur_kv_head,
-                            pfx_seq_len,
+                            pfx_full_len,
                             stride_buf_kbs,
                             stride_buf_kh,
                             stride_buf_vbs,
@@ -1072,6 +1145,56 @@ def gluon_extend_attn_fwd_persistent(
                             mma_layout,
                             mma_offs_n_col,
                             False,
+                        )
+                    if pfx_seq_len > pfx_full_len:
+                        acc, l_i, m_i = attn_fwd_inner_prefix_short(
+                            acc,
+                            l_i,
+                            m_i,
+                            q_dot,
+                            qpe_dot,
+                            K_Buffer,
+                            V_Buffer,
+                            kv_indices,
+                            pfx_kv_start,
+                            cur_kv_head,
+                            pfx_seq_len,
+                            stride_buf_kbs,
+                            stride_buf_kh,
+                            stride_buf_vbs,
+                            stride_buf_vh,
+                            kt_smem,
+                            v_smem,
+                            qk_scale,
+                            LOGIT_CAP,
+                            xai_temperature_reg,
+                            XAI_TEMPERATURE_LEN,
+                            pfx_q_abs_pos,
+                            SLIDING_WINDOW_SIZE,
+                            Mask,
+                            pfx_mask_base,
+                            mask_row_stride,
+                            q_extend_offs,
+                            USE_CUSTOM_MASK,
+                            SKIP_PREFIX_CUSTOM_MASK,
+                            ENABLE_PREFIX_UNMASKED,
+                            BLOCK_M,
+                            BLOCK_N,
+                            BLOCK_DMODEL,
+                            ACTUAL_BLOCK_DMODEL,
+                            BLOCK_DPE,
+                            ACTUAL_BLOCK_DPE,
+                            BLOCK_DV,
+                            ACTUAL_BLOCK_DV,
+                            kt_async_layout,
+                            v_async_layout,
+                            kt_dot_layout,
+                            p_dot_layout,
+                            v_dot_layout,
+                            mma_layout,
+                            mma_offs_n_col,
+                            V_PRELOAD=V_PRELOAD,
+                            block_start=n_full_prefix,
                         )
                 elif pfx_seq_len > 0:
                     acc, l_i, m_i = attn_fwd_inner_prefix_short(
@@ -1397,9 +1520,16 @@ def gluon_extend_attn_fwd_persistent(
 
                 q_dot = gl.convert_layout(q, q_dot_layout)
 
-                # prefix
-                n_prefix_blocks = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
-                if n_prefix_blocks >= NUM_STAGES:
+                # prefix -- basic path splits into unmasked bulk + masked
+                # tail; persistent path uses the straight pattern (see
+                # other sites).
+                if IS_PERSISTENT:
+                    pfx_full_len = pfx_seq_len
+                    n_full_prefix = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
+                else:
+                    pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
+                    n_full_prefix = pfx_seq_len // BLOCK_N
+                if n_full_prefix >= NUM_STAGES:
                     acc, l_i, m_i = attn_fwd_inner_prefix_pipelined(
                         acc,
                         l_i,
@@ -1411,7 +1541,7 @@ def gluon_extend_attn_fwd_persistent(
                         kv_indices,
                         pfx_kv_start,
                         cur_kv_head,
-                        pfx_seq_len,
+                        pfx_full_len,
                         stride_buf_kbs,
                         stride_buf_kh,
                         stride_buf_vbs,
@@ -1499,6 +1629,56 @@ def gluon_extend_attn_fwd_persistent(
                         mma_layout,
                         mma_offs_n_col,
                         V_PRELOAD=V_PRELOAD,
+                    )
+                if n_full_prefix >= NUM_STAGES and pfx_seq_len > pfx_full_len:
+                    acc, l_i, m_i = attn_fwd_inner_prefix_short(
+                        acc,
+                        l_i,
+                        m_i,
+                        q_dot,
+                        qpe_dot,
+                        K_Buffer,
+                        V_Buffer,
+                        kv_indices,
+                        pfx_kv_start,
+                        cur_kv_head,
+                        pfx_seq_len,
+                        stride_buf_kbs,
+                        stride_buf_kh,
+                        stride_buf_vbs,
+                        stride_buf_vh,
+                        kt_smem,
+                        v_smem,
+                        qk_scale,
+                        LOGIT_CAP,
+                        xai_temperature_reg,
+                        XAI_TEMPERATURE_LEN,
+                        pfx_q_abs_pos,
+                        SLIDING_WINDOW_SIZE,
+                        Mask,
+                        pfx_mask_base,
+                        mask_row_stride,
+                        q_extend_offs,
+                        USE_CUSTOM_MASK,
+                        SKIP_PREFIX_CUSTOM_MASK,
+                        ENABLE_PREFIX_UNMASKED,
+                        BLOCK_M,
+                        BLOCK_N,
+                        BLOCK_DMODEL,
+                        ACTUAL_BLOCK_DMODEL,
+                        BLOCK_DPE,
+                        ACTUAL_BLOCK_DPE,
+                        BLOCK_DV,
+                        ACTUAL_BLOCK_DV,
+                        kt_async_layout,
+                        v_async_layout,
+                        kt_dot_layout,
+                        p_dot_layout,
+                        v_dot_layout,
+                        mma_layout,
+                        mma_offs_n_col,
+                        V_PRELOAD=V_PRELOAD,
+                        block_start=n_full_prefix,
                     )
 
                 # EXTEND: per-CTA dispatch (v2 core change)

@@ -8,15 +8,6 @@ Handles D=64, D=128, D=256 where BLOCK_DPE is always 0.
 """
 
 from ._common import *  # noqa: F403
-from ._layouts import (
-    make_mfma_dot_layouts, make_fp8_dot_layouts, make_blocked_and_slice_layouts,
-    SERIAL_KT_SMEM, SERIAL_V_SMEM, SERIAL_Q_SMEM, make_serial_kt_blocked,
-    make_padded_smem, make_dll, make_offset_bases,
-    make_kt_offset_bases, make_kt_dll,
-    make_fp8_bf16_v_offset_bases, make_fp8_bf16_v_dll,
-)
-
-
 # ===-----------------------------------------------------------------------===#
 # FP8 KV basic extend-attention (non-persistent), symmetric head dims
 # ===-----------------------------------------------------------------------===#
