@@ -772,13 +772,15 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     def shutdown(self):
-        """Shutdown the engine"""
+        """Shutdown the engine; block until the scheduler subprocess releases
+        its GPU context so the caller can immediately reallocate on the same
+        device."""
         if (
             self.tokenizer_manager is not None
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
-        kill_process_tree(os.getpid(), include_parent=False)
+        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
         return self
