@@ -7,8 +7,8 @@ import unittest
 from pathlib import Path
 
 import test_deepseek_ocr as deepseek_ocr
-from transformers import AutoTokenizer
 
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -21,9 +21,7 @@ class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
     def setUpClass(cls):
         cls._cleanup_xpu_memory()
         cls.model = "deepseek-ai/DeepSeek-OCR"
-        cls.tokenizer = AutoTokenizer.from_pretrained(
-            cls.model, use_fast=False, trust_remote_code=True
-        )
+        cls.tokenizer = get_tokenizer(cls.model)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.image_path = str(
             (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
