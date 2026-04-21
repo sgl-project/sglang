@@ -1,9 +1,9 @@
 ---
 title: Rerank models
 ---
-
 SGLang offers comprehensive support for rerank models by incorporating optimized serving frameworks with a flexible programming interface. This setup enables efficient processing of cross-encoder reranking tasks, improving the accuracy and relevance of search result ordering. SGLang’s design ensures high throughput and low latency during reranker model deployment, making it ideal for semantic-based result refinement in large-scale retrieval systems.
 
+<Warning>
 Rerank models in SGLang fall into two categories:
 
 - **Cross-encoder rerank models**: run with `--is-embedding` (embedding runner).
@@ -12,15 +12,40 @@ Rerank models in SGLang fall into two categories:
   - Multimodal (e.g. Qwen3-VL-Reranker): also supports image/video content
 
 Some models may require `--trust-remote-code`.
-
+</Warning>
 
 ## Supported rerank models
 
-| Model Family (Rerank)                          | Example HuggingFace Identifier       | Chat Template | Description                                                                                                                      |
-|------------------------------------------------|--------------------------------------|---------------|----------------------------------------------------------------------------------------------------------------------------------|
-| **BGE-Reranker (BgeRerankModel)**              | `BAAI/bge-reranker-v2-m3`            | N/A           | Currently only support `attention-backend` `triton` and `torch_native`. High-performance cross-encoder reranker model from BAAI. Suitable for reranking search results based on semantic relevance.   |
-| **Qwen3-Reranker (decoder-only yes/no)**       | `Qwen/Qwen3-Reranker-8B`             | `examples/chat_template/qwen3_reranker.jinja` | Decoder-only reranker using next-token logprob scoring for labels (yes/no). Launch **without** `--is-embedding`. |
-| **Qwen3-VL-Reranker (multimodal yes/no)**      | `Qwen/Qwen3-VL-Reranker-2B`          | `examples/chat_template/qwen3_vl_reranker.jinja` | Multimodal decoder-only reranker supporting text, images, and videos. Uses yes/no logprob scoring. Launch **without** `--is-embedding`. |
+<table>
+  <thead>
+    <tr>
+      <th>Model Family (Rerank)</th>
+      <th>Example HuggingFace Identifier</th>
+      <th>Chat Template</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>BGE-Reranker (BgeRerankModel)</strong></td>
+      <td><code>BAAI/bge-reranker-v2-m3</code></td>
+      <td>N/A</td>
+      <td>Currently only support <code>attention-backend</code> <code>triton</code> and <code>torch_native</code>. High-performance cross-encoder reranker model from BAAI. Suitable for reranking search results based on semantic relevance.</td>
+    </tr>
+    <tr>
+      <td><strong>Qwen3-Reranker (decoder-only yes/no)</strong></td>
+      <td><code>Qwen/Qwen3-Reranker-8B</code></td>
+      <td><code>examples/chat_template/qwen3_reranker.jinja</code></td>
+      <td>Decoder-only reranker using next-token logprob scoring for labels (yes/no). Launch <strong>without</strong> <code>--is-embedding</code>.</td>
+    </tr>
+    <tr>
+      <td><strong>Qwen3-VL-Reranker (multimodal yes/no)</strong></td>
+      <td><code>Qwen/Qwen3-VL-Reranker-2B</code></td>
+      <td><code>examples/chat_template/qwen3_vl_reranker.jinja</code></td>
+      <td>Multimodal decoder-only reranker supporting text, images, and videos. Uses yes/no logprob scoring. Launch <strong>without</strong> <code>--is-embedding</code>.</td>
+    </tr>
+  </tbody>
+</table>
 
 
 ## Cross-Encoder Rerank (embedding runner)
@@ -88,7 +113,9 @@ python3 -m sglang.launch_server \
   --chat-template examples/chat_template/qwen3_reranker.jinja
 ```
 
+<Note>
 Qwen3-Reranker uses decoder-only logprob scoring (yes/no). Do NOT launch it with `--is-embedding`.
+</Note>
 
 ### Example Client Request (supports optional instruct, top_n, and return_documents)
 
@@ -160,6 +187,7 @@ Example (with `top_n: 2`):
 
 ### Common Pitfalls
 
+- **`--chat-template` is required.** Without `--chat-template examples/chat_template/qwen3_reranker.jinja`, the server does not recognize the model as a decoder-only reranker and returns a 400 error: `"This model does not appear to be an embedding model by default. Please add `--is-embedding`..."`. The fix is to add the chat template flag, NOT `--is-embedding`.
 - If you launch Qwen3-Reranker with `--is-embedding`, `/v1/rerank` cannot compute yes/no logprob scores. Relaunch **without** `--is-embedding`.
 - If you see a validation error like "score should be a valid number" and the backend returned a list, upgrade to a version that coerces `embedding[0]` into `score` for rerank responses.
 
@@ -179,8 +207,9 @@ python3 -m sglang.launch_server \
   --chat-template examples/chat_template/qwen3_vl_reranker.jinja
 ```
 
+<Note>
 Qwen3-VL-Reranker uses decoder-only logprob scoring (yes/no) like Qwen3-Reranker. Do NOT launch it with `--is-embedding`.
-
+</Note>
 
 ### Text-Only Reranking (backward compatible)
 
@@ -295,9 +324,9 @@ for item in results:
 ### Request Parameters (Multimodal)
 
 - `query` (required): Can be a string (text-only) or a list of content parts:
-  - `{"type": "text", "text": "..."}` for text
-  - `{"type": "image_url", "image_url": {"url": "..."}}` for images
-  - `{"type": "video_url", "video_url": {"url": "..."}}` for videos
+  - `&#123;"type": "text", "text": "..."&#125;` for text
+  - `&#123;"type": "image_url", "image_url": &#123;"url": "..."&#125;&#125;` for images
+  - `&#123;"type": "video_url", "video_url": &#123;"url": "..."&#125;&#125;` for videos
 - `documents` (required): List where each document can be a string or list of content parts (same format as query)
 - `instruct` (optional): Instruction text for the reranker
 - `top_n` (optional): Maximum number of documents to return

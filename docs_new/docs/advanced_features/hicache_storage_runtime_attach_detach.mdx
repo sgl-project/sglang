@@ -21,8 +21,8 @@ The control path is:
 
 1. **HTTP Server** (`python/sglang/srt/entrypoints/http_server.py`)
    - Exposes `PUT /hicache/storage-backend`, `DELETE /hicache/storage-backend`, `GET /hicache/storage-backend`
-2. **TokenizerManager** (`python/sglang/srt/managers/tokenizer_communicator_mixin.py`)
-   - Sends the request to the Scheduler via `_Communicator`
+2. **TokenizerManager** (`python/sglang/srt/managers/tokenizer_control_mixin.py`)
+   - Sends the request to the Scheduler via `FanOutCommunicator`
 3. **Scheduler** (`python/sglang/srt/managers/scheduler.py`)
    - Performs a **strict idle check**
    - Calls `tree_cache.attach_storage_backend(...)` / `detach_storage_backend(...)`
@@ -36,11 +36,11 @@ The control path is:
 ***
 ## 2. Idle-state requirement (strict)
 
-The Scheduler uses a stricter `_is_idle_for_hicache_storage_op()`:
+The Scheduler uses `is_fully_idle()` which checks:
 
-- `_is_no_request()` is true (covers running/overlap/pp/disagg and other active states)
-- `waiting_queue` is empty
-- `grammar_queue` is empty (if the grammar backend is enabled)
+- No running batches (including chunked prefill, overlap, pipeline-parallel, and disaggregation paths)
+- No waiting requests in any queue (waiting, grammar, disagg bootstrap/prealloc/transfer/inflight)
+- No DLLM staging requests
 
 If the condition is not met, attach/detach returns an error like:
 

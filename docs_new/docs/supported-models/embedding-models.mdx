@@ -2,17 +2,15 @@
 title: Embedding models
 description: Dense and sparse embedding models with FlashInfer acceleration and SGLang's batching infrastructure.
 ---
-
 SGLang provides robust support for embedding models by integrating efficient serving mechanisms with its flexible programming interface. This integration allows for streamlined handling of embedding tasks, facilitating faster and more accurate retrieval and semantic search operations. SGLang's architecture enables better resource utilization and reduced latency in embedding model deployment.
 
 <Warning>
-  Embedding models must be launched with the `--is-embedding` flag. Some models
-  may also require `--trust-remote-code`.
+Embedding models are executed with `--is-embedding` flag and some may require `--trust-remote-code`
 </Warning>
 
-## Quick start
+## Quick Start
 
-1. **Launch the server**
+### Launch Server
 
 ```bash
 python3 -m sglang.launch_server \
@@ -22,7 +20,7 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 
-2. **Send a client request**
+### Client Request
 
 ```python
 import requests
@@ -39,11 +37,10 @@ response = requests.post(url + "/v1/embeddings", json=payload).json()
 print("Embedding:", response["data"][0]["embedding"])
 ```
 
-## Multimodal embedding example
+
+## Multimodal Embedding Example
 
 For multimodal models like GME that support both text and images:
-
-1. **Launch the server with a multimodal model**
 
 ```bash
 python3 -m sglang.launch_server \
@@ -54,9 +51,7 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 
-2. **Send a multimodal request**
-
-```python
+```python Example
 import requests
 
 url = "http://127.0.0.1:30000"
@@ -67,37 +62,41 @@ image_path = "https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild
 payload = {
     "model": "gme-qwen2-vl",
     "input": [
-        {"text": text_input},
-        {"image": image_path}
+        {
+            "text": text_input
+        },
+        {
+            "image": image_path
+        }
     ],
 }
 
 response = requests.post(url + "/v1/embeddings", json=payload).json()
+
 print("Embeddings:", [x.get("embedding") for x in response.get("data", [])])
 ```
 
-## Matryoshka embedding example
+## Matryoshka Embedding Example
 
-[Matryoshka Embeddings](https://sbert.net/examples/sentence_transformer/training/matryoshka/README.html#matryoshka-embeddings) or [Matryoshka Representation Learning (MRL)](https://arxiv.org/abs/2205.13147) is a technique used in training embedding models. It allows users to trade off between performance and cost.
+[Matryoshka Embeddings](https://sbert.net/examples/sentence_transformer/training/matryoshka/README.html#matryoshka-embeddings) or [Matryoshka Representation Learning (MRL)](https://arxiv.org/abs/2205.13147) is a technique used in training embedding models. It allows user to trade off between performance and cost.
 
-1. **Launch a Matryoshka-capable model**
+### 1. Launch a Matryoshka‑capable model
 
-If the model config already includes `matryoshka_dimensions` or `is_matryoshka` then no override is needed. Otherwise, use `--json-model-override-args` as below:
+If the model config already includes `matryoshka_dimensions` or `is_matryoshka` then no override is needed. Otherwise, you can use `--json-model-override-args` as below:
 
-```bash
+```bash Command
 python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3-Embedding-0.6B \
-  --is-embedding \
-  --host 0.0.0.0 \
-  --port 30000 \
-  --json-model-override-args '{"matryoshka_dimensions": [128, 256, 512, 1024, 1536]}'
+    --model-path Qwen/Qwen3-Embedding-0.6B \
+    --is-embedding \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --json-model-override-args '{"matryoshka_dimensions": [128, 256, 512, 1024, 1536]}'
 ```
 
-<Info>
-  Setting `"is_matryoshka": true` allows truncating to any dimension. Otherwise, the server validates that the specified dimension in the request is one of `matryoshka_dimensions`. Omitting `dimensions` in a request returns the full vector.
-</Info>
+1. Setting `"is_matryoshka": true` allows truncating to any dimension. Otherwise, the server will validate that the specified dimension in the request is one of `matryoshka_dimensions`.
+2. Omitting `dimensions` in a request returns the full vector.
 
-2. **Make requests with different output dimensions**
+### 2. Make requests with different output dimensions
 
 ```python
 import requests
@@ -115,7 +114,8 @@ response = requests.post(url + "/v1/embeddings", json=payload).json()
 print("Embedding:", response["data"][0]["embedding"])
 ```
 
-## Supported models
+
+## Supported Models
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -126,10 +126,10 @@ print("Embedding:", response["data"][0]["embedding"])
   </colgroup>
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Example HF model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model Family</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Example Model</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Chat template</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Notes</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
     </tr>
   </thead>
   <tbody>
@@ -155,7 +155,7 @@ print("Embedding:", response["data"][0]["embedding"])
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>BGE</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`BAAI/bge-large-en-v1.5`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>N/A</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BAAI's text embeddings (requires `--attention-backend triton` or `torch_native`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BAAI's text embeddings (requires <code>attention-backend</code> triton/torch_native)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GME (Multimodal)</td>

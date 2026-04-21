@@ -1,3 +1,8 @@
+---
+title: "GLM-5 examples"
+metatags:
+  description: "Documentation for GLM-5 examples"
+---
 ## Introduction
 
 The GLM (General Language Model) series is an open-source bilingual large language model family jointly developed by the KEG Laboratory of Tsinghua University and Zhipu AI. This series of models has performed outstandingly in the field of Chinese NLP with its unique unified pre-training framework and bilingual capabilities. [GLM-5](https://huggingface.co/zai-org/GLM-5) adopts the DeepSeek-V3/V3.2 architecture, including the sparse attention (DSA) and multi-token prediction (MTP). Ascend supports GLM-5 with 0Day based on the SGLang inference framework, achieving low-code seamless enablement and compatibility with the mainstream distributed parallel capabilities within the current SGLang framework. We welcome developers to download and experience it.
@@ -13,10 +18,9 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 
 ### Installation
 
-The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the quay.io platform. You can directly pull it.
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
 
-<CodeGroup>
-```bash Pull and Start Container
+```bash Command
 #Atlas 800 A3
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann8.5.0-a3-glm5
 #Atlas 800 A2
@@ -31,7 +35,7 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --device=/dev/davinci0:/dev/davinci0  \
---device=/dev/davinci1:/dev/avinci1  \
+--device=/dev/davinci1:/dev/davinci1  \
 --device=/dev/davinci2:/dev/davinci2  \
 --device=/dev/davinci3:/dev/davinci3  \
 --device=/dev/davinci4:/dev/davinci4  \
@@ -51,15 +55,18 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --entrypoint=bash \
 swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
 ```
-</CodeGroup>
 
-Note: Using this image, you need to update transformers to main branch
-<CodeGroup>
-```shell Update Transformers
-# reinstall transformers
-pip install git+https://github.com/huggingface/transformers.git
+### Best Practices
+Note: Using this image for **best practices**, you need to update transformers to version 5.3.0
 ```
-</CodeGroup>
+# reinstall transformers
+
+# Install transformers version 5.3.0 from PyPI
+pip install transformers==5.3.0
+
+# Install from GitHub v5.3.0 tag from GitHub
+pip install git+https://github.com/huggingface/transformers.git@v5.3.0
+```
 
 ## Deployment
 
@@ -69,7 +76,6 @@ pip install git+https://github.com/huggingface/transformers.git
 
 Run the following script to execute online inference.
 
-<CodeGroup>
 ```shell Launch Server
 # high performance cpu
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -113,7 +119,6 @@ python3 -m sglang.launch_server \
         --quantization modelslim \
         --moe-a2a-backend deepep --deepep-mode auto
 ```
-</CodeGroup>
 
 ### Multi-node Deployment
 
@@ -125,7 +130,6 @@ Modify the IP of 2 nodes, then run the same scripts on two nodes.
 
 **node 0/1**
 
-<CodeGroup>
 ```shell Launch Multi-node Server
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
@@ -189,7 +193,6 @@ do
 done
 
 ```
-</CodeGroup>
 
 ### Prefill-Decode Disaggregation
 
