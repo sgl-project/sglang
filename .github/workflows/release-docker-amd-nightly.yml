@@ -1,4 +1,4 @@
-name: Release Docker Images Nightly (AMD)
+name: Release Docker Images Nightly ROCm7.0 (AMD)
 on:
   workflow_dispatch:
   schedule:

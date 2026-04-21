@@ -58,7 +58,7 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_cpu.toml"
               - "test/**/!(*.md)"
-              - "sgl-kernel/**/*.!(md|txt)"
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-xeon.yml"
               - "docker/xeon.Dockerfile"
 
