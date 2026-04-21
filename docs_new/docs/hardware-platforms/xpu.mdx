@@ -2,12 +2,10 @@
 title: XPU
 sidebarTitle: Intel GPUs (XPU)
 ---
-
 The document addresses how to set up the [SGLang](https://github.com/sgl-project/sglang) environment and run LLM inference on Intel GPU, [see more context about Intel GPU support within PyTorch ecosystem](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html).
 
-Specifically, SGLang is optimized for:
-- [Intel® Arc™ Pro B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/242616/intel-arc-pro-b-series-graphics.html)
-- [Intel® Arc™ B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/240391/intel-arc-b-series-graphics.html).
+Specifically, SGLang is optimized for [Intel® Arc™ Pro B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/242616/intel-arc-pro-b-series-graphics.html) and [
+Intel® Arc™ B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/240391/intel-arc-b-series-graphics.html).
 
 ## Optimized Model List
 
@@ -40,72 +38,45 @@ A list of LLMs have been optimized on Intel GPU, and more are on the way:
   </tbody>
 </table>
 
-<Note>The model identifiers listed in the table above have been verified on [Intel® Arc™ B580 Graphics](https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html).</Note>
+**Note:** The model identifiers listed in the table above
+have been verified on [Intel® Arc™ B580 Graphics](https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html).
 
 ## Installation
 
-<Tabs>
+### Install From Source
 
-    <Tab title="Source">
+Currently SGLang XPU only supports installation from source. Please refer to ["Getting Started on Intel GPU"](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html) to install XPU dependency.
 
-        Currently SGLang XPU only supports installation from source. Please refer to [“Getting Started on Intel GPU”](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html) to install XPU dependency.
+```bash Command
+# Create and activate a conda environment
+conda create -n sgl-xpu python=3.12 -y
+conda activate sgl-xpu
 
-        1. **Creation & Activation**
+# Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
+pip3 install torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
+pip3 install xgrammar --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
 
-        Create and activate a conda environment.
+# Clone the SGLang code
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git checkout <YOUR-DESIRED-VERSION>
 
-        ```bash
-        conda create -n sgl-xpu python=3.12 -y
-        conda activate sgl-xpu
-        ```
+# Use dedicated toml file
+cd python
+cp pyproject_xpu.toml pyproject.toml
+# Install SGLang dependent libs, and build SGLang main package
+pip install --upgrade pip setuptools
+pip install -v . --extra-index-url https://download.pytorch.org/whl/xpu
+```
 
-        2. **Install PyTorch and Dependencies**
+### Install Using Docker
 
-        Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
+The docker for XPU is under active development. Please stay tuned.
 
-        ```bash
-        pip3 install torch==2.9.0+xpu torchao torchvision torchaudio pytorch-triton-xpu==3.5.0 --index-url https://download.pytorch.org/whl/xpu
-        pip3 install xgrammar --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
-        ```
-
-        3. **Cloning**
-
-        Clone the SGLang code
-
-        ```bash
-        git clone https://github.com/sgl-project/sglang.git
-        cd sglang
-        git checkout <YOUR-DESIRED-VERSION>
-        ```
-
-        4. **Configure Build File**
-
-        Use dedicated toml file
-
-        ```bash
-        cd python
-        cp pyproject_xpu.toml pyproject.toml
-        ```
-
-        5. **Build and Install**
-
-        Install SGLang dependent libs, and build SGLang main package
-
-        ```bash
-        pip install --upgrade pip setuptools
-        pip install -v .
-        ```
-    </Tab>
-
-    <Tab title="Docker">
-        <Info>The docker for XPU is under active development. Please stay tuned.</Info>
-    </Tab>
-</Tabs>
 ## Launch of the Serving Engine
 
 Example command to launch SGLang serving:
 
-<CodeGroup>
 ```bash
 python -m sglang.launch_server       \
     --model <MODEL_ID_OR_PATH>       \
@@ -117,13 +88,12 @@ python -m sglang.launch_server       \
     --attention-backend intel_xpu    \   # using intel optimized XPU attention backend
     --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
 ```
-</CodeGroup>
 
 ## Benchmarking with Requests
 
-You can benchmark the performance via the `bench_serving` script. Run the command in another terminal.
+You can benchmark the performance via the `bench_serving` script.
+Run the command in another terminal.
 
-<CodeGroup>
 ```bash
 python -m sglang.bench_serving   \
     --dataset-name random        \
@@ -133,14 +103,13 @@ python -m sglang.bench_serving   \
     --request-rate inf           \
     --random-range-ratio 1.0
 ```
-</CodeGroup>
 
 The detail explanations of the parameters can be looked up by the command:
 
-<CodeGroup>
 ```bash
 python -m sglang.bench_serving -h
 ```
-</CodeGroup>
 
-Additionally, the requests can be formed with [OpenAI Completions API](../basic_usage/openai_api_completions) and sent via the command line (e.g. using `curl`) or via your own script.
+Additionally, the requests can be formed with
+[OpenAI Completions API](../basic_usage/openai_api_completions)
+and sent via the command line (e.g. using `curl`) or via your own script.
