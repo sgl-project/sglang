@@ -83,6 +83,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 ### Sampling and output
 
 - `--prompt {PROMPT}` and `--negative-prompt {PROMPT}`
+- `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video or image-to-image generation
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`

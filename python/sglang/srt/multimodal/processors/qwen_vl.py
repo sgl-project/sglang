@@ -162,7 +162,7 @@ async def preprocess_video(
     # preprocessed video
     is_video_obj = isinstance(vr, VideoDecoderWrapper)
     if not is_video_obj:
-        return vr
+        return vr, None
     entry_time = time.perf_counter()
 
     total_frames, video_fps = len(vr), vr.avg_fps

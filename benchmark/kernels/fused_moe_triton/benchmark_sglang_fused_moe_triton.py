@@ -12,13 +12,13 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-    fused_moe as fused_moe_sglang,
-)
 from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
     triton_kernel_moe_forward,
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    fused_moe as fused_moe_sglang,
+)
 from sglang.srt.layers.moe.topk import (
     TopK,
     TopKConfig,

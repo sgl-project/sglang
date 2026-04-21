@@ -69,6 +69,13 @@ class ShutdownReq:
     pass
 
 
+@dataclass
+class GetDisaggStatsReq:
+    """Request to get disagg pipeline metrics from the scheduler."""
+
+    pass
+
+
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],
