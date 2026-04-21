@@ -192,26 +192,31 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     head_sha = pr.head.sha
     print(f"Checking workflows for commit: {head_sha}")
 
-    # If PR has sgl-kernel changes, check whether the wheel build already
-    # succeeded for this commit. If so, we can use rerun_failed_jobs and
-    # avoid retriggering all tests (including flaky ones).
-    # Check-runs display name is "Build Wheel (<python>, <cuda>)"; the ARM
-    # variant is a separate build and CUDA tests depend on the non-ARM wheel.
+    # If PR has sgl-kernel changes, check whether ALL wheel builds already
+    # succeeded for this commit (CUDA + ARM + any others). If so, we can
+    # use rerun_failed_jobs and avoid retriggering all tests. If any wheel
+    # build is pending/failed, a dependent job could fail for missing
+    # artifacts, so fall back to full rerun.
+    # Check-runs display names: "Build Wheel (<python>, <cuda>)",
+    # "Build Wheel Arm (<python>, <cuda>)", legacy "sgl-kernel-build-wheels".
     kernel_wheel_built = False
     if sgl_kernel_changes:
         try:
-            kernel_wheel_built = any(
-                cr.conclusion == "success"
-                and (
-                    "sgl-kernel-build-wheels" in cr.name
-                    or (cr.name.startswith("Build Wheel") and "Arm" not in cr.name)
-                )
+            wheel_builds = [
+                cr
                 for cr in gh_repo.get_commit(head_sha).get_check_runs()
+                if cr.name.startswith("Build Wheel")
+                or "sgl-kernel-build-wheels" in cr.name
+            ]
+            kernel_wheel_built = bool(wheel_builds) and all(
+                cr.conclusion == "success" for cr in wheel_builds
             )
             print(
-                "Kernel wheel already built - using rerun_failed_jobs"
+                f"All {len(wheel_builds)} kernel wheel build(s) passed - using rerun_failed_jobs"
                 if kernel_wheel_built
-                else "Kernel wheel not yet built - will use full rerun"
+                else f"Kernel wheel not fully built "
+                f"({sum(1 for c in wheel_builds if c.conclusion == 'success')}"
+                f"/{len(wheel_builds)} success) - will use full rerun"
             )
         except Exception as e:
             print(f"Failed to check kernel wheel status: {e} - falling back to full rerun")
