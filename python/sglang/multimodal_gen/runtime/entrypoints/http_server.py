@@ -162,6 +162,32 @@ async def health_generate():
     return {"status": "ok"}
 
 
+@health_router.get("/stats")
+async def stats_endpoint(request: Request):
+    """Get runtime statistics including disagg pipeline metrics.
+
+    Returns queue depth, request counts, latency, throughput, etc.
+    Sends a GetDisaggStatsReq to the scheduler via ZMQ and returns the result.
+    """
+    from sglang.multimodal_gen.runtime.entrypoints.utils import GetDisaggStatsReq
+
+    server_args: ServerArgs = request.app.state.server_args
+    response: dict = {
+        "status": "ok",
+        "model_path": server_args.model_path,
+    }
+
+    # Query the scheduler for disagg metrics
+    try:
+        stats_response = await async_scheduler_client.forward(GetDisaggStatsReq())
+        if hasattr(stats_response, "output") and stats_response.output is not None:
+            response["disagg"] = stats_response.output
+    except Exception as e:
+        response["disagg"] = {"error": str(e)}
+
+    return response
+
+
 def make_serializable(obj):
     """Recursively converts Tensors to None for JSON serialization."""
     if isinstance(obj, torch.Tensor):
