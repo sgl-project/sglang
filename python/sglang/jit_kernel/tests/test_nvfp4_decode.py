@@ -174,7 +174,7 @@ def run_batch_decode_nvfp4(
         (k_buf, v_buf),
         k_scale=float(global_scale),
         v_scale=float(global_scale),
-        kv_block_scales=(k_sf, v_sf),
+        kv_cache_sf=(k_sf, v_sf),
     )
 
     has_nan = torch.isnan(o).any().item()
@@ -235,7 +235,7 @@ def replay_dump(dump_path, device="cuda"):
         (k_buf, v_buf),
         k_scale=k_scale,   # plain float or None
         v_scale=v_scale,   # plain float or None
-        kv_block_scales=(k_sf_buf, v_sf_buf),
+        kv_cache_sf=(k_sf_buf, v_sf_buf),
     )
 
     nan_count = torch.isnan(o).sum().item()

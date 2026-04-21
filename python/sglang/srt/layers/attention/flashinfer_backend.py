@@ -586,7 +586,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = (
                     not self.enable_deterministic and not is_in_piecewise_cuda_graph()
                 )
-                # Native FP4 prefill always uses the paged path so kv_block_scales
+                # Native FP4 prefill always uses the paged path so kv_cache_sf
                 # can be passed to run(); ragged would need a separate fix path.
                 if self.enable_nvfp4_native_prefill:
                     use_ragged = False
@@ -958,7 +958,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             if self.enable_nvfp4_native_prefill:
                 # Use run() instead of the deprecated forward() so we can pass
-                # kv_block_scales (per-block FP8 scales for two-level NVFP4 dequant).
+                # kv_cache_sf (per-block FP8 scales for two-level NVFP4 dequant).
                 # Replicate the attribute setup that forward() normally does.
                 prefill_wrapper_paged._causal = not layer.is_cross_attention
                 prefill_wrapper_paged._sm_scale = layer.scaling
@@ -983,7 +983,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     kv_cache,
                     k_scale=_k_scale,
                     v_scale=_v_scale,
-                    kv_block_scales=(k_sf, v_sf),
+                    kv_cache_sf=(k_sf, v_sf),
                 )
             else:
                 # We need to process the paged part for nvfp4 kv cache
@@ -1117,7 +1117,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 (k_buf, v_buf),
                 k_scale=_k_scale,
                 v_scale=_v_scale,
-                kv_block_scales=(k_sf_buf, v_sf_buf),
+                kv_cache_sf=(k_sf_buf, v_sf_buf),
             )
 
         else:

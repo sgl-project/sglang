@@ -891,7 +891,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # torch.save(bmm2_scale, f"{prefix}/bmm2_scale.pt")
         # torch.save(layer.sliding_window_size, f"{prefix}/window_left.pt")
         # torch.save(attention_sink, f"{prefix}/sinks.pt")
-        # torch.save(kv_cache_block_scales, f"{prefix}/kv_block_scales.pt")
+        # torch.save(kv_cache_block_scales, f"{prefix}/kv_cache_sf.pt")
         # exit(0)
 
         # FIXME(Sam): Here XQA only support fp16 input for now, we will add bf16 support when flashinfer release.
@@ -1020,7 +1020,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
             # Use paged KV cache for attention
             kv_cache = (k_paged, v_paged)
-            kv_block_scales = None
+            kv_cache_sf = None
             # self.dq_page_table is only used for nvfp4 target model prefill path
             cur_step_page_table = self.dq_page_table
         elif self.is_nvfp4_kvcache and (
@@ -1054,7 +1054,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 v_cache_scales = canonicalize_stride(v_cache_scales)
 
             kv_cache = (k_cache, v_cache)
-            kv_block_scales = (k_cache_scales, v_cache_scales)
+            kv_cache_sf = (k_cache_scales, v_cache_scales)
             cur_step_page_table = self._get_layer_page_table(layer, forward_batch)
         else:
             # bf16/fp8, all paths
@@ -1071,7 +1071,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if layer.tp_v_head_num == 1:
                 v_cache = canonicalize_stride(v_cache)
             kv_cache = (k_cache, v_cache)
-            kv_block_scales = None
+            kv_cache_sf = None
             cur_step_page_table = self._get_layer_page_table(layer, forward_batch)
 
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1111,7 +1111,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
-                kv_cache_sf=kv_block_scales,
+                kv_cache_sf=kv_cache_sf,
                 workspace_buffer=self.workspace_buffer,
                 block_tables=cur_step_page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
