@@ -1212,14 +1212,14 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(),
             hidden_states,
         )
-        if should_use_dp_reduce_scatterv():
+        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+            dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
+        elif should_use_dp_reduce_scatterv():
             get_tp_group().reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
             )
-        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
-            dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
         return hidden_states, residual
