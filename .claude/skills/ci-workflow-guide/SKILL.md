@@ -270,7 +270,7 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | Suite | Partitions | Runner | max_parallel |
 |-------|-----------|--------|-------------|
 | `stage-a-test-1-gpu-small` | 1 (no matrix) | `1-gpu-5090` | — |
-| `stage-a-test-cpu` | 1 (no matrix) | `ubuntu-latest` | — |
+| `stage-a-test-cpu` | 4 | `ubuntu-latest` | — |
 | `stage-b-test-1-gpu-small` | 8 | `1-gpu-5090` | 8 |
 | `stage-b-test-1-gpu-large` | 14 | `1-gpu-h100` | dynamic (3 or 14) |
 | `stage-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
