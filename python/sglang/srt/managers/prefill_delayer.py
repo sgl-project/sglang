@@ -175,49 +175,41 @@ class PrefillDelayer:
                     max_running_requests + self.dp_size - 1
                 ) // self.dp_size
 
-            # Aggregate across ranks; .max() is conservative (w.r.t.
-            # over-delaying) and consistent with the original slot_trigger.
             global_running_batch_max = int(global_running_batch.max().item())
             global_max_prefill_bs_max = int(global_max_prefill_bs.max().item())
             global_waiting_queue_max = int(global_waiting_queue_len.max().item())
 
-            slot_trigger = (
-                max_running_requests - global_running_batch_max
-                < global_max_prefill_bs_max
-            )
-
             # Queue-based trigger: delay prefill until the waiting queue
-            # reaches queue_min = min(running_req * ratio, max_prefill_bs).
-            # Scales with load (no-op when running_req is small) and is capped
-            # by max_prefill_bs (batching larger than one chunked prefill step
-            # gives no extra benefit). Targets workloads where decode trickles
-            # finish one-at-a-time and fragment prefill (e.g. large
-            # random_range_ratio).
-            queue_trigger = False
+            # reaches queue_min = min(running_req * ratio, max_prefill_bs),
+            # capped by a wall-clock timeout to bound worst-case TTFT.
+            # Targets workloads where decode requests finish one-at-a-time
+            # and fragment prefill into many tiny batches.
+            queue_condition = False
             if self._queue_trigger_enabled and global_running_batch_max > 0:
                 queue_min_effective = min(
                     int(global_running_batch_max * self._queue_min_ratio),
                     global_max_prefill_bs_max,
                 )
-                queue_trigger = (
+                queue_condition = (
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
                 )
+                if queue_condition and prev_state is not None:
+                    elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
+                    if elapsed_ms >= self._max_delay_ms:
+                        queue_condition = False
 
-            # Cap cumulative wall-clock time of a single queue-trigger delay
-            # at prefill_delayer_max_delay_ms to bound worst-case TTFT. The
-            # cap applies to queue_trigger only; slot_trigger is a hard
-            # capacity constraint (releasing prefill would over-subscribe
-            # running slots) and must not be overridden by the timeout.
-            queue_trigger_timed_out = False
-            if queue_trigger and prev_state is not None:
-                elapsed_ms = (time.perf_counter() - prev_state.start_time) * 1000.0
-                queue_trigger_timed_out = elapsed_ms >= self._max_delay_ms
+            slot_condition = (
+                max_running_requests - global_running_batch_max
+                < global_max_prefill_bs_max
+            )
 
-            effective_queue_trigger = queue_trigger and not queue_trigger_timed_out
-            if slot_trigger or effective_queue_trigger:
+            if slot_condition or queue_condition:
+                # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
+                # the first merge_batch causes the decoding to fail to reach the maximum batch size.
                 if self.skip_first_delayer:
                     self.skip_first_delayer = False
+                    pass
                 else:
                     next_state = prev_state or _State()
                     next_state = next_state.bump_delayed_count()
