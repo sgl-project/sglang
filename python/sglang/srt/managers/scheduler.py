@@ -2811,9 +2811,7 @@ class Scheduler(
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(
-                            return_logprob=batch.return_logprob,
-                        )
+                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices
 
@@ -2928,9 +2926,7 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu(
-                return_logprob=self.cur_batch.return_logprob,
-            )
+            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
