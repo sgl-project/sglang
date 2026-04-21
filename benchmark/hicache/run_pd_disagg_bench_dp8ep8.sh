@@ -175,6 +175,11 @@ PREFILL_WAIT_TIMEOUT="${PREFILL_WAIT_TIMEOUT:-6000}"
 MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-mori}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 
+# Extra args forwarded verbatim to sglang.launch_server for both roles.  Split
+# on whitespace so flag+value pairs stay together
+# (e.g. EXTRA_SERVER_ARGS="--max-total-tokens 20000").
+read -r -a EXTRA_SERVER_ARGS_ARR <<< "${EXTRA_SERVER_ARGS:-}"
+
 # ---- Sanity: UMBP requires HICACHE ---------------------------
 if bool_is_true "$ENABLE_UMBP" && ! bool_is_true "$ENABLE_HICACHE"; then
     log "WARNING: ENABLE_UMBP=true requires ENABLE_HICACHE=true. Forcing ENABLE_UMBP=false."
@@ -465,8 +470,22 @@ build_umbp_extra_config() {
         [[ -n "$UMBP_PEER_SERVICE_PORT" ]] && \
             dist_fields+=", \"peer_service_port\": \"${UMBP_PEER_SERVICE_PORT}\""
         dist_fields+=", \"cache_remote_fetches\": ${UMBP_CACHE_REMOTE_FETCHES}"
+        # Optional override for master's PageBitmapAllocator page_size.
+        # When set, takes precedence over UMBPStore's auto-probe (Path A).
+        [[ -n "${UMBP_DRAM_PAGE_SIZE:-}" ]] && \
+            dist_fields+=", \"dram_page_size\": ${UMBP_DRAM_PAGE_SIZE}"
     fi
-    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": true, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
+    # Auto-disable SSD when capacity is zero so UMBPConfig::Validate() does
+    # not reject the config (ssd_enabled=true requires ssd_capacity_bytes>0).
+    # Note: mori's dual-scheme DistributedClient does not currently use the
+    # SSD tier at all (only DRAM is registered with the master), so setting
+    # UMBP_SSD_BYTES=0 is the supported way to fully turn SSD off until SSD
+    # support lands in dual-scheme.
+    local ssd_enabled_json="true"
+    if [[ "${UMBP_SSD_BYTES}" -le 0 ]]; then
+        ssd_enabled_json="false"
+    fi
+    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
 }
 
 # ---- Launch server (unified for both roles) -----------------
@@ -545,6 +564,10 @@ launch_pd_server() {
             )
         fi
     fi
+
+    # Append any extra args forwarded from EXTRA_SERVER_ARGS env (safe under
+    # `set -u` even when the array is empty).
+    cmd+=(${EXTRA_SERVER_ARGS_ARR[@]+"${EXTRA_SERVER_ARGS_ARR[@]}"})
 
     "${cmd[@]}"
 }

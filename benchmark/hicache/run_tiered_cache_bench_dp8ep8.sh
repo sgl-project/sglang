@@ -60,6 +60,11 @@ MOE_A2A_BACKEND="${MOE_A2A_BACKEND:-mori}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 DUMMY_FORWARD="${DUMMY_FORWARD:-}"
 
+# Extra args forwarded verbatim to sglang.launch_server for all cases.  Split
+# on whitespace so flag+value pairs stay together (e.g.
+# EXTRA_SERVER_ARGS="--max-total-tokens 20000").
+read -r -a EXTRA_SERVER_ARGS_ARR <<< "${EXTRA_SERVER_ARGS:-}"
+
 # ---- Derived paths ------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -402,8 +407,18 @@ launch_server_case3() {
         [[ -n "$UMBP_PEER_SERVICE_PORT" ]] && \
             dist_fields+=", \"peer_service_port\": \"${UMBP_PEER_SERVICE_PORT}\""
         dist_fields+=", \"cache_remote_fetches\": ${UMBP_CACHE_REMOTE_FETCHES}"
+        # Optional override for master's PageBitmapAllocator page_size.
+        # When set, takes precedence over UMBPStore's auto-probe (Path A).
+        [[ -n "${UMBP_DRAM_PAGE_SIZE:-}" ]] && \
+            dist_fields+=", \"dram_page_size\": ${UMBP_DRAM_PAGE_SIZE}"
     fi
-    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": true, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
+    # Auto-disable SSD when capacity is zero so UMBPConfig::Validate() does
+    # not reject the config (ssd_enabled=true requires ssd_capacity_bytes>0).
+    local ssd_enabled_json="true"
+    if [[ "${UMBP_SSD_BYTES}" -le 0 ]]; then
+        ssd_enabled_json="false"
+    fi
+    local extra_config="{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
 
     python -m sglang.launch_server \
         --enable-cache-report --enable-metrics \
@@ -502,7 +517,7 @@ for entry in "${CASES[@]}"; do
     # 2. Launch server in background
     SERVER_LOG="${CASE_DIR}/server.log"
     log "Launching server for ${CASE_NAME}..."
-    "launch_server_${CASE_ID}" > "$SERVER_LOG" 2>&1 &
+    "launch_server_${CASE_ID}" ${EXTRA_SERVER_ARGS_ARR[@]+"${EXTRA_SERVER_ARGS_ARR[@]}"} > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
     log "Server PID: $SERVER_PID"
 
