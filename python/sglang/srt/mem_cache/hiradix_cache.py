@@ -1219,6 +1219,7 @@ class HiRadixCache(RadixCache):
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -1226,9 +1227,6 @@ class HiRadixCache(RadixCache):
                 last_host_node=self.root_node,
                 host_hit_length=0,
             )
-
-        key = key.page_aligned(self.page_size)
-        page_aligned_len = len(key)
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
