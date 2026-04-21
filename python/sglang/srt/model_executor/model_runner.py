@@ -2984,7 +2984,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
-            # Collect NSA indexers (None for layers without NSA)
+            # NSA indexers (None for layers without NSA)
             nsa_indexer = None
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
                 nsa_indexer = layer.self_attn.indexer
