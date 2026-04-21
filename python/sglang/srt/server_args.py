@@ -3458,46 +3458,14 @@ class ServerArgs:
                 )
 
         if self.speculative_adaptive:
-            unsupported_reason = None
-            if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
-                unsupported_reason = (
-                    f"speculative_algorithm={self.speculative_algorithm} "
-                    "(only EAGLE/EAGLE3 are supported)"
-                )
-            elif self.speculative_eagle_topk != 1:
-                unsupported_reason = (
-                    f"speculative_eagle_topk={self.speculative_eagle_topk} "
-                    "(only topk=1 is supported)"
-                )
-            elif self.enable_dp_attention:
-                unsupported_reason = (
-                    "enable_dp_attention=True is not supported "
-                    "(adaptive tier decisions are not synchronized across DP ranks)"
-                )
-            elif not self.disable_overlap_schedule:
-                unsupported_reason = (
-                    "the overlap scheduler (spec v2) is enabled "
-                    "(adaptive is only implemented for EAGLEWorker v1)"
-                )
-            elif self.enable_multi_layer_eagle:
-                unsupported_reason = (
-                    "enable_multi_layer_eagle=True is not supported "
-                    "(MultiLayerEagleWorker does not implement adaptive)"
-                )
-            elif self.enable_two_batch_overlap:
-                unsupported_reason = (
-                    "enable_two_batch_overlap=True is not supported "
-                    "(adaptive state swap would discard the TboAttnBackend wrapper)"
-                )
-            elif self.enable_pdmux:
-                unsupported_reason = (
-                    "enable_pdmux=True is not supported "
-                    "(adaptive state swap does not update decode_attn_backend_group)"
-                )
+            from sglang.srt.speculative.adaptive_spec_params import (
+                adaptive_unsupported_reason,
+            )
 
-            if unsupported_reason is not None:
+            reason = adaptive_unsupported_reason(self)
+            if reason is not None:
                 logger.warning(
-                    f"speculative_adaptive disabled: {unsupported_reason}. "
+                    f"speculative_adaptive disabled: {reason}. "
                     "Falling back to static speculative params."
                 )
                 self.speculative_adaptive = False
