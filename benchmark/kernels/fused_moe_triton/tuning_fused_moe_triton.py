@@ -242,7 +242,7 @@ class BenchmarkWorker:
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        self.device_id = 0 if is_hip() else int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
