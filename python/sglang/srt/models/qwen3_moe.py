@@ -968,9 +968,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.attn_cp_rank = get_attn_context_model_parallel_rank()
         self.moe_dp_size = get_moe_data_parallel_world_size()
 
-        assert (
-            self.attn_cp_size == self.moe_dp_size
-        ), "Attention context parallel size must be equal to MoE context parallel size"
+        assert self.attn_cp_size % self.moe_dp_size == 0, (
+            f"attn_cp_size ({self.attn_cp_size}) must be divisible by "
+            f"moe_dp_size ({self.moe_dp_size})"
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
