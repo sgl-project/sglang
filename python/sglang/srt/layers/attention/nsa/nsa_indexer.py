@@ -492,7 +492,8 @@ class Indexer(MultiPlatformOp):
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
         # On AMD with in-place RoPE kernels, self-aliasing can occur;
         # skip write-back when src/dst tensors point to a single memory.
-        if src.data_ptr() == dst.data_ptr():
+        # data_ptr() is not comparable inside torch.compile, so skip the guard there.
+        if not torch.compiler.is_compiling() and src.data_ptr() == dst.data_ptr():
             return
         dst.copy_(src)
 
