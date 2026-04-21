@@ -409,7 +409,9 @@ class ParallelTiledVAE(ABC, nn.Module):
         ].contiguous()
 
         local_result = decoded_core.reshape(-1)
-        local_dim_metadata = [decoded_core.shape]
+        local_dim_metadata = torch.tensor(
+            decoded_core.shape, device=z.device, dtype=torch.int64
+        )
         local_position = torch.tensor(
             [h0 * scale, h1 * scale, w0 * scale, w1 * scale],
             device=z.device,
@@ -423,9 +425,10 @@ class ParallelTiledVAE(ABC, nn.Module):
         local_size = torch.tensor(
             [local_result.size(0)], device=z.device, dtype=torch.int64
         )
-        gathered_dim_metadata = [None] * world_size
-        dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
-        gathered_dim_metadata = cast(list[list[torch.Size]], gathered_dim_metadata)
+        gathered_dim_metadata = [
+            torch.empty_like(local_dim_metadata) for _ in range(world_size)
+        ]
+        dist.all_gather(gathered_dim_metadata, local_dim_metadata)
 
         all_sizes = [
             torch.zeros(1, device=z.device, dtype=torch.int64)
@@ -454,7 +457,7 @@ class ParallelTiledVAE(ABC, nn.Module):
         )
         for src_rank, positions in enumerate(gathered_positions):
             h_start, h_end, w_start, w_end = [int(x.item()) for x in positions]
-            shape = gathered_dim_metadata[src_rank][0]
+            shape = tuple(int(x.item()) for x in gathered_dim_metadata[src_rank])
             patch = gathered_results[src_rank][: prod(shape)].reshape(shape)
             dec[:, :, :, h_start:h_end, w_start:w_end] = patch
         return dec
