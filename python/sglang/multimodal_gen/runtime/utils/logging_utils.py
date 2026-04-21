@@ -92,17 +92,6 @@ class ColoredFormatter(logging.Formatter):
         return formatted_message
 
 
-class _MaxLevelFilter(logging.Filter):
-    """Allow log records whose level is below the given threshold."""
-
-    def __init__(self, exclusive_upper_bound: int):
-        super().__init__()
-        self.exclusive_upper_bound = exclusive_upper_bound
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return record.levelno < self.exclusive_upper_bound
-
-
 class SortedHelpFormatter(argparse.HelpFormatter):
     """SortedHelpFormatter that sorts arguments by their option strings."""
 
@@ -533,20 +522,12 @@ def configure_logger(server_args, prefix: str = ""):
     datefmt = "%m-%d %H:%M:%S"
 
     formatter = ColoredFormatter(log_format, datefmt=datefmt)
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setFormatter(formatter)
-    stdout_handler.addFilter(_MaxLevelFilter(logging.ERROR))
-
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(logging.ERROR)
-    stderr_handler.setFormatter(formatter)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
 
     root = logging.getLogger()
-    for handler in root.handlers[:]:
-        root.removeHandler(handler)
-        handler.close()
-    root.addHandler(stdout_handler)
-    root.addHandler(stderr_handler)
+    root.handlers.clear()
+    root.addHandler(handler)
     root.setLevel(getattr(logging, server_args.log_level.upper()))
 
     set_uvicorn_logging_configs(server_args)
