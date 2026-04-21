@@ -137,6 +137,44 @@ class SWAComponent(TreeComponent):
     ) -> bool:
         return params.swa_evicted_seqlen >= total_prefix_len + key_len
 
+    def recover_after_unevict(
+        self,
+        node: UnifiedTreeNode,
+        prefix_len: int,
+        total_prefix_len: int,
+        params: InsertParams,
+    ) -> None:
+        # _unevict_node_on_insert already wrote the request's fresh KV slice
+        # into the base value. We just need to rebuild SWA from that slice for
+        # the in-window portion. There is no old SWA slot to free here.
+        ct = self.component_type
+        if node.component_data[ct].value is not None:
+            return
+        assert (
+            node.component_data[ct].lock_ref == 0
+        ), f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
+        swa_evicted_seqlen = params.swa_evicted_seqlen
+        assert (
+            swa_evicted_seqlen % self.cache.page_size == 0
+        ), f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+
+        full_value = node.component_data[BASE_COMPONENT_TYPE].value
+        if swa_evicted_seqlen <= total_prefix_len:
+            swa_value = self._translate_full_to_swa(full_value)
+        elif swa_evicted_seqlen < total_prefix_len + prefix_len:
+            start_idx = swa_evicted_seqlen - total_prefix_len
+            self.cache._split_node(node.key, node, start_idx)
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            swa_value = self._translate_full_to_swa(full_value)
+        else:
+            return
+        node.component_data[ct].value = swa_value
+        host_lru = self.cache.host_lru_lists[ct]
+        if host_lru.in_list(node):
+            host_lru.remove_node(node)
+        self.cache.lru_lists[ct].insert_mru(node)
+        self.cache.component_evictable_size_[ct] += len(swa_value)
+
     def commit_insert_component_data(
         self,
         node: UnifiedTreeNode,
@@ -274,12 +312,15 @@ class SWAComponent(TreeComponent):
         swa_lock_size = 0
         swa_uuid_for_lock = None
 
+        # Tombstoned nodes (cd.value is None) have no SWA chunk to protect
+        # skip them and keep walking up. This path is hit when HiCache
+        # backs up a FULL present internal node whose SWA was already evicted.
         cur = node
         while cur != root and swa_lock_size < sliding_window_size:
-            assert (
-                cur.component_data[ct].value is not None
-            ), f"acquire_component_lock({ct}) on tombstoned node {cur.id}"
             comp = cur.component_data[ct]
+            if comp.value is None:
+                cur = cur.parent
+                continue
             if comp.lock_ref == 0:
                 key_len = len(cur.key)
                 self.cache.component_evictable_size_[ct] -= key_len
@@ -303,15 +344,15 @@ class SWAComponent(TreeComponent):
         swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
         dec_swa = True
 
+        # lock_ref == 0 means acquire_component_lock skipped this node
+        # (tombstone at acquire time) or load_back revived a tombstone between
+        # acquire and release. Either way, there is nothing for us to undo here.
         cur = node
         while cur != root and dec_swa:
-            assert (
-                cur.component_data[ct].value is not None
-            ), f"release_component_lock({ct}) on tombstoned node {cur.id}"
             comp = cur.component_data[ct]
-            assert (
-                comp.lock_ref > 0
-            ), f"release_component_lock({ct}) on node with lock_ref=0, node {cur.id}"
+            if comp.lock_ref == 0:
+                cur = cur.parent
+                continue
             if comp.lock_ref == 1:
                 key_len = len(cur.key)
                 self.cache.component_evictable_size_[ct] += key_len
