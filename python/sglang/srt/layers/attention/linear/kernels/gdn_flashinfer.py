@@ -155,8 +155,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # will no longer be needed here.
             # Remap -1 (dummy padding during CUDA graph) to last pool slot.
             # Gather: reading garbage from sentinel slot is harmless.
-            # Scatter: writes garbage to sentinel slot — acceptable until
-            # FlashInfer supports initial_state_indices on SM90.
             safe_indices = torch.where(
                 cache_indices >= 0,
                 cache_indices,
@@ -176,7 +174,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 output=None,
                 use_qk_l2norm=True,
             )
-            ssm_states[safe_indices] = new_state
+            # For dummy requests (cache_indices=-1), write back the original
+            # state_batch instead of garbage new_state.  CUDA-graph safe.
+            valid = (cache_indices >= 0).view(-1, 1, 1, 1)
+            ssm_states[safe_indices] = torch.where(valid, new_state, state_batch)
 
         return output_fi.view(1, batch_size, num_v_heads, head_v_dim)
 
