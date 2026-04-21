@@ -419,6 +419,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self.server_args.disaggregation_mode
         )
         self.bootstrap_server = start_disagg_service(self.server_args)
+        # Counter for auto-assigning bootstrap_room in fake-decode mode.
+        # Placing the assignment here (single source of truth) covers every
+        # load-balance method and single-DP deployments that bypass the DP
+        # controller.
+        self.fake_bootstrap_room_counter = 0
 
         # Encoder Disaggregation
         if self.server_args.language_only:
@@ -919,6 +924,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
+            bootstrap_room = obj.bootstrap_room
+            if (
+                bootstrap_room is None
+                and self.server_args.disaggregation_decode_enable_fake_auto
+            ):
+                bootstrap_room = self.fake_bootstrap_room_counter
+                self.fake_bootstrap_room_counter += 1
+
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text,
                 input_ids,
@@ -933,7 +946,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
-                bootstrap_room=obj.bootstrap_room,
+                bootstrap_room=bootstrap_room,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 session_params=session_params,
