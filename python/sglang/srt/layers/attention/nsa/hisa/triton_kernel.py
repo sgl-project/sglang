@@ -105,15 +105,25 @@ def hisa_coord_transform(
     M, index_topk = relevant.shape
     block_topk = topk_block_indices.shape[-1]
 
+    # Kernel assumes row_stride == row_width (no stride args passed); force
+    # contiguity to be safe. Production inputs (fast_topk_v2 output, hisa
+    # kernel output, 1-D slices of ks/ke) are already contiguous, so these
+    # calls are typically no-ops.
+    relevant = relevant.contiguous()
+    topk_block_indices = topk_block_indices.contiguous()
+
     # Normalize dtypes — the triton kernel assumes int32 throughout.
     if topk_block_indices.dtype != torch.int32:
         topk_block_indices = topk_block_indices.to(torch.int32)
     if lens.dtype != torch.int32:
         lens = lens.to(torch.int32)
+    lens = lens.contiguous()
 
     ragged = ks is not None
-    if ragged and ks.dtype != torch.int32:
-        ks = ks.to(torch.int32)
+    if ragged:
+        if ks.dtype != torch.int32:
+            ks = ks.to(torch.int32)
+        ks = ks.contiguous()
     # In PAGED mode the kernel ignores ks_ptr; pass any valid pointer.
     ks_arg = ks if ragged else lens
 
