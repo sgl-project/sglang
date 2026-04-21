@@ -53,8 +53,14 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
+    # When enable speculative fully async decoding feature, we don't need to save hidden_states for next draft
+    enable_spec_fully_async_decoding = envs.SGLANG_SPEC_FULLY_ASYNC_DECODING.get()
+
     # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
-    return not server_args.enable_multi_layer_eagle
+    return (
+        not server_args.enable_multi_layer_eagle
+        and not enable_spec_fully_async_decoding
+    )
 
 
 @triton.jit
