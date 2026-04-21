@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.radix_cache import (
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-
 # ---------------------------------------------------------------------------
 # Unit tests for RadixCache snapshot / restore (no GPU required)
 # ---------------------------------------------------------------------------
