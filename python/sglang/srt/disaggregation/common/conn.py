@@ -53,6 +53,7 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    context_length: Optional[int] = None
 
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
@@ -64,6 +65,9 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
+        self.context_length = (
+            int(self.context_length) if self.context_length is not None else None
+        )
 
 
 @dataclasses.dataclass
@@ -210,6 +214,16 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        if (
+            info.context_length is not None
+            and info.context_length != self.kv_args.context_length
+        ):
+            raise RuntimeError(
+                f"Context length mismatch: prefill server has context_length={info.context_length}, "
+                f"but decode server has context_length={self.kv_args.context_length}. "
+                f"Both servers must use the same --context-length value."
+            )
+
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
@@ -262,6 +276,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            "context_length": self.kv_args.context_length,
         }
 
         try:
@@ -661,6 +676,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.context_length: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -727,6 +743,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        context_length = data.get("context_length")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -745,6 +762,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.context_length is None and context_length is not None:
+            self.context_length = int(context_length)
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -815,6 +835,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                context_length=self.context_length,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

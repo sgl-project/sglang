@@ -37,6 +37,7 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+    context_length: int
 
 
 class KVPoll:
