@@ -63,7 +63,12 @@ runs:
           fi
 
           # Use GitHub compare API: status is "ahead"/"identical" when MIN_BASE_SHA is reachable from PR head.
-          COMPARE_STATUS=$(gh api "repos/$REPO/compare/$MIN_BASE_SHA...$PR_HEAD_SHA" --jq '.status' 2>/dev/null || echo "UNKNOWN")
+          # On 4xx (e.g., nonexistent SHA) gh api prints the error JSON to stdout before exiting non-zero,
+          # so keep the `|| COMPARE_STATUS=UNKNOWN` outside the subshell — otherwise --jq '.status' extracts
+          # the HTTP status code ("404") from the error body and concatenates with "UNKNOWN", bypassing the
+          # fail-open branch and incorrectly blocking CI.
+          COMPARE_STATUS=$(gh api "repos/$REPO/compare/$MIN_BASE_SHA...$PR_HEAD_SHA" --jq '.status' 2>/dev/null) \
+            || COMPARE_STATUS="UNKNOWN"
           COMPARE_STATUS="${COMPARE_STATUS:-UNKNOWN}"
 
           case "$COMPARE_STATUS" in
