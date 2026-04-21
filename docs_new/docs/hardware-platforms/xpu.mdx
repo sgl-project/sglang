@@ -1,0 +1,146 @@
+---
+title: XPU
+sidebarTitle: Intel GPUs (XPU)
+---
+
+The document addresses how to set up the [SGLang](https://github.com/sgl-project/sglang) environment and run LLM inference on Intel GPU, [see more context about Intel GPU support within PyTorch ecosystem](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html).
+
+Specifically, SGLang is optimized for:
+- [Intel® Arc™ Pro B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/242616/intel-arc-pro-b-series-graphics.html)
+- [Intel® Arc™ B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/240391/intel-arc-b-series-graphics.html).
+
+## Optimized Model List
+
+A list of LLMs have been optimized on Intel GPU, and more are on the way:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model Name</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-3.2-3B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-3.1-8B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen2.5-1.5B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen2.5-1.5B](https://huggingface.co/Qwen/Qwen2.5-1.5B)</td>
+    </tr>
+  </tbody>
+</table>
+
+<Note>The model identifiers listed in the table above have been verified on [Intel® Arc™ B580 Graphics](https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html).</Note>
+
+## Installation
+
+<Tabs>
+
+    <Tab title="Source">
+
+        Currently SGLang XPU only supports installation from source. Please refer to [“Getting Started on Intel GPU”](https://docs.pytorch.org/docs/stable/notes/get_start_xpu.html) to install XPU dependency.
+
+        1. **Creation & Activation**
+
+        Create and activate a conda environment.
+
+        ```bash
+        conda create -n sgl-xpu python=3.12 -y
+        conda activate sgl-xpu
+        ```
+
+        2. **Install PyTorch and Dependencies**
+
+        Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
+
+        ```bash
+        pip3 install torch==2.9.0+xpu torchao torchvision torchaudio pytorch-triton-xpu==3.5.0 --index-url https://download.pytorch.org/whl/xpu
+        pip3 install xgrammar --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
+        ```
+
+        3. **Cloning**
+
+        Clone the SGLang code
+
+        ```bash
+        git clone https://github.com/sgl-project/sglang.git
+        cd sglang
+        git checkout <YOUR-DESIRED-VERSION>
+        ```
+
+        4. **Configure Build File**
+
+        Use dedicated toml file
+
+        ```bash
+        cd python
+        cp pyproject_xpu.toml pyproject.toml
+        ```
+
+        5. **Build and Install**
+
+        Install SGLang dependent libs, and build SGLang main package
+
+        ```bash
+        pip install --upgrade pip setuptools
+        pip install -v .
+        ```
+    </Tab>
+
+    <Tab title="Docker">
+        <Info>The docker for XPU is under active development. Please stay tuned.</Info>
+    </Tab>
+</Tabs>
+## Launch of the Serving Engine
+
+Example command to launch SGLang serving:
+
+<CodeGroup>
+```bash
+python -m sglang.launch_server       \
+    --model <MODEL_ID_OR_PATH>       \
+    --trust-remote-code              \
+    --disable-overlap-schedule       \
+    --device xpu                     \
+    --host 0.0.0.0                   \
+    --tp 2                           \   # using multi GPUs
+    --attention-backend intel_xpu    \   # using intel optimized XPU attention backend
+    --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
+```
+</CodeGroup>
+
+## Benchmarking with Requests
+
+You can benchmark the performance via the `bench_serving` script. Run the command in another terminal.
+
+<CodeGroup>
+```bash
+python -m sglang.bench_serving   \
+    --dataset-name random        \
+    --random-input-len 1024      \
+    --random-output-len 1024     \
+    --num-prompts 1              \
+    --request-rate inf           \
+    --random-range-ratio 1.0
+```
+</CodeGroup>
+
+The detail explanations of the parameters can be looked up by the command:
+
+<CodeGroup>
+```bash
+python -m sglang.bench_serving -h
+```
+</CodeGroup>
+
+Additionally, the requests can be formed with [OpenAI Completions API](../basic_usage/openai_api_completions) and sent via the command line (e.g. using `curl`) or via your own script.
