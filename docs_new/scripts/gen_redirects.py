@@ -23,16 +23,13 @@ SECTION_RENAMES = {
 EXPLICIT = {
     # get_started → get-started
     "/get_started/install": "/docs/get-started/installation",
-
     # developer_guide rename
     "/developer_guide/development_jit_kernel_guide": "/docs/developer_guide/JIT_kernels",
-
     # platforms → hardware-platforms (with file renames)
     "/platforms/amd_gpu": "/docs/hardware-platforms/amd-gpus",
     "/platforms/cpu_server": "/docs/hardware-platforms/cpu-server",
     "/platforms/tpu": "/docs/hardware-platforms/tpu",
     "/platforms/xpu": "/docs/hardware-platforms/xpu",
-
     # platforms/ascend → hardware-platforms/ascend-npus (flattened, renamed)
     "/platforms/ascend/ascend_npu": "/docs/hardware-platforms/ascend-npus/SGLang-installation-with-NPUs-support",
     "/platforms/ascend/ascend_npu_best_practice": "/docs/hardware-platforms/ascend-npus/Best-Practice-on-Ascend-NPU",
@@ -53,7 +50,6 @@ EXPLICIT = {
     "/platforms/mthreads_gpu": "/docs/hardware-platforms/overview",
     "/platforms/nvidia_jetson": "/docs/hardware-platforms/overview",
     "/platforms/plugin": "/docs/hardware-platforms/overview",
-
     # supported_models → supported-models (flattened, renamed)
     "/supported_models": "/docs/supported-models",
     "/supported_models/index": "/docs/supported-models",
@@ -72,7 +68,6 @@ EXPLICIT = {
     "/supported_models/text_generation/multimodal_language_models": "/docs/supported-models/vision-language-models",
     "/supported_models/text_generation/diffusion_language_models": "/docs/supported-models/diffusion-language-models",
     "/supported_models/text_generation/index": "/docs/supported-models",
-
     # diffusion → sglang-diffusion (file renames snake_case → kebab-case)
     "/diffusion": "/docs/sglang-diffusion/installation",
     "/diffusion/index": "/docs/sglang-diffusion/installation",
@@ -98,19 +93,15 @@ EXPLICIT = {
     "/diffusion/reference": "/docs/sglang-diffusion/installation",
     "/diffusion/support_new_models": "/docs/sglang-diffusion/installation",
     "/diffusion/usage": "/docs/sglang-diffusion/installation",
-
     # basic_usage dropped pages
     "/basic_usage/deepseek_ocr": "/docs/basic_usage/overview",
     "/basic_usage/qwen3_5": "/docs/basic_usage/qwen3",
-
     # advanced_features dropped pages
     "/advanced_features/adaptive_speculative_decoding": "/docs/advanced_features/speculative_decoding",
     "/advanced_features/hisparse_guide": "/docs/advanced_features/overview",
-
     # references dropped
     "/references/learn_more": "/",
     "/references/release_lookup": "/docs/references/overview",
-
     # Root index
     "/index": "/",
     "/": "/",
@@ -175,7 +166,11 @@ def main():
             continue
         rel = p.relative_to(OLD_DOCS)
         # Skip non-doc dirs
-        if rel.parts and rel.parts[0] in ("_static", "performance_dashboard", "release_lookup"):
+        if rel.parts and rel.parts[0] in (
+            "_static",
+            "performance_dashboard",
+            "release_lookup",
+        ):
             continue
         old_files.append(rel)
 
