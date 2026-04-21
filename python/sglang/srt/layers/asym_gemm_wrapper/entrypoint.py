@@ -31,12 +31,21 @@ def grouped_gemm_nt_f8f8bf16_masked(
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
 ):
-    num_groups, _, k = lhs[0].shape
+    num_groups, m, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
+
+    # Lazy import to avoid circular dependency with moe_runner.asym_gemm.
+    from sglang.srt.layers.moe.moe_runner.asym_gemm import (
+        build_offsets_experts_from_masked_m,
+    )
+
+    offsets, experts, list_size = build_offsets_experts_from_masked_m(
+        masked_m, num_groups, m
+    )
 
     with compile_utils.asym_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
@@ -48,7 +57,9 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 lhs,
                 rhs,
                 out,
-                masked_m,
+                offsets,
+                experts,
+                list_size,
                 expected_m,
                 disable_ue8m0_cast=False,
             )
@@ -153,6 +164,15 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
     _, n, _ = rhs.shape
     kernel_type = compile_utils.AsymGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
 
+    # Lazy import to avoid circular dependency with moe_runner.asym_gemm.
+    from sglang.srt.layers.moe.moe_runner.asym_gemm import (
+        build_offsets_experts_from_masked_m,
+    )
+
+    offsets, experts, list_size = build_offsets_experts_from_masked_m(
+        masked_m, num_groups, m_max
+    )
+
     with compile_utils.asym_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
@@ -160,7 +180,9 @@ def grouped_gemm_nt_bf16bf16bf16_masked(
             lhs,
             rhs,
             out,
-            masked_m,
+            offsets,
+            experts,
+            list_size,
             expected_m,
             compiled_dims="nk",
         )

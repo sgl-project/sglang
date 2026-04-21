@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import triton
 
 from sglang.srt.layers import asym_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -532,7 +533,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
 
                 # Act + FP8 quant: gc → down_input_c, down_input_scale_c
                 if _MASKED_GEMM_FAST_ACT:
-                    down_input_c, down_input_scale_c = _hp_get('quant_8bit')(
+                    down_input_c, down_input_scale_c = sglang_per_token_group_quant_8bit(
                         x=gc,
                         dst_dtype=torch.float8_e4m3fn,
                         group_size=scale_block_size,
@@ -554,7 +555,7 @@ class AsymGemmRunnerCore(MoeRunnerCore):
                         device=hidden_states_device,
                         dtype=torch.float32,
                     )
-                    _hp_get('silu_masked')(
+                    silu_and_mul_masked_post_quant_fwd(
                         gc,
                         down_input_c,
                         down_input_scale_c,
@@ -896,7 +897,7 @@ def post_permute_asym_gemm_to_standard(
         output = torch.empty(
             hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
         )
-        _hp_get('post_reorder')[(hidden_states_shape[0],)](
+        post_reorder_triton_kernel[(hidden_states_shape[0],)](
             runner_output.hidden_states,
             output,
             src2dst,
