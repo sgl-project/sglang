@@ -525,6 +525,18 @@ def run_scheduler_process(
     elif current_platform.is_musa():
         set_musa_arch()
 
+    # Torch backend overrides for numerical behavior investigation
+    if os.environ.get("SGLANG_DISABLE_CUDNN", "0") == "1":
+        torch.backends.cudnn.enabled = False
+        logger.info("[torch-compat] cuDNN DISABLED globally")
+    if os.environ.get("SGLANG_DISABLE_TF32", "0") == "1":
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        logger.info("[torch-compat] TF32 DISABLED for cudnn and matmul")
+    if os.environ.get("SGLANG_FORCE_FA", "0") == "1":
+        server_args.attention_backend = "fa"
+        logger.info("[torch-compat] Forced attention_backend=fa")
+
     port_args = PortArgs.from_server_args(server_args)
 
     # start the scheduler event loop
