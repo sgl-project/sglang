@@ -193,12 +193,14 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     print(f"Checking workflows for commit: {head_sha}")
 
     # If PR has sgl-kernel changes, check whether ALL wheel builds already
-    # succeeded for this commit (CUDA + ARM + any others). If so, we can
-    # use rerun_failed_jobs and avoid retriggering all tests. If any wheel
+    # succeeded for this commit (CUDA + ARM). If so, we can use
+    # rerun_failed_jobs and avoid retriggering all tests. If any wheel
     # build is pending/failed, a dependent job could fail for missing
     # artifacts, so fall back to full rerun.
-    # Check-runs display names: "Build Wheel (<python>, <cuda>)",
-    # "Build Wheel Arm (<python>, <cuda>)", legacy "sgl-kernel-build-wheels".
+    # Check-runs display names: "Build Wheel (<python>, <cuda>)" (CUDA) and
+    # "Build Wheel Arm (<python>, <cuda>)" (ARM). The YAML job ids
+    # sgl-kernel-build-wheels{,-arm} are NOT what the check-runs API
+    # returns — it returns the job's `name:` field.
     kernel_wheel_built = False
     if sgl_kernel_changes:
         try:
@@ -206,7 +208,6 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                 cr
                 for cr in gh_repo.get_commit(head_sha).get_check_runs()
                 if cr.name.startswith("Build Wheel")
-                or "sgl-kernel-build-wheels" in cr.name
             ]
             kernel_wheel_built = bool(wheel_builds) and all(
                 cr.conclusion == "success" for cr in wheel_builds
