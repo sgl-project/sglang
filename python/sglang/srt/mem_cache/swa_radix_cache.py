@@ -46,7 +46,6 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_page_size1,
     _key_match_paged,
     get_child_key,
-    page_align_keys,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
@@ -430,10 +429,12 @@ class SWARadixCache(BasePrefixCache):
         prev_prefix_len = params.prev_prefix_len
         swa_evicted_seqlen = params.swa_evicted_seqlen
 
-        if value is None:
-            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
-
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+        else:
+            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len = self._insert_helper(
             self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
@@ -455,9 +456,9 @@ class SWARadixCache(BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
-        # EAGLE: skip tuple materialization; is_bigram flag gives bigram semantics.
-        keys = page_align_keys(token_ids, self.page_size, is_bigram=self.is_eagle)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
@@ -502,8 +503,9 @@ class SWARadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        keys = page_align_keys(token_ids, self.page_size, is_bigram=self.is_eagle)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
 
@@ -840,14 +842,11 @@ class SWARadixCache(BasePrefixCache):
         """Preprocess the key before matching."""
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
-
         if self.disable or len(key) == 0:
             return None
-
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
-
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return None
         return key
 
     def _match_post_processor(

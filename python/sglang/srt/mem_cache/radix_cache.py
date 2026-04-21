@@ -122,6 +122,12 @@ class RadixKey:
         preview = self.token_ids[:10]
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
+    def page_aligned(self, page_size: int) -> "RadixKey":
+        if page_size == 1:
+            return self
+        aligned_len = len(self) // page_size * page_size
+        return self[:aligned_len]
+
     def maybe_to_bigram_view(
         self,
         is_eagle: bool,
@@ -134,24 +140,6 @@ class RadixKey:
             if value is not None:
                 value = value[: len(self)]
         return self, value
-
-
-def page_align_keys(key: list, page_size: int, is_bigram: bool = False) -> list:
-    """Truncate a raw token list so the resulting RadixKey length is page-aligned.
-
-    In bigram mode, logical length = len(key) - 1, and we must keep one extra
-    boundary token so that bigram_count == aligned.
-    """
-    if page_size == 1:
-        return key
-    if is_bigram:
-        logical_len = len(key) - 1 if len(key) > 0 else 0
-        aligned = logical_len // page_size * page_size
-        if aligned == 0:
-            return []
-        return key[: aligned + 1]
-    page_aligned_len = len(key) // page_size * page_size
-    return key[:page_aligned_len]
 
 
 class TreeNode:
@@ -504,9 +492,7 @@ class RadixCache(BasePrefixCache):
         if self.disable or len(key) == 0:
             return empty_match_result()
 
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
+        key = key.page_aligned(self.page_size)
 
         if len(key) == 0:
             return empty_match_result()
@@ -531,12 +517,13 @@ class RadixCache(BasePrefixCache):
         priority = params.priority
         chunked = params.chunked
 
-        if value is None:
-            # Debug/test fallback: use token ids themselves as values. Truncate
-            # to the logical key length so bigram mode gets len(key) entries.
-            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
-
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+        else:
+            # Debug/test fallback: use token ids themselves as values.
+            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)
@@ -560,9 +547,11 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        keys = page_align_keys(token_ids, self.page_size, is_bigram=self.is_eagle)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
-        values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        key_len = len(radix_key)
+        values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -577,11 +566,11 @@ class RadixCache(BasePrefixCache):
             )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : len(radix_key)]
+                kv_indices[req.cache_protected_len : key_len]
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[len(radix_key) :])
+        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -596,8 +585,9 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        keys = page_align_keys(token_ids, self.page_size, is_bigram=self.is_eagle)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool

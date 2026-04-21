@@ -1216,10 +1216,8 @@ class HiRadixCache(RadixCache):
                 host_hit_length=0,
             )
 
+        key = key.page_aligned(self.page_size)
         page_aligned_len = len(key)
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
@@ -1394,14 +1392,14 @@ class HiRadixCache(RadixCache):
 
         if priority is None:
             priority = 0
+
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
 
         if len(key) == 0:
             return InsertResult(prefix_len=0)
-
-        if self.is_eagle and value is not None:
-            # Make sure the value len equal to the EAGLE bigram key len
-            value = value[: len(key)]
 
         node = self.root_node
         child_key = self.get_child_key_fn(key)
