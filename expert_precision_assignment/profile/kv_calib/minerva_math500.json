@@ -1,0 +1,40 @@
+{
+  "bench_details": {
+    "source": "/data/huanchen/sglang/expert_precision_assignment/profile/kv_calib/calib_minerva_math500_mc128.jsonl",
+    "input_len": {
+      "n": 128,
+      "min": 721,
+      "mean": 777.48,
+      "std": 60.98,
+      "p50": 759,
+      "p95": 902,
+      "p99": 1050,
+      "max": 1059
+    },
+    "output_len": {
+      "n": 128,
+      "min": 66,
+      "mean": 624.55,
+      "std": 641.41,
+      "p50": 383,
+      "p95": 2129,
+      "p99": 3072,
+      "max": 3072
+    },
+    "total_len": {
+      "n": 128,
+      "min": 790,
+      "mean": 1402.04,
+      "std": 663.69,
+      "p50": 1143,
+      "p95": 2957,
+      "p99": 3901,
+      "max": 3984
+    }
+  },
+  "recommended_slo": {
+    "mean_total_len": 1402.04,
+    "std_total_len": 663.69,
+    "kv_headroom_sigmas": 2.0
+  }
+}

@@ -21,7 +21,7 @@ Either mode is usable alone; providing both gives the fullest picture.
 Example — bench_eval prompt calibration:
     python calib_kv.py \\
         --task gsm8k --model <snapshot> \\
-        --num_samples 64 --num_fewshot 5 --max_gen_toks 512 \\
+        --num_samples 64 --num_fewshot 5 --max_gen_toks 8196 \\
         --out_file kv_calib/gsm8k.json
 
 Example — amortized from a past bench_serving run:
@@ -229,7 +229,7 @@ def main() -> int:
     ap.add_argument("--num_samples", type=int, default=64,
                     help="Number of docs to draw (limit passed to lm_eval).")
     ap.add_argument("--num_fewshot", type=int, default=5)
-    ap.add_argument("--max_gen_toks", type=int, default=512,
+    ap.add_argument("--max_gen_toks", type=int, default=8196,
                     help="Same value you plan to pass to bench_eval.")
     ap.add_argument("--apply_chat_template", action="store_true", default=True)
     ap.add_argument("--no_apply_chat_template",
