@@ -339,6 +339,64 @@ class UMBPStore(HiCacheStorage):
             if cache_remote_fetches is not None:
                 dist_cfg.cache_remote_fetches = _bool_from_any(cache_remote_fetches)
 
+            # Auto-compute master's PageBitmapAllocator page_size so every
+            # UMBPStore Put/Get maps to exactly one master page (no partial
+            # tail, 1 RDMA per page).  Resolution order:
+            #   1. extra_config["dram_page_size"] — explicit operator override
+            #      (escape hatch for debugging / forced experiments).
+            #   2. derived from mem_pool_host (the normal production path).
+            #   3. left at mori-side default (2 MiB) when neither is available;
+            #      the partial-tail safety net in PoolClient still handles it.
+            page_byte_size = None
+            if "dram_page_size" in extra:
+                page_byte_size = int(extra["dram_page_size"])
+            elif mem_pool_host is not None:
+                # Probe element_size from the same buffer-meta helper that
+                # batch_preprocess will actually use; this matches per-call
+                # Put/Get size byte-for-byte for MHA / MHA-split / MLA / NSA
+                # without per-case formulas (NSA in particular: get_ksize_per_token
+                # would over-count by the indexer buffer that is never put to UMBP).
+                dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
+                if self.is_mla_backend:
+                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                elif storage_config is not None and getattr(
+                    storage_config, "should_split_heads", False
+                ):
+                    sf = storage_config.tp_lcm_size // storage_config.tp_size
+                    _, esz = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
+                else:
+                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                page_byte_size = int(esz[0]) if esz else 0
+
+            if page_byte_size is not None and page_byte_size > 0 and hasattr(
+                dist_cfg, "dram_page_size"
+            ):
+                dist_cfg.dram_page_size = int(page_byte_size)
+                logger.info(
+                    "UMBPStore: setting master dram_page_size=%d "
+                    "(ksize_per_token=%s × page_size=%s%s)",
+                    dist_cfg.dram_page_size,
+                    (
+                        mem_pool_host.get_ksize_per_token()
+                        if mem_pool_host is not None
+                        else "n/a"
+                    ),
+                    (
+                        mem_pool_host.page_size
+                        if mem_pool_host is not None
+                        else "n/a"
+                    ),
+                    (
+                        f" / split_factor={storage_config.tp_lcm_size // storage_config.tp_size}"
+                        if (
+                            mem_pool_host is not None
+                            and storage_config is not None
+                            and getattr(storage_config, "should_split_heads", False)
+                        )
+                        else ""
+                    ),
+                )
+
             cfg.distributed = dist_cfg
             logger.info(
                 "UMBPStore distributed mode: master=%s, node_id=%s, node_addr=%s, "
