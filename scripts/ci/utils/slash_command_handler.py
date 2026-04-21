@@ -171,14 +171,14 @@ def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
-    Reruns workflows with 'failure' or 'skipped' conclusions.
+    Reruns workflows with 'failure' conclusion.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    print("Permission granted. Triggering rerun of failed or skipped workflows.")
+    print("Permission granted. Triggering rerun of failed workflows.")
 
     # Check if PR has sgl-kernel changes - if so, we may need full reruns
     # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
@@ -221,37 +221,28 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         except Exception as e:
             print(f"Failed to check kernel wheel status: {e} - falling back to full rerun")
 
-    # Rerun workflows with conclusion=failure or conclusion=skipped.
+    # Rerun workflows with conclusion=failure.
     #
     # rerun_failed_jobs() reruns failed jobs *and their dependent jobs*
-    # (GitHub API docs). That includes jobs marked conclusion=skipped because
-    # a needs: dep failed (e.g. stage-c tests when wait-for-stage-b fails),
-    # so no per-job skipped-rerun is required. It also handles fast-fail
-    # cascades — those jobs call core.setFailed(...) so their conclusion is
-    # "failure", not "skipped".
-    #
-    # For workflows with overall conclusion=skipped (no failed jobs at all),
-    # rerun_failed_jobs() would be a no-op, so fall back to full rerun().
+    # (GitHub API docs), which covers fast-fail cascades (those call
+    # core.setFailed(...) so their conclusion is "failure"). If the PR
+    # touches sgl-kernel and not all wheel builds are success yet, fall
+    # back to full rerun so cross-workflow artifact flow stays consistent
+    # (Build Wheel lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml).
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
 
     rerun_count = 0
     for run in runs:
-        if run.status != "completed":
-            continue
-        if run.conclusion not in ("failure", "skipped"):
+        if run.status != "completed" or run.conclusion != "failure":
             continue
 
-        print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
+        print(f"Processing failed workflow: {run.name} (ID: {run.id})")
         try:
-            need_full_rerun = (
-                run.conclusion == "skipped"  # no failed jobs to rerun
-                or (sgl_kernel_changes and not kernel_wheel_built)
-            )
-            if need_full_rerun:
-                print("  Full rerun")
+            if sgl_kernel_changes and not kernel_wheel_built:
+                print("  Full rerun (kernel wheel not fully built)")
                 run.rerun()
             else:
-                print("  rerun_failed_jobs (covers failed + dependents)")
+                print("  rerun_failed_jobs")
                 run.rerun_failed_jobs()
             rerun_count += 1
         except Exception as e:
@@ -263,7 +254,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
             comment.create_reaction("+1")
         return True
     else:
-        print("No failed or skipped workflows found to rerun.")
+        print("No failed workflows found to rerun.")
         return False
 
 
