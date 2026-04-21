@@ -168,9 +168,6 @@ class AsymGemmBf16RunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
             num_groups,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
         dispose_tensor(hidden_states)
 
@@ -207,9 +204,6 @@ class AsymGemmBf16RunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
             num_groups,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
 
         return down_output

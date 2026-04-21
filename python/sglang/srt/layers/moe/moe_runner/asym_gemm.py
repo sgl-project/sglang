@@ -24,6 +24,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+from sglang.srt.utils.common import get_int_env_var
 from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
@@ -48,6 +49,97 @@ if not (_is_npu or _is_hip) and _is_cuda:
 
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
+
+# Chunk size for the chunked masked GEMM path.  Process this many expert groups
+# per iteration, reusing small intermediate buffers instead of one large
+# (num_groups, m, N) allocation.  Set to 0 to disable (use the original path).
+# When src2dst is available in running_state, each chunk is scattered directly
+# into a (num_tokens, K) output, eliminating the full (G, m, K) down_output.
+_MASKED_GEMM_CHUNK_SIZE = get_int_env_var("SGLANG_MASKED_GEMM_CHUNK_SIZE", default=0)
+
+
+@triton.jit
+def _scatter_chunk_kernel(
+    down_chunk_ptr,     # (c, m, K) bfloat16 — GEMM-1 output for this chunk
+    output_ptr,         # (num_tokens, K) bfloat16 — accumulation target (pre-zeroed)
+    src2dst_ptr,        # (num_tokens * topk,) int32 — flat row index in (G*m) layout
+    topk_ids_ptr,       # (num_tokens * topk,) int32
+    topk_weights_ptr,   # (num_tokens * topk,) float32 (or bfloat16)
+    g_start,            # int — first expert index of this chunk
+    g_lo,               # int — effective lower bound (max(g_start, 1) to match
+                        #        post_reorder's `expert_id > 0` guard)
+    g_end,              # int — last+1 expert index of this chunk
+    m,                  # int — m_max (per-group row stride)
+    K,                  # int — hidden dim
+    topk,               # int — top_k (specialised per unique value)
+    BLOCK_K: tl.constexpr,
+):
+    """Scatter one chunk's GEMM-1 output into the final (num_tokens, K) buffer.
+
+    One Triton program per source token.  For each top-k slot, if the assigned
+    expert falls in [g_lo, g_end), load the corresponding row from down_chunk,
+    weight it, and accumulate into output[src_idx].
+    """
+    src_idx = tl.program_id(0).to(tl.int64)
+    vec = tl.arange(0, BLOCK_K)
+
+    for start_k in tl.range(0, K, BLOCK_K):
+        k_offs = start_k + vec
+        k_mask = k_offs < K
+        sum_vec = tl.zeros([BLOCK_K], dtype=tl.float32)
+
+        for idx in range(topk):
+            expert_id = tl.load(topk_ids_ptr + src_idx * topk + idx)
+            if expert_id >= g_lo and expert_id < g_end:
+                # flat row in (G, m) layout: expert_id * m + row_in_expert
+                dst_flat = tl.load(src2dst_ptr + src_idx * topk + idx).to(tl.int64)
+                # translate to row in this chunk's (c, m) layout
+                chunk_flat = dst_flat - g_start * m
+                weight = tl.load(topk_weights_ptr + src_idx * topk + idx).to(tl.float32)
+                data = tl.load(
+                    down_chunk_ptr + chunk_flat * K + k_offs, mask=k_mask
+                ).to(tl.float32)
+                sum_vec += weight * data
+
+        out_offs = src_idx * K + k_offs
+        existing = tl.load(output_ptr + out_offs, mask=k_mask, other=0.0).to(tl.float32)
+        tl.store(output_ptr + out_offs, (existing + sum_vec).to(tl.bfloat16), mask=k_mask)
+
+
+def _scatter_chunk_to_output(
+    down_chunk: torch.Tensor,       # (c, m, K) bfloat16
+    output: torch.Tensor,           # (num_tokens, K) bfloat16
+    src2dst: torch.Tensor,          # (num_tokens * topk,) int32
+    topk_ids: torch.Tensor,         # (num_tokens, topk) int32
+    topk_weights: torch.Tensor,     # (num_tokens, topk) float32
+    g_start: int,
+    m: int,
+):
+    """Scatter down_chunk rows weighted by topk_weights into the output buffer."""
+    c = down_chunk.shape[0]
+    K = down_chunk.shape[2]
+    num_tokens = output.shape[0]
+    topk = topk_ids.shape[1]
+
+    g_end = g_start + c
+    # Replicate the `expert_id > 0` guard from post_reorder_triton_kernel: skip
+    # expert 0, which acts as a sentinel for "no local expert" in EP settings.
+    g_lo = max(g_start, 1)
+
+    _scatter_chunk_kernel[(num_tokens,)](
+        down_chunk,
+        output,
+        src2dst,
+        topk_ids.view(-1),
+        topk_weights.view(-1),
+        g_start,
+        g_lo,
+        g_end,
+        m,
+        K,
+        topk,
+        BLOCK_K=512,
+    )
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -381,7 +473,141 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             )
 
         num_groups, m, k = hidden_states.shape
-        n = w13_weight.size(1)
+        n = w13_weight.size(1)   # 2 * ffn_dim (gateup output width)
+        K = w2_weight.shape[1]   # hidden_dim (down projection output width)
+        scale_block_size = 128
+
+        chunk_size = _MASKED_GEMM_CHUNK_SIZE
+        if chunk_size > 0:
+            # ------------------------------------------------------------------
+            # Chunked path: process `chunk_size` expert groups per iteration,
+            # reusing (chunk_size, m, *) intermediate buffers.
+            #
+            # Two sub-modes:
+            #   scatter mode  — src2dst available: scatter each chunk directly
+            #                   into a (num_tokens, K) final output, eliminating
+            #                   the full (G, m, K) down_output.
+            #   accumulate mode — no src2dst: write each chunk into
+            #                   down_output[g_start:g_end] (still full size),
+            #                   but gateup and down_input are chunk-sized.
+            # ------------------------------------------------------------------
+            src2dst = running_state.get("src2dst", None)
+            use_scatter = src2dst is not None
+
+            if use_scatter:
+                num_tokens = running_state["hidden_states_shape"][0]
+                topk_ids = running_state["topk_ids"]
+                topk_weights = running_state["topk_weights"]
+                final_output = torch.zeros(
+                    (num_tokens, K), device=hidden_states_device, dtype=torch.bfloat16
+                )
+            else:
+                down_output = torch.empty(
+                    (num_groups, m, K),
+                    device=hidden_states_device,
+                    dtype=torch.bfloat16,
+                )
+
+            # Pre-allocate reusable gateup buffer (chunk_size groups).
+            gateup_chunk = torch.empty(
+                (chunk_size, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            )
+
+            for g_start in range(0, num_groups, chunk_size):
+                g_end = min(g_start + chunk_size, num_groups)
+                c = g_end - g_start
+
+                masked_m_c = masked_m[g_start:g_end]
+                # View into the pre-allocated buffer (no copy for full chunks).
+                gc = gateup_chunk[:c]
+
+                # GEMM-0: hidden_states[chunk] → gc
+                asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (hidden_states[g_start:g_end], hidden_states_scale[g_start:g_end]),
+                    (w13_weight[g_start:g_end], w13_scale[g_start:g_end]),
+                    gc,
+                    masked_m_c,
+                    expected_m,
+                )
+
+                # Act + FP8 quant: gc → down_input_c, down_input_scale_c
+                if _MASKED_GEMM_FAST_ACT:
+                    down_input_c, down_input_scale_c = _hp_get('quant_8bit')(
+                        x=gc,
+                        dst_dtype=torch.float8_e4m3fn,
+                        group_size=scale_block_size,
+                        masked_m=masked_m_c,
+                        column_major_scales=True,
+                        scale_tma_aligned=True,
+                        scale_ue8m0=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0,
+                        fuse_silu_and_mul=True,
+                        enable_v2=True,
+                    )
+                else:
+                    down_input_c = torch.empty(
+                        (c, m, n // 2),
+                        device=hidden_states_device,
+                        dtype=torch.float8_e4m3fn,
+                    )
+                    down_input_scale_c = torch.empty(
+                        (c, m, n // 2 // scale_block_size),
+                        device=hidden_states_device,
+                        dtype=torch.float32,
+                    )
+                    _hp_get('silu_masked')(
+                        gc,
+                        down_input_c,
+                        down_input_scale_c,
+                        scale_block_size,
+                        masked_m_c,
+                        scale_ue8m0=asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0,
+                    )
+
+                if not asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
+                    down_input_scale_c = asym_gemm_wrapper.get_mn_major_tma_aligned_tensor(
+                        down_input_scale_c
+                    )
+
+                # GEMM-1: down_input_c → out_c
+                if use_scatter:
+                    # Allocate a per-chunk output buffer; it will be scattered
+                    # and freed before the next iteration.
+                    out_c = torch.empty(
+                        (c, m, K), device=hidden_states_device, dtype=torch.bfloat16
+                    )
+                else:
+                    # Write directly into the pre-allocated full output slice.
+                    out_c = down_output[g_start:g_end]
+
+                asym_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (down_input_c, down_input_scale_c),
+                    (w2_weight[g_start:g_end], w2_scale[g_start:g_end]),
+                    out_c,
+                    masked_m_c,
+                    expected_m,
+                )
+                del down_input_c, down_input_scale_c
+
+                if use_scatter:
+                    _scatter_chunk_to_output(
+                        out_c, final_output, src2dst,
+                        topk_ids, topk_weights, g_start, m,
+                    )
+                    del out_c
+
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+            del gateup_chunk
+
+            if use_scatter:
+                running_state["is_scattered"] = True
+                return final_output
+            else:
+                return down_output
+
+        # ------------------------------------------------------------------
+        # Original (non-chunked) path
+        # ------------------------------------------------------------------
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
@@ -392,15 +618,11 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             gateup_output,
             masked_m,
             expected_m,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
         )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
         # Act
-        scale_block_size = 128
         if _MASKED_GEMM_FAST_ACT:
             down_input, down_input_scale = sglang_per_token_group_quant_8bit(
                 x=gateup_output,
@@ -443,15 +665,13 @@ class AsymGemmRunnerCore(MoeRunnerCore):
         del gateup_output
 
         # GroupGemm-1
-        n = w2_weight.shape[1]
-
         if not asym_gemm_wrapper.ASYMGEMM_SCALE_UE8M0:
             down_input_scale = asym_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
 
         down_output = torch.empty(
-            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+            (num_groups, m, K), device=hidden_states_device, dtype=torch.bfloat16
         )
 
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
@@ -471,9 +691,6 @@ class AsymGemmRunnerCore(MoeRunnerCore):
             down_output,
             masked_m,
             expected_m,
-            runner_input.offsets,
-            runner_input.experts,
-            runner_input.list_size,
             **gemm_overlap_args_dict,
         )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
@@ -552,21 +769,12 @@ def _pre_permute_standard_to_asym_gemm_fp8(
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
 
-    offsets, experts, list_size = build_offsets_experts_from_masked_m(
-        masked_m,
-        hidden_states.shape[0],
-        hidden_states.shape[1],
-    )
-
     return AsymGemmRunnerInput(
         hidden_states=hidden_states,
         hidden_states_scale=hidden_states_scale,
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
-        offsets=offsets,
-        experts=experts,
-        list_size=list_size,
     )
 
 
@@ -655,20 +863,11 @@ def _pre_permute_standard_to_asym_gemm_bf16(
     running_state["hidden_states_device"] = hidden_states_device
     running_state["src2dst"] = src2dst
 
-    offsets, experts, list_size = build_offsets_experts_from_masked_m(
-        masked_m,
-        num_local_experts,
-        m_max,
-    )
-
     return AsymGemmBf16RunnerInput(
         hidden_states=gateup_input,
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
-        offsets =  offsets,
-        experts = experts,
-        list_size = list_size,
     )
 
 
@@ -685,25 +884,29 @@ def post_permute_asym_gemm_to_standard(
     hidden_states_shape = running_state["hidden_states_shape"]
     hidden_states_dtype = running_state["hidden_states_dtype"]
     hidden_states_device = running_state["hidden_states_device"]
-    src2dst = running_state["src2dst"]
-    topk_ids = running_state["topk_ids"]
-    topk_weights = running_state["topk_weights"]
 
-    output = torch.empty(
-        hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
-    )
-    post_reorder_triton_kernel[(hidden_states_shape[0],)](
-        runner_output.hidden_states,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        runner_config.top_k,
-        hidden_states_shape[1],
-        BLOCK_SIZE=512,
-    )
+    if running_state.get("is_scattered", False):
+        # _run_masked_gemm already scattered into (num_tokens, K); skip post_reorder.
+        output = runner_output.hidden_states
+    else:
+        src2dst = running_state["src2dst"]
+        topk_ids = running_state["topk_ids"]
+        topk_weights = running_state["topk_weights"]
 
-    dispose_tensor(runner_output.hidden_states)
+        output = torch.empty(
+            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
+        )
+        _hp_get('post_reorder')[(hidden_states_shape[0],)](
+            runner_output.hidden_states,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            runner_config.top_k,
+            hidden_states_shape[1],
+            BLOCK_SIZE=512,
+        )
+        dispose_tensor(runner_output.hidden_states)
 
     if runner_config.routed_scaling_factor is not None:
         output *= runner_config.routed_scaling_factor
@@ -735,12 +938,6 @@ def pre_permute_deepep_ll_to_asym_gemm(
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
 
-    offsets, experts, list_size = build_offsets_experts_from_masked_m(
-        masked_m,
-        hidden_states.shape[0],
-        hidden_states.shape[1],
-    )
-
     # Dtype-based dispatch
     if isinstance(quant_info, AsymGemmBf16MoeQuantInfo):
         return AsymGemmBf16RunnerInput(
@@ -748,9 +945,22 @@ def pre_permute_deepep_ll_to_asym_gemm(
             use_masked_gemm=True,
             masked_m=masked_m,
             expected_m=expected_m,
-            offsets=offsets,
-            experts=experts,
-            list_size=list_size,
+        )
+
+    if isinstance(quant_info, AsymGemmFp4MoeQuantInfo):
+        # DeepEP dispatcher may pass BF16 hidden states (no scale) or already
+        # FP4-quantized states. Quantize here only when scales are absent.
+        if hidden_states_scale is None:
+            hs_fp4, hs_scale = _quantize_bf16_to_nvfp4_e4m3(hidden_states)
+            dispose_tensor(hidden_states)
+        else:
+            hs_fp4, hs_scale = hidden_states, hidden_states_scale
+        return AsymGemmFp4RunnerInput(
+            hidden_states=hs_fp4,
+            hidden_states_scale=hs_scale,
+            use_masked_gemm=True,
+            masked_m=masked_m,
+            expected_m=expected_m,
         )
 
     return AsymGemmRunnerInput(
@@ -759,9 +969,6 @@ def pre_permute_deepep_ll_to_asym_gemm(
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
-        offsets =  offsets,
-        experts = experts,
-        list_size = list_size,
     )
 
 
