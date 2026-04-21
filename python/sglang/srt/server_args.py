@@ -3163,10 +3163,12 @@ class ServerArgs:
             return True
 
         # If decode backend is implicit, pick a safe backend without changing io backend.
-        model_config = self.get_model_config()
         if not self.use_mla_backend():
             # FlashInfer does not support attention sinks.
-            if is_flashinfer_available() and not model_config.has_attention_sinks:
+            if (
+                is_flashinfer_available()
+                and not self.get_model_config().has_attention_sinks
+            ):
                 self.decode_attention_backend = "flashinfer"
             else:
                 self.decode_attention_backend = "triton"
