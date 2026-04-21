@@ -1881,6 +1881,7 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
+                multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
 
@@ -2202,6 +2203,7 @@ class Scheduler(
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
+            multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
         )
         req.tokenizer = self.tokenizer
 
@@ -2368,6 +2370,8 @@ class Scheduler(
         # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
+            if self.running_batch.is_empty():
+                self.running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
