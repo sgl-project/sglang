@@ -47,6 +47,9 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+# float8_e4m3 max representable value; values above this overflow to NaN (0x7F).
+FP8_E4M3_MAX = 448.0
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()

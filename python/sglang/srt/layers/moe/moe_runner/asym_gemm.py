@@ -27,6 +27,9 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.offloader import get_offloader
+from sglang.srt.layers.quantization.fp8_utils import (
+    FP8_E4M3_MAX,
+)
 
 # Cached hot-path function references (populated on first use to avoid circular imports)
 _hp = {}  # hot-path cache dict
@@ -135,19 +138,23 @@ def build_offsets_experts_from_masked_m(
         experts:   int32 tensor of size num_groups+1
         list_size: num_active + 1
     """
-    offsets = torch.zeros(2 * num_groups, dtype=torch.int32, device=masked_m.device)
-    experts = torch.full(
-        (num_groups + 1,), -1, dtype=torch.int32, device=masked_m.device
-    )
-    list_size = torch.zeros(1, 1, dtype=torch.int32, device=masked_m.device)
+    offsets = []
+    experts = []
+    for g in range(num_groups):
+        v = masked_m[g].item()
+        if v > 0:
+            start = g * max_m
+            end = start + ((v + block_m - 1) // block_m) * block_m
+            offsets.append(start)
+            offsets.append(end)
+            experts.append(g)
 
-    _build_offsets_experts_kernel[(num_groups,)](
-        masked_m, offsets, experts, list_size, max_m, block_m
+    experts.append(-1)
+    return (
+        torch.tensor(offsets, dtype=torch.int32, device=masked_m.device),
+        torch.tensor(experts, dtype=torch.int32, device=masked_m.device),
+        len(experts),
     )
-    # list_size = num_active + 1 (the +1 accounts for the -1 terminator)
-    list_size.add_(1)
-
-    return offsets, experts, list_size
 
 
 @triton.jit
@@ -301,9 +308,9 @@ class AsymGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
-    offsets: Optional[torch.Tensor] = None
-    experts: Optional[torch.Tensor] = None
-    list_size: Optional[torch.Tensor] = None
+    offsets: Optional[int] = None
+    experts: Optional[int] = None
+    list_size: int = 0
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -612,7 +619,7 @@ def pre_permute_standard_to_asym_gemm(
             dispatch_output, quant_info, runner_config, running_state
         )
     if isinstance(quant_info, AsymGemmFp4MoeQuantInfo):
-        return _pre_permute_standard_to_asym_gemm_fp4_contiguous(
+        return _pre_permute_standard_to_asym_gemm_fp4(
             dispatch_output, quant_info, runner_config, running_state
         )
 
@@ -810,6 +817,109 @@ def _pre_permute_standard_to_asym_gemm_fp4_contiguous(
         hidden_states=sorted_fp4,
         hidden_states_scale=sorted_scale,
         use_masked_gemm=False,
+        offsets=offsets,
+        experts=experts,
+        list_size=list_size,
+    )
+
+
+def _pre_permute_standard_to_asym_gemm_fp4(
+    dispatch_output: StandardDispatchOutput,
+    quant_info,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AsymGemmFp4RunnerInput:
+    """Masked pre-permute for NVFP4 — mirrors _pre_permute_standard_to_asym_gemm_fp8.
+
+    Reorders tokens into a padded masked layout (num_experts, m_max, K) as BF16,
+    then quantizes to NVFP4 (packed uint8 + E4M3 per-group scales).
+    """
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        compute_masked_m_triton_kernel,
+        compute_seg_indptr_triton_kernel,
+        deepgemm_compute_src2dst_triton_kernel,
+    )
+    from sglang.srt.layers.moe.moe_runner.asym_gemm_fp4 import (
+        AsymGemmFp4RunnerInput,
+        _quantize_bf16_to_nvfp4_e4m3,
+    )
+
+    hidden_states, topk_output = (
+        dispatch_output.hidden_states,
+        dispatch_output.topk_output,
+    )
+    topk_weights, topk_ids, _ = topk_output
+
+    hidden_states_shape = hidden_states.shape
+    hidden_states_dtype = hidden_states.dtype
+    hidden_states_device = hidden_states.device
+    hidden_states_ref = hidden_states
+
+    num_local_experts = runner_config.num_local_experts
+    top_k = runner_config.top_k
+    all_tokens = topk_ids.numel()  # num_tokens * top_k
+    # m_max must be a multiple of 256 (matches moe_ep_deepgemm_preprocess)
+    m_max = (hidden_states.size(0) // 256 + 1) * 256
+    expected_m = (all_tokens - 1) // num_local_experts + 1
+
+    # PreReorder: sort tokens by expert, build seg_indptr / masked_m / src2dst
+    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+    seg_indptr = torch.zeros(
+        num_local_experts + 1, device=hidden_states_device, dtype=torch.int64
+    )
+    src2dst = torch.empty(all_tokens, device=hidden_states_device, dtype=torch.int32)
+    masked_m = torch.empty(num_local_experts, device=hidden_states_device, dtype=torch.int32)
+
+    compute_seg_indptr_triton_kernel[(num_local_experts + 1,)](
+        reorder_topk_ids, seg_indptr, all_tokens
+    )
+    compute_masked_m_triton_kernel[(num_local_experts,)](seg_indptr, masked_m)
+
+    grid = lambda meta: (triton.cdiv(all_tokens, meta["BLOCK_SIZE"]),)
+    deepgemm_compute_src2dst_triton_kernel[grid](
+        topk_ids, reorder_ids, seg_indptr, src2dst, m_max, all_tokens, BLOCK_SIZE=256,
+    )
+
+    # Scatter tokens into zero-initialised BF16 masked buffer (num_experts, m_max, K).
+    # src2dst[flat_idx] = expert_id * m_max + row_within_expert (flattened masked position).
+    K = hidden_states.size(1)
+    gateup_input = torch.zeros(
+        (num_local_experts, m_max, K),
+        device=hidden_states_device,
+        dtype=hidden_states_dtype,
+    )
+    flat_topk_ids = topk_ids.view(-1)
+    arange = torch.arange(all_tokens, device=hidden_states_device)
+    valid_mask = flat_topk_ids >= 0
+    valid_masked_pos = src2dst[valid_mask].to(torch.int64)
+    valid_token_indices = arange[valid_mask] // top_k
+    gateup_input.view(-1, K)[valid_masked_pos] = hidden_states[valid_token_indices]
+
+    dispose_tensor(hidden_states_ref)
+
+    # Quantize masked BF16 buffer to NVFP4
+    gateup_fp4, gateup_scale = _quantize_bf16_to_nvfp4_e4m3(gateup_input)
+    del gateup_input
+
+    offsets, experts, list_size = build_offsets_experts_from_masked_m(
+        masked_m,
+        gateup_fp4.shape[0],
+        gateup_fp4.shape[1],
+    )
+
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+    running_state["hidden_states_shape"] = hidden_states_shape
+    running_state["hidden_states_dtype"] = hidden_states_dtype
+    running_state["hidden_states_device"] = hidden_states_device
+    running_state["src2dst"] = src2dst
+
+    return AsymGemmFp4RunnerInput(
+        hidden_states=gateup_fp4,
+        hidden_states_scale=gateup_scale,
+        use_masked_gemm=True,
+        masked_m=masked_m,
+        expected_m=expected_m,
         offsets=offsets,
         experts=experts,
         list_size=list_size,
