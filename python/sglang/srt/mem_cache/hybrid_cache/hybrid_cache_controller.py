@@ -261,7 +261,7 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_hybrid_indices(op)
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -276,10 +276,12 @@ class HybridCacheController(BaseHiCacheController):
                 pool_transfers=op.pool_transfers,
             )
             finish_event.record()
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
+            self._record_transfer_indices_on_stream(
+                self.write_stream,
+                host_indices,
+                device_indices,
+                op.pool_transfers,
+            )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(
@@ -324,7 +326,7 @@ class HybridCacheController(BaseHiCacheController):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_hybrid_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -340,10 +342,12 @@ class HybridCacheController(BaseHiCacheController):
                     pool_transfers=op.pool_transfers,
                 )
                 producer_event.complete(i)
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+            self._record_transfer_indices_on_stream(
+                self.load_stream,
+                host_indices,
+                device_indices,
+                op.pool_transfers,
+            )
         self.ack_load_queue.append(
             HiCacheAck(
                 producer_event.start_event,
@@ -352,6 +356,23 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return producer_id
+
+    def _record_transfer_indices_on_stream(
+        self,
+        stream: torch.Stream,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> None:
+        if host_indices.is_cuda:
+            host_indices.record_stream(stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(stream)
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
+                transfer.host_indices.record_stream(stream)
+            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
+                transfer.device_indices.record_stream(stream)
 
     def prefetch(
         self,
@@ -423,6 +444,17 @@ class HybridCacheController(BaseHiCacheController):
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
+
+    def move_hybrid_indices(self, operation):
+        host_indices, device_indices = self.move_indices(
+            operation.host_indices, operation.device_indices
+        )
+        if operation.pool_transfers:
+            for transfer in operation.pool_transfers:
+                transfer.host_indices, transfer.device_indices = self.move_indices(
+                    transfer.host_indices, transfer.device_indices
+                )
+        return host_indices, device_indices
 
     def _page_transfer(self, operation):
         # Transfer extra pools

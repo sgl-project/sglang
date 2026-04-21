@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ShutdownReq,
     UnmergeLoraWeightsReq,
 )
+from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -86,8 +87,10 @@ class Scheduler(SchedulerDisaggMixin):
             logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
         else:
             self.receiver = None
+        from sglang.multimodal_gen.runtime.platforms import current_platform
 
-        worker = GPUWorker(
+        Exec_worker = CPUWorker if current_platform.is_cpu() else GPUWorker
+        worker = Exec_worker(
             local_rank=local_rank,
             master_port=port_args.master_port,
             rank=gpu_id,
