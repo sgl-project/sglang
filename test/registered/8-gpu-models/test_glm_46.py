@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
@@ -12,6 +14,7 @@ register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 GLM_4_6_MODEL_PATH = "zai-org/GLM-4.6"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGLM46(unittest.TestCase):
     """Unified test class for GLM-4.6 performance and accuracy.
 
