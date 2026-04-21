@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 import numpy
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
@@ -135,6 +133,10 @@ def convert_to_channelwise(
 def requantize_with_max_scale(
     weight: torch.Tensor, weight_scale: torch.Tensor, logical_widths: List[int]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not weight.is_cuda:
+        raise NotImplementedError("requantize_with_max_scale requires CUDA")
+    from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+
     # Max scale to be used for requanitzation.
     max_w_scale = weight_scale.max()
 

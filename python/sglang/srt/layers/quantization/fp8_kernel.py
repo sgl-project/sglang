@@ -51,7 +51,14 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda:
+try:
+    import sgl_kernel  # noqa: F401
+
+    _has_sgl_kernel = True
+except ImportError:
+    _has_sgl_kernel = False
+
+if _is_cuda and _has_sgl_kernel:
     from sgl_kernel import sgl_per_token_quant_fp8
 
     from sglang.jit_kernel.per_tensor_quant_fp8 import (
@@ -2065,7 +2072,7 @@ def triton_scaled_mm(
     return result.to(out_dtype)
 
 
-if _is_cuda:
+if _is_cuda and _has_sgl_kernel:
     if enable_sgl_per_token_group_quant_8bit:
 
         @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit")
