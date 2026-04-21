@@ -1004,14 +1004,14 @@ class MooncakeKVManager(CommonKVManager):
                     f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
                 )
             dst_state_indices = req.dst_state_indices
-            if len(prefill_state_indices) > len(req.dst_state_indices):
+            if len(prefill_state_indices) > len(dst_state_indices):
                 logger.warning(
                     f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(dst_state_indices)}"
                 )
                 prefill_state_indices = prefill_state_indices[
                     : len(dst_state_indices)
                 ]
-            elif len(prefill_state_indices) < len(req.dst_state_indices):
+            elif len(prefill_state_indices) < len(dst_state_indices):
                 logger.warning(
                     f"len(prefill_state_indices) = {len(prefill_state_indices)}, len(dst_state_indices) = {len(dst_state_indices)}"
                 )
