@@ -3,6 +3,8 @@
 Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 from typing import TYPE_CHECKING
@@ -13,7 +15,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def adaptive_unsupported_reason(server_args: "ServerArgs") -> str | None:
+def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
     if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
         return (
