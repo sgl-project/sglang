@@ -220,7 +220,6 @@ def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
     BLOCK_M = frozen_kw['BLOCK_M']
     BLOCK_N = frozen_kw['BLOCK_N']
     BLOCK_DMODEL = frozen_kw['BLOCK_DMODEL']
-    ACTUAL_BLOCK_DMODEL = frozen_kw['ACTUAL_BLOCK_DMODEL']
     NUM_STAGES = frozen_kw['NUM_STAGES']
     # Sinks pointer is a runtime arg (varies per layer on GPT-OSS); HAS_SINK
     # is a compile-time constant baked into the specialized kernel and part
@@ -246,7 +245,7 @@ def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
             strides[4], strides[5], strides[6], strides[7],
             strides[8], strides[9], strides[10], strides[11],
             IS_CAUSAL, USE_CUSTOM_MASK, ENABLE_PREFIX_UNMASKED,
-            BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            BLOCK_M, BLOCK_N, BLOCK_DMODEL,
             NUM_STAGES,
             sinks, HAS_SINK,
             LOGIT_CAP, XAI_TEMPERATURE_LEN, SLIDING_WINDOW_SIZE,
@@ -270,8 +269,8 @@ def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
     ``EXT_BLOCK_N``/``EXT_NUM_STAGES``, ``ASYNC_PAD_K``/``V``) plus the
     persistent-superset runtime args (num_heads, n_m_tiles, total_valid_tiles,
     total_programs, partial_out, partial_lse, tile_done) and constexprs
-    (IS_PERSISTENT, SPLIT_K, V_PRELOAD). With IS_PERSISTENT=False DCE drops
-    every access to the persistent-only args.
+    (IS_PERSISTENT, SPLIT_K). With IS_PERSISTENT=False DCE drops every
+    access to the persistent-only args.
     """
     from triton.runtime import driver as _triton_driver
     from triton import knobs as _triton_knobs
@@ -294,9 +293,7 @@ def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
     BLOCK_M = frozen_kw['BLOCK_M']
     BLOCK_N = frozen_kw['BLOCK_N']
     BLOCK_DMODEL = frozen_kw['BLOCK_DMODEL']
-    ACTUAL_BLOCK_DMODEL = frozen_kw['ACTUAL_BLOCK_DMODEL']
     BLOCK_DV = frozen_kw['BLOCK_DV']
-    ACTUAL_BLOCK_DV = frozen_kw['ACTUAL_BLOCK_DV']
     NUM_STAGES = frozen_kw['NUM_STAGES']
     EXT_BLOCK_N = frozen_kw['EXT_BLOCK_N']
     EXT_NUM_STAGES = frozen_kw['EXT_NUM_STAGES']
@@ -324,8 +321,8 @@ def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
             strides[8], strides[9], strides[10], strides[11],
             IS_CAUSAL, USE_CUSTOM_MASK, SKIP_PREFIX_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED, ENABLE_MASK_SPLIT,
-            BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
-            BLOCK_DV, ACTUAL_BLOCK_DV,
+            BLOCK_M, BLOCK_N, BLOCK_DMODEL,
+            BLOCK_DV,
             NUM_STAGES, EXT_BLOCK_N, EXT_NUM_STAGES,
             ASYNC_PAD_K, ASYNC_PAD_V,
             sinks, HAS_SINK,
@@ -334,8 +331,9 @@ def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
             # Persistent-path runtime args (DCE'd under IS_PERSISTENT=False).
             0, 0, 0, 0,  # num_heads, n_m_tiles, total_valid_tiles, total_programs
             _dummy_partial_out, _dummy_partial_lse, _dummy_tile_done,
+            _dummy_cum_tiles, 0,  # actual_batch_size=0
             # Persistent-path constexprs.
-            False, 1, False,  # IS_PERSISTENT, SPLIT_K, V_PRELOAD
+            False, 1, 8, 0,  # IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2, TILE_MAP_MODE
         )
 
     return _fast_run_fp8
@@ -1064,7 +1062,7 @@ def gluon_extend_attention_fwd(
             return
 
     if _is_fast_eligible:
-        _BLOCK_DMODEL, _ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
+        _BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
         if Lq <= 128:
             _BM_est = 128
@@ -1227,7 +1225,7 @@ def gluon_extend_attention_fwd(
             "EXT_BLOCK_N": _EXT_BN, "EXT_NUM_STAGES": _EXT_NS,
             "SKIP_PREFIX_CUSTOM_MASK": True,
             "ENABLE_MASK_SPLIT": Lq < 256,
-            "BLOCK_DV": _BLOCK_DMODEL, "ACTUAL_BLOCK_DV": Lq,
+            "BLOCK_DV": _BLOCK_DMODEL,
             "ASYNC_PAD_K": _PAD_K, "ASYNC_PAD_V": _PAD_V,
         } if _kv_is_fp8 else {}
 
@@ -1236,7 +1234,7 @@ def gluon_extend_attention_fwd(
             USE_CUSTOM_MASK=False,
             ENABLE_PREFIX_UNMASKED=is_causal,
             BLOCK_M=_BM, BLOCK_N=_BN,
-            BLOCK_DMODEL=_BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL=_ACTUAL_BLOCK_DMODEL,
+            BLOCK_DMODEL=_BLOCK_DMODEL,
             NUM_STAGES=_NS,
             **_kernel_extra,
             Sinks=sinks, HAS_SINK=sinks is not None,
@@ -1291,7 +1289,7 @@ def gluon_extend_attention_fwd(
                 total_valid_tiles=0, total_programs=0,
                 partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
                 tile_done=_dummy_tile_done,
-                IS_PERSISTENT=False, SPLIT_K=1, V_PRELOAD=False,
+                IS_PERSISTENT=False, SPLIT_K=1,
                 grid=_frozen_grid, **_frozen_kw,
             )
         else:
@@ -1338,7 +1336,7 @@ def gluon_extend_attention_fwd(
     # Full dispatch path: heterogeneous batches, custom_mask, test overrides.
     _bump_dispatch("full_dispatch")
 
-    BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
+    BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
     # min_len_extend is only needed below on the D>=256 / persistent / splitk
     # branches. Computing it eagerly would cost a ~15us GPU sync; compute
@@ -1585,7 +1583,7 @@ def gluon_extend_attention_fwd(
         "EXT_BLOCK_N": EXT_BLOCK_N, "EXT_NUM_STAGES": EXT_NUM_STAGES,
         "SKIP_PREFIX_CUSTOM_MASK": skip_prefix_custom_mask,
         "ENABLE_MASK_SPLIT": Lq < 256,
-        "BLOCK_DV": BLOCK_DMODEL, "ACTUAL_BLOCK_DV": Lq,
+        "BLOCK_DV": BLOCK_DMODEL,
         "ASYNC_PAD_K": 16, "ASYNC_PAD_V": 16,
     } if _kv_is_fp8 else {}
 
@@ -1606,7 +1604,7 @@ def gluon_extend_attention_fwd(
             USE_CUSTOM_MASK=USE_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            BLOCK_DMODEL=BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
+            BLOCK_DMODEL=BLOCK_DMODEL,
             NUM_STAGES=NUM_STAGES,
             **_kernel_extra_full,
             Sinks=sinks, HAS_SINK=sinks is not None,
@@ -1618,7 +1616,7 @@ def gluon_extend_attention_fwd(
             total_valid_tiles=0, total_programs=0,
             partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
             tile_done=_dummy_tile_done,
-            IS_PERSISTENT=False, SPLIT_K=1, V_PRELOAD=False,
+            IS_PERSISTENT=False, SPLIT_K=1,
             PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
             num_warps=num_warps, num_stages=1,
             waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
@@ -1643,7 +1641,7 @@ def gluon_extend_attention_fwd(
             USE_CUSTOM_MASK=USE_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-            BLOCK_DMODEL=BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
+            BLOCK_DMODEL=BLOCK_DMODEL,
             NUM_STAGES=NUM_STAGES,
             Sinks=sinks, HAS_SINK=sinks is not None,
             LOGIT_CAP=logit_cap,
@@ -1709,7 +1707,7 @@ def _launch_persistent_fp8(
     and the dummy mask tensors when ``USE_CUSTOM_MASK`` is False."""
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
-    BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
+    BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
     USE_CUSTOM_MASK = custom_mask is not None
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
@@ -1860,9 +1858,7 @@ def _launch_persistent_fp8(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=BLOCK_DMODEL,
-        ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
-        ACTUAL_BLOCK_DV=Lq,
         NUM_STAGES=NUM_STAGES,
         EXT_BLOCK_N=EXT_BLOCK_N,
         EXT_NUM_STAGES=EXT_NUM_STAGES,
@@ -1885,7 +1881,6 @@ def _launch_persistent_fp8(
         actual_batch_size=batch_size,
         IS_PERSISTENT=True,
         SPLIT_K=SPLIT_K,
-        V_PRELOAD=False,
         MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
         TILE_MAP_MODE=TILE_MAP_MODE,
         PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
@@ -1917,7 +1912,7 @@ def _launch_splitk_fp8(
     device = q_extend.device
     batch_size = qo_indptr.shape[0] - 1
 
-    BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
+    BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
     BLOCK_DV = BLOCK_DMODEL
 
     n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M

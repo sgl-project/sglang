@@ -630,7 +630,6 @@ def issue_async_load_k_prefix(
     stride_buf_kbs,  #
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     kt_async_layout: gl.constexpr,  #
 ):
     kt_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=kt_async_layout)
@@ -645,8 +644,6 @@ def issue_async_load_k_prefix(
     kt_offsets = (kt_offs_d[:, None] + kv_locs[None, :] * stride_buf_kbs).to(tl.int32)
 
     kt_mask = mask_n[None, :]
-    if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-        kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
     _buffer_load_to_shared_cast_safe(
         kt_smem, k_prefix_base, kt_offsets, mask=kt_mask, other=0.0
     )
@@ -663,7 +660,6 @@ def issue_async_load_v_prefix(
     stride_buf_vbs,  #
     BLOCK_N: gl.constexpr,
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     v_async_layout: gl.constexpr,  #
 ):
     v_offs_n_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=v_async_layout)
@@ -678,8 +674,6 @@ def issue_async_load_v_prefix(
     v_offsets = (kv_locs[:, None] * stride_buf_vbs + v_offs_d[None, :]).to(tl.int32)
 
     v_mask = mask_n[:, None]
-    if ACTUAL_BLOCK_DV != BLOCK_DV:
-        v_mask = v_mask & (v_offs_d[None, :] < ACTUAL_BLOCK_DV)
     _buffer_load_to_shared_cast_safe(
         v_smem, v_prefix_base, v_offsets, mask=v_mask, other=0.0
     )
@@ -694,15 +688,12 @@ def issue_dma_k_prefix_from_locs(
     stride_buf_kbs,  #
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     kt_async_layout: gl.constexpr,  #
 ):
     kt_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=kt_async_layout)
     kt_offs_d = gl.arange(0, BLOCK_DMODEL, layout=kt_offs_d_layout)
     kt_offsets = (kt_offs_d[:, None] + kv_locs[None, :] * stride_buf_kbs).to(tl.int32)
     kt_mask = mask_n[None, :]
-    if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-        kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
     _buffer_load_to_shared_cast_safe(
         kt_smem, k_prefix_base, kt_offsets, mask=kt_mask, other=0.0
     )
@@ -717,15 +708,12 @@ def issue_dma_v_prefix_from_locs(
     stride_buf_vbs,  #
     BLOCK_N: gl.constexpr,
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     v_async_layout: gl.constexpr,  #
 ):
     v_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=v_async_layout)
     v_offs_d = gl.arange(0, BLOCK_DV, layout=v_offs_d_layout)
     v_offsets = (kv_locs[:, None] * stride_buf_vbs + v_offs_d[None, :]).to(tl.int32)
     v_mask = mask_n[:, None]
-    if ACTUAL_BLOCK_DV != BLOCK_DV:
-        v_mask = v_mask & (v_offs_d[None, :] < ACTUAL_BLOCK_DV)
     _buffer_load_to_shared_cast_safe(
         v_smem, v_prefix_base, v_offsets, mask=v_mask, other=0.0
     )
@@ -740,21 +728,14 @@ def issue_dma_k_prefix_from_locs_hot(
     stride_buf_kbs,  #
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     kt_async_layout: gl.constexpr,  #
 ):
     kt_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=kt_async_layout)
     kt_offs_d = gl.arange(0, BLOCK_DMODEL, layout=kt_offs_d_layout)
     kt_offsets = (kt_offs_d[:, None] + kv_locs[None, :] * stride_buf_kbs).to(tl.int32)
-    if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-        kt_mask = kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL
-        _buffer_load_to_shared_cast_safe(
-            kt_smem, k_prefix_base, kt_offsets, mask=kt_mask, other=0.0
-        )
-    else:
-        _buffer_load_to_shared_cast_safe(
-            kt_smem, k_prefix_base, kt_offsets, mask=scalar_mask, other=0.0
-        )
+    _buffer_load_to_shared_cast_safe(
+        kt_smem, k_prefix_base, kt_offsets, mask=scalar_mask, other=0.0
+    )
 
 
 @gluon.jit
@@ -766,21 +747,14 @@ def issue_dma_v_prefix_from_locs_hot(
     stride_buf_vbs,  #
     BLOCK_N: gl.constexpr,
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     v_async_layout: gl.constexpr,  #
 ):
     v_offs_d_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=v_async_layout)
     v_offs_d = gl.arange(0, BLOCK_DV, layout=v_offs_d_layout)
     v_offsets = (kv_locs[:, None] * stride_buf_vbs + v_offs_d[None, :]).to(tl.int32)
-    if ACTUAL_BLOCK_DV != BLOCK_DV:
-        v_mask = v_offs_d[None, :] < ACTUAL_BLOCK_DV
-        _buffer_load_to_shared_cast_safe(
-            v_smem, v_prefix_base, v_offsets, mask=v_mask, other=0.0
-        )
-    else:
-        _buffer_load_to_shared_cast_safe(
-            v_smem, v_prefix_base, v_offsets, mask=scalar_mask, other=0.0
-        )
+    _buffer_load_to_shared_cast_safe(
+        v_smem, v_prefix_base, v_offsets, mask=scalar_mask, other=0.0
+    )
 
 
 @gluon.jit
@@ -792,7 +766,6 @@ def issue_async_load_k_extend(
     stride_kbs,  #
     BLOCK_N: gl.constexpr,
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     kt_async_layout: gl.constexpr,  #
     SKIP_BOUNDS_CHECK: gl.constexpr = False,
 ):
@@ -808,8 +781,6 @@ def issue_async_load_k_extend(
         kt_mask = None
     else:
         kt_mask = (start_n + kt_offs_n[None, :]) < seq_len_extend
-        if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-            kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
     _buffer_load_to_shared_cast_safe(
         kt_smem, k_base, kt_offsets, mask=kt_mask, other=0.0
     )
@@ -824,7 +795,6 @@ def issue_async_load_v_extend(
     stride_vbs,  #
     BLOCK_N: gl.constexpr,
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     v_async_layout: gl.constexpr,  #
     SKIP_BOUNDS_CHECK: gl.constexpr = False,
 ):
@@ -840,8 +810,6 @@ def issue_async_load_v_extend(
         v_mask = None
     else:
         v_mask = (start_n + v_offs_n[:, None]) < seq_len_extend
-        if ACTUAL_BLOCK_DV != BLOCK_DV:
-            v_mask = v_mask & (v_offs_d[None, :] < ACTUAL_BLOCK_DV)
     _buffer_load_to_shared_cast_safe(
         v_smem, v_base, v_offsets, mask=v_mask, other=0.0
     )
@@ -972,67 +940,37 @@ def compute_softmax_extend(
     mma_offs_n_col: gl.constexpr,
     mma_offs_m_row: gl.constexpr,  #
 ):
-    qk_scaled = qk * qk_scale
-    if LOGIT_CAP > 0:
-        log2_cap: gl.constexpr = LOGIT_CAP * LOG2E
-        inv_cap: gl.constexpr = 2.0 / LOGIT_CAP
-        e_neg = tl.math.exp2(-qk_scaled * inv_cap)
-        sig = 1.0 / (1.0 + e_neg)
-        qk_scaled = log2_cap * (2.0 * sig - 1.0)
-    if XAI_TEMPERATURE_LEN > 0:
-        qk_scaled = qk_scaled * xai_temperature_reg[:, None]
-    if MASK_STEPS:
-        bound_offs = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
-        q_offs = cur_block_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=mma_offs_m_row)
-        valid_mask = q_offs[:, None] < seq_len_extend
-        valid_mask = valid_mask & (bound_offs[None, :] < seq_len_extend)
-        if USE_CUSTOM_MASK:
-            mask_ptrs = (
-                Mask
-                + mask_base_idx
-                + q_offs[:, None] * mask_row_stride
-                + mask_kv_col_offset
-                + start_n
-                + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)[None, :]
-            )
-            mask_vals = gl.load(mask_ptrs, mask=valid_mask, other=0)
-            valid_mask = valid_mask & (mask_vals != 0)
-        elif IS_CAUSAL:
-            valid_mask = valid_mask & (q_offs[:, None] >= bound_offs[None, :])
-        if SLIDING_WINDOW_SIZE > 0:
-            valid_mask = valid_mask & (
-                q_offs[:, None] <= bound_offs[None, :] + SLIDING_WINDOW_SIZE
-            )
-        qk_scaled = gl.where(
-            valid_mask,
-            qk_scaled,
-            gl.full(
-                [BLOCK_M, BLOCK_N], float("-inf"), dtype=gl.float32, layout=mma_layout
-            ),
-        )
+    """Fused softmax step: ``compute_softmax_extend_part0`` composed with
+    ``compute_softmax_extend_part1``. Returns ``(acc, l_i, m_i, p)``.
 
-        m_ij = nan_propagating_max(qk_scaled, axis=1)
-        m_new = gl.maximum(m_i, m_ij, propagate_nan=tl.PropagateNan.ALL)
-        if SLIDING_WINDOW_SIZE > 0 or USE_CUSTOM_MASK:
-            m_new = gl.maximum(
-                m_new,
-                gl.full(
-                    [BLOCK_M],
-                    -1e20,
-                    dtype=gl.float32,
-                    layout=gl.SliceLayout(dim=1, parent=mma_layout),
-                ),
-            )
-        p = gl.exp2(qk_scaled - m_new[:, None])
-    else:
-        m_ij = nan_propagating_max(qk_scaled, axis=1)
-        m_new = gl.maximum(m_i, m_ij, propagate_nan=tl.PropagateNan.ALL)
-        p = gl.exp2(qk_scaled - m_new[:, None])
-    l_ij = gl.sum(p, axis=1)
-    alpha = gl.exp2(m_i - m_new)
-    l_i = l_i * alpha + l_ij
-    acc = acc * alpha[:, None]
-    m_i = m_new
+    Used by callers that don't need the ``_part0``/``_part1`` split for
+    warp-pipelined overlap between QK MMA and V DMA.
+    """
+    p, alpha, m_new = compute_softmax_extend_part0(
+        m_i,
+        qk,
+        start_n,
+        cur_block_m,
+        seq_len_extend,
+        qk_scale,
+        LOGIT_CAP,
+        xai_temperature_reg,
+        XAI_TEMPERATURE_LEN,
+        SLIDING_WINDOW_SIZE,
+        IS_CAUSAL,
+        Mask,
+        mask_base_idx,
+        mask_row_stride,
+        mask_kv_col_offset,
+        USE_CUSTOM_MASK,
+        MASK_STEPS,
+        BLOCK_M,
+        BLOCK_N,
+        mma_layout,
+        mma_offs_n_col,
+        mma_offs_m_row,
+    )
+    acc, l_i, m_i = compute_softmax_extend_part1(acc, l_i, p, alpha, m_new)
     return acc, l_i, m_i, p
 
 
@@ -1180,9 +1118,7 @@ def attn_fwd_inner_prefix_pipelined(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     NUM_STAGES: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
@@ -1227,7 +1163,6 @@ def attn_fwd_inner_prefix_pipelined(
             stride_buf_kbs,
             BLOCK_N,
             BLOCK_DMODEL,
-            ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
         )
         issue_async_load_v_prefix(
@@ -1240,7 +1175,6 @@ def attn_fwd_inner_prefix_pipelined(
             stride_buf_vbs,
             BLOCK_N,
             BLOCK_DV,
-            ACTUAL_BLOCK_DV,
             v_async_layout,
         )
 
@@ -1292,7 +1226,6 @@ def attn_fwd_inner_prefix_pipelined(
                     stride_buf_kbs,
                     BLOCK_N,
                     BLOCK_DMODEL,
-                    ACTUAL_BLOCK_DMODEL,
                     kt_async_layout,
                 )
             else:
@@ -1304,7 +1237,6 @@ def attn_fwd_inner_prefix_pipelined(
                     stride_buf_kbs,
                     BLOCK_N,
                     BLOCK_DMODEL,
-                    ACTUAL_BLOCK_DMODEL,
                     kt_async_layout,
                 )
 
@@ -1345,7 +1277,6 @@ def attn_fwd_inner_prefix_pipelined(
                     stride_buf_vbs,
                     BLOCK_N,
                     BLOCK_DV,
-                    ACTUAL_BLOCK_DV,
                     v_async_layout,
                 )
             else:
@@ -1357,7 +1288,6 @@ def attn_fwd_inner_prefix_pipelined(
                     stride_buf_vbs,
                     BLOCK_N,
                     BLOCK_DV,
-                    ACTUAL_BLOCK_DV,
                     v_async_layout,
                 )
             nf_start_n = ((block_n + NUM_STAGES + 1) * BLOCK_N).to(tl.int32)
@@ -1467,9 +1397,7 @@ def attn_fwd_inner_prefix_short(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
     kt_dot_layout: gl.constexpr,
@@ -1477,7 +1405,6 @@ def attn_fwd_inner_prefix_short(
     v_dot_layout: gl.constexpr,  #
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,  #
-    V_PRELOAD: gl.constexpr = False,  #
     block_start=0,
 ):
     n_prefix_blocks = (seq_len_prefix + BLOCK_N - 1) // BLOCK_N
@@ -1497,7 +1424,6 @@ def attn_fwd_inner_prefix_short(
             stride_buf_kbs,
             BLOCK_N,
             BLOCK_DMODEL,
-            ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
         )
         issue_async_load_v_prefix(
@@ -1510,17 +1436,11 @@ def attn_fwd_inner_prefix_short(
             stride_buf_vbs,
             BLOCK_N,
             BLOCK_DV,
-            ACTUAL_BLOCK_DV,
             v_async_layout,
         )
 
-        if V_PRELOAD:
-            cdna4_async.wait_group(0)
-        else:
-            cdna4_async.wait_group(1)
+        cdna4_async.wait_group(1)
         kt_dot = cdna4_async.load_shared_relaxed(kt_smem.index(0), kt_dot_layout)
-        if V_PRELOAD:
-            v_dot = cdna4_async.load_shared_relaxed(v_smem.index(0), v_dot_layout)
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
@@ -1551,9 +1471,8 @@ def attn_fwd_inner_prefix_short(
             mma_offs_n_col,
         )
 
-        if not V_PRELOAD:
-            cdna4_async.wait_group(0)
-            v_dot = cdna4_async.load_shared_relaxed(v_smem.index(0), v_dot_layout)
+        cdna4_async.wait_group(0)
+        v_dot = cdna4_async.load_shared_relaxed(v_smem.index(0), v_dot_layout)
         p_cast = p.to(v_dot.dtype)
         p_dot = gl.convert_layout(p_cast, p_dot_layout)
         acc = do_mma(p_dot, v_dot, acc)
@@ -1595,9 +1514,7 @@ def attn_fwd_inner_prefix_dma_simple(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     NUM_STAGES: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
@@ -1643,7 +1560,6 @@ def attn_fwd_inner_prefix_dma_simple(
             stride_buf_kbs,
             BLOCK_N,
             BLOCK_DMODEL,
-            ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
         )
         issue_dma_v_prefix_from_locs(
@@ -1654,7 +1570,6 @@ def attn_fwd_inner_prefix_dma_simple(
             stride_buf_vbs,
             BLOCK_N,
             BLOCK_DV,
-            ACTUAL_BLOCK_DV,
             v_async_layout,
         )
 
@@ -1708,7 +1623,6 @@ def attn_fwd_inner_prefix_dma_simple(
             stride_buf_kbs,
             BLOCK_N,
             BLOCK_DMODEL,
-            ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
         )
 
@@ -1758,7 +1672,6 @@ def attn_fwd_inner_prefix_dma_simple(
             stride_buf_vbs,
             BLOCK_N,
             BLOCK_DV,
-            ACTUAL_BLOCK_DV,
             v_async_layout,
         )
 
@@ -1851,9 +1764,7 @@ def attn_fwd_inner_extend_dma(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     NUM_STAGES: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
@@ -1878,7 +1789,6 @@ def attn_fwd_inner_extend_dma(
             stride_kbs,
             BLOCK_N,
             BLOCK_DMODEL,
-            ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
             SKIP_BOUNDS_CHECK,
         )
@@ -1890,7 +1800,6 @@ def attn_fwd_inner_extend_dma(
             stride_vbs,
             BLOCK_N,
             BLOCK_DV,
-            ACTUAL_BLOCK_DV,
             v_async_layout,
             SKIP_BOUNDS_CHECK,
         )
@@ -1919,7 +1828,6 @@ def attn_fwd_inner_extend_dma(
             stride_kbs,
             BLOCK_N,
             BLOCK_DMODEL,
-            ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
             SKIP_BOUNDS_CHECK,
         )
@@ -1967,7 +1875,6 @@ def attn_fwd_inner_extend_dma(
             stride_vbs,
             BLOCK_N,
             BLOCK_DV,
-            ACTUAL_BLOCK_DV,
             v_async_layout,
             SKIP_BOUNDS_CHECK,
         )
@@ -2051,9 +1958,7 @@ def attn_fwd_inner_extend_pipelined(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     NUM_STAGES: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
@@ -2089,7 +1994,6 @@ def attn_fwd_inner_extend_pipelined(
             stride_kbs,
             BLOCK_N,
             BLOCK_DMODEL,
-            ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
             SKIP_BOUNDS_CHECK,
         )
@@ -2101,7 +2005,6 @@ def attn_fwd_inner_extend_pipelined(
             stride_vbs,
             BLOCK_N,
             BLOCK_DV,
-            ACTUAL_BLOCK_DV,
             v_async_layout,
             SKIP_BOUNDS_CHECK,
         )
@@ -2159,7 +2062,6 @@ def attn_fwd_inner_extend_pipelined(
                 stride_kbs,
                 BLOCK_N,
                 BLOCK_DMODEL,
-                ACTUAL_BLOCK_DMODEL,
                 kt_async_layout,
                 SKIP_BOUNDS_CHECK,
             )
@@ -2189,7 +2091,6 @@ def attn_fwd_inner_extend_pipelined(
                 stride_vbs,
                 BLOCK_N,
                 BLOCK_DV,
-                ACTUAL_BLOCK_DV,
                 v_async_layout,
                 SKIP_BOUNDS_CHECK,
             )
@@ -2281,9 +2182,7 @@ def attn_fwd_inner_prefix_serial(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     kt_blocked_layout: gl.constexpr,
     blocked_layout: gl.constexpr,  #
     kt_dot_layout: gl.constexpr,
@@ -2291,7 +2190,6 @@ def attn_fwd_inner_prefix_serial(
     v_dot_layout: gl.constexpr,  #
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,  #
-    V_PRELOAD: gl.constexpr = False,  #
 ):
     kt_offs_d = gl.arange(
         0, BLOCK_DMODEL, layout=gl.SliceLayout(dim=1, parent=kt_blocked_layout)
@@ -2321,28 +2219,12 @@ def attn_fwd_inner_prefix_serial(
             k_prefix_base + kt_offs_d[:, None] + kv_locs_k[None, :] * stride_buf_kbs
         )
         kt_mask = mask_n_k[None, :]
-        if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-            kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
         kt_global = gl.load(kt_ptrs, mask=kt_mask, other=0.0)
         kt_serial_smem.store(kt_global)
         kt_dot = kt_serial_smem.load(kt_dot_layout)
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
-
-        if V_PRELOAD:
-            n_idx_v = start_n + v_offs_n
-            mask_n_v = n_idx_v < seq_len_prefix
-            kv_locs_v = gl.load(
-                kv_indices + kv_start + n_idx_v, mask=mask_n_v, other=0
-            ).to(tl.int32)
-            v_ptrs = (
-                v_prefix_base + kv_locs_v[:, None] * stride_buf_vbs + v_offs_d[None, :]
-            )
-            v_mask = mask_n_v[:, None]
-            if ACTUAL_BLOCK_DV != BLOCK_DV:
-                v_mask = v_mask & (v_offs_d[None, :] < ACTUAL_BLOCK_DV)
-            v_global = gl.load(v_ptrs, mask=v_mask, other=0.0)
 
         acc, l_i, m_i, p = compute_softmax_prefix(
             acc,
@@ -2370,19 +2252,16 @@ def attn_fwd_inner_prefix_serial(
             mma_offs_n_col,
         )
 
-        if not V_PRELOAD:
-            n_idx_v = start_n + v_offs_n
-            mask_n_v = n_idx_v < seq_len_prefix
-            kv_locs_v = gl.load(
-                kv_indices + kv_start + n_idx_v, mask=mask_n_v, other=0
-            ).to(tl.int32)
-            v_ptrs = (
-                v_prefix_base + kv_locs_v[:, None] * stride_buf_vbs + v_offs_d[None, :]
-            )
-            v_mask = mask_n_v[:, None]
-            if ACTUAL_BLOCK_DV != BLOCK_DV:
-                v_mask = v_mask & (v_offs_d[None, :] < ACTUAL_BLOCK_DV)
-            v_global = gl.load(v_ptrs, mask=v_mask, other=0.0)
+        n_idx_v = start_n + v_offs_n
+        mask_n_v = n_idx_v < seq_len_prefix
+        kv_locs_v = gl.load(
+            kv_indices + kv_start + n_idx_v, mask=mask_n_v, other=0
+        ).to(tl.int32)
+        v_ptrs = (
+            v_prefix_base + kv_locs_v[:, None] * stride_buf_vbs + v_offs_d[None, :]
+        )
+        v_mask = mask_n_v[:, None]
+        v_global = gl.load(v_ptrs, mask=v_mask, other=0.0)
         v_serial_smem.store(v_global)
         v_dot = v_serial_smem.load(v_dot_layout)
 
@@ -2424,9 +2303,7 @@ def attn_fwd_inner_extend_serial(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     kt_blocked_layout: gl.constexpr,
     blocked_layout: gl.constexpr,  #
     kt_dot_layout: gl.constexpr,
@@ -2435,7 +2312,6 @@ def attn_fwd_inner_extend_serial(
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,
     mma_offs_m_row: gl.constexpr,  #
-    V_PRELOAD: gl.constexpr = False,  #
 ):
     kt_offs_d = gl.arange(
         0, BLOCK_DMODEL, layout=gl.SliceLayout(dim=1, parent=kt_blocked_layout)
@@ -2457,25 +2333,12 @@ def attn_fwd_inner_extend_serial(
             + (start_n + kt_offs_n[None, :]) * stride_kbs
         )
         kt_mask = (start_n + kt_offs_n[None, :]) < seq_len_extend
-        if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-            kt_mask = kt_mask & (kt_offs_d[:, None] < ACTUAL_BLOCK_DMODEL)
         kt_global = gl.load(kt_ptrs, mask=kt_mask, other=0.0)
         kt_serial_smem.store(kt_global)
         kt_dot = kt_serial_smem.load(kt_dot_layout)
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
-
-        if V_PRELOAD:
-            v_ptrs = (
-                v_extend_base
-                + (start_n + v_offs_n[:, None]) * stride_vbs
-                + v_offs_d[None, :]
-            )
-            v_mask = (start_n + v_offs_n[:, None]) < seq_len_extend
-            if ACTUAL_BLOCK_DV != BLOCK_DV:
-                v_mask = v_mask & (v_offs_d[None, :] < ACTUAL_BLOCK_DV)
-            v_global = gl.load(v_ptrs, mask=v_mask, other=0.0)
 
         acc, l_i, m_i, p = compute_softmax_extend(
             acc,
@@ -2504,16 +2367,13 @@ def attn_fwd_inner_extend_serial(
             mma_offs_m_row,
         )
 
-        if not V_PRELOAD:
-            v_ptrs = (
-                v_extend_base
-                + (start_n + v_offs_n[:, None]) * stride_vbs
-                + v_offs_d[None, :]
-            )
-            v_mask = (start_n + v_offs_n[:, None]) < seq_len_extend
-            if ACTUAL_BLOCK_DV != BLOCK_DV:
-                v_mask = v_mask & (v_offs_d[None, :] < ACTUAL_BLOCK_DV)
-            v_global = gl.load(v_ptrs, mask=v_mask, other=0.0)
+        v_ptrs = (
+            v_extend_base
+            + (start_n + v_offs_n[:, None]) * stride_vbs
+            + v_offs_d[None, :]
+        )
+        v_mask = (start_n + v_offs_n[:, None]) < seq_len_extend
+        v_global = gl.load(v_ptrs, mask=v_mask, other=0.0)
         v_serial_smem.store(v_global)
         v_dot = v_serial_smem.load(v_dot_layout)
 
@@ -2560,9 +2420,7 @@ def attn_fwd_inner_extend_short(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     BLOCK_DV: gl.constexpr,
-    ACTUAL_BLOCK_DV: gl.constexpr,  #
     kt_async_layout: gl.constexpr,
     v_async_layout: gl.constexpr,  #
     kt_dot_layout: gl.constexpr,
@@ -2571,7 +2429,6 @@ def attn_fwd_inner_extend_short(
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,
     mma_offs_m_row: gl.constexpr,  #
-    V_PRELOAD: gl.constexpr = False,  #
     SKIP_BOUNDS_CHECK: gl.constexpr = False,  #
 ):
     """Preload all K/V blocks into distinct SMEM slots, then compute.
@@ -2580,9 +2437,6 @@ def attn_fwd_inner_extend_short(
     Phase 1: issue K[i]->smem[i] and V[i]->smem[i] for all i.
     Phase 2: wait_group(0) -- everything fully drained.
     Phase 3: compute QK.softmax.PV block-by-block from resident SMEM.
-
-    When V_PRELOAD is True, V is loaded from SMEM to registers before softmax
-    so the smem->register transfer overlaps with softmax ALU work.
     """
     cdna4_async.wait_group(0)
 
@@ -2599,7 +2453,6 @@ def attn_fwd_inner_extend_short(
             stride_kbs,
             BLOCK_N,
             BLOCK_DMODEL,
-            ACTUAL_BLOCK_DMODEL,
             kt_async_layout,
             SKIP_BOUNDS_CHECK,
         )
@@ -2611,7 +2464,6 @@ def attn_fwd_inner_extend_short(
             stride_vbs,
             BLOCK_N,
             BLOCK_DV,
-            ACTUAL_BLOCK_DV,
             v_async_layout,
             SKIP_BOUNDS_CHECK,
         )
@@ -2627,8 +2479,6 @@ def attn_fwd_inner_extend_short(
         kt_dot = cdna4_async.load_shared_relaxed(
             kt_smem.index(buf_idx), kt_dot_layout
         )
-        if V_PRELOAD:
-            v_dot = cdna4_async.load_shared_relaxed(v_smem.index(buf_idx), v_dot_layout)
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
         qk = do_mma(q_dot, kt_dot, qk)
@@ -2660,8 +2510,7 @@ def attn_fwd_inner_extend_short(
             mma_offs_m_row,
         )
 
-        if not V_PRELOAD:
-            v_dot = cdna4_async.load_shared_relaxed(v_smem.index(buf_idx), v_dot_layout)
+        v_dot = cdna4_async.load_shared_relaxed(v_smem.index(buf_idx), v_dot_layout)
         p_cast = p.to(v_dot.dtype)
         p_dot = gl.convert_layout(p_cast, p_dot_layout)
         acc = do_mma(p_dot, v_dot, acc)

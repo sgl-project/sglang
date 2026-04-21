@@ -17,8 +17,8 @@ functionally identical to the pre-refactor basic kernel. When True, the
 same body services persistent / split-K / WCA launches.
 
 The following constexprs are derived internally (not accepted as parameters):
-BLOCK_DV/ACTUAL_BLOCK_DV (=BLOCK_DMODEL), ENABLE_MASK_SPLIT/SKIP_PREFIX_CUSTOM_MASK
-(True), ASYNC_PAD_K/V (from BLOCK_DMODEL). BLOCK_DPE is not present -- DeepSeek/MLA
+BLOCK_DV (=BLOCK_DMODEL), ENABLE_MASK_SPLIT/SKIP_PREFIX_CUSTOM_MASK (True),
+ASYNC_PAD_K/V (from BLOCK_DMODEL). BLOCK_DPE is not present -- DeepSeek/MLA
 will use a separate kernel.
 
 Prefix dispatch uses the "unmasked bulk + masked tail" split across all 3
@@ -68,7 +68,6 @@ def gluon_extend_attn_fwd(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     BLOCK_DMODEL: gl.constexpr,
-    ACTUAL_BLOCK_DMODEL: gl.constexpr,  #
     NUM_STAGES: gl.constexpr,  #
     Sinks,
     HAS_SINK: gl.constexpr,  #
@@ -91,11 +90,6 @@ def gluon_extend_attn_fwd(
     TILE_MAP_MODE: gl.constexpr = 0,  # 0=binary search on cum_tiles, 1=WCA inline linear scan
     PREFIX_MASK_MODE: gl.constexpr = 0,  # 0=auto (scalar on persistent, pipelined on basic), 1=force scalar_mask, 2=force pipelined
 ):
-    # Experimental flags that are always False in production after tuning.
-    # Kept as constexprs here so dead-code elimination removes the unused
-    # branches without bloating the kernel signature passed on every launch.
-    V_PRELOAD: gl.constexpr = False
-    UNIFY_CAUSAL_PATH: gl.constexpr = False
 
     num_warps: gl.constexpr = gl.num_warps()
 
@@ -116,8 +110,7 @@ def gluon_extend_attn_fwd(
     mma_m_layout: gl.constexpr = _blk[5]
 
     BLOCK_DV: gl.constexpr = BLOCK_DMODEL
-    ACTUAL_BLOCK_DV: gl.constexpr = ACTUAL_BLOCK_DMODEL
-    ENABLE_MASK_SPLIT: gl.constexpr = ACTUAL_BLOCK_DMODEL < 256
+    ENABLE_MASK_SPLIT: gl.constexpr = BLOCK_DMODEL < 256
     SKIP_PREFIX_CUSTOM_MASK: gl.constexpr = True
     ASYNC_PAD_K: gl.constexpr = 16
     ASYNC_PAD_V: gl.constexpr = 16
@@ -262,8 +255,6 @@ def gluon_extend_attn_fwd(
             + offs_d[None, :]
         )
         q_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) < seq_len_extend
-        if ACTUAL_BLOCK_DMODEL != BLOCK_DMODEL:
-            q_mask = q_mask & (offs_d[None, :] < ACTUAL_BLOCK_DMODEL)
         q = gl.load(q_ptrs, mask=q_mask, other=0.0)
 
         # softmax state
@@ -412,9 +403,7 @@ def gluon_extend_attn_fwd(
                             BLOCK_M,
                             BLOCK_N,
                             BLOCK_DMODEL,
-                            ACTUAL_BLOCK_DMODEL,
                             BLOCK_DV,
-                            ACTUAL_BLOCK_DV,
                             NUM_STAGES,
                             kt_async_layout,
                             v_async_layout,
@@ -458,9 +447,7 @@ def gluon_extend_attn_fwd(
                             BLOCK_M,
                             BLOCK_N,
                             BLOCK_DMODEL,
-                            ACTUAL_BLOCK_DMODEL,
                             BLOCK_DV,
-                            ACTUAL_BLOCK_DV,
                             kt_async_layout,
                             v_async_layout,
                             kt_dot_layout,
@@ -468,7 +455,6 @@ def gluon_extend_attn_fwd(
                             v_dot_layout,
                             mma_layout,
                             mma_offs_n_col,
-                            V_PRELOAD=V_PRELOAD,
                         )
                     if use_pipe_prefix and pfx_seq_len > pfx_full_len:
                         acc, l_i, m_i = attn_fwd_inner_prefix_short(
@@ -504,9 +490,7 @@ def gluon_extend_attn_fwd(
                             BLOCK_M,
                             BLOCK_N,
                             BLOCK_DMODEL,
-                            ACTUAL_BLOCK_DMODEL,
                             BLOCK_DV,
-                            ACTUAL_BLOCK_DV,
                             kt_async_layout,
                             v_async_layout,
                             kt_dot_layout,
@@ -514,7 +498,6 @@ def gluon_extend_attn_fwd(
                             v_dot_layout,
                             mma_layout,
                             mma_offs_n_col,
-                            V_PRELOAD=V_PRELOAD,
                             block_start=n_full_prefix,
                         )
 
@@ -530,8 +513,6 @@ def gluon_extend_attn_fwd(
                 if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
                     n_full_blocks = 0
                 elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
-                    n_full_blocks = 0
-                elif UNIFY_CAUSAL_PATH and IS_CAUSAL:
                     n_full_blocks = 0
                 else:
                     partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
@@ -592,9 +573,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
                         v_async_layout,
@@ -637,9 +616,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_async_layout,
                         v_async_layout,
                         kt_dot_layout,
@@ -648,7 +625,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        V_PRELOAD=V_PRELOAD,
                     )
                 masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
                 remaining_blocks = n_extend_blocks - masked_start
@@ -683,9 +659,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
                         v_async_layout,
@@ -727,9 +701,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_async_layout,
                         v_async_layout,
                         kt_dot_layout,
@@ -738,7 +710,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        V_PRELOAD=V_PRELOAD,
                     )
 
             else:
@@ -801,9 +772,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_blocked_layout,
                         blocked_layout,
                         kt_dot_layout,
@@ -811,7 +780,6 @@ def gluon_extend_attn_fwd(
                         v_dot_layout,
                         mma_layout,
                         mma_offs_n_col,
-                        V_PRELOAD,
                     )
 
                 if IS_CAUSAL:
@@ -823,8 +791,6 @@ def gluon_extend_attn_fwd(
                 if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
                     n_full_blocks = 0
                 elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
-                    n_full_blocks = 0
-                elif UNIFY_CAUSAL_PATH and IS_CAUSAL:
                     n_full_blocks = 0
                 else:
                     partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
@@ -885,9 +851,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_blocked_layout,
                         blocked_layout,
                         kt_dot_layout,
@@ -896,7 +860,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        V_PRELOAD,
                     )
                 masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
                 if n_extend_blocks > masked_start:
@@ -930,9 +893,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_blocked_layout,
                         blocked_layout,
                         kt_dot_layout,
@@ -941,7 +902,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        V_PRELOAD,
                     )
 
         else:
@@ -1031,9 +991,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
                         v_async_layout,
@@ -1078,9 +1036,7 @@ def gluon_extend_attn_fwd(
                             BLOCK_M,
                             BLOCK_N,
                             BLOCK_DMODEL,
-                            ACTUAL_BLOCK_DMODEL,
                             BLOCK_DV,
-                            ACTUAL_BLOCK_DV,
                             kt_async_layout,
                             v_async_layout,
                             kt_dot_layout,
@@ -1088,7 +1044,6 @@ def gluon_extend_attn_fwd(
                             v_dot_layout,
                             mma_layout,
                             mma_offs_n_col,
-                            V_PRELOAD=V_PRELOAD,
                             block_start=n_full_prefix,
                         )
                 elif pfx_seq_len > 0:
@@ -1125,9 +1080,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_async_layout,
                         v_async_layout,
                         kt_dot_layout,
@@ -1135,7 +1088,6 @@ def gluon_extend_attn_fwd(
                         v_dot_layout,
                         mma_layout,
                         mma_offs_n_col,
-                        V_PRELOAD=V_PRELOAD,
                     )
 
                 # EXTEND: per-CTA dispatch (v2 core change)
@@ -1148,8 +1100,6 @@ def gluon_extend_attn_fwd(
                 if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
                     n_full_blocks = 0
                 elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
-                    n_full_blocks = 0
-                elif UNIFY_CAUSAL_PATH and IS_CAUSAL:
                     n_full_blocks = 0
                 else:
                     partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
@@ -1210,9 +1160,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
                         v_async_layout,
@@ -1254,9 +1202,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_async_layout,
                         v_async_layout,
                         kt_dot_layout,
@@ -1265,7 +1211,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        V_PRELOAD=V_PRELOAD,
                     )
                 masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
                 remaining_blocks = n_extend_blocks - masked_start
@@ -1300,9 +1245,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
                         v_async_layout,
@@ -1344,9 +1287,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_async_layout,
                         v_async_layout,
                         kt_dot_layout,
@@ -1355,7 +1296,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        V_PRELOAD=V_PRELOAD,
                     )
 
             else:
@@ -1437,9 +1377,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
                         v_async_layout,
@@ -1484,9 +1422,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_async_layout,
                         v_async_layout,
                         kt_dot_layout,
@@ -1494,7 +1430,6 @@ def gluon_extend_attn_fwd(
                         v_dot_layout,
                         mma_layout,
                         mma_offs_n_col,
-                        V_PRELOAD=V_PRELOAD,
                     )
                 if n_full_prefix >= NUM_STAGES and pfx_seq_len > pfx_full_len:
                     acc, l_i, m_i = attn_fwd_inner_prefix_short(
@@ -1530,9 +1465,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_async_layout,
                         v_async_layout,
                         kt_dot_layout,
@@ -1540,7 +1473,6 @@ def gluon_extend_attn_fwd(
                         v_dot_layout,
                         mma_layout,
                         mma_offs_n_col,
-                        V_PRELOAD=V_PRELOAD,
                         block_start=n_full_prefix,
                     )
 
@@ -1554,8 +1486,6 @@ def gluon_extend_attn_fwd(
                 if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
                     n_full_blocks = 0
                 elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
-                    n_full_blocks = 0
-                elif UNIFY_CAUSAL_PATH and IS_CAUSAL:
                     n_full_blocks = 0
                 else:
                     partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
@@ -1616,9 +1546,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
                         v_async_layout,
@@ -1660,9 +1588,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_async_layout,
                         v_async_layout,
                         kt_dot_layout,
@@ -1671,7 +1597,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        V_PRELOAD=V_PRELOAD,
                     )
                 masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
                 remaining_blocks = n_extend_blocks - masked_start
@@ -1706,9 +1631,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         NUM_STAGES,
                         kt_async_layout,
                         v_async_layout,
@@ -1750,9 +1673,7 @@ def gluon_extend_attn_fwd(
                         BLOCK_M,
                         BLOCK_N,
                         BLOCK_DMODEL,
-                        ACTUAL_BLOCK_DMODEL,
                         BLOCK_DV,
-                        ACTUAL_BLOCK_DV,
                         kt_async_layout,
                         v_async_layout,
                         kt_dot_layout,
@@ -1761,7 +1682,6 @@ def gluon_extend_attn_fwd(
                         mma_layout,
                         mma_offs_n_col,
                         mma_offs_m_row,
-                        V_PRELOAD=V_PRELOAD,
                     )
 
 
@@ -1779,8 +1699,6 @@ def gluon_extend_attn_fwd(
             po_base = partial_out + split_idx * BLOCK_M * BLOCK_DV
             po_ptrs = po_base + offs_m[:, None] * BLOCK_DV + offs_dv[None, :]
             po_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) < orig_seq_len_extend
-            if ACTUAL_BLOCK_DV != BLOCK_DV:
-                po_mask = po_mask & (offs_dv[None, :] < ACTUAL_BLOCK_DV)
             po_val = gl.convert_layout(acc_normed, blocked_layout)
             gl.store(po_ptrs, po_val, mask=po_mask)
 
@@ -1826,8 +1744,6 @@ def gluon_extend_attn_fwd(
                 r_o_base = O_Extend + cur_seq_q_start_idx * stride_obs + cur_head * stride_oh
                 r_o_offsets = ((cur_block_m * BLOCK_M + offs_m[:, None]) * stride_obs + offs_dv[None, :]).to(tl.int32)
                 r_o_mask = r_m_mask[:, None]
-                if ACTUAL_BLOCK_DV != BLOCK_DV:
-                    r_o_mask = r_o_mask & (offs_dv[None, :] < ACTUAL_BLOCK_DV)
                 out_r = gl.convert_layout(r_acc, blocked_layout).to(O_Extend.dtype.element_ty)
                 cdna4_buffer_store(out_r, r_o_base, r_o_offsets, mask=r_o_mask)
         else:
@@ -1838,8 +1754,6 @@ def gluon_extend_attn_fwd(
             o_base = O_Extend + cur_seq_q_start_idx * stride_obs + cur_head * stride_oh
             o_offsets = ((cur_block_m * BLOCK_M + offs_m[:, None]) * stride_obs + offs_dv[None, :]).to(tl.int32)
             o_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) < seq_len_extend
-            if ACTUAL_BLOCK_DV != BLOCK_DV:
-                o_mask = o_mask & (offs_dv[None, :] < ACTUAL_BLOCK_DV)
             out = gl.convert_layout(acc, blocked_layout).to(O_Extend.dtype.element_ty)
             cdna4_buffer_store(out, o_base, o_offsets, mask=o_mask)
 

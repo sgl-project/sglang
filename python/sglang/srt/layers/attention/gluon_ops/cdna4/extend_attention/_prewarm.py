@@ -225,7 +225,7 @@ def _warm_basic_variant(
     the ``CompiledKernel`` so callers can install it in the dispatch
     cache for the direct-HIPLauncher bypass path."""
     BM, BN, NW, NS, PAD_K, PAD_V, EXT_BN, EXT_NS = config
-    BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(head_dim)
+    BLOCK_DMODEL = _resolve_qk_split_dims(head_dim)
     kv_group_num = num_q_heads // num_kv_heads
     sm_scale = 1.0 / math.sqrt(head_dim)
 
@@ -271,7 +271,6 @@ def _warm_basic_variant(
         BLOCK_M=BM,
         BLOCK_N=BN,
         BLOCK_DMODEL=BLOCK_DMODEL,
-        ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
         NUM_STAGES=NS,
         Sinks=tensors["sinks"],
         HAS_SINK=has_sink,
@@ -320,7 +319,7 @@ def _warm_persistent_variant(
     ``tile_map_mode``: 0 = cum_tiles binary search, 1 = WCA inline scan.
     """
     BM, BN, NW, NS, SPLIT_K = config
-    BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(head_dim)
+    BLOCK_DMODEL = _resolve_qk_split_dims(head_dim)
     kv_group_num = num_q_heads // num_kv_heads
     sm_scale = 1.0 / math.sqrt(head_dim)
 
@@ -360,7 +359,6 @@ def _warm_persistent_variant(
         BLOCK_M=BM,
         BLOCK_N=BN,
         BLOCK_DMODEL=BLOCK_DMODEL,
-        ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
         NUM_STAGES=NS,
         Sinks=tensors["sinks"],
         HAS_SINK=has_sink,

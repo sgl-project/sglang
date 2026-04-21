@@ -50,7 +50,6 @@ def _make_persistent_fast_runner(compiled_kernel, frozen_kw: dict):
     BLOCK_M = frozen_kw['BLOCK_M']
     BLOCK_N = frozen_kw['BLOCK_N']
     BLOCK_DMODEL = frozen_kw['BLOCK_DMODEL']
-    ACTUAL_BLOCK_DMODEL = frozen_kw['ACTUAL_BLOCK_DMODEL']
     NUM_STAGES = frozen_kw['NUM_STAGES']
     HAS_SINK = frozen_kw['HAS_SINK']
     LOGIT_CAP = frozen_kw['LOGIT_CAP']
@@ -88,7 +87,7 @@ def _make_persistent_fast_runner(compiled_kernel, frozen_kw: dict):
             strides[4], strides[5], strides[6], strides[7],
             strides[8], strides[9], strides[10], strides[11],
             IS_CAUSAL, USE_CUSTOM_MASK, ENABLE_PREFIX_UNMASKED,
-            BLOCK_M, BLOCK_N, BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL,
+            BLOCK_M, BLOCK_N, BLOCK_DMODEL,
             NUM_STAGES,
             sinks, HAS_SINK,
             LOGIT_CAP, XAI_TEMPERATURE_LEN, SLIDING_WINDOW_SIZE,
@@ -118,7 +117,6 @@ def _persistent_cache_key(Lq, frozen_kw: dict, dtypes: tuple = ()) -> tuple:
         frozen_kw['BLOCK_M'],
         frozen_kw['BLOCK_N'],
         frozen_kw['BLOCK_DMODEL'],
-        frozen_kw['ACTUAL_BLOCK_DMODEL'],
         frozen_kw['NUM_STAGES'],
         frozen_kw['HAS_SINK'],
         frozen_kw['LOGIT_CAP'],
@@ -165,14 +163,17 @@ _QK_SPLIT_CACHE = {}
 
 
 def _resolve_qk_split_dims(Lq: int):
-    """Return (BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL) for symmetric heads."""
+    """Return BLOCK_DMODEL (next power of 2 >= Lq, >= 16).
+
+    The production dispatcher only routes power-of-2 Lq (64/128/256), so
+    BLOCK_DMODEL == Lq and no separate ACTUAL_BLOCK_DMODEL is needed.
+    """
     cached = _QK_SPLIT_CACHE.get(Lq)
     if cached is not None:
         return cached
     block_dmodel = max(triton.next_power_of_2(Lq), 16)
-    result = (block_dmodel, Lq)
-    _QK_SPLIT_CACHE[Lq] = result
-    return result
+    _QK_SPLIT_CACHE[Lq] = block_dmodel
+    return block_dmodel
 
 
 _cached_num_CUs = {}
@@ -377,7 +378,7 @@ def _launch_persistent(
 ):
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
-    BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
+    BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
     USE_CUSTOM_MASK = custom_mask is not None
     _batch_size_prelim = qo_indptr.shape[0] - 1
@@ -542,7 +543,6 @@ def _launch_persistent(
         'BLOCK_M': BLOCK_M,
         'BLOCK_N': BLOCK_N,
         'BLOCK_DMODEL': BLOCK_DMODEL,
-        'ACTUAL_BLOCK_DMODEL': ACTUAL_BLOCK_DMODEL,
         'NUM_STAGES': NUM_STAGES,
         'HAS_SINK': _has_sink,
         'LOGIT_CAP': logit_cap,
@@ -602,7 +602,6 @@ def _launch_persistent(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=BLOCK_DMODEL,
-        ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
         NUM_STAGES=NUM_STAGES,
         Sinks=sinks,
         HAS_SINK=_has_sink,
@@ -694,7 +693,7 @@ def _launch_splitk(
         )
         return
 
-    BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
+    BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
     SPLIT_K = _select_k_splits(total_output_tiles, num_CUs)
 
@@ -752,7 +751,6 @@ def _launch_splitk(
         'BLOCK_M': BLOCK_M,
         'BLOCK_N': BLOCK_N,
         'BLOCK_DMODEL': BLOCK_DMODEL,
-        'ACTUAL_BLOCK_DMODEL': ACTUAL_BLOCK_DMODEL,
         'NUM_STAGES': NUM_STAGES,
         'HAS_SINK': _has_sink,
         'LOGIT_CAP': logit_cap,
@@ -801,7 +799,7 @@ def _launch_splitk(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL, ACTUAL_BLOCK_DMODEL=ACTUAL_BLOCK_DMODEL,
+        BLOCK_DMODEL=BLOCK_DMODEL,
         NUM_STAGES=NUM_STAGES,
         Sinks=sinks, HAS_SINK=_has_sink,
         LOGIT_CAP=logit_cap,
