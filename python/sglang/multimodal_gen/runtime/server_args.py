@@ -318,7 +318,8 @@ class ServerArgs(DisaggArgsMixin):
         """check consistency and raise errors for invalid configs"""
         self._validate_pipeline()
         self._validate_offload()
-        self._validate_parallelism()
+        if not current_platform.is_cpu():
+            self._validate_parallelism()
         self._validate_cfg_parallel()
 
     def _adjust_save_paths(self):
@@ -365,6 +366,10 @@ class ServerArgs(DisaggArgsMixin):
             )
 
     def _adjust_offload(self):
+        if current_platform.is_cpu():
+            # CPU platform does not need offload
+            return
+
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
             logger.info("Enabling all offloading for GPU with low device memory")
@@ -548,6 +553,10 @@ class ServerArgs(DisaggArgsMixin):
         ulysses_unspecified = self.ulysses_degree is None
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
+
+        if current_platform.is_cpu() and self.tp_size > 1:
+            # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
+            self.num_gpus = self.tp_size
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
