@@ -389,6 +389,28 @@ class RotaryPosMixin:
         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
 
+def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Reshape a (..., H*D) tensor into (..., H, D) ahead of QK RMSNorm.
+
+    On CUDA with the inductor piecewise-cuda-graph compiler, return a
+    stride-preserving view so inductor can fuse this reshape with the
+    subsequent RMSNorm (and any upstream/downstream FP8 quant) into a
+    single triton kernel -- the original motivation of #21734.
+
+    Everywhere else (ROCm, or CUDA with the eager PCG fallback), use the
+    flat 2D reshape that forces a copy when the input is a non-contiguous
+    QKV-split stride-trick view. ROCm's RMSNorm kernels assume contiguous
+    inputs and fault on strided tensors (root cause of the #21734 revert
+    in #23159).
+    """
+    if (
+        _is_cuda
+        and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
+    ):
+        return x.view(*x.shape[:-1], -1, head_dim)
+    return x.reshape(-1, head_dim)
+
+
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -437,23 +459,19 @@ def apply_qk_norm(
         )
         return q, k
 
-    # Use reshape with explicit multi-dim shape (not view) so this is safe
-    # when q/k are non-contiguous stride-trick views from the QKV split.
-    # Preserving the leading dims (vs. flattening to 2D) gives inductor
-    # better shape information for fusion with surrounding ops.
     if alt_stream is not None and get_is_capture_mode():
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
-        q_by_head = q.reshape(*q.shape[:-1], -1, head_dim)
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
         with torch.cuda.stream(alt_stream):
-            k_by_head = k.reshape(*k.shape[:-1], -1, head_dim)
+            k_by_head = _reshape_for_qk_norm(k, head_dim)
             k_by_head = k_norm(k_by_head)
         current_stream.wait_stream(alt_stream)
     else:
-        q_by_head = q.reshape(*q.shape[:-1], -1, head_dim)
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
-        k_by_head = k.reshape(*k.shape[:-1], -1, head_dim)
+        k_by_head = _reshape_for_qk_norm(k, head_dim)
         k_by_head = k_norm(k_by_head)
     q = q_by_head.view(q.shape)
     k = k_by_head.view(k.shape)
