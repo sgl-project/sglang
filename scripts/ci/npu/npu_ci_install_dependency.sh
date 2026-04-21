@@ -32,6 +32,12 @@ export UV_NO_CACHE=true
 export UV_SYSTEM_PYTHON=true
 export UV_INDEX_STRATEGY=unsafe-best-match
 
+# Install Rust toolchain (needed by crates built via setuptools-rust, e.g. the
+# native gRPC extension bundled into the sglang wheel).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bash "${SCRIPT_DIR}/../utils/install_rustup.sh"
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
+
 # Pin wheel to 0.45.1, REF: https://github.com/pypa/wheel/issues/662
 ${UV_PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil
 

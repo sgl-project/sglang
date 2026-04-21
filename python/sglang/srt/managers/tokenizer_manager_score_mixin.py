@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.configs.model_config import is_cross_encoding_pooler_model
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
@@ -15,6 +16,12 @@ logger = logging.getLogger(__name__)
 class ScoreResult:
     scores: List[List[float]]
     prompt_tokens: int = 0
+    # Per-item pooled hidden states (pre-head transformer output).
+    # CPU tensors when return_pooled_hidden_states=True; kept as tensors so
+    # in-process consumers (gRPC, engine API) avoid a .tolist() round-trip.
+    # The HTTP path converts to lists in serving_score.py before JSON serialization.
+    # Same layout as scores: one tensor per item (not a single packed 2D tensor).
+    pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
 
 
 class TokenizerManagerScoreMixin:
@@ -151,6 +158,7 @@ class TokenizerManagerScoreMixin:
         label_token_ids: Optional[List[int]],
         apply_softmax: bool,
         batch_request=None,
+        return_pooled_hidden_states: bool = False,
     ) -> ScoreResult:
         """
         Process results from multi-item scoring request.
@@ -166,11 +174,13 @@ class TokenizerManagerScoreMixin:
             label_token_ids: Token IDs to extract scores for
             apply_softmax: Whether to apply softmax normalization
             batch_request: The original batch request containing input sequence
+            return_pooled_hidden_states: Whether to extract pooled hidden states
+                from the result and include them in the ScoreResult.
 
         Returns:
-            ScoreResult with:
-                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
-                prompt_tokens: The number of prompt tokens processed.
+            ScoreResult with per-item scores, prompt token count, and optional
+            pooled_hidden_states (when return_pooled_hidden_states=True and the
+            model populated the field).
         """
         single_result = results[0] if isinstance(results, list) else results
         meta_info = single_result.get("meta_info", {})
@@ -225,10 +235,24 @@ class TokenizerManagerScoreMixin:
         # Skip the first delimiter (query-item boundary)
         scores = per_delimiter_scores[1:]
 
-        return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
+        phs_list = None
+        if return_pooled_hidden_states:
+            raw_phs = single_result.get("pooled_hidden_state")
+            if raw_phs is not None and len(raw_phs) == expected_count:
+                phs_list = raw_phs[1:]
+
+        return ScoreResult(
+            scores=scores,
+            prompt_tokens=prompt_tokens,
+            pooled_hidden_states=phs_list,
+        )
 
     def _process_single_item_scoring_results(
-        self, results: Any, label_token_ids: Optional[List[int]], apply_softmax: bool
+        self,
+        results: Any,
+        label_token_ids: Optional[List[int]],
+        apply_softmax: bool,
+        return_pooled_hidden_states: bool = False,
     ) -> ScoreResult:
         """
         Process results from single-item scoring request.
@@ -241,13 +265,14 @@ class TokenizerManagerScoreMixin:
             results: Results from generate_request
             label_token_ids: Token IDs to extract scores for (generation models only)
             apply_softmax: Whether to apply softmax normalization
+            return_pooled_hidden_states: Whether to extract pooled hidden states
 
         Returns:
-            ScoreResult with:
-                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
-                prompt_tokens: The number of prompt tokens processed.
+            ScoreResult with per-item scores, prompt token count, and optional pooled_hidden_states.
         """
         scores = []
+        phs_list = []
+        has_phs = False
         prompt_tokens = 0
 
         is_generation = getattr(self, "is_generation", True)
@@ -293,7 +318,17 @@ class TokenizerManagerScoreMixin:
                 # EmbeddingPoolerOutput API.
                 scores.append(embedding)
 
-        return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
+                if return_pooled_hidden_states:
+                    phs = result.get("pooled_hidden_state")
+                    phs_list.append(phs)
+                    if phs is not None:
+                        has_phs = True
+
+        return ScoreResult(
+            scores=scores,
+            prompt_tokens=prompt_tokens,
+            pooled_hidden_states=phs_list if has_phs else None,
+        )
 
     # ------------------------------------------------------------------
     # Embed override position resolution
@@ -481,6 +516,7 @@ class TokenizerManagerScoreMixin:
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         request: Optional[Any] = None,
+        return_pooled_hidden_states: bool = False,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -510,11 +546,18 @@ class TokenizerManagerScoreMixin:
             query_embed_overrides: Embedding vectors replacing placeholder tokens in query.
             item_embed_overrides: Per-item embedding vectors replacing placeholder tokens in items.
             request: Optional FastAPI request object
+            return_pooled_hidden_states: Whether to include the raw pooled transformer
+                hidden states (before the task-specific head) in the result. Only
+                supported for non-generation models (SequenceClassification,
+                RewardModel). Raises ValueError for CausalLM models.
 
         Returns:
             ScoreResult with:
-                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+                scores: List of score lists, one per item.
                 prompt_tokens: The number of prompt tokens processed.
+                pooled_hidden_states: Per-item CPU tensors when
+                    return_pooled_hidden_states=True and the model supports it;
+                    None otherwise.
         """
         is_generation = getattr(self, "is_generation", True)
 
@@ -618,6 +661,23 @@ class TokenizerManagerScoreMixin:
                 "Invalid combination of query/items types for score_request."
             )
 
+        if return_pooled_hidden_states:
+            if is_generation:
+                raise ValueError(
+                    "return_pooled_hidden_states is not supported for CausalLM models. "
+                    "It requires a model with a task-specific head "
+                    "(e.g. SequenceClassification or RewardModel)."
+                )
+            model_config = getattr(self, "model_config", None)
+            if model_config is not None:
+                archs = getattr(model_config.hf_config, "architectures", []) or []
+                if is_cross_encoding_pooler_model(archs):
+                    raise ValueError(
+                        f"return_pooled_hidden_states is not supported for "
+                        f"{archs[0]}. This model uses CrossEncodingPooler which "
+                        f"does not expose pre-head hidden states."
+                    )
+
         # Create the appropriate request type
         if is_generation:
             batch_request = GenerateReqInput(
@@ -636,6 +696,7 @@ class TokenizerManagerScoreMixin:
                 text=text_prompts,
                 input_ids=input_ids,
                 positional_embed_overrides=positional_embed_overrides,
+                return_pooled_hidden_states=return_pooled_hidden_states,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()
@@ -643,12 +704,17 @@ class TokenizerManagerScoreMixin:
         if use_multi_item_scoring:
             # Multi-item scoring: extract scores from input_token_ids_logprobs or embedding
             return self._process_multi_item_scoring_results(
-                results, items, label_token_ids, apply_softmax, batch_request
+                results,
+                items,
+                label_token_ids,
+                apply_softmax,
+                batch_request,
+                return_pooled_hidden_states,
             )
         else:
             # Single-item scoring: process each result separately
             return self._process_single_item_scoring_results(
-                results, label_token_ids, apply_softmax
+                results, label_token_ids, apply_softmax, return_pooled_hidden_states
             )
 
     def _convert_logprobs_to_scores(

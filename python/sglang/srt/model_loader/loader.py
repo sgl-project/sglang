@@ -198,6 +198,9 @@ def _get_quantization_config(
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     remap_prefix = getattr(model_class, "remap_prefix", None)
     # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
+    if model_config.quantization == "quark":
+        packed_modules_mapping.update({"gate_up_proj": ["gate_proj", "up_proj"]})
+
     if _is_npu:
         packed_modules_mapping.update(
             {
@@ -503,9 +506,10 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            weight_loader_disable_mmap = (
-                get_global_server_args().weight_loader_disable_mmap
-            )
+            server_args = get_global_server_args()
+            weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
+            weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
+            prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
@@ -518,10 +522,15 @@ class DefaultModelLoader(BaseModelLoader):
                         "num_threads", self.DEFAULT_NUM_THREADS
                     ),
                     disable_mmap=weight_loader_disable_mmap,
+                    prefetch=weight_loader_prefetch,
+                    prefetch_num_threads=prefetch_num_threads,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
-                    hf_weights_files, disable_mmap=weight_loader_disable_mmap
+                    hf_weights_files,
+                    disable_mmap=weight_loader_disable_mmap,
+                    prefetch=weight_loader_prefetch,
+                    prefetch_num_threads=prefetch_num_threads,
                 )
 
         else:
