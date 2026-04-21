@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 """
 Copyright 2023-2024 SGLang Team
@@ -35,10 +34,10 @@ import torch
 logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
-    MEDIUM_GPU,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    StorageMedium,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -62,60 +61,85 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
     SLRUStrategy,
 )
-from sglang.srt.mem_cache.utils import get_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.utils import hash_str_to_int64
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 
 class RadixKey:
+    """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
+
+    __slots__ = ("token_ids", "extra_key", "is_bigram")
+
     def __init__(
         self,
         token_ids: List[int],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
     ):
-        # token ids sequence
+        # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
         # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
-        # is bigram key
+        # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
 
     def __len__(self) -> int:
+        if self.is_bigram:
+            n = len(self.token_ids)
+            return n - 1 if n > 0 else 0
         return len(self.token_ids)
 
-    def __iter__(self) -> Iterator[int]:
-        return iter(self.token_ids)
+    def __iter__(self) -> Iterator:
+        if self.is_bigram:
+            t = self.token_ids
+            for i in range(len(t) - 1):
+                yield (t[i], t[i + 1])
+        else:
+            yield from self.token_ids
 
     def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
-        if isinstance(idx, slice):
-            return RadixKey(self.token_ids[idx], self.extra_key)
-        return RadixKey([self.token_ids[idx]], self.extra_key)
+        # Normalize int -> 1-element slice so the rest handles one shape.
+        if isinstance(idx, int):
+            if idx < 0:
+                idx += len(self)
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f"RadixKey index out of range: {idx}")
+            idx = slice(idx, idx + 1)
+        start, stop, step = idx.indices(len(self))
+        if step != 1:
+            raise ValueError("RadixKey slice step must be 1")
+
+        if self.is_bigram:
+            # bigrams [start, stop) span raw tokens [start, stop + 1);
+            # empty slice -> empty raw tokens (not a dangling boundary token).
+            raw = self.token_ids[start : stop + 1] if stop > start else []
+            return RadixKey(raw, self.extra_key, is_bigram=True)
+        return RadixKey(self.token_ids[start:stop], self.extra_key)
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
-        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
+        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
+    def page_aligned(self, page_size: int) -> "RadixKey":
+        if page_size == 1:
+            return self
+        aligned_len = len(self) // page_size * page_size
+        return self[:aligned_len]
 
-def maybe_bigram_convert(
-    is_eagle: bool,
-    key: RadixKey,
-    value: Optional[torch.Tensor] = None,
-) -> Tuple[RadixKey, Optional[torch.Tensor]]:
-    if is_eagle and not key.is_bigram:
-        key.token_ids = convert_to_bigram_key(key.token_ids)
-        key.is_bigram = True
-        if value is not None:
-            value = value[: len(key)]
-    return key, value
-
-
-def page_align_keys(key: list, page_size) -> list:
-    if page_size == 1:
-        return key
-    page_aligned_len = len(key) // page_size * page_size
-    return key[:page_aligned_len]
+    def maybe_to_bigram_view(
+        self,
+        is_eagle: bool,
+        value: Optional[torch.Tensor] = None,
+    ) -> Tuple["RadixKey", Optional[torch.Tensor]]:
+        # O(1): flip the bigram flag instead of materializing a tuple list.
+        # value is paired with raw tokens and gets truncated to the bigram count.
+        if is_eagle and not self.is_bigram:
+            self.is_bigram = True
+            if value is not None:
+                value = value[: len(self)]
+        return self, value
 
 
 class TreeNode:
@@ -190,32 +214,60 @@ def _check_extra_key(key0: RadixKey, key1: RadixKey):
 
 def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
     _check_extra_key(key0, key1)
+    # In bigram mode we compare raw tokens position-by-position; matching L
+    # consecutive tokens implies L-1 matching bigrams. In plain mode, matching
+    # tokens == matching units directly.
+    t0 = key0.token_ids
+    t1 = key1.token_ids
     i = 0
-    for k0, k1 in zip(key0.token_ids, key1.token_ids):
-        if k0 != k1:
+    for a, b in zip(t0, t1):
+        if a != b:
             break
         i += 1
+    if key0.is_bigram:
+        # Clamp by logical bigram length of each side (guards short tails).
+        return max(0, min(i - 1, len(key0), len(key1)))
     return i
 
 
 def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
     _check_extra_key(key0, key1)
-    min_len = min(len(key0), len(key1))
+    if key0.is_bigram:
+        # Walk raw tokens, convert to bigram count, then round to page boundary.
+        t0 = key0.token_ids
+        t1 = key1.token_ids
+        i = 0
+        for a, b in zip(t0, t1):
+            if a != b:
+                break
+            i += 1
+        bigram_matched = max(0, i - 1)
+        bigram_matched = min(bigram_matched, len(key0), len(key1))
+        return (bigram_matched // page_size) * page_size
 
+    min_len = min(len(key0), len(key1))
     i = 0
     while i < min_len:
         if key0.token_ids[i : i + page_size] != key1.token_ids[i : i + page_size]:
             break
         i += page_size
-
     return i
 
 
 def get_child_key(key: RadixKey, page_size: int = 1):
-    if page_size == 1:
-        plain_key = key.token_ids[0]
+    if key.is_bigram:
+        t = key.token_ids
+        if page_size == 1:
+            # first bigram -> (tokens[0], tokens[1])
+            plain_key = (t[0], t[1])
+        else:
+            # first page_size bigrams spanning tokens[0 : page_size + 1]
+            plain_key = tuple((t[j], t[j + 1]) for j in range(page_size))
     else:
-        plain_key = tuple(key.token_ids[:page_size])
+        if page_size == 1:
+            plain_key = key.token_ids[0]
+        else:
+            plain_key = tuple(key.token_ids[:page_size])
     if key.extra_key is None:
         return plain_key
     else:
@@ -225,34 +277,54 @@ def get_child_key(key: RadixKey, page_size: int = 1):
 def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
     """Compute SHA256-based hash values for position-aware identification.
 
-    Args:
-        node: The TreeNode to compute hash values for
-        page_size: The page size for chunking tokens
-
-    Returns:
-        List of SHA256 hex strings, one per page
+    In bigram mode, each page logically covers `page_size` bigrams over
+    `page_size + 1` raw tokens; we feed overlapping (t_i, t_{i+1}) byte pairs
+    to the hasher so the output matches the pre-optimization tuple-based hash.
     """
     hash_values = []
 
-    # Get parent's last hash value if parent exists
     parent_hash = None
     if node.parent is not None and node.parent.hash_value is not None:
-        # Check if parent is root by checking if it has empty key
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
 
-    # Iterate through node's pages
-    for start in range(0, len(node.key), page_size):
-        page_tokens = node.key.token_ids[start : start + page_size]
-        if not page_tokens:
-            continue
+    raw = node.key.token_ids
+    is_bigram = node.key.is_bigram
+    logical_len = len(node.key)
 
-        # Use SHA256-based chaining via get_hash_str
-        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
+    for start in range(0, logical_len, page_size):
+        end = min(start + page_size, logical_len)
+        if end <= start:
+            continue
+        hash_val = _hash_page(raw, start, end, is_bigram, parent_hash)
         hash_values.append(hash_val)
         parent_hash = hash_val
 
     return hash_values
+
+
+def _hash_page(
+    raw_tokens: List[int],
+    start: int,
+    end: int,
+    is_bigram: bool,
+    prior_hash: Optional[str],
+) -> str:
+    import hashlib
+
+    hasher = hashlib.sha256()
+    if prior_hash:
+        hasher.update(bytes.fromhex(prior_hash))
+    if is_bigram:
+        for j in range(start, end):
+            hasher.update(raw_tokens[j].to_bytes(4, byteorder="little", signed=False))
+            hasher.update(
+                raw_tokens[j + 1].to_bytes(4, byteorder="little", signed=False)
+            )
+    else:
+        for j in range(start, end):
+            hasher.update(raw_tokens[j].to_bytes(4, byteorder="little", signed=False))
+    return hasher.hexdigest()
 
 
 def split_node_hash_value(
@@ -366,11 +438,6 @@ class RadixCache(BasePrefixCache):
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
-    def maybe_bigram_convert(
-        self, key: RadixKey, value: Optional[torch.Tensor] = None
-    ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
-        return maybe_bigram_convert(self.is_eagle, key, value)
-
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 
@@ -409,7 +476,7 @@ class RadixCache(BasePrefixCache):
                 subsequent match efficiency and does not duplicate data.
         """
         key = params.key
-        key, _ = self.maybe_bigram_convert(key)
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
 
         def empty_match_result():
             return MatchResult(
@@ -425,9 +492,7 @@ class RadixCache(BasePrefixCache):
         if self.disable or len(key) == 0:
             return empty_match_result()
 
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
+        key = key.page_aligned(self.page_size)
 
         if len(key) == 0:
             return empty_match_result()
@@ -452,10 +517,13 @@ class RadixCache(BasePrefixCache):
         priority = params.priority
         chunked = params.chunked
 
-        if value is None:
-            value = torch.tensor(key.token_ids, dtype=torch.int64)
-
-        key, value = self.maybe_bigram_convert(key, value)
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+        key = key.page_aligned(self.page_size)
+        if value is not None:
+            value = value[: len(key)]
+        else:
+            # Debug/test fallback: use token ids themselves as values.
+            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)
@@ -479,11 +547,11 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
-        keys = page_align_keys(keys, self.page_size)
-        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        key_len = len(radix_key)
+        values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -498,11 +566,11 @@ class RadixCache(BasePrefixCache):
             )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : len(keys)]
+                kv_indices[req.cache_protected_len : key_len]
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
+        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -517,11 +585,10 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
-        keys = page_align_keys(keys, self.page_size)
-        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         result = self.insert(
@@ -544,7 +611,9 @@ class RadixCache(BasePrefixCache):
             match_result.device_indices,
             match_result.last_device_node,
         )
-        assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
+        assert len(new_indices) == len(
+            radix_key
+        ), f"{len(new_indices)=}, {len(radix_key)=}"
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
@@ -829,9 +898,14 @@ class RadixCache(BasePrefixCache):
                 stack.append(child)
         return total_size
 
-    def _record_store_event(self, node: TreeNode):
+    def _record_store_event(self, node: TreeNode, medium=None):
         # One BlockStored per ``page_size`` chunk.
+        # ``medium`` defaults to StorageMedium.GPU but callers may override
+        # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
         if self.enable_kv_cache_events:
+            if medium is None:
+                medium = StorageMedium.GPU
+
             # Compute hash_value lazily if not already set
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
@@ -846,10 +920,18 @@ class RadixCache(BasePrefixCache):
                     parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
 
             page_index = 0
-            for start in range(0, len(node.key), self.page_size):
-                page_tokens = node.key.token_ids[start : start + self.page_size]
-                if not page_tokens:
+            logical_len = len(node.key)
+            is_bigram = node.key.is_bigram
+            raw = node.key.token_ids
+            for start in range(0, logical_len, self.page_size):
+                end = min(start + self.page_size, logical_len)
+                if end <= start:
                     continue
+                # Preserve historical event payload: bigram pages expose tuples.
+                if is_bigram:
+                    page_tokens = [(raw[j], raw[j + 1]) for j in range(start, end)]
+                else:
+                    page_tokens = raw[start:end]
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
@@ -860,30 +942,36 @@ class RadixCache(BasePrefixCache):
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
                         lora_id=None,
-                        medium=MEDIUM_GPU,
+                        medium=medium,
                     )
                 )
 
                 parent_block_hash = block_hash
                 page_index += 1
 
-    def _record_remove_event(self, node: TreeNode):
+    def _record_remove_event(self, node: TreeNode, medium=None):
         # One BlockRemoved per chunk.
+        # ``medium`` defaults to StorageMedium.GPU but callers may override for
+        # lower-tier removals (e.g. StorageMedium.CPU when evicting from host).
         if self.enable_kv_cache_events:
+            if medium is None:
+                medium = StorageMedium.GPU
+
             # Compute hash_value lazily if not already set (must match what was stored)
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
 
             page_index = 0
-            for start in range(0, len(node.key), self.page_size):
-                page_tokens = node.key.token_ids[start : start + self.page_size]
-                if not page_tokens:
+            logical_len = len(node.key)
+            for start in range(0, logical_len, self.page_size):
+                end = min(start + self.page_size, logical_len)
+                if end <= start:
                     continue
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
                 self.kv_event_queue.append(
-                    BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_GPU)
+                    BlockRemoved(block_hashes=[block_hash], medium=medium)
                 )
 
                 page_index += 1

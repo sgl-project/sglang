@@ -57,7 +57,7 @@ class EagleServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        kill_process_tree(cls.process.pid, wait_timeout=60)
 
     def send_request(self):
         time.sleep(random.uniform(0, 2))

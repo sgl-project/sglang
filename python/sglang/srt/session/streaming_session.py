@@ -113,11 +113,11 @@ def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
 
 
-class SessionAwareCache(BasePrefixCache):
+class StreamingSession(BasePrefixCache):
     """Adds streaming-session KV save/restore on top of any BasePrefixCache.
 
-    Works both as an external wrapper (``SessionAwareCache(RadixCache(...))``)
-    and in embedded composition (``SessionAwareCache(inner=self)``). For the
+    Works both as an external wrapper (``StreamingSession(RadixCache(...))``)
+    and in embedded composition (``StreamingSession(inner=self)``). For the
     embedded case, the composing cache must pre-check dispatch conditions
     (``_is_streaming`` / ``find_active_slot`` / ``has_slot``) so the internal
     fall-through to ``self.inner.xxx`` never fires -- otherwise it recurses.
