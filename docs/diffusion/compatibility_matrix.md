@@ -45,7 +45,11 @@ default parameters when initializing and generating videos.
 1. Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.
 2. SageSLA is based on SpargeAttn. Install it first with `pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation`
 3. LTX-2 and LTX-2.3 two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline`. The spatial upsampler and distilled LoRA are auto-resolved from the model snapshot by default, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
-  - For LTX models, the `Resolutions` column uses output video `width×height` semantics, matching `sglang generate --width ... --height ...`.
+   - For LTX models, the `Resolutions` column uses output video `width×height` semantics, matching `sglang generate --width ... --height ...`.
+4. LTX-2.3 two-stage also supports `--ltx2-two-stage-device-mode {legacy,snapshot,resident}`:
+   - `snapshot` is the default and recommended mode.
+   - `resident` usually provides the best latency/throughput but uses much more VRAM.
+   - `legacy` preserves the historical switching path for fallback/debug.
 
 ### Image Generation Models
 

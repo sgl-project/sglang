@@ -1,4 +1,4 @@
-name: Release Docker Images Nightly (AMD)
+name: Release Docker Images Nightly ROCm7.0 (AMD)
 on:
   workflow_dispatch:
   schedule:
@@ -79,8 +79,25 @@ jobs:
           tag=v${version}-${rocm_tag}
           echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
 
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
+
+      # Persist the tag right after rocm/sgl-dev push succeeds so the local
+      # registry mirror can run even if a later step in this job (lmsys push)
+      # fails. By default this step only runs when the previous step succeeded,
+      # so the artifact only exists when an image actually landed on Docker Hub.
+      - name: Save published image tag
+        run: |
+          mkdir -p image-tag
+          echo "${{ env.IMAGE_TAG }}" > "image-tag/${{ matrix.gpu_arch }}.txt"
+
+      - name: Upload image tag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag-${{ matrix.gpu_arch }}
+          path: image-tag/${{ matrix.gpu_arch }}.txt
+          retention-days: 1
 
       - name: Login to Docker Hub (lmsys)
         uses: docker/login-action@v2
@@ -93,90 +110,136 @@ jobs:
           docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
           docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
 
-  # Temporarily disable docker cache seeding until performant storage is in place
-  cache:
-    if: false
-    # if: always() && github.repository == 'sgl-project/sglang'
-    runs-on: linux-mi300-gpu-1
+  # Mirror the freshly published rocm/sgl-dev image to the in-network Docker
+  # registry so AMD CI runners can pull without hitting Docker Hub rate limits.
+  # The tag is read verbatim from the publish job's artifact so this job uses
+  # exactly the same tag that publish pushed (only the registry prefix differs).
+  # `!cancelled()` lets us still mirror successful matrix legs when other legs
+  # of publish failed; legs without an artifact will fail at download and be
+  # the only ones marked red.
+  push_local_registry:
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' }}
+    runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942']
-        build_type: ['all']
+        gpu_arch: ['gfx942', 'gfx950']
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Download image tag artifact
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0  # Required for git describe to find tags
+          name: image-tag-${{ matrix.gpu_arch }}
 
-      - name: "Set Date"
+      - name: Read image tag
         run: |
-          echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
-
-      - name: Get version from latest tag
-        id: version
-        run: |
-          # Get the latest version tag sorted by version number (e.g., v0.5.7 -> 0.5.7)
-          VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
-
-          if [ -z "$VERSION" ]; then
-            echo "::error::Could not determine version from git tags"
+          image_tag=$(tr -d '[:space:]' < "${{ matrix.gpu_arch }}.txt")
+          if [ -z "${image_tag}" ]; then
+            echo "::error::Image tag artifact is empty"
             exit 1
           fi
+          echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
+          echo "Resolved IMAGE_TAG=${image_tag}"
 
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Detected version: ${VERSION}"
-
-      - name: Login to Docker Hub
+      - name: Login to Docker Hub (AMD)
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-      - name: Pull and Save Docker Image to Cache
+      - name: Mirror rocm/sgl-dev to local registry
         run: |
-          set -euxo pipefail
+          src="rocm/sgl-dev:${{ env.IMAGE_TAG }}"
+          dst="172.29.8.23:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
+          docker pull "${src}"
+          docker tag "${src}" "${dst}"
+          docker push "${dst}"
 
-          version=${{ steps.version.outputs.version }}
-          echo "Version: ${version}"
+  # Temporarily disable docker cache seeding until performant storage is in place
+  # cache:
+  #   if: false
+  #   # if: always() && github.repository == 'sgl-project/sglang'
+  #   runs-on: linux-mi300-gpu-1
+  #   environment: 'prod'
+  #   needs: publish
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       gpu_arch: ['gfx942']
+  #       build_type: ['all']
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0  # Required for git describe to find tags
 
-          if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
-            rocm_tag="rocm700-mi30x"
-          else
-            echo "Unsupported gfx arch"
-            exit 1
-          fi
+  #     - name: "Set Date"
+  #       run: |
+  #         echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
 
-          tag=v${version}-${rocm_tag}
+  #     - name: Get version from latest tag
+  #       id: version
+  #       run: |
+  #         # Get the latest version tag sorted by version number (e.g., v0.5.7 -> 0.5.7)
+  #         VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
 
-          if [ "${{ matrix.build_type }}" = "all" ]; then
-            tag_suffix=""
-          else
-            echo "Unsupported build type"
-            exit 1
-          fi
+  #         if [ -z "$VERSION" ]; then
+  #           echo "::error::Could not determine version from git tags"
+  #           exit 1
+  #         fi
 
-          image="rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix}"
+  #         echo "version=${VERSION}" >> $GITHUB_OUTPUT
+  #         echo "Detected version: ${VERSION}"
 
-          # Determine target cache file name based on ROCm variant
-          if [[ "${rocm_tag}" == rocm700* ]]; then
-            final_path="/home/runner/sgl-data/docker/image-700.tar"
-          else
-            echo "Unexpected ROCm tag: ${rocm_tag}"
-            exit 1
-          fi
+  #     - name: Login to Docker Hub
+  #       uses: docker/login-action@v2
+  #       with:
+  #         username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  #         password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-          tmp_path="${final_path}.tmp"
+  #     - name: Pull and Save Docker Image to Cache
+  #       run: |
+  #         set -euxo pipefail
 
-          echo "Pulling image: ${image}"
-          docker pull "${image}"
+  #         version=${{ steps.version.outputs.version }}
+  #         echo "Version: ${version}"
 
-          echo "Saving to temp file: ${tmp_path}"
-          docker save "${image}" -o "${tmp_path}"
+  #         if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
+  #           rocm_tag="rocm700-mi30x"
+  #         else
+  #           echo "Unsupported gfx arch"
+  #           exit 1
+  #         fi
 
-          echo "Moving to final path: ${final_path}"
-          mv -f "${tmp_path}" "${final_path}"
+  #         tag=v${version}-${rocm_tag}
 
-          echo "Cache populated successfully at ${final_path}"
+  #         if [ "${{ matrix.build_type }}" = "all" ]; then
+  #           tag_suffix=""
+  #         else
+  #           echo "Unsupported build type"
+  #           exit 1
+  #         fi
+
+  #         image="rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix}"
+
+  #         # Determine target cache file name based on ROCm variant
+  #         if [[ "${rocm_tag}" == rocm700* ]]; then
+  #           final_path="/home/runner/sgl-data/docker/image-700.tar"
+  #         else
+  #           echo "Unexpected ROCm tag: ${rocm_tag}"
+  #           exit 1
+  #         fi
+
+  #         tmp_path="${final_path}.tmp"
+
+  #         echo "Pulling image: ${image}"
+  #         docker pull "${image}"
+
+  #         echo "Saving to temp file: ${tmp_path}"
+  #         docker save "${image}" -o "${tmp_path}"
+
+  #         echo "Moving to final path: ${final_path}"
+  #         mv -f "${tmp_path}" "${final_path}"
+
+  #         echo "Cache populated successfully at ${final_path}"
