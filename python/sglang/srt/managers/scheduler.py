@@ -578,7 +578,6 @@ class Scheduler(
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
     def init_tp_model_worker(self):
-
         worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.gpu_id,
@@ -771,7 +770,6 @@ class Scheduler(
 
                 self.tree_cache = SWAChunkCache(params)
         else:
-
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -1560,7 +1558,6 @@ class Scheduler(
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
-
                 status_code = (
                     HTTPStatus.BAD_REQUEST
                     if error_code == 400
@@ -1813,6 +1810,7 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 routing_key=recv_req.routing_key,
+                extra_key=recv_req.extra_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
