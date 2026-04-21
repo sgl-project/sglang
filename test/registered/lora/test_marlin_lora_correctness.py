@@ -256,7 +256,7 @@ def test_marlin_vs_triton_lora_correctness(num_tokens, top_k):
         enable_deterministic_inference = False
 
     with patch(
-        "sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args",
+        "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config.get_global_server_args",
         return_value=MockServerArgs(),
     ):
         marlin_runner = MoeRunner(MoeRunnerBackend.MARLIN, config, lora_enabled=True)
