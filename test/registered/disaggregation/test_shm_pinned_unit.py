@@ -6,9 +6,9 @@ from sglang.srt.disaggregation.shm_pinned.transfer_engine import (
     ShmPinnedTransferEngine,
 )
 from sglang.srt.disaggregation.shm_pinned.utils import (
+    ShmPinnedInfo,
     SlotMeta,
     SlotState,
-    ShmPinnedInfo,
     calculate_slot_bytes,
 )
 from sglang.test.ci.ci_register import register_cpu_ci

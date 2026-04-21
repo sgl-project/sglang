@@ -165,7 +165,9 @@ class ShmPinnedKVManager(CommonKVManager):
         with self.failure_lock:
             return self.failure_records.get(room)
 
-    def _connect_to_decode(self, session_id: str) -> Optional[tuple[object, threading.Lock]]:
+    def _connect_to_decode(
+        self, session_id: str
+    ) -> Optional[tuple[object, threading.Lock]]:
         if session_id in self.decode_connections:
             return self.decode_connections[session_id]
 
@@ -254,9 +256,7 @@ class ShmPinnedKVManager(CommonKVManager):
                 room = int(msg[1].decode("utf-8"))
                 session_id = msg[2].decode("utf-8")
                 reason = (
-                    msg[3].decode("utf-8")
-                    if len(msg) > 3
-                    else "Remote transfer failed"
+                    msg[3].decode("utf-8") if len(msg) > 3 else "Remote transfer failed"
                 )
                 self.record_failure(room, reason)
                 self.update_status(room, KVPoll.Failed)
@@ -355,7 +355,11 @@ class ShmPinnedKVManager(CommonKVManager):
                 if self._decode_thread_running and slot_idx is not None:
                     logger.error("Decode receive loop error: %s", e)
             finally:
-                if slot_idx is not None and not slot_released and self.engine is not None:
+                if (
+                    slot_idx is not None
+                    and not slot_released
+                    and self.engine is not None
+                ):
                     try:
                         self.engine.post_free(slot_idx)
                     except Exception:
@@ -878,7 +882,11 @@ class ShmPinnedKVReceiver(CommonKVReceiver):
                 )
 
     def _send_transfer_req_to_prefill(self) -> None:
-        if self.kv_indices is None or self.bootstrap_infos is None or self.session_id is None:
+        if (
+            self.kv_indices is None
+            or self.bootstrap_infos is None
+            or self.session_id is None
+        ):
             return
 
         payload = self.kv_indices.astype(np.int32).tobytes()
