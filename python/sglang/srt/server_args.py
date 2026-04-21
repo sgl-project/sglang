@@ -159,6 +159,13 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
+# Placeholder token inserted between items in Multi-Item Scoring sequences:
+# query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
+# lengths (multi_item_delimiter_indices); the token only exists for FlashInfer
+# attention mask compat and logprob column indexing. Will be removed once the
+# attention backend supports position-only MIS.
+MIS_DELIMITER_TOKEN_ID = 9999
+
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
@@ -436,6 +443,7 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
+    strip_thinking_cache: bool = False
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
@@ -509,6 +517,8 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -599,10 +609,11 @@ class ServerArgs:
     offload_mode: str = "cpu"
 
     # Scoring configuration
-    # Delimiter token ID used to combine Query and Items into a single sequence for multi-item scoring.
-    # Format: Query<delimiter>Item1<delimiter>Item2<delimiter>...
-    # This enables efficient batch processing of multiple items against a single query.
-    multi_item_scoring_delimiter: Optional[Union[int]] = None
+    # Enable Multi-Item Scoring optimization. Combines query and multiple items
+    # into a single sequence for efficient batch processing. Item boundaries are
+    # determined by pre-computed delimiter indices (from item lengths), not by the
+    # placeholder token. See MIS_DELIMITER_TOKEN_ID for details.
+    enable_mis: bool = False
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -798,9 +809,6 @@ class ServerArgs:
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
 
-        # Handle multi-item scoring constraints.
-        self._handle_multi_item_scoring()
-
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
@@ -820,6 +828,10 @@ class ServerArgs:
         self._handle_amd_specifics()
         self._handle_nccl_pre_warm()
         self._handle_grammar_backend()
+
+        # Handle multi-item scoring constraints. Must run after the above so
+        # the final attention backend and chunked_prefill_size are in effect.
+        self._handle_multi_item_scoring()
 
         # Handle Hicache settings.
         self._handle_hicache()
@@ -1225,19 +1237,35 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_multi_item_scoring(self):
-        """Disable CUDA graphs when multi-item scoring delimiter is set.
+        """Setup and validate multi-item scoring constraints.
 
-        The padded static input_ids buffer used by CUDA graph replay causes
-        spurious delimiter matches in score_and_pool's MIS path.
+        Auto-disables settings incompatible with MIS mechanics (CUDA graph,
+        radix cache, chunked prefill). Asserts on attention backend since
+        changing it silently could surprise users who intentionally picked
+        a non-flashinfer backend.
         """
-        if self.multi_item_scoring_delimiter is None:
+        if not self.enable_mis:
             return
+
         if not self.disable_cuda_graph:
-            logger.warning(
-                "CUDA graph is disabled because --multi-item-scoring-delimiter is set."
-            )
+            logger.warning("CUDA graph is disabled because --enable-mis is set.")
             self.disable_cuda_graph = True
         self.disable_piecewise_cuda_graph = True
+
+        if not self.disable_radix_cache:
+            logger.warning("Radix cache is disabled because --enable-mis is set.")
+            self.disable_radix_cache = True
+
+        if self.chunked_prefill_size != -1:
+            logger.warning("Chunked prefill is disabled because --enable-mis is set.")
+            self.chunked_prefill_size = -1
+
+        prefill_backend, decode_backend = self.get_attention_backends()
+        assert prefill_backend == "flashinfer" and decode_backend == "flashinfer", (
+            "Multi-item scoring requires flashinfer attention backend for custom attention mask support. "
+            f"Please set --attention-backend flashinfer when using --enable-mis. "
+            f"Current backends: prefill={prefill_backend}, decode={decode_backend}"
+        )
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -2326,10 +2354,20 @@ class ServerArgs:
                     self.disable_overlap_schedule = False
             else:
                 if not self.disable_radix_cache:
-                    raise ValueError(
-                        f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
-                        "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
-                    )
+                    if is_hip():
+                        # On ROCm, extra_buffer is unsupported.
+                        # Automatically disable radix cache instead.
+                        logger.warning(
+                            f"Speculative decoding for {model_arch} is not compatible "
+                            "with radix cache on ROCm devices. "
+                            "Automatically disabling radix cache."
+                        )
+                        self.disable_radix_cache = True
+                    else:
+                        raise ValueError(
+                            f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
+                            "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
+                        )
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -3454,6 +3492,22 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+
+        if self.speculative_adaptive:
+            if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+                logger.warning(
+                    "speculative_adaptive is only supported with EAGLE/EAGLE3 and topk=1. "
+                    f"Current algorithm={self.speculative_algorithm}. "
+                    "Falling back to static params."
+                )
+                self.speculative_adaptive = False
+            elif self.speculative_eagle_topk != 1:
+                logger.warning(
+                    "speculative_adaptive is only supported with topk=1. "
+                    f"Current topk={self.speculative_eagle_topk}. "
+                    "Falling back to static params."
+                )
+                self.speculative_adaptive = False
 
     def _handle_load_format(self):
         if (
@@ -4851,6 +4905,13 @@ class ServerArgs:
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
+        parser.add_argument(
+            "--strip-thinking-cache",
+            action="store_true",
+            help="Skip caching reasoning-model output (thinking + answer) in the "
+            "radix tree on finish; keep only the prompt prefix. Opt-in: changes "
+            "cache contents.",
+        )
         tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(
             "--tool-call-parser",
@@ -5290,6 +5351,18 @@ class ServerArgs:
             default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
             help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
         )
+        parser.add_argument(
+            "--speculative-adaptive",
+            action="store_true",
+            help="Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
+            default=ServerArgs.speculative_adaptive,
+        )
+        parser.add_argument(
+            "--speculative-adaptive-config",
+            type=str,
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs ",
+            default=ServerArgs.speculative_adaptive_config,
+        )
 
         # Multi-layer Eagle speculative decoding
         parser.add_argument(
@@ -5699,10 +5772,13 @@ class ServerArgs:
 
         # Args for multi-item-scoring
         parser.add_argument(
-            "--multi-item-scoring-delimiter",
-            type=int,
-            default=ServerArgs.multi_item_scoring_delimiter,
-            help="Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query.",
+            "--enable-mis",
+            action="store_true",
+            default=ServerArgs.enable_mis,
+            help="Enable Multi-Item Scoring optimization. Combines query and multiple items "
+            "into a single sequence for efficient batch processing. "
+            "Requires --attention-backend flashinfer; auto-disables CUDA graph, "
+            "radix cache, and chunked prefill.",
         )
 
         # Optimization/debug options
@@ -6571,17 +6647,6 @@ class ServerArgs:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
-
-        # Check multi-item scoring
-        if self.multi_item_scoring_delimiter is not None:
-            assert self.disable_radix_cache, (
-                "Multi-item scoring requires radix cache to be disabled. "
-                "Please set --disable-radix-cache when using --multi-item-scoring-delimiter."
-            )
-            assert self.chunked_prefill_size == -1, (
-                "Multi-item scoring requires chunked prefill to be disabled. "
-                "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
-            )
 
         # Check hisparse
         if self.enable_hisparse:
