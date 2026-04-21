@@ -4,6 +4,7 @@ import contextlib
 import os
 from typing import Any, Iterator, Optional
 
+import torch
 
 ROW_LINEAR_INV_BLOCK_K = 128
 
@@ -45,6 +46,41 @@ def should_disable_flashinfer_allreduce_fusion(
     server_args: Optional[Any] = None,
 ) -> bool:
     return is_tp_invariant_target(server_args)
+
+
+def should_force_bfloat16_dense_tensor_math(
+    server_args: Optional[Any] = None,
+) -> bool:
+    return is_true_on_policy_enabled(server_args)
+
+
+def should_force_bfloat16_lm_head(
+    *,
+    server_args: Optional[Any] = None,
+    use_fp32_lm_head: bool = False,
+) -> bool:
+    return should_force_bfloat16_dense_tensor_math(server_args) and not use_fp32_lm_head
+
+
+def get_on_policy_rms_norm_kwargs(
+    server_args: Optional[Any] = None,
+    *,
+    weight_dtype: Optional[torch.dtype] = None,
+    override_orig_dtype: Optional[torch.dtype] = None,
+    fp32_residual: bool = False,
+) -> dict[str, Any]:
+    if not is_true_on_policy_enabled(server_args):
+        return {}
+
+    kwargs: dict[str, Any] = {
+        "cast_x_before_out_mul": True,
+        "fp32_residual": fp32_residual,
+    }
+    if weight_dtype is not None:
+        kwargs["weight_dtype"] = weight_dtype
+    if override_orig_dtype is not None:
+        kwargs["override_orig_dtype"] = override_orig_dtype
+    return kwargs
 
 
 def should_use_tp_invariant_row_linear(

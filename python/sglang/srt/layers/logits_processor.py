@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.on_policy_utils import should_force_bfloat16_lm_head
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     compute_temp_top_p_normalized_logprobs,
@@ -878,6 +879,11 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
                 )
+            elif should_force_bfloat16_lm_head(use_fp32_lm_head=self.use_fp32_lm_head):
+                logits = torch.matmul(
+                    hidden_states.to(torch.bfloat16),
+                    lm_head.weight.to(torch.bfloat16).T,
+                ).to(torch.bfloat16)
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
@@ -966,6 +972,8 @@ class LogitsProcessor(nn.Module):
             assert logits_buffer.dtype == torch.float
             logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
+        elif should_force_bfloat16_lm_head(use_fp32_lm_head=self.use_fp32_lm_head):
+            logits = logits[:, : self.vocab_size].to(torch.bfloat16)
         else:
             logits = logits[:, : self.vocab_size].float()
         return logits
