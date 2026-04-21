@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, set_strip_thinking_cache
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -507,11 +507,14 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.mamba_last_track_seqlen = kv_len
         req.reasoning_tokens = 1
-        req.strip_thinking_cache = True
 
-        avail_before = allocator.available_size()
-        tree.cache_finished_req(req, is_insert=True)
-        start_p, end_p = req.pop_overallocated_kv_cache()
+        set_strip_thinking_cache(True)
+        try:
+            avail_before = allocator.available_size()
+            tree.cache_finished_req(req, is_insert=True)
+            start_p, end_p = req.pop_overallocated_kv_cache()
+        finally:
+            set_strip_thinking_cache(False)
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
         if start_p < end_p:

@@ -162,6 +162,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
+    set_strip_thinking_cache,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -594,7 +595,7 @@ class Scheduler(
             )[0]
             # AND env with parser flag: MiniMax-style interleaved thinking
             # opts out even when the env is on.
-            self.model_config.strip_thinking_cache = (
+            set_strip_thinking_cache(
                 envs.SGLANG_STRIP_THINKING_CACHE.get()
                 and reasoning_parser.detector.strip_thinking_cache
             )
@@ -1889,9 +1890,6 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
-            req.strip_thinking_cache = getattr(
-                self.model_config, "strip_thinking_cache", False
-            )
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
