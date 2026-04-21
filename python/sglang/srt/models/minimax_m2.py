@@ -828,6 +828,11 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if hidden_states.shape[0] == 0:
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         if self.use_qk_norm:
             cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
