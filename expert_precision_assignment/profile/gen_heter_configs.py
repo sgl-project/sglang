@@ -36,6 +36,7 @@ import vram_estimator as vest  # noqa: E402
 from assign_experts import (  # noqa: E402
     _assign,
     _composite_scores,
+    _load_hessian_scores,
     _load_model_config,
     _load_sensitivity_inputs,
     _write_outputs,
@@ -53,6 +54,9 @@ INT4_CKPT = (
 )
 LAYER_SENS = SENS_DIR / "per_moe_layer" / "results" / "summary.json"
 EXPERT_SENS = SENS_DIR / "per_expert" / "results" / "summary.json"
+HESSIAN_SCORES = (
+    THIS_DIR.parent / "hessian" / "results" / "hessian_scores.json"
+)
 
 MAX_PROMPT_LEN = 2048
 MAX_OUTPUT_LEN = 2048
@@ -82,6 +86,49 @@ def _parse_args() -> argparse.Namespace:
         "--max_output_len", type=int, default=MAX_OUTPUT_LEN,
         help="Worst-case envelope for output length (default %(default)d). "
              "Ignored when calib provides empirical stats.",
+    )
+
+    ranking = ap.add_mutually_exclusive_group()
+    ranking.add_argument(
+        "--hessian", dest="ranking", action="store_const", const="hessian",
+        help="Rank experts by per-expert ½·dᵀHd from hessian_scores.json "
+             "(default). Signed score: positive = INT4 hurts; negative = "
+             "INT4 is neutral or helpful.",
+    )
+    ranking.add_argument(
+        "--sensitivity", dest="ranking", action="store_const", const="sensitivity",
+        help="Legacy ranking: max(0, ppl_increase[L]) × L2[L][E] / ΣL2[L]. "
+             "Requires sensitivity summaries in --layer_sens / --expert_sens.",
+    )
+    ap.set_defaults(ranking="hessian")
+
+    ap.add_argument(
+        "--hessian_path", type=Path, default=HESSIAN_SCORES,
+        help="Path to hessian_scores.json (only used when --hessian).",
+    )
+
+    fo = ap.add_mutually_exclusive_group()
+    fo.add_argument(
+        "--fo_threshold", dest="fo_threshold", action="store_true",
+        help="Cap K at the number of experts whose hessian_score exceeds the "
+             "mean |first_order_score| (default). Experts below this noise "
+             "floor are statistically indistinguishable from zero — spending "
+             "BF16 budget on them doesn't improve accuracy.",
+    )
+    fo.add_argument(
+        "--no_fo_threshold", dest="fo_threshold", action="store_false",
+        help="Disable the |fo|-mean cap: fill the full VRAM-budget K with top "
+             "scores even when most are near-noise-floor. Useful for A/B.",
+    )
+    ap.set_defaults(fo_threshold=True)
+
+    ap.add_argument(
+        "--layer_sens", type=Path, default=LAYER_SENS,
+        help="Per-layer PPL sensitivity summary (only used when --sensitivity).",
+    )
+    ap.add_argument(
+        "--expert_sens", type=Path, default=EXPERT_SENS,
+        help="Per-expert L2 sensitivity summary (only used when --sensitivity).",
     )
     return ap.parse_args()
 
@@ -145,10 +192,44 @@ def main() -> int:
         num_layers, num_experts, num_experts * num_layers,
     )
 
-    ppl, l2 = _load_sensitivity_inputs(
-        str(LAYER_SENS), str(EXPERT_SENS), num_layers, num_experts
-    )
-    scores = _composite_scores(ppl, l2, num_experts)
+    fo_mean: float | None = None
+    fo_cap: int | None = None
+    if args.ranking == "hessian":
+        logger.info("Ranking policy: hessian (%s)", args.hessian_path)
+        scores, first_order = _load_hessian_scores(
+            str(args.hessian_path), num_layers, num_experts
+        )
+        ppl: dict = {}
+        npos = sum(1 for v in scores.values() if v > 0)
+        nneg = sum(1 for v in scores.values() if v < 0)
+        logger.info(
+            "  %d experts with positive hessian (BF16-critical), "
+            "%d negative (INT4-preferred), %d zero",
+            npos, nneg, len(scores) - npos - nneg,
+        )
+
+        fo_abs = [abs(v) for v in first_order.values()]
+        fo_mean = sum(fo_abs) / len(fo_abs) if fo_abs else 0.0
+        fo_cap = sum(1 for v in scores.values() if v > fo_mean)
+        logger.info(
+            "  |fo|_mean=%.3e → %d experts above noise floor "
+            "(fo_threshold=%s)",
+            fo_mean, fo_cap, args.fo_threshold,
+        )
+    else:
+        if args.fo_threshold and args.ranking != "hessian":
+            logger.info(
+                "fo_threshold has no effect with --sensitivity ranking; ignored."
+            )
+        logger.info(
+            "Ranking policy: sensitivity (layer=%s expert=%s)",
+            args.layer_sens, args.expert_sens,
+        )
+        ppl, l2 = _load_sensitivity_inputs(
+            str(args.layer_sens), str(args.expert_sens),
+            num_layers, num_experts,
+        )
+        scores = _composite_scores(ppl, l2, num_experts)
 
     logger.info("Sweeping max_concurrency ∈ %s (task=%s, out=%s)",
                 MC_LIST, args.task or "<default>", out_root)
@@ -164,11 +245,40 @@ def main() -> int:
         budget = vest.compute_budget(config, gpu_vram, slo, knobs)
         logger.info("[mc=%d] VRAM breakdown:\n%s", mc, vest.format_budget(budget))
 
-        k = budget.k_heter_experts
-        if k == 0:
+        budget_k = budget.k_heter_experts
+        if budget_k == 0:
             logger.warning(
                 "[mc=%d] bf16_budget=0; writing outputs with K=0 (all INT4).", mc
             )
+
+        fo_report: dict | None = None
+        if args.ranking == "hessian" and args.fo_threshold:
+            k = min(budget_k, fo_cap)
+            fo_report = {
+                "enabled": True,
+                "fo_mean": fo_mean,
+                "fo_cap": fo_cap,
+                "budget_k": budget_k,
+                "effective_k": k,
+                "capped": k < budget_k,
+            }
+            if k < budget_k:
+                logger.info(
+                    "[mc=%d] capping K: budget=%d, |fo|-above=%d → K=%d",
+                    mc, budget_k, fo_cap, k,
+                )
+        else:
+            k = budget_k
+            if args.ranking == "hessian":
+                fo_report = {
+                    "enabled": False,
+                    "fo_mean": fo_mean,
+                    "fo_cap": fo_cap,
+                    "budget_k": budget_k,
+                    "effective_k": k,
+                    "capped": False,
+                }
+
         heter, int4_only = _assign(scores, k)
 
         mc_dir = out_root / f"mc{mc}"
@@ -184,6 +294,8 @@ def main() -> int:
             scores=scores,
             ppl=ppl,
             num_layers=num_layers,
+            ranking_policy=args.ranking,
+            fo_threshold=fo_report,
         )
         logger.info(
             "[mc=%d] K=%d heter / %d int4-only → %s",

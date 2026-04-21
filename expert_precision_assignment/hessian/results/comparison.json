@@ -1,0 +1,273 @@
+{
+  "num_experts_compared": 6144,
+  "spearman_corr": 0.06946008494970096,
+  "spearman_corr_abs_scores": 0.4356189289459799,
+  "top_k_overlap": {
+    "0.10": 0.21661237785016288,
+    "0.25": 0.4264322916666667,
+    "0.50": 0.5563151041666666
+  },
+  "first_order_sanity": {
+    "mean_abs_first_order": 9.007138724675739e-05,
+    "mean_abs_hessian": 0.0007286613303564845,
+    "ratio_fo_to_hessian": 0.12361214118868032,
+    "note": "At a trained minimum, first-order \u2248 0 so ratio should be small. Large ratio suggests N is too small for the expectation to converge."
+  },
+  "hybrid_score_stats": {
+    "min": 0.0,
+    "max": 0.01039016625697404,
+    "mean": 5.949230243387551e-05,
+    "std": 0.0001732827808772336,
+    "nonzero_frac": 0.82666015625
+  },
+  "hessian_score_stats": {
+    "min": -0.04136266635032371,
+    "max": 0.28224050998687744,
+    "mean": 0.0001960972847629991,
+    "std": 0.005004670269956342,
+    "nonzero_frac": 0.9973958333333334
+  },
+  "biggest_disagreements": [
+    {
+      "layer": 3,
+      "expert": 82,
+      "hybrid_score": 0.01039016625697404,
+      "hessian_score": -0.025988757610321045,
+      "first_order_score": -0.01916014403104782,
+      "d_norm_sq": 440.0,
+      "token_count": 11321,
+      "hybrid_rank": 0,
+      "hessian_rank": 6140,
+      "rank_delta": 6140
+    },
+    {
+      "layer": 3,
+      "expert": 123,
+      "hybrid_score": 0.0008836997074230498,
+      "hessian_score": -0.007892059860751033,
+      "first_order_score": 5.892707849852741e-05,
+      "d_norm_sq": 410.0,
+      "token_count": 45026,
+      "hybrid_rank": 19,
+      "hessian_rank": 6107,
+      "rank_delta": 6088
+    },
+    {
+      "layer": 3,
+      "expert": 104,
+      "hybrid_score": 0.0007565005071121563,
+      "hessian_score": -0.008383734268136322,
+      "first_order_score": -0.00020294790738262236,
+      "d_norm_sq": 428.0,
+      "token_count": 24953,
+      "hybrid_rank": 38,
+      "hessian_rank": 6111,
+      "rank_delta": 6073
+    },
+    {
+      "layer": 3,
+      "expert": 41,
+      "hybrid_score": 0.0006627747805672873,
+      "hessian_score": -0.011808327748440206,
+      "first_order_score": 4.4498388888314366e-05,
+      "d_norm_sq": 408.0,
+      "token_count": 16523,
+      "hybrid_rank": 53,
+      "hessian_rank": 6120,
+      "rank_delta": 6067
+    },
+    {
+      "layer": 3,
+      "expert": 81,
+      "hybrid_score": 0.000602522527788443,
+      "hessian_score": -0.01693611848895671,
+      "first_order_score": -0.00014609607751481235,
+      "d_norm_sq": 436.0,
+      "token_count": 24899,
+      "hybrid_rank": 64,
+      "hessian_rank": 6128,
+      "rank_delta": 6064
+    },
+    {
+      "layer": 3,
+      "expert": 13,
+      "hybrid_score": 0.0008836997074230498,
+      "hessian_score": -0.004653753247112036,
+      "first_order_score": -8.840765804052353e-05,
+      "d_norm_sq": 472.0,
+      "token_count": 28776,
+      "hybrid_rank": 20,
+      "hessian_rank": 6078,
+      "rank_delta": 6058
+    },
+    {
+      "layer": 1,
+      "expert": 28,
+      "hybrid_score": 0.0,
+      "hessian_score": 0.006627625436522067,
+      "first_order_score": 0.00012247107224538922,
+      "d_norm_sq": 400.0,
+      "token_count": 26371,
+      "hybrid_rank": 6103,
+      "hessian_rank": 78,
+      "rank_delta": 6025
+    },
+    {
+      "layer": 3,
+      "expert": 25,
+      "hybrid_score": 0.0016067267407691814,
+      "hessian_score": -0.002801949856802821,
+      "first_order_score": 5.662976764142513e-05,
+      "d_norm_sq": 416.0,
+      "token_count": 75499,
+      "hybrid_rank": 1,
+      "hessian_rank": 6023,
+      "rank_delta": 6022
+    },
+    {
+      "layer": 46,
+      "expert": 96,
+      "hybrid_score": 0.0,
+      "hessian_score": 0.08006316423416138,
+      "first_order_score": -0.0075928401201963425,
+      "d_norm_sq": 600.0,
+      "token_count": 24836,
+      "hybrid_rank": 6019,
+      "hessian_rank": 4,
+      "rank_delta": 6015
+    },
+    {
+      "layer": 1,
+      "expert": 32,
+      "hybrid_score": 0.0,
+      "hessian_score": 0.005708435433916748,
+      "first_order_score": 0.0001959428482223302,
+      "d_norm_sq": 412.0,
+      "token_count": 5692,
+      "hybrid_rank": 6098,
+      "hessian_rank": 89,
+      "rank_delta": 6009
+    },
+    {
+      "layer": 1,
+      "expert": 68,
+      "hybrid_score": 0.0,
+      "hessian_score": 0.011404654011130333,
+      "first_order_score": -0.002143898978829384,
+      "d_norm_sq": 572.0,
+      "token_count": 22592,
+      "hybrid_rank": 6050,
+      "hessian_rank": 41,
+      "rank_delta": 6009
+    },
+    {
+      "layer": 3,
+      "expert": 49,
+      "hybrid_score": 0.00038996596937418675,
+      "hessian_score": -0.019701533077750355,
+      "first_order_score": -0.0003256488125771284,
+      "d_norm_sq": 482.0,
+      "token_count": 10228,
+      "hybrid_rank": 126,
+      "hessian_rank": 6134,
+      "rank_delta": 6008
+    },
+    {
+      "layer": 1,
+      "expert": 44,
+      "hybrid_score": 0.0,
+      "hessian_score": 0.0048955886595649645,
+      "first_order_score": -5.914476059842855e-05,
+      "d_norm_sq": 432.0,
+      "token_count": 5440,
+      "hybrid_rank": 6082,
+      "hessian_rank": 100,
+      "rank_delta": 5982
+    },
+    {
+      "layer": 46,
+      "expert": 74,
+      "hybrid_score": 0.0,
+      "hessian_score": 0.28224050998687744,
+      "first_order_score": -0.0035420972853899,
+      "d_norm_sq": 612.0,
+      "token_count": 12685,
+      "hybrid_rank": 5977,
+      "hessian_rank": 0,
+      "rank_delta": 5977
+    },
+    {
+      "layer": 47,
+      "expert": 57,
+      "hybrid_score": 0.0008693111223096532,
+      "hessian_score": -0.0019114050082862377,
+      "first_order_score": -0.00022156629711389542,
+      "d_norm_sq": 528.0,
+      "token_count": 31421,
+      "hybrid_rank": 23,
+      "hessian_rank": 5970,
+      "rank_delta": 5947
+    },
+    {
+      "layer": 3,
+      "expert": 74,
+      "hybrid_score": 0.0007364164228525415,
+      "hessian_score": -0.0019160557421855628,
+      "first_order_score": -4.132254980504513e-05,
+      "d_norm_sq": 390.0,
+      "token_count": 48714,
+      "hybrid_rank": 40,
+      "hessian_rank": 5971,
+      "rank_delta": 5931
+    },
+    {
+      "layer": 3,
+      "expert": 4,
+      "hybrid_score": 0.0007598478544887587,
+      "hessian_score": -0.0017742607742547989,
+      "first_order_score": -6.824592128396034e-05,
+      "d_norm_sq": 484.0,
+      "token_count": 14714,
+      "hybrid_rank": 37,
+      "hessian_rank": 5955,
+      "rank_delta": 5918
+    },
+    {
+      "layer": 3,
+      "expert": 59,
+      "hybrid_score": 0.0007799319387483735,
+      "hessian_score": -0.001744130568113178,
+      "first_order_score": 1.2075644917786121e-05,
+      "d_norm_sq": 410.0,
+      "token_count": 35700,
+      "hybrid_rank": 33,
+      "hessian_rank": 5951,
+      "rank_delta": 5918
+    },
+    {
+      "layer": 1,
+      "expert": 73,
+      "hybrid_score": 0.0,
+      "hessian_score": 0.002948437742816168,
+      "first_order_score": -1.59532246470917e-05,
+      "d_norm_sq": 418.0,
+      "token_count": 5341,
+      "hybrid_rank": 6077,
+      "hessian_rank": 159,
+      "rank_delta": 5918
+    },
+    {
+      "layer": 3,
+      "expert": 40,
+      "hybrid_score": 0.0003564924956081621,
+      "hessian_score": -0.00378878484480083,
+      "first_order_score": 2.8145092073827982e-05,
+      "d_norm_sq": 432.0,
+      "token_count": 12250,
+      "hybrid_rank": 153,
+      "hessian_rank": 6057,
+      "rank_delta": 5904
+    }
+  ],
+  "note": "Spearman / top-K overlap at low N is noisy. If N < 32, a ratio |first-order|/|\u00bd\u00b7d\u1d40Hd| > 0.5 means the first-order term hasn't averaged out yet \u2014 scale N up before drawing conclusions."
+}

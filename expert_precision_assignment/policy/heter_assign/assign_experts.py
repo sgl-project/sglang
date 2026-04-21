@@ -107,6 +107,55 @@ def _composite_scores(
     return scores
 
 
+def _load_hessian_scores(
+    hessian_path: str,
+    num_layers: int,
+    num_experts: int,
+) -> Tuple[Dict[Tuple[int, int], float], Dict[Tuple[int, int], float]]:
+    """Load per-expert ½·dᵀHd and first-order scores from ``hessian_score.py``.
+
+    Uses the signed Hessian score directly: positive = INT4 hurts end-to-end
+    loss (expert should stay BF16); negative = INT4 is neutral or mildly
+    helpful (safe to quantize). Ranking top-K by signed score DESC therefore
+    naturally keeps the critical experts in BF16 and dumps loss-reducing or
+    near-zero experts to INT4.
+
+    Also returns per-expert first-order scores ``g·d`` — at a trained minimum
+    g≈0 so ``|g·d|`` characterizes the MC noise floor; experts whose Hessian
+    score is below ``mean(|g·d|)`` are statistically indistinguishable from
+    zero and safe to leave INT4.
+    """
+    with open(hessian_path) as f:
+        d = json.load(f)
+
+    per_layer = d.get("per_layer")
+    if per_layer is None:
+        raise ValueError(f"{hessian_path}: missing 'per_layer'")
+
+    scores: Dict[Tuple[int, int], float] = {}
+    first_order: Dict[Tuple[int, int], float] = {}
+    for L_str, layer_d in per_layer.items():
+        L = int(L_str)
+        experts = layer_d.get("experts", {})
+        for E_str, e_d in experts.items():
+            E = int(E_str)
+            scores[(L, E)] = float(e_d["hessian_score"])
+            first_order[(L, E)] = float(e_d["first_order_score"])
+
+    missing = [
+        (L, E)
+        for L in range(num_layers)
+        for E in range(num_experts)
+        if (L, E) not in scores
+    ]
+    if missing:
+        raise ValueError(
+            f"hessian_scores missing {len(missing)} (layer, expert) pairs, "
+            f"first 10: {missing[:10]}"
+        )
+    return scores, first_order
+
+
 def _assign(
     scores: Dict[Tuple[int, int], float],
     K: int,
@@ -134,6 +183,8 @@ def _write_outputs(
     scores: Dict[Tuple[int, int], float],
     ppl: Dict[int, float],
     num_layers: int,
+    ranking_policy: str = "sensitivity",
+    fo_threshold: dict | None = None,
 ) -> Tuple[Path, Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,6 +235,8 @@ def _write_outputs(
     zero_layers = sorted(L for L, v in ppl.items() if v <= 0)
 
     report = {
+        "ranking_policy": ranking_policy,
+        "fo_threshold": fo_threshold,
         "slo": {
             "max_concurrency": slo.max_concurrency,
             "max_prompt_len": slo.max_prompt_len,
