@@ -93,7 +93,9 @@ class KimiK2Detector(BaseFormatDetector):
             normal_text_chunks = []
             current_pos = 0
             for match in tool_call_matches:
-                normal_text_chunks.append(_strip_special_tokens(text[current_pos:match.start()]))
+                normal_text_chunks.append(
+                    _strip_special_tokens(text[current_pos : match.start()])
+                )
 
                 function_id = match.group("tool_call_id")
                 function_args = match.group("function_arguments")
