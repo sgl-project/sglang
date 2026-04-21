@@ -21,7 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -133,6 +133,9 @@ class SchedulerOutputProcessorMixin:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            if result.routed_experts_output is not None:
+                result.routed_experts_output.finalize()
+                result.routed_experts_output = None
 
             (
                 logits_output,
@@ -391,6 +394,9 @@ class SchedulerOutputProcessorMixin:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -629,13 +635,12 @@ class SchedulerOutputProcessorMixin:
 
         # Process logprob indices based on scoring type
         if is_multi_item_scoring:
-            # Multi-item scoring: only include delimiter token positions
-            relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
-            input_token_logprobs_idx = [
-                token_id
-                for token_id in relevant_tokens
-                if token_id == self.server_args.multi_item_scoring_delimiter
-            ]
+            # MIS scores come from input_token_ids_logprobs, not input_token_logprobs.
+            # But the shared pipeline requires input_token_logprobs_idx to be the same
+            # length as input_token_logprobs_val (validated at line 816). We fill with
+            # MIS_DELIMITER_TOKEN_ID as a dummy — score_request() ignores this field.
+            delimiter_count = len(req.multi_item_delimiter_indices)
+            input_token_logprobs_idx = [MIS_DELIMITER_TOKEN_ID] * delimiter_count
         else:
             # Regular request: include all tokens from logprob_start_len onwards
             input_token_logprobs_idx = req.origin_input_ids[req.logprob_start_len :]
@@ -714,18 +719,11 @@ class SchedulerOutputProcessorMixin:
         For regular requests, all positions from logprob_start_len onwards have logprobs.
         """
         is_multi_item_scoring = self._is_multi_item_scoring(req)
-        relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
 
         if is_multi_item_scoring:
-            # Multi-item scoring: count delimiter tokens from logprob_start_len onwards
-            return sum(
-                1
-                for token_id in relevant_tokens
-                if token_id == self.server_args.multi_item_scoring_delimiter
-            )
+            return len(req.multi_item_delimiter_indices)
         else:
-            # Regular request: all tokens from logprob_start_len onwards
-            return len(relevant_tokens)
+            return len(req.origin_input_ids[req.logprob_start_len :])
 
     def _calculate_num_input_logprobs(
         self: Scheduler, req: Req, extend_input_len: int, extend_logprob_start_len: int
@@ -738,14 +736,11 @@ class SchedulerOutputProcessorMixin:
         is_multi_item_scoring = self._is_multi_item_scoring(req)
 
         if is_multi_item_scoring:
-            # Multi-item scoring: count delimiter tokens in the relevant portion
-            relevant_tokens = req.origin_input_ids[
-                extend_logprob_start_len:extend_input_len
-            ]
+            # Count pre-computed delimiter indices within the extend range
             return sum(
                 1
-                for token_id in relevant_tokens
-                if token_id == self.server_args.multi_item_scoring_delimiter
+                for idx in req.multi_item_delimiter_indices
+                if extend_logprob_start_len <= idx < extend_input_len
             )
         else:
             # Regular request: all tokens in the range
@@ -758,7 +753,11 @@ class SchedulerOutputProcessorMixin:
         token is configured. In this mode, only positions containing the
         delimiter token receive logprobs.
         """
-        return req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
+        return (
+            self.server_args.enable_mis
+            and req.is_prefill_only
+            and req.multi_item_delimiter_indices is not None
+        )
 
     def add_input_logprob_return_values(
         self: Scheduler,
