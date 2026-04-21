@@ -85,6 +85,10 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             self._process_assignment([node.target], node.value)
         self.generic_visit(node)
 
+    def visit_Expr(self, node: ast.Expr):
+        self._process_append(node.value)
+        self.generic_visit(node)
+
     def _process_assignment(self, targets: List[ast.AST], value: ast.AST):
         """Process an assignment to extract case IDs if it's a known list."""
         for target in targets:
@@ -93,6 +97,23 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
                 case_ids = self._extract_case_ids_from_list(value)
                 if case_ids is not None:
                     self.cases[list_name] = case_ids
+
+    def _process_append(self, value: ast.AST):
+        """Process CASE_LIST.append(DiffusionTestCase(...)) calls."""
+        if not isinstance(value, ast.Call):
+            return
+        if not isinstance(value.func, ast.Attribute) or value.func.attr != "append":
+            return
+        if not isinstance(value.func.value, ast.Name):
+            return
+
+        list_name = value.func.value.id
+        if list_name not in CASE_LIST_TO_SUITE or len(value.args) != 1:
+            return
+
+        case_id = self._extract_case_id_from_call(value.args[0])
+        if case_id:
+            self.cases.setdefault(list_name, []).append(case_id)
 
     def _extract_case_ids_from_list(self, node: ast.AST) -> Optional[List[str]]:
         """Extract case IDs from a literal list of DiffusionTestCase calls."""
