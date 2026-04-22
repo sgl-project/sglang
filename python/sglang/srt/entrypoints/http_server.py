@@ -190,7 +190,7 @@ WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 
 @dataclasses.dataclass
 class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
-    template_manager: TemplateManager
+    template_manager: Optional[TemplateManager]
     scheduler_info: Dict
 
 
@@ -285,6 +285,7 @@ async def init_multi_tokenizer() -> ServerArgs:
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
+    grpc_handle = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -377,6 +378,17 @@ async def lifespan(fast_api_app: FastAPI):
         traceback = get_exception_traceback()
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
 
+    if (
+        envs.SGLANG_GRANIAN_PARENT_PID.get() is not None
+        and server_args.enable_grpc
+    ):
+        grpc_handle = _start_native_grpc_server_for_runtime(
+            server_args=server_args,
+            tokenizer_manager=_global_state.tokenizer_manager,
+            template_manager=_global_state.template_manager,
+            scheduler_info=_global_state.scheduler_info,
+        )
+
     # Execute custom warmups
     if server_args.warmups is not None:
         await execute_warmups(
@@ -397,6 +409,7 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
+        _shutdown_native_grpc_server(grpc_handle)
         warmup_thread.join()
 
 
@@ -2310,6 +2323,59 @@ def _setup_and_run_http_server(
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
+def _start_native_grpc_server_for_runtime(
+    server_args,
+    tokenizer_manager,
+    template_manager,
+    scheduler_info,
+):
+    """Attempt to start the native Rust gRPC server for a live runtime.
+
+    Returns a GrpcServerHandle on success, or None if sglang-grpc is not installed.
+    """
+    try:
+        import sglang_grpc
+
+        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+
+        runtime_handle = RuntimeHandle(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            server_args=server_args,
+            scheduler_info=scheduler_info or {},
+        )
+
+        grpc_handle = sglang_grpc.start_server(
+            host=server_args.host,
+            port=server_args.grpc_port,
+            runtime_handle=runtime_handle,
+            worker_threads=server_args.grpc_worker_threads,
+            max_prefill_tokens=server_args.grpc_max_prefill_tokens,
+        )
+        logger.info(
+            f"Native gRPC server started on {server_args.host}:{server_args.grpc_port}"
+        )
+        return grpc_handle
+    except ImportError:
+        logger.info(
+            "sglang-grpc package not installed; native gRPC server disabled. "
+            "Install with: pip install sglang-grpc"
+        )
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to start native gRPC server: {e}")
+        return None
+
+
+def _shutdown_native_grpc_server(grpc_handle) -> None:
+    if grpc_handle is None:
+        return
+    try:
+        grpc_handle.shutdown()
+    except Exception as e:
+        logger.warning(f"Failed to shut down native gRPC server: {e}")
+
+
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
@@ -2347,13 +2413,32 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
-    _setup_and_run_http_server(
-        server_args,
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result.scheduler_infos,
-        subprocess_watchdog,
-        execute_warmup_func=execute_warmup_func,
-        launch_callback=launch_callback,
-    )
+    # Start native gRPC in the same process that owns the live TokenizerManager.
+    # Granian workers get their own TokenizerManager instances, so they start
+    # native gRPC from the worker lifespan instead of the parent process.
+    grpc_handle = None
+    if server_args.enable_grpc and not server_args.enable_http2:
+        grpc_handle = _start_native_grpc_server_for_runtime(
+            server_args,
+            tokenizer_manager,
+            template_manager,
+            (
+                scheduler_init_result.scheduler_infos[0]
+                if scheduler_init_result.scheduler_infos
+                else {}
+            ),
+        )
+
+    try:
+        _setup_and_run_http_server(
+            server_args,
+            tokenizer_manager,
+            template_manager,
+            port_args,
+            scheduler_init_result.scheduler_infos,
+            subprocess_watchdog,
+            execute_warmup_func=execute_warmup_func,
+            launch_callback=launch_callback,
+        )
+    finally:
+        _shutdown_native_grpc_server(grpc_handle)

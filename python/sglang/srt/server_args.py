@@ -319,6 +319,11 @@ class ServerArgs:
     port: int = 30000
     fastapi_root_path: str = ""
     grpc_mode: bool = False
+    grpc_port: Optional[int] = None
+    grpc_worker_threads: int = 4
+    grpc_max_prefill_tokens: Optional[int] = None  # None = auto-detect from KV cache
+    enable_grpc: bool = False
+    smg_grpc: bool = False
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
@@ -979,6 +984,20 @@ class ServerArgs:
                     "Multi-worker HTTP/2 support will be added in a future release."
                 )
 
+        legacy_grpc_requested = self.smg_grpc or self.grpc_mode
+        native_grpc_requested = (
+            self.enable_grpc
+            and not legacy_grpc_requested
+            and not self.use_ray
+            and not self.encoder_only
+            and importlib.util.find_spec("sglang_grpc") is not None
+        )
+        if native_grpc_requested and self.tokenizer_worker_num > 1:
+            raise ValueError(
+                "Native gRPC does not yet support --tokenizer-worker-num > 1. "
+                "Unset --enable-grpc or set --tokenizer-worker-num 1."
+            )
+
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
         if self.mm_process_config is not None:
@@ -1013,20 +1032,33 @@ class ServerArgs:
             envs.SGLANG_SPEC_NAN_DETECTION.set(True)
             envs.SGLANG_SPEC_OOB_DETECTION.set(True)
 
-        # Native gRPC flags — env-only for now, not exposed as CLI args.
-        # Set as instance attributes (not dataclass fields) to avoid
-        # argparse namespace lookup in from_cli_args.
-        self.enable_grpc = envs.SGLANG_ENABLE_GRPC.get()
+        if self.grpc_mode and not self.smg_grpc:
+            import warnings
 
+            warnings.warn(
+                "--grpc-mode is deprecated and will be removed in a future version. "
+                "Use --smg-grpc for the legacy SMG gRPC server. "
+                "The native gRPC server now starts automatically alongside HTTP.",
+                DeprecationWarning,
+                stacklevel=4,
+            )
+            self.smg_grpc = True
+
+        # Env var fallbacks for gRPC flags (backwards compat with env-only phase).
+        if not self.enable_grpc and envs.SGLANG_ENABLE_GRPC.get():
+            self.enable_grpc = True
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
-        self.grpc_port = (
-            grpc_port_env if grpc_port_env is not None else self.port + 10000
-        )
+        if self.grpc_port is None and grpc_port_env is not None:
+            self.grpc_port = grpc_port_env
 
+        if self.grpc_port is None:
+            self.grpc_port = self.port + 10000
         if not (1 <= self.grpc_port <= 65535):
             raise ValueError(
-                f"SGLANG_GRPC_PORT ({self.grpc_port}) must be between 1 and 65535"
+                f"--grpc-port / SGLANG_GRPC_PORT ({self.grpc_port}) must be between 1 and 65535"
             )
+        if self.grpc_worker_threads < 1:
+            raise ValueError("--grpc-worker-threads must be >= 1")
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
@@ -4163,7 +4195,43 @@ class ServerArgs:
         parser.add_argument(
             "--grpc-mode",
             action="store_true",
-            help="If set, use gRPC server instead of HTTP server.",
+            help="(Deprecated, use --smg-grpc) If set, use legacy SMG gRPC server instead of HTTP server.",
+        )
+        parser.add_argument(
+            "--grpc-port",
+            type=int,
+            default=None,
+            help="Port for the native gRPC server. Defaults to --port + 10000 (e.g., 30000 → 40000).",
+        )
+        parser.add_argument(
+            "--grpc-worker-threads",
+            type=int,
+            default=4,
+            help="Number of Tokio worker threads for the native gRPC server.",
+        )
+        parser.add_argument(
+            "--grpc-max-prefill-tokens",
+            type=int,
+            default=None,
+            help=(
+                "Coarse token budget for concurrent prefill admission in the "
+                "native gRPC server. Each request currently acquires "
+                "max_new_tokens permits before prefill and releases them on the "
+                "first response token, so this bounds weighted prefill admission "
+                "rather than true KV occupancy. Default (None) auto-detects "
+                "from the scheduler's max_total_num_tokens. Set to 0 to disable "
+                "admission control."
+            ),
+        )
+        parser.add_argument(
+            "--enable-grpc",
+            action="store_true",
+            help="If set, start the native gRPC server alongside HTTP. Off by default.",
+        )
+        parser.add_argument(
+            "--smg-grpc",
+            action="store_true",
+            help="If set, use the legacy SMG gRPC server (smg-grpc-servicer) instead of HTTP server.",
         )
         parser.add_argument(
             "--skip-server-warmup",
@@ -6735,12 +6803,13 @@ class ServerArgs:
             and self.grpc_port == self.port
         ):
             raise ValueError(
-                f"SGLANG_GRPC_PORT ({self.grpc_port}) must differ from --port ({self.port})"
+                f"--grpc-port ({self.grpc_port}) must differ from --port ({self.port})"
             )
 
         # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port
         # to avoid opaque bind errors at runtime. Deferred because metrics_http_port
         # and nccl_port have dynamic defaults that may not be resolved yet here.
+
 
         if self.gc_threshold:
             if not (1 <= len(self.gc_threshold) <= 3):
