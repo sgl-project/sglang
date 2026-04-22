@@ -13,6 +13,16 @@ on:
         required: false
         default: ''
         type: string
+      output_name:
+        description: 'Custom output folder name (also used for artifact names and publish target dir). Leave empty to use defaults.'
+        required: false
+        default: ''
+        type: string
+      kernel_artifact_run_id:
+        description: "Optional sgl-kernel wheel source: GitHub Actions run ID of a pr-test.yml run on the SAME commit as 'ref' that uploaded wheel-python3.10-cuda13.0. Use only when this branch's torch/ABI change makes the PyPI sglang-kernel wheel incompatible. Find it under Actions > pr-test; artifacts expire after 90 days."
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: diffusion-ci-gt-gen-${{ github.ref }}
@@ -25,6 +35,7 @@ permissions:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
+  OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
 
 jobs:
   multimodal-diffusion-gen-1gpu:
@@ -40,8 +51,26 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        if: inputs.kernel_artifact_run_id != ''
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: inputs.kernel_artifact_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+          run-id: ${{ inputs.kernel_artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install dependencies
-        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
         env:
@@ -52,20 +81,23 @@ jobs:
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
-            --out-dir ./diffusion-ci-outputs \
+            --out-dir ./${{ env.OUTPUT_NAME }} \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-gen-1gpu-part${{ matrix.part }}
-          path: python/diffusion-ci-outputs
+          name: ${{ env.OUTPUT_NAME }}-1gpu-part${{ matrix.part }}
+          path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
       - name: Publish GT images to sglang-bot/sglang-ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir python/diffusion-ci-outputs
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
 
   multimodal-diffusion-gen-2gpu:
     if: github.repository == 'sgl-project/sglang'
@@ -80,8 +112,26 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        if: inputs.kernel_artifact_run_id != ''
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: inputs.kernel_artifact_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+          run-id: ${{ inputs.kernel_artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install dependencies
-        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
         env:
@@ -92,20 +142,23 @@ jobs:
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
-            --out-dir ./diffusion-ci-outputs \
+            --out-dir ./${{ env.OUTPUT_NAME }} \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-gen-2gpu-part${{ matrix.part }}
-          path: python/diffusion-ci-outputs
+          name: ${{ env.OUTPUT_NAME }}-2gpu-part${{ matrix.part }}
+          path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
       - name: Publish GT images to sglang-bot/sglang-ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir python/diffusion-ci-outputs
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
 
   multimodal-diffusion-gen-b200:
     if: github.repository == 'sgl-project/sglang'
@@ -117,8 +170,26 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        if: inputs.kernel_artifact_run_id != ''
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: inputs.kernel_artifact_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+          run-id: ${{ inputs.kernel_artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install dependencies
-        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
         env:
@@ -127,17 +198,20 @@ jobs:
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
             --suite 1-gpu-b200 \
-            --out-dir ./diffusion-ci-outputs \
+            --out-dir ./${{ env.OUTPUT_NAME }} \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-gen-b200
-          path: python/diffusion-ci-outputs
+          name: ${{ env.OUTPUT_NAME }}-b200
+          path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
       - name: Publish GT images to sglang-bot/sglang-ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir python/diffusion-ci-outputs
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
