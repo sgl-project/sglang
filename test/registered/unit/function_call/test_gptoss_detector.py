@@ -53,7 +53,7 @@ class TestGptOssDetector(CustomTestCase):
 
     # ==================== has_tool_call Tests ====================
 
-    def test_has_tool_call_with_python_tag(self):
+    def test_has_tool_call_true(self):
         text = '<|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"city":"Beijing"}<|call|>'
         self.assertTrue(self.detector.has_tool_call(text))
 
