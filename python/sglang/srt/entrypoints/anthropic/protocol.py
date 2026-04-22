@@ -33,11 +33,18 @@ class AnthropicContentBlock(BaseModel):
     """Content block in message"""
 
     type: Literal[
-        "text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking"
+        "text",
+        "image",
+        "tool_use",
+        "tool_result",
+        "thinking",
+        "redacted_thinking",
+        "search_result",
     ]
     text: Optional[str] = None
-    # For image content
-    source: Optional[dict[str, Any]] = None
+    # For image content (dict) and search_result source URL (str)
+    source: Optional[dict[str, Any] | str] = None
+    title: Optional[str] = None
     # For tool use/result
     id: Optional[str] = None
     tool_use_id: Optional[str] = None
@@ -62,11 +69,14 @@ class AnthropicTool(BaseModel):
 
     name: str
     description: Optional[str] = None
-    input_schema: dict[str, Any]
+    input_schema: Optional[dict[str, Any]] = None
+    type: Optional[str] = None
 
     @field_validator("input_schema")
     @classmethod
     def validate_input_schema(cls, v):
+        if v is None:
+            return v
         if not isinstance(v, dict):
             raise ValueError("input_schema must be a dictionary")
         if "type" not in v:
