@@ -62,7 +62,7 @@ class MMMUServerBase(CustomTestCase):
     def tearDownClass(cls):
         if cls.process is not None and cls.process.poll() is None:
             try:
-                kill_process_tree(cls.process.pid)
+                kill_process_tree(cls.process.pid, wait_timeout=60)
             except Exception as e:
                 logger.error(f"Error killing process: {e}")
         time.sleep(2)

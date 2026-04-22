@@ -47,11 +47,10 @@ LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-8B"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 1
-DISABLE_CUDA_GRAPH = True
-PREFILL_ATTENTION_BACKEND = "fa3"
-DECODE_ATTENTION_BACKEND = "fa3"
+PREFILL_ATTENTION_BACKEND = "fa4"
+DECODE_ATTENTION_BACKEND = "fa4"
 
-KL_THRESHOLD = 1e-2
+KL_THRESHOLD = 5e-3
 
 
 def kl_v2(a, b):
@@ -139,7 +138,6 @@ class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
             lora_paths={"my_lora": adapter_path},
             lora_backend=LORA_BACKEND,
             attention_backend="flashinfer",
-            disable_cuda_graph=DISABLE_CUDA_GRAPH,
             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
             decode_attention_backend=DECODE_ATTENTION_BACKEND,
         )

@@ -13,7 +13,7 @@ from sglang.test.test_utils import is_in_ci
 # VLM (Vision Language Model) tests
 
 
-register_cuda_ci(est_time=228, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=176, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=850, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
 
 _is_hip = is_hip()

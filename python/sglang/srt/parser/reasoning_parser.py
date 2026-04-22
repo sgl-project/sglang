@@ -37,6 +37,7 @@ class BaseReasoningFormatDetector:
 
         self._buffer = ""
         self.stripped_think_start = False
+        self.think_start_self_label = ""
 
         self.continue_final_message = continue_final_message
         if self.continue_final_message:
@@ -62,7 +63,9 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult(normal_text=text)
 
         # The text is considered to be in a reasoning block.
-        processed_text = text.replace(self.think_start_token, "").strip()
+        processed_text = text.replace(
+            self.think_start_token + self.think_start_self_label, ""
+        ).strip()
 
         if (
             self.think_end_token not in processed_text
@@ -111,8 +114,10 @@ class BaseReasoningFormatDetector:
         self._buffer += new_text
         current_text = self._buffer
 
+        think_start_text = self.think_start_token + self.think_start_self_label
+
         # If the current text is a prefix of the think token, keep buffering
-        tokens_to_check = [self.think_start_token, self.think_end_token]
+        tokens_to_check = [think_start_text, self.think_end_token]
         if self.tool_start_token:
             tokens_to_check.append(self.tool_start_token)
         if any(
@@ -122,8 +127,8 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult()
 
         # Strip `<think>` token if present
-        if not self.stripped_think_start and self.think_start_token in current_text:
-            current_text = current_text.replace(self.think_start_token, "")
+        if not self.stripped_think_start and think_start_text in current_text:
+            current_text = current_text.replace(think_start_text, "", 1)
             self.stripped_think_start = True
             self._in_reasoning = True
 
@@ -477,6 +482,27 @@ class MistralDetector(BaseReasoningFormatDetector):
         )
 
 
+class Gemma4Detector(BaseReasoningFormatDetector):
+    """Gemma4 reasoning detector."""
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<|channel>",
+            "<channel|>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+        self.think_start_self_label = "thought\n"
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -505,6 +531,7 @@ class ReasoningParser:
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
+        "gemma4": Gemma4Detector,
     }
 
     def __init__(

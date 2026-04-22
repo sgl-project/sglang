@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Register this test for CUDA CI in stage-b (fast attention/kernel tests)
-register_cuda_ci(est_time=25, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-large")
 
 
 def reference_normal_decode_set_metadata(

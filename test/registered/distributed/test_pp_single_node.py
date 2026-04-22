@@ -4,6 +4,7 @@ python3 -m unittest test_pp_single_node.TestPPAccuracy.test_gsm8k
 python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
 python3 -m unittest test_pp_single_node.TestQwenVLPPAccuracy.test_mmmu
+python3 -m unittest test_pp_single_node.TestPPMixedChunk.test_gsm8k
 """
 
 import time
@@ -31,7 +32,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch_server,
 )
 
-register_cuda_ci(est_time=650, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=462, suite="stage-c-test-4-gpu-h100")
 register_amd_ci(est_time=650, suite="stage-c-test-4-gpu-amd")
 
 
@@ -128,11 +129,11 @@ class TestDPAttentionDP2PP2(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_en(self):
+    def test_gsm8k(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="mgsm_en",
+            eval_name="gsm8k",
             num_examples=None,
             num_threads=1024,
         )
@@ -420,6 +421,53 @@ class TestQwen35PPAccuracy(unittest.TestCase):
         )
 
 
+class TestPPMixedChunk(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = "http://127.0.0.1:23338"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp-size",
+                2,
+                "--pp-size",
+                2,
+                "--chunked-prefill-size",
+                256,
+                "--enable-mixed-chunk",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process"):
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        if is_in_amd_ci():
+            # AMD triton backend produces slightly lower accuracy than FA3 on NVIDIA
+            self.assertGreater(metrics["score"], 0.70)
+        else:
+            self.assertGreater(metrics["score"], 0.74)
+        # Wait a little bit so that the memory check happens.
+        time.sleep(4)
+
+
 class TestFixedBugs(unittest.TestCase):
     def test_chunked_prefill_with_small_bs(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -435,7 +483,7 @@ class TestFixedBugs(unittest.TestCase):
             2,
             "--pp-size",
             2,
-            "--chunked-prefill",
+            "--chunked-prefill-size",
             256,
             "--max-running-requests",
             2,
