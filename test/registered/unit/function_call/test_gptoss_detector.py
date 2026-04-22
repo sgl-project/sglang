@@ -130,7 +130,8 @@ class TestGptOssDetector(CustomTestCase):
 
     def test_streaming_text_then_tool_call(self):
         chunks = [
-            "I'll look that up. <|start|>",
+            "I'll look",
+            " that up. <|start|>",
             "assistant<|channel|>",
             "commentary to=functions.get_weather",
             '<|constrain|>json<|message|>{"city":"Beijing", "unit":"celsius"}<|call|>',
