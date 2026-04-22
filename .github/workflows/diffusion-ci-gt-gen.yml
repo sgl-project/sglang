@@ -18,6 +18,11 @@ on:
         required: false
         default: ''
         type: string
+      kernel_artifact_run_id:
+        description: "Optional sgl-kernel wheel source: GitHub Actions run ID of a pr-test.yml run on the SAME commit as 'ref' that uploaded wheel-python3.10-cuda13.0. Use only when this branch's torch/ABI change makes the PyPI sglang-kernel wheel incompatible. Find it under Actions > pr-test; artifacts expire after 90 days."
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: diffusion-ci-gt-gen-${{ github.ref }}
@@ -46,8 +51,26 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        if: inputs.kernel_artifact_run_id != ''
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: inputs.kernel_artifact_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+          run-id: ${{ inputs.kernel_artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install dependencies
-        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
         env:
@@ -89,8 +112,26 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        if: inputs.kernel_artifact_run_id != ''
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: inputs.kernel_artifact_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+          run-id: ${{ inputs.kernel_artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install dependencies
-        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
         env:
@@ -129,8 +170,26 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        if: inputs.kernel_artifact_run_id != ''
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: inputs.kernel_artifact_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          name: wheel-python3.10-cuda13.0
+          run-id: ${{ inputs.kernel_artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install dependencies
-        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
         env:
