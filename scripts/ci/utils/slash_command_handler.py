@@ -192,62 +192,71 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     head_sha = pr.head.sha
     print(f"Checking workflows for commit: {head_sha}")
 
-    # If PR has sgl-kernel changes, check whether the wheel build already
-    # succeeded for this commit. If so, we can skip the full rerun and just
-    # rerun failed jobs — avoids retriggering all tests (including flaky ones).
+    # If PR has sgl-kernel changes, check whether ALL wheel builds already
+    # succeeded for this commit (CUDA + ARM). If so, we can use
+    # rerun_failed_jobs and avoid retriggering all tests. If any wheel
+    # build is pending/failed, a dependent job could fail for missing
+    # artifacts, so fall back to full rerun.
+    # Check-runs display names: "Build Wheel (<python>, <cuda>)" (CUDA) and
+    # "Build Wheel Arm (<python>, <cuda>)" (ARM). The YAML job ids
+    # sgl-kernel-build-wheels{,-arm} are NOT what the check-runs API
+    # returns — it returns the job's `name:` field.
     kernel_wheel_built = False
     if sgl_kernel_changes:
         try:
-            check_runs = gh_repo.get_commit(head_sha).get_check_runs()
-            for cr in check_runs:
-                if "sgl-kernel-build-wheels" in cr.name and cr.conclusion == "success":
-                    kernel_wheel_built = True
-                    print(
-                        f"sgl-kernel-build-wheels already passed (check run {cr.id})"
-                        " - using rerun_failed_jobs"
-                    )
-                    break
-            if not kernel_wheel_built:
-                print(
-                    "sgl-kernel-build-wheels has not passed yet"
-                    " - will use full rerun"
-                )
+            wheel_builds = [
+                cr
+                for cr in gh_repo.get_commit(head_sha).get_check_runs()
+                if cr.name.startswith("Build Wheel")
+            ]
+            kernel_wheel_built = bool(wheel_builds) and all(
+                cr.conclusion == "success" for cr in wheel_builds
+            )
+            print(
+                f"All {len(wheel_builds)} kernel wheel build(s) passed - using rerun_failed_jobs"
+                if kernel_wheel_built
+                else f"Kernel wheel not fully built "
+                f"({sum(1 for c in wheel_builds if c.conclusion == 'success')}"
+                f"/{len(wheel_builds)} success) - will use full rerun"
+            )
         except Exception as e:
             print(
-                f"Failed to check sgl-kernel-build-wheels status: {e}"
-                " - falling back to full rerun"
+                f"Failed to check kernel wheel status: {e} - falling back to full rerun"
             )
 
-    # List all workflow runs for this commit
+    # Rerun workflows with conclusion=failure or conclusion=skipped.
+    #
+    # - failure: use rerun_failed_jobs() which reruns failed jobs *and their
+    #   dependent jobs* (GitHub API). Fast-fail cascades call
+    #   core.setFailed(...) so their conclusion is "failure" and are covered.
+    # - skipped: the entire run was skipped (no jobs ran), so there are no
+    #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
+    # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
+    #   builds are success yet, full-rerun failure runs too — Build Wheel
+    #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
+    #   rerun_failed_jobs() is scoped to a single workflow run.
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
 
     rerun_count = 0
     for run in runs:
         if run.status != "completed":
             continue
+        if run.conclusion not in ("failure", "skipped"):
+            continue
 
-        if run.conclusion == "failure":
-            print(f"Rerunning failed workflow: {run.name} (ID: {run.id})")
-            try:
-                if sgl_kernel_changes and not kernel_wheel_built:
-                    # Full rerun to ensure sgl-kernel-build-wheels runs
-                    # and produces fresh artifacts for dependent jobs
-                    run.rerun()
-                else:
-                    # Use rerun_failed_jobs for efficiency on failures
-                    run.rerun_failed_jobs()
-                rerun_count += 1
-            except Exception as e:
-                print(f"Failed to rerun workflow {run.id}: {e}")
-
-        elif run.conclusion == "skipped":
-            print(f"Rerunning skipped workflow: {run.name} (ID: {run.id})")
-            try:
-                # Skipped workflows don't have 'failed jobs', so we use full rerun()
+        print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
+        try:
+            if run.conclusion == "skipped" or (
+                sgl_kernel_changes and not kernel_wheel_built
+            ):
+                print("  Full rerun")
                 run.rerun()
-                rerun_count += 1
-            except Exception as e:
-                print(f"Failed to rerun workflow {run.id}: {e}")
+            else:
+                print("  rerun_failed_jobs")
+                run.rerun_failed_jobs()
+            rerun_count += 1
+        except Exception as e:
+            print(f"Failed to rerun workflow {run.id}: {e}")
 
     if rerun_count > 0:
         print(f"Triggered rerun for {rerun_count} workflows.")
