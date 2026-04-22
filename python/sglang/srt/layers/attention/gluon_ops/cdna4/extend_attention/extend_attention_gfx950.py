@@ -721,17 +721,10 @@ def _get_num_xcds(device):
 def _select_d256_dispatch(
     batch_size: int,
     max_len_extend: int,
-    min_len_extend: int,
     total_prefix_len: int,
     total_extend_len: int,
-    avg_pfx_proxy: int = 0,
 ):
     """D=256 launch policy (Gemma-style models).
-
-    Narrow oracle-tuned overrides for B>=4 ext>=256 and B=1 ext>=2048 fire
-    first; everything else falls through to the prior tree. ``avg_pfx_proxy``
-    is a coarse proxy for avg prefix length supplied by the caller when
-    ``total_prefix_len`` is not threaded through.
 
     NS=1 is avoided even where it would win: the prefix-pipelined kernel
     hard-asserts NS>=2 for determinism, so NS=2 is used throughout at a
@@ -739,8 +732,6 @@ def _select_d256_dispatch(
     """
     total_tokens = max(1, total_prefix_len + total_extend_len)
     prefix_frac = total_prefix_len / total_tokens
-    ext_ratio = max_len_extend / max(1, min_len_extend)
-    avg_pfx = total_prefix_len // max(1, batch_size)
 
     if batch_size >= 4 and max_len_extend >= 256:
         return 128, 8, 2, 16, 16
@@ -757,18 +748,7 @@ def _select_d256_dispatch(
             return 64, 4, 2, 16, 16
         return 128, 8, 3, 16, 16
 
-    if batch_size <= 4:
-        if max_len_extend <= 128 and avg_pfx >= 2048:
-            return 64, 4, 4, 16, 16
-        return 64, 4, 2, 16, 16
-
-    if max_len_extend <= 128 and avg_pfx >= 2048:
-        return 64, 8, 4, 16, 16
-
-    if ext_ratio <= 2.5:
-        return 64, 4, 2, 16, 16
-
-    return 64, 8, 4, 16, 16
+    return 64, 4, 2, 16, 16
 
 
 # FP8 dispatch defaults for the rare D not in {64, 128} fallthrough. The
@@ -1009,14 +989,15 @@ def _get_basic_dispatch_config(
 
     if Lq == 256:
         _avg_pfx_proxy = (
-            0 if pfx_bucket <= 1
+            0 if pfx_bucket == 0
+            else 256 if pfx_bucket == 1
             else 1024 if pfx_bucket == 2
-            else 2048 if pfx_bucket == 3
-            else 8192
+            else 4096 if pfx_bucket == 3
+            else 16384
         )
+        _total_pfx_proxy = _avg_pfx_proxy * batch_size
         _BM, _NW, _NS, _PAD_K, _PAD_V = _select_d256_dispatch(
-            batch_size, max_len_extend, max_len_extend, 0, _total_ext,
-            avg_pfx_proxy=_avg_pfx_proxy,
+            batch_size, max_len_extend, _total_pfx_proxy, _total_ext,
         )
         _BN = 32
         _EXT_BN, _EXT_NS = _BN, _NS
@@ -1180,13 +1161,6 @@ def gluon_extend_attention_fwd(
     )
     _is_ragged = _is_ragged_ext or _is_ragged_pfx
 
-    # FP8 KV + ragged + short-extend (max_ext<=64): basic per-batch grid
-    # beats WCA persistent by ~0.9x on these decode-ish shapes (the
-    # BM>=128 persistent tile has too much per-seq overhead when each
-    # seq contributes <2 rows). WCA is otherwise numerically equivalent
-    # to basic on Triton 3.7 (verified to <0.1% per-element jitter on 8
-    # ragged shapes spanning D={64,128} and B={4,8,16}; the older
-    # ~10% per-element error observation was a stale Triton issue).
     if _kv_is_fp8 and not _is_uniform and max_len_extend <= 64:
         _is_ragged = False
 
@@ -1341,37 +1315,6 @@ def gluon_extend_attention_fwd(
             _ensure_dummies(q_extend.device, q_extend.shape[0] + 1, batch_size)
         if _wkvo is None:
             _wkvo = _dummy_wkvo[:batch_size]
-
-        # D=256 prefix-aware WCA routing. FP8 D=256 persistent overflows
-        # LDS (204KB > 160KB) and hits LLVM codegen bugs, so BF16 only.
-        if Lq == 256 and not _kv_is_fp8:
-            _total_pfx_256 = total_prefix_len if total_prefix_len is not None else 0
-            _avg_pfx_256 = _total_pfx_256 // max(1, batch_size)
-            _n_m_256 = (max_len_extend + 63) // 64
-            _tiles_256 = batch_size * head_num * _n_m_256
-            _need_persistent_256 = (
-                _avg_pfx_256 >= 4096
-                and (batch_size >= 4 or _avg_pfx_256 >= 16384)
-                and _tiles_256 < _get_num_CUs(q_extend.device)
-            )
-            if _need_persistent_256 and _can_route_wca:
-                if min_len_extend is None:
-                    min_len_extend = max_len_extend
-                _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-                _wca_fn(
-                    q_extend, k_extend, v_extend, o_extend,
-                    k_buffer, v_buffer,
-                    qo_indptr, kv_indptr, kv_indices,
-                    custom_mask, is_causal, mask_indptr, max_len_extend,
-                    k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
-                    logit_cap=logit_cap,
-                    sliding_window_size=sliding_window_size,
-                    sinks=sinks, window_kv_offsets=window_kv_offsets,
-                    xai_temperature_len=xai_temperature_len,
-                    min_len_extend=min_len_extend,
-                    total_prefix_len=total_prefix_len,
-                )
-                return
 
         # Cached dispatch config lookup (O(0.1us) after warmup).
         _pfx_b_full = _pfx_bucket(total_prefix_len, batch_size)
