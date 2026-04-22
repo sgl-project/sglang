@@ -457,10 +457,10 @@ fi
 # parse the first two digits of CU_VERSION (pytorch convention is cu{major}{minor}
 # with a single-digit minor, e.g. cu126, cu129, cu130).
 if [ "$CU_MAJOR" = "13" ]; then
-    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post1"
+    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
 else
-    MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post1"
+    MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
 fi
 $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
