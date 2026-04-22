@@ -905,7 +905,10 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
+    # The `*-low-disk` label (resolved by `set-runner` to `4-gpu-b200-low-disk` or
+    # `4-gpu-b200-kernel-low-disk`) is advertised by both the existing large-disk B200
+    # runners and the new low-disk runner, so this job can land on either pool.
+    runs-on: ${{ needs.check-changes.outputs.b200_low_disk_runner }}
     timeout-minutes: 240
     strategy:
       fail-fast: false
