@@ -313,6 +313,8 @@ class TestROPE(CustomTestCase):
             (128, 4, 256, torch.bfloat16, torch.bfloat16),
             (1, 1, 32, torch.bfloat16, torch.float32),
             (32, 16, 128, torch.bfloat16, torch.float32),
+            (2520, 12, 64, torch.bfloat16, torch.bfloat16),
+            (2520, 12, 64, torch.bfloat16, torch.float32),
         ]
 
         for num_tokens, num_heads, head_dim, dtype, sincos_dtype in test_configs:

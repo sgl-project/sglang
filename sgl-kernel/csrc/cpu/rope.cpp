@@ -662,18 +662,58 @@ void multimodal_rotary_embedding_2D_kernel_impl(
   });
 }
 
-// Apply multidimensional RoPE to a single tensor x.
-// x: [num_tokens, num_heads, head_dim], cos/sin: [num_tokens, head_dim]
+// AVX512 helpers: load/store fVecSize reduced-precision elements as float vectors.
+// Used by the half-width vectorized path when embed_dim < bVecSize but >= fVecSize.
+#if defined(CPU_CAPABILITY_AVX512)
+template <typename T>
+inline at::vec::Vectorized<float> load_as_fvec(const T* ptr);
+
+template <>
+inline at::vec::Vectorized<float> load_as_fvec<at::BFloat16>(const at::BFloat16* ptr) {
+  return at::vec::Vectorized<float>(CVT_BF16_TO_FP32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr))));
+}
+
+template <>
+inline at::vec::Vectorized<float> load_as_fvec<at::Half>(const at::Half* ptr) {
+  return at::vec::Vectorized<float>(CVT_FP16_TO_FP32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr))));
+}
+
+template <>
+inline at::vec::Vectorized<float> load_as_fvec<float>(const float* ptr) {
+  return at::vec::Vectorized<float>::loadu(ptr);
+}
+
+template <typename T>
+inline void store_fvec(T* ptr, const at::vec::Vectorized<float>& v);
+
+template <>
+inline void store_fvec<at::BFloat16>(at::BFloat16* ptr, const at::vec::Vectorized<float>& v) {
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(ptr), (__m256i)_mm512_cvtneps_pbh(__m512(v)));
+}
+
+template <>
+inline void store_fvec<at::Half>(at::Half* ptr, const at::vec::Vectorized<float>& v) {
+  _mm256_storeu_si256(
+      reinterpret_cast<__m256i*>(ptr),
+      _mm512_cvtps_ph(__m512(v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+}
+#endif
+
+// Apply multidimensional RoPE to query and key tensors simultaneously.
+// q/k: [num_tokens, num_heads, head_dim], cos/sin: [num_tokens, head_dim]
 // Splits head_dim into ndim=2 chunks and applies standard rotary to each independently.
+// Fusing query and key into a single pass improves cos/sin cache reuse.
 // cos/sin layout per chunk (chunk_size elements): [cos_half0, cos_half1] matching
 // rotate_half pattern: out_x = x_first * cos_first - x_second * sin_first
 //                      out_y = x_second * cos_second + x_first * sin_second
 template <typename scalar_t, typename param_t>
 void apply_multidimensional_rope_kernel_impl(
-    scalar_t* __restrict__ x,
+    scalar_t* __restrict__ q,
+    scalar_t* __restrict__ k,
     param_t* __restrict__ cos,
     param_t* __restrict__ sin,
-    int64_t x_stride_s,
+    int64_t q_stride_s,
+    int64_t k_stride_s,
     int64_t num_heads,
     int64_t head_dim,
     int64_t num_tokens) {
@@ -686,15 +726,14 @@ void apply_multidimensional_rope_kernel_impl(
   int64_t chunk_size = head_dim / ndim;
   int64_t embed_dim = chunk_size / 2;
 
-  bool flag = (embed_dim % bVecSize == 0);
-  int64_t loop_upper = flag ? embed_dim : embed_dim - bVecSize;
-
   // Vectorized compute loop for a single chunk within a single head.
-  // token_head: offset into x for (token, head)
+  // x: pointer to tensor data (query or key)
+  // token_head: offset into x for (token, head, chunk)
   // cos_ptr/sin_ptr: pointer to the cos/sin data for the chunk
-  auto compute_loop = [&](int64_t token_head, param_t* cos_ptr, param_t* sin_ptr) {
+  auto compute_loop = [&](scalar_t* x, int64_t token_head, param_t* cos_ptr, param_t* sin_ptr) {
     int64_t j = 0;
-    for (; j < loop_upper; j += bVecSize) {
+    // Full-width vectorized loop (bVecSize elements per iteration)
+    for (; j + bVecSize <= embed_dim; j += bVecSize) {
       int64_t x_index = j;
       int64_t y_index = embed_dim + j;
 
@@ -743,25 +782,50 @@ void apply_multidimensional_rope_kernel_impl(
       auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
       out2.store(x + out_y);
     }
-    if (!flag) {
-      for (; j < embed_dim; ++j) {
-        int64_t x_index = j;
-        int64_t y_index = embed_dim + j;
+#if defined(CPU_CAPABILITY_AVX512)
+    // Half-width vectorized loop (fVecSize elements per iteration).
+    // Handles the case where embed_dim < bVecSize but >= fVecSize,
+    // e.g. head_dim=64 -> embed_dim=16 == fVecSize on AVX512.
+    for (; j + fVecSize <= embed_dim; j += fVecSize) {
+      int64_t x_index = j;
+      int64_t y_index = embed_dim + j;
 
-        int64_t out_x = token_head + x_index;
-        int64_t out_y = token_head + y_index;
+      int64_t out_x = token_head + x_index;
+      int64_t out_y = token_head + y_index;
 
-        float _cos_x = cos_ptr[x_index];
-        float _sin_x = sin_ptr[x_index];
-        float _cos_y = cos_ptr[y_index];
-        float _sin_y = sin_ptr[y_index];
+      fVec _cos_x = load_as_fvec(cos_ptr + x_index);
+      fVec _sin_x = load_as_fvec(sin_ptr + x_index);
+      fVec _cos_y = load_as_fvec(cos_ptr + y_index);
+      fVec _sin_y = load_as_fvec(sin_ptr + y_index);
 
-        float _q_x = x[out_x];
-        float _q_y = x[out_y];
+      fVec _q_x = load_as_fvec(x + out_x);
+      fVec _q_y = load_as_fvec(x + out_y);
 
-        x[out_x] = _q_x * _cos_x - _q_y * _sin_x;
-        x[out_y] = _q_y * _cos_y + _q_x * _sin_y;
-      }
+      auto res_x = _q_x * _cos_x - _q_y * _sin_x;
+      auto res_y = _q_y * _cos_y + _q_x * _sin_y;
+
+      store_fvec(x + out_x, res_x);
+      store_fvec(x + out_y, res_y);
+    }
+#endif
+    // Scalar fallback for remaining elements
+    for (; j < embed_dim; ++j) {
+      int64_t x_index = j;
+      int64_t y_index = embed_dim + j;
+
+      int64_t out_x = token_head + x_index;
+      int64_t out_y = token_head + y_index;
+
+      float _cos_x = cos_ptr[x_index];
+      float _sin_x = sin_ptr[x_index];
+      float _cos_y = cos_ptr[y_index];
+      float _sin_y = sin_ptr[y_index];
+
+      float _q_x = x[out_x];
+      float _q_y = x[out_y];
+
+      x[out_x] = _q_x * _cos_x - _q_y * _sin_x;
+      x[out_y] = _q_y * _cos_y + _q_x * _sin_y;
     }
   };
 
@@ -775,8 +839,10 @@ void apply_multidimensional_rope_kernel_impl(
         param_t* sin_ptr = sin + token_idx * head_dim + chunk_offset;
 
         for (int64_t h = 0; h < num_heads; ++h) {
-          int64_t token_head = token_idx * x_stride_s + h * head_dim + chunk_offset;
-          compute_loop(token_head, cos_ptr, sin_ptr);
+          int64_t q_token_head = token_idx * q_stride_s + h * head_dim + chunk_offset;
+          compute_loop(q, q_token_head, cos_ptr, sin_ptr);
+          int64_t k_token_head = token_idx * k_stride_s + h * head_dim + chunk_offset;
+          compute_loop(k, k_token_head, cos_ptr, sin_ptr);
         }
       }
       data_index_step(token_idx, num_tokens);
@@ -832,36 +898,17 @@ apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& 
   int64_t k_stride_s = key.stride(0);
   TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
   TORCH_CHECK(cos.scalar_type() == sin.scalar_type(), "cos and sin must have the same data type");
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "apply_multidimensional_rope_cpu", [&] {
-    auto cos_dtype = cos.scalar_type();
-    auto invoke = [&](auto param_tag) {
-      using param_t = decltype(param_tag);
-      apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
-          query.data_ptr<scalar_t>(),
-          cos.data_ptr<param_t>(),
-          sin.data_ptr<param_t>(),
-          q_stride_s,
-          num_heads,
-          head_dim,
-          num_tokens);
-      apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
-          key.data_ptr<scalar_t>(),
-          cos.data_ptr<param_t>(),
-          sin.data_ptr<param_t>(),
-          k_stride_s,
-          num_heads,
-          head_dim,
-          num_tokens);
-    };
-    if (cos_dtype == at::kFloat) {
-      invoke(float{});
-    } else if (cos_dtype == at::ScalarType::BFloat16) {
-      invoke(at::BFloat16{});
-    } else if (cos_dtype == at::ScalarType::Half) {
-      invoke(at::Half{});
-    } else {
-      TORCH_CHECK(false, "Unsupported cos/sin data type.");
-    }
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input_dtype, cos.scalar_type(), "apply_multidimensional_rope_cpu", [&] {
+    apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
+        query.data_ptr<scalar_t>(),
+        key.data_ptr<scalar_t>(),
+        cos.data_ptr<param_t>(),
+        sin.data_ptr<param_t>(),
+        q_stride_s,
+        k_stride_s,
+        num_heads,
+        head_dim,
+        num_tokens);
   });
   return std::make_tuple(query, key);
 }
