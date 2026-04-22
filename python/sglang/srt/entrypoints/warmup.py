@@ -42,17 +42,19 @@ async def execute_warmups(
 async def whisper_autodetect(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
-    """Pre-compile the xgrammar FSM for Whisper auto-detect regex.
+    """Pre-compile the xgrammar FSM for both Whisper auto-detect regexes.
 
-    The first request that uses the structured generation regex incurs a
-    ~15-20s compilation cost.  Running it at startup avoids a latency
-    spike on the first real request.
+    The first request that uses each structured-generation regex incurs a
+    ~15-20s compilation cost. xgrammar caches compiled grammars by the
+    exact regex string, so we warm both the notimestamps and timestamps
+    variants here — otherwise the first ``language=None +
+    timestamp_granularities`` request would still pay the full spike.
     """
     from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
         WHISPER_AUTODETECT_REGEX,
+        WHISPER_AUTODETECT_TS_REGEX,
     )
 
-    logger.info("Compiling Whisper auto-detect regex FSM (one-time, ~15-20s)...")
     # A short silent audio encoded as base64 WAV (0.1s, 16kHz, mono) —
     # soundfile produces the WAV header + PCM data from a list of floats.
     import base64
@@ -65,24 +67,34 @@ async def whisper_autodetect(
     buf = io.BytesIO()
     sf.write(buf, [0.0] * n, sr, format="WAV")
     audio_b64 = base64.b64encode(buf.getvalue()).decode()
+    audio_data_uri = f"data:audio/wav;base64,{audio_b64}"
 
-    req = GenerateReqInput(
-        text="",
-        audio_data=f"data:audio/wav;base64,{audio_b64}",
-        sampling_params={
-            "max_new_tokens": 4,
-            "temperature": 0,
-            "regex": WHISPER_AUTODETECT_REGEX,
-            "skip_special_tokens": False,
-            "_detect_language": True,
-        },
-        modalities=["audio"],
-    )
-    # Drain the generator so the FSM is fully installed and any downstream
-    # exception surfaces instead of being swallowed after the first yield.
-    async for _ in tokenizer_manager.generate_request(req, None):
-        pass
-    logger.info("Whisper auto-detect regex FSM compiled.")
+    for variant_name, regex in (
+        ("notimestamps", WHISPER_AUTODETECT_REGEX),
+        ("timestamps", WHISPER_AUTODETECT_TS_REGEX),
+    ):
+        logger.info(
+            "Compiling Whisper auto-detect regex FSM (%s, one-time, ~15-20s)...",
+            variant_name,
+        )
+        req = GenerateReqInput(
+            text="",
+            audio_data=audio_data_uri,
+            sampling_params={
+                "max_new_tokens": 4,
+                "temperature": 0,
+                "regex": regex,
+                "skip_special_tokens": False,
+                "_detect_language": True,
+            },
+            modalities=["audio"],
+        )
+        # Drain the generator so the FSM is fully installed and any
+        # downstream exception surfaces instead of being swallowed after
+        # the first yield.
+        async for _ in tokenizer_manager.generate_request(req, None):
+            pass
+    logger.info("Whisper auto-detect regex FSMs compiled.")
 
 
 @warmup("voice_chat")

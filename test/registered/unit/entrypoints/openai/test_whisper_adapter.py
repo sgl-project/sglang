@@ -63,6 +63,19 @@ class TestWhisperParseFusedOutput(CustomTestCase):
             (None, None),
         )
 
+    def test_malformed_prefix_without_transcribe_defers(self):
+        # The parse must match the exact 3-token forced prefix, not
+        # "lang tag + sentinel somewhere". A bypassed-FSM string that
+        # skips <|transcribe|> must not parse as a valid detection.
+        self.assertEqual(
+            WhisperAdapter.parse_fused_output("<|en|>junk<|notimestamps|>text"),
+            (None, None),
+        )
+        self.assertEqual(
+            WhisperAdapter.parse_fused_output("<|en|><|0.00|> text"),
+            (None, None),
+        )
+
     def test_sentinel_in_but_whitespace_only_returns_empty_visible(self):
         # Prefix arrived at a chunk boundary before the first word. The
         # .strip() collapses to "" so streaming callers see no delta yet;

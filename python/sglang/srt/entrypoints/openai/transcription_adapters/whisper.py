@@ -155,16 +155,19 @@ WHISPER_AUTODETECT_TS_REGEX = (
     _LANG_PREFIX + r"<\|transcribe\|>" + r"<\|0\.00\|>" + r"[\s\S]*"
 )
 
-# Pattern to extract the language code from the fused output. Scoped to
-# WHISPER_LANG_TOKEN_CODES so a bypassed/drifted FSM can't sneak through a
-# random 2-or-3-letter code that isn't actually a Whisper language token.
-_LANG_PREFIX_RE = re.compile(r"^" + _LANG_PREFIX)
-
-# Sentinel strings that mark the boundary between the forced prefix and the
-# user-visible transcription. Ordered so we match the notimestamps variant
-# first when both could theoretically appear (they never do in practice:
-# the FSM emits exactly one of the two at position 2).
-_FUSED_SENTINELS = ("<|notimestamps|>", "<|0.00|>")
+# Full forced-prefix pattern, anchored at start. Accepts the exact 3-token
+# shape the FSM emits and rejects anything else (so a bypassed FSM or a
+# chunk-boundary snapshot that's missing ``<|transcribe|>`` can't slip
+# through as a valid detection). ``[\s\S]*`` captures everything after the
+# prefix as the user-visible transcription. Scoped to
+# WHISPER_LANG_TOKEN_CODES so a bogus 2-or-3-letter code can't sneak through
+# either.
+_FUSED_PREFIX_RE = re.compile(
+    r"^"
+    + _LANG_PREFIX
+    + r"<\|transcribe\|>"
+    + r"(?:<\|notimestamps\|>|<\|0\.00\|>)"
+)
 
 # Matches any Whisper special token (``<|...|>``). Used to scrub trailing
 # ``<|endoftext|>`` and embedded ``<|X.XX|>`` timestamp tokens from the
@@ -230,33 +233,19 @@ class WhisperAdapter(TranscriptionAdapter):
         return params
 
     @staticmethod
-    def _find_fused_sentinel(text: str) -> tuple[int, int]:
-        """Locate the prefix sentinel and return ``(start_index, length)``.
-
-        Tries each variant in ``_FUSED_SENTINELS``. The FSM emits exactly
-        one of them at position 2, and the timestamps-variant ``<|0.00|>``
-        only appears as the forced prefix (later segment-boundary timestamp
-        tokens use non-zero values), so the first ``find`` hit is safe.
-        Returns ``(-1, 0)`` when no sentinel is found.
-        """
-        for sentinel in _FUSED_SENTINELS:
-            idx = text.find(sentinel)
-            if idx >= 0:
-                return idx, len(sentinel)
-        return -1, 0
-
-    @staticmethod
     def parse_fused_output(text: str) -> tuple[Optional[str], Optional[str]]:
         """Parse fused output into ``(language_code, user_visible_text)``.
 
-        Handles both prefix variants:
+        Matches the exact 3-token forced prefix the FSM emits, in either
+        variant:
           * ``<|en|><|transcribe|><|notimestamps|> Hello...``
           * ``<|en|><|transcribe|><|0.00|> Hello<|5.00|>...``
 
         Return cases:
 
-        * ``(None, None)`` — the forced prefix isn't locatable yet (language
-          tag missing, or sentinel not in). Streaming callers should keep
+        * ``(None, None)`` — the full forced prefix isn't in yet (streaming
+          snapshot is mid-prefix, or the prefix is malformed / doesn't
+          match the FSM contract). Streaming callers should keep
           buffering; non-streaming / end-of-stream callers should treat
           this as a parse failure and fall back to a best-effort scrub of
           the raw text.
@@ -267,13 +256,10 @@ class WhisperAdapter(TranscriptionAdapter):
           streaming chunks because Whisper's special tokens detokenize
           atomically, so callers can compute deltas against it directly.
         """
-        m = _LANG_PREFIX_RE.match(text)
+        m = _FUSED_PREFIX_RE.match(text)
         if not m:
             return None, None
-        sentinel_idx, sentinel_len = WhisperAdapter._find_fused_sentinel(text)
-        if sentinel_idx < 0:
-            return None, None
-        transcription = text[sentinel_idx + sentinel_len :]
+        transcription = text[m.end() :]
         # Scrub any remaining special tokens. skip_special_tokens=False is
         # set on fused requests so the language prefix survives for
         # parsing, but that also preserves trailing <|endoftext|> and, in
