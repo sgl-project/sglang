@@ -9,6 +9,7 @@ best-effort scrub".
 
 import re
 import unittest
+from typing import Any
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
@@ -240,8 +241,8 @@ class TestWhisperStripSpecialTokens(CustomTestCase):
 class TestWhisperBuildFusedAutodetectParams(CustomTestCase):
     """build_fused_autodetect_params picks the right regex + propagates ts param."""
 
-    def _request(self, **kwargs) -> TranscriptionRequest:
-        base = dict(model="whisper", temperature=0.0)
+    def _request(self, **kwargs: Any) -> TranscriptionRequest:
+        base: dict[str, Any] = dict(model="whisper", temperature=0.0)
         base.update(kwargs)
         return TranscriptionRequest(**base)
 
