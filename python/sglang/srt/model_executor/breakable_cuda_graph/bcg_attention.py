@@ -25,8 +25,6 @@ from typing import Optional
 
 import torch
 
-__all__ = ["bcg_unified_attention_with_output"]
-
 
 def bcg_unified_attention_with_output(
     query: torch.Tensor,

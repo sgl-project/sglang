@@ -67,7 +67,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-class BreakablePiecewiseCudaGraphRunner:
+class BreakableCudaGraphRunner:
     """Piecewise CUDA graph runner using breakable CUDA graph.
 
     Captures the model forward as a breakable CUDA graph with graph breaks
@@ -405,5 +405,5 @@ class BreakablePiecewiseCudaGraphRunner:
         else:
             assert isinstance(output, PPProxyTensors)
             raise NotImplementedError(
-                "PPProxyTensors is not supported in BreakablePiecewiseCudaGraphRunner."
+                "PPProxyTensors is not supported in BreakableCudaGraphRunner."
             )
