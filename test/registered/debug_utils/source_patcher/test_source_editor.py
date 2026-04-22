@@ -5,7 +5,7 @@ from sglang.srt.debug_utils.source_patcher.source_editor import apply_edits
 from sglang.srt.debug_utils.source_patcher.types import EditSpec, PatchApplicationError
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="default", nightly=True)
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu", nightly=True)
 
 
 class TestApplyEdits:
@@ -290,3 +290,9 @@ class TestApplyEdits:
         ]
         result = apply_edits(source=source, edits=edits)
         assert result == ("def foo():\n" "    x = 1\n" "    y = 20\n" "    return x\n")
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

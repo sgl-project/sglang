@@ -26,7 +26,12 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    get_moe_padding_size,
+    get_moe_runner_backend,
+    get_moe_weight_sizes,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -57,7 +62,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -90,6 +98,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+    from sglang.srt.models.utils import WeightsMapper
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -237,6 +246,12 @@ class Fp8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+        if self.ignored_layers:
+            self.ignored_layers = list(
+                dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
+            )
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -492,19 +507,45 @@ class Fp8LinearMethod(LinearMethodBase):
             return
 
         if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+
+            weight = layer.weight.data
+            scale_u8 = layer.weight_scale_inv.data
+            n, k = weight.shape
+            epilogue_tile_m = 128
+
+            copy_or_rebind_param(
+                layer,
+                "weight",
+                shuffle_matrix_a(
+                    weight.contiguous().view(torch.uint8), epilogue_tile_m
+                ).view(torch.float8_e4m3fn),
+            )
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv",
+                shuffle_matrix_sf_a(
+                    scale_u8.contiguous().view(torch.uint8).reshape(n, k // 32),
+                    epilogue_tile_m,
+                    num_elts_per_sf=32,
+                )
+                .reshape_as(scale_u8)
+                .contiguous(),
+            )
+        elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
-            new_swizzled = block_scale_interleave(scale_u8.contiguous()).contiguous()
+            # block_scale_interleave may pad and/or reshape scales,
+            # so store swizzled scales separately to keep weight update working
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_swizzled",
+                block_scale_interleave(scale_u8.contiguous()).contiguous(),
+            )
         else:
             # Triton path consumes canonical 2D UE8M0 scales directly.
             return
-
-        copy_or_rebind_param(layer, "weight_scale_inv_swizzled", new_swizzled)
-        layer._weight_scale_inv_swizzled_src_version = layer.weight_scale_inv._version
-        layer._weight_scale_inv_swizzled_src_data_ptr = (
-            layer.weight_scale_inv.data_ptr()
-        )
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
@@ -643,7 +684,7 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
-            return torch.ops.sglang.apply_fp8_marlin_linear(
+            return apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -654,7 +695,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv
@@ -778,27 +819,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
+
+        w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
+            intermediate_size_per_partition,
+            is_aiter_moe=_use_aiter,
+            is_concat=True,
+            is_packed=False,
+        )
+
         if self.block_quant:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-            # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0:
-                raise ValueError(
-                    f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
-                )
-            if tp_size > 1:
-                # Required by row parallel
-                if intermediate_size_per_partition % block_k != 0:
+
+            padding_size = get_moe_padding_size(_use_aiter)
+            if not (_use_aiter and padding_size == block_n == block_k):
+                # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
+                # Required by column parallel or enabling merged weights
+                if intermediate_size_per_partition % block_n != 0:
                     raise ValueError(
-                        f"The input_size of down's weight = "
+                        f"The output_size of gate's and up's weight = "
                         f"{intermediate_size_per_partition} is not divisible by "
-                        f"weight quantization block_k = {block_k}."
+                        f"weight quantization block_n = {block_n}."
                     )
+                if tp_size > 1:
+                    # Required by row parallel
+                    if intermediate_size_per_partition % block_k != 0:
+                        raise ValueError(
+                            f"The input_size of down's weight = "
+                            f"{intermediate_size_per_partition} is not divisible by "
+                            f"weight quantization block_k = {block_k}."
+                        )
 
         # WEIGHTS
         if _is_hip and _use_hip_int4:
@@ -825,7 +877,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_up_dim,
                     hidden_size,
                     dtype=params_dtype,
                 ),
@@ -835,11 +887,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 torch.empty(
                     num_experts,
                     hidden_size,
-                    intermediate_size_per_partition,
+                    w2_up_dim,
                     dtype=params_dtype,
                 ),
                 requires_grad=False,
             )
+
+        extra_weight_attrs.update(
+            {"weight_padded": weight_padded},
+        )
 
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
@@ -998,23 +1054,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-            if _use_aiter:
-                # add this section for MI300
-                # Pre-shuffle weights
-                layer.w13_weight.data = shuffle_weight(
-                    layer.w13_weight.contiguous(), (16, 16)
-                )
-                layer.w2_weight.data = shuffle_weight(
-                    layer.w2_weight.contiguous(), (16, 16)
-                )
-        elif _use_aiter:
+
+        if _use_aiter:
             # Pre-shuffle weights
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight.contiguous(), (16, 16)
-            )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight.contiguous(), (16, 16)
-            )
+            t = shuffle_weight(layer.w13_weight, (16, 16))
+            layer.w13_weight.copy_(t)
+            del t
+            t = shuffle_weight(layer.w2_weight, (16, 16))
+            layer.w2_weight.copy_(t)
+            del t
         elif _is_cpu:
             assert (
                 _is_cpu_amx_available
@@ -1237,15 +1285,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
-            return
 
-        # Block quant doesn't need to process weights after loading
-        if self.block_quant:
+        elif self.block_quant:
+            # Block quant doesn't need to process weights after loading
             self.process_weights_after_loading_block_quant(layer)
-            return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
-        if not self.quant_config.is_checkpoint_fp8_serialized:
+        elif not self.quant_config.is_checkpoint_fp8_serialized:
             # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
@@ -1272,7 +1318,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
-            return
 
         # If checkpoint is fp8, we need to handle that the
         # MoE kernels require single activation scale and single weight
@@ -1357,13 +1402,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.process_weights_hip_scale_padding(layer)
 
             # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            ):
                 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                     align_fp8_moe_weights_for_flashinfer_trtllm,
                 )
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
-            return
+
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added
@@ -1409,10 +1459,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale1[expert_id] *= layer.w2_weight_scale[expert_id]
 
     def process_weights_hip_scale_padding(self, layer: Module):
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-            padding_size,  # Avoid circular import
-        )
-
+        padding_size = get_moe_padding_size(_use_aiter)
         if _use_aiter:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
@@ -1462,6 +1509,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             # TODO(cwan): refactor other backends
             pass
+
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            b13=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+            use_fp8_w8a8=True,
+            w13_scale=(
+                layer.w13_weight_scale_inv
+                if self.block_quant
+                else layer.w13_weight_scale
+            ),
+            w2_scale=(
+                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+            ),
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            block_shape=self.quant_config.weight_block_size,
+        )
 
     def apply(
         self,
@@ -1605,7 +1672,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 local_num_experts=num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
                 routing_method_type=int(
-                    getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
+                    getattr(layer, "routing_method_type", None)
+                    or RoutingMethodType.DeepSeekV3
                 ),
                 block_quant=self.block_quant,
                 use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
@@ -1638,26 +1706,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
             )
         elif self.runner.runner_backend.is_triton():
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                b13=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
-                use_fp8_w8a8=True,
-                w13_scale=(
-                    layer.w13_weight_scale_inv
-                    if self.block_quant
-                    else layer.w13_weight_scale
-                ),
-                w2_scale=(
-                    layer.w2_weight_scale_inv
-                    if self.block_quant
-                    else layer.w2_weight_scale
-                ),
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                block_shape=self.quant_config.weight_block_size,
-            )
+            quant_info = self.get_triton_quant_info(layer)
         else:
             raise NotImplementedError(
                 "Unsupported runner backend: %s" % self.runner.runner_backend

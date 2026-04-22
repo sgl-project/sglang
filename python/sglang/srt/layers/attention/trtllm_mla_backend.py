@@ -13,7 +13,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
@@ -542,21 +544,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
             del seq_lens_sum  # not handle "num_draft_tokens" but we do not need it
         elif forward_mode.is_draft_extend(include_v2=True):
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu[:bs]) + 1
-                metadata.sum_seq_lens_q = sum(spec_info.accept_length_cpu[:bs]) + bs
-            else:
-                metadata.max_seq_len_q = 1
-                metadata.sum_seq_lens_q = bs
-            # draft_extend uses (accept_length + 1) query tokens per sequence
-            extend_seq_lens = accept_length + 1
-            metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+            num_tokens_per_bs = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+            metadata.cu_seqlens_q[: bs + 1].copy_(
+                torch.arange(
+                    0,
+                    bs * num_tokens_per_bs + 1,
+                    step=num_tokens_per_bs,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
             )
-            metadata.seq_lens_q.copy_(extend_seq_lens)
+            metadata.seq_lens_q[:bs].fill_(num_tokens_per_bs)
             # see NOTE(draft_extend seq_len handling)
-            seq_lens = seq_lens[:bs] - metadata.seq_lens_q + metadata.max_seq_len_q
+            seq_lens = seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
             metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
 
         # Update block indices for new sequences.
@@ -875,6 +877,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             max_seq_len=metadata.max_seq_len_k,
             bmm1_scale=bmm1_scale,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
         )
 
         # Reshape output directly without slicing
@@ -1062,6 +1065,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens=metadata.seq_lens_k,
                 max_seq_len=max_seq_len,
                 bmm1_scale=bmm1_scale,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
 
             if needs_unpad:
@@ -1099,6 +1103,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             "bmm1_scale": q_scale * k_scale * layer.scaling,
             "bmm2_scale": v_scale,
             "cum_seq_lens_q": self.forward_prefill_metadata.cum_seq_lens,
+            "skip_softmax_threshold_scale_factor": envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         }
 
         # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
@@ -1117,7 +1122,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 dtype=self.q_data_type,
                 device=q.device,
             )
-            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 **common_trtllm_args,
                 seq_lens=forward_batch.prefix_chunk_seq_lens[chunk_idx],
                 max_kv_len=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
@@ -1127,6 +1132,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=True,
                 out=out,
             )
+
+            # The TRT-LLM ragged attention cubin kernel does not correctly
+            # handle rows with kv_len == 0: it leaves stale data in the
+            # workspace softmaxStats buffer and may produce non-zero output
+            # for those rows.  Fix up by forcing out=0 and lse=-inf for
+            # zero-KV rows so that downstream merge_state ignores them.
+            # Skip entirely when this chunk has no zero-KV rows (pure CPU
+            # check, precomputed in prepare_chunked_prefix_cache_info).
+            if forward_batch.prefix_chunk_has_zero_kv[chunk_idx]:
+                out_tensor, lse_tensor = result
+                fixup_zero_kv_rows(
+                    out_tensor,
+                    lse_tensor,
+                    forward_batch.prefix_chunk_seq_lens[chunk_idx],
+                    self.forward_prefill_metadata.cum_seq_lens,
+                    self.forward_prefill_metadata.max_seq_len,
+                )
+
+            return result
         else:
             out = torch.zeros(
                 q.shape[0],

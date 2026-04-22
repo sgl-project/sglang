@@ -702,6 +702,7 @@ class TboForwardBatchPreparer:
             "mrope_positions",  # only used by qwen2-vl, thus not care
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
+            "return_pooled_hidden_states",
         ]:
             output_dict[key] = getattr(batch, key)
         if not batch.forward_mode.is_target_verify():
@@ -1035,7 +1036,8 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
             ]
         elif get_moe_a2a_backend().is_mori():
             self._inners = [
-                MoriEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+                MoriEPDispatcher(instance_id=i, **kwargs)
+                for i in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_nixl():
             self._inners = [
