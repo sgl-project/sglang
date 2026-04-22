@@ -121,8 +121,8 @@ def _pad_ragged_kv_indices_to_block_table_kernel(
     kv_indptr_ptr,  # [bs + 1] int32
     kv_indices_ptr,  # [N]      int32 (ragged slot ids)
     block_table_ptr,  # [bs, max_pages] int32 output
-    block_table_row_stride: tl.constexpr,
-    max_pages: tl.constexpr,
+    block_table_row_stride,
+    max_pages,
     page_size: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
