@@ -3,10 +3,56 @@
 Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
 """
 
+from __future__ import annotations
+
 import json
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
+    """Return why adaptive spec cannot run under the given server args, or None if supported."""
+    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        return (
+            f"speculative_algorithm={server_args.speculative_algorithm} "
+            "(only EAGLE/EAGLE3 are supported)"
+        )
+    if server_args.speculative_eagle_topk != 1:
+        return (
+            f"speculative_eagle_topk={server_args.speculative_eagle_topk} "
+            "(only topk=1 is supported)"
+        )
+    if server_args.enable_dp_attention:
+        return (
+            "enable_dp_attention=True is not supported "
+            "(adaptive tier decisions are not synchronized across DP ranks)"
+        )
+    if not server_args.disable_overlap_schedule:
+        return (
+            "the overlap scheduler (spec v2) is enabled "
+            "(adaptive is only implemented for EAGLEWorker v1)"
+        )
+    if server_args.enable_multi_layer_eagle:
+        return (
+            "enable_multi_layer_eagle=True is not supported "
+            "(MultiLayerEagleWorker does not implement adaptive)"
+        )
+    if server_args.enable_two_batch_overlap:
+        return (
+            "enable_two_batch_overlap=True is not supported "
+            "(adaptive state swap would discard the TboAttnBackend wrapper)"
+        )
+    if server_args.enable_pdmux:
+        return (
+            "enable_pdmux=True is not supported "
+            "(adaptive state swap does not update decode_attn_backend_group)"
+        )
+    return None
 
 
 def load_adaptive_config(path: str | None) -> dict[str, object]:
