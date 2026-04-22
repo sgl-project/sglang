@@ -454,9 +454,6 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
-            PoolCls = (
-                HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool
-            )
             pool_kwargs = {}
             if self.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -464,6 +461,34 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+                PoolCls = HiSparseNSATokenToKVPool
+            elif getattr(self.model_config.hf_config, "use_hisa", False):
+                # HISA pool-K cache (v3): paged pool_k_pages indexed by
+                # (phys_pool_page, slot_in_page), mirroring the main KV
+                # cache layout for TMA-friendly block_mqa.
+                from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
+                    POOL_PAGE_SIZE,
+                    HisaNSATokenToKVPool,
+                )
+
+                k_block_size = getattr(
+                    self.model_config.hf_config, "hisa_k_block_size", 128
+                )
+                pool_kwargs["k_block_size"] = k_block_size
+                pool_kwargs["max_running_requests"] = (
+                    self.server_args.max_running_requests or 2048
+                )
+                # Per-request max pages = pages to cover a single longest
+                # request. Tight bound is critical: v3 block_mqa kernel's
+                # inner pipeline iterates ``max_pool_pages_per_req`` times.
+                max_ctx = self.model_config.context_len
+                pool_kwargs["max_pool_pages_per_req"] = (
+                    max_ctx + k_block_size * POOL_PAGE_SIZE - 1
+                ) // (k_block_size * POOL_PAGE_SIZE) + 1
+                PoolCls = HisaNSATokenToKVPool
+            else:
+                PoolCls = NSATokenToKVPool
+
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,

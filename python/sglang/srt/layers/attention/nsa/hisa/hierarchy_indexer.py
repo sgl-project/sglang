@@ -42,7 +42,9 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     fp8_native_hierarchy_mqa_logits,
     fp8_native_hierarchy_paged_mqa_logits,
+    fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3,
 )
+from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import HisaNSATokenToKVPool
 from sglang.srt.layers.attention.nsa.hisa.triton_kernel import hisa_coord_transform
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
@@ -469,20 +471,45 @@ class HisaIndexer(MultiPlatformOp):
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
 
         # ---- hisa kernel ----
-        block_sparse_logits, topk_block_indices = (
-            fp8_native_hierarchy_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32,
-                block_tables,
-                schedule_metadata,
-                max_model_len=max_seq_len,
-                max_seq_len=max_seq_len,
-                k_block_size=self.hisa_k_block_size,
-                block_topk=self.hisa_block_topk,
+        kv_pool = forward_batch.token_to_kv_pool
+        use_pool_cache = isinstance(kv_pool, HisaNSATokenToKVPool)
+        if use_pool_cache:
+            # Paged v3 path: pool rows live in pool_k_pages with the same
+            # paged layout as the main KV cache. block_mqa reads them via
+            # TMA — no gather, no scratch, no tail scratch.
+            pool_k_pages = kv_pool.get_pool_k_pages(layer_id)
+            pool_page_tables = kv_pool.get_pool_page_tables(
+                forward_batch.req_pool_indices,
+            )  # [B, max_pool_pages_per_req] int32 (full col cap)
+            block_sparse_logits, topk_block_indices = (
+                fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3(
+                    q_fp8=q_fp8[:q_offset],
+                    kv_cache_fp8=kv_cache_fp8,
+                    pool_k_pages=pool_k_pages,
+                    pool_page_tables=pool_page_tables[:q_offset].contiguous(),
+                    weights=weights[:q_offset],
+                    context_lens=seqlens_32[:q_offset],
+                    block_tables=block_tables[:q_offset],
+                    k_block_size=self.hisa_k_block_size,
+                    pool_page_size=kv_pool.pool_page_size,
+                    block_topk=self.hisa_block_topk,
+                )
             )
-        )
+        else:
+            block_sparse_logits, topk_block_indices = (
+                fp8_native_hierarchy_paged_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32,
+                    block_tables,
+                    schedule_metadata,
+                    max_model_len=max_seq_len,
+                    max_seq_len=max_seq_len,
+                    k_block_size=self.hisa_k_block_size,
+                    block_topk=self.hisa_block_topk,
+                )
+            )
         # Hisa paged output has a leading next_n=1 dim; squeeze.
         block_sparse_logits = block_sparse_logits.squeeze(1)  # [B, block_topk*k_block_size]
         topk_block_indices = topk_block_indices.squeeze(1)    # [B, block_topk]
@@ -1055,22 +1082,67 @@ class HisaIndexer(MultiPlatformOp):
                 forward_batch.out_cache_loc,
                 forward_batch.token_to_kv_pool.page_size,
             )
-            return
+        else:
+            # Fallback: original path
+            assert act_quant is not None
+            k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
-        # Fallback: original path
-        assert act_quant is not None
-        k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
+            out_loc = forward_batch.out_cache_loc
+            if not out_loc.is_contiguous():
+                out_loc = out_loc.contiguous()
 
-        out_loc = forward_batch.out_cache_loc
-        if not out_loc.is_contiguous():
-            out_loc = out_loc.contiguous()
+            forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=out_loc,
+                index_k=k_fp8,
+                index_k_scale=k_scale,
+            )
 
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
-            layer_id=layer_id,
-            loc=out_loc,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
-        )
+        # Phase-2 pool K cache: incrementally update pool_k_buffer for any
+        # blocks that became full during this forward. No-op if the pool is
+        # a vanilla NSATokenToKVPool. Safe under CUDA-graph capture: the
+        # kernel reads persistent GPU buffers only, with per-grid-cell gating
+        # (no Python list → tensor alloc, no .cpu() / .item()).
+        kv_pool = forward_batch.token_to_kv_pool
+        if isinstance(kv_pool, HisaNSATokenToKVPool):
+            seq_lens_src = forward_batch.seq_lens
+            B = seq_lens_src.shape[0]
+            # Both prev and new need to be int32 for the kernel, and live
+            # in persistent buffers (no alloc during capture). seq_lens may
+            # arrive int32 (captured decode) or int64 (prefill); copy_ casts.
+            prev_scratch = kv_pool._scratch_prev_lens_i32[:B]
+            new_scratch = kv_pool._scratch_new_lens_i32[:B]
+            new_scratch.copy_(seq_lens_src)
+
+            # Extend path: ALWAYS pool from 0 so that any prefix-cached
+            # blocks (K already in main buffer from a previous request
+            # sharing this prefix, but pool_k_pages were never written for
+            # this request's freshly-allocated pool pages) get warmed up.
+            # Redundant-but-idempotent for same-request chunked prefill
+            # (blocks already pooled get recomputed to the same values).
+            # Decode path: prev = new - 1 (pure 1-token steps).
+            if forward_batch.forward_mode.is_decode_or_idle():
+                prev_scratch.fill_(0)
+                torch.sub(new_scratch, 1, out=prev_scratch)
+                max_pool_per_req_grid = 2
+            else:
+                prev_scratch.zero_()
+                # Grid y must cover ``max new_complete`` across the batch —
+                # for cross-request prefix-cache hits this can be >>> the
+                # chunk's own new tokens.
+                max_new_seq = int(forward_batch.seq_lens_cpu.max().item())
+                max_pool_per_req_grid = (
+                    max_new_seq + kv_pool.k_block_size - 1
+                ) // kv_pool.k_block_size + 1
+
+            kv_pool.update_pool_for_completed_blocks(
+                layer_id=layer_id,
+                req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                prev_seq_lens=prev_scratch,
+                new_seq_lens=new_scratch,
+                max_pool_per_req_grid=max_pool_per_req_grid,
+            )
 
     def forward_cuda(
         self,
