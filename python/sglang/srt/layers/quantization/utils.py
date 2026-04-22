@@ -57,12 +57,6 @@ def _module_path_match(ignored: str, prefix: str) -> bool:
 
 # Known fused-linear -> shard names. Used as a fallback when the quant
 # config doesn't ship packed_modules_mapping (typical for HF FP8 configs).
-# Lets is_layer_skipped treat a prefix like model.X.mlp.gate_up_proj as
-# (gate_proj, up_proj) shards instead of plain-substring, so that
-# modules_to_not_convert entries that happen to be a strict substring of a
-# fused name (e.g. Qwen3.6's cruft "mlp.gate" vs "mlp.gate_up_proj", or
-# Qwen3.5's real "linear_attn.in_proj_a" vs fused "linear_attn.in_proj_ba")
-# resolve correctly.
 _FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
