@@ -707,6 +707,32 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
             output_path.write_bytes(content)
             logger.info(f"Saved GT image: {output_path} (format: {detected_format})")
 
+    def _save_diffusion_artifact(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        """Preserve selected generated outputs for CI artifact upload."""
+        artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
+        if not artifact_dir or not content or "modelopt" not in case.id.lower():
+            return
+
+        safe_case_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in case.id)
+        is_video = case.server_args.modality == "video"
+        if is_video:
+            filename = f"{safe_case_id}_5s.mp4"
+        else:
+            from sglang.multimodal_gen.test.test_utils import detect_image_format
+
+            suffix = case.sampling_params.output_format or detect_image_format(content)
+            filename = f"{safe_case_id}.{suffix}"
+
+        dst_dir = Path(artifact_dir) / safe_case_id
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / filename
+        dst.write_bytes(content)
+        logger.info("[Artifact] Preserved generated output: %s", dst)
+
     def _test_lora_api_functionality(
         self,
         ctx: ServerContext,
@@ -1086,6 +1112,7 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
             generate_fn,
             collect_perf=not is_gt_gen_mode,
         )
+        self._save_diffusion_artifact(case, content)
 
         if is_gt_gen_mode:
             # GT generation mode: save output and skip all validations/tests
