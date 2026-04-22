@@ -959,7 +959,7 @@ def main():
 
     print(f"Loaded {len(config['cases'])} comparison case(s) from {args.config}")
 
-    run_comparison(
+    output_data = run_comparison(
         config=config,
         case_ids=args.case_ids,
         frameworks=args.frameworks,
@@ -967,6 +967,14 @@ def main():
         output=args.output,
         dry_run=args.dry_run,
     )
+
+    # Exit with non-zero if any case had an error
+    errors = [r for r in output_data.get("results", []) if r.get("error")]
+    if errors and not args.dry_run:
+        print(f"\n{len(errors)} case(s) had errors:")
+        for e in errors:
+            print(f"  {e['case_id']} ({e['framework']}): {e['error']}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

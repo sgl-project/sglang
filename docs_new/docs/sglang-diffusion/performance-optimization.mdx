@@ -1,0 +1,67 @@
+---
+title: "Performance Optimization"
+description: "Optimize SGLang diffusion performance with caching, kernels, and profiling."
+---
+This section covers the main performance levers for SGLang Diffusion: attention backends, caching acceleration, and profiling.
+
+## Overview
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "22%"}} />
+    <col style={{width: "18%"}} />
+    <col style={{width: "60%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Optimization</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Cache-DiT</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Caching</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Block-level caching with DBCache, TaylorSeer, and SCM</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>TeaCache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Caching</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Timestep-level caching based on temporal similarity</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Attention Backends</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kernel</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optimized attention implementations (FlashAttention, SageAttention, etc.)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Profiling</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Diagnostics</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>PyTorch Profiler and Nsight Systems guidance</td>
+    </tr>
+  </tbody>
+</table>
+
+## Start Here
+
+- Use [Attention Backends](./attention_backends) to choose the best backend for your model and hardware.
+- Use [Caching Acceleration](./caching-acceleration) to reduce denoising cost with Cache-DiT or TeaCache.
+- Use [Profiling](./profiling) when you need to diagnose a bottleneck rather than guess.
+
+## Caching at a Glance
+
+- [Cache-DiT](./cache_dit) is block-level caching for diffusers pipelines and higher speedup-oriented tuning.
+- [TeaCache](./teacache) is timestep-level caching built into SGLang model families.
+
+
+## Current Baseline Snapshot
+
+For Ring SP benchmark details, see:
+
+- [Ring SP Performance](./ring_sp_performance)
+
+## References
+
+- [Cache-DiT Repository](https://github.com/vipshop/cache-dit)
+- [TeaCache Paper](https://arxiv.org/abs/2411.14324)

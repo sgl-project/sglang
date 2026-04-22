@@ -129,7 +129,8 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.needs_quant_draft = (
-            get_global_server_args().speculative_draft_model_quantization
+            get_global_server_args().speculative_draft_model_quantization is not None
+            or quant_config is not None
         )
         quant_config = quant_config if self.needs_quant_draft else None
         self.model = Glm4MoeModelNextN(
