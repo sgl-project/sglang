@@ -1,9 +1,10 @@
-// FractalMesh PM2 Ecosystem — v10003.42 APEX OMNI-MATRIX
+// FractalMesh PM2 Ecosystem — v10003.43 APEX OMNI-MATRIX
 // Samuel James Hiotis | ABN 56628117363 | Albury NSW
 // Usage: pm2 start ecosystem.config.js --env production
-// Agents: 26 nodes | Memory budget: ~1.6GB total
+// Agents: 29 nodes | Memory budget: ~1.8GB total
 
 const ROOT = process.env.FRACTALMESH_HOME || require('path').join(process.env.HOME, 'fmsaas');
+const REPO = process.env.REPO_ROOT        || require('path').join(process.env.HOME, 'sglang');
 
 module.exports = {
     apps: [
@@ -453,6 +454,67 @@ module.exports = {
             },
             error_file: `${ROOT}/logs/fm-warden-error.log`,
             out_file:   `${ROOT}/logs/fm-warden-out.log`,
+            time:       true,
+        },
+
+        // ── OMEGA v40.0 AGENTS (repo-path agents) ────────────────────
+
+        // Omni-dashboard Flask UI (port 8090) — hot-upgrade, log viewer, vault status
+        {
+            name:              'omni-dashboard',
+            script:            `${REPO}/fractalmesh/api/omni_dashboard.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'150M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                REPO_ROOT:        REPO,
+                APP_PORT:         '8090',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/omni-dashboard-error.log`,
+            out_file:   `${ROOT}/logs/omni-dashboard-out.log`,
+            time:       true,
+        },
+
+        // OSINT spider — 18-dork Google CSE lead discovery (interval 7200s)
+        {
+            name:              'fm-osint-spider',
+            script:            `${REPO}/fractalmesh/agents/fm_osint_spider.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'100M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-osint-spider-error.log`,
+            out_file:   `${ROOT}/logs/fm-osint-spider-out.log`,
+            time:       true,
+        },
+
+        // 4A Negotiator — pricing tiers, Gmail proposals, OSINT pipeline (interval 3600s)
+        {
+            name:              'fm-negotiator',
+            script:            `${REPO}/fractalmesh/agents/fm_negotiator.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'80M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-negotiator-error.log`,
+            out_file:   `${ROOT}/logs/fm-negotiator-out.log`,
             time:       true,
         },
 
