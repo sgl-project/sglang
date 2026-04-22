@@ -704,7 +704,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
-            verified_id=torch.empty((0,), device=device, dtype=torch.int32),
+            verified_id=torch.empty((0,), device=device, dtype=torch.int64),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
@@ -723,7 +723,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         if batch.forward_mode.is_idle():
             return
 
-        batch.input_ids = self.verified_id
+        batch.input_ids = self.verified_id.long()
         batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
@@ -735,7 +735,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length.add_(1)
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
-        self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
+        self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int64)
 
         create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
             batch.input_ids,
