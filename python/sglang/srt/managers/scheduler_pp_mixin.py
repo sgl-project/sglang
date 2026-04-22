@@ -857,7 +857,11 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
-    ) -> Tuple[PPProxyTensors, GenerationBatchResult, torch.Event]:
+    ) -> Tuple[
+        Optional[PPProxyTensors],
+        Optional[GenerationBatchResult],
+        Optional[torch.Event],
+    ]:
         self._pp_commit_comm_work(work=self.send_output_work)
         (
             next_pp_outputs,
@@ -1088,7 +1092,12 @@ class SchedulerPPMixin:
         mb_metadata: List[PPBatchMetadata],
         last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
-    ) -> Tuple[PPProxyTensors, List[P2PWork], torch.Event]:
+    ) -> Tuple[
+        Optional[PPProxyTensors],
+        Optional[GenerationBatchResult],
+        Optional[torch.Event],
+        List[P2PWork],
+    ]:
         next_pp_outputs = None
         d2h_event = None
         batch_result = None
