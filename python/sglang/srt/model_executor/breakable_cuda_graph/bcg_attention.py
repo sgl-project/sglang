@@ -25,7 +25,6 @@ from typing import Optional
 
 import torch
 
-
 __all__ = ["bcg_unified_attention_with_output"]
 
 
@@ -45,12 +44,21 @@ def bcg_unified_attention_with_output(
     global _breakable_attention_fn
     if _breakable_attention_fn is None:
         from sglang.srt.layers.radix_attention import unified_attention_with_output
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import eager_on_graph
+        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+            eager_on_graph,
+        )
 
         _breakable_attention_fn = eager_on_graph(True)(unified_attention_with_output)
     _breakable_attention_fn(
-        query, key, value, output, save_kv_cache, layer_id,
-        q_rope=q_rope, k_rope=k_rope, sinks=sinks,
+        query,
+        key,
+        value,
+        output,
+        save_kv_cache,
+        layer_id,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        sinks=sinks,
     )
 
 
