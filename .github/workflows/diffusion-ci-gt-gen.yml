@@ -16,7 +16,7 @@ on:
       output_name:
         description: 'Custom output folder name (also used for artifact names and publish target dir)'
         required: false
-        default: ''
+        default: 'diffusion-ci-outputs'
         type: string
 
 concurrency:
@@ -30,7 +30,7 @@ permissions:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
+  OUTPUT_NAME: ${{ inputs.output_name }}
 
 jobs:
   multimodal-diffusion-gen-1gpu:
@@ -74,7 +74,7 @@ jobs:
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
+            --target-dir diffusion-ci/${{ env.OUTPUT_NAME }}
 
   multimodal-diffusion-gen-2gpu:
     if: github.repository == 'sgl-project/sglang'
@@ -117,7 +117,7 @@ jobs:
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
+            --target-dir diffusion-ci/${{ env.OUTPUT_NAME }}
 
   multimodal-diffusion-gen-b200:
     if: github.repository == 'sgl-project/sglang'
@@ -155,4 +155,4 @@ jobs:
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
+            --target-dir diffusion-ci/${{ env.OUTPUT_NAME }}
