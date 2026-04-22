@@ -302,19 +302,9 @@ class BreakableCudaGraphRunner:
                         f"[BCG] Capturing ({num_tokens=} {avail_mem=:.2f} GB)"
                     )
 
-                mem_before = torch.cuda.memory_allocated(self.device) / 1024**3
                 graph, output = self._capture_one(num_tokens, pool, stream)
                 self.graphs[num_tokens] = graph
                 self.output_buffers[num_tokens] = output
-                mem_after = torch.cuda.memory_allocated(self.device) / 1024**3
-                num_breaks = len(graph._break_fns)
-                logger.info(
-                    f"[BCG] num_tokens={num_tokens}: "
-                    f"segments={len(graph._segments)}, "
-                    f"breaks={num_breaks}, "
-                    f"mem_delta={mem_after - mem_before:.3f} GB, "
-                    f"mem_total={mem_after:.3f} GB"
-                )
 
     def can_run(self, forward_batch: "ForwardBatch"):
         # BCG graphs are captured with batch_size=1 (see _build_capture_forward_batch);
