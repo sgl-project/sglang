@@ -20,6 +20,7 @@ Requirements:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -313,6 +314,7 @@ def fetch_all_jobs_snapshot(
     print(f"Total unique workflow runs: {len(unique_runs)}", file=sys.stderr)
 
     results = []
+    jobs_excluded_no_label = 0
     total_runs = len(unique_runs)
 
     for i, run in enumerate(unique_runs):
@@ -352,6 +354,10 @@ def fetch_all_jobs_snapshot(
             if len(labels) == 1 and labels[0] == "ubuntu-latest":
                 continue
 
+            if not labels:
+                jobs_excluded_no_label += 1
+                continue
+
             is_stuck = False
             if job_status == "in_progress":
                 if runner_name == "-":
@@ -388,6 +394,7 @@ def fetch_all_jobs_snapshot(
         workflow_stats["jobs_collected"] += jobs_added
 
     fetch_metadata["jobs_collected"] = len(results)
+    fetch_metadata["jobs_excluded_no_label"] = jobs_excluded_no_label
     return {
         "snapshot_version": 1,
         "repo": repo,
@@ -446,61 +453,52 @@ def calculate_duration(started_at: str, completed_at: str) -> str:
 
 
 def calculate_queue_time(
-    created_at: str,
-    started_at: str,
-    status: str = None,
+    job: dict,
     report_time: datetime = None,
 ) -> str:
     """
-    Calculate queue time between creation and start.
+    Calculate queue time for a job.
 
-    For queued/waiting jobs that haven't truly started yet, calculate
-    queue time as (report_time - created_at) and mark as "still queuing".
+    Uses ``runner_name`` as the reliable signal for whether a runner
+    picked the job up (consistent with ``_queue_time_seconds``):
+
+    * **Has runner** (job was picked up): ``started_at - created_at``.
+    * **No runner + queued/waiting** (still in queue):
+      ``report_time - created_at``, suffixed with "(queuing)".
+    * **No runner + other status** (skipped / cancelled / stuck):
+      returns "-" (never truly queued for a runner).
     """
-    if not created_at:
-        return "-"
-
-    created = parse_time(created_at)
+    created = parse_time(job.get("created_at", ""))
     if not created:
         return "-"
 
-    # For queued/waiting jobs, calculate time since creation
-    if status in ("queued", "waiting"):
-        if report_time:
-            queue_seconds = (report_time - created).total_seconds()
-        else:
-            queue_seconds = (datetime.now(timezone.utc) - created).total_seconds()
+    runner = job.get("runner_name") or ""
+    has_runner = runner and runner != "-"
 
+    if has_runner:
+        started = parse_time(job.get("started_at", ""))
+        if not started:
+            return "-"
+        queue_seconds = (started - created).total_seconds()
+        if queue_seconds < 0:
+            return "-"  # re-run; timestamps unreliable
+    else:
+        status = job.get("status", "")
+        if status not in ("queued", "waiting"):
+            return "-"
+        ref = report_time or datetime.now(timezone.utc)
+        queue_seconds = (ref - created).total_seconds()
         if queue_seconds < 0:
             return "-"
 
-        minutes = int(queue_seconds // 60)
-        seconds = int(queue_seconds % 60)
-        if minutes >= 60:
-            hours = minutes // 60
-            minutes = minutes % 60
-            return f"{hours}h{minutes}m (queuing)"
-        return f"{minutes}m{seconds}s (queuing)"
-
-    # For completed/in_progress jobs, calculate actual queue time
-    if not started_at:
-        return "-"
-
-    started = parse_time(started_at)
-    if not started:
-        return "-"
-
-    queue_seconds = (started - created).total_seconds()
-    if queue_seconds < 0:
-        return "-"  # Invalid data
-
     minutes = int(queue_seconds // 60)
     seconds = int(queue_seconds % 60)
+    suffix = " (queuing)" if not has_runner else ""
     if minutes >= 60:
         hours = minutes // 60
         minutes = minutes % 60
-        return f"{hours}h{minutes}m"
-    return f"{minutes}m{seconds}s"
+        return f"{hours}h{minutes}m{suffix}"
+    return f"{minutes}m{seconds}s{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +531,26 @@ def _get_runner_label(job: dict) -> str:
     return labels[0]
 
 
+_RUNNER_LABEL_RE = re.compile(r"linux-(mi\w+?)-(\d+)gpu")
+_RUNNER_LABEL_ALT_RE = re.compile(r"linux-(mi\w+?)-gpu-(\d+)")
+
+
+def _runner_label_sort_key(label: str) -> tuple:
+    """Sort key for natural ordering: GPU type first, then GPU count.
+
+    linux-mi325-1gpu-sglang  -> ('mi325', 1, 'linux-mi325-1gpu-sglang')
+    linux-mi35x-8gpu-sglang  -> ('mi35x', 8, 'linux-mi35x-8gpu-sglang')
+    linux-mi35x-gpu-8.fabric -> ('mi35x', 8, 'linux-mi35x-gpu-8.fabric')
+    """
+    m = _RUNNER_LABEL_RE.search(label)
+    if m:
+        return (m.group(1), int(m.group(2)), label)
+    m2 = _RUNNER_LABEL_ALT_RE.search(label)
+    if m2:
+        return (m2.group(1), int(m2.group(2)), label)
+    return ("zzz", 0, label)
+
+
 def _percentile(data: list[float], p: int) -> Optional[float]:
     """Return a percentile from an already sorted or unsorted numeric list."""
     if not data:
@@ -549,17 +567,39 @@ def _average(data: list[float]) -> Optional[float]:
     return sum(data) / len(data)
 
 
-def _queue_time_seconds(job: dict) -> Optional[float]:
-    """Extract queue time in seconds for a job if both timestamps exist."""
+def _queue_time_seconds(job: dict, report_time: datetime = None) -> Optional[float]:
+    """Extract queue time in seconds for a job.
+
+    * Has ``runner_name`` (picked up by a runner): ``started_at - created_at``.
+    * No ``runner_name`` + status ``queued``/``waiting`` (still in queue):
+      ``report_time - created_at``.
+    * No ``runner_name`` + other status (e.g. skipped/cancelled before
+      pickup): ``None`` (skip).
+
+    GitHub sets ``started_at`` when a job *enters* the queue, so for jobs
+    that have not been picked up yet ``started_at ≈ created_at`` and the
+    naive difference would be ~0, which is wrong.  The reliable signal for
+    "actually dequeued" is a non-empty ``runner_name``.
+    """
     created = parse_time(job.get("created_at", ""))
-    started = parse_time(job.get("started_at", ""))
-    if not (created and started):
+    if not created:
         return None
 
-    queue_seconds = (started - created).total_seconds()
-    if queue_seconds < 0:
+    runner = job.get("runner_name") or ""
+    if not runner or runner == "-":
+        status = job.get("status", "")
+        if status not in ("queued", "waiting"):
+            return None
+        if report_time is None:
+            report_time = datetime.now(timezone.utc)
+        queue_seconds = (report_time - created).total_seconds()
+        return queue_seconds if queue_seconds >= 0 else None
+
+    started = parse_time(job.get("started_at", ""))
+    if not started:
         return None
-    return queue_seconds
+    queue_seconds = (started - created).total_seconds()
+    return queue_seconds if queue_seconds >= 0 else None
 
 
 def _build_queue_distribution(queue_times: list[float]) -> dict[str, Any]:
@@ -616,19 +656,23 @@ def analyze_concurrency(jobs: list[dict], report_time: datetime = None) -> dict:
         durations: list[float] = []
 
         for job in pool_jobs:
-            started = parse_time(job.get("started_at", ""))
-            completed = parse_time(job.get("completed_at", ""))
+            runner = job.get("runner_name") or ""
+            has_runner = bool(runner and runner != "-")
 
-            if started and completed:
-                events.append((started, +1))
-                events.append((completed, -1))
-                durations.append((completed - started).total_seconds())
-            elif started:
-                events.append((started, +1))
-                events.append((report_time, -1))
-                durations.append((report_time - started).total_seconds())
+            if has_runner:
+                started = parse_time(job.get("started_at", ""))
+                completed = parse_time(job.get("completed_at", ""))
 
-            qt = _queue_time_seconds(job)
+                if started and completed:
+                    events.append((started, +1))
+                    events.append((completed, -1))
+                    durations.append((completed - started).total_seconds())
+                elif started:
+                    events.append((started, +1))
+                    events.append((report_time, -1))
+                    durations.append((report_time - started).total_seconds())
+
+            qt = _queue_time_seconds(job, report_time=report_time)
             if qt is not None:
                 queue_times.append(qt)
 
@@ -677,13 +721,16 @@ def analyze_concurrency(jobs: list[dict], report_time: datetime = None) -> dict:
     return results
 
 
-def analyze_busy_periods(jobs: list[dict]) -> list[dict]:
+def analyze_busy_periods(jobs: list[dict], report_time: datetime = None) -> list[dict]:
     """Analyze job activity by hour of day (UTC).
 
-    Buckets jobs by the UTC hour they started and computes avg queue time.
-    Classifies each hour as Quiet / Moderate / Busy / Peak relative to the
-    busiest hour.
+    Buckets jobs by the UTC hour they started (or were created, for
+    still-queued jobs) and computes avg queue time.  Classifies each hour
+    as Quiet / Moderate / Busy / Peak relative to the busiest hour.
     """
+    if report_time is None:
+        report_time = datetime.now(timezone.utc)
+
     hourly: dict[int, dict] = {
         h: {"jobs_started": 0, "queue_times": []} for h in range(24)
     }
@@ -691,15 +738,22 @@ def analyze_busy_periods(jobs: list[dict]) -> list[dict]:
     for job in jobs:
         started = parse_time(job.get("started_at", ""))
         created = parse_time(job.get("created_at", ""))
+        runner = job.get("runner_name") or ""
+        has_runner = bool(runner and runner != "-")
 
-        if started:
+        if has_runner and started:
             hour = started.astimezone(timezone.utc).hour
             hourly[hour]["jobs_started"] += 1
-
             if created:
                 qt = (started - created).total_seconds()
                 if qt >= 0:
                     hourly[hour]["queue_times"].append(qt)
+        elif job.get("status") in ("queued", "waiting") and created:
+            hour = created.astimezone(timezone.utc).hour
+            hourly[hour]["jobs_started"] += 1
+            qt = (report_time - created).total_seconds()
+            if qt >= 0:
+                hourly[hour]["queue_times"].append(qt)
 
     max_jobs = max((v["jobs_started"] for v in hourly.values()), default=1) or 1
 
@@ -734,11 +788,11 @@ def analyze_busy_periods(jobs: list[dict]) -> list[dict]:
     return results
 
 
-def analyze_queue_distribution(jobs: list[dict]) -> dict:
+def analyze_queue_distribution(jobs: list[dict], report_time: datetime = None) -> dict:
     """Analyze queue time distribution per runner label."""
     queue_times_by_label: dict[str, list[float]] = {}
     for job in jobs:
-        queue_seconds = _queue_time_seconds(job)
+        queue_seconds = _queue_time_seconds(job, report_time=report_time)
         if queue_seconds is None:
             continue
         label = _get_runner_label(job)
@@ -748,6 +802,102 @@ def analyze_queue_distribution(jobs: list[dict]) -> dict:
         label: _build_queue_distribution(queue_times)
         for label, queue_times in sorted(queue_times_by_label.items())
     }
+
+
+def analyze_utilization_snapshots(
+    jobs: list[dict],
+    report_time: datetime = None,
+    interval_minutes: int = 15,
+    hours: int = 24,
+) -> dict[str, list[dict]]:
+    """Point-in-time snapshot at regular intervals per runner label.
+
+    At each interval mark over the last *hours* hours, counts:
+    - running: jobs that have a runner assigned (``runner_name`` set)
+              and are between ``started_at`` and ``completed_at``
+    - queued:  jobs that have no runner assigned and haven't completed
+
+    GitHub's ``started_at`` is unreliable for distinguishing running vs
+    queued -- it is set when a job enters the queue, not when a runner
+    picks it up.  The reliable signal is ``runner_name`` being non-empty.
+    """
+    if report_time is None:
+        report_time = datetime.now(timezone.utc)
+
+    label_jobs: dict[str, list[dict]] = {}
+    for job in jobs:
+        label = _get_runner_label(job)
+        label_jobs.setdefault(label, []).append(job)
+
+    results: dict[str, list[dict]] = {}
+
+    for label in sorted(label_jobs, key=_runner_label_sort_key):
+        pool_jobs = label_jobs[label]
+
+        running_events: list[tuple[datetime, int]] = []
+        queued_events: list[tuple[datetime, int]] = []
+
+        for job in pool_jobs:
+            created = parse_time(job.get("created_at", ""))
+            started = parse_time(job.get("started_at", ""))
+            completed = parse_time(job.get("completed_at", ""))
+            runner = job.get("runner_name") or ""
+            has_runner = bool(runner and runner != "-")
+
+            if has_runner and started:
+                end = completed if completed else report_time
+                running_events.append((started, +1))
+                running_events.append((end, -1))
+                if created and created < started:
+                    queued_events.append((created, +1))
+                    queued_events.append((started, -1))
+            elif created and job.get("status") in ("queued", "waiting"):
+                queued_events.append((created, +1))
+                queued_events.append((report_time, -1))
+
+        sorted_running = sorted(running_events, key=lambda x: (x[0], x[1]))
+        sorted_queued = sorted(queued_events, key=lambda x: (x[0], x[1]))
+
+        window_start = report_time - timedelta(hours=hours)
+        window_start = window_start.replace(
+            minute=(window_start.minute // interval_minutes) * interval_minutes,
+            second=0,
+            microsecond=0,
+        )
+
+        snapshot_data: list[dict] = []
+        t = window_start
+        while t <= report_time:
+            running = _count_at_time(sorted_running, t)
+            queued = _count_at_time(sorted_queued, t)
+
+            if running > 0 or queued > 0:
+                snapshot_data.append(
+                    {
+                        "time": t.strftime("%m-%d %H:%M"),
+                        "running": running,
+                        "queued": queued,
+                    }
+                )
+            t += timedelta(minutes=interval_minutes)
+
+        if snapshot_data:
+            results[label] = snapshot_data
+
+    return results
+
+
+def _count_at_time(
+    sorted_events: list[tuple[datetime, int]],
+    t: datetime,
+) -> int:
+    """Count concurrent items at an exact point in time using event sweep."""
+    count = 0
+    for ts, delta in sorted_events:
+        if ts > t:
+            break
+        count += delta
+    return max(count, 0)
 
 
 def process_results(
@@ -792,16 +942,24 @@ def process_results(
                 "success": 0,
                 "failure": 0,
                 "cancelled": 0,
+                "skipped": 0,
             }
         if is_stuck:
             status_summary[job_name]["stuck"] += 1
         elif status == "completed":
-            # For completed jobs, count by conclusion
             if conclusion == "success":
                 status_summary[job_name]["success"] += 1
             elif conclusion == "failure":
                 status_summary[job_name]["failure"] += 1
-            elif conclusion in ("cancelled", "timed_out", "action_required"):
+            elif conclusion == "skipped":
+                status_summary[job_name]["skipped"] += 1
+            elif conclusion in (
+                "cancelled",
+                "timed_out",
+                "action_required",
+                "neutral",
+                "stale",
+            ):
                 status_summary[job_name]["cancelled"] += 1
         elif status in status_summary[job_name]:
             status_summary[job_name][status] += 1
@@ -831,9 +989,7 @@ def process_results(
         processed = r.copy()
         processed["created_formatted"] = format_time(r["created_at"])
         processed["started_formatted"] = format_time(r["started_at"])
-        processed["queue_time"] = calculate_queue_time(
-            r["created_at"], r["started_at"], r["status"], report_time
-        )
+        processed["queue_time"] = calculate_queue_time(r, report_time)
         processed["duration"] = calculate_duration(r["started_at"], r["completed_at"])
         # Use the job's html_url for direct link to the specific job
         processed["url"] = (
@@ -998,6 +1154,7 @@ def print_table(
                 counts["success"],
                 counts["failure"],
                 counts["cancelled"],
+                counts["skipped"],
             ]
         )
 
@@ -1013,6 +1170,7 @@ def print_table(
                 "Success",
                 "Failure",
                 "Cancelled",
+                "Skipped",
             ],
             tablefmt="grid",
         )
@@ -1184,14 +1342,14 @@ def format_markdown(
     lines.append("## Summary by Job Name")
     lines.append("")
     lines.append(
-        "> **Status meanings:** Running = executing, Queued = waiting for runner, Waiting = waiting for dependent jobs, Stuck = ghost job, Cancelled = cancelled/timed_out"
+        "> **Status meanings:** Running = executing, Queued = waiting for runner, Waiting = waiting for dependent jobs, Stuck = ghost job, Cancelled = cancelled/timed_out, Skipped = skipped by workflow conditions"
     )
     lines.append("")
     lines.append(
-        "| Job Name | Running | Queued | Waiting | Stuck | Success | Failure | Cancelled |"
+        "| Job Name | Running | Queued | Waiting | Stuck | Success | Failure | Cancelled | Skipped |"
     )
     lines.append(
-        "|----------|---------|--------|---------|-------|---------|---------|-----------|"
+        "|----------|---------|--------|---------|-------|---------|---------|-----------|---------|"
     )
 
     for job_name, counts in sorted(status_summary.items()):
@@ -1202,8 +1360,9 @@ def format_markdown(
         success = str(counts["success"])
         failure = f"**{counts['failure']}**" if counts["failure"] > 0 else "0"
         cancelled = str(counts["cancelled"])
+        skipped = str(counts["skipped"])
         lines.append(
-            f"| `{job_name}` | {running} | {queued} | {waiting} | {stuck} | {success} | {failure} | {cancelled} |"
+            f"| `{job_name}` | {running} | {queued} | {waiting} | {stuck} | {success} | {failure} | {cancelled} | {skipped} |"
         )
 
     lines.append("")
@@ -1348,9 +1507,15 @@ def format_runner_report_markdown(
     lines.append(f"**Workflows:** {', '.join(f'`{w}`' for w in workflows)}")
     lines.append(f"**Time window:** Last {hours} hours")
     lines.append(f"**Generated:** {generated_time} UTC")
+    excluded_no_label = (
+        fetch_metadata.get("jobs_excluded_no_label", 0) if fetch_metadata else 0
+    )
     lines.append(f"**Total jobs analyzed:** {len(jobs)}")
     lines.append("")
-    lines.append("> All times are in UTC. Jobs on `ubuntu-latest` are excluded.")
+    lines.append(
+        "> All times are in UTC. Jobs on `ubuntu-latest` and jobs with no runner label "
+        "(waiting/unassigned) are excluded."
+    )
     lines.append("")
     append_fetch_metadata_notice(lines, fetch_metadata, workflows)
 
@@ -1368,6 +1533,8 @@ def format_runner_report_markdown(
     lines.append(f"| Total runner labels seen | {len(unique_labels)} |")
     lines.append(f"| Total jobs analyzed | {len(jobs)} |")
     lines.append(f"| Completed jobs | {len(completed_jobs)} |")
+    if excluded_no_label:
+        lines.append(f"| Excluded (no runner label) | {excluded_no_label} |")
     lines.append(f"| Time window | {hours}h |")
     lines.append("")
 
@@ -1382,7 +1549,7 @@ def format_runner_report_markdown(
         lines.append(
             "|-------------|----------------|---------------|-----------|-----------|-----------|-----------|-------------|"
         )
-        for label in sorted(concurrency, key=lambda k: -concurrency[k]["peak"]):
+        for label in sorted(concurrency, key=_runner_label_sort_key):
             c = concurrency[label]
             lines.append(
                 f"| `{label}` | **{c['peak']}** | {c['avg_concurrent']} "
@@ -1395,7 +1562,7 @@ def format_runner_report_markdown(
         lines.append("")
 
     # --- Busy Periods ---
-    busy_periods = analyze_busy_periods(jobs)
+    busy_periods = analyze_busy_periods(jobs, report_time=report_time)
     if busy_periods:
         lines.append("## Busy Periods (UTC)")
         lines.append("")
@@ -1429,12 +1596,34 @@ def format_runner_report_markdown(
             lines.append(f"> **Quiet hours:** {labels}")
             lines.append("")
 
+    # --- Runner Utilization Snapshots ---
+    util_snapshots = analyze_utilization_snapshots(jobs, report_time, hours=hours)
+    if util_snapshots:
+        lines.append("## Runner Utilization (15-min snapshots)")
+        lines.append("")
+        lines.append(
+            "> Point-in-time snapshot every 15 minutes (UTC). "
+            "**Running** = jobs with a runner assigned and executing. "
+            "**Queued** = jobs waiting for a runner."
+        )
+        lines.append("")
+
+        for label in sorted(util_snapshots, key=_runner_label_sort_key):
+            snapshots = util_snapshots[label]
+            lines.append(f"### `{label}`")
+            lines.append("")
+            lines.append("| Time (UTC) | Running | Queued |")
+            lines.append("|-----------|---------|--------|")
+            for s in snapshots:
+                lines.append(f"| {s['time']} | **{s['running']}** | {s['queued']} |")
+            lines.append("")
+
     # --- Queue Time Distribution ---
-    queue_dist = analyze_queue_distribution(jobs)
+    queue_dist = analyze_queue_distribution(jobs, report_time=report_time)
     if queue_dist:
         lines.append("## Queue Time Distribution by Runner Label")
         lines.append("")
-        for label in sorted(queue_dist, key=lambda k: -queue_dist[k]["total"]):
+        for label in sorted(queue_dist, key=_runner_label_sort_key):
             dist = queue_dist[label]
             lines.append(f"### `{label}`")
             lines.append("")
@@ -1470,9 +1659,7 @@ def format_runner_report_markdown(
             "|----------|--------|---------|-------|----------|-----------|------|"
         )
         for j in sorted(failed_jobs, key=lambda x: x["created_at"], reverse=True):
-            queue = calculate_queue_time(
-                j["created_at"], j["started_at"], j["status"], report_time
-            )
+            queue = calculate_queue_time(j, report_time)
             dur = calculate_duration(j["started_at"], j["completed_at"])
             pr_info = (
                 f"PR#{j['pr_number']}" if j.get("pr_number") else j.get("branch", "-")
@@ -1600,6 +1787,10 @@ def main():
         snapshot = load_snapshot(args.input_data_file)
         repo = snapshot.get("repo", args.repo)
         fetch_metadata = snapshot.get("fetch_metadata")
+        generated_at = snapshot.get("generated_at")
+        if generated_at:
+            report_time = parse_time(generated_at) or report_time
+            report_generated_time = report_time.strftime("%Y-%m-%d %H:%M:%S")
 
     if args.dump_data_file:
         snapshot = fetch_all_jobs_snapshot(repo, workflows, args.hours)
@@ -1628,9 +1819,17 @@ def main():
             snapshot = fetch_all_jobs_snapshot(repo, workflows, args.hours)
             fetch_metadata = snapshot.get("fetch_metadata")
 
-        jobs = [
-            job for job in snapshot["jobs"] if job.get("workflow") in set(workflows)
+        workflow_set = set(workflows)
+        all_snapshot_jobs = [
+            job for job in snapshot["jobs"] if job.get("workflow") in workflow_set
         ]
+        jobs = [job for job in all_snapshot_jobs if job.get("labels")]
+        if fetch_metadata is None:
+            fetch_metadata = {}
+        if "jobs_excluded_no_label" not in fetch_metadata:
+            fetch_metadata["jobs_excluded_no_label"] = len(all_snapshot_jobs) - len(
+                jobs
+            )
 
         md_content = format_runner_report_markdown(
             jobs,
@@ -1678,9 +1877,7 @@ def main():
             "job_name,status,is_stuck,conclusion,created_at,started_at,queue_time,duration,runner,run_status,run_conclusion,pr_number,branch,url"
         ]
         for r in sorted(results, key=lambda x: x["created_at"], reverse=True):
-            queue_time = calculate_queue_time(
-                r["created_at"], r["started_at"], r["status"], report_time
-            )
+            queue_time = calculate_queue_time(r, report_time)
             duration = calculate_duration(r["started_at"], r["completed_at"])
             is_stuck = "true" if r.get("is_stuck", False) else "false"
             lines.append(
@@ -1692,9 +1889,7 @@ def main():
         json_results = []
         for r in sorted(results, key=lambda x: x["created_at"], reverse=True):
             r_copy = r.copy()
-            r_copy["queue_time"] = calculate_queue_time(
-                r["created_at"], r["started_at"], r["status"], report_time
-            )
+            r_copy["queue_time"] = calculate_queue_time(r, report_time)
             r_copy["duration"] = calculate_duration(r["started_at"], r["completed_at"])
             r_copy["created_at_formatted"] = format_time(r["created_at"])
             r_copy["started_at_formatted"] = format_time(r["started_at"])

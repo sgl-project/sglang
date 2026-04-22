@@ -31,7 +31,7 @@ First use [../sglang-diffusion-benchmark-profile/SKILL.md](../sglang-diffusion-b
 - measure the real denoise regression
 - collect the perf dump baseline
 - capture one representative `torch.profiler` trace
-- rule out existing merged fast paths
+- rule out existing mainline fast paths
 
 If a future specialized optimization skill matches the kernel family better than AKO4ALL, hand off there instead. The diagnosis contract stays the same.
 
