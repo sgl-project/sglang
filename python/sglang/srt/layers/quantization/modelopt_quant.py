@@ -1883,22 +1883,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-
-        if moe_runner_backend.is_auto():
-            if moe_runner_backend.is_flashinfer_trtllm():
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
-        else:
-            if moe_runner_backend.is_asym_gemm():
-                moe_runner_backend = MoeRunnerBackend.ASYM_GEMM
-        if (
-            moe_runner_backend.is_asym_gemm()
-            or moe_runner_backend.is_flashinfer_trtllm()
-        ):
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
-        else:
-            # TODO(cwan): refactor other backends
-            pass
+        if get_moe_runner_backend().is_flashinfer_trtllm():
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
+            )
 
     def apply(
         self,

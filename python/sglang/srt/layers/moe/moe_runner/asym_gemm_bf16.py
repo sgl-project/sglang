@@ -36,9 +36,9 @@ class AsymGemmBf16RunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
-    offsets: Optional[torch.Tensor] = None
-    experts: Optional[torch.Tensor] = None
-    list_size: Optional[torch.Tensor] = None
+    offsets: Optional[int] = None
+    experts: Optional[int] = None
+    list_size: int = 0
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
