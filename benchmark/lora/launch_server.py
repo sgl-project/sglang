@@ -26,6 +26,10 @@ def launch_server(args):
     cmd += f"--tp-size {args.tp_size} "
     if args.disable_custom_all_reduce:
         cmd += "--disable-custom-all-reduce"
+    if args.enable_mscclpp:
+        cmd += "--enable-mscclpp"
+    if args.enable_torch_symm_mem:
+        cmd += "--enable-torch-symm-mem"
     print(cmd)
     os.system(cmd)
 
@@ -49,7 +53,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lora-backend",
         type=str,
-        default="triton",
+        default="csgmv",
     )
     parser.add_argument(
         "--tp-size",
@@ -62,6 +66,16 @@ if __name__ == "__main__":
         "--disable-custom-all-reduce",
         action="store_true",
         help="Disable custom all reduce when device does not support p2p communication",
+    )
+    parser.add_argument(
+        "--enable-mscclpp",
+        action="store_true",
+        help="Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+    )
+    parser.add_argument(
+        "--enable-torch-symm-mem",
+        action="store_true",
+        help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL.",
     )
     args = parser.parse_args()
 

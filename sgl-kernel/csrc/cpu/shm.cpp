@@ -1,9 +1,15 @@
 #include "shm.h"
+#if defined(__x86_64__)
+#include "x86_64/shm.h"
+#elif defined(__aarch64__)
+#include "aarch64/shm.h"
+#else
+#error "unsupported architecture"
+#endif
 
 #include <ATen/ATen.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <immintrin.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +60,8 @@ void shared_open(SharedData* data, const char* name, size_t nbytes) {
 void shared_create(SharedData* data, const char* name, void* bytes, size_t nbytes) {
   int d = shm_open(name, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
   if (d != -1) {
-    if (nbytes = write(d, bytes, nbytes)) {
+    nbytes = write(d, bytes, nbytes);
+    if (nbytes > 0) {
       shared_open(data, name, nbytes);
     }
   } else {
@@ -99,51 +106,6 @@ void wait_buffer_state_until_2(int index, enum coll_state state0, enum coll_stat
   }
 }
 
-__m512 cvt_bf16_to_fp32(const __m256i src) __attribute__((target("avx512bw")));
-inline __m512 cvt_bf16_to_fp32(const __m256i src) {
-  auto y = _mm512_cvtepu16_epi32(src);
-  return _mm512_castsi512_ps(_mm512_bslli_epi128(y, 2));
-}
-
-inline __m256i cvt_fp32_to_bf16(const __m512 src) __attribute__((target("avx512bw")));
-inline __m256i cvt_fp32_to_bf16(const __m512 src) {
-  __m512i value = _mm512_castps_si512(src);
-  __m512i nan = _mm512_set1_epi32(0xffff);
-  auto mask_value = _mm512_cmp_ps_mask(src, src, _CMP_ORD_Q);
-  __m512i ones = _mm512_set1_epi32(0x1);
-  __m512i vec_bias = _mm512_set1_epi32(0x7fff);
-  // uint32_t lsb = (input >> 16) & 1;
-  auto t_value = _mm512_and_si512(_mm512_srli_epi32(value, 16), ones);
-  // uint32_t rounding_bias = 0x7fff + lsb;
-  t_value = _mm512_add_epi32(t_value, vec_bias);
-  // input += rounding_bias;
-  t_value = _mm512_add_epi32(t_value, value);
-  // input = input >> 16;
-  t_value = _mm512_srli_epi32(t_value, 16);
-  // Check NaN before converting back to bf16
-  t_value = _mm512_mask_blend_epi32(mask_value, nan, t_value);
-  return _mm512_cvtusepi32_epi16(t_value);
-}
-
-__m512 cvt_fp16_to_fp32(const __m256i src) __attribute__((target("avx512bw")));
-inline __m512 cvt_fp16_to_fp32(const __m256i src) {
-  return _mm512_cvtph_ps(src);
-}
-
-inline __m256i cvt_fp32_to_fp16(const __m512 src) __attribute__((target("avx512bw")));
-inline __m256i cvt_fp32_to_fp16(const __m512 src) {
-  return _mm512_cvtps_ph(src, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-}
-
-void reduce_bf16_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers)
-    __attribute__((target("avx512bw")));
-
-void reduce_fp16_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers)
-    __attribute__((target("avx512bw")));
-
-void reduce_fp32_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers)
-    __attribute__((target("avx512bw")));
-
 void reduce_all_buffers(
     int start_elements,
     int num_elements,
@@ -153,245 +115,23 @@ void reduce_all_buffers(
     char** buffers) {
   switch (scalar_type) {
     case c10::ScalarType::BFloat16:
-      reduce_bf16_buffers(start_elements, num_elements, to_buffer, buffers);
+      reduce_bf16_buffers(start_elements, num_elements, to_buffer, buffers, world_size);
       break;
     case c10::ScalarType::Half:
-      reduce_fp16_buffers(start_elements, num_elements, to_buffer, buffers);
+      reduce_fp16_buffers(start_elements, num_elements, to_buffer, buffers, world_size);
       break;
     case c10::ScalarType::Float:
-      reduce_fp32_buffers(start_elements, num_elements, to_buffer, buffers);
+      reduce_fp32_buffers(start_elements, num_elements, to_buffer, buffers, world_size);
       break;
     default:
       assert(!"Should not get here");
   }
 }
 
-#define CVT_ADD_BF16(x)                                                                  \
-  do {                                                                                   \
-    auto in##x##_val = cvt_bf16_to_fp32(_mm256_loadu_si256((__m256i*)(buffers[x] + i))); \
-    inout_val = _mm512_add_ps(inout_val, in##x##_val);                                   \
-  } while (0)
-
-// Reduce functions down below use vectorized algorithm, the number of bytes
-// processed each iteration depends on vector length.  256bit vector ==> 32
-// bytes, 512bit vector ==> 64 bytes If you change implementation of
-// reduce_bf16_buffers, etc. , check whether this number needs to be changed
-#define VECTOR_LENGTH_IN_BYTES 32
-
-void reduce_bf16_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers) {
-  const int element_size = 2;
-  const int vector_length = VECTOR_LENGTH_IN_BYTES / element_size;
-  int main_elements = num_elements - (num_elements % vector_length);
-  int remain_elements = num_elements % vector_length;
-
-  // process aligned part
-#pragma omp parallel for
-  for (int i = start_elements * element_size; i < (start_elements + main_elements) * element_size;
-       i += VECTOR_LENGTH_IN_BYTES) {
-    auto inout_val = cvt_bf16_to_fp32(_mm256_loadu_si256((__m256i*)(buffers[0] + i)));
-    switch (world_size) {
-      case 16:
-        CVT_ADD_BF16(15);
-      case 15:
-        CVT_ADD_BF16(14);
-      case 14:
-        CVT_ADD_BF16(13);
-      case 13:
-        CVT_ADD_BF16(12);
-      case 12:
-        CVT_ADD_BF16(11);
-      case 11:
-        CVT_ADD_BF16(10);
-      case 10:
-        CVT_ADD_BF16(9);
-      case 9:
-        CVT_ADD_BF16(8);
-      case 8:
-        CVT_ADD_BF16(7);
-      case 7:
-        CVT_ADD_BF16(6);
-      case 6:
-        CVT_ADD_BF16(5);
-      case 5:
-        CVT_ADD_BF16(4);
-      case 4:
-        CVT_ADD_BF16(3);
-      case 3:
-        CVT_ADD_BF16(2);
-      case 2:
-        CVT_ADD_BF16(1);
-      case 1:
-        break;
-      default:
-        for (int j = 1; j < world_size; j++) {
-          auto in_val = cvt_bf16_to_fp32(_mm256_loadu_si256((__m256i*)(buffers[j] + i)));
-          inout_val = _mm512_add_ps(inout_val, in_val);
-        }
-    }
-    _mm256_storeu_si256((__m256i*)(to_buffer + i), cvt_fp32_to_bf16(inout_val));
-  }
-
-  // process remaining part
-  int i = (start_elements + main_elements) * element_size;
-  while (remain_elements > 0) {
-    float val = 0.0f;
-    for (int j = 0; j < world_size; j++) {
-      val += *(at::BFloat16*)(buffers[j] + i);
-    }
-    *(at::BFloat16*)(to_buffer + i) = val;
-    remain_elements--;
-    i += element_size;
-  }
-}
-
-#define CVT_ADD_FP16(x)                                                                  \
-  do {                                                                                   \
-    auto in##x##_val = cvt_fp16_to_fp32(_mm256_loadu_si256((__m256i*)(buffers[x] + i))); \
-    inout_val = _mm512_add_ps(inout_val, in##x##_val);                                   \
-  } while (0)
-
-void reduce_fp16_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers) {
-  const int element_size = 2;
-  const int vector_length = VECTOR_LENGTH_IN_BYTES / element_size;
-  int main_elements = num_elements - (num_elements % vector_length);
-  int remain_elements = num_elements % vector_length;
-
-  // process aligned part
-#pragma omp parallel for
-  for (int i = start_elements * element_size; i < (start_elements + main_elements) * element_size;
-       i += VECTOR_LENGTH_IN_BYTES) {
-    auto inout_val = cvt_fp16_to_fp32(_mm256_loadu_si256((__m256i*)(buffers[0] + i)));
-    switch (world_size) {
-      case 16:
-        CVT_ADD_FP16(15);
-      case 15:
-        CVT_ADD_FP16(14);
-      case 14:
-        CVT_ADD_FP16(13);
-      case 13:
-        CVT_ADD_FP16(12);
-      case 12:
-        CVT_ADD_FP16(11);
-      case 11:
-        CVT_ADD_FP16(10);
-      case 10:
-        CVT_ADD_FP16(9);
-      case 9:
-        CVT_ADD_FP16(8);
-      case 8:
-        CVT_ADD_FP16(7);
-      case 7:
-        CVT_ADD_FP16(6);
-      case 6:
-        CVT_ADD_FP16(5);
-      case 5:
-        CVT_ADD_FP16(4);
-      case 4:
-        CVT_ADD_FP16(3);
-      case 3:
-        CVT_ADD_FP16(2);
-      case 2:
-        CVT_ADD_FP16(1);
-      case 1:
-        break;
-      default:
-        for (int j = 1; j < world_size; j++) {
-          auto in_val = cvt_fp16_to_fp32(_mm256_loadu_si256((__m256i*)(buffers[j] + i)));
-          inout_val = _mm512_add_ps(inout_val, in_val);
-        }
-    }
-    _mm256_storeu_si256((__m256i*)(to_buffer + i), cvt_fp32_to_fp16(inout_val));
-  }
-
-  // process remaining part
-  int i = (start_elements + main_elements) * element_size;
-  while (remain_elements > 0) {
-    float val = 0.0f;
-    for (int j = 0; j < world_size; j++) {
-      val += *(at::Half*)(buffers[j] + i);
-    }
-    *(at::Half*)(to_buffer + i) = val;
-    remain_elements--;
-    i += element_size;
-  }
-}
-
-#define CVT_ADD_F32(x)                                            \
-  do {                                                            \
-    auto in##x##_val = _mm256_loadu_ps((float*)(buffers[x] + i)); \
-    inout_val = _mm256_add_ps(inout_val, in##x##_val);            \
-  } while (0)
-
-void reduce_fp32_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers) {
-  const int element_size = 4;
-  const int vector_length = VECTOR_LENGTH_IN_BYTES / element_size;
-  int main_elements = num_elements - (num_elements % vector_length);
-  int remain_elements = num_elements % vector_length;
-
-  // process aligned part
-#pragma omp parallel for
-  for (int i = start_elements * element_size; i < (start_elements + main_elements) * element_size;
-       i += VECTOR_LENGTH_IN_BYTES) {
-    auto inout_val = _mm256_loadu_ps((float*)(buffers[0] + i));
-    switch (world_size) {
-      case 16:
-        CVT_ADD_F32(15);
-      case 15:
-        CVT_ADD_F32(14);
-      case 14:
-        CVT_ADD_F32(13);
-      case 13:
-        CVT_ADD_F32(12);
-      case 12:
-        CVT_ADD_F32(11);
-      case 11:
-        CVT_ADD_F32(10);
-      case 10:
-        CVT_ADD_F32(9);
-      case 9:
-        CVT_ADD_F32(8);
-      case 8:
-        CVT_ADD_F32(7);
-      case 7:
-        CVT_ADD_F32(6);
-      case 6:
-        CVT_ADD_F32(5);
-      case 5:
-        CVT_ADD_F32(4);
-      case 4:
-        CVT_ADD_F32(3);
-      case 3:
-        CVT_ADD_F32(2);
-      case 2:
-        CVT_ADD_F32(1);
-      case 1:
-        break;
-      default:
-        for (int j = 1; j < world_size; j++) {
-          auto in_val = _mm256_loadu_ps((float*)(buffers[j] + i));
-          inout_val = _mm256_add_ps(inout_val, in_val);
-        }
-    }
-    _mm256_storeu_ps((float*)(to_buffer + i), inout_val);
-  }
-
-  // process remaining part
-  int i = (start_elements + main_elements) * element_size;
-  while (remain_elements > 0) {
-    float val = 0.0f;
-    for (int j = 0; j < world_size; j++) {
-      val += *(float*)(buffers[j] + i);
-    }
-    *(float*)(to_buffer + i) = val;
-    remain_elements--;
-    i += element_size;
-  }
-}
-
 static bool is_initialized = false;
 static int world_rank;
 
-void shm_initialize(int size, int rank, char* addr_string, char* port_string) {
+void shm_initialize(int size, int rank, const char* addr_string, const char* port_string) {
   if (is_initialized) {
     return;
   }
@@ -409,7 +149,7 @@ void shm_initialize(int size, int rank, char* addr_string, char* port_string) {
   struct allreduce_workspace* workspace_buf;
   struct allreduce_workspace* workspace_buf_other;
   workspace_buf = (struct allreduce_workspace*)malloc(sizeof(struct allreduce_workspace));
-  snprintf(shm_name, NAME_BUF_SIZE, "%s_%d", shm_name_prefix, rank);
+  snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, rank);
   shared_create(&allreduce_buffer, shm_name, workspace_buf, sizeof(struct allreduce_workspace));
   workspace_buf = (struct allreduce_workspace*)allreduce_buffer.bytes;
   workspace_buf->states[0] = coll_alt2_allreduce_naive__copy_in_done;
@@ -425,7 +165,7 @@ void shm_initialize(int size, int rank, char* addr_string, char* port_string) {
   // map shm of all ranks
   for (int i = 0; i < size; i++) {
     if (i != rank) {
-      snprintf(shm_name, NAME_BUF_SIZE, "%s_%d", shm_name_prefix, i);
+      snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, i);
       // printf("open %s, %d\n", shm_name, rank);
       do {
         shared_open(&allreduce_buffer, shm_name, sizeof(struct allreduce_workspace));
@@ -439,22 +179,6 @@ void shm_initialize(int size, int rank, char* addr_string, char* port_string) {
     symmetric_buffer[1][i] = workspace[i]->buffer + BUFFER0_OFFSET(1);
     distributed_buffer[0][i] = workspace[i]->buffer + BUFFER1_OFFSET(0);
     distributed_buffer[1][i] = workspace[i]->buffer + BUFFER1_OFFSET(1);
-  }
-}
-
-static void parallel_memcpy(void* to, void* from, size_t n_bytes) __attribute__((target("avx512bw")));
-static void parallel_memcpy(void* to, void* from, size_t n_bytes) {
-  auto aligned_bytes = n_bytes - (n_bytes % VECTOR_LENGTH_IN_BYTES);
-  // process aligned part
-#pragma omp parallel for
-  for (int i = 0; i < aligned_bytes; i += VECTOR_LENGTH_IN_BYTES) {
-    auto val = _mm256_loadu_si256((__m256i*)((char*)from + i));
-    _mm256_storeu_si256((__m256i*)((char*)to + i), val);
-  }
-
-  // process remaining part
-  for (int i = aligned_bytes; i < n_bytes; i++) {
-    *((char*)to + i) = *((char*)from + i);
   }
 }
 
@@ -481,7 +205,9 @@ void symmetric_naive_all_reduce(char* data_ptr, c10::ScalarType scalar_type, siz
   static int current_buffer = 0;
   static int state_idx = 0;
 
-  enum coll_state copy_current, copy_next;
+  // init states to case 0 to get rid of "maybe-uninitialized" warning.
+  enum coll_state copy_current = coll_allreduce_naive__copy_in_done;
+  enum coll_state copy_next = coll_alt1_allreduce_naive__copy_in_done;
 
   switch (state_idx) {
     case 0:
@@ -526,7 +252,10 @@ void distributed_naive_reduce(char* data_ptr, c10::ScalarType scalar_type, size_
   static int current_buffer = 0;
   static int state_idx = 0;
 
-  enum coll_state copy_current, copy_next, reduce_current;
+  // init states to case 0 to get rid of "maybe-uninitialized" warning.
+  enum coll_state copy_current = coll_allreduce_naive__copy_in_done;
+  enum coll_state reduce_current = coll_allreduce_naive__reduce_done;
+  enum coll_state copy_next = coll_alt1_allreduce_naive__copy_in_done;
 
   // similar to symmetric_naive_allreduce, but here we only need two sets of
   // states, because distributed naive reduce has two barriers in the algorithm
@@ -601,7 +330,9 @@ void naive_all_gather(char* result_ptr, char* data_ptr, size_t res_stride, size_
   static int current_buffer = 0;
   static int state_idx = 0;
 
-  enum coll_state copy_current, copy_next;
+  // init states to case 0 to get rid of "maybe-uninitialized" warning.
+  enum coll_state copy_current = coll_allgather_naive__copy_in_done;
+  enum coll_state copy_next = coll_alt1_allgather_naive__copy_in_done;
 
   switch (state_idx) {
     case 0:
@@ -621,7 +352,6 @@ void naive_all_gather(char* result_ptr, char* data_ptr, size_t res_stride, size_
   }
   state_idx = (state_idx + 1) % 3;
 
-  int data_size = chunk_size / chunk_el;
   parallel_memcpy(distributed_buffer[current_buffer][world_rank], data_ptr, chunk_size);
   std::atomic_thread_fence(std::memory_order_release);
   workspace[world_rank]->states[state_group] = copy_current;
@@ -644,7 +374,7 @@ torch::Tensor& all_gather(torch::Tensor& result, torch::Tensor& data, int dim, s
   auto data_ptr = (char*)(data.data_ptr());
   auto result_ptr = (char*)(result.data_ptr());
   for (int i = 0; i < dim_count; i++) {
-    for (int offset = 0; offset < dim_size; offset += MAX_BUF_SIZE) {
+    for (size_t offset = 0; offset < dim_size; offset += MAX_BUF_SIZE) {
       size_t chunk_size = dim_size - offset > MAX_BUF_SIZE ? MAX_BUF_SIZE : dim_size - offset;
       size_t chunk_el = chunk_size / dtype_size;
       naive_all_gather(

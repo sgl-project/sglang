@@ -24,6 +24,7 @@ include_directories(
     ${Python_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 # Platform-specific library directory
@@ -38,7 +39,50 @@ else()
 endif()
 link_directories(${PLAT_LIB_DIR})
 
-file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+# Conda library path support
+if(DEFINED ENV{CONDA_PREFIX})
+    set(CONDA_LIB_DIR "$ENV{CONDA_PREFIX}/lib")
+    message(STATUS "Using Conda lib dir: ${CONDA_LIB_DIR}")
+    link_directories(${CONDA_LIB_DIR})
+    set(CONDA_INCLUDE_DIR "$ENV{CONDA_PREFIX}/include")
+    include_directories(${CONDA_INCLUDE_DIR})
+
+    # Look for libnuma in Conda's lib directory
+    find_library(NUMA_LIB numa HINTS "${CONDA_LIB_DIR}")
+    if(NUMA_LIB)
+        message(STATUS "Found libnuma: ${NUMA_LIB}")
+    else()
+        message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
+                            "Please install it using: conda install libnuma numactl\n")
+    endif()
+else()
+    if(DEFINED ENV{VIRTUAL_ENV})
+        set(VENV_LIB_DIR "$ENV{VIRTUAL_ENV}/lib")
+        message(STATUS "Using venv lib dir: ${VENV_LIB_DIR}")
+        link_directories(${VENV_LIB_DIR})
+        set(VENV_INCLUDE_DIR "$ENV{VIRTUAL_ENV}/include")
+        include_directories(${VENV_INCLUDE_DIR})
+    endif()
+    # Look for libnuma in system env paths
+    find_library(NUMA_LIB numa)
+    if(NUMA_LIB)
+        message(STATUS "Found libnuma: ${NUMA_LIB}")
+    else()
+        message(FATAL_ERROR "libnuma not found in system environment\n"
+                            "Please install it using: apt-get install libnuma numactl\n")
+    endif()
+endif()
+
+file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+
+if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
+    set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
+endif()
+
+if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
+    message(STATUS "Enabling macro: SGLANG_CPU_FP8_CVT_FTZ")
+    add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
+endif()
 
 add_compile_options(
     -O3
@@ -48,7 +92,7 @@ add_compile_options(
 )
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES})
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
 install(TARGETS common_ops

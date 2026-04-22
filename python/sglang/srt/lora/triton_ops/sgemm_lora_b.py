@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
@@ -27,26 +28,47 @@ def _sgemm_lora_b_kernel(
     seg_indptr,
     weight_indices,
     lora_ranks,
+    sorted_token_ids,
     # Meta parameters
+    SORTED_BY_ADAPTER: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    # For fused output scaling and adding
-    fuse_scaling_add,
+    # For fused output scaling
     scalings,
 ):
-    # x: (s, K), s is the sum of sequence lengths
-    # weights: (num_lora, N, K)
-    # output: (s, N)
+    """
+    Computes a segmented batched matrix multiplication for the LoRA B matrix
+    and adds the result to the output in-place.
+
+    When a sequence's rank is 0, the kernel is essentially a no-op, following
+    the convention in pytorch where the product of two matrices of shape (m, 0)
+    and (0, n) is an all-zero matrix of shape (m, n).
+
+    Args:
+        x (torch.Tensor): The intermediate tensor from the LoRA 'A' multiplication,
+            of shape `(s, K)`, where `s` is the total number of tokens.
+        weights (torch.Tensor): The LoRA 'B' weights for all available adapters,
+            with shape `(num_lora, N, K)`.
+        output (torch.Tensor): The output tensor of shape `(s, N)`. This can be
+            the base model's output for a fused add operation.
+    """
 
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len
     batch_id = tl.program_id(axis=1)
+    w_index = tl.load(weight_indices + batch_id)
+    rank = tl.load(lora_ranks + w_index)
+
+    # If rank is 0, this kernel is a no-op.
+    if rank == 0:
+        return
+
     pid = tl.program_id(axis=0)
     seg_len = tl.load(seg_lens + batch_id)
-    w_index = tl.load(weight_indices + batch_id)
+    if seg_len == 0:
+        return
     seg_start = tl.load(seg_indptr + batch_id)
-    rank = tl.load(lora_ranks + w_index)
     scaling = tl.load(scalings + w_index)
     # Adjust K (rank) according to the specific LoRA adapter
     K = tl.minimum(K, rank)
@@ -55,6 +77,8 @@ def _sgemm_lora_b_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_N)
     pid_s = pid // num_pid_n
     pid_n = pid % num_pid_n
+    if pid_s * BLOCK_S >= seg_len:
+        return
 
     # Create pointers for the first block of x and weights[batch_id]
     # The pointers will be advanced as we move in the K direction
@@ -62,25 +86,26 @@ def _sgemm_lora_b_kernel(
     s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
-    x_ptrs = (x + seg_start * x_stride_0) + (
-        s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
+    s_physical = _resolve_token_positions(
+        sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
     )
+    x_ptrs = x + (s_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
     w_ptrs = (weights + w_index * w_stride_0) + (
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
     # Iterate to compute the block in output matrix
+    n_mask = n_offset[None, :] < N
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len)
-            and (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K),
+            mask=(k_offset[:, None] < K - k * BLOCK_K) & n_mask,
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -91,12 +116,11 @@ def _sgemm_lora_b_kernel(
     # Store result to output matrix
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
-    output_ptr = (output + seg_start * output_stride_0) + (
-        s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
+    output_ptr = output + (
+        s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = s_offset[:, None] < seg_len
-    if fuse_scaling_add:
-        partial_sum += tl.load(output_ptr, mask=output_mask)
+    output_mask = (s_offset[:, None] < seg_len) & n_mask
+    partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
@@ -132,12 +156,11 @@ def sgemm_lora_b_fwd(
     )
 
     if base_output is None:
-        output = torch.empty((S, N), device=x.device, dtype=x.dtype)
-        fuse_scaling_add = False
+        output = torch.zeros((S, N), device=x.device, dtype=x.dtype)
     else:
         output = base_output
-        fuse_scaling_add = True
 
+    sorted_by_adapter = batch_info.permutation is not None
     _sgemm_lora_b_kernel[grid](
         x,
         weights,
@@ -155,10 +178,11 @@ def sgemm_lora_b_fwd(
         batch_info.seg_indptr,
         batch_info.weight_indices,
         batch_info.lora_ranks,
+        batch_info.permutation,
+        sorted_by_adapter,
         BLOCK_S,
         BLOCK_N,
         BLOCK_R,
-        fuse_scaling_add,
         batch_info.scalings,
     )
     return output

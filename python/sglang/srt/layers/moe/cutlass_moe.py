@@ -1,28 +1,32 @@
 """CUTLASS based Fused MoE kernels."""
 
-import functools
-import json
-import logging
-import os
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
+from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    import sgl_kernel
     from sgl_kernel import (
-        cutlass_fp4_group_mm,
+        apply_shuffle_mul_sum,
+        es_fp8_blockwise_scaled_grouped_mm,
+        es_sm100_mxfp8_blockscaled_grouped_mm,
+        es_sm100_mxfp8_blockscaled_grouped_quant,
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
-        scaled_fp4_experts_quant,
+        shuffle_rows,
         silu_and_mul,
     )
 
+    from sglang.jit_kernel.nvfp4 import (
+        cutlass_fp4_group_mm,
+        scaled_fp4_experts_quant,
+    )
 
-def cutlass_fused_experts(
+
+def cutlass_fused_experts_fp8(
     a: torch.Tensor,
     w1_q: torch.Tensor,
     w2_q: torch.Tensor,
@@ -44,6 +48,9 @@ def cutlass_fused_experts(
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
     use_fp8_blockscale: bool = True,
+    use_mxfp8: bool = False,
+    output: Optional[torch.Tensor] = None,
+    enable_es: Tuple[bool, bool] = (False, False),
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
 
@@ -98,7 +105,10 @@ def cutlass_fused_experts(
         b_scales_ptrs (torch.Tensor): Pointers container for calculating offsets of the input scales for each expert.
         use_fp8_blockscale (bool, optional): Flag indicating usage of FP8 with
             block scaling. Currently, only `True` is supported. Defaults to `True`.
-
+        use_mxfp8 (bool, optional): Flag indicating usage of MXFP8 (UE8M0 scales)
+            with SM100 expert-specialization kernels. Defaults to `False`.
+        output (torch.Tensor, optional): Output tensor. If not provided, a new tensor will be created.
+        enable_es (tuple(bool, bool)): Flag indicating usage of expert specialization kernel for (up-projection, down-projection)
     Returns:
         torch.Tensor: The computed MoE layer output. Shape: `(m, k)`, dtype matches `a`.
 
@@ -122,7 +132,7 @@ def cutlass_fused_experts(
         from sglang.srt.layers.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
-
+    es_up, es_down = enable_es
     out_dtype = a.dtype
     num_experts = w1_q.size(0)
     m = a.size(0)
@@ -130,12 +140,48 @@ def cutlass_fused_experts(
     n = w2_q.size(1)
 
     topk = topk_ids.size(1)
-
-    a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
-    device = a_q.device
+    device = a.device
 
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+
+    if use_mxfp8:
+        assert es_up and es_down, "MXFP8 requires expert-specialization for both GEMMs"
+        assert is_sm100_supported(), "MXFP8 requires SM100"
+        assert k % 32 == 0, "MXFP8 requires hidden size to be divisible by 32"
+        assert n % 32 == 0, "MXFP8 requires intermediate size to be divisible by 32"
+        assert w1_scale.dtype == torch.uint8, "MXFP8 w1_scale must be uint8"
+        assert w2_scale.dtype == torch.uint8, "MXFP8 w2_scale must be uint8"
+        expected_w1_scale_shape = (
+            num_experts,
+            w1_q.shape[1] // 32,
+            w1_q.shape[2],
+        )
+        expected_w2_scale_shape = (
+            num_experts,
+            w2_q.shape[1] // 32,
+            w2_q.shape[2],
+        )
+        assert (
+            w1_scale.shape == expected_w1_scale_shape
+        ), f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
+        assert (
+            w2_scale.shape == expected_w2_scale_shape
+        ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+
+        mxfp8_blockscale_align = 128
+        total_tokens = m * topk
+        nonzero_experts = min(num_experts, total_tokens)
+        max_total = total_tokens + (mxfp8_blockscale_align - 1) * nonzero_experts
+        max_blockscale = (
+            (max_total + mxfp8_blockscale_align - 1) // mxfp8_blockscale_align
+        ) * mxfp8_blockscale_align
+
+    blockscale_offsets = None
+    if use_mxfp8 and (es_up or es_down):
+        blockscale_offsets = torch.empty(
+            (num_experts + 1,), dtype=torch.int32, device=device
+        )
 
     prepare_moe_input(
         topk_ids,
@@ -147,10 +193,27 @@ def cutlass_fused_experts(
         num_experts,
         n,
         k,
+        blockscale_offsets,
     )
 
-    rep_a_q = a_q.view(dtype=torch.uint8)[a_map].view(dtype=a_q.dtype)
-    rep_a1_scales = a1_scale[a_map]
+    if use_mxfp8 and es_up:
+        rep_a = shuffle_rows(a, a_map, (m * topk, k))
+        rep_a_q = torch.empty_like(rep_a, dtype=torch.float8_e4m3fn)
+        rep_a1_scales = torch.empty(
+            (max_blockscale, k // 32), dtype=torch.uint8, device=device
+        )
+        es_sm100_mxfp8_blockscaled_grouped_quant(
+            rep_a,
+            problem_sizes1,
+            expert_offsets[:-1],
+            blockscale_offsets[:-1],
+            rep_a_q,
+            rep_a1_scales,
+        )
+    else:
+        a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
+        rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
+        rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -158,55 +221,124 @@ def cutlass_fused_experts(
     a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
     w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
 
-    fp8_blockwise_scaled_grouped_mm(
-        c1,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        rep_a_q,
-        w1_q,
-        rep_a1_scales,
-        w1_scale,
-        a1_strides,
-        a1_strides,
-        c1_strides,
-        a_sf_layout,
-        w_sf_layout,
-        problem_sizes1,
-        expert_offsets[:-1],
-        workspace,
-    )
+    if is_sm90_supported() and es_up:
+        es_fp8_blockwise_scaled_grouped_mm(
+            c1,
+            rep_a_q,
+            w1_q,
+            rep_a1_scales,
+            w1_scale,
+            a1_strides,
+            a1_strides,
+            c1_strides,
+            problem_sizes1,
+            expert_offsets[:-1],
+            workspace,
+        )
+    elif use_mxfp8 and es_up:
+        es_sm100_mxfp8_blockscaled_grouped_mm(
+            c1,
+            rep_a_q,
+            w1_q,
+            rep_a1_scales,
+            w1_scale,
+            problem_sizes1,
+            expert_offsets[:-1],
+            blockscale_offsets[:-1],
+        )
+    else:
+        fp8_blockwise_scaled_grouped_mm(
+            c1,
+            a_ptrs,
+            b_ptrs,
+            out_ptrs,
+            a_scales_ptrs,
+            b_scales_ptrs,
+            rep_a_q,
+            w1_q,
+            rep_a1_scales,
+            w1_scale,
+            a1_strides,
+            a1_strides,
+            c1_strides,
+            a_sf_layout,
+            w_sf_layout,
+            problem_sizes1,
+            expert_offsets[:-1],
+            workspace,
+        )
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
     silu_and_mul(c1, intermediate)
 
-    intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
+    if use_mxfp8 and es_down:
+        intemediate_q = torch.empty_like(intermediate, dtype=torch.float8_e4m3fn)
+        a2_scale = torch.empty(
+            (max_blockscale, n // 32), dtype=torch.uint8, device=device
+        )
+        es_sm100_mxfp8_blockscaled_grouped_quant(
+            intermediate,
+            problem_sizes2,
+            expert_offsets[:-1],
+            blockscale_offsets[:-1],
+            intemediate_q,
+            a2_scale,
+        )
+    else:
+        intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
 
-    fp8_blockwise_scaled_grouped_mm(
-        c2,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        intemediate_q,
-        w2_q,
-        a2_scale,
-        w2_scale,
-        a2_strides,
-        a2_strides,
-        c2_strides,
-        a_sf_layout,
-        w_sf_layout,
-        problem_sizes2,
-        expert_offsets[:-1],
-        workspace,
-    )
-    return (
-        c2[c_map].view(m, topk, k) * topk_weights.view(m, topk, 1).to(out_dtype)
-    ).sum(dim=1)
+    if is_sm90_supported() and es_down:
+        es_fp8_blockwise_scaled_grouped_mm(
+            c2,
+            intemediate_q,
+            w2_q,
+            a2_scale,
+            w2_scale,
+            a2_strides,
+            a2_strides,
+            c2_strides,
+            problem_sizes2,
+            expert_offsets[:-1],
+            workspace,
+        )
+    elif use_mxfp8 and es_down:
+        es_sm100_mxfp8_blockscaled_grouped_mm(
+            c2,
+            intemediate_q,
+            w2_q,
+            a2_scale,
+            w2_scale,
+            problem_sizes2,
+            expert_offsets[:-1],
+            blockscale_offsets[:-1],
+        )
+    else:
+        fp8_blockwise_scaled_grouped_mm(
+            c2,
+            a_ptrs,
+            b_ptrs,
+            out_ptrs,
+            a_scales_ptrs,
+            b_scales_ptrs,
+            intemediate_q,
+            w2_q,
+            a2_scale,
+            w2_scale,
+            a2_strides,
+            a2_strides,
+            c2_strides,
+            a_sf_layout,
+            w_sf_layout,
+            problem_sizes2,
+            expert_offsets[:-1],
+            workspace,
+        )
+
+    if output is None:
+        output = torch.empty((m, k), device=device, dtype=out_dtype)
+
+    apply_shuffle_mul_sum(c2, output, c_map, topk_weights.to(out_dtype))
+    return output
 
 
 FLOAT4_E2M1_MAX = 6.0
@@ -223,17 +355,10 @@ def cutlass_moe_fp4(
     w2_fp4: torch.Tensor,
     w2_blockscale: torch.Tensor,
     w2_alphas: torch.Tensor,
-    ab_strides_13: torch.Tensor,
-    ab_strides_2: torch.Tensor,
-    c_strides_13: torch.Tensor,
-    c_strides_2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    m: int,
-    n: int,
-    k: int,
-    e: int,
-    device: torch.device,
+    params: CutlassMoEParams,
+    apply_router_weight_on_input: bool = False,
 ):
     """
     MoE implementation for FP4 Inputs
@@ -291,77 +416,69 @@ def cutlass_moe_fp4(
     e_w1, nx2_w1, half_k_w1 = w1_fp4.shape
     e_w2, k_w2, half_n_w2 = w2_fp4.shape
 
-    assert e_w1 == e_w2 and e_w1 == e, (
+    assert e_w1 == e_w2 and e_w1 == params.num_experts, (
         "Number of experts must match",
         " between weights.",
     )
     assert (
-        k_a // 2 == half_k_w1 and k == k_w2
+        k_a // 2 == half_k_w1 and params.hidden_size == k_w2
     ), "Hidden size mismatch between a, w1 and w2"
-    assert nx2_w1 == n * 2 and half_n_w2 == n // 2, "mismatch in " "expected `n`"
-    assert m == m_a, "input shape mismatch"
+    assert (
+        nx2_w1 == params.intermediate_size_per_partition * 2
+        and half_n_w2 == params.intermediate_size_per_partition // 2
+    ), ("mismatch in " "expected `n`")
     assert 2 * half_k_w1 == k_w2, "Hidden size mismatch w2 and w1"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid input dtype"
-    assert (
-        topk_weights.shape[0] == m and topk_ids.shape[0] == m
-    ), "topk must be provided for each row of a"
 
     out_dtype = a.dtype
     num_topk = topk_ids.shape[1]
-
-    expert_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
-    # Problem size:  (num_experts, (m,2n,k))
-    problem_sizes1 = torch.empty((e, 3), dtype=torch.int32, device=device)
-    # Problem size:  (num_experts, (m,n,k))
-    problem_sizes2 = torch.empty((e, 3), dtype=torch.int32, device=device)
-
+    device = a.device
     a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-
-    # problem shapes should have [m, n, k]
-    # Note that problem sizes are based on logical number of elements.
-    blockscale_offsets = torch.empty(e + 1, dtype=torch.int32, device=device)
     prepare_moe_input(
         topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
+        params.expert_offsets,
+        params.problem_sizes1,
+        params.problem_sizes2,
         a_map,
         c_map,
-        e,
-        n,
-        k,
-        blockscale_offsets,
+        params.num_experts,
+        params.intermediate_size_per_partition,
+        params.hidden_size,
+        params.blockscale_offsets,
     )
 
     rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
-        a, a1_gscale, expert_offsets, blockscale_offsets, num_topk, expert_map=a_map
+        a,
+        a1_gscale,
+        params.expert_offsets,
+        params.blockscale_offsets,
+        num_topk,
+        expert_map=a_map,
     )
-
     c1 = cutlass_fp4_group_mm(
         rep_a_fp4,
         w1_fp4,
         rep_a_blockscale,
         w1_blockscale,
         w1_alphas,
-        ab_strides_13,
-        c_strides_13,
-        problem_sizes1,
-        expert_offsets[:-1],
-        blockscale_offsets[:-1],
         out_dtype,
-        device,
+        params.to_gemm1_args(),
     )
     del rep_a_fp4, rep_a_blockscale
+
     # hidden size dimension is split to one halfpytho sized tensor.
     intermediate = torch.empty(
-        (m * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
+        (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
-
     silu_and_mul(c1, intermediate)
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
-        intermediate, a2_gscale, expert_offsets, blockscale_offsets, num_topk
+        intermediate,
+        a2_gscale,
+        params.expert_offsets,
+        params.blockscale_offsets,
+        num_topk,
     )
     c2 = cutlass_fp4_group_mm(
         int_fp4,
@@ -369,16 +486,12 @@ def cutlass_moe_fp4(
         int_blockscale,
         w2_blockscale,
         w2_alphas,
-        ab_strides_2,
-        c_strides_2,
-        problem_sizes2,
-        expert_offsets[:-1],
-        blockscale_offsets[:-1],
         out_dtype,
-        device,
+        params.to_gemm2_args(),
     )
     del int_fp4, int_blockscale
-    out = (
-        c2[c_map].view(m, num_topk, k) * topk_weights.view(m, num_topk, 1).half()
-    ).sum(dim=1)
-    return out.to(dtype=out_dtype)
+    c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
+    c2 = c2.view(m_a, num_topk, params.hidden_size)
+    if not apply_router_weight_on_input:
+        c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
+    return c2.sum(dim=1).to(out_dtype)

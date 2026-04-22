@@ -34,16 +34,18 @@ template <
     uint32_t VEC_SIZE,
     bool DETERMINISTIC,
     typename DType,
-    typename IdType>
+    typename IdType,
+    typename IdType2>
 __global__ void TreeSpeculativeSamplingTargetOnly(
     IdType* predicts,          // mutable
     IdType* accept_index,      // mutable
     IdType* accept_token_num,  // mutable
-    IdType* candidates,
-    IdType* retrive_index,
-    IdType* retrive_next_token,
-    IdType* retrive_next_sibling,
+    IdType2* candidates,
+    IdType2* retrive_index,
+    IdType2* retrive_next_token,
+    IdType2* retrive_next_sibling,
     DType* uniform_samples,
+    DType* uniform_samples_for_final_sampling,
     DType* target_probs,
     DType* draft_probs,
     uint32_t batch_size,
@@ -62,16 +64,16 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   DType prob_acc = 0.0;
   uint32_t cur_prob_offset = bx * num_draft_tokens * d;
   DType coin = uniform_samples[bx * num_draft_tokens];
-  IdType last_accepted_retrive_idx = retrive_index[bx * num_draft_tokens];
+  IdType2 last_accepted_retrive_idx = retrive_index[bx * num_draft_tokens];
   accept_index[bx * num_speculative_tokens] = last_accepted_retrive_idx;
   uint32_t num_accepted_tokens = 0;
-  IdType cur_index = 0;
+  IdType2 cur_index = 0;
 
   for (uint32_t j = 1; j < num_speculative_tokens; ++j) {
     cur_index = retrive_next_token[bx * num_draft_tokens + cur_index];
     while (cur_index != -1) {
-      IdType draft_index = retrive_index[bx * num_draft_tokens + cur_index];
-      IdType draft_token_id = candidates[bx * num_draft_tokens + cur_index];
+      IdType2 draft_index = retrive_index[bx * num_draft_tokens + cur_index];
+      IdType2 draft_token_id = candidates[bx * num_draft_tokens + cur_index];
       DType target_prob_single = target_probs[cur_prob_offset + draft_token_id];
       prob_acc += target_prob_single;
 
@@ -94,6 +96,9 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     if (cur_index == -1) break;
   }
   accept_token_num[bx] = num_accepted_tokens;
+
+  // we need a different coin for the final sampling
+  coin = uniform_samples_for_final_sampling[bx];
 
   // sample from relu(target_probs - draft_probs)
   DType sum_relu_q_minus_p(0);
@@ -120,8 +125,9 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   if (tx == 0) {
     temp_storage.block_aggregate.value = sum_relu_q_minus_p;
   }
-  // init the first rejected token to (d - 1)
-  temp_storage.sampled_id = d - 1;
+
+  temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
   __syncthreads();
   sum_relu_q_minus_p = temp_storage.block_aggregate.value;
   DType u = coin * sum_relu_q_minus_p;
@@ -151,21 +157,33 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     }
   }
   __syncthreads();
+  // This would happen when u is very close to 1
+  // and the sum of probabilities is smaller than u
+  // In this case, we use the last valid index as the sampled id
+  int sampled_id = temp_storage.sampled_id;
+  if (sampled_id == d) {
+    if (temp_storage.last_valid_id == -1) {
+      sampled_id = d - 1;
+    } else {
+      sampled_id = temp_storage.last_valid_id;
+    }
+  }
   // set the first rejected token
-  predicts[last_accepted_retrive_idx] = temp_storage.sampled_id;
+  predicts[last_accepted_retrive_idx] = sampled_id;
   // value at not used indices are undefined
 }
 
-template <typename DType, typename IdType>
+template <typename DType, typename IdType, typename IdType2>
 cudaError_t TreeSpeculativeSamplingTargetOnly(
     IdType* predicts,                   // mutable
     IdType* output_token_ids,           // mutable
     IdType* output_accepted_token_num,  // mutable
-    IdType* candidates,
-    IdType* retrive_index,
-    IdType* retrive_next_token,
-    IdType* retrive_next_sibling,
+    IdType2* candidates,
+    IdType2* retrive_index,
+    IdType2* retrive_next_token,
+    IdType2* retrive_next_sibling,
     DType* uniform_samples,
+    DType* uniform_samples_for_final_sampling,
     DType* target_probs,
     DType* draft_probs,
     uint32_t batch_size,
@@ -192,6 +210,7 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
       &retrive_next_token,
       &retrive_next_sibling,
       &uniform_samples,
+      &uniform_samples_for_final_sampling,
       &target_probs,
       &draft_probs,
       &batch_size,
@@ -209,7 +228,8 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
             VEC_SIZE,
             DETERMINISTIC,
             DType,
-            IdType>;
+            IdType,
+            IdType2>;
         FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       })});

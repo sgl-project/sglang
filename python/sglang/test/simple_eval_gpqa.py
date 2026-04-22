@@ -18,7 +18,6 @@ from sglang.test.simple_eval_common import (
     HTML_JINJA,
     Eval,
     EvalResult,
-    MessageList,
     SamplerBase,
     SingleEvalResult,
     format_multichoice_question,
@@ -33,7 +32,10 @@ class GPQAEval(Eval):
         num_threads: int,
         n_repeats: int = 1,
     ):
-        df = pandas.read_csv(filename)
+        if "://" in filename:
+            df = pandas.read_csv(filename, storage_options={"timeout": 30})
+        else:
+            df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         rng = random.Random(0)
         if num_examples:
@@ -71,6 +73,8 @@ class GPQAEval(Eval):
                 )
             ]
             response_text = sampler(prompt_messages)
+            if response_text is None:
+                response_text = ""
             match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
             extracted_answer = match.group(1) if match else None
             score = 1.0 if extracted_answer == correct_answer else 0.0

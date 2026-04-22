@@ -26,6 +26,7 @@ from sglang.lang.ir import (
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
+    SglSeparateReasoning,
     SglVariable,
     SglVarScopeBegin,
     SglVarScopeEnd,
@@ -244,6 +245,30 @@ def cache_program(program, backend):
     prefix = extract_prefix_by_tracing(program, backend)
     if prefix and len(prefix) > 64:
         backend.cache_prefix(prefix)
+
+
+_INCREMENTAL_STREAMING_META_INFO_KEYS = (
+    "output_token_logprobs",
+    "output_top_logprobs",
+    "output_token_ids_logprobs",
+)
+
+
+def _merge_stream_meta_info(
+    pending_meta_info: dict[str, Any] | None,
+    meta_info: dict[str, Any],
+) -> dict[str, Any]:
+    if pending_meta_info is None:
+        return meta_info
+
+    merged_meta_info = dict(meta_info)
+    for key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+        if key not in meta_info and key not in pending_meta_info:
+            continue
+        merged_meta_info[key] = list(pending_meta_info.get(key, [])) + list(
+            meta_info.get(key, [])
+        )
+    return merged_meta_info
 
 
 class StreamExecutor:
@@ -472,6 +497,8 @@ class StreamExecutor:
                 self._execute_concatenate_and_append_kv_cache(other)
             else:
                 self._execute_concatenate_and_append_text(other)
+        elif isinstance(other, SglSeparateReasoning):
+            self._execute_separate_reasoning(other)
         else:
             raise ValueError(f"Unknown type: {type(other)}")
 
@@ -724,8 +751,44 @@ class StreamExecutor:
         src_rids = [state.stream_executor.sid for state in expr.states]
         self.backend.concatenate_and_append(src_rids, self.sid)
 
+    def _execute_separate_reasoning(self, expr: SglSeparateReasoning):
+        if self.stream:
+            # separate reasoning for stream is not supported
+            return
+
+        if (
+            self.cur_role == "assistant"
+            and self.num_api_spec_tokens is not None
+            and self.backend.is_chat_model
+        ):
+            # Execute the stored lazy generation calls
+            self.backend.role_end_generate(self)
+
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        reasoning_parser = ReasoningParser(expr.model_type)
+        other = expr.expr
+        if not other:
+            return
+        elif isinstance(other, SglGen) or isinstance(other, SglSelect):
+            cur_text = self.get_var(other.name)
+            reasoning, normal_text = reasoning_parser.parse_non_stream(cur_text)
+            reasoning_name = expr.process_name_for_reasoning(other.name)
+            self.set_var(other.name, normal_text)
+            self.set_var(reasoning_name, reasoning)
+            # the variable is ready to be used
+            self.variable_event[reasoning_name].set()
+            self.text_ = self.text_[: self.cur_role_begin_pos] + normal_text
+        elif isinstance(other, SglExprList):
+            for x in other.expr_list:
+                self._execute_separate_reasoning(
+                    SglSeparateReasoning(expr.model_type, x)
+                )
+
     def _init_var_event(self, expr):
-        if isinstance(expr, (SglGen, SglSelect, SglVarScopeBegin)):
+        if isinstance(
+            expr, (SglGen, SglSelect, SglVarScopeBegin, SglSeparateReasoning)
+        ):
             self.variable_event[expr.name] = threading.Event()
             if self.stream:
                 self.stream_var_event[expr.name] = threading.Event()
@@ -753,6 +816,7 @@ class StreamExecutor:
             "n",
             "stop",
             "stop_token_ids",
+            "stop_regex",
             "temperature",
             "top_p",
             "top_k",
@@ -909,6 +973,7 @@ class ProgramState:
                         break
             else:
                 event = None
+                pending_meta_info = None
                 while not event:
                     if var_name in self.stream_executor.stream_var_event:
                         event = self.stream_executor.stream_var_event[var_name]
@@ -920,12 +985,24 @@ class ProgramState:
                     await loop.run_in_executor(None, event.wait)
                     event.clear()
                     out = str(self.stream_executor.variables[var_name][prev:])
+                    meta_info = self.stream_executor.meta_info.get(var_name)
                     prev += len(out)
                     if out:
                         if return_meta_data:
-                            yield out, self.stream_executor.meta_info[var_name]
+                            assert meta_info is not None
+                            merged_meta_info = _merge_stream_meta_info(
+                                pending_meta_info,
+                                meta_info,
+                            )
+                            pending_meta_info = None
+                            yield out, merged_meta_info
                         else:
                             yield out
+                    elif return_meta_data and meta_info is not None:
+                        pending_meta_info = _merge_stream_meta_info(
+                            pending_meta_info,
+                            meta_info,
+                        )
                     if self.stream_executor.variable_event[var_name].is_set():
                         break
         else:

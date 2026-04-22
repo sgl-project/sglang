@@ -6,7 +6,6 @@ python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-
 python3 llava_onevision_server.py
 """
 
-import base64
 import io
 import os
 import sys
@@ -14,12 +13,14 @@ import time
 
 import numpy as np
 import openai
+import pybase64
 import requests
-from decord import VideoReader, cpu
 from PIL import Image
 
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
 # pip install httpx==0.23.3
-# pip install decord
+# pip install torchcodec
 # pip install protobuf==3.20.0
 
 
@@ -98,7 +99,7 @@ def multi_image_stream_request_test(client):
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+                            "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
                         },
                         "modalities": "multi-images",
                     },
@@ -200,20 +201,20 @@ def video_speed_test(client, video_path):
 
 def prepare_video_messages(video_path):
     max_frames_num = 32
-    vr = VideoReader(video_path, ctx=cpu(0))
-    total_frame_num = len(vr)
+    decoder = VideoDecoderWrapper(video_path)
+    total_frame_num = len(decoder)
     uniform_sampled_frames = np.linspace(
         0, total_frame_num - 1, max_frames_num, dtype=int
     )
     frame_idx = uniform_sampled_frames.tolist()
-    frames = vr.get_batch(frame_idx).asnumpy()
+    frames = decoder.get_frames_at(frame_idx)
 
     base64_frames = []
     for frame in frames:
         pil_img = Image.fromarray(frame)
         buff = io.BytesIO()
         pil_img.save(buff, format="JPEG")
-        base64_str = base64.b64encode(buff.getvalue()).decode("utf-8")
+        base64_str = pybase64.b64encode(buff.getvalue()).decode("utf-8")
         base64_frames.append(base64_str)
 
     messages = [{"role": "user", "content": []}]

@@ -6,7 +6,8 @@ import triton
 from torch.nn import functional as F
 from transformers import AutoConfig
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+from sglang.benchmark.bench_utils import run_bench
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe as fused_moe_triton,
 )
 from sglang.srt.model_executor.cuda_graph_runner import set_torch_compile_config
@@ -37,10 +38,14 @@ def get_model_config(model_name: str, tp_size: int):
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-
         E = config.n_routed_experts
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // tp_size
+    elif config.architectures[0] == "Llama4ForConditionalGeneration":
+        E = config.text_config.num_local_experts
+        topk = config.text_config.num_experts_per_tok
+        intermediate_size = config.text_config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
@@ -254,8 +259,8 @@ def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
         )
     torch.cuda.synchronize()
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(
         lambda: api_func(
             x,
             w1,

@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
@@ -27,32 +28,52 @@ def _gate_up_lora_b_kernel(
     seg_indptr,
     weight_indices,
     lora_ranks,
+    sorted_token_ids,
     # Meta parameters
+    SORTED_BY_ADAPTER: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    # For fused output scaling and adding
-    fuse_scaling_add,
+    # For fused output scaling
     scalings,
 ):
-    # This kernel packs 2 sgemms (gate/up) into a single kernel.
+    """
+    This kernel packs 2 sgemms (gate/up) into a single kernel. The multiplication
+    results are accumulated into the output tensor.
 
-    # x: (s, 2 * K), s is the sum of sequence lengths, K equals to lora rank
-    # weights: (num_lora, 2 * output_dim, K)
-    # output: (s, 2 * output_dim)
+    When a sequence's rank is 0, the kernel is essentially a no-op, following
+    the convention in pytorch where the product of two matrices of shape (m, 0)
+    and (0, n) is an all-zero matrix of shape (m, n).
+
+    Args:
+        x (Tensor): The input tensor, which is the result of the LoRA A projection.
+            Shape: (s, 2 * K), where s is the sum of all sequence lengths in the
+            batch and K is the maximum LoRA rank.
+        weights (Tensor): The LoRA B weights for all adapters.
+            Shape: (num_lora, 2 * output_dim, K).
+        output (Tensor): The output tensor where the result is stored.
+            Shape: (s, 2 * output_dim).
+    """
     # output_dim >> K
 
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len.
     # gate_up_id decides which of gate or up (0: gate, 1: up)
     batch_id = tl.program_id(axis=2)
+    w_index = tl.load(weight_indices + batch_id)
+    rank = tl.load(lora_ranks + w_index)
+
+    # If rank is 0, this kernel is a no-op.
+    if rank == 0:
+        return
+
     gate_up_id = tl.program_id(axis=1)
     pid = tl.program_id(axis=0)
     seg_len = tl.load(seg_lens + batch_id)
-    w_index = tl.load(weight_indices + batch_id)
+    if seg_len == 0:
+        return
     seg_start = tl.load(seg_indptr + batch_id)
     n_start = gate_up_id * output_dim  # offset on output dim
-    rank = tl.load(lora_ranks + w_index)
     scaling = tl.load(scalings + w_index)
 
     # Adjust K (rank) according to the specific LoRA adapter
@@ -62,6 +83,8 @@ def _gate_up_lora_b_kernel(
     num_pid_n = tl.cdiv(output_dim, BLOCK_N)
     pid_s = pid // num_pid_n
     pid_n = pid % num_pid_n
+    if pid_s * BLOCK_S >= seg_len:
+        return
 
     # Create pointers for the first block of x and weights
     # The pointers will be advanced as we move in the K direction
@@ -70,8 +93,13 @@ def _gate_up_lora_b_kernel(
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
 
-    x_ptrs = (x + seg_start * x_stride_0 + (gate_up_id * K) * x_stride_1) + (
-        s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
+    s_physical = _resolve_token_positions(
+        sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
+    )
+    x_ptrs = (
+        x
+        + (gate_up_id * K) * x_stride_1
+        + (s_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
     )
     w_ptrs = (weights + w_index * w_stride_0 + n_start * w_stride_1) + (
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
@@ -82,14 +110,13 @@ def _gate_up_lora_b_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len)
-            and (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
             w_ptrs,
             mask=(k_offset[:, None] < K - k * BLOCK_K)
-            and (n_offset[None, :] < output_dim),
+            & (n_offset[None, :] < output_dim),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -100,12 +127,13 @@ def _gate_up_lora_b_kernel(
     # Store result to output matrix
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
-    output_ptr = (output + seg_start * output_stride_0 + n_start * output_stride_1) + (
-        s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
+    output_ptr = (
+        output
+        + n_start * output_stride_1
+        + (s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1)
     )
-    output_mask = (s_offset[:, None] < seg_len) and (n_offset[None, :] < output_dim)
-    if fuse_scaling_add:
-        partial_sum += tl.load(output_ptr, mask=output_mask)
+    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < output_dim)
+    partial_sum += tl.load(output_ptr, mask=output_mask)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
@@ -143,12 +171,11 @@ def gate_up_lora_b_fwd(
     )
 
     if base_output is None:
-        output = torch.empty((s, 2 * output_dim), device=x.device, dtype=x.dtype)
-        fuse_scaling_add = False
+        output = torch.zeros((s, 2 * output_dim), device=x.device, dtype=x.dtype)
     else:
         output = base_output
-        fuse_scaling_add = True
 
+    sorted_by_adapter = batch_info.permutation is not None
     _gate_up_lora_b_kernel[grid_b](
         x,
         gate_up_lora_b,
@@ -166,10 +193,11 @@ def gate_up_lora_b_fwd(
         batch_info.seg_indptr,
         batch_info.weight_indices,
         batch_info.lora_ranks,
+        batch_info.permutation,
+        sorted_by_adapter,
         BLOCK_S,
         BLOCK_OUT,
         BLOCK_R,
-        fuse_scaling_add,
         batch_info.scalings,
     )
 

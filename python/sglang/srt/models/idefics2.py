@@ -26,9 +26,10 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 
 class Idefics2VisionMLP(nn.Module):
@@ -82,7 +83,6 @@ class Idefics2EncoderLayer(nn.Module):
             use_qkv_parallel=True,
             quant_config=quant_config,
             dropout=config.attention_dropout,
-            qkv_backend="sdpa",
             softmax_in_single_precision=True,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
@@ -162,6 +162,9 @@ class Idefics2Encoder(nn.Module):
                 `input_ids` indices into associated vectorsthan the model's
                 internal embedding lookup matrix.
         """
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
@@ -191,7 +194,7 @@ class Idefics2VisionEmbeddings(nn.Module):
         self.embed_dim = config.hidden_size
         self.image_size = config.image_size
         self.patch_size = config.patch_size
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,

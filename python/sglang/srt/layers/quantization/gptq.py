@@ -1,49 +1,80 @@
+from __future__ import annotations
+
 import logging
+from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 
-from sglang.srt.layers.linear import LinearBase, set_weight_attrs
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    npu_fused_experts,
+)
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+from sglang.srt.layers.parameter import (
+    BasevLLMParameter,
+    ChannelQuantScaleParameter,
+    GroupQuantScaleParameter,
+    PackedColumnParameter,
+    PackedvLLMParameter,
+    RowvLLMParameter,
+    permute_param_layout_,
+)
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.utils import replace_parameter
-from sglang.srt.utils import is_cuda
+from sglang.srt.layers.quantization.marlin_utils import (
+    apply_gptq_marlin_linear,
+    check_marlin_supported,
+    check_marlin_supports_shape,
+    marlin_is_k_full,
+    marlin_make_empty_g_idx,
+    marlin_make_workspace,
+    marlin_moe_permute_scales,
+    marlin_permute_scales,
+    marlin_repeat_scales_on_all_ranks,
+    marlin_sort_g_idx,
+    marlin_zero_points,
+    verify_marlin_supported,
+)
+from sglang.srt.layers.quantization.utils import (
+    get_linear_quant_method,
+    get_scalar_types,
+    replace_parameter,
+    unpack_cols,
+)
+from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils.patch_torch import register_fake_if_exists
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 _is_cuda = is_cuda()
 
-try:
-    from vllm import _custom_ops as ops
-    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-    from vllm.model_executor.layers.quantization.gptq_marlin import (
-        FusedMoE,
-        FusedMoEMethodBase,
-        FusedMoeWeightScaleSupported,
-        GPTQMarlinLinearMethod,
-        marlin_moe_permute_scales,
-    )
-    from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        check_marlin_supported,
-    )
-    from vllm.scalar_type import scalar_types
+if _is_cuda:
+    from sgl_kernel import gptq_gemm, gptq_shuffle
 
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
+    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 
-    GPTQLinearMethod = MarlinLinearMethod = Any
+_is_npu = is_npu()
 
-    FusedMoEMethodBase = QuantizeMethodBase
-
-    class scalar_types:
-        uint4b8 = "uint4b8"
-        uint8b128 = "uint8b128"
-
+if _is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
+ScalarType, scalar_types = get_scalar_types()
 
 
 def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
@@ -52,6 +83,36 @@ def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
     return hf_quant_cfg.get("checkpoint_format") == "marlin" or hf_quant_cfg.get(
         "is_marlin_format", False
     )
+
+
+def gptq_marlin_moe_repack(
+    b_q_weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> torch.Tensor:
+    num_experts = b_q_weight.shape[0]
+    assert size_k % 16 == 0
+    output = torch.empty(
+        (num_experts, size_k // 16, size_n * (num_bits // 2)),
+        device=b_q_weight.device,
+        dtype=b_q_weight.dtype,
+    )
+    for e in range(num_experts):
+        output[e] = gptq_marlin_repack(b_q_weight[e], perm[e], size_k, size_n, num_bits)
+    return output
+
+
+@dataclass
+class MarlinLinearLayerConfig:
+    full_weight_shape: tuple[int, int]  # [in, out]
+    partition_weight_shape: tuple[int, int]
+    weight_type: ScalarType
+    act_type: torch.dtype
+    group_size: int
+    zero_points: bool
+    has_g_idx: bool
 
 
 class GPTQConfig(QuantizationConfig):
@@ -67,6 +128,7 @@ class GPTQConfig(QuantizationConfig):
         desc_act: bool,
         lm_head_quantized: bool,
         dynamic: Dict[str, Dict[str, Union[int, bool]]],
+        checkpoint_format: str = "",
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
@@ -99,6 +161,10 @@ class GPTQConfig(QuantizationConfig):
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
         self.pack_factor = Fraction(32, self.weight_bits)
+        # GPTQ v1 and v2 format deals with zero points differently.
+        # Currently GPTQModel stores v1 format checkpoints by default,
+        # but provides the option to set `format="gptq_v2"` in `QuantizeConfig`.
+        self.checkpoint_format = checkpoint_format
         if self.weight_bits not in [2, 3, 4, 8]:
             raise ValueError(
                 "Currently, only 2/3/4/8-bit weight quantization is "
@@ -111,7 +177,8 @@ class GPTQConfig(QuantizationConfig):
             f"group_size={self.group_size}, "
             f"desc_act={self.desc_act}),"
             f"lm_head_quantized={self.lm_head_quantized}), "
-            f"dynamic={self.dynamic}"
+            f"dynamic={self.dynamic},"
+            f"checkpoint_format={self.checkpoint_format})"
         )
 
     def get_scaled_act_names(self) -> List[str]:
@@ -127,19 +194,24 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half]
+        return [torch.half] if not _is_npu else [torch.half, torch.bfloat16]
 
     @classmethod
     # Need to figure it out
     def get_min_capability(cls) -> int:
-        return 60
+        if _is_npu:
+            raise NotImplementedError(
+                'NPU hardware does not support "get_min_capability" feature.'
+            )
+        else:
+            return 60
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GPTQConfig":
+    def from_config(cls, config: Dict[str, Any]) -> GPTQConfig:
         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
         dynamic = {} if dynamic is None else dynamic
 
@@ -147,15 +219,38 @@ class GPTQConfig(QuantizationConfig):
         group_size = cls.get_from_keys(config, ["group_size"])
         desc_act = cls.get_from_keys(config, ["desc_act"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
-        return cls(weight_bits, group_size, desc_act, lm_head_quantized, dynamic)
+        checkpoint_format = cls.get_from_keys_or(
+            config, ["checkpoint_format"], default=""
+        )
+        return cls(
+            weight_bits,
+            group_size,
+            desc_act,
+            lm_head_quantized,
+            dynamic,
+            checkpoint_format,
+        )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[GPTQLinearMethod]:
+    ) -> Optional[LinearMethodBase]:
         # Delay the import to avoid circular dependency
-        from sglang.srt.layers.quantization import get_linear_quant_method
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
+        if _is_npu:
+            if isinstance(layer, FusedMoE):
+                return GPTQMoEAscendMethod(self)
+            if isinstance(layer, LinearBase):
+                return GPTQLinearAscendMethod(self)
+            return None
+
+        if isinstance(layer, FusedMoE):
+            raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
+        else:
+            return get_linear_quant_method(
+                self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+            )
 
 
 class GPTQMarlinConfig(QuantizationConfig):
@@ -258,7 +353,7 @@ class GPTQMarlinConfig(QuantizationConfig):
         return ["quantize_config.json"]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "GPTQMarlinConfig":
+    def from_config(cls, config: Dict[str, Any]) -> GPTQMarlinConfig:
         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
         dynamic = {} if dynamic is None else dynamic
 
@@ -309,18 +404,9 @@ class GPTQMarlinConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.layers.quantization import get_linear_quant_method
 
         if isinstance(layer, FusedMoE):
             return GPTQMarlinMoEMethod(self)
-            # TODO: re-enable after SGLang syncs with vllm >= 0.7.3
-            # if layer.num_experts > 32:
-            #     # For MoEs with many experts the moe_wna16 kernel is faster
-            #     return MoeWNA16Config.from_config(self.full_config).get_quant_method(
-            #         layer, prefix
-            #     )
-            # else:
-            #     return GPTQMarlinMoEMethod(self)
         return get_linear_quant_method(self, layer, prefix, GPTQMarlinLinearMethod)
 
     @classmethod
@@ -349,103 +435,857 @@ class GPTQMarlinConfig(QuantizationConfig):
         )
 
 
-class MarlinConfig(QuantizationConfig):
-    """Config class for Marlin.
+class GPTQLinearMethod(LinearMethodBase):
+    """Linear method for GPTQ.
 
-    Reference: https://github.com/IST-DASLab/marlin/tree/master
+    Args:
+        quant_config: The GPTQ quantization config.
     """
 
-    def __init__(
+    def __init__(self, quant_config: GPTQConfig):
+        self.quant_config = quant_config
+        # GPTQ v1 and v2 format deals with zero points differently
+        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
+
+    def create_weights(
         self,
-        group_size: int,
-        lm_head_quantized: bool,
-    ) -> None:
-        # Group size for the quantization.
-        self.group_size = group_size
-        self.lm_head_quantized = lm_head_quantized
-        if self.group_size != 128 and self.group_size != -1:
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        del output_size  # Unused.
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        if input_size_per_partition % self.quant_config.group_size != 0:
             raise ValueError(
-                "Currently, only group size 128 and -1 (channelwise) "
-                "is supported for Marlin, but got group_size of "
-                f"{self.group_size}"
+                "The input size is not aligned with the quantized "
+                "weight shape. This can be caused by too large "
+                "tensor parallel size."
+            )
+        output_size_per_partition = sum(output_partition_sizes)
+        if output_size_per_partition % self.quant_config.pack_factor.numerator != 0:
+            raise ValueError(
+                "The output size is not aligned with the quantized "
+                "weight shape. This can be caused by too large "
+                "tensor parallel size."
             )
 
-        # 4 Bits packed into 32 bit datatype.
-        self.pack_factor = 32 // 4
+        if self.quant_config.group_size != -1:
+            group_size = self.quant_config.group_size
+        else:
+            group_size = input_size
 
-        # Tile size used by marlin kernels.
-        self.tile_size = 16
-
-        # Min out_features dim
-        self.min_n_threads = 64
-
-        # Min in_features dim
-        self.min_k_threads = 128
-
-        # Max parallel problems to solve at once (improves large
-        # batch performance)
-        self.max_parallel = 16
-
-        # Permutation length used by the marlin kernels.
-        self.perm_len = 1024
-
-    def __repr__(self) -> str:
-        return (
-            f"MarlinConfig(group_size={self.group_size}, "
-            f"lm_head_quantized={self.lm_head_quantized})"
-        )
-
-    @classmethod
-    def get_name(cls) -> str:
-        return "marlin"
-
-    @classmethod
-    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return [torch.half]
-
-    @classmethod
-    # Need to figure it out
-    def get_min_capability(cls) -> int:
-        return 80
-
-    @classmethod
-    def get_config_filenames(cls) -> List[str]:
-        return ["quantize_config.json"]
-
-    @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "MarlinConfig":
-        group_size = cls.get_from_keys(config, ["group_size"])
-        lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
-        return cls(group_size, lm_head_quantized)
-
-    @classmethod
-    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
-        is_marlin_format = check_marlin_format(hf_quant_cfg)
-
-        is_valid_user_quant = (
-            user_quant is None or user_quant == "gptq" or user_quant == "marlin"
-        )
-
-        if is_marlin_format and is_valid_user_quant:
-            msg = "The model is serialized in {} format. Using {} kernel.".format(
-                cls.get_name(), cls.get_name()
-            )
-            logger.info(msg)
-            return cls.get_name()
-
-        return None
-
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[MarlinLinearMethod]:
-        # Delay the import to avoid circular dependency
-        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-
-        if isinstance(layer, LinearBase) or (
-            isinstance(layer, ParallelLMHead) and self.lm_head_quantized
+        self.use_shuffle = True
+        scale_and_zero_size = input_size // group_size
+        scale_and_zero_input_dim = None
+        if (
+            input_size != input_size_per_partition
+            and self.quant_config.group_size != -1
         ):
-            return MarlinLinearMethod(self)
-        return None
+            if self.quant_config.desc_act:
+                self.use_shuffle = False
+            else:
+                # we need to partition qzeros and scales for exllama kernel
+                scale_and_zero_size = input_size_per_partition // group_size
+                scale_and_zero_input_dim = 0
+
+        qweight = PackedvLLMParameter(
+            data=torch.empty(
+                input_size_per_partition // self.quant_config.pack_factor,
+                output_size_per_partition,
+                dtype=torch.int32,
+            ),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=0,
+            packed_factor=self.quant_config.pack_factor,
+            weight_loader=weight_loader,
+        )
+
+        g_idx = RowvLLMParameter(
+            data=torch.tensor(
+                [
+                    i // self.quant_config.group_size
+                    for i in range(input_size_per_partition)
+                ],
+                dtype=torch.int32,
+            ),
+            input_dim=0,
+            weight_loader=weight_loader,
+        )
+        qzeros_args = {
+            "data": torch.empty(
+                scale_and_zero_size,
+                output_size_per_partition // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            "weight_loader": weight_loader,
+        }
+        weight_scale_args = {
+            "data": torch.empty(
+                scale_and_zero_size,
+                output_size_per_partition,
+                dtype=params_dtype,
+            ),
+            "weight_loader": weight_loader,
+        }
+        if scale_and_zero_input_dim is None:
+            scales = ChannelQuantScaleParameter(output_dim=1, **weight_scale_args)
+            qzeros = PackedColumnParameter(
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args,
+            )
+
+        else:
+            scales = GroupQuantScaleParameter(
+                output_dim=1, input_dim=0, **weight_scale_args
+            )
+            qzeros = PackedvLLMParameter(
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args,
+            )
+
+        layer.register_parameter("qweight", qweight)
+        layer.register_parameter("g_idx", g_idx)
+        layer.register_parameter("qzeros", qzeros)
+        layer.register_parameter("scales", scales)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # for torch.compile
+        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+        layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
+        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+
+        # exllama needs to shuffle the weight after the weight is loaded
+        # here we do the shuffle on first forward pass
+        if self.use_shuffle:
+            if self.quant_config.desc_act:
+                layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
+            else:
+                layer.g_idx.data = torch.empty(
+                    (0,), dtype=torch.int, device=layer.g_idx.device
+                )
+            gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+        reshaped_x = x.reshape(-1, x.shape[-1])
+
+        output = gptq_gemm(
+            reshaped_x,
+            layer.qweight,
+            layer.qzeros,
+            layer.scales,
+            layer.g_idx,
+            self.use_shuffle,
+            self.quant_config.weight_bits,
+        )
+        if bias is not None:
+            output.add_(bias)
+        return output.reshape(out_shape)
+
+
+class GPTQMoEAscendMethod(FusedMoEMethodBase):
+
+    def __init__(self, quant_config: GPTQConfig):
+        super().__init__()
+        self.quant_config = quant_config
+        self.use_v2_format = quant_config.checkpoint_format == "gptq_v2"
+        self.moe_runner_config: Optional[MoeRunnerConfig] = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        pack_factor = self.quant_config.pack_factor
+
+        num_groups_w13 = hidden_size // self.quant_config.group_size
+        num_groups_w2 = intermediate_size_per_partition // self.quant_config.group_size
+
+        extra_weight_attrs.update(
+            {
+                "is_transposed": True,
+                "quant_method": FusedMoeWeightScaleSupported.GROUP.value,
+            }
+        )
+
+        w13_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size // pack_factor,
+                2 * intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qweight", w13_qweight)
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+
+        w2_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition // pack_factor,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qweight", w2_qweight)
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+
+        w13_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w13,
+                2 * intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scales", w13_scales)
+        set_weight_attrs(w13_scales, extra_weight_attrs)
+
+        w2_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w2,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scales", w2_scales)
+        set_weight_attrs(w2_scales, extra_weight_attrs)
+
+        w13_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w13,
+                2 * intermediate_size_per_partition // pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qzeros", w13_qzeros)
+        set_weight_attrs(w13_qzeros, extra_weight_attrs)
+
+        w2_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w2,
+                hidden_size // pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qzeros", w2_qzeros)
+        set_weight_attrs(w2_qzeros, extra_weight_attrs)
+
+    def create_moe_runner(
+        self,
+        layer: torch.nn.Module,
+        moe_runner_config: MoeRunnerConfig,
+        **extra_weight_attrs,
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
+            -1, layer.w13_qzeros.shape[-1]
+        )
+        layer.w13_qzeros = torch.nn.Parameter(
+            unpack_from_int32(
+                w13_qzeros_2d,
+                self.quant_config.weight_bits,
+                packed_dim=1,
+            )
+            .reshape(layer.w13_qzeros.shape[0], layer.w13_qzeros.shape[1], -1)
+            .to(layer.w13_scales.dtype),
+            requires_grad=False,
+        )
+        if not self.use_v2_format:
+            layer.w13_qzeros += 1
+
+        w2_qzeros_2d = layer.w2_qzeros.data.contiguous().reshape(
+            -1, layer.w2_qzeros.shape[-1]
+        )
+        layer.w2_qzeros = torch.nn.Parameter(
+            unpack_from_int32(
+                w2_qzeros_2d,
+                self.quant_config.weight_bits,
+                packed_dim=1,
+            )
+            .reshape(layer.w2_qzeros.shape[0], layer.w2_qzeros.shape[1], -1)
+            .to(layer.w2_scales.dtype),
+            requires_grad=False,
+        )
+        if not self.use_v2_format:
+            layer.w2_qzeros += 1
+
+        w13_qweight_2d = (
+            layer.w13_qweight.data.transpose(-1, -2)
+            .contiguous()
+            .reshape(-1, layer.w13_qweight.shape[-2])
+        )
+        w13_qweight_tmp = unpack_from_int32(
+            w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1
+        )
+
+        if self.quant_config.weight_bits == 4:
+            group_size = self.quant_config.group_size
+            scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)
+
+            neg_mask = scale_expanded < 0
+
+            if neg_mask.any():
+                neg_mask = neg_mask.transpose(-1, -2)
+                neg_mask = neg_mask.contiguous().reshape(w13_qweight_tmp.shape)
+                w13_qweight_tmp[neg_mask] = -w13_qweight_tmp[neg_mask]
+
+                if w13_qweight_tmp.max() > 7:
+                    w13_qweight_tmp.clamp_(max=7)
+
+                layer.w13_scales.data.abs_()
+
+            layer.w13_qweight = torch.nn.Parameter(
+                torch_npu.npu_convert_weight_to_int4pack(
+                    w13_qweight_tmp.reshape(
+                        layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
+                    )
+                    .transpose(-1, -2)
+                    .contiguous()
+                    .reshape(-1, layer.w13_qweight.shape[2])
+                    .to(torch.int32)
+                )
+                .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
+                .contiguous(),
+                requires_grad=False,
+            )
+        # use int8 to store weight by default
+        else:
+            layer.w13_qweight = torch.nn.Parameter(
+                w13_qweight_tmp.reshape(
+                    layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
+                )
+                .transpose(-1, -2)
+                .contiguous(),
+                requires_grad=False,
+            )
+
+        w2_qweight_2d = (
+            layer.w2_qweight.data.transpose(-1, -2)
+            .contiguous()
+            .reshape(-1, layer.w2_qweight.shape[-2])
+        )
+        w2_qweight_tmp = unpack_from_int32(
+            w2_qweight_2d, self.quant_config.weight_bits, packed_dim=1
+        )
+
+        if self.quant_config.weight_bits == 4:
+            group_size = self.quant_config.group_size
+            scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
+
+            neg_mask = scale_expanded < 0
+
+            if neg_mask.any():
+                neg_mask = neg_mask.transpose(-1, -2)
+                neg_mask = neg_mask.contiguous().reshape(w2_qweight_tmp.shape)
+                w2_qweight_tmp[neg_mask] = -w2_qweight_tmp[neg_mask]
+
+                if w2_qweight_tmp.max() > 7:
+                    w2_qweight_tmp.clamp_(max=7)
+
+                layer.w2_scales.data.abs_()
+
+            layer.w2_qweight = torch.nn.Parameter(
+                torch_npu.npu_convert_weight_to_int4pack(
+                    w2_qweight_tmp.reshape(
+                        layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
+                    )
+                    .transpose(-1, -2)
+                    .contiguous()
+                    .reshape(-1, layer.w2_qweight.shape[2])
+                    .to(torch.int32)
+                )
+                .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
+                .contiguous(),
+                requires_grad=False,
+            )
+        # use int8 to store weight by default
+        else:
+            layer.w2_qweight = torch.nn.Parameter(
+                w2_qweight_tmp.reshape(
+                    layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
+                )
+                .transpose(-1, -2)
+                .contiguous(),
+                requires_grad=False,
+            )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config is not None
+        ), "moe_runner_config is not set. Did you forget to call create_weights/create_moe_runner?"
+
+        assert self.moe_runner_config.activation in ("silu", "swiglu"), (
+            f"Only SiLU/Swiglu activation is supported, "
+            f"got {self.moe_runner_config.activation!r}."
+        )
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+
+        output = npu_fused_experts(
+            hidden_states=x,
+            w13=layer.w13_qweight,
+            w13_scale=layer.w13_scales,
+            w13_offset=layer.w13_qzeros,
+            w2=layer.w2_qweight,
+            w2_scale=layer.w2_scales,
+            w2_offset=layer.w2_qzeros,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+            use_wna16=True,
+        )
+
+        return StandardCombineInput(hidden_states=output)
+
+
+class GPTQMarlinLinearMethod(LinearMethodBase):
+    """Linear method for GPTQ Marlin.
+
+    Args:
+        quant_config: The GPTQ Marlin quantization config.
+    """
+
+    _kernel_backends_being_used: set[str] = set()
+
+    def __init__(self, quant_config: GPTQMarlinConfig) -> None:
+        self.quant_config = quant_config
+
+        # Verify supported on platform.
+        verify_marlin_supported(
+            quant_type=self.quant_config.quant_type,
+            group_size=self.quant_config.group_size,
+        )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        output_size_per_partition = sum(output_partition_sizes)
+        is_row_parallel = input_size != input_size_per_partition
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        self.kernel_config = MarlinLinearLayerConfig(
+            full_weight_shape=(input_size, output_size),
+            partition_weight_shape=(
+                input_size_per_partition,
+                output_size_per_partition,
+            ),
+            weight_type=self.quant_config.quant_type,
+            act_type=params_dtype,
+            group_size=self.quant_config.group_size,
+            zero_points=False,
+            has_g_idx=self.quant_config.desc_act,
+        )
+        # Normalize group_size
+        if self.quant_config.group_size != -1:
+            group_size = self.quant_config.group_size
+        else:
+            group_size = input_size
+
+        # Determine sharding
+        if marlin_repeat_scales_on_all_ranks(
+            self.quant_config.desc_act, self.quant_config.group_size, is_row_parallel
+        ):
+            # By setting scale_dim == None, weight_loader will
+            # repeat the scales on each GPU in TP>1 case.
+            scales_and_zp_input_dim = None
+            scales_and_zp_size = input_size // group_size
+        else:
+            # By setting scale_dim == 0, weight_loader will
+            # shard the scales in TP>1 case.
+            scales_and_zp_input_dim = 0
+            scales_and_zp_size = input_size_per_partition // group_size
+
+        # Quantized weights
+        qweight = PackedvLLMParameter(
+            data=torch.empty(
+                input_size_per_partition // self.quant_config.pack_factor,
+                output_size_per_partition,
+                dtype=torch.int32,
+            ),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=0,
+            packed_factor=self.quant_config.pack_factor,
+            weight_loader=weight_loader,
+        )
+
+        # Activation order
+        g_idx = RowvLLMParameter(
+            data=torch.empty(
+                input_size_per_partition,
+                dtype=torch.int32,
+            ),
+            input_dim=0,
+            weight_loader=weight_loader,
+        )
+
+        qzeros_args = {
+            "data": torch.empty(
+                scales_and_zp_size,
+                output_size_per_partition // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            "weight_loader": weight_loader,
+        }
+        weight_scale_args = {
+            "data": torch.empty(
+                scales_and_zp_size,
+                output_size_per_partition,
+                dtype=params_dtype,
+            ),
+            "weight_loader": weight_loader,
+        }
+
+        if scales_and_zp_input_dim is None:
+            scales = ChannelQuantScaleParameter(output_dim=1, **weight_scale_args)
+            qzeros = PackedColumnParameter(
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args,
+            )
+
+        else:
+            scales = GroupQuantScaleParameter(
+                output_dim=1, input_dim=0, **weight_scale_args
+            )
+            qzeros = PackedvLLMParameter(
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args,
+            )
+
+        layer.register_parameter("qweight", qweight)
+        layer.register_parameter("g_idx", g_idx)
+        layer.register_parameter("scales", scales)
+        layer.register_parameter("qzeros", qzeros)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        device = getattr(layer, "qweight").device
+        c = self.kernel_config
+
+        check_marlin_supports_shape(
+            c.partition_weight_shape[1],  # out_features
+            c.partition_weight_shape[0],  # in_features
+            c.full_weight_shape[0],  # in_features
+            c.group_size,
+        )
+
+        row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
+        self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
+
+        # Allocate marlin workspace.
+        self.workspace = marlin_make_workspace(device)
+
+        # Default names since marlin requires empty parameters for these,
+        # TODO: remove this requirement from marlin (allow optional tensors)
+        self.w_q_name = "qweight"
+        self.w_s_name = "scales"
+        self.w_zp_name = "qzeros"
+        self.w_gidx_name = "g_idx"
+
+        def _transform_param(
+            layer: torch.nn.Module, name: Optional[str], fn: Callable
+        ) -> None:
+            if name is not None and getattr(layer, name, None) is not None:
+
+                old_param = getattr(layer, name)
+                new_param = fn(old_param)
+                # replace the parameter with torch.nn.Parameter for TorchDynamo
+                # compatibility
+                replace_parameter(
+                    layer, name, torch.nn.Parameter(new_param.data, requires_grad=False)
+                )
+
+        def transform_w_q(x):
+            assert isinstance(x, BasevLLMParameter)
+            permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
+            x.data = gptq_marlin_repack(
+                x.data.contiguous(),
+                perm=layer.g_idx_sort_indices,
+                size_k=c.partition_weight_shape[0],
+                size_n=c.partition_weight_shape[1],
+                num_bits=c.weight_type.size_bits,
+            )
+            return x
+
+        def transform_w_s(x):
+            assert isinstance(x, BasevLLMParameter)
+            permute_param_layout_(x, input_dim=0, output_dim=1)
+            x.data = marlin_permute_scales(
+                x.data.contiguous(),
+                size_k=c.partition_weight_shape[0],
+                size_n=c.partition_weight_shape[1],
+                group_size=c.group_size,
+            )
+            return x
+
+        if c.has_g_idx:
+            g_idx, g_idx_sort_indices = marlin_sort_g_idx(
+                getattr(layer, self.w_gidx_name)
+            )
+            _transform_param(layer, self.w_gidx_name, lambda _: g_idx)
+            layer.g_idx_sort_indices = g_idx_sort_indices
+        else:
+            setattr(layer, self.w_gidx_name, marlin_make_empty_g_idx(device))
+            layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
+
+        if c.zero_points:
+            grouped_k = (
+                c.partition_weight_shape[0] // c.group_size if c.group_size != -1 else 1
+            )
+            _transform_param(
+                layer,
+                self.w_zp_name,
+                lambda x: marlin_zero_points(
+                    unpack_cols(
+                        x.t(),
+                        c.weight_type.size_bits,
+                        grouped_k,
+                        c.partition_weight_shape[1],
+                    ),
+                    size_k=grouped_k,
+                    size_n=c.partition_weight_shape[1],
+                    num_bits=c.weight_type.size_bits,
+                ),
+            )
+        else:
+            setattr(layer, self.w_zp_name, marlin_make_empty_g_idx(device))
+        _transform_param(layer, self.w_q_name, transform_w_q)
+        _transform_param(layer, self.w_s_name, transform_w_s)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        c = self.kernel_config
+
+        def _get_weight_params(
+            layer: torch.nn.Module,
+        ) -> tuple[
+            torch.Tensor,  # w_q
+            torch.Tensor,  # w_s
+            Optional[torch.Tensor],  # w_zp,
+            Optional[torch.Tensor],  # w_gidx
+        ]:
+            return (
+                getattr(layer, self.w_q_name),
+                getattr(layer, self.w_s_name),
+                getattr(layer, self.w_zp_name or "", None),
+                getattr(layer, self.w_gidx_name or "", None),
+            )
+
+        w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
+
+        # `process_weights_after_loading` will ensure w_zp and w_gidx are not
+        #  None for marlin
+        return apply_gptq_marlin_linear(
+            input=x,
+            weight=w_q,
+            weight_scale=w_s,
+            weight_zp=w_zp,  # type: ignore
+            g_idx=w_gidx,  # type: ignore
+            g_idx_sort_indices=layer.g_idx_sort_indices,
+            workspace=self.workspace,
+            wtype=c.weight_type,
+            input_size_per_partition=c.partition_weight_shape[0],
+            output_size_per_partition=c.partition_weight_shape[1],
+            is_k_full=self.is_k_full,
+            bias=bias,
+        )
+
+
+def unpack_from_int32(
+    weight: torch.Tensor,
+    num_bits: int,
+    packed_dim: int = 1,
+) -> torch.Tensor:
+    """
+    Unpacks quantized weights from int32 format back to original bits.
+
+    :param weight: The packed int32 tensor containing quantized weights
+    :param num_bits: The number of bits used for quantization (<= 8)
+    :param packed_dim: Dimension along which weights are packed (0 or 1), defaults to 1
+    :return: Unpacked tensor with int8 dtype after applying offset correction
+    """
+    assert (
+        weight.dtype == torch.int32
+    ), f"Expecting `weight.dtype` is torch.int32 but got {weight.dtype}."
+    assert (
+        num_bits <= 8
+    ), f"Expecting `num_bits` should not be larger than 8 but got {num_bits}."
+
+    pack_factor = 32 // num_bits
+    mask = (1 << num_bits) - 1
+
+    if packed_dim == 1:
+        unpacked_weight = torch.zeros(
+            (weight.shape[0], weight.shape[1] * pack_factor),
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        for i in range(pack_factor):
+            unpacked_weight[:, i::pack_factor] = (weight >> (num_bits * i)) & mask
+    else:
+        unpacked_weight = torch.zeros(
+            (weight.shape[0] * pack_factor, weight.shape[1]),
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        for i in range(pack_factor):
+            unpacked_weight[i::pack_factor, :] = (weight >> (num_bits * i)) & mask
+    offset = pow(2, num_bits) // 2
+    unpacked_weight = (unpacked_weight - offset).to(torch.int8)
+    return unpacked_weight
+
+
+class GPTQLinearAscendMethod(GPTQLinearMethod):
+    """Linear method for GPTQ on Ascend NPU."""
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        set_weight_attrs(layer.qzeros, {"pack_factor": self.quant_config.pack_factor})
+        set_weight_attrs(layer.qweight, {"pack_factor": self.quant_config.pack_factor})
+
+        if self.quant_config.desc_act:
+            raise ValueError(
+                "Currently, desc_act (True) is not supported by GPTQ quantization on npu."
+            )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+
+        layer.qzeros = torch.nn.Parameter(
+            unpack_from_int32(
+                layer.qzeros.data.contiguous(),
+                self.quant_config.weight_bits,
+                packed_dim=1,
+            ).to(layer.scales.dtype),
+            requires_grad=False,
+        )
+        if not self.use_v2_format:
+            layer.qzeros += 1
+
+        qweight_tmp = unpack_from_int32(
+            layer.qweight.data.contiguous(), self.quant_config.weight_bits, packed_dim=0
+        )
+        # use int8 to store weight by default
+        if self.quant_config.weight_bits != 4:
+            layer.qweight = torch.nn.Parameter(
+                qweight_tmp,
+                requires_grad=False,
+            )
+            return
+
+        # for 4bit case we need to pack 4bit weight to int32 to save memory
+        layer.qweight = torch.nn.Parameter(
+            torch_npu.npu_convert_weight_to_int4pack(qweight_tmp.to(torch.int32)),
+            requires_grad=False,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        qweight = layer.qweight
+        scales = layer.scales
+        qzeros = layer.qzeros
+
+        reshaped_x = x.reshape(-1, x.shape[-1])
+
+        if bias is not None and bias.dtype == torch.bfloat16:
+            bias = bias.float()
+
+        # 4bit weight is packed to int32(8 x int4)
+        if self.quant_config.weight_bits == 4:
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * 8,)
+        else:
+            out_shape = x.shape[:-1] + (qweight.shape[-1],)
+
+        out = torch_npu.npu_weight_quant_batchmatmul(
+            reshaped_x,
+            qweight,
+            antiquant_scale=scales,
+            antiquant_offset=qzeros,
+            antiquant_group_size=self.quant_config.group_size,
+            bias=bias,
+        )
+
+        return out.reshape(out_shape)
 
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
@@ -463,19 +1303,18 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        intermediate_size = extra_weight_attrs.pop("intermediate_size")
+        # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import set_weight_attrs
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        self.is_k_full = (not self.quant_config.desc_act) or (
-            intermediate_size_per_partition == intermediate_size
-        )
+        self.is_k_full = (not self.quant_config.desc_act) or layer.moe_tp_size == 1
 
         if self.quant_config.group_size != -1:
             scales_size13 = hidden_size // self.quant_config.group_size
-            w2_scales_size = (
-                intermediate_size
-                if self.quant_config.desc_act
-                else intermediate_size_per_partition
-            )
+            if self.quant_config.desc_act:
+                w2_scales_size = intermediate_size_per_partition
+            else:
+                w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
             scales_size2 = w2_scales_size // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
@@ -640,20 +1479,20 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
         # Repack weights
-        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w13_qweight = gptq_marlin_moe_repack(
             layer.w13_qweight,
             layer.w13_g_idx_sort_indices,
             layer.w13_qweight.shape[1] * self.quant_config.pack_factor,
             layer.w13_qweight.shape[2],
-            self.quant_config.quant_type.size_bits,
+            self.quant_config.weight_bits,
         )
         replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
-        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+        marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_qweight,
             layer.w2_g_idx_sort_indices,
             layer.w2_qweight.shape[1] * self.quant_config.pack_factor,
             layer.w2_qweight.shape[2],
-            self.quant_config.quant_type.size_bits,
+            self.quant_config.weight_bits,
         )
         replace_parameter(layer, "w2_qweight", marlin_w2_qweight)
         # Repack scales
@@ -677,55 +1516,47 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         )
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        assert get_moe_runner_backend().is_auto()
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
-        activation: str = "silu",
-    ) -> torch.Tensor:
-        assert activation == "silu", "Only SiLU activation is supported."
-
-        # The input must currently be float16
-        orig_dtype = x.dtype
-        x = x.half()
-
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        quant_info = MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_qweight,
+            w2_qweight=layer.w2_qweight,
+            w13_scales=layer.w13_scales,
+            w2_scales=layer.w2_scales,
+            w13_g_idx=layer.w13_g_idx,
+            w2_g_idx=layer.w2_g_idx,
+            w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
+            w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
+            weight_bits=self.quant_config.weight_bits,
+            is_k_full=self.is_k_full,
         )
 
-        return torch.ops.vllm.fused_marlin_moe(
-            x,
-            layer.w13_qweight,
-            layer.w2_qweight,
-            layer.w13_scales,
-            layer.w2_scales,
-            router_logits,
-            topk_weights,
-            topk_ids,
-            g_idx1=layer.w13_g_idx,
-            g_idx2=layer.w2_g_idx,
-            sort_indices1=layer.w13_g_idx_sort_indices,
-            sort_indices2=layer.w2_g_idx_sort_indices,
-            num_bits=self.quant_config.quant_type.size_bits,
-            is_k_full=self.is_k_full,
-        ).to(orig_dtype)
+        return self.runner.run(dispatch_output, quant_info)
+
+
+# Register fake implementations for torch.compile support
+if _is_cuda:
+
+    @register_fake_if_exists("sgl_kernel::gptq_gemm")
+    def _(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
+        return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
+
+    @register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
+    def _(b_q_weight, perm, size_k, size_n, num_bits):
+        return b_q_weight.new_empty(
+            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
+        )
+
+    @register_fake_if_exists("sgl_kernel::gptq_shuffle")
+    def _(q_weight, q_perm, bit):
+        return

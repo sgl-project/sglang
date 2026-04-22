@@ -17,6 +17,42 @@ from torch.distributed import TCPStore
 
 logger = logging.getLogger(__name__)
 
+# Global TCPStore that is created during distributed initialization
+# This is the single shared store that all components should use
+_global_tcp_store: Optional[TCPStore] = None
+
+
+def set_global_tcp_store(store: TCPStore) -> None:
+    """Set the global TCPStore instance.
+
+    This should be called during distributed initialization to make
+    the store available to all components that need it.
+    """
+    global _global_tcp_store
+    _global_tcp_store = store
+    logger.info("Global TCPStore has been set")
+
+
+def get_global_tcp_store() -> Optional[TCPStore]:
+    """Get the existing global TCPStore.
+
+    This function provides access to the shared TCPStore instance that was
+    created during distributed initialization. All components (like NIXL buffers)
+    should use this same store for coordination.
+
+    Returns:
+        The global TCPStore instance, or None if not initialized yet.
+    """
+    global _global_tcp_store
+
+    if _global_tcp_store is None:
+        logger.warning(
+            "Global TCPStore not found. Make sure init_distributed_environment "
+            "was called with a tcp:// init method."
+        )
+
+    return _global_tcp_store
+
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
@@ -65,7 +101,7 @@ def get_pp_indices(
 ) -> Tuple[int, int]:
     """Try to evenly distribute layers across partitions.
     If the number of layers is not divisible by the number of partitions,
-    the last partition will have the remaining layers.
+    the last N partitions will have one extra layer, where N = remainder.
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
@@ -83,12 +119,18 @@ def get_pp_indices(
         start_layer = sum(partitions[:pp_rank])
         end_layer = start_layer + partitions[pp_rank]
     else:
-        layers_per_partition = num_hidden_layers // pp_size
-        start_layer = pp_rank * layers_per_partition
-        end_layer = start_layer + layers_per_partition
-
-        if pp_rank == pp_size - 1:
-            end_layer = num_hidden_layers
+        base_layers = num_hidden_layers // pp_size
+        remainder = num_hidden_layers % pp_size
+        # Distribute the extra layers to the last 'remainder' partitions
+        if pp_rank >= pp_size - remainder:
+            partitions_without_extra_layer = pp_size - remainder
+            # This partition gets one extra layer
+            start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
+            end_layer = start_layer + (base_layers + 1)
+        else:
+            # This partition gets only base layers
+            start_layer = pp_rank * base_layers
+            end_layer = start_layer + base_layers
 
     return (start_layer, end_layer)
 

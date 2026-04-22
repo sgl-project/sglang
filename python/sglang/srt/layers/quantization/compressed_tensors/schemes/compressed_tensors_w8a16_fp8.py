@@ -12,41 +12,23 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsLinearScheme,
+)
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
-
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear,
-        prepare_fp8_layer_for_marlin,
-    )
-
-    MARLIN_FP8_AVAILABLE = True
-except ImportError:
-    MARLIN_FP8_AVAILABLE = False
-
-    def apply_fp8_marlin_linear(*args, **kwargs):
-        raise ImportError("vllm is not installed")
-
-    def prepare_fp8_layer_for_marlin(*args, **kwargs):
-        raise ImportError("vllm is not installed")
-
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
 SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
 
 
-class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
+class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
     def __init__(self, strategy: str, is_static_input_scheme: bool):
         self.strategy = strategy
         self.is_static_input_scheme = is_static_input_scheme
-
-        if not MARLIN_FP8_AVAILABLE:
-            raise ImportError(
-                "vllm is not installed. To use CompressedTensorsW8A16Fp8, please install vllm"
-            )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -76,7 +58,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
-        prepare_fp8_layer_for_marlin(layer, strategy="channel")
+        prepare_fp8_layer_for_marlin(layer, size_k_first=True)
 
     def create_weights(
         self,

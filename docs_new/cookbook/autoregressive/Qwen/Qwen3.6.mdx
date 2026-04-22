@@ -1,0 +1,471 @@
+---
+title: Qwen3.6
+metatags:
+    description: "Deploy Qwen3.6 with SGLang - open-weight 35B MoE multimodal model with 3B active parameters, thinking preservation, tool calling, MTP, and long-context support."
+tag: NEW
+---
+
+import { Qwen36Deployment } from '/src/snippets/autoregressive/qwen36-deployment.jsx';
+
+## 1. Model Introduction
+
+[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) is the first open-weight variant of the Qwen3.6 series developed by Alibaba. Built on direct feedback from the community, Qwen3.6 prioritizes stability and real-world utility, delivering substantial upgrades in agentic coding and thinking preservation.
+
+Qwen3.6 features a Gated Delta Networks combined with sparse Mixture-of-Experts architecture (35B total parameters, 3B activated), supporting multimodal inputs (text, image, video) and natively handles context lengths of up to 262,144 tokens, extensible to over 1M tokens.
+
+**Key Features:**
+
+- **Agentic Coding**: Handles frontend workflows and repository-level reasoning with greater fluency and precision
+- **Thinking Preservation**: New option to retain reasoning context from historical messages, streamlining iterative development
+- **Efficient Hybrid Architecture**: Gated Delta Networks + sparse MoE (35B total / 3B active) for high-throughput inference
+- **Hybrid Reasoning**: Thinking mode enabled by default with step-by-step reasoning, can be disabled for direct responses
+- **Tool Calling**: Built-in tool calling support with `qwen3_coder` parser
+- **Multi-Token Prediction (MTP)**: Speculative decoding support for lower latency
+- **Multimodal**: Unified vision-language model supporting text, image, and video inputs
+
+**Available Models:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr>
+      <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>Model</th>
+      <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>Weights</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.6-35B-A3B (BF16)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen3.6-35B-A3B (FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.6-35B-A3B-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)</td>
+    </tr>
+  </tbody>
+</table>
+
+**License:** Apache 2.0
+
+## 2. SGLang Installation
+
+SGLang `>=0.5.10` is required for Qwen3.6. You can install from source or use a Docker image:
+
+```bash Command
+# Install from PyPI
+uv pip install "sglang[all]"
+
+# Or install from source
+uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+
+# Or use Docker (NVIDIA GPUs)
+docker pull lmsysorg/sglang:latest
+```
+
+For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities.
+
+
+<Qwen36Deployment />
+
+### 3.2 Configuration Tips
+
+- Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
+- **Mamba Radix Cache**: Qwen3.6's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-scheduler-strategy`:
+  - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage.
+  - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-scheduler-strategy extra_buffer --page-size 64`. Requires FLA kernel backend (NVIDIA GPUs only). Trades higher mamba state memory for better throughput.
+- The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
+- Context length defaults to 262,144 tokens. If you encounter OOM errors, consider reducing it, but maintain at least 128K to preserve thinking capabilities.
+- **CUDA IPC Transport**: Add `SGLANG_USE_CUDA_IPC_TRANSPORT=1` as an environment variable to use CUDA IPC for transferring multimodal features, significantly improving TTFT (Time To First Token). Note: this consumes additional memory proportional to image size, so you may need to lower `--mem-fraction-static` or `--max-running-requests`.
+- **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200.
+- For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
+- Hardware requirements:
+    - **BF16**: ~35B parameters require ~70GB of GPU memory for weights. TP=1 fits on all supported hardware.
+    - **FP8**: The FP8 quantized model requires ~35GB for weights. TP=1 fits on all supported hardware.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr>
+      <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>Hardware</th>
+      <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>Memory</th>
+      <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>BF16 TP</th>
+      <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>FP8 TP</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H100</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>80GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>H200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>141GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>183GB</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+    </tr>
+  </tbody>
+</table>
+
+
+## 4. Model Invocation
+
+Deploy Qwen3.6-35B-A3B with the following command (H200, all features enabled):
+
+```shell Command
+SGLANG_ENABLE_SPEC_V2=1 sglang serve \
+  --model-path Qwen/Qwen3.6-35B-A3B-FP8 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.8 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+### 4.2 Vision Input
+
+Qwen3.6 supports image and video inputs as a unified vision-language model.
+
+**Image Input Example:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://qianwen-res.oss-accelerate.aliyuncs.com/Qwen3.5/demo/CI_Demo/mathv-1327.jpg"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "Describe this image in detail."
+                }
+            ]
+        }
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+thinking_started = False
+has_thinking = False
+has_answer = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Video Input Example:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "https://qianwen-res.oss-accelerate.aliyuncs.com/Qwen3.5/demo/video/N1cdUjctpG8.mp4"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "Describe what happens in this video."
+                }
+            ]
+        }
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+thinking_started = False
+has_thinking = False
+has_answer = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+### 4.3 Advanced Usage
+
+#### 4.3.1 Reasoning Parser
+
+Qwen3.6 supports Thinking mode **by default**. Enable the reasoning parser during deployment to separate the thinking and content sections. The thinking process is returned via `reasoning_content` in the streaming response.
+
+To disable thinking and use Instruct mode, pass `chat_template_kwargs` at request time:
+
+- **Thinking mode** (default): The model performs step-by-step reasoning before answering. No extra parameters needed.
+- **Instruct mode** (`{"enable_thinking": false}`): The model responds directly without a thinking process.
+
+**Example 1: Thinking Mode (Default)**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    max_tokens=2048,
+    stream=True
+)
+
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Example 2: Instruct Mode (Thinking Off)**
+
+To disable thinking and get a direct response, pass `{"enable_thinking": false}` via `chat_template_kwargs`:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    messages=[
+        {"role": "user", "content": "What is 15% of 240?"}
+    ],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    max_tokens=2048,
+    stream=True
+)
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+#### 4.3.2 Thinking Preservation
+
+Qwen3.6 has been trained to preserve and leverage thinking traces from historical messages. Enable this for agent scenarios where maintaining full reasoning context improves decision consistency:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    messages=[
+        {"role": "user", "content": "Help me plan a web app architecture."}
+    ],
+    extra_body={"chat_template_kwargs": {"preserve_thinking": True}},
+    max_tokens=2048,
+    stream=True
+)
+
+thinking_started = False
+has_thinking = False
+has_answer = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+#### 4.3.3 Tool Calling
+
+Qwen3.6 supports tool calling capabilities. Enable the tool call parser during deployment.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3.6-35B-A3B-FP8",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    stream=True
+)
+
+thinking_started = False
+has_thinking = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                if tool_call.function:
+                    print(f"Tool Call: {tool_call.function.name}")
+                    print(f"   Arguments: {tool_call.function.arguments}")
+
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```

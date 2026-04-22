@@ -18,6 +18,7 @@ KV caching events
 """
 
 import atexit
+import enum
 import logging
 import queue
 import threading
@@ -43,6 +44,7 @@ class EventBatch(
 ):
     ts: float
     events: list[Any]
+    attn_dp_rank: Optional[int] = None
 
 
 class KVCacheEvent(
@@ -55,16 +57,44 @@ class KVCacheEvent(
     """Base class for all KV cache-related events"""
 
 
+class StorageMedium(str, enum.Enum):
+    """Storage tier for KV cache events."""
+
+    GPU = "GPU"  # L1: device HBM
+    CPU = "CPU_PINNED"  # L2: host pinned memory
+    DISK = "DISK"  # L3: SSD / NVMe
+    EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
+
+
+class OffloadedState:
+    """
+    OffloadedState represents the state of a KV cache block offloaded to the hicache.
+
+    - prefill_len (int): The length of the prefill part of the KV cache block.
+    - inc_len (int): The length of the incremental part of the KV cache block.
+    - last_hash (Optional[str]): The hash of the last token in the KV cache block.
+    """
+
+    def __init__(
+        self, prefill_len: int, inc_len: int = 0, last_hash: Optional[str] = None
+    ):
+        self.prefill_len = prefill_len
+        self.inc_len = inc_len
+        self.last_hash = last_hash
+
+
 class BlockStored(KVCacheEvent):
     block_hashes: list[int]
     parent_block_hash: Optional[int]
     token_ids: list[int]
     block_size: int
     lora_id: Optional[int]
+    medium: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    medium: Optional[str] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
@@ -76,7 +106,21 @@ class KVEventBatch(EventBatch):
 
 
 class EventPublisher(ABC):
-    """Lightweight publisher for EventBatch batches."""
+    """
+    Lightweight publisher for EventBatch batches with
+    support for DP attention.
+
+    In DP attention - each rank has its own Scheduler and
+    KV cache instance in order to avoid duplicate events
+    and ensure proper event attribution. In our implementation
+
+    - Each DP rank has its own EventPublisher
+    - Publishers annotate events with the dp rank
+    - This allows consumers to distinguish events from different DP ranks
+    """
+
+    def __init__(self, attn_dp_rank: int = 0):
+        self._attn_dp_rank = attn_dp_rank
 
     @abstractmethod
     def publish(self, events: EventBatch) -> None:
@@ -130,6 +174,7 @@ class ZmqEventPublisher(EventPublisher):
 
     def __init__(
         self,
+        attn_dp_rank: int,
         endpoint: str = "tcp://*:5557",
         replay_endpoint: Optional[str] = None,
         buffer_steps: int = 10_000,
@@ -138,6 +183,7 @@ class ZmqEventPublisher(EventPublisher):
         topic: str = "",
     ) -> None:
         # Storage
+        super().__init__(attn_dp_rank)
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
 
@@ -145,8 +191,11 @@ class ZmqEventPublisher(EventPublisher):
         self._ctx = zmq.Context.instance()
         self._pub: Optional[zmq.Socket] = None
         self._replay: Optional[zmq.Socket] = None
-        self._endpoint = endpoint
-        self._replay_endpoint = replay_endpoint
+        self._dp_rank = attn_dp_rank
+        self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
+        self._replay_endpoint = self.offset_endpoint_port(
+            replay_endpoint, self._dp_rank
+        )
         self._hwm = hwm
         self._socket_setup()
 
@@ -168,6 +217,8 @@ class ZmqEventPublisher(EventPublisher):
     def publish(self, events: EventBatch) -> None:
         if not self._running:
             raise RuntimeError("Publisher is closed")
+        if events.attn_dp_rank is None:
+            events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
 
     def shutdown(self) -> None:
@@ -216,6 +267,9 @@ class ZmqEventPublisher(EventPublisher):
                 or self._endpoint.startswith("ipc://")
                 or self._endpoint.startswith("inproc://")
             ):
+                logger.debug(
+                    f"ZmqEventPublisher socket publisher_endpoint bind to {self._endpoint}"
+                )
                 self._pub.bind(self._endpoint)
             else:
                 self._pub.connect(self._endpoint)
@@ -226,6 +280,9 @@ class ZmqEventPublisher(EventPublisher):
         # 3) works in our non‑blocking poll loop alongside PUB
         if self._replay_endpoint is not None:
             self._replay = self._ctx.socket(zmq.ROUTER)
+            logger.debug(
+                f"ZmqEventPublisher socket replay_endpoint bind to {self._replay_endpoint}"
+            )
             self._replay.bind(self._replay_endpoint)
 
     def _publisher_thread(self) -> None:
@@ -288,6 +345,39 @@ class ZmqEventPublisher(EventPublisher):
         # receiving payload is (-1, b""")
         self._replay.send_multipart((client_id, b"", self.END_SEQ, b""))
 
+    @staticmethod
+    def offset_endpoint_port(
+        endpoint: Optional[str], data_parallel_rank: int
+    ) -> Optional[str]:
+        """Helper function to offset the port in an endpoint by
+            the data parallel rank.
+
+        Args:
+            endpoint: The endpoint string
+                (e.g., "tcp://*:5557" or "inproc://cache")
+            data_parallel_rank: The data parallel rank to offset by
+
+        Returns:
+            The endpoint with the port offset by data_parallel_rank
+                or suffix appended
+        """
+        # Do nothing if input is None or data_parallel_rank is 0
+        if not endpoint or data_parallel_rank == 0:
+            return endpoint
+
+        if "inproc" in endpoint:
+            return f"{endpoint}_dp{data_parallel_rank}"
+        if "tcp" in endpoint:
+            if endpoint and ":" in endpoint:
+                # Get everything after the last colon (the port)
+                last_colon_idx = endpoint.rfind(":")
+                base_addr = endpoint[:last_colon_idx]
+                base_port = int(endpoint[last_colon_idx + 1 :])
+                new_port = base_port + data_parallel_rank
+                return f"{base_addr}:{new_port}"
+            return endpoint
+        raise ValueError("Invalid endpoint: must contain 'inproc' or 'tcp'")
+
 
 class KVEventsConfig(BaseModel):
     """Configuration for KV event publishing."""
@@ -342,7 +432,7 @@ class EventPublisherFactory:
         cls._registry[name] = ctor
 
     @classmethod
-    def create(cls, config: Optional[str]) -> EventPublisher:
+    def create(cls, config: Optional[str], attn_dp_rank: int = 0) -> EventPublisher:
         """Create publisher from a config mapping."""
         if not config:
             return NullEventPublisher()
@@ -354,4 +444,4 @@ class EventPublisherFactory:
             constructor = cls._registry[kind]
         except KeyError as exc:
             raise ValueError(f"Unknown event publisher '{kind}'") from exc
-        return constructor(**config_dict)
+        return constructor(attn_dp_rank=attn_dp_rank, **config_dict)

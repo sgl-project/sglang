@@ -2,27 +2,33 @@ import ast
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import List
 
+from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
-    StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
-from sglang.srt.openai_api.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
 
 class PythonicDetector(BaseFormatDetector):
     """
-    Detector for Llama-3.2 and Llama-4 models with pythonic tool call format.
-    Assumes function call format:
-      [tool1(arg1=val1, arg2=val2), tool2(arg1=val3)]
-    Arguments are Python literals (not JSON).
+    Detector for Llama-4 models with Pythonic tool call format.
+
+    The Pythonic format uses Python function call syntax within square brackets,
+    with arguments as Python literals rather than JSON.
+
+    Format Structure:
+    ```
+    [tool1(arg1=val1, arg2=val2), tool2(arg1=val3)]
+    ```
+
+    Reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct?chat_template=default
     """
 
     def __init__(self):
@@ -75,11 +81,7 @@ class PythonicDetector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
             calls = []
-            tool_indices = {
-                tool.function.name: i
-                for i, tool in enumerate(tools)
-                if tool.function.name
-            }
+            tool_indices = self._get_tool_indices(tools)
             for call_index, call in enumerate(parsed.elts):
                 if not isinstance(call.func, ast.Name):
                     continue
@@ -89,7 +91,9 @@ class PythonicDetector(BaseFormatDetector):
                     logger.warning(
                         f"Model attempted to call undefined function: {function_name}"
                     )
-                    continue
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue  # Skip unknown tools (default legacy behavior)
+
                 arguments = {}
                 for keyword in call.keywords:
                     arguments[keyword.arg] = self._get_parameter_value(keyword.value)
@@ -213,17 +217,8 @@ class PythonicDetector(BaseFormatDetector):
         else:
             raise ValueError("Tool call arguments must be literals")
 
+    def supports_structural_tag(self) -> bool:
+        return False
+
     def structure_info(self) -> _GetInfoFunc:
-        def info(name: str):
-            return StructureInfo(begin=f"[{name}(", end=")]", trigger=f"[{name}(")
-
-        return info
-
-    def build_ebnf(self, tools: List[Tool]) -> Optional[str]:
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token="[",
-            sequence_end_token="]",
-            tool_call_separator=",",
-            function_format="pythonic",
-        )
+        raise NotImplementedError

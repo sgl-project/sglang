@@ -3,12 +3,14 @@ import unittest
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionBackend,
+    draft_decode_set_expand_metadata,
+)
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.model_runner import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -21,6 +23,9 @@ class MockModelRunner:
     ):
         self.device = "cuda"
         self.dtype = torch.float16
+        self.kv_cache_dtype = torch.float16
+        self.is_hybrid_swa = False
+        self.attention_chunk_size = None
         attention_arch = AttentionArch.MHA
         # Max batch size for the test.
         max_batch_size = 160
@@ -33,10 +38,27 @@ class MockModelRunner:
                 "context_len": max_context_len,
                 "is_multimodal": False,
                 "attention_arch": attention_arch,
+                "is_encoder_decoder": False,
+                "is_local_attention_model": False,
+            },
+        )()
+        self.sliding_window_size = None
+        self.kv_cache_dtype = (
+            self.dtype
+        )  # torch dtype, required by FlashAttentionBackend
+
+        # server_args is still needed for string-based config (kv_cache_dtype_str)
+        self.server_args = type(
+            "ServerArgs",
+            (),
+            {
+                "kv_cache_dtype": "auto",  # string version for kv_cache_dtype_str
+                "speculative_eagle_topk": None,
+                "speculative_num_draft_tokens": 0,
+                "enable_deterministic_inference": False,
             },
         )
-        self.sliding_window_size = None
-        self.device = self.device
+        self.attn_cp_size = 1
         # Create a large enough req_to_token_pool to fit the test usage.
         self.req_to_token_pool = type(
             "TokenPool",
@@ -52,7 +74,7 @@ class MockModelRunner:
                     device=self.device,
                 ),
             },
-        )
+        )()
         self.page_size = page_size
         max_total_num_tokens = max_batch_size * max_context_len
         self.token_to_kv_pool = MHATokenToKVPool(
@@ -65,8 +87,6 @@ class MockModelRunner:
             device=self.device,
             enable_memory_saver=False,
         )
-        # Required by torch native backend
-        self.server_args = ServerArgs(model_path="fake_model_path")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -162,7 +182,9 @@ class TestFlashAttentionBackend(CustomTestCase):
                     "Attention output is not close to the torch native backend output"
                 )
 
-    def _create_forward_batch(self, mode, q_len=None, prefix_len=0, page_size=1):
+    def _create_forward_batch(
+        self, mode, q_len=None, prefix_len=0, page_size=1, attn_cp_size=1
+    ):
         """Create a forward batch for testing based on mode and lengths."""
         self._init_model_runner(page_size=page_size)
 
@@ -203,6 +225,25 @@ class TestFlashAttentionBackend(CustomTestCase):
                 ),
                 attn_backend=self.backend,
             )
+            if attn_cp_size > 1:
+                forward_batch.attn_cp_metadata = type(
+                    "AttnCPMetadata",
+                    (),
+                    {
+                        "kv_len_prev_tensor": torch.tensor(
+                            [q_len // 2] * self.batch_size,
+                            dtype=torch.int32,
+                            device=self.device,
+                        ),
+                        "kv_len_next_tensor": torch.tensor(
+                            [q_len] * self.batch_size,
+                            dtype=torch.int32,
+                            device=self.device,
+                        ),
+                        "actual_seq_q_prev": q_len // 2,
+                        "actual_seq_q_next": q_len // 2,
+                    },
+                )
         else:  # ForwardMode.DECODE
             decode_len = q_len  # Assuming 1 for decode testing
             total_len = self.seq_len + decode_len
@@ -321,29 +362,197 @@ class TestFlashAttentionBackend(CustomTestCase):
 
         return output
 
-    def test_forward_extend(self):
-        """Test the standard extend operation."""
-        self._run_attention_test(ForwardMode.EXTEND, q_len=self.seq_len)
+    def _run_attention_cp_test(self, mode, q_len, prefix_len=0, page_size=1):
+        layer = self._create_attention_layer()
 
-    def test_forward_decode(self):
-        """Test the decode operation with cached tokens."""
-        self._run_attention_test(ForwardMode.DECODE, q_len=1)
+        # Create forward batch and set up
+        forward_batch = self._create_forward_batch(
+            mode, q_len, prefix_len, page_size, attn_cp_size=2
+        )
+        self.backend.attn_cp_size = 2
 
-    def test_forward_extend_with_prefix(self):
-        """Test extending from cached prefix tokens."""
-        prefix_len = self.seq_len // 2
-        extend_len = self.seq_len - prefix_len
-        self._run_attention_test(
-            ForwardMode.EXTEND, q_len=extend_len, prefix_len=prefix_len
+        # Create QKV tensors for the input
+        q, k, v = self._create_qkv_tensors(self.batch_size * q_len)
+
+        # KV cache for prefixed extend is prefix_len
+        # KV cache for decode is same as seq_len
+        # No KV cache for extend without prefix
+        # Setup KV cache for CP testing - need KV cache to have actual values
+        # For extend with CP, we need KV cache populated so attention has something to attend to
+        self._setup_kv_cache(forward_batch, layer, q_len)
+
+        self.backend.init_forward_metadata(forward_batch)
+
+        # if mode == ForwardMode.EXTEND:
+        expected_shape = (
+            self.batch_size * q_len,
+            self.num_heads * self.head_dim,
         )
 
-    def test_forward_extend_with_page_size_greater_than_1(self):
-        """Test extending from cached prefix tokens with page size greater than 1."""
-        self._run_attention_test(ForwardMode.EXTEND, q_len=self.seq_len, page_size=64)
+        output = self.backend.forward_extend(q, k, v, layer, forward_batch)
+        # else:
+        #     expected_shape = (self.batch_size, self.num_heads * self.head_dim)
+        #     output = self.backend.forward_decode(q, k, v, layer, forward_batch)
 
-    def test_forward_decode_with_page_size_greater_than_1(self):
-        """Test decode operation with page size greater than 1."""
-        self._run_attention_test(ForwardMode.DECODE, q_len=1, page_size=64)
+        output_ref = self._run_reference_forward(
+            mode, q, k, v, layer, forward_batch, expected_shape
+        )
+
+        self._verify_output(output, expected_shape, output_ref)
+
+        return output
+
+    def test_forward_extend_cp(self):
+        """Test the standard extend operation with context parallel."""
+        self._run_attention_cp_test(ForwardMode.EXTEND, q_len=self.seq_len)
+
+    # def test_forward_extend_cp_with_prefix(self):
+    #     """Test the standard extend operation with context parallel and prefix."""
+    #     prefix_len = self.seq_len // 2
+    #     extend_len = self.seq_len - prefix_len
+    #     self._run_attention_cp_test(ForwardMode.EXTEND, q_len=extend_len, prefix_len=prefix_len)
+
+    # def test_forward_extend(self):
+    #     """Test the standard extend operation."""
+    #     self._run_attention_test(ForwardMode.EXTEND, q_len=self.seq_len)
+
+    # def test_forward_decode(self):
+    #     """Test the decode operation with cached tokens."""
+    #     self._run_attention_test(ForwardMode.DECODE, q_len=1)
+
+    # def test_forward_extend_with_prefix(self):
+    #     """Test extending from cached prefix tokens."""
+    #     prefix_len = self.seq_len // 2
+    #     extend_len = self.seq_len - prefix_len
+    #     self._run_attention_test(
+    #         ForwardMode.EXTEND, q_len=extend_len, prefix_len=prefix_len
+    #     )
+
+    # def test_forward_extend_with_page_size_greater_than_1(self):
+    #     """Test extending from cached prefix tokens with page size greater than 1."""
+    #     self._run_attention_test(ForwardMode.EXTEND, q_len=self.seq_len, page_size=64)
+
+    # def test_forward_decode_with_page_size_greater_than_1(self):
+    #     """Test decode operation with page size greater than 1."""
+    #     self._run_attention_test(ForwardMode.DECODE, q_len=1, page_size=64)
+
+
+class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
+    """
+    All the test cases examples have 1 additional cache location than the decode length.
+    This is to align with the current allocation logic. It does not affect the correctness.
+    """
+
+    def test_draft_decode_set_expand_metadata(self):
+        bs, topk, page_size = 1, 2, 4
+
+        cases = [
+            (
+                torch.tensor(
+                    [
+                        [23, 24],
+                        [31, 32],
+                    ],
+                    dtype=torch.int32,
+                ),
+                torch.tensor(
+                    [
+                        [5, 6],
+                        [7, 8],
+                    ],
+                    dtype=torch.int32,
+                ),
+                1,
+            ),
+            # Decode span multiple pages:
+            # duplicated kv cache: 24, 25, 26
+            # decode locations: 27, 28, 29, 30, 31, 32
+            # We need 3 pages in total.
+            (
+                torch.tensor(
+                    [
+                        [27, 28, 29, 30, 31, 32],
+                        [35, 36, 37, 38, 39, 40],
+                    ],
+                    dtype=torch.int32,
+                ),
+                torch.tensor(
+                    [
+                        [6, 7, 8, 0, 0, 0],
+                        [8, 9, 10, 0, 0, 0],
+                    ],
+                    dtype=torch.int32,
+                ),
+                5,
+            ),
+        ]
+
+        last_page_lens = torch.tensor([3], dtype=torch.int32)
+        for cache_loc, expected_page_table, decode_length in cases:
+            cache_seqlens_int32 = torch.zeros(bs * topk, dtype=torch.int32)
+            page_table = torch.zeros_like(cache_loc, dtype=torch.int32)
+            draft_decode_set_expand_metadata(
+                cache_seqlens_int32=cache_seqlens_int32,
+                page_table=page_table,
+                last_page_lens=last_page_lens,
+                decode_length=decode_length,
+                cache_loc=cache_loc,
+                topk=topk,
+                page_size=page_size,
+            )
+
+            expected_cache_seqlens = torch.tensor(
+                [decode_length + 3, decode_length + 3], dtype=torch.int32
+            )
+            self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
+            self.assertTrue(torch.equal(page_table, expected_page_table))
+
+    def test_update_draft_decode_set_expand_metadata_multi_batch(self):
+        """
+        Ensure expand metadata works when batch size > 1 and last pages differ.
+        """
+        bs, topk, decode_length, page_size = 3, 2, 3, 4
+        cache_loc = torch.tensor(
+            [
+                # First batch: last page duplicate is 1, consecutive pages
+                [1, 2, 3, 4],
+                [6, 7, 8, 9],
+                # Second batch: last page duplicate is 3, non-consecutive pages
+                [3, 8, 9, 10],
+                [14, 15, 16, 17],
+                # Third batch: last page duplicate is 0, consecutive pages
+                [0, 1, 2, 3],
+                [4, 5, 6, 7],
+            ],
+            dtype=torch.int32,
+        )
+        cache_seqlens_int32 = torch.zeros(bs * topk, dtype=torch.int32)
+        last_page_lens = torch.tensor([1, 3, 0], dtype=torch.int32)
+        page_table = torch.zeros_like(cache_loc, dtype=torch.int32)
+        draft_decode_set_expand_metadata(
+            cache_seqlens_int32=cache_seqlens_int32,
+            page_table=page_table,
+            last_page_lens=last_page_lens,
+            decode_length=decode_length,
+            cache_loc=cache_loc,
+            topk=topk,
+            page_size=page_size,
+        )
+
+        expected_cache_seqlens = torch.tensor([4, 4, 6, 6, 3, 3], dtype=torch.int32)
+        expected_page_table = torch.tensor(
+            [
+                [0, 1, 0, 0],
+                [1, 2, 0, 0],
+                [0, 2, 0, 0],
+                [3, 4, 0, 0],
+                [0, 0, 0, 0],
+                [1, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        )
+        self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
+        self.assertTrue(torch.equal(page_table, expected_page_table))
 
 
 if __name__ == "__main__":

@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
 
 class RedisConnector(BaseKVConnector):
 
-    def __init__(self, url: str, device: torch.device = "cpu"):
+    def __init__(self, url: str):
         import redis
 
-        super().__init__(url, device)
+        super().__init__(url)
         parsed_url = urlparse(url)
         self.connection = redis.Redis(host=parsed_url.hostname, port=parsed_url.port)
         self.model_name = parsed_url.path.lstrip("/")
