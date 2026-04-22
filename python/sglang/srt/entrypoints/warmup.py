@@ -85,6 +85,7 @@ async def whisper_autodetect(
                 "temperature": 0,
                 "regex": regex,
                 "skip_special_tokens": False,
+                "spaces_between_special_tokens": False,
                 "_detect_language": True,
             },
             modalities=["audio"],

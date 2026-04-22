@@ -162,6 +162,38 @@ class TestWhisperLangTokenCoverage(CustomTestCase):
             with self.subTest(lang=code):
                 self.assertEqual(normalize_language_to_code(code), code)
 
+    def test_unknown_language_token_id_raises_clean_error(self):
+        # Some Whisper codes (yue, v3-only) aren't in older checkpoints'
+        # vocabs. The explicit-language path must raise a clean ValueError
+        # in that case instead of silently feeding the unk token into the
+        # decoder and producing garbage. Mocks cover both "returns None"
+        # and "returns unk_token_id" tokenizer behaviors.
+        from unittest.mock import Mock
+
+        from sglang.srt.multimodal.processors.whisper import WhisperProcessor
+
+        proc = WhisperProcessor.__new__(WhisperProcessor)
+        # Tokenizer where <|yue|> is not in the vocab → returns unk_id.
+        tok = Mock()
+        tok.convert_tokens_to_ids = Mock(return_value=100)  # arbitrary unk
+        tok.unk_token_id = 100
+        proc._tokenizer = tok
+        with self.assertRaises(ValueError) as ctx:
+            proc._get_language_token_id("yue")
+        self.assertIn("yue", str(ctx.exception))
+
+        # Known code (English) on the same tokenizer still works.
+        tok.convert_tokens_to_ids = Mock(return_value=50259)  # <|en|>
+        self.assertEqual(proc._get_language_token_id("en"), 50259)
+
+        # Some tokenizers return None for unknown tokens instead of unk_id.
+        tok2 = Mock()
+        tok2.convert_tokens_to_ids = Mock(return_value=None)
+        tok2.unk_token_id = 100
+        proc._tokenizer = tok2
+        with self.assertRaises(ValueError):
+            proc._get_language_token_id("yue")
+
 
 class TestWhisperStripSpecialTokens(CustomTestCase):
     """Fallback scrub used when parse_fused_output defers."""
@@ -230,6 +262,17 @@ class TestWhisperBuildFusedAutodetectParams(CustomTestCase):
         params = WhisperAdapter().build_fused_autodetect_params(req)
         self.assertEqual(params["regex"], WHISPER_AUTODETECT_REGEX)
         self.assertNotIn("timestamp_granularities", params)
+
+    def test_spaces_between_special_tokens_is_false(self):
+        # parse_fused_output assumes a zero-space forced prefix. Slow
+        # Whisper tokenizers otherwise insert a space between adjacent
+        # special tokens, which would silently break the parse path.
+        for req in (
+            self._request(),
+            self._request(timestamp_granularities=["segment"]),
+        ):
+            params = WhisperAdapter().build_fused_autodetect_params(req)
+            self.assertIs(params["spaces_between_special_tokens"], False)
 
     def test_fused_params_survive_sampling_params_construction(self):
         # Regression: the multimodal processor's fused branch used to skip

@@ -144,7 +144,21 @@ class WhisperProcessor(BaseMultimodalProcessor):
         if language is None:
             language = "en"  # Default to English
         language_token = f"<|{language}|>"
-        return self._tokenizer.convert_tokens_to_ids(language_token)
+        token_id = self._tokenizer.convert_tokens_to_ids(language_token)
+        # normalize_language_to_code accepts the full Whisper language-token
+        # vocab (including yue/haw/jw) so fused autodetect output round-trips.
+        # Older checkpoints (v1/v2) don't have every newer token in their
+        # vocab, in which case convert_tokens_to_ids returns the unk id.
+        # Raise a clean error here instead of silently feeding unk into the
+        # decoder and producing garbage.
+        unk_id = getattr(self._tokenizer, "unk_token_id", None)
+        if token_id is None or (unk_id is not None and token_id == unk_id):
+            raise ValueError(
+                f"Language '{language}' is not in this Whisper model's vocabulary. "
+                f"The '{language_token}' token may have been added in a later "
+                f"Whisper version than the loaded checkpoint."
+            )
+        return token_id
 
     async def process_mm_data_async(
         self,

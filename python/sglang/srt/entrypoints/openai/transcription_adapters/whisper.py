@@ -254,6 +254,13 @@ class WhisperAdapter(TranscriptionAdapter):
                 WHISPER_AUTODETECT_TS_REGEX if use_ts else WHISPER_AUTODETECT_REGEX
             ),
             "skip_special_tokens": False,
+            # parse_fused_output matches a zero-space forced prefix
+            # (``<|en|><|transcribe|><|notimestamps|>`` glued together).
+            # Fast Whisper tokenizers decode adjacent added tokens with no
+            # space, but slow ones insert a space between them. Force
+            # spaces_between_special_tokens=False so the parse regex is
+            # correct regardless of tokenizer variant.
+            "spaces_between_special_tokens": False,
             "_detect_language": True,
         }
         if use_ts:
