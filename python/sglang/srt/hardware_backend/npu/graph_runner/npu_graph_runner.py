@@ -174,7 +174,9 @@ class NPUGraphRunner(CudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if forward_batch.mrope_positions is not None:
-                self.buffers.mrope_positions[: , :self.raw_num_token].copy_(forward_batch.mrope_positions)
+                self.buffers.mrope_positions[: , :self.raw_num_token].copy_(
+                    forward_batch.mrope_positions
+                )
 
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
