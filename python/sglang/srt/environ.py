@@ -516,6 +516,10 @@ class Envs:
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
+    # Native gRPC server (internal, not yet user-facing)
+    SGLANG_GRPC_PORT = EnvInt(None)
+    SGLANG_ENABLE_GRPC = EnvBool(False)
+
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
@@ -529,8 +533,8 @@ class Envs:
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
-    # Tokenizer
-    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+    # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
+    SGLANG_PATCH_TOKENIZER = EnvBool(True)
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
@@ -553,6 +557,10 @@ class Envs:
 
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+
+    # Plugin system
+    SGLANG_PLATFORM = EnvStr("")
+    SGLANG_PLUGINS = EnvStr("")
 
 
 envs = Envs()

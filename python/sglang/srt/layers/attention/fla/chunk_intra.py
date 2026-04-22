@@ -657,5 +657,6 @@ def chunk_kda_fwd_intra(
         q=q if disable_recompute else None,
         gk=gk,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
     )
     return w, u, qg, kg, Aqk, Akk

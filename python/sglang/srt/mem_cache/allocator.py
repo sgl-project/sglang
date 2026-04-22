@@ -164,11 +164,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.free_group.append(free_index)
 
-    def get_cpu_copy(self, indices):
-        return self._kvcache.get_cpu_copy(indices)
+    def get_cpu_copy(self, indices, **kwargs):
+        return self._kvcache.get_cpu_copy(indices, **kwargs)
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
-        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
+        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices, **kwargs)
 
 
 def alloc_extend_naive(
@@ -512,8 +512,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
-    def get_cpu_copy(self, indices):
-        return self._kvcache.get_cpu_copy(indices)
+    def get_cpu_copy(self, indices, **kwargs):
+        return self._kvcache.get_cpu_copy(indices, **kwargs)
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
-        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
+        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices, **kwargs)
