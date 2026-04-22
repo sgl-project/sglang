@@ -1,6 +1,6 @@
 # O'BRIEN LOGISTICS: SOVEREIGN COMPLIANCE AUDIT v1.0
 **Sector: Wodonga Logistics Precinct (Z7)**
-**Auditor: Samuel James Hiotis | ABN 56 628 117 363 | IronVision Nexus**
+**Auditor: Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader**
 **Date: April 2026**
 
 ---
@@ -56,5 +56,5 @@ This audit is conducted in alignment with:
 
 ---
 
-*Audited and signed by: Samuel James Hiotis | IronVision Nexus*
+*Audited and signed by: Samuel James Hiotis (ABN 56 628 117 363) — Sole Trader*
 *White-hat, defensive operations only.*

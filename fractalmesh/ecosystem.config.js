@@ -1,7 +1,7 @@
-// FractalMesh PM2 Ecosystem — v10003.43 APEX OMNI-MATRIX
-// Samuel James Hiotis | ABN 56628117363 | Albury NSW
+// FractalMesh Omega Titan v2.0.0 — PM2 Ecosystem
+// Samuel James Hiotis | ABN 56628117363 | Sole Trader | Albury NSW
 // Usage: pm2 start ecosystem.config.js --env production
-// Agents: 29 nodes | Memory budget: ~1.8GB total
+// Agents: 41 nodes | Memory budget: ~2.4GB total
 
 const ROOT = process.env.FRACTALMESH_HOME || require('path').join(process.env.HOME, 'fmsaas');
 const REPO = process.env.REPO_ROOT        || require('path').join(process.env.HOME, 'sglang');
@@ -515,6 +515,204 @@ module.exports = {
             },
             error_file: `${ROOT}/logs/fm-negotiator-error.log`,
             out_file:   `${ROOT}/logs/fm-negotiator-out.log`,
+            time:       true,
+        },
+
+        // ── v2.0.0 ENTERPRISE + AUTOMATION AGENTS ────────────────────
+
+        // Enterprise Bus — circuit breakers, HMAC, monetization tracking
+        {
+            name:              'fm-enterprise-bus',
+            script:            `${REPO}/fractalmesh/agents/fm_enterprise_bus.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'100M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                REPO_ROOT:        REPO,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-enterprise-bus-error.log`,
+            out_file:   `${ROOT}/logs/fm-enterprise-bus-out.log`,
+            time:       true,
+        },
+
+        // RAG API — semantic knowledge search (port 8001)
+        {
+            name:              'rag-api',
+            script:            `${REPO}/fractalmesh/api/rag_api.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'120M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                RAG_API_PORT:     '8001',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/rag-api-error.log`,
+            out_file:   `${ROOT}/logs/rag-api-out.log`,
+            time:       true,
+        },
+
+        // Billing API — Stripe/PayPal/LemonSqueezy metering (port 8003)
+        {
+            name:              'billing-api',
+            script:            `${REPO}/fractalmesh/api/billing_api.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'80M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                BILLING_API_PORT: '8003',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/billing-api-error.log`,
+            out_file:   `${ROOT}/logs/billing-api-out.log`,
+            time:       true,
+        },
+
+        // Licensing agent — auto copyright/license stamping (interval 3600s)
+        {
+            name:              'fm-licensing',
+            script:            `${REPO}/fractalmesh/agents/fm_licensing.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'50M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                REPO_ROOT:        REPO,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-licensing-error.log`,
+            out_file:   `${ROOT}/logs/fm-licensing-out.log`,
+            time:       true,
+        },
+
+        // Watermark agent — document + image watermarking (interval 3600s)
+        {
+            name:              'fm-watermark',
+            script:            `${REPO}/fractalmesh/agents/fm_watermark.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'60M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                REPO_ROOT:        REPO,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-watermark-error.log`,
+            out_file:   `${ROOT}/logs/fm-watermark-out.log`,
+            time:       true,
+        },
+
+        // Geo validator — coordinate validation + geotagging (interval 1800s)
+        {
+            name:              'fm-geo-validator',
+            script:            `${REPO}/fractalmesh/agents/fm_geo_validator.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'60M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-geo-validator-error.log`,
+            out_file:   `${ROOT}/logs/fm-geo-validator-out.log`,
+            time:       true,
+        },
+
+        // Carbon credits — fleet energy + CO2 analysis (interval 86400s)
+        {
+            name:              'fm-carbon-credits',
+            script:            `${REPO}/fractalmesh/agents/fm_carbon_credits.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'50M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-carbon-credits-error.log`,
+            out_file:   `${ROOT}/logs/fm-carbon-credits-out.log`,
+            time:       true,
+        },
+
+        // Smart contracts — ERC-20 + royalty split generation (interval 7200s)
+        {
+            name:              'fm-smart-contracts',
+            script:            `${REPO}/fractalmesh/agents/fm_smart_contracts.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'60M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                REPO_ROOT:        REPO,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-smart-contracts-error.log`,
+            out_file:   `${ROOT}/logs/fm-smart-contracts-out.log`,
+            time:       true,
+        },
+
+        // AdMob bridge — Google AdMob revenue tracking (interval 3600s)
+        {
+            name:              'fm-admob',
+            script:            `${REPO}/fractalmesh/agents/fm_admob_bridge.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'50M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-admob-error.log`,
+            out_file:   `${ROOT}/logs/fm-admob-out.log`,
+            time:       true,
+        },
+
+        // Campaign manager — multi-channel outreach lifecycle (interval 3600s)
+        {
+            name:              'fm-campaign-manager',
+            script:            `${REPO}/fractalmesh/agents/marketing/fm_campaign_manager.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'80M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-campaign-manager-error.log`,
+            out_file:   `${ROOT}/logs/fm-campaign-manager-out.log`,
             time:       true,
         },
 
