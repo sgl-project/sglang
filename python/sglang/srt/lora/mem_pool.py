@@ -8,6 +8,8 @@ from sglang.srt.distributed import (
     divide,
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
 )
 from sglang.srt.lora.eviction_policy import get_eviction_policy
@@ -57,6 +59,18 @@ def _get_moe_ep_context() -> Tuple[int, int]:
     try:
         return get_moe_expert_parallel_world_size(), get_moe_expert_parallel_rank()
     except Exception:  # pragma: no cover - MoE EP group not initialized
+        return 1, 0
+
+
+def _get_moe_tp_context() -> Tuple[int, int]:
+    """Return `(moe_tp_size, moe_tp_rank)`, or `(1, 0)` if the MoE TP group
+    is not initialized. Under `--tp N --ep N` the outer attention TP group
+    is consumed entirely by EP, leaving `moe_tp_size == 1`, so per-expert
+    MoE weights are NOT sharded along their inner dim even though attention
+    weights are."""
+    try:
+        return get_moe_tensor_parallel_world_size(), get_moe_tensor_parallel_rank()
+    except Exception:  # pragma: no cover - MoE TP group not initialized
         return 1, 0
 
 
@@ -120,6 +134,17 @@ class LoRAMemoryPool:
             and not _moe_runner_keeps_global_expert_ids()
             and num_experts_global % self.moe_ep_size == 0
         )
+
+        # Per-expert MoE weights are sharded by `moe_tp_size`, NOT the outer
+        # `tp_size`: `moe_tp_size = tp_size // ep_size // dp_size`, so under
+        # e.g. `--tp 4 --ep 4` each rank holds full-width expert weights
+        # (`moe_tp_size == 1`). Sizing per-expert LoRA buffers by `tp_size`
+        # here would yield a 4x-narrower inner dim than the adapter weight
+        # (which `FusedMoEWithLoRA.slice_moe_lora_{a,b}_weights` correctly
+        # skip-slices when `moe_tp_size <= 1`), producing a shape-mismatch
+        # assert during weight load. Non-MoE modules still shard by
+        # `tp_size` because attention TP is unchanged.
+        self.moe_tp_size, self.moe_tp_rank = _get_moe_tp_context()
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
@@ -283,12 +308,16 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name)
+        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
+        effective_tp_size = (
+            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
+        )
         if (
-            self.tp_size > 1
+            effective_tp_size > 1
             and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            input_dim = divide(input_dim, self.tp_size)
+            input_dim = divide(input_dim, effective_tp_size)
 
         if self.is_moe_module(module_name):
             expert_dim = self._get_num_local_experts(base_model)
@@ -338,12 +367,16 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
+        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
+        effective_tp_size = (
+            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
+        )
         if (
-            self.tp_size > 1
+            effective_tp_size > 1
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            output_dim = divide(output_dim, self.tp_size)
+            output_dim = divide(output_dim, effective_tp_size)
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):

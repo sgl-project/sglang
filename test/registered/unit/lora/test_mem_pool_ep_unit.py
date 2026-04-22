@@ -27,6 +27,7 @@ import torch
 from sglang.srt.lora.mem_pool import (
     LoRAMemoryPool,
     _get_moe_ep_context,
+    _get_moe_tp_context,
     _moe_runner_keeps_global_expert_ids,
 )
 
@@ -48,6 +49,10 @@ def _make_pool(
     pool.moe_ep_size = moe_ep_size
     pool.moe_ep_rank = moe_ep_rank
     pool.moe_use_local_expert_ids = moe_use_local_expert_ids
+    # Helpers under test in this module don't consult moe_tp_size, but set
+    # defaults so accidental reads don't AttributeError.
+    pool.moe_tp_size = 1
+    pool.moe_tp_rank = 0
     if moe_use_local_expert_ids and num_experts_global % moe_ep_size == 0:
         pool._num_experts_local = num_experts_global // moe_ep_size
     else:
@@ -319,6 +324,13 @@ class TestModuleLevelHelpers(unittest.TestCase):
         self.assertEqual(ep_size, 1)
         self.assertEqual(ep_rank, 0)
 
+    def test_tp_context_defaults_when_group_uninitialized(self):
+        # Mirror of `_get_moe_ep_context` for the MoE TP group: if it isn't
+        # initialized (hermetic tests, pure-TP launches), fall back to (1, 0).
+        tp_size, tp_rank = _get_moe_tp_context()
+        self.assertEqual(tp_size, 1)
+        self.assertEqual(tp_rank, 0)
+
     def test_keeps_global_expert_ids_defaults_to_false(self):
         # Without a specific flashinfer backend selected, default is False.
         self.assertFalse(_moe_runner_keeps_global_expert_ids())
@@ -334,6 +346,10 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
         ep_rank: int,
         keeps_global: bool,
         num_experts: int = 8,
+        moe_tp_size: int = 1,
+        moe_tp_rank: int = 0,
+        tp_size: int = 1,
+        tp_rank: int = 0,
     ) -> LoRAMemoryPool:
         """Construct a pool with `__init__` called, but stop before
         `init_buffers` — we only care about the EP-context state.
@@ -342,6 +358,10 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
             mock.patch(
                 "sglang.srt.lora.mem_pool._get_moe_ep_context",
                 return_value=(ep_size, ep_rank),
+            ),
+            mock.patch(
+                "sglang.srt.lora.mem_pool._get_moe_tp_context",
+                return_value=(moe_tp_size, moe_tp_rank),
             ),
             mock.patch(
                 "sglang.srt.lora.mem_pool._moe_runner_keeps_global_expert_ids",
@@ -361,8 +381,8 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 base_hf_config=hf_cfg,
                 max_loras_per_batch=1,
                 dtype=torch.bfloat16,
-                tp_size=1,
-                tp_rank=0,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
                 max_lora_rank=8,
                 target_modules={"qkv_proj"},
                 base_model=base_model,
@@ -403,6 +423,188 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
         self.assertEqual(pool.moe_ep_size, 4)
         self.assertEqual(pool.moe_ep_rank, 1)
         self.assertFalse(pool.moe_use_local_expert_ids)
+
+    def test_init_captures_moe_tp_context(self):
+        """`__init__` must capture moe_tp_size/rank so per-expert MoE LoRA
+        buffers can be sharded by the MoE-TP group (not the outer attn TP).
+        Under `--tp N --ep N` the MoE TP group degenerates to size 1.
+        """
+        pool = self._new_pool_with_ep(
+            ep_size=4,
+            ep_rank=0,
+            keeps_global=False,
+            tp_size=4,
+            tp_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+        )
+        self.assertEqual(pool.tp_size, 4)
+        self.assertEqual(pool.moe_tp_size, 1)
+        self.assertEqual(pool.moe_tp_rank, 0)
+
+
+def _fake_base_model_with_hidden_dim(num_experts: int) -> torch.nn.Module:
+    """Fake base model that implements `get_hidden_dim` for MoE + attention
+    modules. Matches the signatures `LoRAMemoryPool.get_lora_{A,B}_shape`
+    call through `sglang.srt.lora.utils.get_hidden_dim`.
+    """
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(4, 4, bias=False)
+            self.config = types.SimpleNamespace(
+                num_hidden_layers=1,
+                hidden_size=64,
+                num_attention_heads=8,
+                num_key_value_heads=8,
+                head_dim=8,
+                intermediate_size=256,
+                moe_intermediate_size=192,
+                vocab_size=32,
+                num_experts=num_experts,
+            )
+
+        def get_hidden_dim(self, module_name: str, layer_idx: int):
+            cfg = self.config
+            if module_name == "qkv_proj":
+                head = cfg.head_dim
+                return cfg.hidden_size, head * (
+                    cfg.num_attention_heads + cfg.num_key_value_heads * 2
+                )
+            if module_name == "o_proj":
+                return cfg.head_dim * cfg.num_attention_heads, cfg.hidden_size
+            if module_name == "gate_up_proj_moe":
+                return cfg.hidden_size, cfg.moe_intermediate_size * 2
+            if module_name == "down_proj_moe":
+                return cfg.moe_intermediate_size, cfg.hidden_size
+            raise NotImplementedError(module_name)
+
+    return _Model()
+
+
+class TestMoeBufferShardsByMoeTp(unittest.TestCase):
+    """Regression: per-expert MoE LoRA buffers must shard by `moe_tp_size`,
+    not the outer attention `tp_size`.
+
+    Under `--tp N --ep N` (e.g. tp=4, ep=4) `moe_tp_size == 1`, so per-
+    expert weights span the full MoE intermediate dim on every rank; the
+    corresponding LoRA buffer must match. Before the fix, the buffer was
+    divided by `tp_size` (= 4) while `FusedMoEWithLoRA.slice_moe_lora_*`
+    kept the weight full-width, producing a 4x shape-mismatch assert at
+    load time. Non-MoE modules still shard by the outer `tp_size`.
+    """
+
+    def _pool(
+        self,
+        *,
+        tp_size: int,
+        moe_tp_size: int,
+        num_experts: int = 128,
+        ep_size: int = 1,
+        ep_rank: int = 0,
+    ) -> LoRAMemoryPool:
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.max_loras_per_batch = 2
+        pool.tp_size = tp_size
+        pool.tp_rank = 0
+        pool.moe_ep_size = ep_size
+        pool.moe_ep_rank = ep_rank
+        pool.moe_tp_size = moe_tp_size
+        pool.moe_tp_rank = 0
+        pool.moe_use_local_expert_ids = ep_size > 1
+        pool._num_experts_local = (
+            num_experts // ep_size if pool.moe_use_local_expert_ids else num_experts
+        )
+        pool.experts_shared_outer_loras = False
+        pool.base_hf_config = types.SimpleNamespace(
+            hidden_size=64,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            head_dim=8,
+            intermediate_size=256,
+            moe_intermediate_size=192,
+        )
+        return pool
+
+    def test_moe_down_proj_uses_moe_tp_not_attn_tp(self):
+        """down_proj_moe is row-parallel: LoRA-A input_dim = moe_inter must
+        be divided by `moe_tp_size`, NOT `tp_size`. This is the exact shape
+        that failed at load time on `--tp 4 --ep 4` before the fix.
+        """
+        pool = self._pool(tp_size=4, moe_tp_size=1, num_experts=128, ep_size=4)
+        model = _fake_base_model_with_hidden_dim(num_experts=128)
+        num_local = 128 // 4  # 32
+        # A: input_dim = moe_inter / moe_tp_size = 192 / 1 = 192 (pre-fix: 48).
+        self.assertEqual(
+            pool.get_lora_A_shape("down_proj_moe", model, 8, 0),
+            (2, num_local, 8, 192),
+        )
+        # B: output_dim = hidden_size, not row-parallel -> unsharded.
+        self.assertEqual(
+            pool.get_lora_B_shape("down_proj_moe", model, 8, 0),
+            (2, num_local, 64, 8),
+        )
+
+    def test_moe_gate_up_proj_uses_moe_tp_not_attn_tp(self):
+        """gate_up_proj_moe is column-parallel: LoRA-B output_dim =
+        moe_inter*2 must be divided by `moe_tp_size`, not `tp_size`.
+        """
+        pool = self._pool(tp_size=4, moe_tp_size=1, num_experts=128, ep_size=4)
+        model = _fake_base_model_with_hidden_dim(num_experts=128)
+        num_local = 128 // 4
+        # A: input_dim = hidden_size, not row-parallel -> unsharded. Rank
+        # dim is `max_lora_dim * stacked_multiply` (2 for gate_up).
+        self.assertEqual(
+            pool.get_lora_A_shape("gate_up_proj_moe", model, 8, 0),
+            (2, num_local, 16, 64),
+        )
+        # B: output_dim = moe_inter*2 / moe_tp_size = 384 / 1 = 384 (pre-fix: 96).
+        self.assertEqual(
+            pool.get_lora_B_shape("gate_up_proj_moe", model, 8, 0),
+            (2, num_local, 384, 8),
+        )
+
+    def test_moe_tp_gt1_still_shards_moe_dims(self):
+        """Under `--tp 8 --ep 4` the MoE TP group has size 2, so per-expert
+        weights ARE sharded along the MoE inner dim — the LoRA buffer must
+        follow.
+        """
+        pool = self._pool(tp_size=8, moe_tp_size=2, num_experts=128, ep_size=4)
+        model = _fake_base_model_with_hidden_dim(num_experts=128)
+        num_local = 128 // 4
+        # 192 / 2 = 96
+        self.assertEqual(
+            pool.get_lora_A_shape("down_proj_moe", model, 8, 0),
+            (2, num_local, 8, 96),
+        )
+        # 384 / 2 = 192 (B: moe_inter*2 / moe_tp_size).
+        self.assertEqual(
+            pool.get_lora_B_shape("gate_up_proj_moe", model, 8, 0),
+            (2, num_local, 192, 8),
+        )
+        # A: input_dim = hidden_size, unaffected by MoE TP.
+        self.assertEqual(
+            pool.get_lora_A_shape("gate_up_proj_moe", model, 8, 0),
+            (2, num_local, 16, 64),
+        )
+
+    def test_non_moe_modules_unaffected_by_moe_tp(self):
+        """Non-MoE modules must continue to shard by the outer `tp_size`;
+        the MoE-TP substitution applies only to `*_moe` modules.
+        """
+        pool = self._pool(tp_size=4, moe_tp_size=1, num_experts=128, ep_size=4)
+        model = _fake_base_model_with_hidden_dim(num_experts=128)
+        # o_proj is row-parallel: A input_dim sharded by tp_size, B unsharded.
+        o_a = pool.get_lora_A_shape("o_proj", model, 8, 0)
+        o_b = pool.get_lora_B_shape("o_proj", model, 8, 0)
+        # head_dim*num_heads / tp_size = 64 / 4 = 16; B output = hidden_size = 64.
+        self.assertEqual(o_a, (2, 8, 16))
+        self.assertEqual(o_b, (2, 64, 8))
+        # qkv_proj is column-parallel: A unsharded, B sharded by tp_size.
+        q_b = pool.get_lora_B_shape("qkv_proj", model, 8, 0)
+        # head_dim * (heads + 2*kv_heads) / tp_size = 8 * 24 / 4 = 48.
+        self.assertEqual(q_b, (2, 48, 8))
 
 
 if __name__ == "__main__":
