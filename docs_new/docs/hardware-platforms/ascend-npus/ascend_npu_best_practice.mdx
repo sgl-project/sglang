@@ -689,7 +689,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```shell Command
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 3072 --random-range-ratio 1 --request-rate 16
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 1024 --random-input-len 3584 --random-output-len 1536 --num-prompts 7168 --random-range-ratio 1 --request-rate 40
 ```
 
 ### DeepSeek-R1 2K-2K 50ms on A3 24 Cards Disaggregation Mode
