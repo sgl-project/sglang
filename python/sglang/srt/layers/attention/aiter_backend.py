@@ -118,9 +118,9 @@ _AITER_PARTITION_SIZE_ROCM = 256
 
 @triton.jit
 def _pad_ragged_kv_indices_to_block_table_kernel(
-    kv_indptr_ptr,        # [bs + 1] int32
-    kv_indices_ptr,       # [N]      int32 (ragged slot ids)
-    block_table_ptr,      # [bs, max_pages] int32 output
+    kv_indptr_ptr,  # [bs + 1] int32
+    kv_indices_ptr,  # [N]      int32 (ragged slot ids)
+    block_table_ptr,  # [bs, max_pages] int32 output
     block_table_row_stride: tl.constexpr,
     max_pages: tl.constexpr,
     page_size: tl.constexpr,
@@ -744,9 +744,7 @@ class AiterAttnBackend(AttentionBackend):
             # non-spec unified path which also calls .max().item()).
             seq_lens_kv = kv_indptr[1 : spec_bs + 1] - kv_indptr[:spec_bs]
             max_kv_len_int = int(seq_lens_kv.max().item())
-            max_pages = max(
-                (max_kv_len_int + self.page_size - 1) // self.page_size, 1
-            )
+            max_pages = max((max_kv_len_int + self.page_size - 1) // self.page_size, 1)
             block_table = torch.zeros(
                 (spec_bs, max_pages),
                 dtype=torch.int32,
@@ -1397,7 +1395,9 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
             self.cuda_graph_spec_seqused_k = torch.zeros(
-                (max_num_tokens,), dtype=torch.int32, device=self.device,
+                (max_num_tokens,),
+                dtype=torch.int32,
+                device=self.device,
             )
             self.cuda_graph_spec_qo_indptr = torch.arange(
                 0,
