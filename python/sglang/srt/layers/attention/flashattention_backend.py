@@ -920,11 +920,25 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver == 3, "Only FA3 support here"
                 # Do absorbed multi-latent attention
-                kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                    layer.layer_id
-                ).to(q.dtype)
+                fa4_fp8 = (
+                    self.kv_cache_dtype_str != "auto" and self.fa_impl_ver == 4
+                )
+                if fa4_fp8:
+                    # FA4 FP8 native: keep KV cache in FP8, cast q to match.
+                    # No descale — upstream FA4 kernel asserts qv and descale
+                    # are mutually exclusive.  MLA quantization uses scale=1.0
+                    # (direct cast), so identity descale is correct.
+                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                        layer.layer_id
+                    )
+                    q = q.to(self.kv_cache_dtype)
+                    if q_rope is not None:
+                        q_rope = q_rope.to(self.kv_cache_dtype)
+                else:
+                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                        layer.layer_id
+                    ).to(q.dtype)
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = k_rope.view(
