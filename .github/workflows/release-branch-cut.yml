@@ -207,9 +207,16 @@ jobs:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit
 
-  run-nightly-tests-intel:
+  run-nightly-tests-xpu:
     needs: cut-release-branch
-    uses: ./.github/workflows/nightly-test-intel.yml
+    uses: ./.github/workflows/nightly-test-xpu.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-xeon:
+    needs: cut-release-branch
+    uses: ./.github/workflows/nightly-test-xeon.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit

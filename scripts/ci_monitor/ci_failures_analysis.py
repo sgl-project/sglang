@@ -2488,7 +2488,7 @@ def main():
         )
         nightly_intel_scheduled_runs = analyzer.get_recent_runs(
             limit=nightly_scheduled_limit,
-            workflow_filter=["nightly-test-intel.yml"],
+            workflow_filter=["nightly-test-xpu.yml", "nightly-test-xeon.yml"],
             filters={"event": "schedule"},
         )
         nightly_npu_scheduled_runs = analyzer.get_recent_runs(
@@ -2531,7 +2531,7 @@ def main():
         )
         nightly_intel_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
-            workflow_filter=["nightly-test-intel.yml"],
+            workflow_filter=["nightly-test-xpu.yml", "nightly-test-xeon.yml"],
         )
         nightly_npu_general_runs = analyzer.get_recent_runs(
             limit=args.limit,
