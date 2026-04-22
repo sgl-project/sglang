@@ -35,7 +35,7 @@ class TestMLA(CustomTestCase, MGSMEnMixin):
             # the score becomes a fixed function of (model, weights, CUDA
             # stack), so threshold-edge flakes stop being random noise.
         ]
-        if not is_hip():
+        if not is_in_amd_ci():
             # On AMD, the default attention backend (aiter) is not in the deterministic-inference allowlist, so the server fails to start, disable it.
             other_args.append("--enable-deterministic-inference")
         cls.process = popen_launch_server(
