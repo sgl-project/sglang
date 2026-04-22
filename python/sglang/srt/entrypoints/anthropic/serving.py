@@ -270,6 +270,23 @@ class AnthropicServing:
 
         chat_request = ChatCompletionRequest(**request_data)
 
+        # Wire thinking parameter
+        if anthropic_request.thinking is not None:
+            # Pick the correct kwarg key based on the model's reasoning parser
+            reasoning_parser = self.openai_serving_chat.reasoning_parser
+            if reasoning_parser in ("deepseek-v3", "kimi_k2"):
+                thinking_key = "thinking"
+            else:
+                thinking_key = "enable_thinking"
+
+            enabled = anthropic_request.thinking.type == "enabled"
+            chat_request.separate_reasoning = enabled
+            if enabled:
+                chat_request.stream_reasoning = True
+            if chat_request.chat_template_kwargs is None:
+                chat_request.chat_template_kwargs = {}
+            chat_request.chat_template_kwargs[thinking_key] = enabled
+
         # Convert tools
         if anthropic_request.tools:
             tools = []
@@ -429,6 +446,7 @@ class AnthropicServing:
         first_chunk = True
         content_block_index = 0
         content_block_open = False
+        thinking_block_open = False
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -441,8 +459,20 @@ class AnthropicServing:
             data_str = sse_line[6:].strip()
 
             if data_str == "[DONE]":
+                # Close any open thinking block
+                if thinking_block_open:
+                    stop_event = AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    )
+                    yield _wrap_sse_event(
+                        stop_event.model_dump_json(exclude_none=True),
+                        "content_block_stop",
+                    )
+                    thinking_block_open = False
+
                 # Close any open content block
-                if content_block_open:
+                elif content_block_open:
                     stop_event = AnthropicStreamEvent(
                         type="content_block_stop",
                         index=content_block_index,
@@ -540,6 +570,53 @@ class AnthropicServing:
                 continue
 
             delta = choice.delta
+
+            # Handle reasoning/thinking content deltas
+            if delta.reasoning_content is not None and delta.reasoning_content != "":
+                # Start a thinking content block if needed
+                if not thinking_block_open:
+                    start_event = AnthropicStreamEvent(
+                        type="content_block_start",
+                        index=content_block_index,
+                        content_block=AnthropicContentBlock(
+                            type="thinking", thinking=""
+                        ),
+                    )
+                    yield _wrap_sse_event(
+                        start_event.model_dump_json(exclude_none=True),
+                        "content_block_start",
+                    )
+                    thinking_block_open = True
+
+                # Emit thinking delta
+                delta_event = AnthropicStreamEvent(
+                    type="content_block_delta",
+                    index=content_block_index,
+                    delta=AnthropicDelta(
+                        type="thinking_delta",
+                        thinking=delta.reasoning_content,
+                    ),
+                )
+                yield _wrap_sse_event(
+                    delta_event.model_dump_json(exclude_none=True),
+                    "content_block_delta",
+                )
+                continue
+
+            # Close thinking block when transitioning to non-thinking content
+            if thinking_block_open and (
+                delta.tool_calls or (delta.content is not None and delta.content != "")
+            ):
+                stop_event = AnthropicStreamEvent(
+                    type="content_block_stop",
+                    index=content_block_index,
+                )
+                yield _wrap_sse_event(
+                    stop_event.model_dump_json(exclude_none=True),
+                    "content_block_stop",
+                )
+                content_block_index += 1
+                thinking_block_open = False
 
             # Handle tool call deltas
             if delta.tool_calls:
@@ -652,6 +729,14 @@ class AnthropicServing:
 
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
+
+        # Add thinking content if present
+        if choice.message.reasoning_content:
+            content.append(
+                AnthropicContentBlock(
+                    type="thinking", thinking=choice.message.reasoning_content
+                )
+            )
 
         # Add text content
         if choice.message.content:
