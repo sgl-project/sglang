@@ -104,7 +104,6 @@ class TritonAttnBackend(AttentionBackend):
         ):
             from sglang.srt.layers.attention.gluon_extend_attention import (
                 make_extend_attention_fwd,
-                prewarm_for_model,
             )
             _gluon_fwd = make_extend_attention_fwd(extend_attention_fwd)
             if _gluon_fwd is not extend_attention_fwd:
@@ -114,33 +113,6 @@ class TritonAttnBackend(AttentionBackend):
                     "Gluon extend attention enabled on gfx950 "
                     "(--enable-gluon-extend-attention)."
                 )
-                try:
-                    prewarm_for_model(
-                        head_dim=int(model_runner.model_config.head_dim),
-                        num_q_heads=int(
-                            model_runner.model_config.num_attention_heads
-                            // get_attention_tp_size()
-                        ),
-                        num_kv_heads=int(
-                            model_runner.model_config.get_num_kv_heads(
-                                get_attention_tp_size()
-                            )
-                        ),
-                        is_causal_modes=(True,),
-                        hf_config=getattr(
-                            model_runner.model_config, "hf_config", None
-                        ),
-                        # FP8 KV cache needs its own dispatch ladder compiled
-                        # up-front; the FP8 D=128 retune demotes the small
-                        # decode-continuation bucket to BM=64 NW=4 NS=1 and
-                        # those variants aren't in the BF16 phase-1 set.
-                        kv_cache_dtype=getattr(
-                            model_runner, "kv_cache_dtype", None
-                        ),
-                    )
-                except Exception:
-                    # Best-effort; first live calls will JIT as normal.
-                    pass
         self.extend_attention_fwd = torch.compiler.disable(_extend_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified

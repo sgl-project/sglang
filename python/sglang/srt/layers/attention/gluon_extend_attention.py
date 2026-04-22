@@ -117,9 +117,6 @@ if _PROFILE_PATH:
 _GLUON_SUPPORTED_HEAD_DIMS = {64, 128, 256}
 
 _GLUON_FN: Optional[Callable] = None
-_PREWARM_FN: Optional[Callable] = None
-_PREWARM_MODEL_FN: Optional[Callable] = None
-_PREWARMED_MODELS: set = set()
 
 # Optional numerical-parity check: ``SGLANG_GLUON_DEBUG=compare=<N>`` runs
 # BOTH Gluon and Triton for the first N calls after startup and logs
@@ -184,21 +181,17 @@ def _compare_log_diff(
 
 
 def _try_import_gluon() -> bool:
-    """Populate the Gluon entry points from the vendored package.
+    """Populate the Gluon entry point from the vendored package.
     Idempotent; returns True on success, False if the import raised
     (wrapper stays on the Triton fallback)."""
-    global _GLUON_FN, _PREWARM_FN, _PREWARM_MODEL_FN
+    global _GLUON_FN
     if _GLUON_FN is not None:
         return True
     try:
         from sglang.srt.layers.attention.gluon_ops.cdna4.extend_attention import (
             gluon_extend_attention_fwd,
-            prewarm_extend_attention,
-            prewarm_for_model as _pfm,
         )
         _GLUON_FN = gluon_extend_attention_fwd
-        _PREWARM_FN = prewarm_extend_attention
-        _PREWARM_MODEL_FN = _pfm
         return True
     except Exception as e:
         logger.warning(
@@ -206,179 +199,6 @@ def _try_import_gluon() -> bool:
             f"Falling back to Triton."
         )
         return False
-
-
-# Architectures whose SGLang model class passes ``sinks=...`` into the
-# attention backend (HAS_SINK=True kernel constexpr). Grok1 is
-# intentionally absent — grok.py passes attn_temperature_len only, not
-# sinks, so including it here would warm the wrong variant.
-_HAS_SINK_ARCHS = {
-    "GptOssForCausalLM",
-    "GptOssMoeForCausalLM",
-}
-
-# Architectures that pattern-match sliding-vs-full layers on layer_id
-# (i.e. no explicit ``config.layer_types``). Mirror the runtime
-# convention exactly so prewarm hits the same SLIDING_WINDOW_SIZE
-# constexpr the runtime will request.
-_GEMMA2_ARCHS = {"Gemma2ForCausalLM", "Gemma2Model"}
-_LLAMA4_ARCHS = {
-    "Llama4ForCausalLM",
-    "Llama4ForConditionalGeneration",
-    "Llama4TextModel",
-}
-
-
-def _build_layer_spec_from_hf_config(hf_config) -> Optional[list]:
-    """Derive a per-layer attention-pattern list for ``prewarm_for_model``.
-
-    Returns the exact ``(HAS_SINK, SLIDING_WINDOW_SIZE, LOGIT_CAP,
-    XAI_TEMPERATURE_LEN)`` tuples the runtime will request so prewarm
-    hits every variant and the first E2E prefill never JITs.
-
-    SGLang uses exclusive sliding windows while HF uses inclusive, so
-    the runtime window is ``hf_config.sliding_window - 1`` for most
-    families (Cohere v2 is the exception; see ``spec_cohere2``).
-    Pattern inference order:
-
-    1. ``hf_config.layer_types`` (GPT-OSS / Gemma 3 / Cohere v2 /
-       OLMo 2 — authoritative when present).
-    2. Family-specific rules:
-
-       * Gemma 2: even layer ids are sliding.
-       * Llama 4 iRoPE: layers with ``(id + 1) % 4 != 0`` are chunked;
-         every 4th is full NoPE.
-
-    3. Fallback: uniform full attention.
-
-    Missing-layer-types configs (Mistral v0.3, Mixtral, older Llama)
-    intentionally fall through to (3) — their HF ``sliding_window``
-    field is present but ignored by the SGLang model class.
-    """
-    if hf_config is None:
-        return None
-    num_layers = getattr(hf_config, "num_hidden_layers", None)
-    if num_layers is None:
-        return None
-
-    architectures = getattr(hf_config, "architectures", None) or []
-    arch = architectures[0] if architectures else ""
-    has_sink = arch in _HAS_SINK_ARCHS
-
-    raw_sliding_window = getattr(hf_config, "sliding_window", None) or -1
-    sliding_window = raw_sliding_window - 1 if raw_sliding_window > 0 else -1
-    logit_cap = float(getattr(hf_config, "attn_logit_softcapping", None) or 0.0)
-    # Accept both the new HF key and the older xai-style alias for Grok.
-    xai_temp_len = int(
-        getattr(hf_config, "attn_temperature_len", None)
-        or getattr(hf_config, "xai_temperature_len", None)
-        or -1
-    )
-    layer_types = getattr(hf_config, "layer_types", None)
-    is_gemma2 = arch in _GEMMA2_ARCHS
-    is_llama4 = arch in _LLAMA4_ARCHS
-
-    layers = []
-    for i in range(num_layers):
-        if layer_types is not None and i < len(layer_types):
-            is_sliding = layer_types[i] in ("sliding_attention", "sliding")
-            sw = sliding_window if is_sliding else -1
-        elif is_gemma2 and raw_sliding_window > 0:
-            sw = sliding_window if (i % 2 == 0) else -1
-        elif is_llama4 and raw_sliding_window > 0:
-            sw = sliding_window if ((i + 1) % 4 != 0) else -1
-        else:
-            sw = -1
-        layers.append({
-            "sliding_window_size": sw,
-            "has_sink": has_sink,
-            "logit_cap": logit_cap,
-            "xai_temperature_len": xai_temp_len,
-            "is_causal": True,
-        })
-    return layers
-
-
-def prewarm_for_model(
-    head_dim: int,
-    num_q_heads: int,
-    num_kv_heads: int,
-    is_causal_modes=(True,),
-    hf_config=None,
-    kv_cache_dtype=None,
-) -> None:
-    """Warm the Gluon JIT cache at server boot.
-
-    Called once per ``(head_dim, num_q_heads, num_kv_heads)`` tuple by
-    :class:`TritonAttnBackend`. With ``hf_config`` we warm the exact
-    per-layer pattern (sinks, alternating SWA, logit cap); without one
-    we fall back to the generic (causal, full-attention) warm. No-op
-    if the Gluon import failed.
-
-    ``kv_cache_dtype`` is ``model_runner.kv_cache_dtype``; if it's a
-    supported FP8 variant we also drive an FP8 Phase-2 pass so the
-    FP8 dispatch ladder (retuned for small-batch decode-continuation
-    at D=128) is compiled before first serving token. FP8 D=256 is
-    not supported on gfx950 and silently skips FP8 warming there.
-    """
-    if _PREWARM_FN is None:
-        return
-    if head_dim not in _GLUON_SUPPORTED_HEAD_DIMS:
-        return
-
-    include_fp8 = kv_cache_dtype in _FP8_KV_DTYPES
-
-    layer_spec = _build_layer_spec_from_hf_config(hf_config)
-    key_layers = tuple(
-        (l["sliding_window_size"], l["has_sink"], l["logit_cap"],
-         l["xai_temperature_len"], l["is_causal"])
-        for l in (layer_spec or [])
-    )
-    key = (head_dim, num_q_heads, num_kv_heads, tuple(sorted(is_causal_modes)),
-           key_layers, bool(include_fp8))
-    if key in _PREWARMED_MODELS:
-        return
-    _PREWARMED_MODELS.add(key)
-
-    if layer_spec and _PREWARM_MODEL_FN is not None:
-        try:
-            r = _PREWARM_MODEL_FN(
-                layer_spec,
-                head_dim=head_dim,
-                num_q_heads=num_q_heads,
-                num_kv_heads=num_kv_heads,
-                include_fp8=include_fp8,
-                parallel=8,
-                verbose=False,
-            )
-            logger.info(
-                f"Gluon prewarm D={head_dim} H={num_q_heads} kvH={num_kv_heads} "
-                f"fp8={include_fp8} (model-aware): {r['num_patterns']} patterns, "
-                f"{r['total_variants']} variants, {r['wall_time']:.1f}s"
-            )
-            return
-        except Exception as e:
-            logger.warning(
-                f"Gluon model-aware prewarm failed: {e!r}. "
-                f"Falling back to generic prewarm."
-            )
-
-    try:
-        r = _PREWARM_FN(
-            head_dim=head_dim,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            is_causal_modes=is_causal_modes,
-            include_fp8=include_fp8,
-            parallel=8,
-            verbose=False,
-        )
-        logger.info(
-            f"Gluon prewarm D={head_dim} H={num_q_heads} kvH={num_kv_heads} "
-            f"fp8={include_fp8}: {r['num_variants']} variants in {r['wall_time']:.1f}s"
-        )
-    except Exception as e:
-        logger.warning(f"Gluon prewarm failed (non-fatal): {e!r}")
 
 
 def is_gluon_extend_available() -> bool:
