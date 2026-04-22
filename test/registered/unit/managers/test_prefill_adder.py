@@ -88,7 +88,7 @@ class TestPrefillAdder(CustomTestCase):
             new_token_ratio=1.0,
             rem_input_tokens=10000,
             rem_chunk_tokens=None,
-            mixed_with_decode_tokens=0,
+            num_mixed_decode_tokens=0,
             priority_scheduling_preemption_threshold=0,
         )
         defaults.update(kwargs)
@@ -365,7 +365,7 @@ class TestPrefillAdder(CustomTestCase):
             running_batch,
             rem_input_tokens=200,
             rem_chunk_tokens=64,
-            mixed_with_decode_tokens=len(decode_reqs),
+            num_mixed_decode_tokens=len(decode_reqs),
         )
 
         self.assertEqual(adder.rem_input_tokens, 192)  # 200 - 8
@@ -400,7 +400,7 @@ class TestPrefillAdder(CustomTestCase):
             running_batch2,
             rem_input_tokens=200,
             rem_chunk_tokens=64,
-            mixed_with_decode_tokens=len(remaining_decode_reqs),
+            num_mixed_decode_tokens=len(remaining_decode_reqs),
         )
 
         self.assertEqual(adder2.rem_input_tokens, 195)  # 200 - 5
