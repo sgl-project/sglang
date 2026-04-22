@@ -104,6 +104,11 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.lplb_solver import (
+    LPLBSolver,
+    clear_global_lplb_solvers,
+    set_global_lplb_solver,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
@@ -605,6 +610,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.remote_instance_init_transfer_engine()
 
         if not self.is_draft_worker:
+            logger.info("Computing initial expert location metadata...")
             set_global_expert_location_metadata(
                 compute_initial_expert_location_metadata(
                     server_args=server_args,
@@ -612,6 +618,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     moe_ep_rank=self.moe_ep_rank,
                 )
             )
+            logger.info("Expert location metadata computed.")
             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
                     f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
@@ -624,6 +631,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     rank=self.tp_rank,
                 )
             )
+
+        if (
+            self.server_args.ep_dispatch_algorithm == "lp"
+            and not self.is_draft_worker
+        ):
+            self._init_lplb_solvers()
 
         # Expert parallelism
         self.eplb_manager = (
@@ -639,8 +652,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else None
         )
         # Load the model
+        logger.info("Creating sampler and loading model...")
         self.sampler = create_sampler()
         self.load_model()
+        logger.info("Model loaded successfully.")
 
         # Load the expert backup client
         self.expert_backup_client = (
@@ -1567,6 +1582,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
 
+    def _init_lplb_solvers(self):
+        """Initialize per-layer LPLB solvers from current expert location metadata."""
+        from sglang.srt.distributed import get_moe_ep_group
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+        clear_global_lplb_solvers()
+        ep_group = get_moe_ep_group()
+        for lid in range(metadata.num_layers):
+            solver = LPLBSolver(
+                phy2log=metadata.physical_to_logical_map[lid],
+                log2phy=metadata.logical_to_all_physical_map[lid],
+                num_gpus=metadata.ep_size,
+                ep_group=ep_group,
+                logical_to_all_physical_map_num_valid=(
+                    metadata.logical_to_all_physical_map_num_valid[lid]
+                ),
+            )
+            set_global_lplb_solver(lid, solver)
+        logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
+
     def update_expert_location(
         self,
         new_expert_location_metadata: ExpertLocationMetadata,
@@ -1608,6 +1645,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
+
+        # Re-init LPLB solvers after expert location update
+        if self.server_args.ep_dispatch_algorithm == "lp":
+            self._init_lplb_solvers()
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
