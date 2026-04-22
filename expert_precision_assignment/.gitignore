@@ -5,8 +5,8 @@ output/
 profile/results/
 profile/full_sweep.log
 profile/smoke.log
-profile/kv_calib/*.jsonl
-profile/kv_calib/server_*.log
+# KV calibration outputs — reproducible via run_calib.sh, not source of truth.
+profile/kv_calib/
 
 # Python caches
 __pycache__/
