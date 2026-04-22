@@ -505,6 +505,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
     else \
         python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+    fi
 
 # Install essential Python packages (use constraints to prevent conflicts)
 RUN --mount=type=cache,target=/root/.cache/pip \
