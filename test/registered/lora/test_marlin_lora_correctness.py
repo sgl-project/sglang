@@ -204,6 +204,7 @@ def test_marlin_vs_triton_lora_correctness(num_tokens, top_k):
             adapter_enabled=torch.ones(num_loras + 1, dtype=torch.int32, device=device),
             max_lora_rank=rank,
             num_experts=num_experts,
+            lora_use_virtual_experts=True,
             experts_shared_outer_loras=True,
         )
 
@@ -255,7 +256,7 @@ def test_marlin_vs_triton_lora_correctness(num_tokens, top_k):
         enable_deterministic_inference = False
 
     with patch(
-        "sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args",
+        "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config.get_global_server_args",
         return_value=MockServerArgs(),
     ):
         marlin_runner = MoeRunner(MoeRunnerBackend.MARLIN, config, lora_enabled=True)

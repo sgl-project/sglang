@@ -403,6 +403,8 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        self._gfx95_quant_format = self._detect_gfx95_quant_format()
+
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,

@@ -102,11 +102,16 @@ class Req:
     audio_latents: torch.Tensor | None = None
     audio_noise: torch.Tensor | None = None
     raw_audio_latent_shape: tuple[int, ...] | None = None
+    did_sp_shard_audio_latents: bool = False
+    sp_audio_start_frame: int = 0
+    sp_audio_orig_num_frames: int = 0
 
     # Audio Parameters
     generate_audio: bool = True
 
     raw_latent_shape: torch.Tensor | None = None
+    did_sp_shard_latents: bool = False
+    sp_video_start_frame: int = 0
     noise_pred: torch.Tensor | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None

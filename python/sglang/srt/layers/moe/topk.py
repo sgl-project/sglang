@@ -1017,9 +1017,21 @@ def _post_process_topk_ids(
         topk_ids=topk_ids,
     )
     if _is_cuda:
-        topk_ids = _biased_grouped_topk_postprocess(
-            topk_ids, expert_location_dispatch_info, num_token_non_padded
-        )
+        # When shared experts are fused (appended as extra columns in topk_ids),
+        # EPLB dispatch must only remap the routed expert columns.
+        # The shared expert column (value = n_routed_experts) would be out-of-bounds
+        # for the logical-to-physical dispatch table.
+        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+            shared_cols = topk_ids[:, -num_fused_shared_experts:]
+            routed_cols = topk_ids[:, :-num_fused_shared_experts]
+            routed_cols = _biased_grouped_topk_postprocess(
+                routed_cols, expert_location_dispatch_info, num_token_non_padded
+            )
+            topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+        else:
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids, expert_location_dispatch_info, num_token_non_padded
+            )
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
@@ -1030,7 +1042,7 @@ def _post_process_topk_ids(
         )
 
         # Lazy import to avoid circular-import issues
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             fused_append_shared_experts,
         )
 

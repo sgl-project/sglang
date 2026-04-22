@@ -483,7 +483,10 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]) or (
+            if (
+                self.storage_backend_type
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+            ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -680,7 +683,9 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
         self.write_queue.clear()
 
         start_event = device_module.Event()
@@ -720,8 +725,7 @@ class HiCacheController:
         )
         return device_indices
 
-    def move_indices(self, op: CacheOperation):
-        host_indices, device_indices = op.host_indices, op.device_indices
+    def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
@@ -749,7 +753,9 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()

@@ -192,6 +192,7 @@ work_dirs/
 *.csv
 
 !logo.png
+!docs_new/images/*.png
 
 # Prerequisites
 *.d
@@ -274,3 +275,4 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+artifacts/
