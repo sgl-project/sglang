@@ -725,18 +725,14 @@ class MooncakeKVManager(CommonKVManager):
 
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs_pp, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(
-                    self.kv_args.kv_data_ptrs, dst_kv_ptrs
-                )
+                self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
             )
             # MLA: single combined KV per layer
             src_ptr = src_kv_ptrs[layer_id]
             dst_ptr = dst_kv_ptrs_pp[layer_id]
             item_len = self.kv_args.kv_item_lens[layer_id]
             transfer_blocks = []
-            for prefill_index, decode_index in zip(
-                prefill_kv_blocks, dst_kv_blocks
-            ):
+            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
@@ -744,15 +740,11 @@ class MooncakeKVManager(CommonKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(
-                    self.kv_args.kv_data_ptrs, dst_kv_ptrs
-                )
+                self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
             )
             # MHA: separate K and V arrays, each indexed by layer_id
             k_item_len = self.kv_args.kv_item_lens[layer_id]
-            v_item_len = self.kv_args.kv_item_lens[
-                layers_current_pp_stage + layer_id
-            ]
+            v_item_len = self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id]
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in [
                 (src_k_ptrs[layer_id], dst_k_ptrs[layer_id], k_item_len),

@@ -89,9 +89,7 @@ class FakeKVSender(BaseKVSender):
         """Per-layer KV send stub for warmup. Only marks sent on the last layer."""
         if is_last:
             self.has_sent = True
-        logger.debug(
-            f"FakeKVSender send_layer layer_id={layer_id} is_last={is_last}"
-        )
+        logger.debug(f"FakeKVSender send_layer layer_id={layer_id} is_last={is_last}")
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")

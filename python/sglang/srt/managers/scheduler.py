@@ -3208,9 +3208,7 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
-    def run_batch_pipelined(
-        self, batch: ScheduleBatch
-    ) -> GenerationBatchResult:
+    def run_batch_pipelined(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch with layer-pipelined KV transfer.
 
         Instead of computing all layers then transferring all KV at once,
@@ -3237,9 +3235,7 @@ class Scheduler(
             start_idx = req.start_send_idx
             end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
             kv_indices = (
-                self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, start_idx:end_idx
-                ]
+                self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
                 .cpu()
                 .numpy()
             )
@@ -3257,10 +3253,8 @@ class Scheduler(
             group_end = min(group_start + group_size, num_layers)
             forward_count = group_end - group_start
 
-            ret, cuda_event = (
-                self.tp_worker.forward_batch_generation_split_layer(
-                    forward_batch, forward_count=forward_count
-                )
+            ret, cuda_event = self.tp_worker.forward_batch_generation_split_layer(
+                forward_batch, forward_count=forward_count
             )
             if ret is not None:
                 logits_output = ret
@@ -3275,15 +3269,13 @@ class Scheduler(
                         page_indices,
                         layer_id=layer_id,
                         cuda_event=cuda_event,
-                        is_last=(
-                            is_last_group and layer_id == num_layers - 1
-                        ),
+                        is_last=(is_last_group and layer_id == num_layers - 1),
                     )
 
         # Sample next tokens
-        assert logits_output is not None, (
-            "forward_split_prefill should return logits after the last layer"
-        )
+        assert (
+            logits_output is not None
+        ), "forward_split_prefill should return logits after the last layer"
         next_token_ids = self.tp_worker.forward_batch_generation_split_sample(
             logits_output, forward_batch
         )
@@ -3291,9 +3283,7 @@ class Scheduler(
         batch.output_ids = next_token_ids
 
         if batch.return_logprob:
-            extend_input_len_per_req = [
-                req.extend_input_len for req in batch.reqs
-            ]
+            extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
             extend_logprob_start_len_per_req = [
                 req.extend_logprob_start_len for req in batch.reqs
             ]
