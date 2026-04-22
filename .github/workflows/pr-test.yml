@@ -25,6 +25,11 @@ on:
         required: false
         type: string
         default: ""
+      include_wheel_build:
+        description: "When set with target_stage, also run sgl-kernel-build-wheels so the target stage uses the freshly-built kernel (for /rerun-stage on PRs that modify sgl-kernel/)"
+        required: false
+        type: boolean
+        default: false
       test_parallel_dispatch:
         description: "Test parallel dispatch behavior (simulates scheduled run)"
         required: false
@@ -80,10 +85,14 @@ jobs:
     outputs:
       # Use API-based detection for target_stage mode (filter-api), otherwise use dorny/paths-filter (filter)
       main_package: ${{ steps.filter-api.outputs.main_package || steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
-      # sgl_kernel is forced to false when target_stage is set, since sgl-kernel-build-wheels won't run
-      # This prevents CUSTOM_BUILD_SGL_KERNEL=true when the wheel artifacts aren't available
-      # Note: If PR has kernel changes AND target_stage is set, the validate-target-stage step will fail
-      sgl_kernel: ${{ !inputs.target_stage && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }}
+      # sgl_kernel is forced to false when target_stage is set AND include_wheel_build is NOT set,
+      # since sgl-kernel-build-wheels normally skips in target_stage mode. When include_wheel_build
+      # is true, keep the real value so the wheel build runs and the target stage downloads its
+      # artifact (used by /rerun-stage on PRs that modify sgl-kernel/).
+      # This prevents CUSTOM_BUILD_SGL_KERNEL=true when the wheel artifacts aren't available.
+      # Note: If PR has kernel changes AND target_stage is set AND include_wheel_build is NOT set,
+      # the validate-target-stage step will fail.
+      sgl_kernel: ${{ (!inputs.target_stage || inputs.include_wheel_build) && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }}
       # Raw sgl_kernel value before target_stage override (used for validation)
       sgl_kernel_raw: ${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
@@ -298,20 +307,26 @@ jobs:
           fi
 
       - name: Validate target_stage with kernel changes
-        # Use API-based detection (filter-api) for target_stage mode, otherwise use dorny/paths-filter (filter)
-        if: inputs.target_stage && (steps.filter-api.outputs.sgl_kernel == 'true' || steps.filter.outputs.sgl_kernel == 'true')
+        # Fail only when PR has sgl-kernel changes AND the caller didn't opt into include_wheel_build.
+        # include_wheel_build=true means sgl-kernel-build-wheels will run alongside the target stage
+        # (see the sgl_kernel output and sgl-kernel-build-wheels if-conditions above/below), so it's
+        # safe to proceed.
+        if: inputs.target_stage && !inputs.include_wheel_build && (steps.filter-api.outputs.sgl_kernel == 'true' || steps.filter.outputs.sgl_kernel == 'true')
         run: |
-          echo "::error::Cannot use /rerun-stage when PR has sgl-kernel changes."
-          echo "::error::The sgl-kernel-build-wheels job is skipped in target_stage mode, but this PR modifies sgl-kernel/ files."
-          echo "::error::Please use /tag-and-rerun-ci to run the full workflow including kernel builds."
+          echo "::error::Cannot use /rerun-stage when PR has sgl-kernel changes without include_wheel_build."
+          echo "::error::The sgl-kernel-build-wheels job is skipped in target_stage mode by default, but this PR modifies sgl-kernel/ files."
+          echo "::error::The slash-command handler should have set include_wheel_build=true automatically; falling back to /tag-and-rerun-ci."
           echo ""
-          echo "ERROR: Cannot use /rerun-stage when PR has sgl-kernel changes."
+          echo "ERROR: Cannot use /rerun-stage when PR has sgl-kernel changes without include_wheel_build."
           echo ""
           echo "This PR modifies files in sgl-kernel/, which requires building custom kernel wheels."
-          echo "The /rerun-stage command skips the wheel build job, so the test would run against"
-          echo "the wrong (PyPI) version of sgl-kernel instead of your changes."
+          echo "Running the target stage without rebuilding the kernel would use the wrong (PyPI)"
+          echo "version of sgl-kernel instead of your changes."
           echo ""
-          echo "To properly test your kernel changes, use one of these commands instead:"
+          echo "The /rerun-stage handler sets include_wheel_build=true automatically when it detects"
+          echo "sgl-kernel/ changes on the PR. If you see this error, the handler may be outdated."
+          echo ""
+          echo "Alternatives:"
           echo "  /tag-and-rerun-ci           - Re-run the full workflow including kernel builds"
           echo "  /rerun-ci                   - Re-run the full workflow"
           echo ""
@@ -326,7 +341,7 @@ jobs:
             echo "|-------------------|---------|"
             echo "| main_package      | ${{ steps.filter-api.outputs.main_package || steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }} |"
             echo "| sgl_kernel (raw)  | ${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }} |"
-            echo "| sgl_kernel (used) | ${{ !inputs.target_stage && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }} |"
+            echo "| sgl_kernel (used) | ${{ (!inputs.target_stage || inputs.include_wheel_build) && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }} |"
             echo "| jit_kernel        | ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
             echo "| multimodal_gen    | ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
             echo "| target_stage      | ${{ inputs.target_stage || '(none)' }} |"
@@ -421,8 +436,22 @@ jobs:
 
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
-    # Skip for scheduled runs (they run stages independently) and when target_stage is set
-    if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
+    # Skip for scheduled runs (they run stages independently). Runs in target_stage mode only when
+    # include_wheel_build is true (i.e. /rerun-stage on a PR with sgl-kernel changes), so the
+    # target stage can download the freshly-built wheel.
+    #
+    # `always()` lets us run when call-gate is skipped (which it always is in target_stage mode by
+    # design). The explicit needs.<x>.result checks preserve old gating for the normal PR path.
+    if: |
+      always() &&
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true' &&
+      (
+        (!inputs.target_stage && needs.call-gate.result == 'success') ||
+        (inputs.target_stage && inputs.include_wheel_build)
+      )
     runs-on: x64-kernel-build-node
     timeout-minutes: 240
     strategy:
@@ -469,8 +498,20 @@ jobs:
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
-    # Skip for scheduled runs (they run stages independently) and when target_stage is set
-    if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
+    # Skip for scheduled runs (they run stages independently). Runs in target_stage mode only when
+    # include_wheel_build is true (i.e. /rerun-stage on a PR with sgl-kernel changes).
+    #
+    # See sgl-kernel-build-wheels above for the always() + result-check rationale.
+    if: |
+      always() &&
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true' &&
+      (
+        (!inputs.target_stage && needs.call-gate.result == 'success') ||
+        (inputs.target_stage && inputs.include_wheel_build)
+      )
     runs-on: arm-kernel-build-node
     timeout-minutes: 240
     strategy:
@@ -946,7 +987,7 @@ jobs:
     secrets: inherit
 
   stage-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1004,7 +1045,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1081,7 +1122,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h20:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1142,7 +1183,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1211,7 +1252,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1281,7 +1322,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1340,7 +1381,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-4-gpu-b200-small:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
