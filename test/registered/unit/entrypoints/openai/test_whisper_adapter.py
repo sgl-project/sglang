@@ -167,6 +167,30 @@ class TestWhisperStripSpecialTokens(CustomTestCase):
         )
         self.assertEqual(WhisperAdapter.strip_special_tokens(""), "")
 
+    def test_preserves_spoken_angle_bracket_sequences(self):
+        # The scrub must only remove actual Whisper special-token literals
+        # (lang / control / <|X.XX|> timestamps), not arbitrary ``<|...|>``
+        # patterns that can appear in transcribed speech (someone reading a
+        # token name aloud, an AI-safety demo, code dictation, etc.).
+        self.assertEqual(
+            WhisperAdapter.strip_special_tokens("the token <|foo|> is unused"),
+            "the token <|foo|> is unused",
+        )
+        # Real specials still scrubbed even when interleaved with bogus ones.
+        self.assertEqual(
+            WhisperAdapter.strip_special_tokens(
+                "<|en|>hello <|foo|> world<|endoftext|>"
+            ),
+            "hello <|foo|> world",
+        )
+
+    def test_parse_preserves_spoken_angle_bracket_sequences(self):
+        # Same for the per-chunk scrub inside parse_fused_output.
+        lang, visible = WhisperAdapter.parse_fused_output(
+            "<|en|><|transcribe|><|notimestamps|> look at <|foo|><|endoftext|>"
+        )
+        self.assertEqual((lang, visible), ("en", "look at <|foo|>"))
+
 
 class TestWhisperBuildFusedAutodetectParams(CustomTestCase):
     """build_fused_autodetect_params picks the right regex + propagates ts param."""

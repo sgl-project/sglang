@@ -169,12 +169,40 @@ _FUSED_PREFIX_RE = re.compile(
     + r"(?:<\|notimestamps\|>|<\|0\.00\|>)"
 )
 
-# Matches any Whisper special token (``<|...|>``). Used to scrub trailing
-# ``<|endoftext|>`` and embedded ``<|X.XX|>`` timestamp tokens from the
-# user-visible text in fused-autodetect responses, where
-# ``skip_special_tokens=False`` is needed to preserve the language prefix
-# for parsing but would otherwise leak other special tokens downstream.
-_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]+\|>")
+# Fixed Whisper control tokens (see transformers.models.whisper vocab).
+# <|startoftranscript|> / <|startofprev|> / <|startoflm|> only appear at
+# the decoder prompt and never in generated output, but they are cheap to
+# include and harmless if they ever leak.
+_WHISPER_CONTROL_TOKENS = frozenset(
+    {
+        "endoftext",
+        "startoftranscript",
+        "startofprev",
+        "startoflm",
+        "translate",
+        "transcribe",
+        "notimestamps",
+        "nospeech",
+    }
+)
+
+# Scrubs only actual Whisper special-token literals: language codes
+# (WHISPER_LANG_TOKEN_CODES), control tokens (_WHISPER_CONTROL_TOKENS),
+# and timestamp tokens (<|X.XX|>, where X.XX matches the
+# ``{ts_base + k * 0.02}`` schema the model emits). A broad
+# ``<\|[^|]+\|>`` would eat legitimate spoken content on audio that
+# pronounces angle-bracket / pipe sequences (e.g. someone reading
+# ``<|endoftext|>`` out loud). Used to scrub trailing ``<|endoftext|>``
+# and embedded ``<|X.XX|>`` timestamp tokens from the user-visible text
+# in fused-autodetect responses, where ``skip_special_tokens=False`` is
+# needed to preserve the language prefix for parsing but would otherwise
+# leak other special tokens downstream.
+_SPECIAL_TOKEN_RE = re.compile(
+    r"<\|(?:"
+    + "|".join(sorted(WHISPER_LANG_TOKEN_CODES | _WHISPER_CONTROL_TOKENS))
+    + r"|\d+\.\d{2}"
+    + r")\|>"
+)
 
 
 @register_transcription_adapter("Whisper")
