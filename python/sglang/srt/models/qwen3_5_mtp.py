@@ -131,8 +131,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             and get_global_server_args().quantization is not None
         ):
             # ascend mtp unquant
-            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "1"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
+            os.environ.get("SGLANG_DEEPEP_BF16_DISPATCH")
+            os.environ.get("DEEP_NORMAL_MODE_USE_INT8_QUANT")
+            os.environ.update(
+                {
+                    "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+                    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "0",
+                }
+            )
         assert input_embeds is None
         input_embeds = forward_batch.mm_input_embeds
         if (
@@ -170,8 +176,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             and get_global_server_args().quantization is not None
         ):
             # ascend mtp unquant
-            os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "0"
-            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
+            os.environ.get("SGLANG_DEEPEP_BF16_DISPATCH")
+            os.environ.get("DEEP_NORMAL_MODE_USE_INT8_QUANT")
+            os.environ.update(
+                {
+                    "SGLANG_DEEPEP_BF16_DISPATCH": "0",
+                    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+                }
+            )
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
