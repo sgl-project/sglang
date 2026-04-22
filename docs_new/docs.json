@@ -1158,7 +1158,6 @@
                 "group": "References",
                 "pages": [
                   "docs/sglang-diffusion/environment_variables",
-                  "docs/sglang-diffusion/compatibility_matrix",
                   "docs/sglang-diffusion/support_new_models",
                   "docs/sglang-diffusion/contributing"
                 ]
