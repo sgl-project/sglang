@@ -312,7 +312,7 @@ def prepare_request(
             f"Height and width must be positive, got height={req.height}, width={req.width}"
         )
 
-    if server_args.enable_trace and external_trace_header:
+    if server_args.enable_trace:
         trace_ctx = TraceReqContext(
             rid=sampling_params.request_id,
             module_name="diffusion",
