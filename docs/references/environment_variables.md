@@ -150,6 +150,14 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DISAGG_STAGING_POOL_SIZE_MB` | Decode-side ring buffer pool total size in MB. Shared buffer receiving RDMA data from all prefill ranks. Larger values support higher concurrency. | `4096` |
 | `SGLANG_STAGING_USE_TORCH` | Force using PyTorch gather/scatter fallback instead of Triton fused kernels for staging operations. Useful for debugging. | `false` |
 
+## PD Disaggregation — Layer-Pipelined KV Transfer
+
+| Environment Variable | Description | Default Value |
+| --- | --- | --- |
+| `SGLANG_PIPELINED_KV_TRANSFER` | Enable layer-pipelined KV transfer. Splits prefill into layer groups and transfers KV cache incrementally after each group, overlapping RDMA transfer with GPU compute. Only effective in PD disaggregation prefill mode. | `false` |
+| `SGLANG_PIPELINE_GROUP_SIZE` | Number of layers per pipeline group. For an 80-layer model with group_size=10, prefill runs 8 groups with KV transfer after each. Smaller values increase overlap but add per-group overhead. | `10` |
+| `SGLANG_PIPELINE_MIN_TOKENS` | Minimum average input token length to activate pipelined mode. Batches below this threshold use the normal (non-pipelined) path to avoid overhead on short prompts. | `3072` |
+
 ## Testing & Debugging (Internal/CI)
 
 *These variables are primarily used for internal testing, continuous integration, or debugging.*

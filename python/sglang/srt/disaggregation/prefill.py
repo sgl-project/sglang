@@ -20,7 +20,6 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
-import os
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -391,9 +390,9 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _should_use_pipelined(self: Scheduler, batch) -> bool:
         """Check if the batch should use layer-pipelined KV transfer."""
-        if os.environ.get("SGLANG_PIPELINED_KV_TRANSFER", "0") != "1":
+        if not envs.SGLANG_PIPELINED_KV_TRANSFER.get():
             return False
-        min_tokens = int(os.environ.get("SGLANG_PIPELINE_MIN_TOKENS", "3072"))
+        min_tokens = envs.SGLANG_PIPELINE_MIN_TOKENS.get()
         avg_tokens = sum(req.extend_input_len for req in batch.reqs) // len(batch.reqs)
         return avg_tokens >= min_tokens
 

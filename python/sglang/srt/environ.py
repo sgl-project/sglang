@@ -248,6 +248,12 @@ class Envs:
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
     SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS = EnvInt(0)
+    # Layer-pipelined KV transfer: overlap RDMA transfer with GPU compute
+    # by splitting prefill into layer groups and transferring each group
+    # incrementally. Only effective in PD disaggregation prefill mode.
+    SGLANG_PIPELINED_KV_TRANSFER = EnvBool(False)
+    SGLANG_PIPELINE_GROUP_SIZE = EnvInt(10)
+    SGLANG_PIPELINE_MIN_TOKENS = EnvInt(3072)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

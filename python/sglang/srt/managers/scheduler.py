@@ -3227,7 +3227,7 @@ class Scheduler(
 
         num_layers = self.model_config.num_hidden_layers
         page_size = self.token_to_kv_pool_allocator.page_size
-        group_size = int(os.environ.get("SGLANG_PIPELINE_GROUP_SIZE", "10"))
+        group_size = envs.SGLANG_PIPELINE_GROUP_SIZE.get()
 
         # Prepare KV page indices for all requests (same for every layer)
         req_page_indices_list = []
@@ -4043,7 +4043,7 @@ def dispatch_event_loop(scheduler: Scheduler):
         else:
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
-        if os.environ.get("SGLANG_PIPELINED_KV_TRANSFER", "0") == "1":
+        if envs.SGLANG_PIPELINED_KV_TRANSFER.get():
             logger.info(
                 "Layer-pipelined KV transfer enabled "
                 "(dispatched per-batch in normal event loop)"
