@@ -30,6 +30,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -1090,7 +1091,7 @@ class SchedulerPPMixin:
         next_pp_outputs = None
         d2h_event = None
         batch_result = None
-        send_output_work = None
+        send_output_work = []
 
         def send_output():
             nonlocal send_output_work
@@ -1119,12 +1120,12 @@ class SchedulerPPMixin:
                         d2h_event = torch.cuda.Event()
                         d2h_event.record(torch.cuda.current_stream())
 
-        if self.pp_group.is_last_rank:
-            send_output()
+        if is_npu() and self.pp_size == 2 and self.pp_group.is_first_rank:
             recv_output()
+            send_output()
         else:
-            recv_output()
             send_output()
+            recv_output()
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
