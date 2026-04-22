@@ -191,6 +191,8 @@ async def async_request_image_sglang(
 
         if input.width and input.height:
             payload["size"] = f"{input.width}x{input.height}"
+        if input.num_inference_steps:
+            payload["num_inference_steps"] = input.num_inference_steps
 
         # Merge extra parameters
         payload.update(input.extra_body)
@@ -299,6 +301,8 @@ async def async_request_video_sglang(
             payload["size"] = f"{input.width}x{input.height}"
         if input.num_frames:
             payload["num_frames"] = input.num_frames
+        if input.num_inference_steps:
+            payload["num_inference_steps"] = input.num_inference_steps
         if input.fps:
             payload["fps"] = input.fps
 
@@ -519,6 +523,11 @@ async def benchmark(args):
 
     setattr(args, "task_name", task_name)
 
+    if args.random_request_config and args.dataset != "random":
+        raise ValueError(
+            "--random-request-config can only be used with --dataset random"
+        )
+
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
     elif args.dataset == "random":
@@ -720,6 +729,25 @@ if __name__ == "__main__":
     )
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
+    parser.add_argument(
+        "--random-request-config",
+        type=str,
+        default=None,
+        help=(
+            "JSON string defining random request profiles. "
+            "Each profile may contain: width, height, num_inference_steps, etc. "
+            "The 'weight' field controls sampling probability (relative weight). "
+            "Example: "
+            '[{"width":512,"height":512,"num_inference_steps":20,"weight":0.15},'
+            '{"width":768,"height":768,"num_inference_steps":20,"weight":0.85}]'
+        ),
+    )
+    parser.add_argument(
+        "--random-request-seed",
+        type=int,
+        default=42,
+        help="Random seed for sampling request profiles (default: 42).",
+    )
     parser.add_argument(
         "--num-frames", type=int, default=None, help="Number of frames (for video)."
     )
