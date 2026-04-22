@@ -85,9 +85,7 @@ def is_layer_skipped(
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
     effective_fused = (
-        fused_mapping
-        if proj_name in fused_mapping
-        else _FALLBACK_FUSED_SHARDS
+        fused_mapping if proj_name in fused_mapping else _FALLBACK_FUSED_SHARDS
     )
     if proj_name in effective_fused:
         shard_prefixes = [
@@ -98,8 +96,7 @@ def is_layer_skipped(
         is_skipped = None
         for shard_prefix in shard_prefixes:
             is_shard_skipped = any(
-                _module_path_match(ignored, shard_prefix)
-                for ignored in ignored_layers
+                _module_path_match(ignored, shard_prefix) for ignored in ignored_layers
             )
 
             if is_skipped is None:
