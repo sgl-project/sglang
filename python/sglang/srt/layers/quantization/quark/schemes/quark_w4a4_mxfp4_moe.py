@@ -76,8 +76,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        layer._intermediate_size_per_partition = intermediate_size_per_partition
-
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=_use_aiter,
@@ -95,6 +93,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
 
         params_dtype = torch.uint8
+        layer.inter_dim = intermediate_size_per_partition
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -183,15 +182,13 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             # Weights are stored as torch.uint8 but semantically MXFP4
             layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
 
-        # Determine whether this rank is idle (all-zero expert weights due to
-        # alignment padding, PR#21097). Computed geometrically in O(1) — no
-        # tensor scan needed.
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_moe_tensor_parallel_rank()
-        first_idle_rank = get_mxfp4_first_idle_rank(
-            layer._intermediate_size_per_partition, tp_size, is_aiter_moe=True
-        )
-        layer.is_idle_rank = tp_rank >= first_idle_rank
+        if _use_aiter:
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_moe_tensor_parallel_rank()
+            first_idle_rank = get_mxfp4_first_idle_rank(
+                layer.inter_dim, tp_size, True
+            )
+            layer.is_idle_rank = tp_rank >= first_idle_rank
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

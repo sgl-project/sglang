@@ -361,7 +361,7 @@ TRITON_PADDING_SIZE = 128
 align_moe = lambda n, alignment: ((n + alignment - 1) // alignment) * alignment
 
 
-def get_moe_padding_size(is_aiter_moe):
+def get_moe_padding_size(is_aiter_moe: bool):
     if is_aiter_moe:
         return AITER_PADDING_SIZE
     else:
@@ -372,7 +372,12 @@ def get_moe_padding_size(is_aiter_moe):
         )
 
 
-def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
+def get_moe_weight_sizes(
+    inter_dim: int,
+    is_concat: bool,
+    is_packed: bool,
+    is_aiter_moe: bool,
+):
     w13_up_dim = 2 * inter_dim if is_concat else inter_dim
     w2_down_dim = inter_dim // 2 if is_packed else inter_dim
 
@@ -391,7 +396,11 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
 
 
-def get_mxfp4_first_idle_rank(inter_dim: int, tp_size: int, is_aiter_moe: bool) -> int:
+def get_mxfp4_first_idle_rank(
+    inter_dim: int,
+    tp_size: int,
+    is_aiter_moe: bool,
+):
     if not is_aiter_moe or tp_size < 2:
         return tp_size
 
@@ -404,10 +413,6 @@ def get_mxfp4_first_idle_rank(inter_dim: int, tp_size: int, is_aiter_moe: bool) 
     total_real = w2_down_dim * tp_size
     first_idle = (total_real + w2_down_dim_padded - 1) // w2_down_dim_padded
     return min(first_idle, tp_size)
-
-
-def has_mxfp4_idle_ranks(inter_dim: int, tp_size: int, is_aiter_moe: bool) -> bool:
-    return get_mxfp4_first_idle_rank(inter_dim, tp_size, is_aiter_moe) < tp_size
 
 
 def get_shared_expert_tp_params(
