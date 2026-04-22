@@ -2104,24 +2104,7 @@ class NativeSparseAttnBackend(
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
-        out = torch.empty(
-            (batch_size, num_heads, self.kv_lora_rank),
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
-        out_kernel = out
-        if forward_batch.forward_mode.is_extend_without_speculative():
-            # Piecewise CUDA graph pads tensors (q, block_tables) to static_num_tokens
-            # but seq_lens covers only the real batch. Slice to real tokens to avoid
-            # invalid block index accesses on padding rows.
-            # out is kept at full batch_size for the caller; out_kernel is the slice the kernel writes into.
-            real_batch_size = seq_lens.shape[0]
-            if real_batch_size < batch_size:
-                q = q[:real_batch_size]
-                block_tables = block_tables[:real_batch_size]
-                out_kernel = out[:real_batch_size]
-
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv,
             workspace_buffer=self.workspace_buffer,
@@ -2132,7 +2115,6 @@ class NativeSparseAttnBackend(
             seq_lens=seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.nsa_index_topk,
-            out=out_kernel,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
