@@ -88,25 +88,13 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             if hasattr(batch, "extra")
             else ""
         )
-        if (
-            pipeline is not None
-            and getattr(pipeline, "_use_premerged_stage2_transformer", False)
-            and server_args.dit_cpu_offload
-            and not server_args.use_fsdp_inference
-            and current_phase == "stage2"
-        ):
-            release_to_snapshots = getattr(
-                pipeline, "release_premerged_transformers_to_cpu_snapshots", None
-            )
-            if callable(release_to_snapshots):
-                release_to_snapshots()
-            else:
-                for dit in filter(None, [self.transformer]):
-                    param = next(dit.parameters(), None)
-                    if param is not None and param.device.type == "cuda":
-                        dit.to("cpu")
-                if torch.get_device_module().is_available():
-                    torch.get_device_module().empty_cache()
+        release_phase_state = (
+            getattr(pipeline, "release_ltx2_phase_state", None)
+            if pipeline is not None
+            else None
+        )
+        if callable(release_phase_state):
+            release_phase_state(current_phase)
 
         if isinstance(self.transformer, OffloadableDiTMixin):
             for manager in self.transformer.layerwise_offload_managers:

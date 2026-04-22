@@ -98,7 +98,7 @@ class DPBudget:
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
 
-    def dispatch(self, method: LoadBalanceMethod):
+    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
@@ -112,6 +112,7 @@ class DPBudget:
 
         # Increment the load of that worker by one as a heuristic
         self.total_requests[target_rank] += 1
+        self.total_tokens[target_rank] += estimated_tokens
         return target_rank
 
 
@@ -558,16 +559,6 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        # Set default bootstrap_room if in FAKE auto mode and room is None
-        if (
-            req.bootstrap_room is None
-            and self.server_args.disaggregation_transfer_backend == "fake"
-        ):
-            req.bootstrap_room = self.round_robin_counter
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
-
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
@@ -584,7 +575,10 @@ class DataParallelController:
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
+        estimated_tokens = len(req.input_ids)
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+        )
         self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
