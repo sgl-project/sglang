@@ -780,6 +780,7 @@ def aiter_w8a8_block_fp8_linear(
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
     else:
+        # TODO(1am9trash), to deal with chance of this branch changes
         gemm_a8w8_blockscale_op = gemm_a8w8_blockscale_bpreshuffle
 
     output = gemm_a8w8_blockscale_op(

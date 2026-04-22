@@ -510,12 +510,13 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.data = weight_scale.data
 
         if (
-            _use_aiter
-            and _use_aiter_gfx95
+            _use_aiter_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
             n, k = layer.weight.shape
             if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
+                # TODO(1am9trash), to deal with case that this branch chance
+                # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
                 del t
