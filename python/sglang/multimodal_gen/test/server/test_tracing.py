@@ -105,20 +105,20 @@ def test_spans_exported(tracing_env):
         ), f"Missing span '{expected}'. Collected: {sorted(span_names)}"
 
 
-def test_no_spans_without_traceparent(tracing_env):
-    """Requests without a traceparent header should not produce spans."""
+def test_spans_without_traceparent(tracing_env):
+    """Requests without a traceparent header still produce spans as a new
+    root trace (not linked to any upstream)."""
     collector, _ = tracing_env
     collector.clear()
 
     _generate_image()
+    _wait_for_spans(collector, required_names=EXPECTED_DIFF_SPANS)
 
-    # Give some time for any spans to arrive
-    time.sleep(3)
-
-    assert collector.count_spans() == 0, (
-        f"Expected no spans without traceparent, but got: "
-        f"{sorted(collector.get_span_names())}"
-    )
+    span_names = collector.get_span_names()
+    for expected in EXPECTED_DIFF_SPANS:
+        assert (
+            expected in span_names
+        ), f"Missing span '{expected}'. Collected: {sorted(span_names)}"
 
 
 def test_batch_requests(tracing_env):
