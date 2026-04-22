@@ -86,10 +86,14 @@ def normalize_language_to_code(language: Optional[str]) -> Optional[str]:
 
     Args:
         language: Language as full name (e.g., 'English', 'Spanish') or
-                  ISO 639-1 code (e.g., 'en', 'es')
+                  ISO 639-1 code (e.g., 'en', 'es'). Three-letter Whisper
+                  codes the model supports but that aren't in
+                  ISO639_1_SUPPORTED_LANGS (e.g., 'yue', 'haw', 'jw') are
+                  also accepted so that a code returned by fused autodetect
+                  round-trips cleanly when reused as ``language=`` later.
 
     Returns:
-        ISO 639-1 code or None if input is None
+        Whisper language code or None if input is None
     """
     if language is None:
         return None
@@ -103,6 +107,18 @@ def normalize_language_to_code(language: Optional[str]) -> Optional[str]:
     # Check if it's a full language name
     if language_lower in LANG_NAME_TO_CODE:
         return LANG_NAME_TO_CODE[language_lower]
+
+    # Fused autodetect's FSM regex covers the full Whisper language-token
+    # vocab (see WHISPER_LANG_TOKEN_CODES), which is wider than the
+    # English-name-keyed ISO639_1_SUPPORTED_LANGS dict. Accept any code in
+    # that wider set too so that detection -> reuse-as-input round-trips.
+    # Lazy import to avoid top-level cycle with the openai entrypoint.
+    from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
+        WHISPER_LANG_TOKEN_CODES,
+    )
+
+    if language_lower in WHISPER_LANG_TOKEN_CODES:
+        return language_lower
 
     # Not recognized
     raise ValueError(

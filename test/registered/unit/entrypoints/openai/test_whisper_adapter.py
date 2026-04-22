@@ -149,6 +149,19 @@ class TestWhisperLangTokenCoverage(CustomTestCase):
             self.assertIn(re.escape(code), WHISPER_AUTODETECT_REGEX)
             self.assertIn(re.escape(code), WHISPER_AUTODETECT_TS_REGEX)
 
+    def test_autodetect_codes_round_trip_through_input_validator(self):
+        # A code returned by fused autodetect must be accepted as
+        # ``language=`` on a follow-up request. Before the fix,
+        # ``normalize_language_to_code("yue")`` raised ValueError even
+        # though verbose_json could report ``"yue"`` from the same server.
+        from sglang.srt.multimodal.processors.whisper import (
+            normalize_language_to_code,
+        )
+
+        for code in ("yue", "haw", "jw", "ba", "su", "tt"):
+            with self.subTest(lang=code):
+                self.assertEqual(normalize_language_to_code(code), code)
+
 
 class TestWhisperStripSpecialTokens(CustomTestCase):
     """Fallback scrub used when parse_fused_output defers."""
