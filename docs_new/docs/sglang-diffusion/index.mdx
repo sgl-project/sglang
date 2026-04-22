@@ -2,27 +2,20 @@
 title: SGLang Diffusion
 description: Accelerated image and video generation with diffusion models.
 ---
+SGLang Diffusion is a high-performance inference framework for image and video generation. It provides native SGLang pipelines, diffusers backend support, an OpenAI-compatible server, and an optimized kernel stack built on both precompiled `sgl-kernel` operators and JIT kernels for key inference paths.
 
-SGLang Diffusion is an inference framework for accelerated image and video generation using diffusion models. It provides an end-to-end unified pipeline with optimized kernels and an efficient scheduler loop.
+## Key Features
 
-## Key features
+- Broad model support across Wan, Hunyuan, Qwen-Image, FLUX, Z-Image, GLM-Image, and more
+- Fast inference with `sgl-kernel`, JIT kernels, scheduler improvements, and caching acceleration
+- Multiple interfaces: `sglang generate`, `sglang serve`, and an OpenAI-compatible API
+- Multi-platform support for NVIDIA, AMD, Intel XPU, Ascend, Apple Silicon, and Moore Threads
 
-* **Broad model support:** Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image, and more
-* **Fast inference:** optimized kernels, efficient scheduler loop, and Cache-DiT acceleration
-* **Ease of use:** OpenAI-compatible API, CLI, and Python SDK
-* **Multi-platform:** NVIDIA GPUs (H100, H200, A100, B200, 4090), AMD GPUs (MI300X, MI325X), and Ascend NPU (A2, A3)
-
-## Quick start
-
-1. **Install SGLang Diffusion**
+## Quick Start
 
 ```bash
 uv pip install "sglang[diffusion]" --prerelease=allow
 ```
-
-See the [installation guide](./installation) for more installation methods and ROCm-specific instructions.
-
-2. **Run a one-off generation**
 
 ```bash
 sglang generate --model-path Qwen/Qwen-Image \
@@ -30,36 +23,33 @@ sglang generate --model-path Qwen/Qwen-Image \
   --save-output
 ```
 
-3. **Serve with the OpenAI-compatible API**
-
 ```bash
 sglang serve --model-path Qwen/Qwen-Image --port 30010
 ```
 
-## CLI quick reference
+## Start Here
 
-### Generate (one-off generation)
+- [Installation](/docs/sglang-diffusion/installation): install SGLang Diffusion and platform dependencies
+- [Compatibility Matrix](/docs/sglang-diffusion/compatibility_matrix): check model, optimization, and component override support
+- [CLI](/docs/sglang-diffusion/api/cli): run one-off generation jobs or launch a persistent server
+- [OpenAI-Compatible API](/docs/sglang-diffusion/api/openai_api): send image and video requests to the HTTP server
+- [Attention Backends](/docs/sglang-diffusion/attention_backends): choose the best backend for your model and hardware
+- [Caching Acceleration](/docs/sglang-diffusion/caching-acceleration): use Cache-DiT or TeaCache to reduce denoising cost
+- [Quantization](/docs/sglang-diffusion/quantization): load quantized transformer checkpoints
+- [Contributing](/docs/sglang-diffusion/contributing): contribution workflow, adding new models, and CI perf baselines
 
-```bash
-sglang generate --model-path <MODEL> --prompt "<PROMPT>" --save-output
-```
+## Additional Documentation
 
-### Serve (HTTP server)
-
-```bash
-sglang serve --model-path <MODEL> --port 30010
-```
-
-### Enable Cache-DiT acceleration
-
-```bash
-SGLANG_CACHE_DIT_ENABLED=true sglang generate --model-path <MODEL> --prompt "<PROMPT>"
-```
+- [Post-Processing](/docs/sglang-diffusion/api/post_processing): frame interpolation and upscaling
+- [Performance Overview](/docs/sglang-diffusion/performance-optimization): overview of attention, caching, and profiling
+- [Environment Variables](/docs/sglang-diffusion/environment_variables): platform, caching, storage, and debugging configuration
+- [Support New Models](/docs/sglang-diffusion/support_new_models): implementation guide for new diffusion pipelines
+- [CI Performance](/docs/sglang-diffusion/ci_perf): performance baseline generation
 
 ## References
 
-* [SGLang GitHub](https://github.com/sgl-project/sglang)
-* [Cache-DiT](https://github.com/vipshop/cache-dit)
-* [FastVideo](https://github.com/hao-ai-lab/FastVideo)
-* [xDiT](https://github.com/xdit-project/xDiT)
-* [Diffusers](https://github.com/huggingface/diffusers)
+- [SGLang GitHub](https://github.com/sgl-project/sglang)
+- [Cache-DiT](https://github.com/vipshop/cache-dit)
+- [FastVideo](https://github.com/hao-ai-lab/FastVideo)
+- [xDiT](https://github.com/xdit-project/xDiT)
+- [Diffusers](https://github.com/huggingface/diffusers)

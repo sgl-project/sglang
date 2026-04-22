@@ -1,113 +1,8 @@
 #include "common.h"
 #include "gemm.h"
-#include "vec.h"
+#include "moe.h"
 
 namespace {
-
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-// no remainder
-#pragma GCC unroll 4
-  for (int64_t d = 0; d < size; d += Vec::size()) {
-    Vec data = Vec::loadu(input + d);
-    data.store(out + d);
-  }
-}
-
-template <>
-inline void copy_stub<uint8_t>(uint8_t* __restrict__ out, const uint8_t* __restrict__ input, int64_t size) {
-  // size might be 64x + 32
-  std::memcpy(out, input, size * sizeof(uint8_t));
-}
-
-template <typename scalar_t>
-inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec weight_vec = fVec(weight);
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d) * weight_vec;
-    fVec data1 = fVec::loadu(input + d + fVec::size()) * weight_vec;
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] * weight);
-  }
-}
-
-// acc from [topk, K] to [K]
-template <typename scalar_t>
-inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  if (topk == 1) {
-    // do copy for topk = 1
-    copy_stub(out, input, K);
-  } else {
-    // do sum for topk != 1
-    int64_t d;
-#pragma GCC unroll 4
-    for (d = 0; d <= K - kVecSize; d += kVecSize) {
-      fVec sum_fvec0 = fVec(0.f);
-      fVec sum_fvec1 = fVec(0.f);
-      for (int t = 0; t < topk; ++t) {
-        bVec x_bvec = bVec::loadu(input + t * K + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-
-        sum_fvec0 += x_fvec0;
-        sum_fvec1 += x_fvec1;
-      }
-      bVec out_bvec = convert_from_float_ext<scalar_t>(sum_fvec0, sum_fvec1);
-      out_bvec.store(out + d);
-    }
-    for (; d < K; ++d) {
-      float sum_val = 0.f;
-      for (int t = 0; t < topk; ++t) {
-        sum_val += static_cast<float>(input[t * K + d]);
-      }
-      out[d] = static_cast<scalar_t>(sum_val);
-    }
-  }
-}
-
-// out = input + input2 * scale
-template <typename scalar_t>
-inline void add_mul_stub(
-    scalar_t* __restrict__ out,
-    const float* __restrict__ input,
-    const scalar_t* __restrict__ input2,
-    float scale,
-    int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec s_vec = fVec(scale);
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec x0 = fVec::loadu(input + d);
-    fVec x1 = fVec::loadu(input + d + fVec::size());
-
-    bVec y_bvec = bVec::loadu(input2 + d);
-    fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
-
-    x0 = x0 + y0 * s_vec;
-    x1 = x1 + y1 * s_vec;
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] + float(input2[d]) * scale);
-  }
-}
 
 template <typename scalar_t, int BLOCK_N>
 inline void silu_and_mul(
@@ -885,6 +780,7 @@ void shared_expert_int8_kernel_impl(
   const int64_t stride_n = packed_K;
 
   const bool use_brgemm = can_use_brgemm<int8_t>(M);
+  const bool apply_scaling_factor = fused_experts_out != nullptr;
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
@@ -1034,9 +930,11 @@ void shared_expert_int8_kernel_impl(
 
       // 2.b copy from C to output and add fused_experts_out
       scalar_t* __restrict__ out = output + mb * BLOCK_M * K + nb * BLOCK_N;
-      const scalar_t* __restrict__ fused_out = fused_experts_out + mb * BLOCK_M * K + nb * BLOCK_N;
+      const scalar_t* __restrict__ fused_out =
+          apply_scaling_factor ? fused_experts_out + mb * BLOCK_M * K + nb * BLOCK_N : nullptr;
       for (int64_t m = 0; m < m_size; ++m) {
-        add_mul_stub(out + m * K, C + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, n_size);
+        const scalar_t* __restrict__ fused_out_row = apply_scaling_factor ? (fused_out + m * K) : nullptr;
+        add_mul_stub(out + m * K, C + m * BLOCK_N, fused_out_row, routed_scaling_factor, n_size);
       }
     });
 

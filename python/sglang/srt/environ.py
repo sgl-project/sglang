@@ -533,8 +533,8 @@ class Envs:
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
-    # Tokenizer
-    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+    # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
+    SGLANG_PATCH_TOKENIZER = EnvBool(True)
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)

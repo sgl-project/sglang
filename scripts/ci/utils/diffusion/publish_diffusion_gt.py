@@ -39,12 +39,12 @@ else:
 REPO_OWNER = "sglang-bot"
 REPO_NAME = "sglang-ci-data"
 BRANCH = "main"
-TARGET_DIR = "diffusion-ci/consistency_gt"
+DEFAULT_TARGET_DIR = "diffusion-ci/consistency_gt"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
-def collect_images(source_dir):
+def collect_images(source_dir, target_dir):
     """Collect image files from source_dir and return list of (repo_path, content) tuples."""
     files = []
     for entry in sorted(os.listdir(source_dir)):
@@ -56,24 +56,25 @@ def collect_images(source_dir):
             continue
         with open(full_path, "rb") as f:
             content = f.read()
-        repo_path = f"{TARGET_DIR}/{entry}"
+        repo_path = f"{target_dir}/{entry}"
         files.append((repo_path, content))
     return files
 
 
-def publish(source_dir):
+def publish(source_dir, target_dir=None):
+    target_dir = target_dir or DEFAULT_TARGET_DIR
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         print("Error: GITHUB_TOKEN environment variable not set")
         sys.exit(1)
 
-    files_to_upload = collect_images(source_dir)
+    files_to_upload = collect_images(source_dir, target_dir)
     if not files_to_upload:
         print(f"No image files found in {source_dir}")
         return
 
     print(
-        f"Found {len(files_to_upload)} image(s) to upload to {REPO_OWNER}/{REPO_NAME}/{TARGET_DIR}"
+        f"Found {len(files_to_upload)} image(s) to upload to {REPO_OWNER}/{REPO_NAME}/{target_dir}"
     )
 
     # Verify token
@@ -158,8 +159,14 @@ def main():
     parser.add_argument(
         "--source-dir", required=True, help="Directory containing GT images"
     )
+    parser.add_argument(
+        "--target-dir",
+        required=False,
+        default=None,
+        help=f"Target directory in the remote repo (default: {DEFAULT_TARGET_DIR})",
+    )
     args = parser.parse_args()
-    publish(args.source_dir)
+    publish(args.source_dir, args.target_dir)
 
 
 if __name__ == "__main__":
