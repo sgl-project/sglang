@@ -2686,11 +2686,20 @@ class Scheduler(
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
+            mamba_pool = getattr(self.tree_cache.req_to_token_pool, "mamba_pool", None)
+            old_mamba_available = (
+                mamba_pool.available_size() if mamba_pool is not None else None
+            )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
+            mamba_num_gained = (
+                mamba_pool.available_size() - old_mamba_available
+                if mamba_pool is not None
+                else None
+            )
 
             self.num_retracted_reqs = len(retracted_reqs)
             if self.enable_metrics and len(retracted_reqs) > 0:
@@ -2720,6 +2729,8 @@ class Scheduler(
                 else "Testing retraction. "
             )
             msg_details = f"#retracted_reqs: {len(retracted_reqs)}, #new_tokens_gained: {new_token_gained}"
+            if mamba_num_gained is not None:
+                msg_details += f", #mamba_num_gained: {mamba_num_gained}"
             if kv_full_retract_flag:
                 msg_details += (
                     f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
