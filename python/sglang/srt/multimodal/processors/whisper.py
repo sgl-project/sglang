@@ -149,6 +149,15 @@ class WhisperProcessor(BaseMultimodalProcessor):
         # Check if this is a fused auto-detect request (decoder prompt = [SOT] only,
         # structured generation handles the rest via regex constraint).
         detect_language = self._pop_sampling_param(request_obj, "_detect_language")
+        # timestamp_granularities is a transcription-level field; it must be
+        # popped in both branches or it leaks into SamplingParams(**kwargs)
+        # downstream and TypeErrors. In the fused branch the FSM regex was
+        # already picked in build_fused_autodetect_params based on this value,
+        # so we only need to keep it here to pick the timestamp_token_id for
+        # the explicit-language branch.
+        timestamp_granularities = self._pop_sampling_param(
+            request_obj, "timestamp_granularities"
+        )
 
         audios = [load_audio(audio) for audio in audio_data]
 
@@ -182,9 +191,6 @@ class WhisperProcessor(BaseMultimodalProcessor):
                 self._pop_sampling_param(request_obj, "language")
             )
             language_token_id = self._get_language_token_id(language)
-            timestamp_granularities = self._pop_sampling_param(
-                request_obj, "timestamp_granularities"
-            )
 
             transcribe_token_id = self._tokenizer.convert_tokens_to_ids(
                 "<|transcribe|>"

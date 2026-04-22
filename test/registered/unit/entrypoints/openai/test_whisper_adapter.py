@@ -181,6 +181,21 @@ class TestWhisperBuildFusedAutodetectParams(CustomTestCase):
         self.assertEqual(params["regex"], WHISPER_AUTODETECT_REGEX)
         self.assertNotIn("timestamp_granularities", params)
 
+    def test_fused_params_survive_sampling_params_construction(self):
+        # Regression: the multimodal processor's fused branch used to skip
+        # popping `timestamp_granularities`, leaking the key into
+        # SamplingParams(**kwargs) → TypeError on any language=None +
+        # timestamp_granularities request. Mirrors what the processor does
+        # before constructing SamplingParams.
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        req = self._request(timestamp_granularities=["segment"])
+        params = WhisperAdapter().build_fused_autodetect_params(req)
+        # Fields the processor pops before SamplingParams(**kwargs).
+        params.pop("_detect_language", None)
+        params.pop("timestamp_granularities", None)
+        SamplingParams(**params)
+
 
 if __name__ == "__main__":
     unittest.main()
