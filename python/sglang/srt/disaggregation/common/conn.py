@@ -14,6 +14,7 @@ import numpy.typing as npt
 import requests
 import zmq
 from aiohttp import web
+from requests.adapters import HTTPAdapter
 
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
@@ -42,6 +43,43 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Process-wide pool of long-lived requests.Sessions keyed by bootstrap_addr.
+#
+# Decode workers poll the prefill bootstrap server very frequently
+# (`/route` and `/query_dp_ranks`). With one `requests.{get,post}` call per
+# poll the kernel opens a fresh TCP connection every time, which on a busy
+# host quickly exhausts the ephemeral source-port range against a single
+# (dst_ip, dst_port) tuple and surfaces as
+# `[Errno 99] Cannot assign requested address` from `connect(2)`.
+#
+# Using a Session with a sized HTTPAdapter enables HTTP keep-alive and a real
+# connection pool, so all DP ranks on a host share a small number of
+# persistent TCP connections to each bootstrap server instead of burning
+# through (and TIME_WAITing) a new ephemeral port per request.
+_BOOTSTRAP_HTTP_SESSIONS: Dict[str, requests.Session] = {}
+_BOOTSTRAP_HTTP_SESSIONS_LOCK = threading.Lock()
+
+
+def _get_bootstrap_http_session(bootstrap_addr: str) -> requests.Session:
+    """Return a process-wide keep-alive Session for the given bootstrap_addr."""
+    session = _BOOTSTRAP_HTTP_SESSIONS.get(bootstrap_addr)
+    if session is not None:
+        return session
+    with _BOOTSTRAP_HTTP_SESSIONS_LOCK:
+        session = _BOOTSTRAP_HTTP_SESSIONS.get(bootstrap_addr)
+        if session is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(
+                pool_connections=32,
+                pool_maxsize=128,
+                pool_block=False,
+            )
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            _BOOTSTRAP_HTTP_SESSIONS[bootstrap_addr] = session
+    return session
 
 
 @dataclasses.dataclass
@@ -627,7 +665,8 @@ class CommonKVReceiver(BaseKVReceiver):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
-            response = requests.get(url, timeout=5)
+            session = _get_bootstrap_http_session(self.bootstrap_addr)
+            response = session.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
                 return bootstrap_info
@@ -647,7 +686,8 @@ class CommonKVReceiver(BaseKVReceiver):
         """Batch query prefill dp_ranks for given bootstrap_rooms."""
         try:
             url = f"http://{bootstrap_addr}/query_dp_ranks"
-            response = requests.post(
+            session = _get_bootstrap_http_session(bootstrap_addr)
+            response = session.post(
                 url,
                 json={"bootstrap_rooms": bootstrap_rooms},
                 timeout=5,
