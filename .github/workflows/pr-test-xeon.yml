@@ -84,6 +84,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and Push
         run: |
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
@@ -94,7 +97,7 @@ jobs:
           docker build \
             ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
             ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
-            . -f docker/xeon.Dockerfile  -t sglang_xeon --no-cache
+            --no-cache --progress=plain -f docker/xeon.Dockerfile -t sglang_xeon .
 
       - name: Run container
         run: |
