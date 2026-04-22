@@ -538,6 +538,7 @@ class ServerArgs:
         "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
+    record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
@@ -5406,6 +5407,14 @@ class ServerArgs:
             choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
+        )
+        parser.add_argument(
+            "--record-nolora-graph",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.record_nolora_graph,
+            help="Capture a second set of CUDA graphs without LoRA hooks. "
+            "Batches without active adapters replay the faster nolora graph. "
+            "Enabled by default.",
         )
         parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
