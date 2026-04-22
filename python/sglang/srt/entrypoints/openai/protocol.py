@@ -617,6 +617,11 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+    # Per-request override for the post-inference unclosed-reasoning recovery
+    # (Fallback B). When None, the server-side default (controlled by the
+    # `--auto-recover-unclosed-reasoning` CLI flag) is used. Set to True/False
+    # to override per request.
+    recover_unclosed_reasoning: Optional[bool] = None
 
     # SGLang multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None

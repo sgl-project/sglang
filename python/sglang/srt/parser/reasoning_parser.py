@@ -52,6 +52,21 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
+    def _strip_leading_think_end_tokens(self, text: str) -> str:
+        """Aggressively remove leading think_end tokens from a normal_text segment.
+
+        Useful when speculative decoding (or the reasoning-EOS redirect logit
+        processor) accidentally produces duplicate think_end tokens at the
+        boundary between reasoning and answer. Only leading occurrences are
+        stripped — any think_end that appears mid-content is left untouched.
+        """
+        if not text or not self.think_end_token:
+            return text
+        stripped = text.lstrip()
+        while stripped.startswith(self.think_end_token):
+            stripped = stripped[len(self.think_end_token) :].lstrip()
+        return stripped
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses reasoning sections in the provided text.
@@ -92,7 +107,7 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in processed_text:
             splits = processed_text.split(self.think_end_token, maxsplit=1)
             reasoning_text = splits[0]
-            normal_text = splits[1].strip()
+            normal_text = self._strip_leading_think_end_tokens(splits[1].strip())
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
@@ -140,7 +155,9 @@ class BaseReasoningFormatDetector:
 
             self._buffer = ""
             self._in_reasoning = False
-            normal_text = current_text[end_idx + len(self.think_end_token) :]
+            normal_text = self._strip_leading_think_end_tokens(
+                current_text[end_idx + len(self.think_end_token) :]
+            )
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
@@ -169,7 +186,9 @@ class BaseReasoningFormatDetector:
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
             self._buffer = ""
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(
+                normal_text=self._strip_leading_think_end_tokens(current_text)
+            )
 
         return StreamingParseResult()
 
