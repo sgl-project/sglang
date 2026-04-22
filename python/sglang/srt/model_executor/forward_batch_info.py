@@ -586,7 +586,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
             ):
-                ret._compute_spec_mrope_positions(model_runner, batch)
+                ret.compute_spec_mrope_positions(model_runner, batch)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
@@ -695,7 +695,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_lens=req_lens,
         )
 
-    def _compute_spec_mrope_positions(
+    def compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
         # TODO support batched deltas
