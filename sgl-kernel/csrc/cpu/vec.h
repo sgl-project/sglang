@@ -7,6 +7,8 @@
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
 
+#include "common.h"
+
 namespace {
 
 using namespace at::vec;
