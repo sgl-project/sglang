@@ -1180,10 +1180,14 @@ def gluon_extend_attention_fwd(
     )
     _is_ragged = _is_ragged_ext or _is_ragged_pfx
 
-    # FP8 KV + ragged on WCA persistent has ~10% per-element error
-    # (BM=256 masked-tail x FP8 MFMA accumulation order); keep FP8 het
-    # batches on the basic path until fixed.
-    if _kv_is_fp8 and not _is_uniform:
+    # FP8 KV + ragged + short-extend (max_ext<=64): basic per-batch grid
+    # beats WCA persistent by ~0.9x on these decode-ish shapes (the
+    # BM>=128 persistent tile has too much per-seq overhead when each
+    # seq contributes <2 rows). WCA is otherwise numerically equivalent
+    # to basic on Triton 3.7 (verified to <0.1% per-element jitter on 8
+    # ragged shapes spanning D={64,128} and B={4,8,16}; the older
+    # ~10% per-element error observation was a stale Triton issue).
+    if _kv_is_fp8 and not _is_uniform and max_len_extend <= 64:
         _is_ragged = False
 
     # D=128 B<=4: every WCA clause requires B>=5 so short-circuit.
