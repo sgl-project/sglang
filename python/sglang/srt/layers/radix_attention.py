@@ -179,7 +179,7 @@ def unified_attention_with_output(
     if llama_4_scaling is not None:
         kwargs["llama_4_scaling"] = llama_4_scaling
     if topk_indices is not None:
-        kwargs["topk_indices"] = topk_indices
+        kwargs["topk_indices"] = topk_indices[:real_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
