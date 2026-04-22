@@ -976,7 +976,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     encoder_attention_mask=negative_encoder_attention_mask,
                 ),
             ]
-            if need_perturbed:
+            if not use_cfg_pair_batch and need_perturbed:
                 pass_specs.append(
                     LTX2GuidancePassSpec(
                         name="perturbed",
@@ -991,7 +991,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         ),
                     )
                 )
-            if need_modality:
+            if not use_cfg_pair_batch and need_modality:
                 pass_specs.append(
                     LTX2GuidancePassSpec(
                         name="modality",
@@ -1032,7 +1032,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     [pass_spec.encoder_attention_mask for pass_spec in pass_specs]
                 ),
             )
-            if use_split_two_stage_ti2v_guider or not use_cfg_pair_batch:
+            if use_split_two_stage_ti2v_guider:
                 split_sizes = [1] * expanded_batch_size
                 batched_video_chunks = []
                 batched_audio_chunks = []
@@ -1084,6 +1084,53 @@ class LTX2DenoisingStage(DenoisingStage):
             v_neg, a_v_neg = pass_outputs["neg"]
             v_ptb, a_v_ptb = pass_outputs.get("perturbed", (None, None))
             v_mod, a_v_mod = pass_outputs.get("modality", (None, None))
+
+            if use_cfg_pair_batch:
+                v_ptb = None
+                a_v_ptb = None
+                if need_perturbed:
+                    with set_forward_context(
+                        current_timestep=step.step_index,
+                        attn_metadata=step.attn_metadata,
+                    ):
+                        v_ptb, a_v_ptb = step.current_model(
+                            **self._build_ltx2_model_kwargs(
+                                ctx,
+                                base_model_kwargs,
+                                encoder_hidden_states=encoder_hidden_states,
+                                audio_encoder_hidden_states=audio_encoder_hidden_states,
+                                encoder_attention_mask=encoder_attention_mask,
+                                skip_video_self_attn_blocks=tuple(
+                                    stage1_guider_params["video_stg_blocks"]
+                                ),
+                                skip_audio_self_attn_blocks=tuple(
+                                    stage1_guider_params["audio_stg_blocks"]
+                                ),
+                            )
+                        )
+                    v_ptb = v_ptb.float()
+                    a_v_ptb = a_v_ptb.float()
+
+                v_mod = None
+                a_v_mod = None
+                if need_modality:
+                    with set_forward_context(
+                        current_timestep=step.step_index,
+                        attn_metadata=step.attn_metadata,
+                    ):
+                        v_mod, a_v_mod = step.current_model(
+                            **self._build_ltx2_model_kwargs(
+                                ctx,
+                                base_model_kwargs,
+                                encoder_hidden_states=encoder_hidden_states,
+                                audio_encoder_hidden_states=audio_encoder_hidden_states,
+                                encoder_attention_mask=encoder_attention_mask,
+                                disable_a2v_cross_attn=True,
+                                disable_v2a_cross_attn=True,
+                            )
+                        )
+                    v_mod = v_mod.float()
+                    a_v_mod = a_v_mod.float()
 
         sigma_val = float(sigma.item())
         video_sigma_for_x0: float | torch.Tensor = sigma_val
