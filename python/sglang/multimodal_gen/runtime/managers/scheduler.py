@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GetDisaggStatsReq,
@@ -112,6 +113,7 @@ class Scheduler(SchedulerDisaggMixin):
             ShutdownReq: self._handle_shutdown,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+            UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 
@@ -176,6 +178,21 @@ class Scheduler(SchedulerDisaggMixin):
             flush_cache=req.flush_cache,
             target_modules=req.target_modules,
         )
+        return OutputBatch(
+            output={"success": success, "message": message},
+            error=None if success else message,
+        )
+
+    def _handle_update_weights_from_tensor(self, reqs: List[Any]) -> OutputBatch:
+        """Handle update_weights_from_tensor request for RL workflows."""
+        req = reqs[0]
+        success, message = self.worker.update_weights_from_tensor(req)
+
+        if self.server_args.tp_size > 1:
+            import torch
+
+            torch.distributed.barrier(group=self.worker.tp_cpu_group)
+
         return OutputBatch(
             output={"success": success, "message": message},
             error=None if success else message,
