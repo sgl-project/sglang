@@ -489,40 +489,104 @@ DEEPEP_SUITES = {
 }
 
 
+MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
+
+MULTIMODAL_PATH_TO_RUNNER = {
+    "2_gpu": "2-gpu-h100",
+    "2-gpu": "2-gpu-h100",
+}
+MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
+
+
 def resolve_test_file(file_part):
     """
-    Resolve a user-provided file path to a path relative to test/.
+    Resolve a user-provided file path to a path relative to test/ or full path for multimodal.
 
     Supports:
     - Full path: test/registered/core/test_srt_endpoint.py
     - Relative to test/: registered/core/test_srt_endpoint.py
     - Bare filename: test_srt_endpoint.py (glob-matched, must be unique)
+    - Multimodal paths: python/sglang/multimodal_gen/test/server/test_server_a.py
 
-    Returns (resolved_path, error_message). On success error_message is None.
+    Returns (resolved_path, is_multimodal, error_message). On success error_message is None.
     """
+    # Check if it's explicitly a multimodal path
+    multimodal_prefixes = [
+        "python/sglang/multimodal_gen/test/",
+        "sglang/multimodal_gen/test/",
+        "multimodal_gen/test/",
+    ]
+    for prefix in multimodal_prefixes:
+        if file_part.startswith(prefix):
+            full_path = (
+                file_part
+                if file_part.startswith("python/")
+                else f"python/sglang/multimodal_gen/test/{file_part[len(prefix):]}"
+            )
+            if not os.path.isfile(full_path):
+                return None, False, f"File not found: `{full_path}`"
+            return full_path, True, None
+
+    # Existing logic for test/registered/ paths
     if file_part.startswith("test/"):
         file_part = file_part[len("test/") :]
 
     if "/" not in file_part:
+        # Try test/registered/ first
         matches = glob.glob(f"test/registered/**/{file_part}", recursive=True)
-        if len(matches) == 0:
+
+        # Try multimodal test directory
+        mm_matches = glob.glob(f"{MULTIMODAL_TEST_DIR}/**/{file_part}", recursive=True)
+        # Filter to only test files
+        mm_matches = [m for m in mm_matches if os.path.basename(m).startswith("test_")]
+
+        if len(matches) == 1 and len(mm_matches) == 0:
+            return matches[0][len("test/") :], False, None
+        if len(matches) == 0 and len(mm_matches) == 1:
+            return mm_matches[0], True, None
+
+        all_matches = matches + mm_matches
+        if len(all_matches) == 0:
             return (
                 None,
-                f"No test file found matching `{file_part}` under `test/registered/`.",
+                False,
+                f"No test file found matching `{file_part}` under `test/registered/` or `{MULTIMODAL_TEST_DIR}/`.",
             )
-        if len(matches) > 1:
-            match_list = "\n".join(f"- `{m}`" for m in sorted(matches))
-            return None, (
-                f"Ambiguous filename `{file_part}` — matched {len(matches)} files:\n\n"
-                f"{match_list}\n\n"
-                f"Please provide the full path, e.g. `/rerun-test {matches[0]}`"
+        if len(all_matches) > 1:
+            match_list = "\n".join(f"- `{m}`" for m in sorted(all_matches))
+            return (
+                None,
+                False,
+                (
+                    f"Ambiguous filename `{file_part}` — matched {len(all_matches)} files:\n\n"
+                    f"{match_list}\n\n"
+                    f"Please provide the full path, e.g. `/rerun-test {all_matches[0]}`"
+                ),
             )
-        return matches[0][len("test/") :], None
+        # Shouldn't reach here, but handle gracefully
+        if mm_matches:
+            return mm_matches[0], True, None
+        return matches[0][len("test/") :], False, None
 
+    # Path with directory - check test/ location
     full_path = f"test/{file_part}"
-    if not os.path.isfile(full_path):
-        return None, f"File not found: `{full_path}`"
-    return file_part, None
+    if os.path.isfile(full_path):
+        return file_part, False, None
+
+    return None, False, f"File not found: `{full_path}`"
+
+
+def detect_multimodal_suite(file_path):
+    """
+    Determine runner for a multimodal gen test file based on its path.
+
+    Returns (runner_label, error_message).
+    """
+    # Check path components and basename for GPU count hints
+    for pattern, runner in MULTIMODAL_PATH_TO_RUNNER.items():
+        if pattern in file_path:
+            return runner, None
+    return MULTIMODAL_DEFAULT_RUNNER, None
 
 
 def detect_suite(file_path_from_test):
@@ -598,9 +662,34 @@ def _resolve_test_spec(test_spec):
     if test_selector:
         test_selector = test_selector.strip()
 
-    resolved_path, err = resolve_test_file(file_part)
+    resolved_path, is_multimodal, err = resolve_test_file(file_part)
     if err:
         return {"spec": test_spec, "error": err}
+
+    if is_multimodal:
+        runner_label, err = detect_multimodal_suite(resolved_path)
+        if err:
+            return {"spec": test_spec, "error": err}
+
+        # For multimodal pytest tests, use :: separator for test selection
+        test_command = resolved_path
+        if test_selector:
+            test_command = f"{resolved_path}::{test_selector}"
+
+        print(
+            f"Resolved (multimodal): file={resolved_path}, selector={test_selector}, "
+            f"runner={runner_label}, command='{test_command}'"
+        )
+        return {
+            "spec": test_spec,
+            "test_command": test_command,
+            "suite": "multimodal",
+            "runner_label": runner_label,
+            "use_deepep": False,
+            "is_cpu": False,
+            "install_diffusion": True,
+            "error": None,
+        }
 
     suite, runner_label, use_deepep, is_cpu, err = detect_suite(resolved_path)
     if err:
@@ -622,6 +711,7 @@ def _resolve_test_spec(test_spec):
         "runner_label": runner_label,
         "use_deepep": use_deepep,
         "is_cpu": is_cpu,
+        "install_diffusion": False,
         "error": None,
     }
 
@@ -637,6 +727,7 @@ def _dispatch_batch(gh_repo, pr, batch, token):
     runner_label = batch[0]["runner_label"]
     use_deepep = batch[0]["use_deepep"]
     is_cpu = batch[0]["is_cpu"]
+    install_diffusion = batch[0].get("install_diffusion", False)
 
     # Join multiple commands with newlines for the workflow to iterate over
     combined_command = "\n".join(test_commands)
@@ -667,6 +758,7 @@ def _dispatch_batch(gh_repo, pr, batch, token):
             "runner_label": runner_label,
             "use_deepep": str(use_deepep).lower(),
             "is_cpu": str(is_cpu).lower(),
+            "install_diffusion": str(install_diffusion).lower(),
         }
         if is_fork:
             ref = "main"
@@ -777,10 +869,15 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
         else:
             resolved.append(r)
 
-    # Phase 2: Group by (runner_label, use_deepep, is_cpu)
+    # Phase 2: Group by (runner_label, use_deepep, is_cpu, install_diffusion)
     groups = {}
     for r in resolved:
-        key = (r["runner_label"], r["use_deepep"], r["is_cpu"])
+        key = (
+            r["runner_label"],
+            r["use_deepep"],
+            r["is_cpu"],
+            r.get("install_diffusion", False),
+        )
         groups.setdefault(key, []).append(r)
 
     # Phase 3: Dispatch one workflow per group
@@ -792,9 +889,19 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
     lines = []
     for dr in dispatch_results:
         if dr["success"]:
-            cmds = "\n".join(
-                f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
+            install_diff = any(
+                r.get("install_diffusion", False)
+                for r in resolved
+                if r["spec"] in dr["specs"]
             )
+            if install_diff:
+                cmds = "\n".join(
+                    f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]
+                )
+            else:
+                cmds = "\n".join(
+                    f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
+                )
             if dr.get("run_url"):
                 lines.append(
                     f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
