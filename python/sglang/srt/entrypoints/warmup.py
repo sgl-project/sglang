@@ -90,6 +90,12 @@ async def whisper_autodetect(
             },
             modalities=["audio"],
         )
+        # PD prefill servers assert req.bootstrap_room is not None in the
+        # default follow_bootstrap_room scheduler; the fake values match
+        # what the voice_chat warmup uses for the same reason.
+        if disaggregation_mode != "null":
+            req.bootstrap_room = 0
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
         # Drain the generator so the FSM is fully installed and any
         # downstream exception surfaces instead of being swallowed after
         # the first yield.
