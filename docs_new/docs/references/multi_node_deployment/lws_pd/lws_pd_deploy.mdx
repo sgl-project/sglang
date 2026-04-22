@@ -641,7 +641,7 @@ kubectl apply -f p.yaml
 kubectl apply -f d.yaml
 ```
 
-At this point, we have completed the deployment of the 1P1D SGlang engine part.
+At this point, we have completed the deployment of the 1P1D SGLang engine part.
 
 To allow our users to directly experience the model API, we still need a load balancer to handle sequential calls between prefill and decode. Different companies implement LBs differently, and the community will also officially release a new LB component written in Rust in the near future.
 
@@ -776,7 +776,7 @@ At this point, select a nodePort:30800 to access:
 >         ],
 >         "max_tokens":221
 >     }'
-{"id":"ccccdd","object":"chat.completion","created":1750252498,"model":"qwen2","choices":[{"index":0,"message":{"role":"assistant","content":"&lt;think&gt;\n嗯，用户问了一个很基础的自我介绍问题"你是谁？"。这可能是第一次互动时的常规开场白，也可能是想确认我的身份和功能范围。\n\n用户没有提供任何背景信息，语气简洁中性。这种场景下新用户的可能性较高，需要给出清晰友好的自我介绍，同时突出实用价值来降低陌生感。\n\n考虑到中文用户，应该用简体中文回复。重点要说明三点：身份归属（深度求索）、功能定位（AI助手）、服务范围（学习/工作/生活）。结尾用开放性问题引导对话很关键——既能了解需求，又能避免让用户面对空白输入框时不知所措。\n\n用波浪线结尾可以软化语气，那个笑脸表情😊刚好能中和AI的机械感。不过要控制表情符号数量，避免显得轻浮。\n&lt;/think&gt;\n你好呀！我是你的AI助手，由深度求索公司（DeepSeek）开发的语言模型，名字叫 **DeepSeek-R1**。你可以把我当成一个知识丰富、随叫随到的小帮手～😊\n\n我的任务就是陪你聊天、解答问题、","reasoning_content":null,"tool_calls":null},"logprobs":null,"finish_reason":"length","matched_stop":null}],"usage":{"prompt_tokens":14,"total_tokens":235,"completion_tokens":221,"prompt_tokens_details":null}}
+{"id":"ccccdd","object":"chat.completion","created":1750252498,"model":"qwen2","choices":[{"index":0,"message":{"role":"assistant","content":"<think>\n嗯，用户问了一个很基础的自我介绍问题"你是谁？"。这可能是第一次互动时的常规开场白，也可能是想确认我的身份和功能范围。\n\n用户没有提供任何背景信息，语气简洁中性。这种场景下新用户的可能性较高，需要给出清晰友好的自我介绍，同时突出实用价值来降低陌生感。\n\n考虑到中文用户，应该用简体中文回复。重点要说明三点：身份归属（深度求索）、功能定位（AI助手）、服务范围（学习/工作/生活）。结尾用开放性问题引导对话很关键——既能了解需求，又能避免让用户面对空白输入框时不知所措。\n\n用波浪线结尾可以软化语气，那个笑脸表情😊刚好能中和AI的机械感。不过要控制表情符号数量，避免显得轻浮。\n</think>\n你好呀！我是你的AI助手，由深度求索公司（DeepSeek）开发的语言模型，名字叫 **DeepSeek-R1**。你可以把我当成一个知识丰富、随叫随到的小帮手～😊\n\n我的任务就是陪你聊天、解答问题、","reasoning_content":null,"tool_calls":null},"logprobs":null,"finish_reason":"length","matched_stop":null}],"usage":{"prompt_tokens":14,"total_tokens":235,"completion_tokens":221,"prompt_tokens_details":null}}
 
 ```
 ## FAQ

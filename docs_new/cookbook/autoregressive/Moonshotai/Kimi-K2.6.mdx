@@ -72,7 +72,7 @@ For details, see [official documentation](https://huggingface.co/moonshotai/Kimi
 
 ## 2. SGLang Installation
 
-Refer to the [official SGLang installation guide](../../../docs/get-started/installation).
+Refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
 ## 3. Model Deployment
 
@@ -693,9 +693,41 @@ python3 eval.py ocrbench \
 
 #### 5.1.5 MMMU Pro Vision
 
-```text Output
-Pending update...
+- Dataset: [MMMU Pro](https://huggingface.co/datasets/MMMU/MMMU_Pro) standard 10-option subset (1,730 questions with images)
+- Evaluation Tool: [Kimi-Vendor-Verifier](https://github.com/MoonshotAI/Kimi-Vendor-Verifier) (inspect-ai based)
+- Settings: max_tokens=32,768, thinking mode (default), max_connections=256
+
+> **Important**: Kimi-K2.6 is a reasoning model. Setting `max_tokens` too low (e.g., 4096) causes the thinking process to consume the entire token budget, leaving no tokens for the final answer. Use `max_tokens=32768` or higher.
+
+**Evaluation Command:**
+
+```shell Command
+cd Kimi-Vendor-Verifier
+
+OPENAI_BASE_URL=http://localhost:30000/v1 OPENAI_API_KEY=placeholder \
+python3 eval.py mmmu \
+  --model openai/moonshotai/Kimi-K2.6 \
+  --max-tokens 32768 \
+  --think-mode none \
+  --max-connections 256
 ```
+
+**Results (1,481/1,730 samples completed):**
+
+<table>
+  <thead>
+    <tr>
+      <th>Evaluation Mode</th>
+      <th>Accuracy</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>pass@1</td>
+      <td><strong>82.2%</strong></td>
+    </tr>
+  </tbody>
+</table>
 
 ### 5.2 Speed Benchmark
 

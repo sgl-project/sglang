@@ -4,6 +4,8 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -18,10 +20,9 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
-from sglang.srt.layers.attention.fla.utils import is_amd
+from sglang.srt.layers.attention.fla.utils import check_shared_mem
 
-BT_LIST_AUTOTUNE = [32, 64, 128]
-NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
 def cdiv(a: int, b: int) -> int:
@@ -645,15 +646,15 @@ def recompute_w_u_fwd(
     q: torch.Tensor | None = None,
     gk: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
     BK = 64
     BV = 64
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     w = torch.empty_like(k)
@@ -816,15 +817,13 @@ def chunk_gla_fwd_o_gk(
     scale: float,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
 ):
     B, T, H, K, V = *q.shape, v.shape[-1]
     BT = chunk_size
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     def grid(meta):
@@ -850,6 +849,178 @@ def chunk_gla_fwd_o_gk(
     return o
 
 
+@triton.jit
+def softplus_fwd(x):
+    """Standard softplus: log(1 + exp(x)), with linear approx for large x."""
+    return tl.where(x < 20.0, log(1.0 + exp(x)), x)
+
+
+@triton.heuristics(
+    {
+        "HAS_BIAS": lambda args: args["dt_bias"] is not None,
+        "HAS_SCALE": lambda args: args["scale"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+    }
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BS": BS}, num_warps=num_warps)
+        for BS in BS_LIST
+        for num_warps in [2, 4, 8]
+    ],
+    key=["H", "S", "BT", "IS_VARLEN"],
+)
+@triton.jit(do_not_specialize=["T"])
+def kda_gate_chunk_cumsum_vector_kernel(
+    s,
+    A_log,
+    dt_bias,
+    o,
+    scale,
+    cu_seqlens,
+    chunk_indices,
+    lower_bound,
+    T,
+    H: tl.constexpr,
+    S: tl.constexpr,
+    BT: tl.constexpr,
+    BS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+):
+    i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    p_s = tl.make_block_ptr(
+        s + (bos * H + i_h) * S,
+        (T, S),
+        (H * S, 1),
+        (i_t * BT, i_s * BS),
+        (BT, BS),
+        (1, 0),
+    )
+    p_o = tl.make_block_ptr(
+        o + (bos * H + i_h) * S,
+        (T, S),
+        (H * S, 1),
+        (i_t * BT, i_s * BS),
+        (BT, BS),
+        (1, 0),
+    )
+    # [BT, BS]
+    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+
+    if HAS_BIAS:
+        p_b = tl.make_block_ptr(
+            dt_bias + i_h * S,
+            (S,),
+            (1,),
+            (i_s * BS,),
+            (BS,),
+            (0,),
+        )
+        b_bias = tl.load(p_b, boundary_check=(0,)).to(tl.float32)
+        b_s = b_s + b_bias[None, :]
+
+    b_A = tl.load(A_log + i_h).to(tl.float32)
+    if not USE_LOWER_BOUND:
+        # Standard gate: -exp(A_log) * softplus(g + bias)
+        b_gate = -exp(b_A) * softplus_fwd(b_s)
+    else:
+        # Safe gate: lower_bound * sigmoid(exp(A_log) * (g + bias))
+        b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)
+
+    # Chunk-local cumulative sum
+    b_o = tl.cumsum(b_gate, axis=0)
+
+    if HAS_SCALE:
+        b_o *= scale
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+def kda_gate_chunk_cumsum(
+    g: torch.Tensor,
+    A_log: torch.Tensor,
+    chunk_size: int,
+    scale: float = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = torch.float,
+    chunk_indices: Optional[torch.LongTensor] = None,
+    lower_bound: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Fused KDA gate activation + chunk-local cumulative sum.
+
+    Combines two memory-bound kernels into one:
+      1. Gate activation: g = -exp(A_log) * softplus(raw_g + dt_bias)
+      2. Chunk-local cumsum along the time axis
+
+    Args:
+        g: Raw gate tensor of shape [B, T, H, K] (before activation).
+        A_log: Per-head log-scale parameter, [H] elements (any shape, numel=H).
+        chunk_size: Chunk size for cumsum (must be power of 2).
+        scale: Optional scale factor applied to output.
+        dt_bias: Optional per-head bias, flat [H*K] elements.
+        cu_seqlens: Cumulative sequence lengths for variable-length input.
+        output_dtype: Output dtype (default float32).
+        chunk_indices: Pre-computed chunk indices for varlen mode.
+        lower_bound: If set, use safe gate: lower_bound * sigmoid(exp(A_log) * g).
+
+    Returns:
+        Cumulative-summed gated tensor of shape [B, T, H, K].
+    """
+    if cu_seqlens is not None:
+        assert (
+            g.shape[0] == 1
+        ), "Only batch size 1 is supported when cu_seqlens are provided"
+    assert len(g.shape) == 4
+    B, T, H, S = g.shape
+    BT = chunk_size
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    assert chunk_size == 2 ** (
+        chunk_size.bit_length() - 1
+    ), "chunk_size must be a power of 2"
+
+    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
+
+    def grid(meta):
+        return (cdiv(meta["S"], meta["BS"]), NT, B * H)
+
+    kda_gate_chunk_cumsum_vector_kernel[grid](
+        s=g_org,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        o=g,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        lower_bound=lower_bound,
+        T=T,
+        H=H,
+        S=S,
+        BT=BT,
+    )
+    return g
+
+
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -859,10 +1030,40 @@ def chunk_kda_fwd(
     scale: float,
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: Optional[torch.LongTensor] = None,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
 ):
     chunk_size = 64
-    g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens)
+    # Pre-compute chunk indices once and thread through all downstream kernels.
+    # Without this, each of the 4 callees would recompute independently.
+    chunk_indices = (
+        prepare_chunk_indices(cu_seqlens, chunk_size)
+        if cu_seqlens is not None
+        else None
+    )
+
+    if A_log is not None:
+        # Fused: gate activation + chunk-local cumsum in one kernel.
+        # g is raw gate (before activation); A_log, dt_bias drive the activation.
+        g = kda_gate_chunk_cumsum(
+            g,
+            A_log=A_log,
+            chunk_size=chunk_size,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            lower_bound=lower_bound,
+        )
+    else:
+        # g is already gate-activated by caller; just do cumsum.
+        g = chunk_local_cumsum(
+            g,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
 
     # Fused: scaled_dot_kkt + solve_tril + recompute_w_u
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
@@ -874,6 +1075,7 @@ def chunk_kda_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
     )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
@@ -884,6 +1086,7 @@ def chunk_kda_fwd(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
     )
     del w, u, kg
     o = chunk_gla_fwd_o_gk(
@@ -896,6 +1099,7 @@ def chunk_kda_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
+        chunk_indices=chunk_indices,
     )
     del Aqk, v_new, h
     return o
@@ -911,7 +1115,10 @@ def chunk_kda(
     initial_state: torch.Tensor = None,
     initial_state_indices: torch.Tensor = None,
     use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens: Optional[torch.LongTensor] = None,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
     **kwargs,
 ):
     if scale is None:
@@ -931,124 +1138,8 @@ def chunk_kda(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
     )
     return o
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BT": bt}, num_warps=nw, num_stages=ns)
-        for bt in BT_LIST_AUTOTUNE
-        for nw in NUM_WARPS_AUTOTUNE
-        for ns in [2, 3]
-    ],
-    key=["H", "D"],
-)
-@triton.jit
-def kda_gate_fwd_kernel(
-    g,
-    A,
-    y,
-    g_bias,
-    beta: tl.constexpr,
-    threshold: tl.constexpr,
-    T,
-    H,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-):
-    i_t, i_h = tl.program_id(0), tl.program_id(1)
-    n_t = i_t * BT
-
-    b_a = tl.load(A + i_h).to(tl.float32)
-    b_a = -tl.exp(b_a)
-
-    stride_row = H * D
-    stride_col = 1
-
-    g_ptr = tl.make_block_ptr(
-        base=g + i_h * D,
-        shape=(T, D),
-        strides=(stride_row, stride_col),
-        offsets=(n_t, 0),
-        block_shape=(BT, BD),
-        order=(1, 0),
-    )
-
-    y_ptr = tl.make_block_ptr(
-        base=y + i_h * D,
-        shape=(T, D),
-        strides=(stride_row, stride_col),
-        offsets=(n_t, 0),
-        block_shape=(BT, BD),
-        order=(1, 0),
-    )
-
-    b_g = tl.load(g_ptr, boundary_check=(0, 1)).to(tl.float32)
-
-    if HAS_BIAS:
-        n_d = tl.arange(0, BD)
-        bias_mask = n_d < D
-        b_bias = tl.load(g_bias + i_h * D + n_d, mask=bias_mask, other=0.0).to(
-            tl.float32
-        )
-        b_g = b_g + b_bias[None, :]
-
-    # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
-    # When beta * x > threshold, use linear approximation x
-    # Use threshold to switch to linear when beta*x > threshold
-    g_scaled = b_g * beta
-    use_linear = g_scaled > threshold
-    sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
-    b_y = b_a * sp
-
-    tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
-
-
-def fused_kda_gate(
-    g: torch.Tensor,
-    A: torch.Tensor,
-    head_k_dim: int,
-    g_bias: torch.Tensor | None = None,
-    beta: float = 1.0,
-    threshold: float = 20.0,
-) -> torch.Tensor:
-    """
-    Forward pass for KDA gate:
-      input g: [..., H*D]
-      param A: [H] or [1, 1, H, 1]
-      beta: softplus beta parameter
-      threshold: softplus threshold parameter
-      return  : [..., H, D]
-    """
-    orig_shape = g.shape[:-1]
-
-    g = g.view(-1, g.shape[-1])
-    T = g.shape[0]
-    HD = g.shape[1]
-    H = A.numel()
-    assert H * head_k_dim == HD
-
-    y = torch.empty_like(g, dtype=torch.float32)
-
-    def grid(meta):
-        return (cdiv(T, meta["BT"]), H)
-
-    kda_gate_fwd_kernel[grid](
-        g,
-        A,
-        y,
-        g_bias,
-        beta,
-        threshold,
-        T,
-        H,
-        head_k_dim,
-        BD=next_power_of_2(head_k_dim),
-        HAS_BIAS=g_bias is not None,
-    )
-
-    y = y.view(*orig_shape, H, head_k_dim)
-    return y
