@@ -287,8 +287,15 @@ jobs:
       OSL: ${{ matrix.config.osl }}
       CONFIG_FILE: ${{ matrix.config.config_file }}
       RESULT_FILENAME: gb200-${{ matrix.config.name }}
+      MATRIX_CONFIG_NAME: ${{ matrix.config.name }}
       SQUASH_FILE: ${{ needs.prepare-image.outputs.squash_file }}
       NGINX_SQUASH_FILE: ${{ needs.prepare-image.outputs.nginx_squash_file }}
+      # S3 log-upload credentials — consumed by srt-slurm's postprocess stage
+      # to upload /logs after each Slurm job; prefix derived in launch_gb200.sh.
+      AWS_ACCESS_KEY_ID: ${{ secrets.NV_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.NV_S3_SECRET_ACCESS_KEY }}
+      S3_BUCKET: ${{ secrets.NV_S3_BUCKET }}
+      S3_ENDPOINT_URL: ${{ secrets.NV_S3_ENDPOINT_URL }}
 
     steps:
       - name: Checkout code
