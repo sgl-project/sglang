@@ -42,7 +42,8 @@ class TranscriptionAdapter(ABC):
         """
         raise NotImplementedError
 
-    def parse_fused_output(self, text: str) -> tuple[Optional[str], Optional[str]]:
+    @staticmethod
+    def parse_fused_output(text: str) -> tuple[Optional[str], Optional[str]]:
         """Parse the fused output into ``(language_code, user_visible_text)``.
 
         Called by both streaming and non-streaming handlers with the same
@@ -59,7 +60,8 @@ class TranscriptionAdapter(ABC):
         """
         raise NotImplementedError
 
-    def strip_special_tokens(self, text: str) -> str:
+    @staticmethod
+    def strip_special_tokens(text: str) -> str:
         """Best-effort scrub of model-specific special-token strings.
 
         Used as a fallback when ``parse_fused_output`` reports a parse
