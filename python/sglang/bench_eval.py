@@ -35,6 +35,7 @@ def run_bench_eval(
     flush_cache: bool = False,
     extra_request_body: Optional[Dict[str, Any]] = None,
     system_instruction: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     import lm_eval
     from transformers import AutoTokenizer
@@ -42,6 +43,12 @@ def run_bench_eval(
     from sglang.benchmark.eval_harness import (
         BenchServingLM, merge_report, write_report,
     )
+    from sglang.benchmark.eval_harness.niah_cache import install_niah_disk_cache
+
+    # Opt-in disk cache for RULER niah_* dataset construction. No-op when
+    # NIAH_CACHE_DIR is unset; required for any task using the niah builders
+    # if you want to amortize the ~minutes-per-rebuild cost across a sweep.
+    install_niah_disk_cache()
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
@@ -59,6 +66,13 @@ def run_bench_eval(
 
     gen_kwargs = f"max_gen_toks={max_gen_toks}"
 
+    effective_metadata: Optional[Dict[str, Any]] = None
+    if metadata:
+        effective_metadata = dict(metadata)
+        # RULER's custom_dataset asserts tokenizer= in its kwargs. Inject the
+        # caller's tokenizer path unless they've set one explicitly.
+        effective_metadata.setdefault("tokenizer", tokenizer_path)
+
     results = lm_eval.simple_evaluate(
         model=lm,
         tasks=[task],
@@ -69,6 +83,7 @@ def run_bench_eval(
         system_instruction=system_instruction,
         gen_kwargs=gen_kwargs,
         batch_size=max_concurrency or "auto",
+        metadata=effective_metadata,
     )
 
     if lm.last_perf is None:
@@ -157,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="System message prepended to every prompt. "
                         "Math: 'Please reason step by step, and put your final answer within \\boxed{}.' "
                         "MCQ: 'Please show your choice in the answer field with only the choice letter, e.g., \"answer\": \"C\".'")
+    p.add_argument("--metadata", default=None,
+                   help="JSON string passed to lm_eval.simple_evaluate as "
+                        "metadata. Used by RULER — e.g. "
+                        "--metadata='{\"max_seq_lengths\":[8192,65536]}'. "
+                        "tokenizer= is auto-injected from --tokenizer.")
     return p
 
 
@@ -178,6 +198,9 @@ def main(argv=None) -> int:
     if args.presence_penalty != 0.0:
         sampling["presence_penalty"] = args.presence_penalty
 
+    import json as _json
+    metadata_dict = _json.loads(args.metadata) if args.metadata else None
+
     report = run_bench_eval(
         task=args.task,
         base_url=args.base_url,
@@ -197,6 +220,7 @@ def main(argv=None) -> int:
         flush_cache=args.flush_cache,
         extra_request_body=sampling,
         system_instruction=args.system_instruction,
+        metadata=metadata_dict,
     )
 
     print("=" * 60)

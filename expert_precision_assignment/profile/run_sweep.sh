@@ -20,6 +20,17 @@
 #   FEWSHOT_AS_MULTITURN=1             (bench_eval only; default on — wraps
 #                                       each fewshot exemplar as its own
 #                                       chat turn so model learns to stop)
+#   RULER_MAX_SEQ=65536                (flips RULER defaults: fewshot=0,
+#                                       max_gen=128, no chat template, sets
+#                                       --metadata, --context-length, YaRN)
+#   BENCH_TASK=niah_single_2           (when TASK is a virtual task name like
+#                                       ruler_niah_64k — routes bench_eval to
+#                                       the actual RULER subtask)
+#   LIMIT=128                          (caps --limit on bench_eval)
+#   NIAH_CACHE_DIR=<path>              (opt-in disk cache for RULER niah_*
+#                                       dataset construction; amortizes the
+#                                       ~minutes-per-build cost across the
+#                                       N parallel workers)
 set -uo pipefail
 
 TASK="${1:-}"
@@ -49,17 +60,38 @@ HOST="127.0.0.1"
 # sharegpt knobs
 NUM_PROMPTS="${NUM_PROMPTS:-1024}"
 SHAREGPT_CONTEXT_LEN="${SHAREGPT_CONTEXT_LEN:-4096}"
+# RULER_MAX_SEQ (e.g. 8192, 65536, 131072, 262144) flips defaults for the
+# RULER subtasks — matches run_calib.sh semantics. When set:
+#   * num_fewshot=0, max_gen_toks=128 (RULER YAMLs)
+#   * apply_chat_template=0, fewshot_as_multiturn=0 (RULER is raw completion;
+#     the instruct-chat wrap gives 0% on Qwen3)
+#   * METADATA = '{"max_seq_lengths":[$RULER_MAX_SEQ]}'
+#   * Server gets --context-length $((RULER_MAX_SEQ+512)) and YaRN scaling
+#     when that budget exceeds Qwen3's native 40960.
+RULER_MAX_SEQ="${RULER_MAX_SEQ:-}"
 # bench_eval knobs
-NUM_FEWSHOT="${NUM_FEWSHOT:-5}"
-MAX_GEN_TOKS="${MAX_GEN_TOKS:-512}"
-APPLY_CHAT_TEMPLATE="${APPLY_CHAT_TEMPLATE:-1}"
-# Wrap each fewshot exemplar as its own <|im_start|>user/assistant turn so the
-# model sees N examples of "assistant closes with <|im_end|>" before emitting
-# its own answer. Without this, chat-tuned models under the Question:/Answer:
-# fewshot scaffold don't learn to stop and run to MAX_GEN_TOKS on every req.
-# MUST match the value used in run_calib.sh — the KV sizing depends on the
-# output-length distribution this flag produces.
-FEWSHOT_AS_MULTITURN="${FEWSHOT_AS_MULTITURN:-1}"
+if [ -n "$RULER_MAX_SEQ" ]; then
+    NUM_FEWSHOT="${NUM_FEWSHOT:-0}"
+    MAX_GEN_TOKS="${MAX_GEN_TOKS:-128}"
+    APPLY_CHAT_TEMPLATE="${APPLY_CHAT_TEMPLATE:-0}"
+    FEWSHOT_AS_MULTITURN="${FEWSHOT_AS_MULTITURN:-0}"
+    METADATA="${METADATA:-{\"max_seq_lengths\":[$RULER_MAX_SEQ]}}"
+else
+    NUM_FEWSHOT="${NUM_FEWSHOT:-5}"
+    MAX_GEN_TOKS="${MAX_GEN_TOKS:-512}"
+    APPLY_CHAT_TEMPLATE="${APPLY_CHAT_TEMPLATE:-1}"
+    # Wrap each fewshot exemplar as its own <|im_start|>user/assistant turn so
+    # the model sees N examples of "assistant closes with <|im_end|>" before
+    # emitting its own answer. Without this, chat-tuned models under the
+    # Question:/Answer: fewshot scaffold don't learn to stop and run to
+    # MAX_GEN_TOKS on every req. MUST match the value used in run_calib.sh —
+    # the KV sizing depends on the output-length distribution this flag
+    # produces.
+    FEWSHOT_AS_MULTITURN="${FEWSHOT_AS_MULTITURN:-1}"
+    METADATA="${METADATA:-}"
+fi
+# LIMIT caps eval docs for quick/smoke sweeps (passed as --limit to bench_eval).
+LIMIT="${LIMIT:-}"
 # bench_eval.py defaults temperature=0.7 (non-thinking), which overrides the
 # per-task greedy setting and causes runaway generation up to MAX_GEN_TOKS.
 # Force greedy here; override with TEMPERATURE=<x> if needed.
@@ -87,7 +119,13 @@ if [ -z "${SYSTEM_INSTRUCTION+x}" ]; then
     esac
 fi
 
-MC_LIST=(256 128 64 32 16 8)
+# MC_LIST env override: `MC_LIST="32 64 128 256" bash run_sweep.sh ...` —
+# for restricted sweeps. Leave unset for the full 6-point ladder.
+if [ -n "${MC_LIST:-}" ]; then
+    read -r -a MC_LIST <<< "$MC_LIST"
+else
+    MC_LIST=(256 128 64 32 16 8)
+fi
 # VARIANTS env override: `VARIANTS="thr128 hot0" bash run_sweep.sh ...` — for
 # smoke tests. Leave unset for the full 6×11 grid.
 if [ -n "${VARIANTS:-}" ]; then
@@ -157,6 +195,10 @@ run_bench() {
         [ "$FEWSHOT_AS_MULTITURN" = "1" ] && mt_flag=(--fewshot-as-multiturn)
         local sys_flag=()
         [ -n "$SYSTEM_INSTRUCTION" ] && sys_flag=(--system-instruction "$SYSTEM_INSTRUCTION")
+        local meta_flag=()
+        [ -n "$METADATA" ] && meta_flag=(--metadata "$METADATA")
+        local lim_flag=()
+        [ -n "$LIMIT" ] && lim_flag=(--limit "$LIMIT")
         python3 -m sglang.bench_eval \
             --task "${BENCH_TASK:-$TASK}" \
             --base-url "http://${HOST}:${port}" \
@@ -171,6 +213,8 @@ run_bench() {
             "${ct_flag[@]}" \
             "${mt_flag[@]}" \
             "${sys_flag[@]}" \
+            "${meta_flag[@]}" \
+            "${lim_flag[@]}" \
             --output-file "$out" > "$log" 2>&1
     fi
 }
@@ -196,14 +240,41 @@ run_one_variant() {
 
     local server_log="$OUT_DIR/${label}_server.log"
     local nccl_port=${GPU_NCCL_PORT[$gpu]}
+    # RULER: size the context window to RULER_MAX_SEQ (plus headroom); YaRN
+    # rope scaling when the target exceeds Qwen3's native 40960. sglang's
+    # ModelConfig._derive_context_length reads max_position_embeddings
+    # directly from the hf config (40960) — it does NOT recompute from
+    # rope_scaling overrides — so any ctx > 40960 requires the explicit
+    # SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 escape hatch to start up.
+    local server_ctx_flag=()
+    local allow_long_ctx=0
+    if [ -n "$RULER_MAX_SEQ" ]; then
+        local ctx=$((RULER_MAX_SEQ + 512))
+        server_ctx_flag=(--context-length "$ctx")
+        if [ "$ctx" -gt 40960 ]; then
+            local factor
+            factor=$(awk -v c=$ctx 'BEGIN{printf "%.4f", c/40960.0}')
+            # transformers v5 exposes a single merged `rope_parameters` dict
+            # (rope_theta + rope_type + scaling kwargs). rope_theta is no
+            # longer a top-level attribute and rope_scaling overrides don't
+            # feed back into rope_parameters. Override rope_parameters
+            # directly — sglang's get_rope_config reads from it. Qwen3-30B's
+            # native rope_theta is 1_000_000.
+            server_ctx_flag+=(--json-model-override-args "{\"rope_parameters\":{\"rope_theta\":1000000.0,\"rope_type\":\"yarn\",\"factor\":$factor,\"original_max_position_embeddings\":40960}}")
+            allow_long_ctx=1
+        fi
+    fi
     echo "[gpu$gpu $label] launching server on port $port (nccl $nccl_port, max-running=$mc)"
-    CUDA_VISIBLE_DEVICES="$gpu" python3 -m sglang.launch_server \
+    CUDA_VISIBLE_DEVICES="$gpu" \
+    SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN="$allow_long_ctx" \
+    python3 -m sglang.launch_server \
         --model-path "$BF16_MODEL" \
         --host "$HOST" --port "$port" \
         --nccl-port "$nccl_port" \
         --trust-remote-code \
         --max-running-requests "$mc" \
         --cuda-graph-max-bs "$mc" \
+        "${server_ctx_flag[@]}" \
         --heter-precision-config "$config" > "$server_log" 2>&1 &
     local server_pid=$!
 
