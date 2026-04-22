@@ -1645,7 +1645,7 @@ groups:
 | `--policy` | str | cache_aware | Routing policy |
 | `--max-concurrent-requests` | int | -1 | Concurrency limit (-1 disables) |
 | `--request-timeout-secs` | int | 600 | Request timeout |
-| `--max-payload-size` | int | 256MB | Maximum request payload |
+| `--max-payload-size` | int | 512MB | Maximum request payload |
 
 ### Prefill/Decode
 

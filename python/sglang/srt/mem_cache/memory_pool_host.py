@@ -1715,6 +1715,9 @@ class HostPoolGroup:
     def get_ksize_per_token(self):
         return self.anchor_entry.host_pool.get_ksize_per_token()
 
+    def get_pool(self, name: PoolName):
+        return self.entry_map[name].host_pool
+
     def get_page_buffer_meta(self, indices):
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
 
@@ -1729,13 +1732,7 @@ class HostPoolGroup:
         return self.anchor_entry.host_pool.alloc(need_size)
 
     def free(self, indices: torch.Tensor) -> int:
-        n = self.anchor_entry.host_pool.free(indices)
-        for entry in self.entries:
-            if entry is self.anchor_entry:
-                continue
-            if getattr(entry, "share_indices_with_anchor", False):
-                entry.host_pool.free(indices)
-        return n
+        return self.anchor_entry.host_pool.free(indices)
 
     def get_data_page(self, index, flat: bool = True):
         return self.anchor_entry.host_pool.get_data_page(index, flat)

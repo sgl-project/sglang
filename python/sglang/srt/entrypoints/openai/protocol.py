@@ -1016,6 +1016,7 @@ class ScoringRequest(BaseModel):
     )
     apply_softmax: bool = False
     item_first: bool = False
+    return_pooled_hidden_states: bool = False
     model: str = DEFAULT_MODEL_NAME
 
 
@@ -1023,6 +1024,7 @@ class ScoringResponse(BaseModel):
     scores: List[
         List[float]
     ]  # List of lists of probabilities, each in the order of label_token_ids
+    pooled_hidden_states: Optional[List[Optional[List[float]]]] = None
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"

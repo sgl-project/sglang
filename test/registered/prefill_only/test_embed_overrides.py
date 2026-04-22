@@ -20,6 +20,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
+from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -204,16 +205,15 @@ class TestEmbeddingReqInputEmbedOverride(CustomTestCase):
 class _FakeServerArgs:
     """Minimal stub for server_args."""
 
-    def __init__(self, multi_item_scoring_delimiter=None):
-        self.multi_item_scoring_delimiter = multi_item_scoring_delimiter
+    def __init__(self, enable_mis=False):
+        self.enable_mis = enable_mis
 
 
 class _FakeMixin(TokenizerManagerScoreMixin):
     """Minimal stub to call mixin methods without a full TokenizerManager."""
 
-    def __init__(self, delimiter=None):
-        self.server_args = _FakeServerArgs(delimiter)
-        self.multi_item_delimiter_text = None
+    def __init__(self, enable_mis=False):
+        self.server_args = _FakeServerArgs(enable_mis)
         self.tokenizer = None
         self.is_generation = True
 
@@ -334,17 +334,17 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
 # Score mixin: _build_token_id_inputs
 # ========================================================================
 
-DELIM_TOKEN = 99
+DELIM_TOKEN = MIS_DELIMITER_TOKEN_ID
 
 
 class TestBuildTokenIdInputs(CustomTestCase):
     def setUp(self):
-        self.mixin = _FakeMixin(delimiter=DELIM_TOKEN)
+        self.mixin = _FakeMixin(enable_mis=True)
 
     # --- single-item mode, no embeds ---
 
     def test_single_item_no_embeds(self):
-        _, input_ids, injection = self.mixin._build_token_id_inputs(
+        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
             query=[1, 2],
             items=[[3, 4], [5, 6]],
             item_first=False,
@@ -354,10 +354,10 @@ class TestBuildTokenIdInputs(CustomTestCase):
             item_embed_overrides=None,
         )
         self.assertEqual(input_ids, [[1, 2, 3, 4], [1, 2, 5, 6]])
-        self.assertIsNone(injection)
+        self.assertIsNone(positional_embed_overrides)
 
     def test_single_item_no_embeds_item_first(self):
-        _, input_ids, injection = self.mixin._build_token_id_inputs(
+        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
             query=[1, 2],
             items=[[3, 4]],
             item_first=True,
@@ -367,12 +367,12 @@ class TestBuildTokenIdInputs(CustomTestCase):
             item_embed_overrides=None,
         )
         self.assertEqual(input_ids, [[3, 4, 1, 2]])
-        self.assertIsNone(injection)
+        self.assertIsNone(positional_embed_overrides)
 
     # --- multi-item mode, no embeds ---
 
     def test_multi_item_no_embeds(self):
-        _, input_ids, injection = self.mixin._build_token_id_inputs(
+        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
             query=[1, 2],
             items=[[3, 4], [5, 6]],
             item_first=False,
@@ -385,13 +385,13 @@ class TestBuildTokenIdInputs(CustomTestCase):
         self.assertEqual(
             input_ids, [[1, 2, DELIM_TOKEN, 3, 4, DELIM_TOKEN, 5, 6, DELIM_TOKEN]]
         )
-        self.assertIsNone(injection)
+        self.assertIsNone(positional_embed_overrides)
 
     # --- single-item mode, with embeds ---
 
     def test_single_item_query_embeds(self):
         """Query placeholder overrides are resolved per item."""
-        _, input_ids, injection = self.mixin._build_token_id_inputs(
+        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
             query=[50, 10],
             items=[[20, 30], [40, 50]],
             item_first=False,
@@ -401,15 +401,15 @@ class TestBuildTokenIdInputs(CustomTestCase):
             item_embed_overrides=None,
         )
         self.assertEqual(input_ids, [[50, 10, 20, 30], [50, 10, 40, 50]])
-        self.assertIsNotNone(injection)
-        self.assertEqual(len(injection), 2)
+        self.assertIsNotNone(positional_embed_overrides)
+        self.assertEqual(len(positional_embed_overrides), 2)
         # Each item gets its own PositionalEmbeds with query override at pos 0
-        self.assertEqual(injection[0].positions, [0])
-        self.assertEqual(injection[1].positions, [0])
+        self.assertEqual(positional_embed_overrides[0].positions, [0])
+        self.assertEqual(positional_embed_overrides[1].positions, [0])
 
     def test_single_item_item_embeds(self):
         """Per-item overrides with correct position offsets."""
-        _, input_ids, injection = self.mixin._build_token_id_inputs(
+        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
             query=[10, 20],
             items=[[50, 30]],
             item_first=False,
@@ -419,13 +419,13 @@ class TestBuildTokenIdInputs(CustomTestCase):
             item_embed_overrides=[[_vec(2)]],
         )
         self.assertEqual(input_ids, [[10, 20, 50, 30]])
-        self.assertIsNotNone(injection)
+        self.assertIsNotNone(positional_embed_overrides)
         # item placeholder at index 0 of item, offset by query length 2
-        self.assertEqual(injection[0].positions, [2])
+        self.assertEqual(positional_embed_overrides[0].positions, [2])
 
     def test_single_item_no_override_positions_returns_none_injection(self):
-        """When no items have placeholders, injection should be None."""
-        _, input_ids, injection = self.mixin._build_token_id_inputs(
+        """When no items have placeholders, positional_embed_overrides should be None."""
+        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
             query=[10, 20],
             items=[[30, 40]],
             item_first=False,
@@ -434,11 +434,11 @@ class TestBuildTokenIdInputs(CustomTestCase):
             query_embed_overrides=None,
             item_embed_overrides=[None],
         )
-        self.assertIsNone(injection)
+        self.assertIsNone(positional_embed_overrides)
 
     def test_single_item_query_and_item_embeds(self):
         """Single-item mode with both query and item overrides in one request."""
-        _, input_ids, injection = self.mixin._build_token_id_inputs(
+        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
             query=[50, 10],
             items=[[20, 50]],
             item_first=False,
@@ -448,15 +448,15 @@ class TestBuildTokenIdInputs(CustomTestCase):
             item_embed_overrides=[[_vec(2)]],
         )
         self.assertEqual(input_ids, [[50, 10, 20, 50]])
-        self.assertIsNotNone(injection)
-        pe = injection[0]
+        self.assertIsNotNone(positional_embed_overrides)
+        pe = positional_embed_overrides[0]
         # query override at pos 0, item override at pos 3 (query_len=2 + idx=1)
         self.assertEqual(pe.positions, [0, 3])
         self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
 
     def test_single_item_empty_query(self):
         """Empty query with item-only overrides (valid from score_prompts)."""
-        _, input_ids, injection = self.mixin._build_token_id_inputs(
+        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
             query=[],
             items=[[50, 10]],
             item_first=False,
@@ -466,15 +466,15 @@ class TestBuildTokenIdInputs(CustomTestCase):
             item_embed_overrides=[[_vec(1)]],
         )
         self.assertEqual(input_ids, [[50, 10]])
-        self.assertIsNotNone(injection)
+        self.assertIsNotNone(positional_embed_overrides)
         # item placeholder at absolute pos 0 (offset=len([])=0)
-        self.assertEqual(injection[0].positions, [0])
+        self.assertEqual(positional_embed_overrides[0].positions, [0])
 
     # --- multi-item mode, with embeds ---
 
     def test_multi_item_with_query_and_item_embeds(self):
         """Multi-item mode resolves query overrides once and item overrides per item."""
-        _, input_ids, injection = self.mixin._build_token_id_inputs(
+        _, input_ids, positional_embed_overrides, _ = self.mixin._build_token_id_inputs(
             query=[50, 10],
             items=[[20, 50], [30, 40]],
             item_first=False,
@@ -483,13 +483,13 @@ class TestBuildTokenIdInputs(CustomTestCase):
             query_embed_overrides=[_vec(1)],
             item_embed_overrides=[[_vec(2)], None],
         )
-        # query<D>item1<D>item2<D> = [50,10, 99, 20,50, 99, 30,40, 99]
+        # query<D>item1<D>item2<D> = [50,10, DELIM, 20,50, DELIM, 30,40, DELIM]
         self.assertEqual(len(input_ids), 1)
-        self.assertIsNotNone(injection)
+        self.assertIsNotNone(positional_embed_overrides)
         self.assertEqual(
-            len(injection), 1
+            len(positional_embed_overrides), 1
         )  # single PositionalEmbeds for combined sequence
-        pe = injection[0]
+        pe = positional_embed_overrides[0]
         # query override at pos 0, item[0] override at pos 4 (query_len=2 + delim=1 + idx=1)
         self.assertIn(0, pe.positions)
         self.assertIn(4, pe.positions)

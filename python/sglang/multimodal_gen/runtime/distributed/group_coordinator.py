@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_stdout,
 )
+from sglang.srt.utils import is_shm_available
 
 try:
     import torch_musa  # noqa: F401
@@ -186,7 +187,6 @@ class GroupCoordinator:
         self.device = get_local_torch_device()
 
         self.use_device_communicator = use_device_communicator
-
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
         if use_device_communicator and self.world_size > 1:
             # Platform-aware device communicator selection
@@ -324,9 +324,19 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
         else:
-            torch.distributed.all_reduce(
-                input_, op=op, group=self.device_group, async_op=async_op
-            )
+            if (
+                current_platform.is_cpu()
+                and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
+                and op is torch.distributed.ReduceOp.SUM
+            ):
+                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
+                torch.ops.sgl_kernel.shm_allreduce(
+                    input_, int(torch.distributed.ReduceOp.SUM)
+                )
+            else:
+                torch.distributed.all_reduce(
+                    input_, op=op, group=self.device_group, async_op=async_op
+                )
         return input_
 
     def all_gather(
@@ -348,10 +358,17 @@ class GroupCoordinator:
         output_tensor = torch.empty(
             input_size, dtype=input_.dtype, device=input_.device
         )
+
         # All-gather.
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
+        if current_platform.is_cpu() and is_shm_available(
+            input_.dtype, self.world_size, len(self.ranks)
+        ):
+            return torch.ops.sgl_kernel.shm_allgather(input_, dim)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
+
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
@@ -435,9 +452,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return obj
-        if self.shm_broadcaster is not None:
+        if self.mq_broadcaster is not None:
             assert src == 0, "Shared memory broadcaster only supports src=0"
-            return self.shm_broadcaster.broadcast_object(obj)
+            return self.mq_broadcaster.broadcast_object(obj)
         if self.rank_in_group == src:
             torch.distributed.broadcast_object_list(
                 [obj], src=self.ranks[src], group=self.cpu_group
