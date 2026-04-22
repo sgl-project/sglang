@@ -39,7 +39,6 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -243,58 +242,6 @@ def _normalize_tp_style(style: str) -> Style:
     if style not in {"colwise", "colwise_rep", "rowwise", "rowwise_rep", "replicate"}:
         raise ValueError(f"Unsupported TP style '{style}' for Transformers backend.")
     return style
-
-
-def replace_rms_norm_class(rms_norm: nn.Module, hidden_size: int) -> nn.Module:
-    eps = _getattr_first(rms_norm, ("eps", "variance_epsilon"), 1e-6)
-    kwargs = {"hidden_size": hidden_size, "eps": eps}
-    weight_meta = getattr(rms_norm, "weight", None)
-    if weight_meta is not None:
-        kwargs["hidden_size"] = weight_meta.size(0)
-
-    try:
-        with torch.device("cpu"):
-            weight_test = getattr(rms_norm.__class__(1), "weight", None)
-    except Exception:
-        weight_test = None
-    is_gemma = weight_test is not None and torch.all(weight_test == 0)
-
-    if is_gemma:
-        base_cls = GemmaRMSNorm
-        norm = base_cls(
-            **{k: v for k, v in kwargs.items() if k in ("hidden_size", "eps")}
-        )
-    else:
-        kwargs["has_weight"] = getattr(rms_norm, "with_scale", True)
-        if weight_meta is not None:
-            kwargs["weight_dtype"] = weight_meta.dtype
-        else:
-            kwargs["has_weight"] = False
-        base_cls = RMSNorm
-        norm = base_cls(**kwargs)
-
-    # Wrap to handle 3D inputs from Transformers backbone (batch dim)
-    class HFCompatibleRMSNorm(norm.__class__):
-        def forward(self, x, *args, **kwargs):
-            orig_shape = x.shape
-            if x.ndim > 2:
-                x = x.reshape(-1, x.shape[-1]).contiguous()
-            result = super().forward(x, *args, **kwargs)
-            if isinstance(result, tuple):
-                return tuple(
-                    (
-                        r.reshape(orig_shape)
-                        if torch.is_tensor(r) and r.shape != orig_shape
-                        else r
-                    )
-                    for r in result
-                )
-            if torch.is_tensor(result) and result.shape != orig_shape:
-                return result.reshape(orig_shape)
-            return result
-
-    norm.__class__ = HFCompatibleRMSNorm
-    return norm
 
 
 def sglang_flash_attention_forward(
@@ -635,7 +582,7 @@ class TransformersBase(nn.Module):
 
         # Pipeline parallel
         self.pipeline_parallel()
-        # Module replacement (Linear → TP, RMSNorm → fused, MoE overridden by MoEMixin)
+        # Module replacement (Linear → TP, MoE overridden by MoEMixin)
         tp_size = get_tensor_model_parallel_world_size()
         self.recursive_replace()
         # Attention instances
@@ -747,7 +694,7 @@ class TransformersBase(nn.Module):
             normalized[pattern] = _normalize_tp_style(style)
         return normalized
 
-    # -- Recursive module replacement (Linear + RMSNorm) --------------------
+    # -- Recursive module replacement (Linear only) -------------------------
     def recursive_replace(self):
         tp_size = get_tensor_model_parallel_world_size()
         tp_plan = self._normalize_tp_plan(self._get_model_tp_plan())
@@ -776,11 +723,6 @@ class TransformersBase(nn.Module):
                         style,
                         self.quant_config,
                         prefix=qual_name,
-                    )
-                elif child_module.__class__.__name__.endswith("RMSNorm"):
-                    new_module = replace_rms_norm_class(
-                        child_module,
-                        self.text_config.hidden_size,
                     )
                 else:
                     _recursive_replace(child_module, prefix=qual_name)
@@ -1185,7 +1127,7 @@ class MoEMixin:
 
     def recursive_replace(self):
         """Replace experts modules with TransformersFusedMoE, then call
-        super().recursive_replace() for Linear/RMSNorm replacement."""
+        super().recursive_replace() for Linear replacement."""
         text_config = self.text_config
 
         num_experts = _getattr_first(
