@@ -38,9 +38,12 @@ class MemoryPoolConfig:
 
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
-            msg = "Not enough memory. Please try to increase --mem-fraction-static."
+            msg = (
+                "Not enough memory to allocate KV cache.\n"
+                "Please try to increase --mem-fraction-static."
+            )
             if self.mem_fraction_static is not None:
-                msg += f" Current value: mem_fraction_static={self.mem_fraction_static}"
+                msg += f"\nCurrent --mem-fraction-static={self.mem_fraction_static}"
             raise RuntimeError(msg)
 
 

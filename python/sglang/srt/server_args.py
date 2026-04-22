@@ -4323,7 +4323,13 @@ class ServerArgs:
             "--mem-fraction-static",
             type=float,
             default=ServerArgs.mem_fraction_static,
-            help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+            help=(
+                "Fraction of GPU memory for model weights + KV cache pool. "
+                "The remainder (1 - value) is reserved for activations and CUDA graphs. "
+                "Increase when SGLang has the GPU to itself and KV cache is too small at startup. "
+                "Decrease when a co-tenant process shares the GPU and causes activation OOM "
+                "(e.g., sibling process memory grew after SGLang booted)."
+            ),
         )
         parser.add_argument(
             "--max-running-requests",
