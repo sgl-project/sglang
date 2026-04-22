@@ -8,9 +8,9 @@ are split correctly.
 Regression test for https://github.com/sgl-project/sglang/issues/23051
 """
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=4, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=4, suite="stage-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
