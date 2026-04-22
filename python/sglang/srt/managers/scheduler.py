@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    kv_to_page_indices,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -3207,6 +3208,107 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    def run_batch_pipelined(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Run a batch with layer-pipelined KV transfer.
+
+        Instead of computing all layers then transferring all KV at once,
+        this runs layers in groups and enqueues KV transfer after each group.
+        Transfer of group N overlaps with GPU compute of group N+1.
+
+        Group size is controlled by SGLANG_PIPELINE_GROUP_SIZE (default=10).
+        """
+        self.forward_ct += 1
+        self._profile_batch_predicate(batch)
+
+        # Capture prefill start time
+        set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
+
+        model_worker_batch = batch.get_model_worker_batch()
+
+        num_layers = self.model_config.num_hidden_layers
+        page_size = self.token_to_kv_pool_allocator.page_size
+        group_size = int(os.environ.get("SGLANG_PIPELINE_GROUP_SIZE", "10"))
+
+        # Prepare KV page indices for all requests (same for every layer)
+        req_page_indices_list = []
+        for req in batch.reqs:
+            start_idx = req.start_send_idx
+            end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
+            kv_indices = (
+                self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, start_idx:end_idx
+                ]
+                .cpu()
+                .numpy()
+            )
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            req_page_indices_list.append(page_indices)
+
+        # Initialize split prefill
+        forward_batch = self.tp_worker.forward_batch_generation_split_init(
+            model_worker_batch
+        )
+
+        logits_output = None
+        # Grouped layer forward + per-group KV transfer
+        for group_start in range(0, num_layers, group_size):
+            group_end = min(group_start + group_size, num_layers)
+            forward_count = group_end - group_start
+
+            ret, cuda_event = (
+                self.tp_worker.forward_batch_generation_split_layer(
+                    forward_batch, forward_count=forward_count
+                )
+            )
+            if ret is not None:
+                logits_output = ret
+
+            # Enqueue KV transfer for all layers in this group
+            is_last_group = group_end == num_layers
+            for req, page_indices in zip(batch.reqs, req_page_indices_list):
+                if len(page_indices) == 0:
+                    continue
+                for layer_id in range(group_start, group_end):
+                    req.disagg_kv_sender.send_layer(
+                        page_indices,
+                        layer_id=layer_id,
+                        cuda_event=cuda_event,
+                        is_last=(
+                            is_last_group and layer_id == num_layers - 1
+                        ),
+                    )
+
+        # Sample next tokens
+        assert logits_output is not None, (
+            "forward_split_prefill should return logits after the last layer"
+        )
+        next_token_ids = self.tp_worker.forward_batch_generation_split_sample(
+            logits_output, forward_batch
+        )
+
+        batch.output_ids = next_token_ids
+
+        if batch.return_logprob:
+            extend_input_len_per_req = [
+                req.extend_input_len for req in batch.reqs
+            ]
+            extend_logprob_start_len_per_req = [
+                req.extend_logprob_start_len for req in batch.reqs
+            ]
+        else:
+            extend_input_len_per_req = None
+            extend_logprob_start_len_per_req = None
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=next_token_ids,
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            can_run_cuda_graph=False,
+        )
+
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -3951,6 +4053,11 @@ def dispatch_event_loop(scheduler: Scheduler):
         else:
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
+        if os.environ.get("SGLANG_PIPELINED_KV_TRANSFER", "0") == "1":
+            logger.info(
+                "Layer-pipelined KV transfer enabled "
+                "(dispatched per-batch in normal event loop)"
+            )
         if server_args.pp_size > 1:
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:

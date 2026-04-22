@@ -79,6 +79,20 @@ class FakeKVSender(BaseKVSender):
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )
 
+    def send_layer(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        layer_id: int = 0,
+        cuda_event=None,
+        is_last: bool = False,
+    ):
+        """Per-layer KV send stub for warmup. Only marks sent on the last layer."""
+        if is_last:
+            self.has_sent = True
+        logger.debug(
+            f"FakeKVSender send_layer layer_id={layer_id} is_last={is_last}"
+        )
+
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 

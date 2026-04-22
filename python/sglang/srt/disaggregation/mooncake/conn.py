@@ -66,7 +66,9 @@ class TransferKVChunk:
     index_slice: slice
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
-    state_indices: Optional[List]
+    state_indices: Optional[List[int]]
+    layer_id: Optional[int] = None
+    cuda_event: object = None
 
 
 # decode
@@ -704,6 +706,67 @@ class MooncakeKVManager(CommonKVManager):
             executor=executor,
         )
 
+    def send_kvcache_layer(
+        self,
+        mooncake_session_id: str,
+        layer_id: int,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+    ) -> int:
+        """Send KV cache for a single transformer layer via RDMA.
+
+        For MHA models, kv_data_ptrs layout is [K0..K_{N-1}, V0..V_{N-1}].
+        For MLA models, kv_data_ptrs layout is [KV0..KV_{N-1}].
+        """
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_kv_indices, dst_kv_indices
+        )
+
+        if self.is_mla_backend:
+            src_kv_ptrs, dst_kv_ptrs_pp, layers_current_pp_stage = (
+                self.get_mla_kv_ptrs_with_pp(
+                    self.kv_args.kv_data_ptrs, dst_kv_ptrs
+                )
+            )
+            # MLA: single combined KV per layer
+            src_ptr = src_kv_ptrs[layer_id]
+            dst_ptr = dst_kv_ptrs_pp[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
+            transfer_blocks = []
+            for prefill_index, decode_index in zip(
+                prefill_kv_blocks, dst_kv_blocks
+            ):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
+                transfer_blocks.append((src_addr, dst_addr, length))
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                self.get_mha_kv_ptrs_with_pp(
+                    self.kv_args.kv_data_ptrs, dst_kv_ptrs
+                )
+            )
+            # MHA: separate K and V arrays, each indexed by layer_id
+            k_item_len = self.kv_args.kv_item_lens[layer_id]
+            v_item_len = self.kv_args.kv_item_lens[
+                layers_current_pp_stage + layer_id
+            ]
+            transfer_blocks = []
+            for src_ptr, dst_ptr, item_len in [
+                (src_k_ptrs[layer_id], dst_k_ptrs[layer_id], k_item_len),
+                (src_v_ptrs[layer_id], dst_v_ptrs[layer_id], v_item_len),
+            ]:
+                for prefill_index, decode_index in zip(
+                    prefill_kv_blocks, dst_kv_blocks
+                ):
+                    src_addr = src_ptr + int(prefill_index[0]) * item_len
+                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                    length = item_len * len(prefill_index)
+                    transfer_blocks.append((src_addr, dst_addr, length))
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+
     def send_kvcache_hisparse(
         self,
         mooncake_session_id: str,
@@ -1265,6 +1328,17 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             ret = 0
+                        elif kv_chunk.layer_id is not None:
+                            # Layer-pipelined mode: sync CUDA event, send single layer
+                            if kv_chunk.cuda_event is not None:
+                                kv_chunk.cuda_event.synchronize()
+                            ret = self.send_kvcache_layer(
+                                req.mooncake_session_id,
+                                kv_chunk.layer_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                            )
                         elif self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
@@ -1581,7 +1655,9 @@ class MooncakeKVManager(CommonKVManager):
         index_slice: slice,
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
-        state_indices: Optional[List] = None,
+        state_indices: Optional[List[int]] = None,
+        layer_id: Optional[int] = None,
+        cuda_event: object = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1616,6 +1692,8 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                layer_id=layer_id,
+                cuda_event=cuda_event,
             )
         )
 
@@ -1714,6 +1792,25 @@ class MooncakeKVSender(CommonKVSender):
                 state_indices=state_indices,
             )
         self._record_transfer_indices(kv_indices, state_indices)
+
+    def send_layer(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        layer_id: int,
+        cuda_event: object,
+        is_last: bool = False,
+    ):
+        """Enqueue a single layer's KV transfer for layer-pipelined mode."""
+        index_slice = slice(0, len(kv_indices))
+        self.kv_mgr.add_transfer_request(
+            self.bootstrap_room,
+            kv_indices,
+            index_slice,
+            is_last=is_last,
+            aux_index=self.aux_index if is_last else None,
+            layer_id=layer_id,
+            cuda_event=cuda_event,
+        )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

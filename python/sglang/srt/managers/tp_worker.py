@@ -538,6 +538,49 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
 
+    def forward_batch_generation_split_init(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+    ) -> ForwardBatch:
+        """Initialize a ForwardBatch for layer-pipelined split prefill.
+
+        Keeps forward_mode as EXTEND so that LogitsProcessor correctly
+        extracts last-token logits. The split is controlled solely via
+        split_index, not forward_mode.
+        """
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch.split_index = 0
+        return forward_batch
+
+    def forward_batch_generation_split_layer(
+        self,
+        forward_batch: ForwardBatch,
+        forward_count: int = 1,
+    ) -> tuple:
+        """Run forward_count layers of split prefill and return (logits_or_none, event).
+
+        The CUDA event is recorded right after the layer forward completes.
+        Returns (None, event) for intermediate groups.
+        Returns (LogitsProcessorOutput, event) for the final group
+        (when split_index reaches num_hidden_layers).
+        """
+        logits_output = self.model_runner.forward_split_prefill(
+            forward_batch,
+            reinit_attn_backend=(forward_batch.split_index == 0),
+            forward_count=forward_count,
+        )
+        event = torch.cuda.Event()
+        event.record()
+        return logits_output, event
+
+    def forward_batch_generation_split_sample(
+        self,
+        logits_output,
+        forward_batch: ForwardBatch,
+    ):
+        """Sample next tokens from logits after split prefill completes."""
+        return self.model_runner.sample(logits_output, forward_batch)
+
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:
             forward_batch = ForwardBatch.init_new(batch, self.model_runner)
