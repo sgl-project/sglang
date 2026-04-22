@@ -12,8 +12,11 @@ Usage:
     # Tag the run for later compare_perf.py usage
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
 
-    # All 10 preset models
+    # All 14 preset models
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
+
+    # Show preset order, model path, and nightly mapping
+    python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --list-models
 
 For gated Hugging Face repos such as FLUX, export HF_TOKEN first:
     export HF_TOKEN=<your_hf_token>
@@ -22,8 +25,6 @@ Input images required for image-guided models:
     ASSET_DIR=$(python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py print-assets-dir --mkdir)
     wget -O "${ASSET_DIR}/cat.png" \
       https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png
-    wget -O "${ASSET_DIR}/astronaut.jpg" \
-      https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg
     wget -O "${ASSET_DIR}/mova_single_person.jpg" \
       https://github.com/OpenMOSS/MOVA/raw/main/assets/single_person.jpg
 """
@@ -52,131 +53,184 @@ from diffusion_skill_env import (
 REPO_ROOT = get_repo_root()
 ASSET_DIR = ensure_dir(get_assets_dir(REPO_ROOT))
 GATED_MODELS = {"flux", "flux2"}
+DIFFUSERS_FALLBACK_SIGNALS = (
+    "falling back to diffusers backend",
+    "using diffusers backend",
+    "loaded diffusers pipeline",
+)
 
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
+# Nightly-aligned presets come first, followed by skill-only extras.
 # Each entry produces the same `sglang generate` command as shown in that doc.
 # ---------------------------------------------------------------------------
 MODELS = {
-    # 1. Qwen/Qwen-Image-2512 — Text-to-Image, 1024×1024, 50 steps
-    "qwen": {
-        "path": "Qwen/Qwen-Image-2512",
-        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets, highly detailed, 8k",
-        "negative_prompt": " ",
+    # 1. Nightly: flux1_dev_t2i_1024
+    "flux": {
+        "nightly_case_id": "flux1_dev_t2i_1024",
+        "path": "black-forest-labs/FLUX.1-dev",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
         "extra_args": [
             "--width=1024",
             "--height=1024",
             "--num-inference-steps=50",
             "--guidance-scale=4.0",
-            "--dit-cpu-offload",
-            "false",
-            "--text-encoder-cpu-offload",
+            "--dit-layerwise-offload",
             "false",
         ],
     },
-    # 2. Qwen/Qwen-Image-Edit-2511 — Image Editing, 1024×1024, 50 steps
+    # 2. Nightly: flux2_dev_t2i_1024
+    "flux2": {
+        "nightly_case_id": "flux2_dev_t2i_1024",
+        "path": "black-forest-labs/FLUX.2-dev",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=50",
+            "--guidance-scale=4.0",
+            "--dit-layerwise-offload",
+            "false",
+        ],
+    },
+    # 3. Nightly: qwen_image_2512_t2i_1024
+    "qwen": {
+        "nightly_case_id": "qwen_image_2512_t2i_1024",
+        "path": "Qwen/Qwen-Image-2512",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=50",
+            "--guidance-scale=4.0",
+        ],
+    },
+    # 4. Nightly: qwen_image_edit_2511
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "qwen-edit": {
+        "nightly_case_id": "qwen_image_edit_2511",
         "path": "Qwen/Qwen-Image-Edit-2511",
-        "prompt": "Transform into anime style",
-        "negative_prompt": " ",
+        "prompt": "Make the cat wear a red hat",
         "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
             "--width=1024",
             "--height=1024",
             "--num-inference-steps=50",
             "--guidance-scale=4.0",
-            "--dit-cpu-offload",
-            "false",
-            "--text-encoder-cpu-offload",
-            "false",
         ],
     },
-    # 3. black-forest-labs/FLUX.1-dev — Text-to-Image, 1024×1024, 50 steps
-    "flux": {
-        "path": "black-forest-labs/FLUX.1-dev",
-        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets, highly detailed, 8k",
-        "extra_args": [
-            "--width=1024",
-            "--height=1024",
-            "--num-inference-steps=50",
-            "--guidance-scale=4.0",
-        ],
-    },
-    # 4. black-forest-labs/FLUX.2-dev — Text-to-Image, 1024×1024
-    "flux2": {
-        "path": "black-forest-labs/FLUX.2-dev",
-        "prompt": "A Logo With Bold Large Text: SGL Diffusion",
-        "extra_args": [
-            "--width=1024",
-            "--height=1024",
-            "--dit-layerwise-offload",
-            "false",
-            "--dit-cpu-offload",
-            "false",
-            "--text-encoder-cpu-offload",
-            "true",
-            "--vae-cpu-offload",
-            "false",
-        ],
-    },
-    # 5. Tongyi-MAI/Z-Image-Turbo — Turbo Text-to-Image, 1024×1024, 9 steps
+    # 5. Nightly: zimage_turbo_t2i_1024
     "zimage": {
+        "nightly_case_id": "zimage_turbo_t2i_1024",
         "path": "Tongyi-MAI/Z-Image-Turbo",
-        "prompt": "A fantasy landscape with mountains and a river, detailed, vibrant colors",
+        "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
         "extra_args": [
             "--width=1024",
             "--height=1024",
             "--num-inference-steps=9",
-            "--guidance-scale=0.0",
-            "--dit-cpu-offload",
-            "false",
-            "--text-encoder-cpu-offload",
-            "false",
+            "--guidance-scale=4.0",
         ],
     },
-    # 6. Wan-AI/Wan2.2-T2V-A14B-Diffusers — Text-to-Video, 720P, 4 GPUs, 81 frames, 2 steps
+    # 6. Nightly: wan22_t2v_a14b_720p
     "wan-t2v": {
+        "nightly_case_id": "wan22_t2v_a14b_720p",
         "path": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-        "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon.",
-        "negative_prompt": " ",
+        "prompt": "A cat and a dog baking a cake together in a kitchen.",
         "extra_args": [
             "--720p",
             "--num-inference-steps=2",
             "--num-frames=81",
             "--guidance-scale=5.0",
             "--num-gpus=4",
-            "--ulysses-degree=4",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=2",
             "--text-encoder-cpu-offload",
             "--pin-cpu-memory",
         ],
     },
-    # 7. Wan-AI/Wan2.2-TI2V-5B-Diffusers — Text-Image-to-Video, 720P, 1 GPU, 81 frames, 50 steps
-    # Requires: <repo>/inputs/diffusion_benchmark/figs/astronaut.jpg
+    # 7. Nightly: wan22_ti2v_5b_720p
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "wan-ti2v": {
+        "nightly_case_id": "wan22_ti2v_5b_720p",
         "path": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        "prompt": "An astronaut hatching from an egg, on the surface of the moon, the darkness and depth of space realised in the background. High quality, ultrarealistic detail and breath-taking movie-like camera shot.",
-        "negative_prompt": "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
-        "image_path": str(ASSET_DIR / "astronaut.jpg"),
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
-            "--num-frames",
-            "81",
             "--720p",
-            "--num-inference-steps",
-            "50",
-            "--guidance-scale",
-            "5.0",
-            "--dit-layerwise-offload",
-            "false",
-            "--dit-cpu-offload",
-            "false",
-            "--vae-cpu-offload",
-            "false",
-            "--text-encoder-cpu-offload",
-            "false",
+            "--num-frames=81",
+            "--num-inference-steps=50",
+            "--guidance-scale=5.0",
         ],
     },
-    # 8. hunyuanvideo-community/HunyuanVideo — Text-to-Video, 848×480, 65 frames, 30 steps
+    # 8. Nightly: ltx2_twostage_t2v
+    "ltx2": {
+        "nightly_case_id": "ltx2_twostage_t2v",
+        "path": "Lightricks/LTX-2",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=1536",
+            "--height=1024",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-gpus=1",
+        ],
+    },
+    # 9. Nightly: wan22_i2v_a14b_720p
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "wan-i2v": {
+        "nightly_case_id": "wan22_i2v_a14b_720p",
+        "path": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        "prompt": "The cat starts walking slowly towards the camera.",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--720p",
+            "--num-inference-steps=2",
+            "--num-frames=81",
+            "--guidance-scale=5.0",
+            "--num-gpus=4",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=2",
+            "--text-encoder-cpu-offload",
+            "--pin-cpu-memory",
+        ],
+    },
+    # 10. Skill-only extra preset
+    "ltx23-one-stage": {
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--width=768",
+            "--height=512",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=30",
+            "--guidance-scale=3.0",
+            "--num-gpus=2",
+        ],
+    },
+    # 11. Skill-only extra preset
+    "ltx23-two-stage": {
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=1536",
+            "--height=1024",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=30",
+            "--guidance-scale=3.0",
+            "--num-gpus=2",
+        ],
+    },
+    # 12. Skill-only extra preset
     "hunyuanvideo": {
         "path": "hunyuanvideo-community/HunyuanVideo",
         "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
@@ -189,7 +243,7 @@ MODELS = {
             "--num-inference-steps=30",
         ],
     },
-    # 9. OpenMOSS-Team/MOVA-720p — Image-to-Video, 4 GPUs, 193 frames, 2 steps
+    # 13. Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
@@ -205,7 +259,7 @@ MODELS = {
             "--num-inference-steps=2",
         ],
     },
-    # 10. BestWishYsh/Helios-Base — Text-to-Video, 640×384, 33 frames
+    # 14. Skill-only extra preset
     "helios": {
         "path": "BestWishYsh/Helios-Base",
         "prompt": "A curious raccoon",
@@ -227,11 +281,35 @@ MODELS = {
 
 
 def required_gpus_for_model(model_key: str) -> int:
-    if model_key == "wan-t2v":
+    if model_key in {"wan-t2v", "wan-i2v"}:
         return 4
     if model_key == "mova-720p":
         return 4
+    if model_key in {"ltx23-one-stage", "ltx23-two-stage"}:
+        return 2
     return 1
+
+
+def model_nightly_case_id(model_key: str) -> str:
+    return MODELS[model_key].get("nightly_case_id", "-")
+
+
+def print_model_catalog():
+    """Print preset order, model path, and whether each preset maps to nightly."""
+    print()
+    print("=" * 95)
+    print("MODEL PRESETS — Nightly-aligned first, skill-only extras after")
+    print("=" * 95)
+    print(f"{'Preset':<17} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
+    print("-" * 95)
+    for model_key, cfg in MODELS.items():
+        print(
+            f"{model_key:<17} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
+        )
+    print("-" * 112)
+    print(
+        "Nightly column shows the comparison_configs.json case id; '-' means skill-only."
+    )
 
 
 def build_sglang_cmd(
@@ -253,11 +331,13 @@ def build_sglang_cmd(
         "generate",
         f"--model-path={cfg['path']}",
         f"--prompt={cfg['prompt']}",
+        "--backend=sglang",
         "--log-level=info",
     ]
 
-    if seed is not None:
-        cmd.append(f"--seed={seed}")
+    effective_seed = cfg.get("seed", seed)
+    if effective_seed is not None:
+        cmd.append(f"--seed={effective_seed}")
 
     if "negative_prompt" in cfg:
         cmd.append(f"--negative-prompt={cfg['negative_prompt']}")
@@ -284,6 +364,7 @@ def run_benchmark_once(
     label: str,
     output_dir: Path,
     warmup: bool = True,
+    torch_compile: bool = True,
 ) -> dict:
     """Run a single benchmark pass and return results dict."""
     perf_path = output_dir / f"{model_key}_{label}.json"
@@ -292,6 +373,7 @@ def run_benchmark_once(
         model_key,
         perf_dump_path=str(perf_path),
         warmup=warmup,
+        torch_compile=torch_compile,
     )
 
     env = os.environ.copy()
@@ -323,11 +405,32 @@ def run_benchmark_once(
     print()
 
     t0 = time.time()
-    result = subprocess.run(cmd, env=env, text=True)
+    process = subprocess.Popen(
+        cmd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    fallback_detected = False
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="")
+        if any(signal in line.lower() for signal in DIFFUSERS_FALLBACK_SIGNALS):
+            fallback_detected = True
+    returncode = process.wait()
     elapsed = time.time() - t0
 
-    if result.returncode != 0:
-        print(f"  ERROR: exit code {result.returncode}")
+    if fallback_detected:
+        print(
+            "  ERROR: model fell back to the diffusers backend. "
+            "Fix native SGLang diffusion backend selection before collecting perf data."
+        )
+        return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
+
+    if returncode != 0:
+        print(f"  ERROR: exit code {returncode}")
         return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
 
     metrics = {"model": model_key, "label": label, "elapsed_s": elapsed, "error": False}
@@ -342,20 +445,28 @@ def run_benchmark_once(
                 float(total_ms) / 1000.0 if total_ms is not None else None
             )
 
-            # denoise latency: accept the canonical "DenoisingStage" plus
-            # model-specific variants such as "MOVADenoisingStage" and
-            # "HeliosChunkedDenoisingStage".
-            # steps = [{"name": "DenoisingStage", "duration_ms": 1234.5}, ...]
+            # denoise latency: sum all true denoise/refinement stages.
+            # This accepts variants such as "MOVADenoisingStage",
+            # "HeliosChunkedDenoisingStage", and the LTX-2 two-stage pair
+            # "LTX2AVDenoisingStage" + "LTX2RefinementStage", while excluding
+            # setup stages like "QwenImageLayeredBeforeDenoisingStage".
             denoise_latency_s = None
+            denoise_stage_total_ms = 0.0
             for step in perf.get("steps", []):
                 step_name = step.get("name")
                 if (
                     isinstance(step_name, str)
-                    and "DenoisingStage" in step_name
                     and step.get("duration_ms") is not None
+                    and (
+                        step_name.endswith("DenoisingStage")
+                        or step_name.endswith("RefinementStage")
+                    )
+                    and "BeforeDenoisingStage" not in step_name
                 ):
-                    denoise_latency_s = float(step["duration_ms"]) / 1000.0
-                    break
+                    denoise_stage_total_ms += float(step["duration_ms"])
+
+            if denoise_stage_total_ms > 0.0:
+                denoise_latency_s = denoise_stage_total_ms / 1000.0
 
             # fallback: sum all per-step durations from denoise_steps_ms
             # denoise_steps_ms = [{"step": 0, "duration_ms": 100.5}, ...]
@@ -393,9 +504,9 @@ def print_results_table(results: list[dict]):
     print("=" * 80)
 
     print(
-        f"{'Model':<16} {'Label':<12} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
+        f"{'Model':<14} {'Nightly':<24} {'Label':<12} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
     )
-    print("-" * 64)
+    print("-" * 92)
 
     for result in results:
         denoise_s = result.get("denoise_latency_s")
@@ -405,12 +516,14 @@ def print_results_table(results: list[dict]):
         e2e_text = f"{e2e_s:.2f}" if isinstance(e2e_s, float) else "n/a"
         mem_text = f"{peak_mem:.1f}" if isinstance(peak_mem, float) else "n/a"
         print(
-            f"{result['model']:<16} {result['label']:<12} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
+            f"{result['model']:<14} {model_nightly_case_id(result['model']):<24} {result['label']:<12} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
         )
 
-    print("-" * 64)
+    print("-" * 92)
     print()
-    print("★ Denoise latency = total DiT forward pass time across all inference steps.")
+    print(
+        "★ Denoise latency = sum of stages ending with DenoisingStage plus any RefinementStage."
+    )
     print(
         "  Compare two runs with python/sglang/multimodal_gen/benchmarks/compare_perf.py."
     )
@@ -425,7 +538,12 @@ def main():
         choices=list(MODELS.keys()),
         help="Model to benchmark (default: flux)",
     )
-    parser.add_argument("--all", action="store_true", help="Benchmark all 10 models")
+    parser.add_argument("--all", action="store_true", help="Benchmark all 14 models")
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List preset order, nightly mapping, and exit",
+    )
     parser.add_argument(
         "--label",
         type=str,
@@ -439,18 +557,36 @@ def main():
         help="Directory for perf dump JSON files",
     )
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup")
+    parser.add_argument(
+        "--no-torch-compile",
+        action="store_true",
+        help="Keep torch.compile disabled for eager-mode comparisons.",
+    )
 
     args = parser.parse_args()
+
+    if args.list_models:
+        print_model_catalog()
+        return
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     warmup = not args.no_warmup
+    torch_compile = not args.no_torch_compile
 
     models_to_run = list(MODELS.keys()) if args.all else [args.model or "flux"]
     results = []
 
     for model_key in models_to_run:
-        results.append(run_benchmark_once(model_key, args.label, output_dir, warmup))
+        results.append(
+            run_benchmark_once(
+                model_key,
+                args.label,
+                output_dir,
+                warmup=warmup,
+                torch_compile=torch_compile,
+            )
+        )
 
     if results:
         print_results_table(results)

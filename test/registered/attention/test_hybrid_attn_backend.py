@@ -6,7 +6,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 
 # Hybrid attention backend tests (FA3 prefill + FlashInfer decode, requires SM 90+ / H100)
 # Multiple test classes: base, MLA, TorchCompile, SpecDecode variants
-register_cuda_ci(est_time=200, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=342, suite="stage-b-test-1-gpu-large")
 
 GSM_DATASET_PATH = None
 
@@ -76,24 +76,23 @@ class TestHybridAttnBackendBase(CustomTestCase):
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
 
+        model = DEFAULT_TARGET_MODEL_EAGLE if self.speculative_decode else self.model
         args = SimpleNamespace(
-            num_shots=4,
-            num_questions=100,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-            data_path=GSM_DATASET_PATH,
+            base_url=self.base_url,
+            model=model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=100,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
 
-        # Use the appropriate metric key based on the test class
-        metric_key = "accuracy"
-        self.assertGreater(metrics[metric_key], self.accuracy_threshold)
+        self.assertGreater(metrics["score"], self.accuracy_threshold)
 
         if self.speculative_decode:
-            server_info = requests.get(self.base_url + "/get_server_info")
+            server_info = requests.get(self.base_url + "/server_info")
             avg_spec_accept_length = server_info.json()["internal_states"][0][
                 "avg_spec_accept_length"
             ]

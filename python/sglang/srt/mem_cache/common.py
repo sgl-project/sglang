@@ -478,10 +478,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
-    # FIXME: SessionAwareCache.cache_finished_req sets req_pool_idx = None to
-    # transfer KV ownership to the SessionSlot, so we skip the remaining
-    # cleanup (overalloc free + pool slot free). This means over-allocated
-    # tokens from speculative decoding are NOT freed between turns.
+    # StreamingSession.cache_finished_req handles speculative tail trim
+    # and bookkeeping flag sync internally, then sets req_pool_idx = None.
     if req.req_pool_idx is None:
         return
 
@@ -491,7 +489,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
-    if spec_algo is None:
+    # strip_thinking_cache intentionally reports output tokens as overallocated
+    # so they fall into the free path below (#22373).
+    if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"

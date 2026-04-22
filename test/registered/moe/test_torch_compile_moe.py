@@ -12,10 +12,11 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=210, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=125, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -73,6 +74,9 @@ class TestTorchCompileMoe(CustomTestCase):
         throughput = max_tokens / (tok - tic)
         if is_cuda():
             self.assertGreaterEqual(throughput, 285)
+        elif is_in_amd_ci():
+            # relax for mi300x
+            self.assertGreaterEqual(throughput, 240)
         else:
             self.assertGreaterEqual(throughput, 270)
 

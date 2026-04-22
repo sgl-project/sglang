@@ -67,7 +67,7 @@ class RuntimeEndpoint(BaseBackend):
 
     def get_server_info(self):
         res = http_request(
-            self.base_url + "/get_server_info",
+            self.base_url + "/server_info",
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -531,7 +531,7 @@ class Runtime:
 
     async def get_server_info(self):
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.url}/get_server_info") as response:
+            async with session.get(f"{self.url}/server_info") as response:
                 if response.status == 200:
                     return await response.json()
                 else:

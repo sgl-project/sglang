@@ -9,7 +9,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=132, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-large")
 
 
 class TestFP8Base(CustomTestCase):
@@ -96,7 +96,9 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
         A, A_quant_gt, scale_gt = self._make_A(
             M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
         )
-        A_quant, scale = per_token_group_quant_fp8(x=A, group_size=self.group_size)
+        A_quant, scale = per_token_group_quant_fp8(
+            x=A.to(torch.bfloat16), group_size=self.group_size
+        )
         torch.testing.assert_close(scale, scale_gt)
         diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
         diff_count = (diff > 1e-5).count_nonzero()

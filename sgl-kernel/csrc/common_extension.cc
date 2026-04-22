@@ -50,8 +50,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/attention
    */
-  m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
-  m.impl("merge_state", torch::kCUDA, &merge_state);
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
   m.def(
@@ -89,11 +87,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
-
-  m.def(
-      "downcast_fp8(Tensor k, Tensor v, Tensor k_out, Tensor v_out, Tensor k_scale, Tensor v_scale, Tensor loc, "
-      "int mult, int offset) -> ()");
-  m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);
 
   m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
   m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
@@ -363,9 +356,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
   m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
-
-  m.def("top_k_mask_logits(Tensor logits, Tensor mask_logits, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
-  m.impl("top_k_mask_logits", torch::kCUDA, &top_k_mask_logits);
 
   /*
    * From Sparse Flash Attention

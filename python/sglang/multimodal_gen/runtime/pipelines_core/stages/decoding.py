@@ -56,6 +56,12 @@ class DecodingStage(PipelineStage):
     output format (e.g., pixel values).
     """
 
+    @property
+    def role_affinity(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        return RoleType.DECODER
+
     def __init__(self, vae, pipeline=None, component_name: str = "vae") -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
@@ -236,6 +242,7 @@ class DecodingStage(PipelineStage):
             output=frames,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
             trajectory_decoded=trajectory_decoded,
             metrics=batch.metrics,
             noise_pred=None,

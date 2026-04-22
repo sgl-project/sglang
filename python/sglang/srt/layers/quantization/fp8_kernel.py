@@ -47,6 +47,8 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_sm100_supported = is_sm100_supported()
+_is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
@@ -322,10 +324,6 @@ def _per_token_group_quant_8bit_raw(
     return x_q, x_s
 
 
-# backward compatibility
-per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
-
-
 def _per_token_group_quant_8bit_fuse_silu_and_mul(
     x: torch.Tensor,
     group_size: int,
@@ -505,6 +503,11 @@ def sglang_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
 
+    # Enable v2 kernel by default on supported group sizes
+    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
+    if enable_v2 is None:
+        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
+
     if x.shape[0] > 0:
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
@@ -602,6 +605,12 @@ def sglang_per_token_quant_fp8(
     sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
+
+
+if _is_cuda:
+    per_token_group_quant_fp8 = sglang_per_token_group_quant_fp8
+else:
+    per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
 
 
 @triton.jit
@@ -1299,7 +1308,7 @@ def mxfp8_block_scaled_matmul_triton(
             SM120: 1, SM100: 4.
     """
     if num_stages is None:
-        num_stages = 1 if is_sm120_supported() else (4 if is_sm100_supported() else 1)
+        num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
     M, K = a.shape
     N, K_b = b.shape
     assert K == K_b

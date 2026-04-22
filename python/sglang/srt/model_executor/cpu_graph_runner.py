@@ -140,6 +140,7 @@ def register_fake_ops():
         "causal_conv1d_fwd_cpu",
         "gemma_rmsnorm_cpu",
         "gemma3_rmsnorm_cpu",
+        "gemma4_rmsnorm_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
@@ -222,6 +223,7 @@ def register_fake_ops():
         use_fp8_w8a16,
         qkv_a_proj_scale,
         q_b_proj_scale,
+        w_scale,
         is_vnni,
         block_size,
         q_lora_rank,
