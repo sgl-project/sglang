@@ -57,7 +57,7 @@ def l2norm_fwd_kernel(
     y,
     eps,
     NB: tl.constexpr,
-    T: tl.constexpr,
+    T, #It should be runtime rather than constexpr.
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
