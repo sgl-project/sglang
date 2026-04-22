@@ -332,6 +332,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--elastic-ep-backend` | Specify the collective communication backend for elastic EP. Currently supports 'mooncake'. | `none` | `none`, `mooncake` |
 | `--enable-elastic-expert-backup` | Enable elastic EP backend to backup expert weights in DRAM feature. Currently supports 'mooncake'.| `False` | bool flag (set to enable) |
 | `--mooncake-ib-device` | The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled. | `None` | Type: str |
+| `--enable-deepep-waterfill` | Enable DeepEP Waterfill load balancing for the shared expert. Instead of running the shared expert locally on every rank, waterfill treats it as a virtual 9th routed expert and dispatches it to the least-loaded EP rank via DeepEP. Requires `--moe-a2a-backend deepep --deepep-mode normal`. Implicitly enables shared expert fusion (equivalent to `--enforce-shared-experts-fusion`). Use with `--init-expert-location` for static EPLB guidance (recommended). Currently supported on DeepSeek-V3/R1 with EP >= 2. | `False` | bool flag (set to enable) |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |

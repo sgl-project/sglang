@@ -845,11 +845,7 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if (
-                not sbo_enabled_flag
-                and not self._enable_deepep_waterfill
-                and self.num_fused_shared_experts == 0
-            ):
+            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
@@ -866,9 +862,6 @@ class DeepseekV2MoE(nn.Module):
                     layer_id=self.layer_id,
                 ),
             )
-
-            # Waterfill: expand topk from 8 to 9 columns, routing shared expert
-            # to the least-loaded rank instead of the home rank.
             if self._enable_deepep_waterfill:
                 topk_output = self.deepep_waterfill_balancer.expand_topk(
                     topk_output, hidden_states.shape[0]
@@ -1044,7 +1037,6 @@ class DeepseekV2MoE(nn.Module):
         if (
             hidden_states.shape[0] > 0
             and not sbo_enabled_flag
-            and not self._enable_deepep_waterfill
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
         ):
@@ -1070,11 +1062,7 @@ class DeepseekV2MoE(nn.Module):
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
     ):
-        if (
-            hidden_states.shape[0] > 0
-            and self.num_fused_shared_experts == 0
-            and not self._enable_deepep_waterfill
-        ):
+        if hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0:
             return self.shared_experts(
                 hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
             )
@@ -2275,27 +2263,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if server_args.disable_shared_experts_fusion:
             return
 
-        # DeepEP + enforce or waterfill: paths that enable fusion under DeepEP.
-        if is_deepep_class_backend() and (
-            server_args.enforce_shared_experts_fusion
-            or server_args.enable_deepep_waterfill
-        ):
-            mode = (
-                "waterfill dispatch"
-                if server_args.enable_deepep_waterfill
-                else "home EP rank local slot"
-            )
-            log_info_on_rank0(
-                logger,
-                f"DeepEP shared expert fusion: fusing shared expert into MoE kernel "
-                f"via {mode}.",
-            )
-            self.num_fused_shared_experts = self.config.n_shared_experts
-            return
-
-        # Check all conditions that disable fusion.
         disable_reason = None
-        if is_sbo_enabled() or is_tbo_enabled():
+        if get_global_server_args().enable_deepep_waterfill:
+            server_args.enforce_shared_experts_fusion = True
+        elif (
+            is_deepep_class_backend() and server_args.enforce_shared_experts_fusion
+        ):
+            pass
+        elif is_sbo_enabled() or is_tbo_enabled():
             disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."
         elif is_deepep_class_backend():
             disable_reason = "DeepEP: fusion off by default (use --enforce-shared-experts-fusion to enable)."
@@ -2332,6 +2307,17 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
+        if is_deepep_class_backend():
+            mode = (
+                "waterfill dispatch"
+                if server_args.enable_deepep_waterfill
+                else "home EP rank local slot"
+            )
+            log_info_on_rank0(
+                logger,
+                f"DeepEP shared expert fusion: fusing shared expert into MoE kernel "
+                f"via {mode}.",
+            )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

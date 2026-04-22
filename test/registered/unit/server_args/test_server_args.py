@@ -477,5 +477,19 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestDeepEPWaterfillArgs(CustomTestCase):
+    def test_waterfill_enforces_shared_experts_fusion_and_stats(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            enable_deepep_waterfill=True,
+            disable_shared_experts_fusion=True,
+        )
+
+        self.assertFalse(server_args.disable_shared_experts_fusion)
+        self.assertTrue(server_args.enforce_shared_experts_fusion)
+        self.assertEqual(server_args.expert_distribution_recorder_mode, "stat")
+
+
 if __name__ == "__main__":
     unittest.main()

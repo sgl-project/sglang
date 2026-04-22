@@ -5425,11 +5425,18 @@ class ServerArgs:
             "--enable-deepep-waterfill",
             action="store_true",
             default=ServerArgs.enable_deepep_waterfill,
-            help="Enable waterfill load balancing for shared expert using DeepEP dispatch. "
-            "This treats shared expert as the 9th expert and dispatches it through DeepEP "
-            "based on routed expert load for better load balancing. "
-            "Note: enabling DeepEP Waterfill also fuses shared expert into the MoE "
-            "dispatch/compute/combine path.",
+            help="Enable DeepEP Waterfill load balancing for the shared expert. "
+            "Instead of running the shared expert locally on every rank, waterfill "
+            "treats it as a virtual 9th routed expert and dispatches it to the "
+            "least-loaded EP rank via DeepEP, turning the shared expert into a "
+            "dynamic load-balancing lever. "
+            "Requires --moe-a2a-backend deepep --deepep-mode normal. "
+            "Implicitly enables shared expert fusion into the MoE dispatch/compute/"
+            "combine path (equivalent to --enforce-shared-experts-fusion). "
+            "Use together with --init-expert-location for static EPLB guidance "
+            "(recommended for best performance); without it, waterfill falls back "
+            "to dynamic all-reduce mode to estimate rank load each forward pass. "
+            "Currently supported on DeepSeek-V3/R1 with EP >= 2.",
         )
 
         # Mamba Cache
