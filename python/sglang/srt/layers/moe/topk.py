@@ -1070,15 +1070,19 @@ def _biased_grouped_topk_ungrouped(
     moe_fused_gate_ungrouped(
         gating_output.to(dtype=torch.float32),
         correction_bias,
-        topk=routed_topk,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
-        apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-        output=output,
-        indices=indices,
+        routed_topk,
+        renormalize,
+        routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+        apply_routed_scaling_factor_on_output,
+        output,
+        indices,
     )
 
-    # Fill shared expert slots in-place (no cat needed)
+    # Fill shared expert slots in-place (no cat needed).
+    # Shared expert weight = sum(routed_weights) / routed_scaling_factor.
+    # After kernel renormalization, sum(routed) = 1.0 (or *= rsf when
+    # apply_routed_scaling_factor_on_output is True), so shared weight equals
+    # 1/sf (or rsf/sf = 1.0), matching biased_grouped_topk_impl's semantics.
     if num_fused_shared_experts > 0:
         sf = routed_scaling_factor if routed_scaling_factor is not None else 1.0
         output[:, routed_topk:] = output[:, :routed_topk].sum(dim=-1, keepdim=True) / sf
@@ -1223,12 +1227,13 @@ def biased_grouped_topk_gpu(
             apply_routed_scaling_factor_on_output,
         )
     else:
-        # Use optimized path for ungrouped MoE (num_expert_group=1) with 256 or 384 experts
+        # Use optimized path for ungrouped MoE (num_expert_group=1)
         if (
             _is_cuda
             and moe_fused_gate_ungrouped is not None
             and num_expert_group == 1
-            and num_experts in (256, 384)
+            and num_experts % 128 == 0
+            and topk_routed <= 8
         ):
             return _biased_grouped_topk_ungrouped(
                 gating_output,

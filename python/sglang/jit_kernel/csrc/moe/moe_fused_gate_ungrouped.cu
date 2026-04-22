@@ -184,7 +184,9 @@ __global__ void moe_fused_gate_ungrouped_kernel(
   static constexpr int VPT = NUM_EXPERTS / WARP_SIZE;
 
   int64_t row_idx = blockIdx.x * WARPS_PER_CTA + threadIdx.y;
-  if (row_idx >= num_rows) return;
+  // Use valid-row predicate instead of early return to avoid __syncthreads deadlock
+  // when num_rows is not divisible by WARPS_PER_CTA.
+  bool valid_row = (row_idx < num_rows);
 
   int lane_id = threadIdx.x;
   int warp_id = threadIdx.y;
@@ -195,26 +197,28 @@ __global__ void moe_fused_gate_ungrouped_kernel(
   float* warp_scores = shared_scores + warp_id * NUM_EXPERTS;
   float* warp_original_scores = shared_original_scores + warp_id * NUM_EXPERTS;
 
-  // Vectorized loading
-  static constexpr int VEC_PER_LANE = VPT / VEC_SIZE;
-  float4* input_vec = reinterpret_cast<float4*>(input + row_idx * NUM_EXPERTS);
-  float4* bias_vec = reinterpret_cast<float4*>(bias);
+  // Vectorized loading (only for valid rows)
+  if (valid_row) {
+    static constexpr int VEC_PER_LANE = VPT / VEC_SIZE;
+    float4* input_vec = reinterpret_cast<float4*>(input + row_idx * NUM_EXPERTS);
+    float4* bias_vec = reinterpret_cast<float4*>(bias);
 
 #pragma unroll
-  for (int i = 0; i < VEC_PER_LANE; i++) {
-    int vec_idx = lane_id * VEC_PER_LANE + i;
-    float4 input_val = input_vec[vec_idx];
-    float4 bias_val = bias_vec[vec_idx];
+    for (int i = 0; i < VEC_PER_LANE; i++) {
+      int vec_idx = lane_id * VEC_PER_LANE + i;
+      float4 input_val = input_vec[vec_idx];
+      float4 bias_val = bias_vec[vec_idx];
 
 #pragma unroll
-    for (int j = 0; j < VEC_SIZE; j++) {
-      int expert = vec_idx * VEC_SIZE + j;
-      float inp = ((float*)&input_val)[j];
-      float b = ((float*)&bias_val)[j];
-      float sigmoid_val = 1.0f / (1.0f + expf(-inp));
-      float biased_val = sigmoid_val + b;
-      warp_scores[expert] = biased_val;
-      warp_original_scores[expert] = sigmoid_val;
+      for (int j = 0; j < VEC_SIZE; j++) {
+        int expert = vec_idx * VEC_SIZE + j;
+        float inp = ((float*)&input_val)[j];
+        float b = ((float*)&bias_val)[j];
+        float sigmoid_val = 1.0f / (1.0f + expf(-inp));
+        float biased_val = sigmoid_val + b;
+        warp_scores[expert] = biased_val;
+        warp_original_scores[expert] = sigmoid_val;
+      }
     }
   }
 
@@ -224,10 +228,12 @@ __global__ void moe_fused_gate_ungrouped_kernel(
     float max_val = -FLT_MAX;
     int max_expert = -1;
 
-    for (int expert = lane_id; expert < NUM_EXPERTS; expert += WARP_SIZE) {
-      if (warp_scores[expert] > max_val) {
-        max_val = warp_scores[expert];
-        max_expert = expert;
+    if (valid_row) {
+      for (int expert = lane_id; expert < NUM_EXPERTS; expert += WARP_SIZE) {
+        if (warp_scores[expert] > max_val) {
+          max_val = warp_scores[expert];
+          max_expert = expert;
+        }
       }
     }
 
@@ -241,7 +247,7 @@ __global__ void moe_fused_gate_ungrouped_kernel(
       }
     }
 
-    if (lane_id == 0) {
+    if (valid_row && lane_id == 0) {
       int64_t output_idx = row_idx * output_stride + k;
       if (max_expert != -1) {
         output_ptr[output_idx] = warp_original_scores[max_expert];
@@ -258,7 +264,7 @@ __global__ void moe_fused_gate_ungrouped_kernel(
 
   __syncthreads();
 
-  if (renormalize && lane_id == 0) {
+  if (valid_row && renormalize && lane_id == 0) {
     float sum = 0.0f;
     for (int k = 0; k < topk; k++) {
       sum += output_ptr[row_idx * output_stride + k];
