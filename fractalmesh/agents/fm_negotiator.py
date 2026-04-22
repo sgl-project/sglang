@@ -1,8 +1,9 @@
 """
-FractalMesh Negotiator Agent
-4A Signature: payment handling, proposal generation, negotiation specialist
-Logs pipeline stages to sovereign.db; dry-run safe
-Samuel James Hiotis | ABN 56 628 117 363
+FractalMesh Negotiator Agent v2.0.0
+4A Signature: payment handling, proposal generation, negotiation specialist.
+Includes satellite intelligence report tiers (methane, AIS, crop yield).
+Logs pipeline stages to sovereign.db; dry-run safe.
+Samuel James Hiotis | ABN 56 628 117 363 | Sole Trader
 """
 import os
 import json
@@ -28,10 +29,18 @@ OPERATOR_PHONE = os.getenv("OPERATOR_PHONE", "0439 008 640")
 
 # ── 4A Signature tiers ─────────────────────────────────────────────────────────
 TIERS = {
-    "audit":      {"label": "Infrastructure Audit",    "aud": 750.0,  "days": 5},
-    "compliance": {"label": "Compliance Automation",   "aud": 1500.0, "days": 10},
-    "deploy":     {"label": "Sovereign Node Deploy",   "aud": 2500.0, "days": 14},
-    "bundle":     {"label": "Full Sovereign Bundle",   "aud": 4500.0, "days": 21},
+    # Infrastructure consulting
+    "audit":           {"label": "Infrastructure Audit",              "aud":  750.0, "days": 5},
+    "compliance":      {"label": "Compliance Automation",             "aud": 1500.0, "days": 10},
+    "deploy":          {"label": "Sovereign Node Deploy",             "aud": 2500.0, "days": 14},
+    "bundle":          {"label": "Full Sovereign Bundle",             "aud": 4500.0, "days": 21},
+    # Satellite intelligence reports
+    "ch4_single":      {"label": "Methane Super-Emitter Report",      "aud": 2000.0, "days": 3},
+    "ch4_cluster":     {"label": "Methane Cluster Report (5 sites)",  "aud": 8000.0, "days": 5},
+    "ch4_retainer":    {"label": "Monthly Methane Monitoring",        "aud": 3500.0, "days": 30},
+    "ais_dark":        {"label": "Dark Fleet Intelligence (30 days)", "aud": 4500.0, "days": 7},
+    "crop_yield":      {"label": "Early Yield Signal Report",         "aud": 1500.0, "days": 5},
+    "cross_verify":    {"label": "WiFi + Satellite Ground-Truth",     "aud": 6000.0, "days": 7},
 }
 
 NEGOTIATION_ANCHORS = {
@@ -161,9 +170,12 @@ def run_cycle():
 
     # Demo proposal generation (one per cycle)
     demo_props = [
-        ("O'Brien Logistics",   "bundle",     False),
-        ("Visy Albury",         "compliance", True),
-        ("Local Construction",  "audit",      False),
+        ("O'Brien Logistics",            "bundle",       False),
+        ("Visy Albury",                  "compliance",   True),
+        ("Local Construction",           "audit",        False),
+        ("Carbon Trading Desk",          "ch4_single",   False),
+        ("Meridian Marine Insurance",    "ais_dark",     True),
+        ("Macquarie Commodities Desk",   "cross_verify", False),
     ]
     for prospect, tier, urgency in demo_props:
         prop   = _proposal(prospect, tier, urgency)

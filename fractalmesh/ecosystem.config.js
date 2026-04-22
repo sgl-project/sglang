@@ -1,7 +1,7 @@
 // FractalMesh Omega Titan v2.0.0 — PM2 Ecosystem
 // Samuel James Hiotis | ABN 56628117363 | Sole Trader | Albury NSW
 // Usage: pm2 start ecosystem.config.js --env production
-// Agents: 41 nodes | Memory budget: ~2.4GB total
+// Agents: 44 nodes | Memory budget: ~2.6GB total
 
 const ROOT = process.env.FRACTALMESH_HOME || require('path').join(process.env.HOME, 'fmsaas');
 const REPO = process.env.REPO_ROOT        || require('path').join(process.env.HOME, 'sglang');
@@ -515,6 +515,66 @@ module.exports = {
             },
             error_file: `${ROOT}/logs/fm-negotiator-error.log`,
             out_file:   `${ROOT}/logs/fm-negotiator-out.log`,
+            time:       true,
+        },
+
+        // ── v2.0.0 SATELLITE INTELLIGENCE AGENTS ─────────────────────
+
+        // Sentinel ingest — S5P CH4 + NASA EMIT + S2 NDVI (interval 6h)
+        {
+            name:              'fm-sentinel-ingest',
+            script:            `${REPO}/fractalmesh/agents/fm_sentinel_ingest.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'100M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-sentinel-ingest-error.log`,
+            out_file:   `${ROOT}/logs/fm-sentinel-ingest-out.log`,
+            time:       true,
+        },
+
+        // Methane reports — super-emitter detection + client report generation
+        {
+            name:              'fm-methane-reports',
+            script:            `${REPO}/fractalmesh/agents/fm_methane_reports.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'80M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                REPO_ROOT:        REPO,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-methane-reports-error.log`,
+            out_file:   `${ROOT}/logs/fm-methane-reports-out.log`,
+            time:       true,
+        },
+
+        // AIS monitor — dark fleet gap + spoofing detection (interval 15min)
+        {
+            name:              'fm-ais-monitor',
+            script:            `${REPO}/fractalmesh/agents/fm_ais_monitor.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'80M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-ais-monitor-error.log`,
+            out_file:   `${ROOT}/logs/fm-ais-monitor-out.log`,
             time:       true,
         },
 
