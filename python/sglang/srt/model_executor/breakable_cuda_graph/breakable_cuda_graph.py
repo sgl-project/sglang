@@ -310,7 +310,9 @@ class BreakableCUDAGraphCapture:
 
     def _begin_new_segment(self) -> None:
         graph = torch.cuda.CUDAGraph()
-        graph.capture_begin(pool=self._pool, capture_error_mode=self._capture_error_mode)
+        graph.capture_begin(
+            pool=self._pool, capture_error_mode=self._capture_error_mode
+        )
         self.cuda_graph._segments.append(graph)
 
     def _end_current_segment(self) -> None:

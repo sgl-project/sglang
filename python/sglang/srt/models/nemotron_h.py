@@ -434,9 +434,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
             and get_forward_context() is not None
         ):
             output = torch.empty_like(hidden_states)
-            breakable_nemotron_mamba2_with_output(
-                hidden_states, output, self.layer_id
-            )
+            breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
             return output, residual
 
         if is_in_piecewise_cuda_graph():
