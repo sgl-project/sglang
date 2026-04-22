@@ -288,6 +288,31 @@ class LTX2DenoisingStage(DenoisingStage):
             return False
         return not is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
 
+    @staticmethod
+    def _should_use_ltx23_two_stage_cfg_pair_batch(
+        batch: Req,
+        ctx: LTX2DenoisingContext,
+        server_args: ServerArgs,
+    ) -> bool:
+        """Only batch stage-1 guider passes whose execution graph is identical.
+
+        For native LTX-2.3 two-stage guider passes, `cond` and `neg` differ only in
+        text conditioning, so they can share one CFG pair batch. `perturbed` changes
+        the executed graph by skipping selected video/audio self-attention blocks, and
+        `modality` changes it by disabling A2V/V2A cross-attention. Those two passes
+        must remain separate forwards rather than being mixed into the same batch as
+        `cond`/`neg`, otherwise the stage-1 guider drifts from the sequential
+        reference.
+        """
+        if not is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name):
+            return False
+        if not ctx.is_ltx23_variant or ctx.use_ltx23_legacy_one_stage:
+            return False
+        if int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0:
+            return False
+        if get_sp_world_size() != 1:
+            return False
+        return True
     @classmethod
     def _ltx2_calculate_guided_x0(
         cls,
@@ -931,6 +956,11 @@ class LTX2DenoisingStage(DenoisingStage):
                 is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
                 and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
             )
+            use_cfg_pair_batch = self._should_use_ltx23_two_stage_cfg_pair_batch(
+                batch=batch,
+                ctx=ctx,
+                server_args=server_args,
+            )
 
             pass_specs: list[LTX2GuidancePassSpec] = [
                 LTX2GuidancePassSpec(
@@ -1002,7 +1032,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     [pass_spec.encoder_attention_mask for pass_spec in pass_specs]
                 ),
             )
-            if use_split_two_stage_ti2v_guider:
+            if use_split_two_stage_ti2v_guider or not use_cfg_pair_batch:
                 split_sizes = [1] * expanded_batch_size
                 batched_video_chunks = []
                 batched_audio_chunks = []
