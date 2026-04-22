@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
@@ -31,6 +31,7 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    lplb_solver: object = field(default=None, repr=False)
 
     @classmethod
     def init_new(cls, layer_id: int):
@@ -40,6 +41,12 @@ class ExpertLocationDispatchInfo:
 
         if ep_dispatch_algorithm is None:
             return None
+
+        lplb_solver = None
+        if ep_dispatch_algorithm == "lp":
+            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+            lplb_solver = get_global_lplb_solver(layer_id)
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
@@ -58,6 +65,7 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            lplb_solver=lplb_solver,
         )
 
 
@@ -74,7 +82,9 @@ def transform_select_experts_inputs(
 
 
 def topk_ids_logical_to_physical(
-    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor,
+    info: Optional[ExpertLocationDispatchInfo],
+    log2phy_prob: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if info is None:
         return topk_ids
@@ -82,6 +92,10 @@ def topk_ids_logical_to_physical(
     if info.ep_dispatch_algorithm == "static":
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
+        return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    if info.ep_dispatch_algorithm == "lp" and log2phy_prob is not None:
+        return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
+    if info.ep_dispatch_algorithm == "lp":
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
@@ -107,3 +121,23 @@ def _topk_ids_logical_to_physical_dynamic(
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids
+
+
+def _topk_ids_logical_to_physical_probability(
+    topk_ids: torch.Tensor,
+    info: ExpertLocationDispatchInfo,
+    log2phy_prob: torch.Tensor,
+) -> torch.Tensor:
+    """Select physical experts based on LP-computed probability distribution."""
+    topk_ids_original_shape = topk_ids.shape
+    topk_ids = topk_ids.flatten()
+    log2phy_map = info.partial_logical_to_all_physical_map
+    topk_probs = log2phy_prob[topk_ids].float()
+    row_sums = topk_probs.sum(dim=-1)
+    zero_rows = row_sums <= 0
+    if zero_rows.any():
+        valid_mask = (log2phy_map[topk_ids[zero_rows]] >= 0).float()
+        topk_probs[zero_rows] = valid_mask
+    chosen = torch.multinomial(topk_probs, 1).flatten()
+    topk_ids = log2phy_map[topk_ids, chosen]
+    return topk_ids.view(topk_ids_original_shape)

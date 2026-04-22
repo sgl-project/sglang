@@ -1136,6 +1136,16 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
         else:
+            # Empty-token ranks must still call solver.solve() to participate
+            # in the EP all-reduce inside LPLBSolver, preventing deadlock
+            # with DP-attention where not all ranks have tokens.
+            _info = ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if _info is not None and _info.lplb_solver is not None:
+                _info.lplb_solver.solve(
+                    torch.empty(
+                        (0, self.top_k), dtype=torch.int32, device=hidden_states.device
+                    )
+                )
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         if sbo_overlap_dispatch_flag:
@@ -1361,6 +1371,16 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
         else:
+            # Empty-token ranks must still call solver.solve() to participate
+            # in the EP all-reduce inside LPLBSolver, preventing deadlock
+            # with DP-attention where not all ranks have tokens.
+            _info = ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if _info is not None and _info.lplb_solver is not None:
+                _info.lplb_solver.solve(
+                    torch.empty(
+                        (0, self.top_k), dtype=torch.int32, device=hidden_states.device
+                    )
+                )
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
 
     def op_dispatch_a(self, state):
