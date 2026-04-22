@@ -1042,7 +1042,7 @@ def _post_process_topk_ids(
         )
 
         # Lazy import to avoid circular-import issues
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             fused_append_shared_experts,
         )
 
