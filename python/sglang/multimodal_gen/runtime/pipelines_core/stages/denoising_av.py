@@ -82,6 +82,20 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             batch.latents = latents
             batch.audio_latents = audio_latents
 
+        pipeline = self.pipeline() if self.pipeline else None
+        current_phase = (
+            str(getattr(batch, "extra", {}).get("ltx2_phase", ""))
+            if hasattr(batch, "extra")
+            else ""
+        )
+        release_phase_state = (
+            getattr(pipeline, "release_ltx2_phase_state", None)
+            if pipeline is not None
+            else None
+        )
+        if callable(release_phase_state):
+            release_phase_state(current_phase)
+
         if isinstance(self.transformer, OffloadableDiTMixin):
             for manager in self.transformer.layerwise_offload_managers:
                 manager.release_all()
@@ -91,9 +105,15 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     """Stage-2 refinement wrapper that re-noises distilled LTX latents once."""
 
     def __init__(
-        self, transformer, scheduler, distilled_sigmas, vae=None, audio_vae=None
+        self,
+        transformer,
+        scheduler,
+        distilled_sigmas,
+        vae=None,
+        audio_vae=None,
+        pipeline=None,
     ):
-        super().__init__(transformer, scheduler, vae, audio_vae)
+        super().__init__(transformer, scheduler, vae, audio_vae, pipeline=pipeline)
         self.distilled_sigmas = torch.tensor(distilled_sigmas)
 
     @staticmethod
@@ -217,9 +237,6 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 batch.audio_latents = batch.audio_latents.to(
                     device=batch.audio_latents.device, dtype=torch.float32
                 )
-
-        batch.image_latent = None
-        batch.ltx2_num_image_tokens = 0
 
         original_scheduler = self.scheduler
         original_batch_timesteps = batch.timesteps
