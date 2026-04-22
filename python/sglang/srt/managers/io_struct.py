@@ -1137,6 +1137,13 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
 
+    # VLA (Vision-Language-Action) per-request action chunks.
+    # vla_actions[i] is a nested list of shape (action_horizon, action_dim)
+    # for VLA requests, or ``None`` for non-VLA requests. Set by the
+    # scheduler's VLA result path and consumed by the tokenizer manager to
+    # surface ``actions`` as a top-level response field.
+    vla_actions: Optional[List[Optional[List[List[float]]]]] = None
+
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
@@ -1202,6 +1209,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
+
+    # VLA action chunks — see ``BatchTokenIDOutput.vla_actions`` for schema.
+    vla_actions: Optional[List[Optional[List[List[float]]]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None

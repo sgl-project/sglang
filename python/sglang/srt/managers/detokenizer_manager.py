@@ -391,6 +391,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             token_steps=recv_obj.token_steps,
             load=recv_obj.load,
             dp_ranks=recv_obj.dp_ranks,
+            # VLA actions bypass the tokenizer; pass them through unchanged.
+            vla_actions=recv_obj.vla_actions,
             time_stats=recv_obj.time_stats,
         )
 

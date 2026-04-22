@@ -303,6 +303,21 @@ class EmbeddingBatchResult:
         self.copy_done.record()
 
 
+@dataclass
+class VLABatchResult:
+    """Forward result for a Vision-Language-Action model (e.g. π0).
+
+    VLA models produce continuous action vectors instead of token logits —
+    one tensor of shape ``(action_horizon, action_dim)`` per request — so
+    they bypass the sampling / decoding pipeline entirely. Unlike
+    ``GenerationBatchResult``, VLA batches are not run under overlap
+    scheduling, so no ``copy_to_cpu`` indirection is needed; the tensors
+    are ``.tolist()``-ed directly in ``process_batch_result_vla``.
+    """
+
+    actions: List[torch.Tensor]          # per-request, shape (action_horizon, action_dim)
+
+
 def validate_dflash_request(req: Req) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
@@ -593,6 +608,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
+        self.is_vla = self.model_config.is_vla
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -1617,9 +1633,13 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            if self.is_generation:
+            # Run sample of the current batch.
+            # It depends on the result of the last batch (e.g., grammar), so
+            # we run it after the last batch is processed.
+            # VLA models never sample tokens — their forward returns actions
+            # directly, so skip the delayed-sample path which expects a
+            # ``GenerationBatchResult``.
+            if self.is_generation and not self.is_vla:
                 self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
@@ -3021,7 +3041,61 @@ class Scheduler(
             return self._run_batch_prebuilt(batch)
 
         # Run forward
-        if self.is_generation:
+        if self.is_vla and batch.forward_mode.is_extend():
+            # VLA path: model outputs continuous actions, no token sampling.
+            # Checked before ``is_generation`` because VLA models also
+            # advertise themselves as generation models.
+            #
+            # The ``is_extend()`` guard is load-bearing: IDLE / DECODE /
+            # prebuilt batches (health checks, DP sync, CUDA graph warmup)
+            # must fall through to the generic branch so they replay the
+            # captured decode-mode graphs unchanged. Without it, an IDLE
+            # probe routes through Pi0.forward and crashes in
+            # ``populate_from_forward_batch``.
+            #
+            # We intentionally DO NOT set ``is_prefill_only=True`` to skip
+            # ``sample()``: that flag is also consumed by CUDA-graph capture
+            # plumbing and forces the extend path through a decode-mode
+            # graph that expects initialized ``sampling_info.temperatures``,
+            # crashing during replay. Instead we let ``sample()`` run
+            # (harmless), extract the action chunks from
+            # ``next_token_logits``, and clear ``next_token_ids`` below so
+            # no downstream reader sees the bogus argmax.
+            model_worker_batch = batch.get_model_worker_batch()
+            with self.record_forward_metrics(batch):
+                batch_result = self.tp_worker.forward_batch_generation(
+                    model_worker_batch
+                )
+            # ``Pi0ForActionPrediction.forward`` packs the action chunks into
+            # ``next_token_logits`` with shape ``(batch_size, horizon*dim)``
+            # so SGLang's existing plumbing can carry them. We split back into
+            # a per-request list here; the tokenizer manager re-shapes on the
+            # way out.
+            actions_flat = (
+                batch_result.logits_output.next_token_logits
+                if batch_result.logits_output is not None
+                else None
+            )
+            if isinstance(actions_flat, torch.Tensor):
+                actions_list = list(actions_flat.unbind(0))
+            else:
+                actions_list = []
+            # Null out the sampled token ids so nothing downstream can read
+            # garbage (they were argmaxed over action-chunk floats).
+            if batch_result.next_token_ids is not None:
+                batch_result.next_token_ids = None
+            # Populate ``batch.output_ids`` with dummy zeros. Downstream
+            # overlap-scheduling code (``event_loop_overlap``'s next
+            # iteration, ``prepare_for_decode``, etc.) reads this to thread
+            # state through CUDA graphs. Leaving it ``None`` crashes the
+            # next batch's future-resolution in ``resolve_future`` /
+            # ``populate_from_forward_batch``. VLA requests finish right
+            # after this forward so the actual values are irrelevant.
+            batch.output_ids = torch.zeros(
+                len(batch.reqs), dtype=torch.long, device=self.device
+            )
+            ret = VLABatchResult(actions=actions_list)
+        elif self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
@@ -3180,7 +3254,12 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if batch.forward_mode.is_decode():
+        # VLA results must be handled first regardless of forward_mode.
+        # With overlap scheduling, a VLA decode batch can appear before
+        # the prefill result is processed; route it to the VLA handler.
+        if isinstance(result, VLABatchResult):
+            self.process_batch_result_vla(batch, result)
+        elif batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
@@ -3203,6 +3282,54 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.update_device_timer()
+
+    def process_batch_result_vla(
+        self, batch: ScheduleBatch, result: VLABatchResult
+    ):
+        """Finish every request in the VLA batch with its action chunk.
+
+        VLA models (e.g. π0) have no decode loop — a single prefill forward
+        produces the entire action chunk. We attach the chunk to
+        ``req.vla_actions`` so it travels through the normal output
+        pipeline as a typed ``vla_actions`` field on ``BatchTokenIDOutput``
+        / ``BatchStrOutput``. The tokenizer manager then surfaces it as a
+        top-level ``actions`` field on the response.
+
+        No JSON encoding, no dummy tokens, no ``completion_tokens=1``
+        accounting: ``decoded_text`` stays empty, ``output_ids`` stays
+        empty, and the finish reason is ``FINISH_VLA`` (serializes to
+        ``{"type": "stop", "matched": "vla_done"}``).
+        """
+        from sglang.srt.managers.schedule_batch import FINISH_VLA
+
+        for i, req in enumerate(batch.reqs):
+            if i < len(result.actions):
+                actions = result.actions[i]
+                actions_list = (
+                    actions.tolist() if isinstance(actions, torch.Tensor) else actions
+                )
+            else:
+                actions_list = []
+
+            # Typed channel consumed by the output processor.
+            req.vla_actions = actions_list
+            req.finished_reason = FINISH_VLA()
+
+            # VLA models like π0 manage their own PaliGemma KV cache in
+            # PyTorch (see ``PaliGemmaWithActionExpert.forward``) and never
+            # touch ``req_to_token_pool``, so ``req_pool_idx`` may legitimately
+            # be ``None``. Only release the shared KV cache if one was
+            # allocated during the extend / warmup path.
+            #
+            # NOTE(pi0-followup): if a future VLA model *does* allocate from
+            # ``req_to_token_pool`` but has a non-standard finish path, it
+            # could leak here. Extend this branch (or hoist the logic up to
+            # the general "finish cleanup" helper) the first time that
+            # happens.
+            if req.req_pool_idx is not None:
+                release_kv_cache(req, self.tree_cache)
+
+        self.stream_output(batch.reqs, batch.return_logprob)
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
