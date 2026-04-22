@@ -261,6 +261,8 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        attn_cp_rank: int = 0,
+        attn_cp_size: int = 1,
         enable_storage_metrics: bool = False,
     ):
         self.tp_group = tp_group
@@ -280,6 +282,8 @@ class HiCacheController:
         self.storage_backend_type = None
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.attn_cp_rank = attn_cp_rank
+        self.attn_cp_size = attn_cp_size
         self.enable_storage_metrics = enable_storage_metrics
 
         # Default storage page IO functions (may be overridden by attach).
@@ -479,7 +483,10 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]) or (
+            if (
+                self.storage_backend_type
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+            ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -611,6 +618,8 @@ class HiCacheController:
             tp_size=self.tp_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
             is_mla_model=is_mla_backend,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
@@ -674,7 +683,9 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
         self.write_queue.clear()
 
         start_event = device_module.Event()
@@ -714,8 +725,7 @@ class HiCacheController:
         )
         return device_indices
 
-    def move_indices(self, op: CacheOperation):
-        host_indices, device_indices = op.host_indices, op.device_indices
+    def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
@@ -743,7 +753,9 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()

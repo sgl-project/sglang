@@ -84,6 +84,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -166,6 +167,10 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
         Please refer to `ServerArgs` for the documentation.
         """
+
+        # Ensure plugins are loaded before ServerArgs construction,
+        # so hooks on ServerArgs.__post_init__ fire correctly.
+        load_plugins()
 
         # Parse server_args
         if "server_args" in kwargs:
@@ -446,6 +451,8 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        embed_override_token_id: Optional[int] = None,
+        embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -460,6 +467,8 @@ class Engine(EngineScoreMixin, EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            embed_override_token_id=embed_override_token_id,
+            embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -475,6 +484,8 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        embed_override_token_id: Optional[int] = None,
+        embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -491,6 +502,8 @@ class Engine(EngineScoreMixin, EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            embed_override_token_id=embed_override_token_id,
+            embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -639,6 +652,11 @@ class Engine(EngineScoreMixin, EngineBase):
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
+
+        # Defensive: ensure plugins loaded (may already be loaded by
+        # Engine.__init__ or CLI entry).
+        load_plugins()
+
         server_args.check_server_args()
         _set_gc(server_args)
 
@@ -754,13 +772,15 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     def shutdown(self):
-        """Shutdown the engine"""
+        """Shutdown the engine; block until the scheduler subprocess releases
+        its GPU context so the caller can immediately reallocate on the same
+        device."""
         if (
             self.tokenizer_manager is not None
             and self.tokenizer_manager._subprocess_watchdog is not None
         ):
             self.tokenizer_manager._subprocess_watchdog.stop()
-        kill_process_tree(os.getpid(), include_parent=False)
+        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
         return self
@@ -1128,7 +1148,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.7.post2",
+                "0.6.7.post3",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

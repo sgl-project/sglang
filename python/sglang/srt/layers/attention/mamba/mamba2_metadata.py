@@ -41,6 +41,10 @@ class ForwardMetadata:
     is_target_verify: bool = False
     draft_token_num: int = 1
 
+    has_mamba_track_mask: bool = False
+    mamba_track_mask_indices: Optional[torch.Tensor] = None
+    conv_states_mask_indices: Optional[torch.Tensor] = None
+
 
 @dataclass(kw_only=True)
 class Mamba2Metadata(ForwardMetadata):

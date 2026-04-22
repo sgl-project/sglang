@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=1200, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=852, suite="stage-c-test-4-gpu-b200")
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3.2-NVFP4"
 SERVER_LAUNCH_TIMEOUT = 1200

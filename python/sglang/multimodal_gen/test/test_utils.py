@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -191,6 +192,26 @@ def post_json(
 ) -> httpx.Response:
     """POST JSON to ``<base_url><path>`` and return the response."""
     return httpx.post(urljoin(base_url, path), json=payload, timeout=timeout)
+
+
+def run_command(command: list[str]) -> bool:
+    """Run a CLI command and return whether it succeeded."""
+    print(f"Running command: {' '.join(command)}", flush=True)
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+    ) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(line)
+        process.wait()
+        if process.returncode == 0:
+            return True
+        print(f"Command failed with exit code {process.returncode}", flush=True)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1108,7 +1129,7 @@ def compare_with_gt(
 
     status = "PASSED" if passed else "FAILED"
     print(f"\n{'=' * 60}")
-    print(f"[CLIP Consistency] {case_id}: {status}")
+    print(f"[Consistency Check] {case_id}: {status}")
     print(
         "  Thresholds: "
         f"clip>={thresholds.clip_threshold}, "

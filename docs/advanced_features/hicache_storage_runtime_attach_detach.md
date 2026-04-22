@@ -19,8 +19,8 @@ The control path is:
 
 1. **HTTP Server** (`python/sglang/srt/entrypoints/http_server.py`)
    - Exposes `PUT /hicache/storage-backend`, `DELETE /hicache/storage-backend`, `GET /hicache/storage-backend`
-2. **TokenizerManager** (`python/sglang/srt/managers/tokenizer_communicator_mixin.py`)
-   - Sends the request to the Scheduler via `_Communicator`
+2. **TokenizerManager** (`python/sglang/srt/managers/tokenizer_control_mixin.py`)
+   - Sends the request to the Scheduler via `FanOutCommunicator`
 3. **Scheduler** (`python/sglang/srt/managers/scheduler.py`)
    - Performs a **strict idle check**
    - Calls `tree_cache.attach_storage_backend(...)` / `detach_storage_backend(...)`

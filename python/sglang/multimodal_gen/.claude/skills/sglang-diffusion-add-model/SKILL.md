@@ -586,17 +586,8 @@ Before submitting, verify:
 
 ## After Implementation: Tests and Performance Data
 
-Once the model is working and output quality is verified, **ask the user** whether they would like to:
-
-1. **Add tests** — Create unit tests and/or integration tests for the new model. Tests should cover:
-   - Pipeline construction and stage wiring
-   - Single-GPU inference producing non-noise output
-   - Multi-GPU inference (TP/SP) if supported
-   - See the `write-sglang-test` skill for test conventions and placement guidelines
-
-2. **Generate performance data** — Run benchmarks and collect perf metrics:
-   - Single-GPU latency and throughput (look for `Pixel data generated successfully in xxxx seconds` in console output; use the `warmup excluded` line for accurate timing)
-   - Multi-GPU scaling (TP/SP) throughput comparison
-   - Use `python/sglang/multimodal_gen/benchmarks/bench_serving.py` for serving benchmarks
-
-Do not skip this step — always ask the user before proceeding, as test and benchmark requirements vary per model.
+After the model produces non-noise output, read
+[references/testing-and-accuracy.md](references/testing-and-accuracy.md) before
+adding GPU cases, component-accuracy skips/hooks, suite entries, or benchmark
+claims. That reference tracks the current `gpu_cases.py` / `testcase_configs.py`
+/ `run_suite.py` split and the component-accuracy decision rules.

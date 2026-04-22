@@ -10,6 +10,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -71,6 +73,7 @@ class NGRAMWorker:
                 )
             )
             loaded = self.add_external_corpus(corpus_path, chunks)
+            self.commit_corpus_load(corpus_path, loaded)
             logger.info(
                 "Loaded external ngram corpus '%s' (%d tokens).",
                 corpus_path,
@@ -83,10 +86,13 @@ class NGRAMWorker:
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
 
+    def commit_corpus_load(self, corpus_id: str, loaded_token_count: int) -> None:
+        self.ngram_corpus.commit_external_corpus_load(corpus_id, loaded_token_count)
+
     def remove_external_corpus(self, corpus_id: str) -> None:
         self.ngram_corpus.remove_external_corpus(corpus_id)
 
-    def list_external_corpora(self) -> list[str]:
+    def list_external_corpora(self) -> dict[str, int]:
         return self.ngram_corpus.list_external_corpora()
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
@@ -246,7 +252,12 @@ class NGRAMWorker:
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+
         self._prepare_for_speculative_decoding(batch)
+
+        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+
         model_worker_batch = batch.get_model_worker_batch()
         spec_info = model_worker_batch.spec_info
         num_accepted_tokens = 0
@@ -260,6 +271,8 @@ class NGRAMWorker:
                 draft_tokens_cpu = spec_info.draft_token.view(
                     spec_info.retrive_next_token.shape
                 ).cpu()
+
+            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
@@ -294,6 +307,16 @@ class NGRAMWorker:
                 batch, logits_output, self.page_size, vocab_mask
             )
             accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
+
+            if get_global_tracing_enabled():
+                for idx, req in enumerate(batch.reqs):
+                    accepted = (
+                        verify_input.accept_length[idx].item()
+                        if verify_input.accept_length is not None
+                        else 0
+                    )
+                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
             if batch.return_logprob:

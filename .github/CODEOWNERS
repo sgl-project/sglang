@@ -1,6 +1,8 @@
 .github @merrymercy @Fridge003 @ispobock @Kangyan-Zhou @bingxche
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani @yctseng0211
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname
+/docs @wisclmy0611 @zijiexia
+/docs_new @wisclmy0611 @zijiexia @Richardczl98
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
 /python/sglang/jit_kernel @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/jit_kernel/diffusion @yingluosanqian @BBuf @mickqian
@@ -23,6 +25,8 @@
 /python/sglang/srt/eplb @fzyzcjy @ch-wan
 /python/sglang/srt/function_call @CatherineSue @JustinTong0323
 /python/sglang/srt/grpc @CatherineSue @slin1237
+/python/sglang/srt/hardware_backend/mlx @yeahdongcn
+/python/sglang/srt/hardware_backend/musa @yeahdongcn
 /python/sglang/srt/hardware_backend/npu @ping1jing2 @iforgetmyname
 /python/sglang/srt/hardware_backend/npu/quantization @OrangeRedeng @TamirBaydasov @iforgetmyname
 /python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1
@@ -47,7 +51,7 @@
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
 /python/sglang/srt/observability @merrymercy @fzyzcjy @sufeng-buaa
 /python/sglang/srt/ray @Qiaolin-Yu @xyuzh
-/python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
+/python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu
 /sgl-kernel @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
@@ -68,7 +72,7 @@
 /sgl-model-gateway/src/tool_parser @slin1237 @CatherineSue
 /sgl-model-gateway/src/wasm @slin1237
 /sgl-model-gateway/examples/wasm @slin1237
-/test/registered/core/test_score_api.py @sundar24295s @chanh @fortunecookiee
+/test/registered/prefill_only @sundar24295s @chanh @fortunecookiee
 /benchmark/prefill_only/bench_score.py @sundar24295s @chanh @fortunecookiee
 /test/srt/ascend @ping1jing2 @iforgetmyname
 /test/srt/test_modelopt* @Edwardf0t1

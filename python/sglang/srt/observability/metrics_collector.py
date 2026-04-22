@@ -79,6 +79,8 @@ class SchedulerStats:
     # Basics
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_used_tokens: int = 0
+    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
+    # not just KV token usage. Rename requires API deprecation.
     token_usage: float = 0.0
     full_token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -92,6 +94,9 @@ class SchedulerStats:
     cache_hit_rate: float = 0.0
 
     max_total_num_tokens: int = 0
+    kv_available_tokens: int = 0
+    kv_evictable_tokens: int = 0
+    kv_used_tokens: int = 0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -129,6 +134,10 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+
+    # Streaming session metrics
+    num_streaming_sessions: int = 0
+    streaming_session_held_tokens: int = 0
 
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
@@ -174,6 +183,7 @@ class SchedulerMetricsCollector:
         labels: Dict[str, str],
         enable_lora: bool = False,
         enable_hierarchical_cache: bool = False,
+        enable_streaming_session: bool = False,
         server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
@@ -182,6 +192,7 @@ class SchedulerMetricsCollector:
         self.labels = labels
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
+        self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
 
@@ -267,6 +278,25 @@ class SchedulerMetricsCollector:
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.kv_available_tokens = Gauge(
+            name="sglang:kv_available_tokens",
+            documentation="Number of free token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_evictable_tokens = Gauge(
+            name="sglang:kv_evictable_tokens",
+            documentation="Number of evictable (radix-cached) token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_used_tokens = Gauge(
+            name="sglang:kv_used_tokens",
+            documentation="Number of actively used token slots in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -652,6 +682,21 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        # Streaming session metrics (only created when streaming sessions are enabled)
+        if self.enable_streaming_session:
+            self.num_streaming_sessions = Gauge(
+                name="sglang:num_streaming_sessions",
+                documentation="The number of streaming sessions.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.streaming_session_held_tokens = Gauge(
+                name="sglang:streaming_session_held_tokens",
+                documentation="The number of KV tokens currently held by streaming session slots.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
         self.num_unique_running_routing_keys = Gauge(
             name="sglang:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
@@ -991,6 +1036,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+        self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
+        self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
+        self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
@@ -1045,6 +1093,13 @@ class SchedulerMetricsCollector:
             )
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
+            )
+
+        # Streaming session metrics (only logged if streaming sessions are enabled)
+        if self.enable_streaming_session:
+            self._log_gauge(self.num_streaming_sessions, stats.num_streaming_sessions)
+            self._log_gauge(
+                self.streaming_session_held_tokens, stats.streaming_session_held_tokens
             )
 
         self._log_gauge(
