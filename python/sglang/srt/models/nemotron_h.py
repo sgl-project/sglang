@@ -59,6 +59,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.breakable_cuda_graph.bcg_ops import (
+    make_bcg_break_point,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -429,10 +435,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        if (
-            get_global_server_args().enable_breakable_cuda_graph
-            and get_forward_context() is not None
-        ):
+        if is_in_breakable_cuda_graph():
             output = torch.empty_like(hidden_states)
             breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
             return output, residual
@@ -891,12 +894,14 @@ class NemotronHForCausalLM(nn.Module):
 EntryClass = [NemotronHForCausalLM]
 
 
-def _nemotron_mamba2_with_output_impl(
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def nemotron_mamba2_with_output(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_id: int,
 ) -> None:
-    """Shared mamba2 body used by both PCG split op and BCG non_graph path."""
+    """Split op for Mamba2 forward in piecewise CUDA graph mode."""
     context = get_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
@@ -920,36 +925,6 @@ def _nemotron_mamba2_with_output_impl(
     output[:num_actual_tokens].view(ret.shape).copy_(ret)
 
 
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def nemotron_mamba2_with_output(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    """Split op for Mamba2 forward in piecewise CUDA graph mode (torch.compile PCG)."""
-    _nemotron_mamba2_with_output_impl(hidden_states, output, layer_id)
-
-
-# Lazy-init: wrapped with non_graph(True) on first use to avoid import-time
-# dependency on breakable_cuda_graph (which requires cuda.bindings).
-_breakable_mamba_fn = None
-
-
-def breakable_nemotron_mamba2_with_output(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    """BCG graph-break point for mamba2. Runs the mamba body eagerly at every
-    replay, re-reading fresh attention-backend metadata and mamba state so SSM
-    updates use the correct replay-time indices."""
-    global _breakable_mamba_fn
-    if _breakable_mamba_fn is None:
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
-            eager_on_graph,
-        )
-
-        _breakable_mamba_fn = eager_on_graph(True)(_nemotron_mamba2_with_output_impl)
-    return _breakable_mamba_fn(hidden_states, output, layer_id)
-    return
+breakable_nemotron_mamba2_with_output = make_bcg_break_point(
+    nemotron_mamba2_with_output
+)

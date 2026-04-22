@@ -23,8 +23,8 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.model_executor.breakable_cuda_graph.bcg_attention import (
-    bcg_unified_attention_with_output,
+from sglang.srt.model_executor.breakable_cuda_graph.bcg_ops import (
+    make_bcg_break_point,
 )
 from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -182,3 +182,6 @@ def unified_attention_with_output(
 
     output.view(ret.shape).copy_(ret)
     return
+
+
+bcg_unified_attention_with_output = make_bcg_break_point(unified_attention_with_output)
