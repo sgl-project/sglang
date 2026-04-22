@@ -781,6 +781,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
+            routed_experts_output=forward_batch_output.routed_experts_output,
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):

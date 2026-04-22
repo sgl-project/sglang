@@ -379,6 +379,7 @@ class ServerArgs:
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
+    batch_notify_size: int = 16
     stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
@@ -2422,7 +2423,10 @@ class ServerArgs:
             elif is_mps():
                 return "torch_native"
             else:
-                return "flashinfer" if is_flashinfer_available() else "triton"
+                # FlashInfer does not support attention sinks.
+                if is_flashinfer_available() and not model_config.has_attention_sinks:
+                    return "flashinfer"
+                return "triton"
         else:
             # MLA architecture
             if is_hopper_with_cuda_12_3():
@@ -3161,9 +3165,14 @@ class ServerArgs:
 
         # If decode backend is implicit, pick a safe backend without changing io backend.
         if not self.use_mla_backend():
-            self.decode_attention_backend = (
-                "flashinfer" if is_flashinfer_available() else "triton"
-            )
+            # FlashInfer does not support attention sinks.
+            if (
+                is_flashinfer_available()
+                and not self.get_model_config().has_attention_sinks
+            ):
+                self.decode_attention_backend = "flashinfer"
+            else:
+                self.decode_attention_backend = "triton"
         else:
             self.decode_attention_backend = (
                 "flashinfer" if is_sm100_supported() else "triton"
@@ -3494,18 +3503,15 @@ class ServerArgs:
                 )
 
         if self.speculative_adaptive:
-            if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+            from sglang.srt.speculative.adaptive_spec_params import (
+                adaptive_unsupported_reason,
+            )
+
+            reason = adaptive_unsupported_reason(self)
+            if reason is not None:
                 logger.warning(
-                    "speculative_adaptive is only supported with EAGLE/EAGLE3 and topk=1. "
-                    f"Current algorithm={self.speculative_algorithm}. "
-                    "Falling back to static params."
-                )
-                self.speculative_adaptive = False
-            elif self.speculative_eagle_topk != 1:
-                logger.warning(
-                    "speculative_adaptive is only supported with topk=1. "
-                    f"Current topk={self.speculative_eagle_topk}. "
-                    "Falling back to static params."
+                    f"speculative_adaptive disabled: {reason}. "
+                    "Falling back to static speculative params."
                 )
                 self.speculative_adaptive = False
 
@@ -4536,6 +4542,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.stream_interval,
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
+        )
+        parser.add_argument(
+            "--batch-notify-size",
+            type=int,
+            default=ServerArgs.batch_notify_size,
+            help="Number of streaming notifications to batch before yielding to the event loop. "
+            "Reduces asyncio wakeup overhead under high concurrency.",
         )
         parser.add_argument(
             "--incremental-streaming-output",
