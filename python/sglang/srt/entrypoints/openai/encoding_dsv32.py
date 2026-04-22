@@ -97,7 +97,10 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = """<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>"""
     P_dsml_strs = []
 
-    arguments = json.loads(tool_call["arguments"])
+    try:
+        arguments = json.loads(tool_call["arguments"])
+    except (json.JSONDecodeError, TypeError):
+        arguments = {"raw": tool_call["arguments"]}
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(
