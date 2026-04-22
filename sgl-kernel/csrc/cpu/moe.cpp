@@ -26,7 +26,6 @@ namespace {
 //     3. abstract at::native::cpublas::brgemm with WoQ gemm (M = 1 & M != 1)
 //
 
-
 template <int BLOCK_M>
 int moe_align_block_size(
     int32_t* __restrict__ sorted_ids,

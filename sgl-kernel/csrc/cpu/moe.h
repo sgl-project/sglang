@@ -172,7 +172,6 @@ inline void silu_and_mul_stub(
   }
 }
 
-
 template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -240,7 +239,6 @@ inline void add_bias_stub(float* __restrict__ input, const float* __restrict__ i
     input[d] = input[d] + input2[d];
   }
 }
-
 
 template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, float weight, int64_t size) {
