@@ -9,18 +9,19 @@ Mixed-dim / DeepSeek MLA heads live on a separate ``mla_prefill`` branch
 and are out of scope here.
 
 Dispatch picks between four kernel bodies (BF16 basic, BF16 WCA persistent,
-FP8 basic, FP8 WCA persistent) via a config-keyed cache; on cache hit the
-launcher invokes HIPLauncher directly and bypasses Triton's JITFunction
-specialization.
+FP8 basic, FP8 WCA persistent). All kernels are launched via the standard
+Triton ``kernel[grid](...)`` JIT entry point. Triton's own compile cache
+avoids recompilation on warm launches; a small shape-keyed tile-config
+cache avoids rerunning the heuristic tree on every call, and WCA metadata
+(``cum_tiles_per_batch``, split-K workspace, dummy mask buffers) is
+computed once and reused across the attention layers of a single forward
+pass.
 
 Env vars
 --------
 - ``SGLANG_GLUON_FP8_KV_FORCE_BF16=1`` (user-facing safety rail): route
   FP8 KV through the BF16 kernels by casting per call. Used when a new
   FP8 config hits a numerical issue in production.
-- ``SGLANG_GLUON_DEBUG=...`` (dev): comma-separated k[=v] tokens; see
-  :mod:`._debug` for the full set (``trace``, ``compare``,
-  ``profile_shapes``, ``disable_cfg_cache``, ...).
 """
 
 import functools
@@ -34,14 +35,15 @@ import triton
 from ._kernel_bf16_gfx950 import (
     gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric,
 )
-from ._debug import DEBUG
 from ._kernel_fp8_gfx950 import (
     gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric_fp8,
 )
-# Unified BF16 kernel used by the persistent / split-K launchers below.
+# Unified BF16 kernel. Same JITFunction covers the basic path
+# (IS_PERSISTENT=False) and the WCA persistent / split-K paths
+# (IS_PERSISTENT=True).
 _bf16_kernel = _gluon_extend_attn_fwd_symmetric
-# Unified FP8 kernel also serves the basic (non-persistent) fast-path via
-# IS_PERSISTENT=False.
+# Unified FP8 kernel. Same gating as BF16: IS_PERSISTENT toggles between
+# the basic and the WCA persistent / split-K bodies.
 _gluon_extend_attn_fwd_fp8_basic = _gluon_extend_attn_fwd_symmetric_fp8
 
 _dummy_cm = None
@@ -49,8 +51,8 @@ _dummy_mi = None
 _dummy_mi_size = 0
 _dummy_wkvo = None
 _dummy_wkvo_size = 0
-# Singleton passed to the kernel when HAS_SINK=False (HIPLauncher arg list
-# is fixed; the kernel body never loads from it and DCE eliminates the path).
+# Singleton passed to the kernel when HAS_SINK=False. The kernel body
+# never loads from it and DCE eliminates the path.
 _dummy_sinks = None
 # Singletons passed to the unified BF16 kernel when IS_PERSISTENT=False.
 # Triton specializes CompiledKernel on pointer element dtype, so they must
@@ -64,71 +66,6 @@ _dummy_cum_tiles = None
 
 _LOGGED_FP8_KV_MODE = False
 logger = logging.getLogger(__name__)
-
-# Config-keyed dispatch cache.
-#
-# Key on the OUTPUT of `_get_basic_dispatch_config` rather than the raw
-# (batch_size, max_len_extend) input. Dispatch is a step function with
-# ~6 configs per (Lq, is_fp8) pair, so calls that land on the same config
-# share one cache entry regardless of the exact driving inputs. Hit rate
-# is near-100% in production; per-call we only recompute grid = (B, H,
-# ceildiv(max_len_extend, BM)).
-#
-# Entry layout: ("fast", fast_run_closure, sm, strides, BM). Both BF16 and
-# FP8 paths use `_make_fast_runner` / `_make_fast_runner_fp8` to invoke the
-# HIPLauncher directly, bypassing Triton's JITFunction specialization.
-_config_cache = {}
-
-# Dispatch-path counters. Enabled via ``SGLANG_GLUON_DEBUG=trace=N`` (see
-# ``_debug``); unset they are effectively free.
-_dispatch_counters = {
-    "total": 0,
-    "early_cache_hit": 0,       # uniform_like fast-path hit
-    "wca_persistent": 0,        # ragged -> WCA persistent
-    "wca_persistent_d256": 0,   # D=256 WCA
-    "late_cache_hit": 0,        # het/ragged late cache hit (non uniform_like)
-    "basic_slow_first": 0,      # first-time JIT + install
-    "full_dispatch": 0,         # custom mask / force_* / full path
-    "wrapper_fallback": 0,      # wrapper-level triton_fallback (outside this fn)
-}
-
-
-def _bump_dispatch(key):
-    _dispatch_counters[key] = _dispatch_counters.get(key, 0) + 1
-    _dispatch_counters["total"] += 1
-    _maybe_trace_dispatch()
-
-
-_TRACE_LAST_TOTAL = 0
-
-
-def _maybe_trace_dispatch():
-    if DEBUG.trace_interval <= 0:
-        return
-    global _TRACE_LAST_TOTAL
-    total = _dispatch_counters["total"]
-    if total - _TRACE_LAST_TOTAL < DEBUG.trace_interval:
-        return
-    _TRACE_LAST_TOTAL = total
-    parts = [f"total={total}"]
-    for k, v in _dispatch_counters.items():
-        if k == "total" or v == 0:
-            continue
-        parts.append(f"{k}={v}")
-    logger.warning("gluon extend dispatch: " + " ".join(parts))
-
-
-def get_dispatch_counters():
-    """Snapshot of per-path dispatch counts. Useful for tests/benches that
-    want to assert the fast path is hitting vs silently falling back."""
-    return dict(_dispatch_counters)
-
-
-def reset_dispatch_counters():
-    for k in list(_dispatch_counters):
-        _dispatch_counters[k] = 0
-    global _TRACE_LAST_TOTAL
-    _TRACE_LAST_TOTAL = 0
 
 
 def _ensure_dummies(device, mi_size, wkvo_size):
@@ -157,8 +94,7 @@ def _ensure_dummies(device, mi_size, wkvo_size):
 
 
 # User-facing safety rail: route FP8 KV through the BF16 kernels (pays a
-# per-call dtype cast). Referenced in user-visible error messages so it
-# stays top-level rather than under SGLANG_GLUON_DEBUG.
+# per-call dtype cast). Referenced in user-visible error messages.
 _FP8_KV_FORCE_BF16 = int(os.getenv("SGLANG_GLUON_FP8_KV_FORCE_BF16", "0")) != 0
 
 
@@ -166,127 +102,14 @@ _cached_num_xcds = {}
 
 
 # ===-----------------------------------------------------------------------===#
-# Persistent / split-K launch machinery
+# Persistent / split-K launch helpers
 # ===-----------------------------------------------------------------------===#
 #
 # ``_launch_persistent`` and ``_launch_splitk`` wrap the unified BF16 kernel
 # (``_gluon_extend_attn_fwd_symmetric``, IS_PERSISTENT=True path) with
-# tile-scheduling and split-K workspace management, and share a single
-# ``_persistent_fast_cache`` of direct-HIPLauncher closures. Same fast-runner
-# trick as ``_make_fast_runner`` below for the basic path: on cache hit the
-# launcher skips Triton's JITFunction specialization entirely.
-
-
-# Fast-runner cache shared between _launch_persistent and _launch_splitk.
-_persistent_fast_cache = {}
-
-
-def _make_persistent_fast_runner(compiled_kernel, frozen_kw: dict):
-    """Build a direct-HIPLauncher closure for the persistent BF16 kernel.
-
-    ``frozen_kw`` must carry every constexpr in the kernel signature;
-    ``kv_group_num`` and ``sm_scale`` flow in at call time so one runner
-    serves multiple GQA configs sharing the same constexpr bundle.
-    """
-    from triton.runtime import driver as _triton_driver
-    from triton import knobs as _triton_knobs
-
-    compiled_kernel._init_handles()
-    _hip_launcher = compiled_kernel.run
-    _fn_handle = compiled_kernel.function
-    _packed_md = compiled_kernel.packed_metadata
-    _active = _triton_driver.active
-    _get_dev = _active.get_current_device
-    _get_stream = _active.get_current_stream
-    _enter_hook = _triton_knobs.runtime.launch_enter_hook
-    _exit_hook = _triton_knobs.runtime.launch_exit_hook
-
-    IS_CAUSAL = frozen_kw['IS_CAUSAL']
-    USE_CUSTOM_MASK = frozen_kw['USE_CUSTOM_MASK']
-    ENABLE_PREFIX_UNMASKED = frozen_kw['ENABLE_PREFIX_UNMASKED']
-    BLOCK_M = frozen_kw['BLOCK_M']
-    BLOCK_N = frozen_kw['BLOCK_N']
-    BLOCK_DMODEL = frozen_kw['BLOCK_DMODEL']
-    NUM_STAGES = frozen_kw['NUM_STAGES']
-    HAS_SINK = frozen_kw['HAS_SINK']
-    LOGIT_CAP = frozen_kw['LOGIT_CAP']
-    XAI_TEMPERATURE_LEN = frozen_kw['XAI_TEMPERATURE_LEN']
-    SLIDING_WINDOW_SIZE = frozen_kw['SLIDING_WINDOW_SIZE']
-    IS_PERSISTENT = frozen_kw['IS_PERSISTENT']
-    SPLIT_K = frozen_kw['SPLIT_K']
-    MAX_BATCH_LOG2 = frozen_kw['MAX_BATCH_LOG2']
-    TILE_MAP_MODE = frozen_kw['TILE_MAP_MODE']
-    PREFIX_MASK_MODE = frozen_kw['PREFIX_MASK_MODE']
-
-    def _fast_run(
-        q, k, v, o, kb, vb,
-        qo_i, kv_i, kv_x,
-        mask, mi, wkvo,
-        sm_scale, kv_gn, strides,
-        sinks, v_scale,
-        num_heads, n_m_tiles,
-        total_valid_tiles, total_programs,
-        partial_out, partial_lse, tile_done,
-        cum_tiles_per_batch, actual_batch_size,
-        grid,
-    ):
-        dev = _get_dev()
-        stream = _get_stream(dev)
-        _hip_launcher(
-            grid[0], grid[1] if len(grid) > 1 else 1, grid[2] if len(grid) > 2 else 1,
-            stream, _fn_handle, _packed_md, None,
-            _enter_hook, _exit_hook,
-            q, k, v, o, kb, vb,
-            qo_i, kv_i, kv_x,
-            mask, mi, wkvo,
-            sm_scale, kv_gn,
-            strides[0], strides[1], strides[2], strides[3],
-            strides[4], strides[5], strides[6], strides[7],
-            strides[8], strides[9], strides[10], strides[11],
-            IS_CAUSAL, USE_CUSTOM_MASK, ENABLE_PREFIX_UNMASKED,
-            BLOCK_M, BLOCK_N, BLOCK_DMODEL,
-            NUM_STAGES,
-            sinks, HAS_SINK,
-            LOGIT_CAP, XAI_TEMPERATURE_LEN, SLIDING_WINDOW_SIZE,
-            v_scale,
-            num_heads, n_m_tiles,
-            total_valid_tiles, total_programs,
-            partial_out, partial_lse, tile_done,
-            cum_tiles_per_batch, actual_batch_size,
-            IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2, TILE_MAP_MODE, PREFIX_MASK_MODE,
-        )
-
-    return _fast_run
-
-
-def _persistent_cache_key(Lq, frozen_kw: dict, dtypes: tuple = ()) -> tuple:
-    """Cache key for a compiled persistent/split-K kernel.
-
-    ``dtypes`` carries the indptr/indices tensor dtypes; Triton bakes the
-    pointer element type into SASS, so distinct dtype combos MUST map to
-    separate cache entries (else async HSA memory-aperture faults).
-    """
-    return (
-        Lq,
-        frozen_kw['IS_CAUSAL'],
-        frozen_kw['USE_CUSTOM_MASK'],
-        frozen_kw['ENABLE_PREFIX_UNMASKED'],
-        frozen_kw['BLOCK_M'],
-        frozen_kw['BLOCK_N'],
-        frozen_kw['BLOCK_DMODEL'],
-        frozen_kw['NUM_STAGES'],
-        frozen_kw['HAS_SINK'],
-        frozen_kw['LOGIT_CAP'],
-        frozen_kw['XAI_TEMPERATURE_LEN'],
-        frozen_kw['SLIDING_WINDOW_SIZE'],
-        frozen_kw['IS_PERSISTENT'],
-        frozen_kw['SPLIT_K'],
-        frozen_kw['MAX_BATCH_LOG2'],
-        frozen_kw['TILE_MAP_MODE'],
-        frozen_kw['PREFIX_MASK_MODE'],
-        frozen_kw['_num_warps'],
-        dtypes,
-    )
+# tile-scheduling and split-K workspace management. Kernels are launched via
+# standard ``kernel[grid](...)``; Triton's own compile cache absorbs the JIT
+# cost on warm calls.
 
 
 # MAX_BATCH_LOG2=8 supports batch_size up to 256 with 8 static iterations
@@ -413,6 +236,14 @@ _cum_tiles_buf = None
 _cum_tiles_cap = 0
 
 
+# Cross-layer reuse: when the same ``qo_indptr`` object drives all 32
+# attention layers of one forward pass, the cum_tiles cumsum runs once
+# and subsequent calls with the same (data_ptr, BLOCK_M, batch_size) hit
+# the cache. Keyed on data_ptr rather than id() because PyTorch may alias
+# the same storage under a new Tensor wrapper.
+_cum_tiles_cache_key = None
+
+
 def _ensure_cum_tiles(qo_indptr, BLOCK_M, num_heads, batch_size):
     """Compute cum_tiles_per_batch = cumsum of ceil(ext_i / BM) on-device.
 
@@ -420,7 +251,7 @@ def _ensure_cum_tiles(qo_indptr, BLOCK_M, num_heads, batch_size):
     ``tile_idx -> (seq, head, block_m)``, enabling dense packing of valid
     tiles across CTAs regardless of batch heterogeneity.
     """
-    global _cum_tiles_buf, _cum_tiles_cap
+    global _cum_tiles_buf, _cum_tiles_cap, _cum_tiles_cache_key
     device = qo_indptr.device
     needed = batch_size + 1
     if (
@@ -430,11 +261,16 @@ def _ensure_cum_tiles(qo_indptr, BLOCK_M, num_heads, batch_size):
     ):
         _cum_tiles_cap = max(needed, 256)
         _cum_tiles_buf = torch.zeros(_cum_tiles_cap, dtype=torch.int32, device=device)
+        _cum_tiles_cache_key = None
     cum_tiles = _cum_tiles_buf[:needed]
+    _key = (qo_indptr.data_ptr(), BLOCK_M, batch_size)
+    if _cum_tiles_cache_key == _key:
+        return cum_tiles
     ext_lens = (qo_indptr[1:batch_size + 1] - qo_indptr[:batch_size]).to(torch.int32)
     n_tiles_per_batch = (ext_lens + (BLOCK_M - 1)) // BLOCK_M
     cum_tiles[0] = 0
     torch.cumsum(n_tiles_per_batch, 0, dtype=torch.int32, out=cum_tiles[1:])
+    _cum_tiles_cache_key = _key
     return cum_tiles
 
 
@@ -506,16 +342,8 @@ def _launch_persistent(
     xai_temperature_len=-1,
     enable_mask_split=True,
     enable_prefix_unmasked=True,
-    _force_block_m=None,
-    _force_num_warps=None,
-    _force_num_stages=None,
-    _force_waves_per_eu=None,
-    _force_block_n=None,
-    _ck_v_preload=False,
     min_len_extend=None,
     total_prefix_len=None,
-    _force_tile_map_mode=1,  # WCA inline scan (fast, no CPU sync)
-    _force_prefix_mask_mode=None,
 ):
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
@@ -536,8 +364,6 @@ def _launch_persistent(
     assert q_extend.shape[1] % k_extend.shape[1] == 0
 
     BLOCK_N = 32 if BLOCK_DMODEL >= 256 else 64
-    if _force_block_n is not None:
-        BLOCK_N = _force_block_n
     batch_size = qo_indptr.shape[0] - 1
 
     if min_len_extend is None:
@@ -548,20 +374,31 @@ def _launch_persistent(
         min_len_extend = max_len_extend
     head_num = q_extend.shape[1]
 
-    # Small-tile regime: BM=64 NW=4 NS=2 when per-seq work is small or
-    # the batch is ragged enough that BM=128 wastes compute on masked
-    # tokens. Exception: big-B chat with a substantial prefix -- each tile
-    # iterates the full per-seq prefix regardless of BM, so larger BM
-    # amortizes the scan over more query rows.
+    # Tile-config auto-select. Three regimes on top of the D>=256 and
+    # default BM=128 NW=8 paths:
+    #   * small-tile (BM=64 NW=4 NS=2): per-seq work is small or the
+    #     batch is ragged enough that BM=128 wastes compute on masked
+    #     tokens, OR Lq=128 ext-dominated chat-mix. Exception: big-B chat
+    #     with a substantial prefix -- each tile iterates the full
+    #     per-seq prefix regardless of BM, so larger BM amortizes the
+    #     scan over more query rows.
+    #   * bsearch tile map (TILE_MAP_MODE=0): Lq=128 full-batch prefill
+    #     (B>=16, max_ext>=2048, avg_ext>=512) where the tighter
+    #     bsearch schedule beats inline scan.
     _het_ratio = max_len_extend / max(min_len_extend, 1)
     _total_pfx_est = (
         total_prefix_len if total_prefix_len is not None
         else kv_indices.numel()
     )
+    _total_ext = q_extend.shape[0]
+    _avg_ext = _total_ext / max(1, batch_size)
     _pfx_dominated_big_b = (
         batch_size >= 8
         and _total_pfx_est >= batch_size * 1024
         and 32 <= max_len_extend <= 512
+    )
+    _lq128_ext_dominated = (
+        Lq == 128 and _total_pfx_est < 4 * _total_ext
     )
     _use_small_tile = (
         not _pfx_dominated_big_b
@@ -569,13 +406,17 @@ def _launch_persistent(
             max_len_extend <= 128
             or (max_len_extend <= 256 and _het_ratio >= 2.0)
             or (min_len_extend < 64 and max_len_extend <= 512 and batch_size <= 4)
+            or _lq128_ext_dominated
         )
     )
+    _use_bsearch = (
+        Lq == 128
+        and batch_size >= 16
+        and max_len_extend >= 2048
+        and _avg_ext >= 512
+    )
 
-    if _force_block_m is not None and _force_num_warps is not None:
-        BLOCK_M = _force_block_m
-        num_warps = _force_num_warps
-    elif BLOCK_DMODEL >= 256:
+    if BLOCK_DMODEL >= 256:
         BLOCK_M = 64
         num_warps = 4
     elif _use_small_tile:
@@ -591,9 +432,7 @@ def _launch_persistent(
         BLOCK_M = 128
         num_warps = 8
 
-    if _force_num_stages is not None:
-        NUM_STAGES = _force_num_stages
-    elif BLOCK_DMODEL >= 256:
+    if BLOCK_DMODEL >= 256:
         NUM_STAGES = 1
     elif BLOCK_M == 64 and num_warps == 4:
         NUM_STAGES = 2
@@ -602,12 +441,7 @@ def _launch_persistent(
     else:
         NUM_STAGES = 4
 
-    if (
-        BLOCK_M == 128
-        and num_warps == 8
-        and NUM_STAGES == 2
-        and _force_num_stages is None
-    ):
+    if BLOCK_M == 128 and num_warps == 8 and NUM_STAGES == 2:
         NUM_STAGES = 3
 
     sm_scale = sm_scale or 1.0 / math.sqrt(Lq)
@@ -629,7 +463,7 @@ def _launch_persistent(
         (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
     ) * head_num
 
-    TILE_MAP_MODE = _effective_tile_map_mode(_force_tile_map_mode)
+    TILE_MAP_MODE = _effective_tile_map_mode(0 if _use_bsearch else 1)
     if TILE_MAP_MODE == 1:
         # WCA inline-scan: tolerates empty slots; pass the tight bound.
         total_output_tiles = total_output_tiles_tight
@@ -677,51 +511,8 @@ def _launch_persistent(
     _enable_prefix_unmasked = enable_prefix_unmasked
     _has_sink = sinks is not None
     _v_scale_final = 1.0 if SPLIT_K > 1 else v_scale
-    _frozen_kw = {
-        'IS_CAUSAL': is_causal,
-        'USE_CUSTOM_MASK': USE_CUSTOM_MASK,
-        'ENABLE_PREFIX_UNMASKED': _enable_prefix_unmasked,
-        'BLOCK_M': BLOCK_M,
-        'BLOCK_N': BLOCK_N,
-        'BLOCK_DMODEL': BLOCK_DMODEL,
-        'NUM_STAGES': NUM_STAGES,
-        'HAS_SINK': _has_sink,
-        'LOGIT_CAP': logit_cap,
-        'XAI_TEMPERATURE_LEN': xai_temperature_len,
-        'SLIDING_WINDOW_SIZE': sliding_window_size,
-        'IS_PERSISTENT': True,
-        'SPLIT_K': SPLIT_K,
-        'MAX_BATCH_LOG2': _DEFAULT_MAX_BATCH_LOG2,
-        'TILE_MAP_MODE': TILE_MAP_MODE,
-        'PREFIX_MASK_MODE': _force_prefix_mask_mode or 0,
-        '_num_warps': num_warps,
-    }
-    _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
-    _os = o_extend.stride(); _kbs = k_buffer.stride(); _vbs = v_buffer.stride()
-    _strides = (
-        _qs[0], _qs[1], _ks[0], _ks[1], _vs[0], _vs[1],
-        _os[0], _os[1], _kbs[0], _kbs[1], _vbs[0], _vbs[1],
-    )
-    _dtypes = (qo_indptr.dtype, kv_indptr.dtype, kv_indices.dtype)
-    _cache_key = _persistent_cache_key(Lq, _frozen_kw, _dtypes)
-    _runner = _persistent_fast_cache.get(_cache_key)
 
-    if _runner is not None:
-        _runner(
-            q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            custom_mask, mask_indptr, window_kv_offsets,
-            sm_scale, kv_group_num, _strides,
-            sinks, _v_scale_final,
-            head_num, n_m_tiles,
-            total_valid_tiles, total_programs,
-            partial_out, partial_lse, tile_done,
-            cum_tiles_per_batch, batch_size,
-            grid,
-        )
-        return
-
-    _compiled = _bf16_kernel.run(
+    _bf16_kernel[grid](
         q_extend,
         k_extend,
         v_extend,
@@ -736,7 +527,12 @@ def _launch_persistent(
         window_kv_offsets,
         sm_scale,
         kv_group_num,
-        *_strides,
+        q_extend.stride(0), q_extend.stride(1),
+        k_extend.stride(0), k_extend.stride(1),
+        v_extend.stride(0), v_extend.stride(1),
+        o_extend.stride(0), o_extend.stride(1),
+        k_buffer.stride(0), k_buffer.stride(1),
+        v_buffer.stride(0), v_buffer.stride(1),
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         ENABLE_PREFIX_UNMASKED=_enable_prefix_unmasked,
@@ -763,18 +559,12 @@ def _launch_persistent(
         SPLIT_K=SPLIT_K,
         MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
         TILE_MAP_MODE=TILE_MAP_MODE,
-        PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
-        grid=grid,
+        PREFIX_MASK_MODE=0,
         num_warps=num_warps,
         num_stages=1,
-        waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
+        waves_per_eu=2,
         matrix_instr_nonkdim=32,
-        warmup=False,
     )
-    if _cache_key not in _persistent_fast_cache:
-        _persistent_fast_cache[_cache_key] = _make_persistent_fast_runner(
-            _compiled, _frozen_kw,
-        )
 
 
 def _launch_splitk(
@@ -786,10 +576,7 @@ def _launch_splitk(
     Lq, Lv, is_causal, max_len_extend, min_len_extend,
     sinks, xai_temperature_len, sliding_window_size,
     BLOCK_M, BLOCK_N, num_warps, NUM_STAGES,
-    _force_waves_per_eu=None,
     total_prefix_len=None,
-    _force_tile_map_mode=1,  # WCA inline scan (fast, no CPU sync)
-    _force_prefix_mask_mode=None,
 ):
     """Split-K persistent kernel: partitions prefix across CTAs, then reduces."""
     head_num = q_extend.shape[1]
@@ -824,8 +611,7 @@ def _launch_splitk(
             xai_temperature_len=xai_temperature_len,
             sliding_window_size=sliding_window_size,
             window_kv_offsets=window_kv_offsets,
-            _force_tile_map_mode=_force_tile_map_mode,
-            _force_prefix_mask_mode=_force_prefix_mask_mode,
+            total_prefix_len=total_prefix_len,
         )
         return
 
@@ -863,11 +649,8 @@ def _launch_splitk(
         (q_extend.shape[0] + batch_size * (BLOCK_M - 1)) // BLOCK_M
     ) * head_num
 
-    TILE_MAP_MODE = _effective_tile_map_mode(_force_tile_map_mode)
-    if TILE_MAP_MODE == 1:
-        cum_tiles_per_batch = _ensure_splitk_dummy(device)
-    else:
-        cum_tiles_per_batch = _ensure_cum_tiles(qo_indptr, BLOCK_M, head_num, batch_size)
+    TILE_MAP_MODE = _effective_tile_map_mode(1)
+    cum_tiles_per_batch = _ensure_splitk_dummy(device)
 
     total_splits = total_output_tiles * SPLIT_K
     partial_out, partial_lse, tile_done = _ensure_splitk_workspace(
@@ -880,57 +663,19 @@ def _launch_splitk(
 
     _has_sink = sinks is not None
     _v_scale_final = 1.0 if SPLIT_K > 1 else v_scale
-    _frozen_kw = {
-        'IS_CAUSAL': is_causal,
-        'USE_CUSTOM_MASK': USE_CUSTOM_MASK,
-        'ENABLE_PREFIX_UNMASKED': enable_prefix_unmasked,
-        'BLOCK_M': BLOCK_M,
-        'BLOCK_N': BLOCK_N,
-        'BLOCK_DMODEL': BLOCK_DMODEL,
-        'NUM_STAGES': NUM_STAGES,
-        'HAS_SINK': _has_sink,
-        'LOGIT_CAP': logit_cap,
-        'XAI_TEMPERATURE_LEN': xai_temperature_len,
-        'SLIDING_WINDOW_SIZE': sliding_window_size,
-        'IS_PERSISTENT': True,
-        'SPLIT_K': SPLIT_K,
-        'MAX_BATCH_LOG2': _DEFAULT_MAX_BATCH_LOG2,
-        'TILE_MAP_MODE': TILE_MAP_MODE,
-        'PREFIX_MASK_MODE': _force_prefix_mask_mode or 0,
-        '_num_warps': num_warps,
-    }
-    _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
-    _os = o_extend.stride(); _kbs = k_buffer.stride(); _vbs = v_buffer.stride()
-    _strides = (
-        _qs[0], _qs[1], _ks[0], _ks[1], _vs[0], _vs[1],
-        _os[0], _os[1], _kbs[0], _kbs[1], _vbs[0], _vbs[1],
-    )
-    _dtypes = (qo_indptr.dtype, kv_indptr.dtype, kv_indices.dtype)
-    _cache_key = _persistent_cache_key(Lq, _frozen_kw, _dtypes)
-    _runner = _persistent_fast_cache.get(_cache_key)
 
-    if _runner is not None:
-        _runner(
-            q_extend, k_extend, v_extend, o_extend, k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            custom_mask, mask_indptr, window_kv_offsets,
-            sm_scale, kv_group_num, _strides,
-            sinks, _v_scale_final,
-            head_num, n_m_tiles,
-            total_valid_tiles, total_programs,
-            partial_out, partial_lse, tile_done,
-            cum_tiles_per_batch, batch_size,
-            grid,
-        )
-        return
-
-    _compiled = _bf16_kernel.run(
+    _bf16_kernel[grid](
         q_extend, k_extend, v_extend, o_extend,
         k_buffer, v_buffer,
         qo_indptr, kv_indptr, kv_indices,
         custom_mask, mask_indptr, window_kv_offsets,
         sm_scale, kv_group_num,
-        *_strides,
+        q_extend.stride(0), q_extend.stride(1),
+        k_extend.stride(0), k_extend.stride(1),
+        v_extend.stride(0), v_extend.stride(1),
+        o_extend.stride(0), o_extend.stride(1),
+        k_buffer.stride(0), k_buffer.stride(1),
+        v_buffer.stride(0), v_buffer.stride(1),
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
@@ -951,188 +696,16 @@ def _launch_splitk(
         IS_PERSISTENT=True, SPLIT_K=SPLIT_K,
         MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
         TILE_MAP_MODE=TILE_MAP_MODE,
-        PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
-        grid=grid,
+        PREFIX_MASK_MODE=0,
         num_warps=num_warps, num_stages=1,
-        waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
+        waves_per_eu=2,
         matrix_instr_nonkdim=32,
-        warmup=False,
     )
-    if _cache_key not in _persistent_fast_cache:
-        _persistent_fast_cache[_cache_key] = _make_persistent_fast_runner(
-            _compiled, _frozen_kw,
-        )
 
 
 # ===-----------------------------------------------------------------------===#
-# Basic-path fast-runner
+# Basic-path tile-config heuristics
 # ===-----------------------------------------------------------------------===#
-
-
-def _make_fast_runner(compiled_kernel, frozen_kw: dict, kv_gn: int):
-    """Build a HIPLauncher-direct closure for the BF16 unified kernel on the
-    basic path (IS_PERSISTENT=False).
-
-    Once dispatch has picked a config, all constexprs are fixed; only the
-    tensors, sm_scale, 12 stride ints, and grid change per call. Baking the
-    constexprs into a closure avoids Triton's JITFunction specialization
-    pass on every launch.
-
-    The unified kernel signature carries the persistent-only runtime args
-    (num_heads, n_m_tiles, total_valid_tiles, total_programs, partial_out,
-    partial_lse, tile_done, cum_tiles_per_batch, actual_batch_size) and the
-    persistent-only constexprs (IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2,
-    TILE_MAP_MODE) as a superset over the pre-refactor basic signature.
-    With IS_PERSISTENT=False the scheduling preamble collapses to a single
-    pass and every access to those args is DCE'd away, so we pass integer
-    zeros for the scalars and 1-element module-level dummy tensors for the
-    pointers (Triton specializes on pointer element dtype; dtypes must
-    match the persistent-path fp32 / int32 choice).
-
-    Assumes ``knobs.runtime.launch_enter_hook`` / ``launch_exit_hook`` are
-    ``None`` at construction time. Callers that later install a profiler
-    should clear ``_config_cache`` so the closures are rebuilt.
-    """
-    from triton.runtime import driver as _triton_driver
-    from triton import knobs as _triton_knobs
-
-    compiled_kernel._init_handles()
-    _hip_launcher = compiled_kernel.run
-    _fn_handle = compiled_kernel.function
-    _packed_md = compiled_kernel.packed_metadata
-    _active = _triton_driver.active
-    _get_dev = _active.get_current_device
-    _get_stream = _active.get_current_stream
-    _enter_hook = _triton_knobs.runtime.launch_enter_hook
-    _exit_hook = _triton_knobs.runtime.launch_exit_hook
-
-    IS_CAUSAL = frozen_kw['IS_CAUSAL']
-    USE_CUSTOM_MASK = frozen_kw['USE_CUSTOM_MASK']
-    ENABLE_PREFIX_UNMASKED = frozen_kw['ENABLE_PREFIX_UNMASKED']
-    BLOCK_M = frozen_kw['BLOCK_M']
-    BLOCK_N = frozen_kw['BLOCK_N']
-    BLOCK_DMODEL = frozen_kw['BLOCK_DMODEL']
-    NUM_STAGES = frozen_kw['NUM_STAGES']
-    # Sinks pointer is a runtime arg (varies per layer on GPT-OSS); HAS_SINK
-    # is a compile-time constant baked into the specialized kernel and part
-    # of the cache key, so swapping the pointer across calls is safe.
-    HAS_SINK = frozen_kw['HAS_SINK']
-    LOGIT_CAP = frozen_kw['LOGIT_CAP']
-    XAI_TEMPERATURE_LEN = frozen_kw['XAI_TEMPERATURE_LEN']
-    SLIDING_WINDOW_SIZE = frozen_kw['SLIDING_WINDOW_SIZE']
-    v_scale = frozen_kw['v_scale']
-
-    def _fast_run(q, k, v, o, kb, vb, qo_i, kv_i, kv_x,
-                  mask, mi, wkvo, sinks, sm_scale, strides, grid):
-        dev = _get_dev()
-        stream = _get_stream(dev)
-        _hip_launcher(
-            grid[0], grid[1], grid[2], stream, _fn_handle, _packed_md, None,
-            _enter_hook, _exit_hook,
-            q, k, v, o, kb, vb,
-            qo_i, kv_i, kv_x,
-            mask, mi, wkvo,
-            sm_scale, kv_gn,
-            strides[0], strides[1], strides[2], strides[3],
-            strides[4], strides[5], strides[6], strides[7],
-            strides[8], strides[9], strides[10], strides[11],
-            IS_CAUSAL, USE_CUSTOM_MASK, ENABLE_PREFIX_UNMASKED,
-            BLOCK_M, BLOCK_N, BLOCK_DMODEL,
-            NUM_STAGES,
-            sinks, HAS_SINK,
-            LOGIT_CAP, XAI_TEMPERATURE_LEN, SLIDING_WINDOW_SIZE,
-            v_scale,
-            # Persistent-path runtime args -- DCE'd under IS_PERSISTENT=False.
-            0, 0, 0, 0,  # num_heads, n_m_tiles, total_valid_tiles, total_programs
-            _dummy_partial_out, _dummy_partial_lse, _dummy_tile_done,
-            _dummy_cum_tiles, 0,  # actual_batch_size=0
-            # Persistent-path constexprs + PREFIX_MASK_MODE (last constexpr in
-            # kernel signature, baked in at compile time but still occupies a
-            # positional slot in the HIPLauncher stub).
-            False, 1, 8, 0, 0,  # IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2, TILE_MAP_MODE, PREFIX_MASK_MODE
-        )
-
-    return _fast_run
-
-
-def _make_fast_runner_fp8(compiled_kernel, frozen_kw: dict, kv_gn: int):
-    """FP8 twin of :func:`_make_fast_runner`.
-
-    The FP8 unified kernel signature carries the FP8-specific constexprs
-    (``SKIP_PREFIX_CUSTOM_MASK``, ``ENABLE_MASK_SPLIT``, ``BLOCK_DV``,
-    ``EXT_BLOCK_N``/``EXT_NUM_STAGES``, ``ASYNC_PAD_K``/``V``) plus the
-    persistent-superset runtime args (num_heads, n_m_tiles, total_valid_tiles,
-    total_programs, partial_out, partial_lse, tile_done) and constexprs
-    (IS_PERSISTENT, SPLIT_K). With IS_PERSISTENT=False DCE drops every
-    access to the persistent-only args.
-    """
-    from triton.runtime import driver as _triton_driver
-    from triton import knobs as _triton_knobs
-
-    compiled_kernel._init_handles()
-    _hip_launcher = compiled_kernel.run
-    _fn_handle = compiled_kernel.function
-    _packed_md = compiled_kernel.packed_metadata
-    _active = _triton_driver.active
-    _get_dev = _active.get_current_device
-    _get_stream = _active.get_current_stream
-    _enter_hook = _triton_knobs.runtime.launch_enter_hook
-    _exit_hook = _triton_knobs.runtime.launch_exit_hook
-
-    IS_CAUSAL = frozen_kw['IS_CAUSAL']
-    USE_CUSTOM_MASK = frozen_kw['USE_CUSTOM_MASK']
-    SKIP_PREFIX_CUSTOM_MASK = frozen_kw['SKIP_PREFIX_CUSTOM_MASK']
-    ENABLE_PREFIX_UNMASKED = frozen_kw['ENABLE_PREFIX_UNMASKED']
-    ENABLE_MASK_SPLIT = frozen_kw['ENABLE_MASK_SPLIT']
-    BLOCK_M = frozen_kw['BLOCK_M']
-    BLOCK_N = frozen_kw['BLOCK_N']
-    BLOCK_DMODEL = frozen_kw['BLOCK_DMODEL']
-    BLOCK_DV = frozen_kw['BLOCK_DV']
-    NUM_STAGES = frozen_kw['NUM_STAGES']
-    EXT_BLOCK_N = frozen_kw['EXT_BLOCK_N']
-    EXT_NUM_STAGES = frozen_kw['EXT_NUM_STAGES']
-    ASYNC_PAD_K = frozen_kw['ASYNC_PAD_K']
-    ASYNC_PAD_V = frozen_kw['ASYNC_PAD_V']
-    HAS_SINK = frozen_kw['HAS_SINK']
-    LOGIT_CAP = frozen_kw['LOGIT_CAP']
-    XAI_TEMPERATURE_LEN = frozen_kw['XAI_TEMPERATURE_LEN']
-    SLIDING_WINDOW_SIZE = frozen_kw['SLIDING_WINDOW_SIZE']
-    v_scale = frozen_kw['v_scale']
-
-    def _fast_run_fp8(q, k, v, o, kb, vb, qo_i, kv_i, kv_x,
-                      mask, mi, wkvo, sinks, sm_scale, strides, grid):
-        dev = _get_dev()
-        stream = _get_stream(dev)
-        _hip_launcher(
-            grid[0], grid[1], grid[2], stream, _fn_handle, _packed_md, None,
-            _enter_hook, _exit_hook,
-            q, k, v, o, kb, vb,
-            qo_i, kv_i, kv_x,
-            mask, mi, wkvo,
-            sm_scale, kv_gn,
-            strides[0], strides[1], strides[2], strides[3],
-            strides[4], strides[5], strides[6], strides[7],
-            strides[8], strides[9], strides[10], strides[11],
-            IS_CAUSAL, USE_CUSTOM_MASK, SKIP_PREFIX_CUSTOM_MASK,
-            ENABLE_PREFIX_UNMASKED, ENABLE_MASK_SPLIT,
-            BLOCK_M, BLOCK_N, BLOCK_DMODEL,
-            BLOCK_DV,
-            NUM_STAGES, EXT_BLOCK_N, EXT_NUM_STAGES,
-            ASYNC_PAD_K, ASYNC_PAD_V,
-            sinks, HAS_SINK,
-            LOGIT_CAP, XAI_TEMPERATURE_LEN, SLIDING_WINDOW_SIZE,
-            v_scale,
-            # Persistent-path runtime args (DCE'd under IS_PERSISTENT=False).
-            0, 0, 0, 0,  # num_heads, n_m_tiles, total_valid_tiles, total_programs
-            _dummy_partial_out, _dummy_partial_lse, _dummy_tile_done,
-            _dummy_cum_tiles, 0,  # actual_batch_size=0
-            # Persistent-path constexprs + PREFIX_MASK_MODE (last constexpr in
-            # kernel signature, baked in at compile time but still occupies a
-            # positional slot in the HIPLauncher stub).
-            False, 1, 8, 1, 0,  # IS_PERSISTENT, SPLIT_K, MAX_BATCH_LOG2, TILE_MAP_MODE, PREFIX_MASK_MODE
-        )
-
-    return _fast_run_fp8
 
 
 def _get_num_xcds(device):
@@ -1427,8 +1000,9 @@ def _get_basic_dispatch_config(
 
     Returns (BLOCK_M, BLOCK_N, num_warps, NUM_STAGES, PAD_K, PAD_V,
     EXT_BLOCK_N, EXT_NUM_STAGES) for the basic (non-persistent) kernel.
-    Cached per shape signature; ``pfx_bucket`` keeps the cache small
-    while preserving the prefix-vs-no-prefix distinction.
+    Memoized on the full argument tuple -- the heuristic tree is a step
+    function with ~6 configs per (Lq, is_fp8) pair, so the live cache
+    stays small and hit rate is near-100% in production.
     """
     _total_ext = batch_size * max_len_extend
     _PAD_K, _PAD_V = 16, 16
@@ -1504,16 +1078,6 @@ def gluon_extend_attention_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
-    _force_block_m=None,
-    _force_num_warps=None,
-    _force_num_stages=None,
-    _force_waves_per_eu=None,
-    _force_use_persistent=None,
-    _force_use_splitk=None,
-    _force_block_n=None,
-    _force_prefix_mask_mode=None,
-    _ck_v_preload=False,
-    _mask_split_ext_threshold=1024,
     min_len_extend=None,
     total_prefix_len=None,
     total_extend_len=None,
@@ -1588,152 +1152,14 @@ def gluon_extend_attention_fwd(
     _uniform_by_shape = (_total_extend_rows == batch_size * max_len_extend)
     _uniform_like = (batch_size <= 1 or _uniform_by_shape)
 
-    # Config-keyed dispatch cache (see module-level comment). The
-    # basic-path cache is gated on `_uniform_like` because the basic
-    # grid is `(B, H, ceil(max_ext / BM))` — heterogeneous batches
-    # waste most of those tiles and route through WCA persistent.
-    _basic_forced_only = (
-        (_force_use_persistent is False or _force_use_persistent is None)
-        and (_force_use_splitk is False or _force_use_splitk is None)
-    )
-    # Spec-decode-style small-ext + big-pfx-skew shapes look uniform but
-    # the longest-prefix CTA dominates; WCA persistent regains ~1.77x,
-    # so exclude them from the basic cache. D=128 only (below WCA branch).
-    #
-    # FP8 D=128 with ext<=64: after the small-bucket retune (basic gets
-    # BM=64 NW=4 NS=1 on B>=16 or B>=8+long-prefix), the basic path
-    # reaches 1.4x-1.5x vs Triton on uniform-ext shapes. The WCA
-    # persistent FP8 branch below lands at 0.64x-0.66x vs Triton on
-    # those same shapes — it's still the right path for genuinely
-    # skewed prefixes but we can't detect skew cheaply, so keep FP8
-    # uniform-ext short-extend shapes on basic where the retune wins.
-    _cache_exclude_pfx_skew = (
-        Lq == 128
-        and batch_size >= 4
-        and max_len_extend <= 128
-        and (
-            total_prefix_len if total_prefix_len is not None
-            else kv_indices.numel()
-        ) >= batch_size * 2048
-        and (_force_use_persistent is not False)
-        and (_force_use_splitk is not False)
-        and not (_kv_is_fp8 and max_len_extend <= 64)
-    )
-    # Structural gate: no force_* overrides, no custom mask. Sinks and
-    # window_kv_offsets are runtime args keyed via HAS_SINK /
-    # SLIDING_WINDOW_SIZE, so they don't need to be part of this check.
-    _cfg_cache_eligible = (
-        _force_block_m is None
-        and _force_block_n is None
-        and not _ck_v_preload
-        and _basic_forced_only
-        and custom_mask is None
-        and _force_num_warps is None
-        and _force_num_stages is None
-        and _force_waves_per_eu is None
-        and _force_prefix_mask_mode is None
-        and not _cache_exclude_pfx_skew
-        and not DEBUG.disable_cfg_cache
-    )
     _has_sink = sinks is not None
 
-    def _try_config_cache():
-        """Return the cache entry for the current shape, or None on miss."""
-        _pfx_b_local = _pfx_bucket(total_prefix_len, batch_size)
-        _cfg_local = _get_basic_dispatch_config(
-            Lq, batch_size, max_len_extend, _pfx_b_local, _kv_is_fp8,
-            sliding_window_size=sliding_window_size,
-            head_num=head_num,
-        )
-        # Key includes head_num/k_head_num (kv_group_num is baked), HAS_SINK
-        # (distinct kernel bodies), and the indptr/indices dtypes (Triton
-        # bakes pointer element type into SASS).
-        return _config_cache.get(
-            (_cfg_local, Lq, _kv_is_fp8,
-             is_causal, logit_cap, sliding_window_size, xai_temperature_len,
-             head_num, k_extend.shape[1], _has_sink,
-             qo_indptr.dtype, kv_indptr.dtype, kv_indices.dtype)
-        )
-
-    def _run_config_cache_entry(_cc_entry):
-        """Execute a cache hit.
-
-        Strides and sm_scale are recomputed per call: both are HIPLauncher
-        runtime args, and per-layer tensors may have different strides or
-        KV scales than the install-time sample.
-        """
-        _mi_n = _total_extend_rows + 1
-        _wkvo_n = batch_size if batch_size > 0 else 1
-        if _dummy_mi_size < _mi_n or _dummy_wkvo_size < _wkvo_n or _dummy_sinks is None:
-            _ensure_dummies(q_extend.device, _mi_n, _wkvo_n)
-        _sinks_arg = sinks if sinks is not None else _dummy_sinks
-        _wkvo_arg = (
-            window_kv_offsets
-            if window_kv_offsets is not None
-            else _dummy_wkvo[:_wkvo_n]
-        )
-        _qs = q_extend.stride(); _ks = k_extend.stride(); _vs = v_extend.stride()
-        _os = o_extend.stride(); _kbs = k_buffer.stride(); _vbs = v_buffer.stride()
-        _live_strides = (
-            _qs[0], _qs[1], _ks[0], _ks[1], _vs[0], _vs[1],
-            _os[0], _os[1], _kbs[0], _kbs[1], _vbs[0], _vbs[1],
-        )
-        _sm_live = (sm_scale if sm_scale is not None else Lq**-0.5) * k_scale
-        _tag = _cc_entry[0]
-        if _tag == "fast":
-            _, _cc_run, _cc_sm, _cc_strides, _cc_BM = _cc_entry
-            _cc_run(
-                q_extend, k_extend, v_extend, o_extend,
-                k_buffer, v_buffer,
-                qo_indptr, kv_indptr, kv_indices,
-                _dummy_cm, _dummy_mi[:_mi_n],
-                _wkvo_arg, _sinks_arg,
-                _sm_live, _live_strides,
-                (batch_size, head_num,
-                 (max_len_extend + _cc_BM - 1) // _cc_BM),
-            )
-        else:
-            # Legacy JITFunction.run path, kept as a forward-compat fallback.
-            _, _cc_run, _cc_sm, _cc_gn, _cc_strides, _cc_kw, _cc_BM = _cc_entry
-            if "Sinks" in _cc_kw:
-                _cc_kw = {**_cc_kw, "Sinks": _sinks_arg}
-            _cc_run(
-                q_extend, k_extend, v_extend, o_extend,
-                k_buffer, v_buffer,
-                qo_indptr, kv_indptr, kv_indices,
-                _dummy_cm, _dummy_mi[:_mi_n],
-                _wkvo_arg,
-                _sm_live, _cc_gn, *_live_strides,
-                grid=(batch_size, head_num,
-                      (max_len_extend + _cc_BM - 1) // _cc_BM),
-                **_cc_kw,
-            )
-
-    if _uniform_like and _cfg_cache_eligible:
-        _cc_entry = _try_config_cache()
-        if _cc_entry is not None:
-            _bump_dispatch("early_cache_hit")
-            _run_config_cache_entry(_cc_entry)
-            return
-        # Cache miss falls through to the full dispatch, which populates it.
-
-    # Fast-path eligibility: no custom mask, no ``_force_*`` overrides.
-    # ``_force_use_*=False`` is accepted (explicit "basic, please").
-    _is_fast_eligible = (
-        _force_block_m is None
-        and _force_block_n is None
-        and not _ck_v_preload
-        and _basic_forced_only
-        and custom_mask is None
-    )
+    # WCA eligibility: no custom mask. Custom-mask workloads always fall
+    # back to the basic per-batch grid.
+    _can_route_wca = custom_mask is None
     _is_uniform = (batch_size <= 1 or min_len_extend == max_len_extend
                    or _uniform_by_shape)
-    _ragged_routable = (
-        _is_fast_eligible
-        and (_force_use_persistent is not False)
-        and (_force_use_splitk is not False)
-    )
-    _is_ragged_ext = _ragged_routable and not _is_uniform and batch_size >= 2
+    _is_ragged_ext = _can_route_wca and not _is_uniform and batch_size >= 2
     # Small-ext + big-prefix-skew (e.g. spec-decode) — looks uniform but
     # the longest-prefix CTA dominates; WCA persistent regains ~1.7x.
     _total_pfx_est_pre = (
@@ -1741,15 +1167,15 @@ def gluon_extend_attention_fwd(
         else kv_indices.numel()
     )
     _is_ragged_pfx = (
-        _ragged_routable
+        _can_route_wca
         and batch_size >= 4
         and max_len_extend <= 128
         and _total_pfx_est_pre >= batch_size * 2048
-        # Mirror the _cache_exclude_pfx_skew guard: FP8 D=128 short-extend
-        # stays on basic after the small-bucket retune (1.4-1.5x vs
-        # Triton) instead of WCA persistent (0.64-0.66x vs Triton on the
-        # same shapes). Genuine pfx-skew would still benefit from WCA but
-        # we can't cheaply distinguish it from uniform at dispatch time.
+        # FP8 D=128 short-extend stays on basic after the small-bucket
+        # retune (1.4-1.5x vs Triton) instead of WCA persistent (0.64-
+        # 0.66x vs Triton on the same shapes). Genuine pfx-skew would
+        # still benefit from WCA but we can't cheaply distinguish it from
+        # uniform at dispatch time.
         and not (_kv_is_fp8 and Lq == 128 and max_len_extend <= 64)
     )
     _is_ragged = _is_ragged_ext or _is_ragged_pfx
@@ -1798,38 +1224,10 @@ def gluon_extend_attention_fwd(
                     and (batch_size >= 5 or _total_pfx_est >= 512))
             )
         if _use_wca:
+            # Launcher internally picks between three BF16 variants (bsearch
+            # tile map for full-batch prefill, small-tile for ext-dominated
+            # batches, default for prefix-dominated chat-mix) based on shape.
             _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-            # BF16 persistent has three variants (thresholds from
-            # bench_real_het.py): bsearch tile map for full-batch prefill,
-            # WCA default for prefix-dominated chat-mix, and WCA small
-            # (BM=64 NW=4 NS=2) for ext-dominated / heavily-skewed batches.
-            # The force_* knobs only exist on the BF16 launcher.
-            _wca_kw = dict()
-            _avg_ext = _total_ext / max(1, batch_size)
-            _use_bsearch = (
-                (not _kv_is_fp8)
-                and Lq == 128
-                and batch_size >= 16
-                and max_len_extend >= 2048
-                and _avg_ext >= 512
-            )
-            if _use_bsearch:
-                _wca_kw.update(_force_tile_map_mode=0)
-            elif (not _kv_is_fp8) and Lq == 128 and _total_pfx_est < 4 * _total_ext:
-                _wca_kw.update(
-                    _force_block_m=64,
-                    _force_num_warps=4,
-                    _force_num_stages=2,
-                )
-            _bump_dispatch("wca_persistent")
-            if DEBUG.trace_interval and _dispatch_counters["wca_persistent"] <= 20:
-                logger.warning(
-                    "gluon extend WCA: B=%d minE=%s maxE=%d pfx_est=%d Lq=%d "
-                    "sw=%s sink=%s kw=%s",
-                    batch_size, min_len_extend, max_len_extend,
-                    _total_pfx_est, Lq, sliding_window_size,
-                    sinks is not None, _wca_kw,
-                )
             _wca_fn(
                 q_extend, k_extend, v_extend, o_extend,
                 k_buffer, v_buffer,
@@ -1843,21 +1241,10 @@ def gluon_extend_attention_fwd(
                 xai_temperature_len=xai_temperature_len,
                 min_len_extend=min_len_extend,
                 total_prefix_len=total_prefix_len,
-                **_wca_kw,
             )
             return
 
-    # Late config-cache lookup for het batches that bypassed the early
-    # uniform path and then fell out of the ``_is_ragged`` block without
-    # routing to WCA. Skip full dispatch on cache hit.
-    if (not _uniform_like) and _cfg_cache_eligible:
-        _cc_entry = _try_config_cache()
-        if _cc_entry is not None:
-            _bump_dispatch("late_cache_hit")
-            _run_config_cache_entry(_cc_entry)
-            return
-
-    if _is_fast_eligible:
+    if _can_route_wca:
         _BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
         if Lq <= 128:
@@ -1919,18 +1306,14 @@ def gluon_extend_attention_fwd(
                                 and (batch_size >= 4 or _avg_pfx >= 16384))
                         )
                     )
-            if _need_persistent and _ragged_routable:
+            if _need_persistent and _can_route_wca:
                 if min_len_extend is None:
                     # Avoid the 6ms CPU sync that computing min_len_extend
                     # would cost; falling back to max is conservative.
                     min_len_extend = max_len_extend
-                if _kv_is_fp8:
-                    _p_bm = 64 if Lq == 128 else 32
-                    _p_bn = 128
-                    _p_nw = 4
-                    _p_ns = 1
-                else:
-                    _p_bm = _p_bn = _p_nw = _p_ns = None
+                # Both launchers auto-select tiles for prefix-dominated
+                # chat-mix (BF16 via _use_small_tile+_lq128_ext_dominated,
+                # FP8 via _fp8_prefix_dominated).
                 _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
                 _wca_fn(
                     q_extend, k_extend, v_extend, o_extend,
@@ -1942,10 +1325,6 @@ def gluon_extend_attention_fwd(
                     sliding_window_size=sliding_window_size,
                     sinks=sinks, window_kv_offsets=window_kv_offsets,
                     xai_temperature_len=xai_temperature_len,
-                    _force_block_m=_p_bm,
-                    _force_num_warps=_p_nw,
-                    _force_num_stages=_p_ns,
-                    _force_block_n=_p_bn,
                     min_len_extend=min_len_extend,
                     total_prefix_len=total_prefix_len,
                 )
@@ -1971,11 +1350,10 @@ def gluon_extend_attention_fwd(
                 and (batch_size >= 4 or _avg_pfx_256 >= 16384)
                 and _tiles_256 < _get_num_CUs(q_extend.device)
             )
-            if _need_persistent_256 and _ragged_routable:
+            if _need_persistent_256 and _can_route_wca:
                 if min_len_extend is None:
                     min_len_extend = max_len_extend
                 _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-                _bump_dispatch("wca_persistent_d256")
                 _wca_fn(
                     q_extend, k_extend, v_extend, o_extend,
                     k_buffer, v_buffer,
@@ -2000,14 +1378,6 @@ def gluon_extend_attention_fwd(
                 head_num=head_num,
             )
         )
-        if _force_block_n is not None:
-            _BN = _force_block_n
-        if _kv_is_fp8 and _force_num_warps is not None:
-            _NW = _force_num_warps
-        if _force_num_stages is not None:
-            _NS = _force_num_stages
-            if _kv_is_fp8:
-                _EXT_NS = _force_num_stages
 
         # Cache strides once (avoid 12 separate Python->C++ calls).
         _q_s0, _q_s1 = q_extend.stride(0), q_extend.stride(1)
@@ -2025,7 +1395,22 @@ def gluon_extend_attention_fwd(
             "ASYNC_PAD_K": _PAD_K, "ASYNC_PAD_V": _PAD_V,
         } if _kv_is_fp8 else {}
 
-        _frozen_kw = dict(
+        _grid = (batch_size, head_num, (max_len_extend + _BM - 1) // _BM)
+        # Both BF16 and FP8 unified kernels take the persistent-superset
+        # signature. IS_PERSISTENT=False collapses the outer tile loop to a
+        # single pass and DCE eliminates every access to the persistent-only
+        # runtime args, so integer zeros for scalars and 1-element module
+        # dummies for the pointer workspaces are sufficient. Persistent args
+        # go in via kwargs because the signature interleaves constexprs
+        # between the stride block and the persistent-only runtime block.
+        _kernel_fn[_grid](
+            q_extend, k_extend, v_extend, o_extend,
+            k_buffer, v_buffer,
+            qo_indptr, kv_indptr, kv_indices,
+            _dummy_cm, _dummy_mi[: q_extend.shape[0] + 1], _wkvo,
+            _sm, _kv_gn,
+            _q_s0, _q_s1, _k_s0, _k_s1, _v_s0, _v_s1,
+            _o_s0, _o_s1, _kb_s0, _kb_s1, _vb_s0, _vb_s1,
             IS_CAUSAL=is_causal,
             USE_CUSTOM_MASK=False,
             ENABLE_PREFIX_UNMASKED=is_causal,
@@ -2038,80 +1423,19 @@ def gluon_extend_attention_fwd(
             XAI_TEMPERATURE_LEN=xai_temperature_len,
             SLIDING_WINDOW_SIZE=sliding_window_size,
             v_scale=v_scale,
-            num_warps=_NW, num_stages=1, waves_per_eu=2,
-            matrix_instr_nonkdim=32,
-            warmup=False,
-        )
-        _frozen_grid = (batch_size, head_num, (max_len_extend + _BM - 1) // _BM)
-        _frozen_scalars = (_sm, _kv_gn)
-        _frozen_strides = (
-            _q_s0, _q_s1, _k_s0, _k_s1, _v_s0, _v_s1,
-            _o_s0, _o_s1, _kb_s0, _kb_s1, _vb_s0, _vb_s1,
-        )
-        # First call: pay JITFunction.run once (compiles if needed), capture
-        # the CompiledKernel, and install a direct HIPLauncher closure for
-        # subsequent hits via `_make_fast_runner[_fp8]`.
-        _bump_dispatch("basic_slow_first")
-        if DEBUG.trace_interval:
-            _cfg_for_log = (_BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS)
-            logger.warning(
-                "gluon extend JIT: B=%d maxE=%d pfxB=%d Lq=%d H=%d kvH=%d "
-                "causal=%s sw=%s cap=%s xai=%s sink=%s cfg=%s",
-                batch_size, max_len_extend,
-                _pfx_b_full, Lq, head_num, k_extend.shape[1],
-                is_causal, sliding_window_size, logit_cap,
-                xai_temperature_len, sinks is not None, _cfg_for_log,
-            )
-        # Both BF16 and FP8 unified kernels take the persistent-superset
-        # signature. IS_PERSISTENT=False collapses the outer tile loop to a
-        # single pass and DCE eliminates every access to the persistent-only
-        # runtime args, so integer zeros for scalars and 1-element module
-        # dummies for the pointer workspaces are sufficient. Persistent args
-        # go in via kwargs because the signature interleaves constexprs
-        # between the stride block and the persistent-only runtime block.
-        _compiled = _kernel_fn.run(
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            _dummy_cm, _dummy_mi[: q_extend.shape[0] + 1], _wkvo,
-            *_frozen_scalars, *_frozen_strides,
             num_heads=0, n_m_tiles=0,
             total_valid_tiles=0, total_programs=0,
             partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
             tile_done=_dummy_tile_done,
             cum_tiles_per_batch=_dummy_cum_tiles, actual_batch_size=0,
             IS_PERSISTENT=False, SPLIT_K=1, MAX_BATCH_LOG2=8, TILE_MAP_MODE=0,
-            grid=_frozen_grid, **_frozen_kw,
+            PREFIX_MASK_MODE=0,
+            num_warps=_NW, num_stages=1, waves_per_eu=2,
+            matrix_instr_nonkdim=32,
         )
-
-        # Install the direct-HIPLauncher closure for future calls with
-        # matching (config, shape, dtype) — including the indptr/indices
-        # dtypes since Triton specializes CompiledKernel on pointer element
-        # type.
-        if (
-            _force_block_n is None
-            and _force_num_warps is None
-            and custom_mask is None
-            and not DEBUG.disable_cfg_cache
-        ):
-            _cfg = (_BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS)
-            _has_sink_w = sinks is not None
-            _cc_key = (_cfg, Lq, _kv_is_fp8,
-                       is_causal, logit_cap, sliding_window_size, xai_temperature_len,
-                       head_num, k_extend.shape[1], _has_sink_w,
-                       qo_indptr.dtype, kv_indptr.dtype, kv_indices.dtype)
-            if _cc_key not in _config_cache:
-                _runner_factory = _make_fast_runner_fp8 if _kv_is_fp8 else _make_fast_runner
-                _config_cache[_cc_key] = (
-                    "fast",
-                    _runner_factory(_compiled, _frozen_kw, _kv_gn),
-                    _sm, _frozen_strides, _BM,
-                )
         return
 
     # Full dispatch path: heterogeneous batches, custom_mask, test overrides.
-    _bump_dispatch("full_dispatch")
-
     BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
     # min_len_extend is only needed below on the D>=256 / persistent / splitk
@@ -2122,25 +1446,13 @@ def gluon_extend_attention_fwd(
 
     num_CUs = _get_num_CUs(q_extend.device)
 
-    _BM_est = _force_block_m or (64 if Lq < 256 else 128)
+    _BM_est = 64 if Lq < 256 else 128
     n_m_tiles_est = (max_len_extend + _BM_est - 1) // _BM_est
     total_tiles_est = batch_size * head_num * n_m_tiles_est
 
-    use_splitk = False
-    use_persistent = False
-
-    if _force_use_splitk:
-        use_splitk = True
-    elif _force_use_persistent:
-        use_persistent = True
-    elif (_force_use_splitk is False) or (_force_use_persistent is False):
-        # At least one of splitk / persistent explicitly disabled — let
-        # the remaining default rules below decide.
-        pass
-    elif Lq >= 256:
-        use_persistent = False
-    elif custom_mask is None and Lq <= 128:
-        use_splitk = True
+    # Default routing: splitk for D<=128 causal (no custom_mask), basic
+    # otherwise. D>=256 always falls through to the basic path below.
+    use_splitk = (Lq <= 128) and (custom_mask is None)
 
     if use_splitk:
         _BN = 32 if BLOCK_DMODEL >= 256 else 64
@@ -2156,51 +1468,11 @@ def gluon_extend_attention_fwd(
             sm_scale, k_scale, v_scale, logit_cap,
             Lq, Lv, is_causal, max_len_extend, min_len_extend,
             sinks, xai_temperature_len, sliding_window_size,
-            BLOCK_M=_force_block_m or 64,
+            BLOCK_M=64,
             BLOCK_N=_BN,
-            num_warps=_force_num_warps or 4,
-            NUM_STAGES=_force_num_stages or 2,
-            _force_waves_per_eu=_force_waves_per_eu,
+            num_warps=4,
+            NUM_STAGES=2,
             total_prefix_len=total_prefix_len,
-            _force_prefix_mask_mode=_force_prefix_mask_mode,
-        )
-        return
-
-    if use_persistent:
-        if min_len_extend is None:
-            min_len_extend = max_len_extend
-        _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-        _wca_fn(
-            q_extend,
-            k_extend,
-            v_extend,
-            o_extend,
-            k_buffer,
-            v_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            custom_mask,
-            is_causal,
-            mask_indptr,
-            max_len_extend,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            sm_scale=sm_scale,
-            logit_cap=logit_cap,
-            skip_prefix_custom_mask=skip_prefix_custom_mask,
-            sliding_window_size=sliding_window_size,
-            sinks=sinks,
-            window_kv_offsets=window_kv_offsets,
-            xai_temperature_len=xai_temperature_len,
-            _force_block_m=_force_block_m,
-            _force_num_warps=_force_num_warps,
-            _force_num_stages=_force_num_stages,
-            _force_waves_per_eu=_force_waves_per_eu,
-            _force_block_n=_force_block_n,
-            min_len_extend=min_len_extend,
-            total_prefix_len=total_prefix_len,
-            _force_prefix_mask_mode=_force_prefix_mask_mode,
         )
         return
 
@@ -2217,17 +1489,12 @@ def gluon_extend_attention_fwd(
         BLOCK_N = 32
     else:
         BLOCK_N = 64
-    if _force_block_n is not None:
-        BLOCK_N = _force_block_n
     if _kv_is_fp8 and BLOCK_DMODEL < 256:
         BLOCK_N = 128
     EXT_BLOCK_N = BLOCK_N
     NUM_STAGES = 1
 
-    if _force_block_m is not None and _force_num_warps is not None:
-        BLOCK_M = _force_block_m
-        num_warps = _force_num_warps
-    elif BLOCK_DMODEL >= 256:
+    if BLOCK_DMODEL >= 256:
         # Caller should pass total_{prefix,extend}_len; fall back to
         # CPU-side proxies instead of a GPU reduction on miss.
         if total_prefix_len is None or total_extend_len is None:
@@ -2283,11 +1550,8 @@ def gluon_extend_attention_fwd(
         BLOCK_M = 128
         num_warps = 8
 
-    if _force_num_stages is not None:
-        NUM_STAGES = _force_num_stages
-    elif BLOCK_DMODEL >= 256:
-        if _force_block_m is not None and _force_num_warps is not None:
-            NUM_STAGES = 4 if BLOCK_M >= 128 else 2
+    if BLOCK_DMODEL >= 256:
+        pass  # NUM_STAGES already set by _select_d256_dispatch
     elif BLOCK_DMODEL == 64:
         if BLOCK_M == 256 and num_warps == 8:
             NUM_STAGES = 2
@@ -2310,23 +1574,19 @@ def gluon_extend_attention_fwd(
     if _kv_is_fp8:
         if BLOCK_DMODEL < 128:
             # D<128 FP8: only the NW=4 NS=1 serial path is wired up.
-            NUM_STAGES = _force_num_stages or 1
-            num_warps = _force_num_warps or 4
-            if _force_block_m is not None:
-                BLOCK_M = _force_block_m
-            elif batch_size >= 16 and max_len_extend <= 128:
+            NUM_STAGES = 1
+            num_warps = 4
+            if batch_size >= 16 and max_len_extend <= 128:
                 BLOCK_M = 64
             else:
                 BLOCK_M = 128
         else:
-            # D>=128 FP8 basic fallback (het / custom mask / forced).
-            # Mirrors the fast-path defaults; NS>=2 required by the
-            # 8-warp pipelined path.
-            NUM_STAGES = _force_num_stages or 1
-            num_warps = _force_num_warps if _force_num_warps is not None else 8
-            if _force_block_m is not None:
-                BLOCK_M = _force_block_m
-            elif batch_size == 1 and max_len_extend <= 256:
+            # D>=128 FP8 basic fallback (het / custom mask). NS>=2 is
+            # required by the 8-warp pipelined path below, but NS=1 is
+            # safe for BM=64 small batches.
+            NUM_STAGES = 1
+            num_warps = 8
+            if batch_size == 1 and max_len_extend <= 256:
                 BLOCK_M = 64
             else:
                 BLOCK_M = 128
@@ -2340,8 +1600,7 @@ def gluon_extend_attention_fwd(
         if BLOCK_M == 256 and NUM_STAGES in (1, 3, 4):
             NUM_STAGES = 2
     if BLOCK_DMODEL >= 256 and num_warps == 8 and NUM_STAGES == 1:
-        if _force_num_stages is None:
-            NUM_STAGES = 2
+        NUM_STAGES = 2
 
     sm_scale = sm_scale or 1.0 / math.sqrt(Lq)
     sm_scale = sm_scale * k_scale
@@ -2368,7 +1627,8 @@ def gluon_extend_attention_fwd(
     # Persistent runtime args go in as kwargs since the signature
     # interleaves constexprs between the stride block and the persistent-
     # only runtime block.
-    _kernel_fn.run(
+    _grid_full = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+    _kernel_fn[_grid_full](
         q_extend, k_extend, v_extend, o_extend,
         k_buffer, v_buffer,
         qo_indptr, kv_indptr, kv_indices,
@@ -2394,12 +1654,10 @@ def gluon_extend_attention_fwd(
         tile_done=_dummy_tile_done,
         cum_tiles_per_batch=_dummy_cum_tiles, actual_batch_size=0,
         IS_PERSISTENT=False, SPLIT_K=1, MAX_BATCH_LOG2=8, TILE_MAP_MODE=0,
-        PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
+        PREFIX_MASK_MODE=0,
         num_warps=num_warps, num_stages=1,
-        waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
+        waves_per_eu=2,
         matrix_instr_nonkdim=32,
-        grid=(batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M)),
-        warmup=False,
     )
 
 
@@ -2431,17 +1689,9 @@ def _launch_persistent_fp8(
     xai_temperature_len=-1,
     enable_mask_split=True,
     enable_prefix_unmasked=True,
-    _force_block_m=None,
-    _force_num_warps=None,
-    _force_num_stages=None,
-    _force_waves_per_eu=None,
-    _force_block_n=None,
-    _ck_v_preload=False,
     min_len_extend=None,
     SPLIT_K=1,
     total_prefix_len=None,
-    _force_prefix_mask_mode=None,
-    _force_tile_map_mode=1,  # WCA inline scan (fast, no CPU sync)
 ):
     """Launch the FP8 persistent-CTA kernel, managing split-K workspace
     and the dummy mask tensors when ``USE_CUSTOM_MASK`` is False."""
@@ -2465,40 +1715,59 @@ def _launch_persistent_fp8(
     assert q_extend.shape[1] % k_extend.shape[1] == 0
 
     BLOCK_DV = BLOCK_DMODEL
-    BLOCK_N = 128 if Lq <= 128 else (32 if BLOCK_DMODEL >= 256 else 64)
-    if _force_block_n is not None:
-        BLOCK_N = _force_block_n
     batch_size = qo_indptr.shape[0] - 1
 
     if min_len_extend is None:
         min_len_extend = max_len_extend
     head_num = q_extend.shape[1]
 
-    if _force_block_m is not None and _force_num_warps is not None:
-        BLOCK_M = _force_block_m
-        num_warps = _force_num_warps
-    elif max(BLOCK_DMODEL, BLOCK_DV) >= 256:
+    # Prefix-dominated chat-mix detection (Lq=128 only in practice, since
+    # D>=256 FP8 is unsupported): when the per-seq prefix is large enough
+    # that each tile iterates a long prefix, BM=64 NW=4 NS=1 BN=128 beats
+    # the default BM>=128 NW=8 by ~1.5-2x (no waste on short extends,
+    # better LDS/CU utilization per tile).
+    _total_pfx_fp8 = total_prefix_len if total_prefix_len is not None else 0
+    _avg_pfx_fp8 = _total_pfx_fp8 // max(1, batch_size)
+    _fp8_prefix_dominated = (
+        Lq == 128
+        and _avg_pfx_fp8 >= 4096
+        and (batch_size >= 4 or _avg_pfx_fp8 >= 16384)
+    )
+
+    if SPLIT_K > 1:
+        # Split-K reduction is only correct at the BM=128 NW=8 big-tile
+        # config; pre-selected by ``_launch_splitk_fp8`` before it dispatches
+        # here with SPLIT_K>1.
+        BLOCK_M = 128
+        BLOCK_N = 128 if Lq <= 128 else (32 if BLOCK_DMODEL >= 256 else 64)
+        num_warps = 8
+        NUM_STAGES = _FP8_DEFAULT_NS
+    elif _fp8_prefix_dominated:
         BLOCK_M = 64
+        BLOCK_N = 128
         num_warps = 4
-    elif max_len_extend <= 128:
-        BLOCK_M = 128
-        num_warps = 8
-    elif batch_size <= 4:
-        BLOCK_M = 128
-        num_warps = 8
-    elif BLOCK_DMODEL >= 128 and min_len_extend >= 64 and max_len_extend >= 256:
-        BLOCK_M = 256
-        num_warps = 8
+        NUM_STAGES = 1
     else:
-        BLOCK_M = 128
-        num_warps = 8
+        BLOCK_N = 128 if Lq <= 128 else (32 if BLOCK_DMODEL >= 256 else 64)
+        if max(BLOCK_DMODEL, BLOCK_DV) >= 256:
+            BLOCK_M = 64
+            num_warps = 4
+        elif max_len_extend <= 128:
+            BLOCK_M = 128
+            num_warps = 8
+        elif batch_size <= 4:
+            BLOCK_M = 128
+            num_warps = 8
+        elif BLOCK_DMODEL >= 128 and min_len_extend >= 64 and max_len_extend >= 256:
+            BLOCK_M = 256
+            num_warps = 8
+        else:
+            BLOCK_M = 128
+            num_warps = 8
 
-    if Lq < 128:
-        num_warps = min(num_warps, 4)
+        if Lq < 128:
+            num_warps = min(num_warps, 4)
 
-    if _force_num_stages is not None:
-        NUM_STAGES = _force_num_stages
-    else:
         NUM_STAGES = _FP8_DEFAULT_NS
 
     EXT_BLOCK_N = _FP8_DEFAULT_EXT_BN
@@ -2523,15 +1792,11 @@ def _launch_persistent_fp8(
         (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
     ) * head_num
 
-    TILE_MAP_MODE = _effective_tile_map_mode(_force_tile_map_mode)
-    if TILE_MAP_MODE == 1:
-        # WCA inline-scan: tolerates empty slots; tight bound keeps the
-        # grid small enough that the linear O(B) prologue stays cheap.
-        total_output_tiles = total_output_tiles_tight
-        cum_tiles_per_batch = _ensure_splitk_dummy(device)
-    else:
-        total_output_tiles = total_output_tiles_tight
-        cum_tiles_per_batch = _ensure_cum_tiles(qo_indptr, BLOCK_M, head_num, batch_size)
+    TILE_MAP_MODE = _effective_tile_map_mode(1)
+    # WCA inline-scan: tolerates empty slots; tight bound keeps the grid
+    # small enough that the linear O(B) prologue stays cheap.
+    total_output_tiles = total_output_tiles_tight
+    cum_tiles_per_batch = _ensure_splitk_dummy(device)
 
     if total_output_tiles == 0:
         return
@@ -2623,10 +1888,10 @@ def _launch_persistent_fp8(
         SPLIT_K=SPLIT_K,
         MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
         TILE_MAP_MODE=TILE_MAP_MODE,
-        PREFIX_MASK_MODE=_force_prefix_mask_mode or 0,
+        PREFIX_MASK_MODE=0,
         num_warps=num_warps,
         num_stages=1,
-        waves_per_eu=_force_waves_per_eu if _force_waves_per_eu is not None else 2,
+        waves_per_eu=2,
         matrix_instr_nonkdim=32,
     )
 
@@ -2640,20 +1905,19 @@ def _launch_splitk_fp8(
     Lq, Lv, is_causal, max_len_extend, min_len_extend,
     sinks, xai_temperature_len, sliding_window_size,
     BLOCK_M, BLOCK_N, num_warps, NUM_STAGES,
-    _force_waves_per_eu=None,
     total_prefix_len=None,
-    _force_prefix_mask_mode=None,
-    _force_tile_map_mode=1,  # WCA inline scan (fast, no CPU sync)
 ):
     """Pick ``SPLIT_K`` and delegate to ``_launch_persistent_fp8``; falls
     back to SPLIT_K=1 when the tiles-per-CU / pfx-per-BN heuristics
-    don't justify a multi-split reduction."""
+    don't justify a multi-split reduction.
+
+    The pre-selected ``BLOCK_M`` / ``num_warps`` / ``NUM_STAGES`` are
+    inputs to the SPLIT_K=1 tile estimate; the persistent launcher
+    re-picks tiles for SPLIT_K>1 (it must use BM=128 NW=8 NS=default).
+    """
     head_num = q_extend.shape[1]
     device = q_extend.device
     batch_size = qo_indptr.shape[0] - 1
-
-    BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
-    BLOCK_DV = BLOCK_DMODEL
 
     n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
     total_output_tiles = batch_size * head_num * n_m_tiles
@@ -2683,18 +1947,11 @@ def _launch_splitk_fp8(
             xai_temperature_len=xai_temperature_len,
             sliding_window_size=sliding_window_size,
             window_kv_offsets=window_kv_offsets,
-            _force_prefix_mask_mode=_force_prefix_mask_mode,
-            _force_tile_map_mode=_force_tile_map_mode,
+            total_prefix_len=total_prefix_len,
         )
         return
 
     SPLIT_K = _select_k_splits(total_output_tiles, num_CUs)
-
-    if max(BLOCK_DMODEL, BLOCK_DV) < 256:
-        BLOCK_M = 128
-        num_warps = 8
-        NUM_STAGES = _FP8_DEFAULT_NS
-
     enable_prefix_unmasked = is_causal
     enable_mask_split = (custom_mask is None) and is_causal
 
@@ -2713,11 +1970,6 @@ def _launch_splitk_fp8(
         window_kv_offsets=window_kv_offsets,
         enable_mask_split=enable_mask_split,
         enable_prefix_unmasked=enable_prefix_unmasked,
-        _force_block_m=BLOCK_M,
-        _force_num_warps=num_warps,
-        _force_num_stages=NUM_STAGES,
-        _force_waves_per_eu=_force_waves_per_eu,
         SPLIT_K=SPLIT_K,
-        _force_prefix_mask_mode=_force_prefix_mask_mode,
-        _force_tile_map_mode=_force_tile_map_mode,
+        total_prefix_len=total_prefix_len,
     )
