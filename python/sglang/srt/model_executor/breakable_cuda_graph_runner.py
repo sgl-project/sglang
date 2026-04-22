@@ -11,12 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Piecewise CUDA graph runner using breakable CUDA graph.
+"""Breakable CUDA graph (BCG) runner.
 
-Instead of torch.compile + FX graph splitting, this runner uses breakable CUDA
-graph to insert graph breaks at attention layers. The model forward is captured
-as a single breakable CUDA graph that automatically splits at @non_graph points
-(radix attention for dense models).
+Captures the model forward as a sequence of ``torch.cuda.CUDAGraph`` segments
+split at attention layers. Functionally parallel to the torch.compile-based
+PCG runner but does not depend on torch.compile or FX graph splitting — graph
+breaks are inserted eagerly via :func:`eager_on_graph` decorated callables
+(radix attention for dense models, mamba for hybrid models).
 """
 
 from __future__ import annotations
@@ -28,10 +29,7 @@ from typing import TYPE_CHECKING, Union
 import torch
 import tqdm
 
-from sglang.srt.compilation.piecewise_context_manager import (
-    enable_piecewise_cuda_graph,
-    set_forward_context,
-)
+from sglang.srt.compilation.piecewise_context_manager import set_forward_context
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -46,6 +44,9 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    enable_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.cuda_graph_runner import (
     get_global_graph_memory_pool,
@@ -68,14 +69,17 @@ if TYPE_CHECKING:
 
 
 class BreakableCudaGraphRunner:
-    """Piecewise CUDA graph runner using breakable CUDA graph.
+    """Breakable CUDA graph runner.
 
-    Captures the model forward as a breakable CUDA graph with graph breaks
-    at attention layers. Much simpler than the torch.compile-based approach.
+    Captures the model forward as a series of ``torch.cuda.CUDAGraph`` segments
+    with graph breaks at attention layers. Simpler than the torch.compile-based
+    PCG runner: no FX tracing, no compiled-kernel fusion — just segment-level
+    graph capture of the eager kernel stream.
     """
 
-    # Reuse replay_prepare from PiecewiseCudaGraphRunner (no inheritance needed
-    # since __init__ and capture are completely different).
+    # replay_prepare shares its buffer-population logic with the PCG runner —
+    # bind the method here without inheriting. __init__, capture, and replay
+    # diverge enough that inheritance would obscure more than it saves.
     replay_prepare = PiecewiseCudaGraphRunner.replay_prepare
 
     def __init__(self, model_runner: ModelRunner):
@@ -99,10 +103,9 @@ class BreakableCudaGraphRunner:
 
         log_info_on_rank0(
             logger,
-            f"[Breakable PCG] Capture num tokens: {self.capture_num_tokens}",
+            f"[BCG] Capture num tokens: {self.capture_num_tokens}",
         )
 
-        # Reuse parent's buffer setup
         self._init_buffers(model_runner)
 
         self.attention_layers = model_runner.attention_layers
@@ -137,7 +140,7 @@ class BreakableCudaGraphRunner:
         self.raw_num_tokens = 0
 
     def _init_buffers(self, model_runner):
-        """Initialize input buffers (shared logic with parent)."""
+        """Initialize input buffers."""
         from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
             PrefillInputBuffers,
         )
@@ -279,7 +282,7 @@ class BreakableCudaGraphRunner:
         """Capture breakable CUDA graphs for all token sizes."""
         with freeze_gc(
             self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
+        ), graph_capture() as graph_capture_context, enable_breakable_cuda_graph():
             stream = graph_capture_context.stream
             pool = get_global_graph_memory_pool()
 
@@ -296,7 +299,7 @@ class BreakableCudaGraphRunner:
                         empty_cache=False,
                     )
                     capture_range.set_description(
-                        f"[Breakable PCG] Capturing ({num_tokens=} {avail_mem=:.2f} GB)"
+                        f"[BCG] Capturing ({num_tokens=} {avail_mem=:.2f} GB)"
                     )
 
                 mem_before = torch.cuda.memory_allocated(self.device) / 1024**3
@@ -306,7 +309,7 @@ class BreakableCudaGraphRunner:
                 mem_after = torch.cuda.memory_allocated(self.device) / 1024**3
                 num_breaks = len(graph._break_fns)
                 logger.info(
-                    f"[Breakable PCG] num_tokens={num_tokens}: "
+                    f"[BCG] num_tokens={num_tokens}: "
                     f"segments={len(graph._segments)}, "
                     f"breaks={num_breaks}, "
                     f"mem_delta={mem_after - mem_before:.3f} GB, "
@@ -363,8 +366,7 @@ class BreakableCudaGraphRunner:
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
 
-        with enable_piecewise_cuda_graph():
-            # Reuse parent's buffer preparation and static forward batch construction
+        with enable_breakable_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             bs = forward_batch.batch_size
 
