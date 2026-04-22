@@ -55,7 +55,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    IS_INTEL: tl.constexpr,
+    USE_BLOCK_PTR: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -227,11 +227,33 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 b_h4 *= exp(b_gk_last4)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
-        if IS_INTEL:
-            # Use tensor pointers instead of block pointers for k, to avoid the
-            # Intel XPU Triton bug where boundary_check on column-major block
-            # pointers reads garbage (instead of 0) for out-of-bounds lanes.
-            # TODO: Always use the other branch after the bug is fixed.
+        if USE_BLOCK_PTR:
+            p_k = tl.make_block_ptr(
+                k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_h1 += tl.trans(tl.dot(b_k, b_v))
+            if K > 64:
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
+                )
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_h2 += tl.trans(tl.dot(b_k, b_v))
+            if K > 128:
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
+                )
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_h3 += tl.trans(tl.dot(b_k, b_v))
+            if K > 192:
+                p_k = tl.make_block_ptr(
+                    k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
+                )
+                b_k = tl.load(p_k, boundary_check=(0, 1))
+                b_h4 += tl.trans(tl.dot(b_k, b_v))
+        else:
+            # Block pointers are becoming deprecated in Triton.
+            # The indexing logic is the same as block pointers.
             offs_t = i_t * BT + tl.arange(0, BT)  # [BT]
             offs_k1 = tl.arange(0, 64)  # [64]
             p_k = k + offs_k1[:, None] + offs_t[None, :] * stride_k  # [64, BT]
@@ -259,30 +281,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 b_k = tl.load(
                     p_k, mask=(offs_k4[:, None] < K) & (offs_t[None, :] < T), other=0.0
                 )
-                b_h4 += tl.trans(tl.dot(b_k, b_v))
-        else:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
-            )
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h1 += tl.trans(tl.dot(b_k, b_v))
-            if K > 64:
-                p_k = tl.make_block_ptr(
-                    k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h2 += tl.trans(tl.dot(b_k, b_v))
-            if K > 128:
-                p_k = tl.make_block_ptr(
-                    k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h3 += tl.trans(tl.dot(b_k, b_v))
-            if K > 192:
-                p_k = tl.make_block_ptr(
-                    k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1))
                 b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
@@ -342,6 +340,10 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
+    # Block pointers are becoming deprecated in Triton. We use tensor pointers for Intel GPU (XPU) here
+    # to avoid any breakage of other hardware platforms.
+    use_block_ptr = not is_intel
+
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -360,14 +362,14 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        BV=(16 if is_intel else 32),  # BV=16 on Intel Xe2 to avoid GRF spilling
+        BV=(16 if is_intel else 32),  # BV=16 on Intel GPU to avoid GRF spilling
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
-        IS_INTEL=is_intel,
+        USE_BLOCK_PTR=use_block_ptr,
         num_warps=4,
         num_stages=2,
     )
