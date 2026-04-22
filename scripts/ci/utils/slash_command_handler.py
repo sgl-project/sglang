@@ -294,6 +294,7 @@ def handle_rerun_stage(
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-4-gpu-b200",
+        "stage-c-test-4-gpu-b200-small",
         "stage-c-test-4-gpu-gb200",
         "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
@@ -459,6 +460,7 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-c-test-8-gpu-h200": "8-gpu-h200",
     "stage-c-test-8-gpu-h20": "8-gpu-h20",
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
+    "stage-c-test-4-gpu-b200-small": "4-gpu-b200-low-disk",
     "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
 }
