@@ -50,8 +50,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    _use_aiter_gfx95,
-    aiter_w8a8_block_fp8_linear,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -62,7 +60,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
-    use_aiter_triton_gemm_w8a8_tuned_gfx950,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
@@ -116,6 +113,13 @@ if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+if _use_aiter:
+    from sglang.srt.layers.quantization.fp8_utils import (
+        _use_aiter_gfx95,
+        aiter_w8a8_block_fp8_linear,
+        use_aiter_triton_gemm_w8a8_tuned_gfx950,
+    )
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -506,8 +510,9 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.data = weight_scale.data
 
         if (
-            self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+            _use_aiter
             and _use_aiter_gfx95
+            and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
             n, k = layer.weight.shape
             if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
