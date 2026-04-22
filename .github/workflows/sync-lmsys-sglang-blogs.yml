@@ -23,17 +23,18 @@ jobs:
       - name: Sync blog cards
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/update_lmsys_sglang_blogs.py
+        run: python docs_new/scripts/update_lmsys_sglang_blogs.py
 
       - name: Commit and push changes
         run: |
-          if git diff --quiet; then
-            echo "No changes to commit."
+          if git diff --quiet -- docs_new/index.mdx; then
+            echo "No blog card changes to commit."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add index.mdx src/generated/lmsys_sglang_blogs.json
+          git add docs_new/index.mdx
+          git diff --cached --quiet && exit 0
           git commit -m "docs: sync LMSYS SGLang blog cards"
           git push
