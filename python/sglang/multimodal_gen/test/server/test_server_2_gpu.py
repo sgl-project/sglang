@@ -6,14 +6,12 @@ from __future__ import annotations
 
 import pytest
 
+from sglang.multimodal_gen.test.server.gpu_cases import TWO_GPU_CASES
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
     diffusion_server,
 )
-from sglang.multimodal_gen.test.server.testcase_configs import (
-    TWO_GPU_CASES,
-    DiffusionTestCase,
-)
+from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 
 class TestDiffusionServerTwoGpu(DiffusionServerBase):

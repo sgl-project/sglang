@@ -294,6 +294,7 @@ def handle_rerun_stage(
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-4-gpu-b200",
+        "stage-c-test-4-gpu-b200-small",
         "stage-c-test-4-gpu-gb200",
         "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
@@ -449,6 +450,7 @@ def handle_rerun_stage(
 
 
 CUDA_SUITE_TO_RUNNER = {
+    # PR test suites
     "stage-a-test-1-gpu-small": "1-gpu-5090",
     "stage-a-test-cpu": "ubuntu-latest",
     "stage-b-test-1-gpu-small": "1-gpu-5090",
@@ -459,8 +461,25 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-c-test-8-gpu-h200": "8-gpu-h200",
     "stage-c-test-8-gpu-h20": "8-gpu-h20",
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
+    "stage-c-test-4-gpu-b200-small": "4-gpu-b200-low-disk",
     "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
+    # Nightly test suites (NVIDIA)
+    "nightly-1-gpu": "1-gpu-h100",
+    "nightly-4-gpu": "4-gpu-h100",
+    "nightly-4-gpu-b200": "4-gpu-b200",
+    "nightly-8-gpu-common": "8-gpu-h200",
+    "nightly-8-gpu-h200": "8-gpu-h200",
+    "nightly-8-gpu-h20": "8-gpu-h20",
+    "nightly-8-gpu-b200": "8-gpu-b200",
+    "nightly-eval-text-2-gpu": "2-gpu-h100",
+    "nightly-eval-vlm-2-gpu": "2-gpu-h100",
+    "nightly-perf-text-2-gpu": "2-gpu-h100",
+    "nightly-perf-vlm-2-gpu": "2-gpu-h100",
+    "nightly-kernel-1-gpu": "1-gpu-h100",
+    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
+    # Weekly test suites
+    "weekly-8-gpu-h200": "8-gpu-h200",
 }
 
 DEEPEP_SUITES = {
