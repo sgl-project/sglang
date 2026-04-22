@@ -43,6 +43,34 @@ def get_scalar_types():
 ScalarType, scalar_types = get_scalar_types()
 
 
+def _module_path_match(ignored: str, prefix: str) -> bool:
+    # Match on dotted module-path boundaries so that `mlp.gate` does NOT
+    # match `mlp.gate_up_proj`. Needed for quant configs (e.g. Qwen3.6-FP8)
+    # whose `modules_to_not_convert` lists MoE-template names like `mlp.gate`
+    # that collide with fused dense MLP names by plain substring.
+    if ignored == prefix:
+        return True
+    if prefix.startswith(ignored + "."):
+        return True
+    return ("." + ignored + ".") in ("." + prefix + ".")
+
+
+# Known fused-linear -> shard names. Used as a fallback when the quant
+# config doesn't ship packed_modules_mapping (typical for HF FP8 configs).
+# Lets is_layer_skipped treat a prefix like model.X.mlp.gate_up_proj as
+# (gate_proj, up_proj) shards instead of plain-substring, so that
+# modules_to_not_convert entries that happen to be a strict substring of a
+# fused name (e.g. Qwen3.6's cruft "mlp.gate" vs "mlp.gate_up_proj", or
+# Qwen3.5's real "linear_attn.in_proj_a" vs fused "linear_attn.in_proj_ba")
+# resolve correctly.
+_FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+}
+
+
 def is_layer_skipped(
     prefix: str,
     ignored_layers: List[str],
@@ -56,16 +84,22 @@ def is_layer_skipped(
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
-    if proj_name in fused_mapping:
+    effective_fused = (
+        fused_mapping
+        if proj_name in fused_mapping
+        else _FALLBACK_FUSED_SHARDS
+    )
+    if proj_name in effective_fused:
         shard_prefixes = [
             prefix.replace(proj_name, shard_proj_name)
-            for shard_proj_name in fused_mapping[proj_name]
+            for shard_proj_name in effective_fused[proj_name]
         ]
 
         is_skipped = None
         for shard_prefix in shard_prefixes:
             is_shard_skipped = any(
-                ignored in shard_prefix for ignored in ignored_layers
+                _module_path_match(ignored, shard_prefix)
+                for ignored in ignored_layers
             )
 
             if is_skipped is None:
@@ -77,7 +111,9 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = any(ignored in prefix for ignored in ignored_layers)
+        is_skipped = any(
+            _module_path_match(ignored, prefix) for ignored in ignored_layers
+        )
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")
