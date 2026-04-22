@@ -93,12 +93,9 @@ def apply_flashinfer_rope_qk_inplace(
 
     if flashinfer_apply_rope_inplace is None:
         # Triton fallback for AMD/ROCm where FlashInfer is not available
-        import warnings
 
-        warnings.warn(
-            "FlashInfer not available, using Triton fallback for RoPE",
-            stacklevel=2,
-        )
+        _maybe_warn_about_missing_flashinfer()
+
         half_size = cos_sin_cache.shape[-1] // 2
         if positions is None:
             cos = cos_sin_cache[:seqlen, :half_size].to(q.dtype)
@@ -141,3 +138,14 @@ def apply_flashinfer_rope_qk_inplace(
         is_neox=is_neox,
     )
     return q_flat.view(bsz, seqlen, nheads, d), k_flat.view(bsz, seqlen, nheads, d)
+
+
+@torch.compiler.assume_constant_result
+def _maybe_warn_about_missing_flashinfer():
+    import warnings
+
+    warnings.warn(
+        "FlashInfer not available, using Triton fallback for RoPE",
+        stacklevel=2,
+    )
+    return None
