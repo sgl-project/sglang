@@ -163,10 +163,7 @@ WHISPER_AUTODETECT_TS_REGEX = (
 # WHISPER_LANG_TOKEN_CODES so a bogus 2-or-3-letter code can't sneak through
 # either.
 _FUSED_PREFIX_RE = re.compile(
-    r"^"
-    + _LANG_PREFIX
-    + r"<\|transcribe\|>"
-    + r"(?:<\|notimestamps\|>|<\|0\.00\|>)"
+    r"^" + _LANG_PREFIX + r"<\|transcribe\|>" + r"(?:<\|notimestamps\|>|<\|0\.00\|>)"
 )
 
 # Fixed Whisper control tokens (see transformers.models.whisper vocab).

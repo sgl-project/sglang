@@ -50,17 +50,17 @@ async def whisper_autodetect(
     variants here — otherwise the first ``language=None +
     timestamp_granularities`` request would still pay the full spike.
     """
-    from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
-        WHISPER_AUTODETECT_REGEX,
-        WHISPER_AUTODETECT_TS_REGEX,
-    )
-
     # A short silent audio encoded as base64 WAV (0.1s, 16kHz, mono) —
     # soundfile produces the WAV header + PCM data from a list of floats.
     import base64
     import io
 
     import soundfile as sf
+
+    from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
+        WHISPER_AUTODETECT_REGEX,
+        WHISPER_AUTODETECT_TS_REGEX,
+    )
 
     sr, dur = 16000, 0.1
     n = int(sr * dur)
