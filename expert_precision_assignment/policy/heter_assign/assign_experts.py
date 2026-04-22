@@ -185,6 +185,7 @@ def _write_outputs(
     num_layers: int,
     ranking_policy: str = "sensitivity",
     fo_threshold: dict | None = None,
+    expert_importance: Dict[int, List[float]] | None = None,
 ) -> Tuple[Path, Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -196,6 +197,17 @@ def _write_outputs(
     int4_path = out_dir / "int4_only_experts.json"
     with open(int4_path, "w") as f:
         json.dump(by_layer, f, indent=2)
+
+    importance_path: Path | None = None
+    if expert_importance is not None:
+        importance_path = out_dir / "expert_importance.json"
+        # Keep keys as strings so the runtime loader can index by str(layer_id).
+        by_layer_str = {
+            str(L): [float(v) for v in row]
+            for L, row in expert_importance.items()
+        }
+        with open(importance_path, "w") as f:
+            json.dump(by_layer_str, f, indent=2)
 
     heter_config = {
         "groups": [
@@ -211,6 +223,8 @@ def _write_outputs(
         "policy_params": {"threshold": 128},
         "int4_only_experts_file": str(int4_path.resolve()),
     }
+    if importance_path is not None:
+        heter_config["expert_importance_file"] = str(importance_path.resolve())
     config_path = out_dir / "heter_config.json"
     with open(config_path, "w") as f:
         json.dump(heter_config, f, indent=2)

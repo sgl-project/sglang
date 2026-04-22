@@ -29,6 +29,7 @@ HeterDispatchPolicy = _policy_mod.HeterDispatchPolicy
 ExpertLoadHeterDispatch = _policy_mod.ExpertLoadHeterDispatch
 ConfidenceThresholdHeterDispatch = _policy_mod.ConfidenceThresholdHeterDispatch
 TotalWeightHeterDispatch = _policy_mod.TotalWeightHeterDispatch
+HessianWeightedRoutingWeightsDispatch = _policy_mod.HessianWeightedRoutingWeightsDispatch
 RandomHeterDispatch = _policy_mod.RandomHeterDispatch
 ExpertBatchGatedHeterDispatch = _policy_mod.ExpertBatchGatedHeterDispatch
 create_policy = _policy_mod.create_policy
@@ -228,6 +229,82 @@ class TestTotalWeightHeterDispatch:
         experts_g1, _ = dispatches[1]
         mask_expert0 = topk_ids == 0
         assert (experts_g1[mask_expert0] == 0).all()
+
+
+# --- HessianWeightedRoutingWeightsDispatch ---------------------------------
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestHessianWeightedRoutingWeightsDispatch:
+    """score(E) = importance(E) × sum(scales for E)."""
+
+    def _make(self, num_experts=8, importance=None, ratios=(0.75, 0.25)):
+        if importance is None:
+            importance = torch.ones(num_experts, device="cuda")
+        return HessianWeightedRoutingWeightsDispatch(
+            num_experts=num_experts,
+            group_size_ratios=list(ratios),
+            importance=importance,
+            device=torch.device("cuda"),
+        )
+
+    def test_identity_importance_matches_total_weight(self):
+        # Uniform importance=1 reduces to TotalWeightHeterDispatch.
+        topk_ids = torch.tensor(
+            [[0, 1], [0, 2], [0, 3], [0, 4], [5, 6]], device="cuda"
+        )
+        topk_weights = torch.rand(5, 2, device="cuda")
+        p_ref = TotalWeightHeterDispatch(
+            num_experts=8, group_size_ratios=[0.75, 0.25],
+            device=torch.device("cuda"),
+        )
+        p = self._make()
+        g_ref = p_ref._assign(topk_ids, topk_weights)
+        g_new = p._assign(topk_ids, topk_weights)
+        assert torch.equal(g_ref, g_new)
+
+    def test_zero_importance_expert_never_in_bf16(self):
+        # Expert 0 dominates routing, but importance=0 -> must stay out of BF16.
+        imp = torch.ones(8, device="cuda")
+        imp[0] = 0.0
+        p = self._make(importance=imp)
+        topk_ids = torch.tensor(
+            [[0, 0], [0, 0], [0, 0], [0, 1], [2, 3]], device="cuda"
+        )
+        topk_weights = torch.ones(5, 2, device="cuda")
+        d = p.dispatch(topk_ids, topk_weights)
+        experts_g1, _ = d[1]  # BF16 group
+        mask_e0 = topk_ids == 0
+        # Expert 0 slots in BF16 group must all be sentineled (default -1).
+        assert (experts_g1[mask_e0] == -1).all()
+
+    def test_importance_breaks_tie_on_equal_weight(self):
+        # Two experts with equal routing weight: higher importance wins BF16.
+        imp = torch.zeros(4, device="cuda")
+        imp[1] = 10.0  # winner
+        imp[2] = 1.0   # loser
+        p = self._make(num_experts=4, importance=imp, ratios=(0.75, 0.25))
+        # Experts 1 and 2 both get one slot of weight 1.0; 0 and 3 none.
+        topk_ids = torch.tensor([[1, 2]], device="cuda")
+        topk_weights = torch.ones(1, 2, device="cuda")
+        g = p._assign(topk_ids, topk_weights)
+        # k_high = round(4*0.25) = 1, so top-1 by score goes BF16.
+        assert g[1].item() == 1
+        assert g[2].item() == 0
+
+    def test_fallback_without_signals(self):
+        p = self._make()
+        result = p._assign(None, None)
+        assert result.shape == (8,)
+
+    def test_shape_assertion(self):
+        with pytest.raises(AssertionError):
+            HessianWeightedRoutingWeightsDispatch(
+                num_experts=8,
+                group_size_ratios=[0.75, 0.25],
+                importance=torch.ones(4, device="cuda"),  # wrong length
+                device=torch.device("cuda"),
+            )
 
 
 # --- ExpertBatchGatedHeterDispatch -------------------------------------------
@@ -471,6 +548,14 @@ class TestCreatePolicy:
             group_size_ratios=[0.75, 0.25], device=torch.device("cuda"),
         )
         assert isinstance(p, TotalWeightHeterDispatch)
+
+    def test_create_hessian_weighted_routing_weights(self):
+        p = create_policy(
+            "hessian_weighted_routing_weights", num_experts=8,
+            group_size_ratios=[0.75, 0.25], device=torch.device("cuda"),
+            importance=torch.ones(8, device="cuda"),
+        )
+        assert isinstance(p, HessianWeightedRoutingWeightsDispatch)
 
     def test_unknown_policy(self):
         with pytest.raises(ValueError, match="Unknown heter policy"):

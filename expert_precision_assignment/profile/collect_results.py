@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 MC_VARIANT_RE = re.compile(
-    r"^mc(?P<mc>\d+)_(?P<variant>(hot\d+|thr\d+))"
+    r"^mc(?P<mc>\d+)_(?P<variant>(hot\d+|thr\d+|hess\d+))"
     r"(?:_n\d+)?\.(jsonl|json)$"
 )
 
@@ -47,7 +47,13 @@ LEADING = ["mc", "variant", "schema", "task"]
 
 
 def _variant_sort_key(v: str) -> tuple:
-    return (0, int(v[3:])) if v.startswith("hot") else (1, int(v[3:]))
+    if v.startswith("hot"):
+        return (0, int(v[3:]))
+    if v.startswith("thr"):
+        return (1, int(v[3:]))
+    if v.startswith("hess"):
+        return (2, int(v[4:]))
+    return (3, 0)
 
 
 def _read_first_record(path: Path) -> Dict[str, Any] | None:
