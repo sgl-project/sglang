@@ -191,38 +191,6 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
   }
 }
 
-// out = input + input2 * scale
-template <typename scalar_t>
-inline void add_mul_stub(
-    scalar_t* __restrict__ out,
-    const float* __restrict__ input,
-    const scalar_t* __restrict__ input2,
-    float scale,
-    int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec s_vec = fVec(scale);
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec x0 = fVec::loadu(input + d);
-    fVec x1 = fVec::loadu(input + d + fVec::size());
-
-    bVec y_bvec = bVec::loadu(input2 + d);
-    fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
-
-    x0 = x0 + y0 * s_vec;
-    x1 = x1 + y1 * s_vec;
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] + float(input2[d]) * scale);
-  }
-}
-
 // input = input + input2
 inline void add_bias_stub(float* __restrict__ input, const float* __restrict__ input2, int64_t size) {
   using fVec = at::vec::Vectorized<float>;
@@ -259,40 +227,6 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict
   }
   for (; d < size; ++d) {
     out[d] = static_cast<scalar_t>(input[d] * weight);
-  }
-}
-
-// out = input + input2 * scale
-template <typename scalar_t>
-inline void add_mul_stub(
-    scalar_t* __restrict__ out,
-    const scalar_t* __restrict__ input,
-    const scalar_t* __restrict__ input2,
-    float scale,
-    int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec s_vec = fVec(scale);
-
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    bVec x_bvec = bVec::loadu(input + d);
-    fVec x0, x1;
-    std::tie(x0, x1) = at::vec::convert_to_float(x_bvec);
-
-    bVec y_bvec = bVec::loadu(input2 + d);
-    fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
-
-    x0 = x0 + y0 * s_vec;
-    x1 = x1 + y1 * s_vec;
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] + float(input2[d]) * scale);
   }
 }
 
