@@ -849,15 +849,22 @@ class PiecewiseCudaGraphRunner:
                     ):
                         mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
                     return LogitsProcessorOutput(
-                        next_token_logits=output.next_token_logits[
-                            : self.raw_num_tokens
-                        ],
+                        next_token_logits=(
+                            output.next_token_logits[: self.raw_num_tokens]
+                            if output.next_token_logits is not None
+                            else None
+                        ),
                         hidden_states=(
                             output.hidden_states[: self.raw_num_tokens]
                             if output.hidden_states is not None
                             else None
                         ),
                         mm_input_embeds=mm_input_embeds,
+                        next_token_ids_shortcut=(
+                            output.next_token_ids_shortcut[: self.raw_num_tokens]
+                            if output.next_token_ids_shortcut is not None
+                            else None
+                        ),
                     )
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output

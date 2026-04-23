@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -25,6 +26,7 @@ from triton.language.extra import libdevice
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.environ import envs
@@ -56,11 +58,93 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    is_hip,
+    is_npu,
+    use_intel_amx_backend,
+)
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_hip = is_hip()
+
+# Greedy AG+argmax shortcut (opt-in, AMD/ROCm only). Replaces the full-vocab
+# LM-head all-gather + full-vocab torch.argmax with a per-rank local argmax
+# followed by a tiny all-gather of (max_value, local_index) pairs and a global
+# pick. Validated and measured only on AMD MI355X under HIP graph replay; the
+# runtime gate in `_try_greedy_argmax_shortcut` short-circuits on non-HIP
+# platforms to preserve existing CUDA/NPU/CPU behavior bit-for-bit.
+SGLANG_AITER_AG_ARGMAX_SHORTCUT = get_bool_env_var(
+    "SGLANG_AITER_AG_ARGMAX_SHORTCUT", default="false"
+)
+# Minimum batch size (M = pruned_states.shape[0]) at which the shortcut is
+# taken. Below this the baseline AG+argmax is cheaper than the shortcut's
+# constant ~40 µs floor under HIP graph replay. Default 2 matches the
+# measured crossover on MI355X / TP=8 / Qwen3.5 FP8 LM-head shape; override
+# per-deployment if a different model/TP shifts the curve.
+SGLANG_AITER_AG_ARGMAX_SHORTCUT_MIN_M = int(
+    os.environ.get("SGLANG_AITER_AG_ARGMAX_SHORTCUT_MIN_M", "2")
+)
+
+
+def _fused_greedy_argmax_across_tp(local_logits: torch.Tensor) -> torch.Tensor:
+    """
+    Compute ``torch.argmax(tensor_model_parallel_all_gather(local_logits), dim=-1)``
+    without materializing the full-vocab logits on any rank.
+
+    Each rank computes its local (max_value, argmax_index_in_shard) and participates
+    in a single all-gather of a [M, 2] int32 tensor (fp32 max-value reinterpreted as
+    int32 bits in column 0, int32 argmax index in column 1). All ranks then pick the
+    global winner locally.
+
+    Tie-break matches ``torch.argmax`` semantics on the concatenation
+    ``[rank0_shard | rank1_shard | ...]``: the smallest flat index wins on ties,
+    because (1) ``torch.max``/``torch.argmax`` return the first occurrence inside a
+    shard, and (2) ``torch.argmax`` over [M, TP] picks the smallest rank on ties.
+
+    Args:
+        local_logits: [M, V_local] on the current rank. ``V_local`` must equal
+            ``vocab_size // tp_world_size`` (no intra-shard padding); callers must
+            gate on that condition before invoking this helper.
+
+    Returns:
+        [M] int64 tensor of global token ids, matching ``torch.argmax`` output.
+    """
+    tp_group = get_tp_group()
+    tp_world = tp_group.world_size
+    v_local = local_logits.shape[-1]
+    m = local_logits.shape[0]
+
+    local_max_val, local_arg = local_logits.max(dim=-1)
+
+    # Pack (max_value_fp32, local_arg_int32-as-fp32-bits) into one [M, 2] fp32
+    # tensor. We keep the AG payload dtype as fp32 so that the aiter custom
+    # all-gather (which only accepts fp16/bf16/fp32) can handle it; bit-copy
+    # semantics make reinterpret safe on both ends.
+    val_f32 = local_max_val.to(torch.float32)
+    idx_i32 = local_arg.to(torch.int32)
+    local_pair = torch.stack(
+        [val_f32, idx_i32.view(torch.float32)], dim=-1
+    ).contiguous()
+
+    gathered = torch.empty(
+        (tp_world, m, 2), dtype=torch.float32, device=local_logits.device
+    )
+    tp_group.all_gather_into_tensor(gathered.view(tp_world * m, 2), local_pair)
+
+    vals_f32 = gathered[..., 0]
+    idxs_i32 = gathered[..., 1].view(torch.int32)
+    vals_f32 = vals_f32.transpose(0, 1).contiguous()
+    idxs_i32 = idxs_i32.transpose(0, 1).contiguous()
+
+    winner_rank = vals_f32.argmax(dim=-1)
+    winner_local_idx = idxs_i32.gather(1, winner_rank.unsqueeze(-1)).squeeze(-1)
+    global_idx = winner_rank.to(torch.int64) * v_local + winner_local_idx.to(
+        torch.int64
+    )
+    return global_idx
 
 
 @dataclasses.dataclass
@@ -107,6 +191,13 @@ class LogitsProcessorOutput:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    ## Part 6: Greedy AG+argmax shortcut (opt-in via SGLANG_AITER_AG_ARGMAX_SHORTCUT).
+    # When set, `next_token_logits` is None and the Sampler should use these
+    # precomputed greedy-argmax token ids directly, skipping the full-vocab AG
+    # + full-vocab argmax that would otherwise run on the gathered logits.
+    # Shape: [num_seqs], dtype int64 (matches torch.argmax semantics).
+    next_token_ids_shortcut: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -150,6 +241,13 @@ class LogitsMetadata:
     is_prefill_only: bool = False
 
     mm_input_embeds: Optional[torch.Tensor] = None
+
+    # Sampling/logprob info peeked from ForwardBatch; used to gate the
+    # greedy AG+argmax shortcut inside LogitsProcessor.forward (opt-in via
+    # SGLANG_AITER_AG_ARGMAX_SHORTCUT). Kept as `Any` to avoid a circular
+    # import on SamplingBatchInfo here; only attribute accesses are used.
+    sampling_info: Optional[Any] = None
+    sampler_return_logprob: bool = False
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -202,6 +300,8 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            sampling_info=forward_batch.sampling_info,
+            sampler_return_logprob=forward_batch.return_logprob,
         )
 
     def compute_dp_attention_metadata(self):
@@ -339,6 +439,23 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            # Greedy AG+argmax shortcut: when the batch is all-greedy, we can
+            # skip both the full-vocab LM-head all-gather and the full-vocab
+            # torch.argmax in the Sampler, and instead do a per-rank local
+            # argmax plus a tiny all-gather of (max_val, local_idx) pairs.
+            # Returns precomputed token ids on the output; Sampler picks them
+            # up and skips its own argmax path.
+            shortcut_ids = self._try_greedy_argmax_shortcut(
+                pruned_states, lm_head, logits_metadata, sample_indices
+            )
+            if shortcut_ids is not None:
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                    next_token_ids_shortcut=shortcut_ids,
+                )
+
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -883,6 +1000,120 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def _try_greedy_argmax_shortcut(
+        self,
+        pruned_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        sample_indices: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Fast path for decode when all requests use greedy sampling.
+
+        Skips the full-vocab LM-head all-gather and the full-vocab
+        ``torch.argmax`` in the Sampler, replacing them with a per-rank local
+        argmax + a tiny all-gather of (val, idx) pairs. Returns the chosen
+        token ids (shape ``[num_seqs]`` int64) on success, or ``None`` if any
+        eligibility check fails (callers must then fall back to the standard
+        AG path). See ``_fused_greedy_argmax_across_tp`` for details.
+        """
+        if not SGLANG_AITER_AG_ARGMAX_SHORTCUT:
+            return None
+        # AMD/ROCm only — validated on MI355X; other platforms fall through to
+        # the standard AG+argmax path so behavior is bitwise-unchanged.
+        if not _is_hip:
+            return None
+        if not self.do_tensor_parallel_all_gather:
+            return None
+        if self.use_attn_tp_group or self.do_tensor_parallel_all_gather_dp_attn:
+            return None
+        # Batch-size guard. The shortcut has a constant ~40 µs floor under HIP
+        # graph replay (measured on MI355X / TP=8 / Qwen3.5 FP8 LM-head shape,
+        # see benchmark/kernels/all_gather/benchmark_ag_argmax_shortcut.py).
+        # The baseline AG+argmax is cheaper than that floor only at M=1 (~22 µs
+        # under graph), so we fall back for single-row batches. For M>=2 the
+        # shortcut is strictly faster (2.3x at M=2 up to 11x at M=256).
+        # Note: at graph capture time M is the captured/padded batch size, so
+        # this gate specializes captured graphs for bs>=2 only.
+        if pruned_states.shape[0] < SGLANG_AITER_AG_ARGMAX_SHORTCUT_MIN_M:
+            return None
+        if self.final_logit_softcapping is not None:
+            return None
+        if self.return_full_logits or self.use_fp32_lm_head:
+            return None
+        if sample_indices is not None:
+            return None
+        if not logits_metadata.forward_mode.is_decode_or_idle():
+            return None
+        if logits_metadata.mm_input_embeds is not None:
+            return None
+        # `next_token_logits_buffer` is always allocated under CUDA-graph
+        # capture; we just leave it unused when the shortcut fires.
+        if logits_metadata.sampler_return_logprob:
+            return None
+
+        # Capture-time override: under CUDA-graph capture we don't have a real
+        # SamplingBatchInfo (the capture ForwardBatch leaves sampling_info
+        # unset). The env flag is an explicit opt-in that asserts "serve this
+        # engine in all-greedy mode"; in that case we bake the shortcut into
+        # the captured graph and skip the runtime sampling-info checks below.
+        # At replay the graph always runs the shortcut regardless of the live
+        # sampling mode, so callers must not enable the flag for servers that
+        # also serve top-p / temperature / grammar workloads on captured shapes.
+        is_capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if not is_capturing:
+            sampling_info = logits_metadata.sampling_info
+            if sampling_info is None or not getattr(
+                sampling_info, "is_all_greedy", False
+            ):
+                return None
+            if getattr(sampling_info, "logit_bias", None) is not None:
+                return None
+            if getattr(sampling_info, "vocab_mask", None) is not None:
+                return None
+            if getattr(sampling_info, "grammars", None):
+                return None
+            if getattr(sampling_info, "has_custom_logit_processor", False):
+                return None
+            penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+            if penalizer is not None and getattr(penalizer, "is_required", False):
+                return None
+
+        # lm_head must be a plain column-parallel linear without LoRA/AMX/GGUF
+        # paths, because we bypass `_compute_lm_head`'s special cases here.
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            return None
+        if not hasattr(lm_head, "weight"):
+            return None
+        if use_intel_amx_backend(lm_head):
+            return None
+        if get_global_server_args().rl_on_policy_target is not None:
+            return None
+
+        tp_world = get_tensor_model_parallel_world_size()
+        # Require exact divisibility so that local shard indices are global
+        # indices modulo V_local, with no intra-shard padding to mask. This
+        # holds for Qwen3.5 FP8 (vocab 248320, TP=8 → V_local 31040) and is a
+        # strict gate; non-divisible vocabs fall back to the standard path.
+        if tp_world <= 1 or self.vocab_size % tp_world != 0:
+            return None
+        v_local = self.vocab_size // tp_world
+        if lm_head.weight.shape[0] != v_local:
+            # Padded lm_head (V_padded > V_actual / TP): the trailing rows on
+            # the last rank may produce winning argmax values. Skip.
+            return None
+
+        local_logits = torch.matmul(
+            pruned_states.to(lm_head.weight.dtype), lm_head.weight.T
+        )
+        if self.logit_scale is not None:
+            # argmax is invariant under positive scaling; still apply for
+            # bitwise equivalence with the baseline when logit_scale != 1.
+            local_logits.mul_(self.logit_scale)
+
+        return _fused_greedy_argmax_across_tp(local_logits)
 
     def _compute_lm_head(
         self,
