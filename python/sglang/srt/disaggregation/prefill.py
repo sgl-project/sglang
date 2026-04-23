@@ -398,6 +398,15 @@ class SchedulerDisaggregationPrefillMixin:
         if avg_tokens < min_tokens:
             return 0
 
+        # Safety: fall back to normal path for unsupported configurations.
+        # Mamba/SWA/NSA state transfer requires is_last_chunk dispatch which
+        # layer-pipelined mode does not yet support per-layer.
+        kv_manager = getattr(self, "disagg_prefill_kv_manager", None)
+        if kv_manager is not None:
+            state_type = getattr(kv_manager.kv_args, "state_type", "none")
+            if state_type != "none":
+                return 0
+
         # If user explicitly set group_size, respect it (backward compatible)
         explicit = os.environ.get("SGLANG_PIPELINE_GROUP_SIZE")
         if explicit is not None:
