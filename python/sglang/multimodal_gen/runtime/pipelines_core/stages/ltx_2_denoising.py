@@ -805,6 +805,8 @@ class LTX2DenoisingStage(DenoisingStage):
                     "legacy_ltx23_one_stage_semantics": False,
                 }
             )
+        if self._should_use_ltx23_hq_legacy_ff_semantics(self.server_args):
+            kwargs["_sglang_use_ltx23_hq_legacy_ff"] = True
         return kwargs
 
     def _build_ltx2_model_kwargs(
@@ -905,6 +907,10 @@ class LTX2DenoisingStage(DenoisingStage):
 
     @staticmethod
     def _should_use_native_hq_res2s_sde_noise(server_args: ServerArgs) -> bool:
+        return server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
+
+    @staticmethod
+    def _should_use_ltx23_hq_legacy_ff_semantics(server_args: ServerArgs) -> bool:
         return server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
 
     def _prepare_denoising_loop(
