@@ -1,6 +1,6 @@
 # Speculative Decoding
 
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, DFLASH, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
 
 ## Summary
 
@@ -12,6 +12,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
   - [EAGLE-2 Decoding via Frequency-Ranked Speculative Sampling](#eagle-2-decoding-via-frequency-ranked-speculative-sampling)
   - [EAGLE-3 Decoding](#eagle-3-decoding)
 - [Multi Token Prediction](#multi-token-prediction)
+- [DFlash Decoding](#dflash-decoding)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -39,6 +40,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 | EAGLE-2 + FR-Spec | Same as EAGLE-2 + token subset | Typically yes | Add `--speculative-token-map ...` | Reduces `lm_head` overhead with high-frequency token vocab |
 | EAGLE-3 | EAGLE3 draft model | Yes | `--speculative-algorithm EAGLE3` + `--speculative-draft-model-path ...` | Best throughput in the benchmark below |
 | MTP | Built-in multi-token heads (model-specific) | Often no | See **Multi Token Prediction** section | Uses speculative workflow; draft path may be auto-handled for some models |
+| DFLASH | DFlash draft model (linear block verification) | Yes | `--speculative-algorithm DFLASH` + `--speculative-draft-model-path ...` | No DP attention; `pp_size == 1`; overlap scheduler disabled |
 | STANDALONE | Smaller draft LLM (token-level) | Yes | `--speculative-algorithm STANDALONE` + `--speculative-draft-model-path ...` | Does **not** support `--enable-dp-attention` |
 | SpecV2 (experimental) | V2 workers + overlap scheduler | N/A | `SGLANG_ENABLE_SPEC_V2=True` | Only supports `--speculative-eagle-topk 1`; applies to `EAGLE`, `EAGLE3`, `STANDALONE` |
 | NGRAM | Ngram cache from previous tokens | No | `--speculative-algorithm NGRAM` | CUDA-only; no `--enable-dp-attention`; disables overlap scheduler & mixed chunked prefill |
@@ -281,6 +283,47 @@ print(response.json())
 
 ---
 
+## DFlash Decoding
+
+SGLang also supports **DFLASH** speculative decoding using a dedicated draft model checkpoint. Compared with EAGLE-style tree verification, DFLASH verifies a linear draft block and is configured around a block size / draft window. This path is useful when the target model has a matching DFlash draft checkpoint, such as `meta-llama/Llama-3.1-8B-Instruct` with `z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat`.
+
+Relevant parameters:
+
+| Parameter | Description | Default |
+|---|---|---|
+| `--speculative-draft-model-path` | Required DFlash draft model path/weights. | `None` |
+| `--speculative-num-draft-tokens` | DFlash verify block size. | Inferred from draft config, otherwise `16` |
+| `--speculative-dflash-block-size` | Alias of `--speculative-num-draft-tokens` for DFlash. | `None` |
+| `--speculative-dflash-draft-window-size` | Draft KV sliding-window size. Must be `>= block_size` when set. | `None` |
+
+```bash
+python3 -m sglang.launch_server \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat
+```
+
+**Send a request:**
+
+```python
+import openai
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    messages=[
+        {"role": "user", "content": "Write a quicksort implementation in Python."},
+    ],
+    temperature=0,
+    max_tokens=128,
+)
+
+print(response.choices[0].message.content)
+```
+
+---
+
 ## Standalone Speculative Decoding (Small Draft Model)
 
 Besides EAGLE/MTP, SGLang also supports **token-level speculative decoding** using a smaller **draft model**. Enable it with `--speculative-algorithm STANDALONE` and provide a draft model via `--speculative-draft-model-path`.
@@ -443,13 +486,15 @@ Below is a comprehensive list of all speculative decoding parameters available i
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
+| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `DFLASH`, `EAGLE`, `EAGLE3`, `STANDALONE`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
 | `--speculative-draft-model-path` | `str` | `None` | Path to the draft model weights |
 | `--speculative-draft-model-revision` | `str` | `None` | Specific revision/commit of the draft model (`"main"` is auto-used when draft path is set and revision is omitted) |
 | `--speculative-draft-load-format` | `str` | `None` | Load format for draft model weights |
 | `--speculative-num-steps` | `int` | `None` (auto-chosen when omitted) | Autoregressive drafting depth |
 | `--speculative-eagle-topk` | `int` | `None` (auto-chosen when omitted) | Branching factor per drafting step |
 | `--speculative-num-draft-tokens` | `int` | `None` (auto-chosen when omitted) | Maximum number of draft tokens for verification |
+| `--speculative-dflash-block-size` | `int` | `None` | DFlash-only alias of `--speculative-num-draft-tokens` |
+| `--speculative-dflash-draft-window-size` | `int` | `None` | DFlash-only draft KV sliding-window size |
 | `--speculative-accept-threshold-single` | `float` | `1.0` | Single-token acceptance threshold |
 | `--speculative-accept-threshold-acc` | `float` | `1.0` | Accumulated acceptance threshold |
 | `--speculative-token-map` | `str` | `None` | Path to FR-Spec high-frequency token map |
