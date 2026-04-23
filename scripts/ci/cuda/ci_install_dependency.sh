@@ -282,6 +282,25 @@ FLASHINFER_UNINSTALL="flashinfer-python"
 $PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
 $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 
+# `uv pip uninstall flashinfer-python` leaves the flashinfer/data/ subdir
+# behind when flashinfer-cubin is kept (cubin files sit under that tree),
+# which breaks the next `uv pip install -e python[...]` with
+# "failed to create directory flashinfer/data/: File exists (os error 17)".
+# See https://github.com/sgl-project/sglang/actions/runs/24634237642/job/72027123887
+#
+# Purge any residual flashinfer/ tree. If we wipe it, cubin's files go with
+# it, so force cubin to reinstall too (150 MB, fetched via the flashinfer
+# artifacts step below).
+SITE_PACKAGES=$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
+if [ -n "$SITE_PACKAGES" ] && [ -d "$SITE_PACKAGES/flashinfer" ]; then
+    rm -rf "$SITE_PACKAGES/flashinfer"
+    echo "Purged residual $SITE_PACKAGES/flashinfer after uninstall"
+    if [ "$UNINSTALL_CUBIN" = false ]; then
+        $PIP_UNINSTALL_CMD flashinfer-cubin $PIP_UNINSTALL_SUFFIX || true
+        UNINSTALL_CUBIN=true
+    fi
+fi
+
 mark_step_done "Uninstall Flashinfer"
 
 # ------------------------------------------------------------------------------

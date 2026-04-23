@@ -10,14 +10,41 @@
 set +e
 set -u
 
-# Skip entirely when venv mode is disabled — no /tmp/sglang-ci-* dir exists
-# and there's nothing to sweep. Matches the USE_VENV parsing in
-# ci_install_dependency.sh (accepts 1/true/yes, case-insensitive).
+# Matches the USE_VENV parsing in ci_install_dependency.sh (accepts
+# 1/true/yes, case-insensitive).
 USE_VENV_RAW="${USE_VENV:-true}"
 case "$(printf '%s' "$USE_VENV_RAW" | tr '[:upper:]' '[:lower:]')" in
     1 | true | yes) ;;
     *)
-        echo "USE_VENV=${USE_VENV_RAW}: skipping venv cleanup"
+        # USE_VENV=false path: there is no /tmp/sglang-ci-* venv to drop,
+        # but system site-packages can carry over stale trees between jobs.
+        # Observed: `uv pip uninstall flashinfer-python` leaves flashinfer/data/
+        # behind because flashinfer-cubin owns files beneath it, so the next
+        # job's `uv pip install -e python[...]` fails with
+        # "failed to create directory flashinfer/data/: File exists (os error 17)".
+        # See https://github.com/sgl-project/sglang/actions/runs/24634237642/job/72027123887
+        #
+        # Fully uninstall the flashinfer trio and rm -rf any residual package
+        # dirs so the next setup starts from a clean slate. Cached wheels
+        # under ~/.cache/flashinfer-wheels/ keep the reinstall fast.
+        echo "USE_VENV=${USE_VENV_RAW}: purging flashinfer leftovers from system site-packages"
+        python3 -m pip uninstall -y \
+            flashinfer-python flashinfer-cubin flashinfer-jit-cache \
+            >/dev/null 2>&1 || true
+
+        SITE_PACKAGES="$(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null)"
+        if [ -n "${SITE_PACKAGES:-}" ] && [ -d "$SITE_PACKAGES" ]; then
+            for pkg in flashinfer flashinfer_cubin flashinfer_jit_cache; do
+                stale="${SITE_PACKAGES}/${pkg}"
+                if [ -e "$stale" ] || [ -L "$stale" ]; then
+                    if rm -rf "$stale"; then
+                        echo "Purged ${stale}"
+                    else
+                        echo "::warning::Failed to remove ${stale}"
+                    fi
+                fi
+            done
+        fi
         exit 0
         ;;
 esac
