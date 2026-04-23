@@ -206,7 +206,7 @@ class Envs:
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
-    SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
+    SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
@@ -266,6 +266,12 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER = EnvFloat(1.0)
+    # For non-streaming requests, the scheduler still flushes intermediate
+    # output batches to the tokenizer manager every N decoded tokens so that
+    # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
+    # an accurate TTFT for benchmarking; the upstream default of 50 trades
+    # off some TTFT-metric accuracy for less IPC overhead.
+    SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -516,6 +522,10 @@ class Envs:
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
+    # Native gRPC server (internal, not yet user-facing)
+    SGLANG_GRPC_PORT = EnvInt(None)
+    SGLANG_ENABLE_GRPC = EnvBool(False)
+
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
@@ -529,8 +539,8 @@ class Envs:
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
-    # Tokenizer
-    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+    # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
+    SGLANG_PATCH_TOKENIZER = EnvBool(True)
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
@@ -553,6 +563,10 @@ class Envs:
 
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+
+    # Plugin system
+    SGLANG_PLATFORM = EnvStr("")
+    SGLANG_PLUGINS = EnvStr("")
 
 
 envs = Envs()

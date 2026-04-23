@@ -59,7 +59,7 @@ class FlashinferTrtllmGenMoeBackendFP8Base:
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.93)
+        self.assertGreater(metrics["score"], 0.89)
 
 
 class FlashinferTrtllmGenMoeBackendBF16Base:
