@@ -1340,42 +1340,44 @@ class Scheduler(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
 
-    def _abort_all_and_rebalance_on_rank_fault(self):
-        """Rank fault detected: drain GPU, abort every in-flight request
-        (release KV + notify tokenizer), then rebalance experts and mark
-        the new snapshot as handled."""
+    def _retract_all_and_rebalance_on_rank_fault(self):
+        """Rank fault: drain GPU, retract every in-flight decode req (or
+        abort if over SGLANG_ELASTIC_EP_MAX_RETRACTION), rebalance experts,
+        mark snapshot handled."""
         self.result_queue.clear()
         torch.cuda.synchronize()
 
         if self.running_batch is not None and not self.running_batch.is_empty():
+            max_retraction = envs.SGLANG_ELASTIC_EP_MAX_RETRACTION.get()
             abort_reason = FINISH_ABORT(
-                message="Elastic EP rank fault; aborted, please retry.",
+                message=f"Elastic EP rank fault; aborted after {max_retraction} retractions.",
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 err_type="ElasticEPRankFault",
             )
-            for idx, req in enumerate(self.running_batch.reqs):
-                req.finished_reason = abort_reason
-                # schedule_batch.Req is not an io_struct.BaseReq, so SenderWrapper
-                # will not auto-propagate the IPC name; set it explicitly so
-                # MultiTokenizerRouter can route the abort to the right worker.
-                self.send_to_tokenizer.send_output(
-                    AbortReq(
-                        finished_reason=abort_reason.to_json(),
-                        rid=req.rid,
-                        http_worker_ipc=req.http_worker_ipc,
-                    ),
-                    req,
-                )
+            for idx, req in enumerate(list(self.running_batch.reqs)):
+                # release_req frees KV and calls reset_for_retract, which
+                # bumps retraction_count. Hence the post-bump > check.
                 self.running_batch.release_req(idx, 0, self.server_args)
+                if req.retraction_count > max_retraction:
+                    req.finished_reason = abort_reason
+                    self.send_to_tokenizer.send_output(
+                        AbortReq(finished_reason=abort_reason.to_json(),
+                                 rid=req.rid, http_worker_ipc=req.http_worker_ipc),
+                        req,
+                    )
+                else:
+                    self._add_request_to_queue(req, is_retracted=True)
             self.running_batch.filter_batch(keep_indices=[])
         self.last_batch = self.cur_batch = None
 
-        gen = self.tp_worker.model_runner.eplb_manager.rebalance()
-        while True:
-            try:
-                next(gen)
-            except StopIteration:
-                break
+        eplb_manager = self.tp_worker.model_runner.eplb_manager
+        if eplb_manager is not None:
+            gen = eplb_manager.rebalance()
+            while True:
+                try:
+                    next(gen)
+                except StopIteration:
+                    break
         ElasticEPStateManager.instance().mark_snapshot_handled()
 
     def get_init_info(self) -> Dict[str, Any]:
@@ -1453,7 +1455,7 @@ class Scheduler(
                 if tmp_result.copy_done is not None:
                     tmp_result.copy_done.synchronize()
                 if _elastic_state.is_stale_snapshot():
-                    self._abort_all_and_rebalance_on_rank_fault()
+                    self._retract_all_and_rebalance_on_rank_fault()
                     return False
             self.process_batch_result(tmp_batch, tmp_result)
             return True
