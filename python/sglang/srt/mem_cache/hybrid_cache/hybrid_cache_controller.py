@@ -252,8 +252,8 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, moved_pool_transfers = self.move_hybrid_indices(
-            op
+        host_indices, device_indices, resolved_pool_transfers = (
+            self.move_hybrid_indices(op)
         )
         self.write_queue.clear()
         start_event = device_module.Event()
@@ -266,14 +266,14 @@ class HybridCacheController(BaseHiCacheController):
                 host_indices,
                 device_indices,
                 self.io_backend,
-                pool_transfers=moved_pool_transfers,
+                pool_transfers=resolved_pool_transfers,
             )
             finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.write_stream,
                 host_indices,
                 device_indices,
-                moved_pool_transfers,
+                resolved_pool_transfers,
             )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
@@ -316,8 +316,8 @@ class HybridCacheController(BaseHiCacheController):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, moved_pool_transfers = self.move_hybrid_indices(
-            op
+        host_indices, device_indices, resolved_pool_transfers = (
+            self.move_hybrid_indices(op)
         )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
@@ -331,14 +331,14 @@ class HybridCacheController(BaseHiCacheController):
                     device_indices,
                     i,
                     self.io_backend,
-                    pool_transfers=moved_pool_transfers,
+                    pool_transfers=resolved_pool_transfers,
                 )
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,
                 host_indices,
                 device_indices,
-                moved_pool_transfers,
+                resolved_pool_transfers,
             )
         self.ack_load_queue.append(
             HiCacheAck(
@@ -443,23 +443,26 @@ class HybridCacheController(BaseHiCacheController):
         host_indices, device_indices = self.move_indices(
             operation.host_indices, operation.device_indices
         )
-        moved_pool_transfers = None
+        resolved_pool_transfers = None
         if operation.pool_transfers:
-            moved_pool_transfers = []
+            resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
                 transfer_host_indices, transfer_device_indices = self.move_indices(
                     transfer.host_indices, transfer.device_indices
                 )
-                moved_pool_transfers.append(
+                # Keep the original PoolTransfer unchanged because tree-owned
+                # transfers may still reference radix-tree host state. The
+                # controller only needs a normalized execution-time copy.
+                resolved_pool_transfers.append(
                     PoolTransfer(
                         name=transfer.name,
                         host_indices=transfer_host_indices,
                         device_indices=transfer_device_indices,
-                        keys=transfer.keys.copy() if transfer.keys else None,
+                        keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
                     )
                 )
-        return host_indices, device_indices, moved_pool_transfers
+        return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation):
         # Transfer extra pools
