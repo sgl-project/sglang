@@ -324,10 +324,6 @@ def _per_token_group_quant_8bit_raw(
     return x_q, x_s
 
 
-# backward compatibility
-per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
-
-
 def _per_token_group_quant_8bit_fuse_silu_and_mul(
     x: torch.Tensor,
     group_size: int,
@@ -507,6 +503,11 @@ def sglang_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
 
+    # Enable v2 kernel by default on supported group sizes
+    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
+    if enable_v2 is None:
+        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
+
     if x.shape[0] > 0:
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
@@ -604,6 +605,12 @@ def sglang_per_token_quant_fp8(
     sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
+
+
+if _is_cuda:
+    per_token_group_quant_fp8 = sglang_per_token_group_quant_fp8
+else:
+    per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
 
 
 @triton.jit

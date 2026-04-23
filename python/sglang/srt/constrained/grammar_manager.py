@@ -32,6 +32,7 @@ class GrammarManager:
                 scheduler.tokenizer,
                 scheduler.model_config.vocab_size,
                 scheduler.model_config.hf_eos_token_id,
+                think_end_id=scheduler.model_config.think_end_id,
             )
         else:
             self.grammar_backend = None

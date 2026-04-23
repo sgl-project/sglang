@@ -35,12 +35,12 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
         ), patch.object(
             schedule_batch.torch.cuda, "current_device", return_value=0
         ), patch.object(
-            schedule_batch.envs.SGLANG_ENABLE_MM_SPLITTING, "get", return_value=False
-        ), patch.object(
             schedule_batch.envs.SGLANG_MM_BUFFER_SIZE_MB, "get", return_value=0
         ):
             mm_inputs = MultimodalInputs.from_dict({"mm_items": [mm_item]})
 
+        # Splitting happens at the processor layer, not in from_dict.
+        # from_dict just reconstructs and passes through.
         self.assertEqual(len(mm_inputs.mm_items), 1)
         self.assertTrue(torch.equal(mm_inputs.mm_items[0].feature, feature_tensor))
         proxy_feature.reconstruct_on_target_device.assert_called_once_with(0)

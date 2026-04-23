@@ -11,14 +11,11 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
+    Flux2MistralTextConfig,
     T5Config,
-    TextEncoderConfig,
+    build_flux2_text_messages,
 )
-from sglang.multimodal_gen.configs.models.encoders.base import TextEncoderArchConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
-from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
-    _is_transformer_layer,
-)
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -83,6 +80,13 @@ class FluxPipelineConfig(ImagePipelineConfig):
             None,
         ]
     )
+
+    def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
+        # Flux v1 does not use attention masks for text encoders.
+        return None
+
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        return outputs.pooler_output
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
@@ -353,61 +357,6 @@ def flux2_klein_postprocess_text(
     return prompt_embeds
 
 
-@dataclass
-class Flux2MistralTextArchConfig(TextEncoderArchConfig):
-    stacked_params_mapping: list[tuple[str, str, str]] = field(
-        default_factory=lambda: [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-    )
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer]
-    )
-
-    def __post_init__(self):
-        self.tokenizer_kwargs = {
-            "padding": "max_length",
-            "truncation": True,
-            "max_length": 512,
-            "add_special_tokens": True,
-            "return_attention_mask": True,
-            "return_tensors": "pt",
-        }
-
-
-@dataclass
-class Flux2MistralTextConfig(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(
-        default_factory=Flux2MistralTextArchConfig
-    )
-
-
-def format_text_input(prompts: List[str], system_message: str = None):
-    # Remove [IMG] tokens from prompts to avoid Pixtral validation issues
-    # when truncation is enabled. The processor counts [IMG] tokens and fails
-    # if the count changes after truncation.
-    cleaned_txt = [prompt.replace("[IMG]", "") for prompt in prompts]
-
-    return [
-        [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": system_message}],
-            },
-            {"role": "user", "content": [{"type": "text", "text": prompt}]},
-        ]
-        for prompt in cleaned_txt
-    ]
-
-
-def flux_2_preprocess_text(prompt: str):
-    system_message = "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object attribution and actions without speculation."
-    return format_text_input([prompt], system_message=system_message)
-
-
 # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._pack_latents
 def flux2_pack_latents(latents):
     batch_size, num_channels, height, width = latents.shape
@@ -422,13 +371,15 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.TI2I
 
+    vae_precision: str = "bf16"
+
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Flux2MistralTextConfig(),)
     )
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (flux_2_preprocess_text,),
+        default_factory=lambda: (None,),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
@@ -447,11 +398,18 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         ]
     )
 
+    def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
+        # Flux2 uses standard attention masks (unlike Flux v1).
+        return text_inputs.get("attention_mask")
+
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        # Flux2 does not use pooler output.
+        return None
+
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        # flatten to 1-d list
-        prompts = [p for prompt in prompts for p in prompt]
+        messages = build_flux2_text_messages(prompts)
         inputs = tokenizer.apply_chat_template(
-            prompts,
+            messages,
             add_generation_prompt=False,
             tokenize=True,
             return_dict=True,
@@ -505,7 +463,22 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def preprocess_condition_image(
         self, image, target_width, target_height, vae_image_processor: VaeImageProcessor
     ):
-        img = image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+        target_area = 1024 * 1024
+        img = image
+        if image.width * image.height > target_area:
+            resize_to_target_area = getattr(
+                vae_image_processor, "_resize_to_target_area", None
+            )
+            if callable(resize_to_target_area):
+                img = resize_to_target_area(image, target_area)
+            else:
+                scale = math.sqrt(target_area / (image.width * image.height))
+                resized_width = int(image.width * scale)
+                resized_height = int(image.height * scale)
+                img = image.resize(
+                    (resized_width, resized_height), PIL.Image.Resampling.LANCZOS
+                )
+
         image_width, image_height = img.size
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
         multiple_of = vae_scale_factor * 2
@@ -589,6 +562,19 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         # patchify
         image_latents = _patchify_latents(image_latents)
         return image_latents
+
+    def normalize_vae_encode(self, image_latents, vae):
+        if not self._check_vae_has_bn(vae):
+            return None
+
+        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(
+            image_latents.device, image_latents.dtype
+        )
+        latents_bn_std = torch.sqrt(
+            vae.bn.running_var.view(1, -1, 1, 1)
+            + self.vae_config.arch_config.batch_norm_eps
+        ).to(image_latents.device, image_latents.dtype)
+        return (image_latents - latents_bn_mean) / latents_bn_std
 
     def _check_vae_has_bn(self, vae):
         """Check if VAE has bn attribute (cached check to avoid repeated hasattr calls)."""
