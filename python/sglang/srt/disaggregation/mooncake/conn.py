@@ -1929,6 +1929,7 @@ class MooncakeKVSender(CommonKVSender):
         layer_id: int,
         cuda_event: object,
         is_last: bool = False,
+        state_indices: Optional[List[int]] = None,
     ):
         """Enqueue a single layer's KV transfer for layer-pipelined mode."""
         index_slice = slice(0, len(kv_indices))
@@ -1938,6 +1939,7 @@ class MooncakeKVSender(CommonKVSender):
             index_slice,
             is_last=is_last,
             aux_index=self.aux_index if is_last else None,
+            state_indices=state_indices if is_last else None,
             layer_id=layer_id,
             cuda_event=cuda_event,
         )

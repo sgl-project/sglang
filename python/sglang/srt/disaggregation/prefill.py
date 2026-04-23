@@ -389,6 +389,50 @@ class SchedulerDisaggregationPrefillMixin:
 
         return batch
 
+    def _prepare_pipelined_state_indices(self: Scheduler, batch) -> None:
+        """Pre-compute state indices for hybrid models and attach to each req.
+
+        Mirrors the state_indices computation in send_kv_chunk, but stores
+        the result on req.pipelined_state_indices so that run_batch_pipelined
+        can pass it through the last send_layer call.
+        """
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = self.token_to_kv_pool_allocator.page_size
+
+        for req in batch.reqs:
+            state_indices = None
+            if isinstance(kvcache, HybridLinearKVPool):
+                state_indices = [
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        req.req_pool_idx
+                    ]
+                    .cpu()
+                    .numpy()
+                ]
+            elif isinstance(kvcache, SWAKVPool):
+                seq_len = len(req.fill_ids)
+                window_size = self.sliding_window_size
+                window_start = max(0, seq_len - window_size)
+                window_start = (window_start // page_size) * page_size
+                window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, window_start:seq_len
+                ]
+                window_kv_indices_swa = (
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        window_kv_indices_full
+                    )
+                )
+                state_indices = window_kv_indices_swa.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
+            elif isinstance(kvcache, NSATokenToKVPool):
+                seq_len = len(req.fill_ids)
+                kv_indices_full = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :seq_len
+                ]
+                state_indices = kv_indices_full.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
+            req.pipelined_state_indices = state_indices
+
     def _get_pipeline_group_size(self: Scheduler, batch) -> int:
         """Return adaptive group_size, or 0 if pipelining should not be used."""
         if not envs.SGLANG_PIPELINED_KV_TRANSFER.get():
@@ -397,15 +441,6 @@ class SchedulerDisaggregationPrefillMixin:
         avg_tokens = sum(req.extend_input_len for req in batch.reqs) // len(batch.reqs)
         if avg_tokens < min_tokens:
             return 0
-
-        # Safety: fall back to normal path for unsupported configurations.
-        # Mamba/SWA/NSA state transfer requires is_last_chunk dispatch which
-        # layer-pipelined mode does not yet support per-layer.
-        kv_manager = getattr(self, "disagg_prefill_kv_manager", None)
-        if kv_manager is not None:
-            state_type = getattr(kv_manager.kv_args, "state_type", "none")
-            if state_type != "none":
-                return 0
 
         # If user explicitly set group_size, respect it (backward compatible)
         explicit = os.environ.get("SGLANG_PIPELINE_GROUP_SIZE")

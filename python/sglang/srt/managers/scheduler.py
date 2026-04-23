@@ -3243,6 +3243,10 @@ class Scheduler(
             page_indices = kv_to_page_indices(kv_indices, page_size)
             req_page_indices_list.append(page_indices)
 
+        # Pre-compute state indices for hybrid models (Mamba/SWA/NSA).
+        # Attached to req so the last send_layer call can pass them through.
+        self._prepare_pipelined_state_indices(batch)
+
         # Initialize split prefill
         forward_batch = self.tp_worker.forward_batch_generation_split_init(
             model_worker_batch
@@ -3266,11 +3270,15 @@ class Scheduler(
                 if len(page_indices) == 0:
                     continue
                 for layer_id in range(group_start, group_end):
+                    is_last = is_last_group and layer_id == num_layers - 1
                     req.disagg_kv_sender.send_layer(
                         page_indices,
                         layer_id=layer_id,
                         cuda_event=cuda_event,
-                        is_last=(is_last_group and layer_id == num_layers - 1),
+                        is_last=is_last,
+                        state_indices=(
+                            req.pipelined_state_indices if is_last else None
+                        ),
                     )
 
         # Sample next tokens

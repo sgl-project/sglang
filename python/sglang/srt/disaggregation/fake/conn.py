@@ -85,6 +85,7 @@ class FakeKVSender(BaseKVSender):
         layer_id: int = 0,
         cuda_event=None,
         is_last: bool = False,
+        state_indices=None,
     ):
         """Per-layer KV send stub for warmup. Only marks sent on the last layer."""
         if is_last:
