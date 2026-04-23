@@ -34,7 +34,6 @@ try:
 except ImportError:
     rt = None
 
-from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 from sglang.srt.model_executor.breakable_cuda_graph.cuda_utils import checkCudaErrors
 
 logger = logging.getLogger(__name__)
@@ -152,8 +151,14 @@ def _weak_ref_if_tensor(x):
     """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
     pass-through for non-tensors. Weak-ref'ing captured args lets the shared
     mempool reclaim per-layer intermediates between segments — storage stays
-    alive for each segment CUDAGraph's lifetime via its pool use_count."""
+    alive for each segment CUDAGraph's lifetime via its pool use_count.
+
+    ``weak_ref_tensors`` is imported lazily: the module hard-raises on
+    non-CUDA/NPU platforms, and we only reach this code during an active
+    BCG capture (which can't happen on CPU-only runners anyway)."""
     if torch.is_tensor(x):
+        from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+
         return weak_ref_tensors(x)
     return x
 
