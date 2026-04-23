@@ -611,8 +611,8 @@ class UMBPStore(HiCacheStorage):
         # underlying RDMA IOEngine so PoolClient can take the zero-copy path
         # for batch_get_into_ptr / batch_put_from_ptr (skips the staging
         # buffer memcpy + lock and removes the per-call `staging_buffer_size`
-        # cap).  Standalone mode is a no-op (pybind register_memory returns
-        # true without doing anything when the impl is not DistributedClient).
+        # cap).  Standalone returns true as no-op by IUMBPClient contract;
+        # we still gate on is_distributed() below to avoid a pointless call.
         self._zero_copy_registered = False
         if self.client is None:
             return
