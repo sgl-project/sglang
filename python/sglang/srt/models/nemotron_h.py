@@ -59,8 +59,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.breakable_cuda_graph.bcg_ops import (
-    make_bcg_break_point,
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
 )
 from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -925,6 +925,6 @@ def nemotron_mamba2_with_output(
     output[:num_actual_tokens].view(ret.shape).copy_(ret)
 
 
-breakable_nemotron_mamba2_with_output = make_bcg_break_point(
+breakable_nemotron_mamba2_with_output = eager_on_graph(True)(
     nemotron_mamba2_with_output
 )
