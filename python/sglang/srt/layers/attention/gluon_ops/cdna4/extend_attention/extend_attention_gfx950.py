@@ -33,20 +33,10 @@ import os
 import torch
 import triton
 
-from ._kernel_gfx950 import (
-    gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric,
-)
-# FP8 routes through the same unified kernel with IS_FP8=True. Keeping the
-# alias so the existing dispatcher call-sites stay unchanged; the symmetric
-# path below passes IS_FP8 explicitly and the kernel body branches on it.
-_gluon_extend_attn_fwd_symmetric_fp8 = _gluon_extend_attn_fwd_symmetric
-# Unified BF16 kernel. Same JITFunction covers the basic path
-# (IS_PERSISTENT=False) and the WCA persistent / split-K paths
-# (IS_PERSISTENT=True).
-_bf16_kernel = _gluon_extend_attn_fwd_symmetric
-# Unified FP8 kernel. Same gating as BF16: IS_PERSISTENT toggles between
-# the basic and the WCA persistent / split-K bodies.
-_gluon_extend_attn_fwd_fp8_basic = _gluon_extend_attn_fwd_symmetric_fp8
+# Unified BF16+FP8 kernel. Same JITFunction covers:
+#   * basic vs persistent/split-K paths (IS_PERSISTENT constexpr)
+#   * BF16 vs FP8 KV cache (IS_FP8 constexpr)
+from ._kernel_gfx950 import gluon_extend_attn_fwd as _kernel
 
 _dummy_cm = None
 _dummy_mi = None
@@ -101,11 +91,11 @@ _FP8_KV_FORCE_BF16 = int(os.getenv("SGLANG_GLUON_FP8_KV_FORCE_BF16", "0")) != 0
 # Persistent / split-K launch helpers
 # ===-----------------------------------------------------------------------===#
 #
-# ``_launch_persistent`` and ``_launch_splitk`` wrap the unified BF16 kernel
-# (``_gluon_extend_attn_fwd_symmetric``, IS_PERSISTENT=True path) with
-# tile-scheduling and split-K workspace management. Kernels are launched via
-# standard ``kernel[grid](...)``; Triton's own compile cache absorbs the JIT
-# cost on warm calls.
+# ``_launch_persistent`` and ``_launch_splitk`` wrap ``_kernel`` (IS_PERSISTENT=
+# True path, BF16 when IS_FP8=False) with tile-scheduling and split-K workspace
+# management. ``_launch_persistent_fp8`` / ``_launch_splitk_fp8`` do the same for
+# IS_FP8=True. Kernels are launched via standard ``kernel[grid](...)``; Triton's
+# own compile cache absorbs the JIT cost on warm calls.
 
 
 _QK_SPLIT_CACHE = {}
@@ -389,17 +379,13 @@ def _launch_persistent(
 
     num_CUs = _get_num_CUs(device)
 
-    # Auto-splitk here is only correct at the BM=128 NW=8 NS=4 "big-tile"
-    # config used by _launch_splitk; other tile shapes produce NaNs from
-    # the multi-split reduction. Callers who need split-K at other configs
-    # must go through _launch_splitk directly.
+    # Split-K fires whenever the non-split persistent grid underfills the
+    # GPU and the prefix is long enough that partitioning its reduction
+    # across CTAs pays off. The per-split reduction (LSE-rescale) in the
+    # kernel epilogue is tile-agnostic -- all configs covered by the
+    # auto-dispatch are safe.
     SPLIT_K = 1
-    if (
-        total_output_tiles < num_CUs
-        and BLOCK_M == 128
-        and num_warps == 8
-        and NUM_STAGES == 4
-    ):
+    if total_output_tiles < num_CUs:
         if total_prefix_len is not None:
             avg_kv_len = total_prefix_len // max(1, batch_size)
         else:
@@ -426,7 +412,7 @@ def _launch_persistent(
     _has_sink = sinks is not None
     _v_scale_final = 1.0 if SPLIT_K > 1 else v_scale
 
-    _bf16_kernel[grid](
+    _kernel[grid](
         q_extend,
         k_extend,
         v_extend,
@@ -483,7 +469,7 @@ def _launch_splitk(
     qo_indptr, kv_indptr, kv_indices,
     custom_mask, mask_indptr, window_kv_offsets,
     sm_scale, k_scale, v_scale, logit_cap,
-    Lq, Lv, is_causal, max_len_extend, min_len_extend,
+    Lq, is_causal, max_len_extend, min_len_extend,
     sinks, xai_temperature_len, sliding_window_size,
     BLOCK_M, BLOCK_N, num_warps, NUM_STAGES,
     total_prefix_len=None,
@@ -571,7 +557,7 @@ def _launch_splitk(
     _has_sink = sinks is not None
     _v_scale_final = 1.0 if SPLIT_K > 1 else v_scale
 
-    _bf16_kernel[grid](
+    _kernel[grid](
         q_extend, k_extend, v_extend, o_extend,
         k_buffer, v_buffer,
         qo_indptr, kv_indptr, kv_indices,
@@ -621,19 +607,38 @@ def _select_d256_dispatch(
 ):
     """D=256 launch policy (Gemma-style models).
 
-    Narrow oracle-tuned overrides for B>=4 ext>=256 and B=1 ext>=2048 fire
-    first; everything else falls through to the prior tree. ``avg_pfx_proxy``
-    is a coarse proxy for avg prefix length supplied by the caller when
-    ``total_prefix_len`` is not threaded through.
+    Two BM regimes at D=256:
+      * BM=128 NW=8 (NS=2 or 3) for extend-dominated prefill (ext >= 256
+        per seq, or B=1 long extend): more query rows per tile amortises
+        the D=256 K/V load.
+      * BM=64 NW=4 (NS=2-4) for decode-like or small-ext batched shapes:
+        with ext < 128 the query tile is mostly pad at BM=128 and a
+        smaller tile halves pad waste and doubles grid size.
+
+    ``avg_pfx_proxy`` is a coarse bucket proxy for avg per-seq prefix
+    used when the caller does not thread ``total_prefix_len`` through
+    (e.g. the cached basic dispatch); the D=256 tree never needs the
+    exact prefix length, only whether it dominates the total token count.
 
     NS=1 is avoided even where it would win: the prefix-pipelined kernel
     hard-asserts NS>=2 for determinism, so NS=2 is used throughout at a
     3-6% cost (within BF16 noise) on shapes where NS=1 would have won.
     """
-    total_tokens = max(1, total_prefix_len + total_extend_len)
-    prefix_frac = total_prefix_len / total_tokens
+    # When total_prefix_len is unknown, fall back to the bucket proxy for
+    # both the avg-pfx and prefix-frac decisions. Otherwise the tree
+    # treats every shape as "no prefix" and mis-routes decode-like batched
+    # workloads to the BM=128 ext-dominated config.
+    if total_prefix_len > 0:
+        avg_pfx = total_prefix_len // max(1, batch_size)
+        total_tokens = max(1, total_prefix_len + total_extend_len)
+        prefix_frac = total_prefix_len / total_tokens
+    else:
+        avg_pfx = avg_pfx_proxy
+        # prefix_frac proxy: avg_pfx_proxy vs max_len_extend gives the
+        # right "is prefix heavy" signal for the tree below.
+        _total_est = max(1, avg_pfx_proxy + max_len_extend)
+        prefix_frac = avg_pfx_proxy / _total_est
     ext_ratio = max_len_extend / max(1, min_len_extend)
-    avg_pfx = total_prefix_len // max(1, batch_size)
 
     if batch_size >= 4 and max_len_extend >= 256:
         return 128, 8, 2, 16, 16
@@ -645,8 +650,11 @@ def _select_d256_dispatch(
             return 64, 4, 2, 16, 16
         return 128, 8, 3, 16, 16
 
+    # Extend-dominated at B>=3 (prefix_frac small): the BM=128 kernel
+    # earns its keep iff the per-seq extend is at least one BM row of
+    # real work. For small-ext decode-like batches the pad ratio wins.
     if prefix_frac <= 0.55:
-        if batch_size <= 2:
+        if batch_size <= 2 or max_len_extend <= 64:
             return 64, 4, 2, 16, 16
         return 128, 8, 3, 16, 16
 
@@ -655,8 +663,11 @@ def _select_d256_dispatch(
             return 64, 4, 4, 16, 16
         return 64, 4, 2, 16, 16
 
-    if max_len_extend <= 128 and avg_pfx >= 2048:
-        return 64, 8, 4, 16, 16
+    if batch_size >= 8 and max_len_extend >= 128 and avg_pfx >= 2048:
+        return 128, 8, 3, 16, 16
+
+    if max_len_extend <= 64 and avg_pfx >= 2048:
+        return 64, 4, 2, 16, 16
 
     if ext_ratio <= 2.5:
         return 64, 4, 2, 16, 16
@@ -1029,10 +1040,6 @@ def gluon_extend_attention_fwd(
             f"Gluon extend attention only supports symmetric heads (Lq == Lv), "
             f"got Lq={Lq}, Lv={Lv}. Use mla_prefill/ for mixed-dim DeepSeek MLA."
         )
-    _kernel_fn = (
-        _gluon_extend_attn_fwd_fp8_basic if _kv_is_fp8
-        else _gluon_extend_attn_fwd_symmetric
-    )
     batch_size = qo_indptr.shape[0] - 1
     head_num = _q_shape[1]
 
@@ -1181,7 +1188,8 @@ def gluon_extend_attention_fwd(
                             (max_len_extend >= 128
                              and (batch_size >= 8 or max_len_extend >= 1024))
                             or (_avg_pfx >= 4096
-                                and (batch_size >= 4 or _avg_pfx >= 16384))
+                                and (batch_size >= 8
+                                     or (batch_size <= 2 and _avg_pfx >= 16384)))
                         )
                     )
                 else:
@@ -1191,7 +1199,8 @@ def gluon_extend_attention_fwd(
                             (max_len_extend >= 128
                              and (batch_size >= 8 or max_len_extend >= 1024))
                             or (_avg_pfx >= 4096
-                                and (batch_size >= 4 or _avg_pfx >= 16384))
+                                and (batch_size >= 8
+                                     or (batch_size <= 2 and _avg_pfx >= 16384)))
                         )
                     )
             if _need_persistent and _can_route_wca:
@@ -1235,7 +1244,7 @@ def gluon_extend_attention_fwd(
             _tiles_256 = batch_size * head_num * _n_m_256
             _need_persistent_256 = (
                 _avg_pfx_256 >= 4096
-                and (batch_size >= 4 or _avg_pfx_256 >= 16384)
+                and (batch_size >= 8 or (batch_size <= 2 and _avg_pfx_256 >= 16384))
                 and _tiles_256 < _get_num_CUs(q_extend.device)
             )
             if _need_persistent_256 and _can_route_wca:
@@ -1259,7 +1268,7 @@ def gluon_extend_attention_fwd(
 
         # Cached dispatch config lookup (O(0.1us) after warmup).
         _pfx_b_full = _pfx_bucket(total_prefix_len, batch_size)
-        _BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS = (
+        _BM, _BN, _NW, _NS, _, _, _EXT_BN, _EXT_NS = (
             _get_basic_dispatch_config(
                 Lq, batch_size, max_len_extend, _pfx_b_full, _kv_is_fp8,
                 sliding_window_size=sliding_window_size,
@@ -1288,7 +1297,7 @@ def gluon_extend_attention_fwd(
         # dummies for the pointer workspaces are sufficient. Persistent args
         # go in via kwargs because the signature interleaves constexprs
         # between the stride block and the persistent-only runtime block.
-        _kernel_fn[_grid](
+        _kernel[_grid](
             q_extend, k_extend, v_extend, o_extend,
             k_buffer, v_buffer,
             qo_indptr, kv_indptr, kv_indices,
@@ -1350,7 +1359,7 @@ def gluon_extend_attention_fwd(
             custom_mask, mask_indptr,
             window_kv_offsets if window_kv_offsets is not None else _dummy_wkvo[:batch_size],
             sm_scale, k_scale, v_scale, logit_cap,
-            Lq, Lv, is_causal, max_len_extend, min_len_extend,
+            Lq, is_causal, max_len_extend, min_len_extend,
             sinks, xai_temperature_len, sliding_window_size,
             BLOCK_M=64,
             BLOCK_N=_BN,
@@ -1494,7 +1503,7 @@ def gluon_extend_attention_fwd(
     # interleaves constexprs between the stride block and the persistent-
     # only runtime block.
     _grid_full = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    _kernel_fn[_grid_full](
+    _kernel[_grid_full](
         q_extend, k_extend, v_extend, o_extend,
         k_buffer, v_buffer,
         qo_indptr, kv_indptr, kv_indices,
@@ -1552,7 +1561,6 @@ def _launch_persistent_fp8(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
-    enable_mask_split=True,
     enable_prefix_unmasked=True,
     min_len_extend=None,
     SPLIT_K=1,
@@ -1561,11 +1569,9 @@ def _launch_persistent_fp8(
     """Launch the FP8 persistent-CTA kernel, managing split-K workspace
     and the dummy mask tensors when ``USE_CUSTOM_MASK`` is False."""
     Lq = q_extend.shape[-1]
-    Lv = v_extend.shape[-1]
     BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
     USE_CUSTOM_MASK = custom_mask is not None
-    SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
     _bs_fp8 = qo_indptr.shape[0] - 1
     if not USE_CUSTOM_MASK:
         custom_mask, mask_indptr, _wkvo_dummy_fp8 = _ensure_dummy_mask_tensors(
@@ -1638,9 +1644,6 @@ def _launch_persistent_fp8(
     EXT_BLOCK_N = _FP8_DEFAULT_EXT_BN
     EXT_NUM_STAGES = _FP8_DEFAULT_EXT_NS
 
-    ASYNC_PAD_K = 8 if BLOCK_DMODEL >= 256 else 16
-    ASYNC_PAD_V = 32 if BLOCK_DV >= 256 else 16
-
     sm_scale = sm_scale or 1.0 / math.sqrt(Lq)
     sm_scale = sm_scale * k_scale
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
@@ -1687,7 +1690,7 @@ def _launch_persistent_fp8(
     total_programs = _select_persistent_grid(total_valid_tiles, num_CUs)
     grid = (total_programs,)
 
-    _gluon_extend_attn_fwd_symmetric_fp8[grid](
+    _kernel[grid](
         q_extend,
         k_extend,
         v_extend,
@@ -1753,7 +1756,7 @@ def _launch_splitk_fp8(
     qo_indptr, kv_indptr, kv_indices,
     custom_mask, mask_indptr, window_kv_offsets,
     sm_scale, k_scale, v_scale, logit_cap,
-    Lq, Lv, is_causal, max_len_extend, min_len_extend,
+    Lq, is_causal, max_len_extend, min_len_extend,
     sinks, xai_temperature_len, sliding_window_size,
     BLOCK_M, BLOCK_N, num_warps, NUM_STAGES,
     total_prefix_len=None,
@@ -1804,7 +1807,6 @@ def _launch_splitk_fp8(
 
     SPLIT_K = _select_k_splits(total_output_tiles, num_CUs)
     enable_prefix_unmasked = is_causal
-    enable_mask_split = (custom_mask is None) and is_causal
 
     _launch_persistent_fp8(
         q_extend, k_extend, v_extend, o_extend,
@@ -1819,7 +1821,6 @@ def _launch_splitk_fp8(
         xai_temperature_len=xai_temperature_len,
         sliding_window_size=sliding_window_size,
         window_kv_offsets=window_kv_offsets,
-        enable_mask_split=enable_mask_split,
         enable_prefix_unmasked=enable_prefix_unmasked,
         SPLIT_K=SPLIT_K,
         total_prefix_len=total_prefix_len,
