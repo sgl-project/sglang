@@ -379,15 +379,11 @@ class LTX2DenoisingStage(DenoisingStage):
         *,
         ctx: "LTX2DenoisingContext",
         batch: Req,
-        step: "DenoisingStepState",
         sigma: torch.Tensor,
         sigma_next: torch.Tensor,
         model_video_velocity: torch.Tensor,
         model_audio_velocity: torch.Tensor,
-        base_model_kwargs: dict[str, object],
-        encoder_hidden_states: torch.Tensor,
-        audio_encoder_hidden_states: torch.Tensor,
-        encoder_attention_mask: torch.Tensor | None,
+        midpoint_model_call,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """res2s RK2 step for unguided stage-2 refinement (HQ pipeline).
 
@@ -471,105 +467,9 @@ class LTX2DenoisingStage(DenoisingStage):
                 anchor_audio = x_mid_a - h * a21 * eps1_audio
                 eps1_audio = denoised_audio.double() - anchor_audio
 
-        # Rebuild kwargs with midpoint latents substituted in (hidden_states
-        # and audio_hidden_states come from the fresh midpoint tensors).
-        mid_kwargs = dict(base_model_kwargs)
-        mid_kwargs["hidden_states"] = midpoint_video_latents.to(ctx.target_dtype)
-        mid_kwargs["audio_hidden_states"] = midpoint_audio_latents.to(ctx.target_dtype)
-        # Stage-2 primary call uses sigma*1000 timesteps via
-        # `_prepare_ltx2_model_inputs`; midpoint re-eval must match scale.
-        timestep_scale_multiplier = float(
-            getattr(step.current_model, "timestep_scale_multiplier", 1000)
+        mid_v, mid_a = midpoint_model_call(
+            midpoint_video_latents, midpoint_audio_latents, sub_sigma
         )
-        local_batch_size = int(midpoint_video_latents.shape[0])
-        sub_t_scalar = (
-            sub_sigma.to(device=midpoint_video_latents.device, dtype=torch.float32)
-            * timestep_scale_multiplier
-        )
-        timestep_local = sub_t_scalar.expand(local_batch_size)
-        if ctx.denoise_mask is not None:
-            timestep_video_local = (
-                timestep_local.unsqueeze(-1) * ctx.denoise_mask.squeeze(-1)
-            )
-        elif ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage:
-            timestep_video_local = timestep_local.view(local_batch_size, 1).expand(
-                local_batch_size, int(midpoint_video_latents.shape[1])
-            )
-        else:
-            timestep_video_local = timestep_local
-        if (
-            ctx.is_ltx23_variant
-            and not ctx.use_ltx23_legacy_one_stage
-            and midpoint_audio_latents.ndim == 3
-        ):
-            timestep_audio_local = timestep_local.view(local_batch_size, 1).expand(
-                local_batch_size, int(midpoint_audio_latents.shape[1])
-            )
-        else:
-            timestep_audio_local = timestep_local
-        mid_kwargs["timestep"] = timestep_video_local
-        mid_kwargs["audio_timestep"] = timestep_audio_local
-        # prompt_timestep scalar per batch at sigma*1000 scale.
-        sub_prompt_t = sub_t_scalar.expand(local_batch_size)
-        if (
-            "prompt_timestep" in mid_kwargs
-            and mid_kwargs["prompt_timestep"] is not None
-        ):
-            mid_kwargs["prompt_timestep"] = sub_prompt_t
-        if (
-            "audio_prompt_timestep" in mid_kwargs
-            and mid_kwargs["audio_prompt_timestep"] is not None
-        ):
-            mid_kwargs["audio_prompt_timestep"] = sub_prompt_t
-        mid_kwargs["encoder_hidden_states"] = encoder_hidden_states
-        mid_kwargs["audio_encoder_hidden_states"] = audio_encoder_hidden_states
-        mid_kwargs["encoder_attention_mask"] = encoder_attention_mask
-        mid_kwargs["audio_encoder_attention_mask"] = encoder_attention_mask
-
-        if batch.do_classifier_free_guidance:
-            cfg_batch_size = int(midpoint_video_latents.shape[0]) * 2
-            mid_kwargs = self._repeat_ltx2_model_kwargs_batch(
-                mid_kwargs, cfg_batch_size
-            )
-            mid_kwargs["encoder_hidden_states"] = torch.cat(
-                [batch.negative_prompt_embeds[0], batch.prompt_embeds[0]], dim=0
-            )
-            mid_kwargs["audio_encoder_hidden_states"] = torch.cat(
-                [
-                    batch.negative_audio_prompt_embeds[0],
-                    batch.audio_prompt_embeds[0],
-                ],
-                dim=0,
-            )
-            if self._should_pass_ltx2_text_attention_mask(ctx):
-                repeated_attention_mask = self._cat_or_none(
-                    [
-                        self._get_ltx_prompt_attention_mask(
-                            batch,
-                            is_ltx23_variant=(
-                                ctx.is_ltx23_variant
-                                and not ctx.use_ltx23_legacy_one_stage
-                            ),
-                            negative=True,
-                        ),
-                        encoder_attention_mask,
-                    ]
-                )
-                mid_kwargs["encoder_attention_mask"] = repeated_attention_mask
-                mid_kwargs["audio_encoder_attention_mask"] = repeated_attention_mask
-
-        with set_forward_context(
-            current_timestep=step.step_index, attn_metadata=step.attn_metadata
-        ):
-            mid_v, mid_a = step.current_model(**mid_kwargs)
-
-        mid_v = mid_v.float()
-        mid_a = mid_a.float()
-        if batch.do_classifier_free_guidance:
-            mid_v_u, mid_v_t = mid_v.chunk(2)
-            mid_a_u, mid_a_t = mid_a.chunk(2)
-            mid_v = mid_v_u + batch.guidance_scale * (mid_v_t - mid_v_u)
-            mid_a = mid_a_u + batch.guidance_scale * (mid_a_t - mid_a_u)
 
         midpoint_denoised_video = midpoint_video_latents.float() - sub_sigma * mid_v
         midpoint_denoised_audio = midpoint_audio_latents.float() - sub_sigma * mid_a
@@ -1245,18 +1145,104 @@ class LTX2DenoisingStage(DenoisingStage):
                 # HQ stage-2 uses RK2 res2s here to match official LTX-2.3 HQ
                 # output. Without this path the scheduler falls back to Euler
                 # and loses ~3.7 dB against the official canonical.
+                def _stage2_midpoint_model_call(
+                    video_latents: torch.Tensor,
+                    audio_latents: torch.Tensor,
+                    sigma_value: torch.Tensor,
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+                    original_video_latents = ctx.latents
+                    original_audio_latents = ctx.audio_latents
+                    ctx.latents = video_latents
+                    ctx.audio_latents = audio_latents
+                    try:
+                        model_inputs_local = self._prepare_ltx2_model_inputs(
+                            ctx, step, batch, server_args, sigma_value
+                        )
+                        batch_size_local = int(
+                            model_inputs_local.latent_model_input.shape[0]
+                        )
+                        base_model_kwargs_local = self._build_ltx2_base_model_kwargs(
+                            ctx, batch, model_inputs_local
+                        )
+                        model_kwargs_local = self._build_ltx2_model_kwargs(
+                            ctx,
+                            base_model_kwargs_local,
+                            encoder_hidden_states=batch.prompt_embeds[0],
+                            audio_encoder_hidden_states=batch.audio_prompt_embeds[0],
+                            encoder_attention_mask=prompt_attention_mask,
+                        )
+                        if batch.do_classifier_free_guidance:
+                            cfg_batch_size = batch_size_local * 2
+                            model_kwargs_local = self._repeat_ltx2_model_kwargs_batch(
+                                model_kwargs_local, cfg_batch_size
+                            )
+                            model_kwargs_local["encoder_hidden_states"] = torch.cat(
+                                [
+                                    batch.negative_prompt_embeds[0],
+                                    batch.prompt_embeds[0],
+                                ],
+                                dim=0,
+                            )
+                            model_kwargs_local["audio_encoder_hidden_states"] = (
+                                torch.cat(
+                                    [
+                                        batch.negative_audio_prompt_embeds[0],
+                                        batch.audio_prompt_embeds[0],
+                                    ],
+                                    dim=0,
+                                )
+                            )
+                            if self._should_pass_ltx2_text_attention_mask(ctx):
+                                repeated_attention_mask = self._cat_or_none(
+                                    [
+                                        self._get_ltx_prompt_attention_mask(
+                                            batch,
+                                            is_ltx23_variant=(
+                                                ctx.is_ltx23_variant
+                                                and not ctx.use_ltx23_legacy_one_stage
+                                            ),
+                                            negative=True,
+                                        ),
+                                        prompt_attention_mask,
+                                    ]
+                                )
+                                model_kwargs_local["encoder_attention_mask"] = (
+                                    repeated_attention_mask
+                                )
+                                model_kwargs_local["audio_encoder_attention_mask"] = (
+                                    repeated_attention_mask
+                                )
+
+                        with set_forward_context(
+                            current_timestep=step.step_index,
+                            attn_metadata=step.attn_metadata,
+                        ):
+                            mid_v, mid_a = step.current_model(**model_kwargs_local)
+
+                        mid_v = mid_v.float()
+                        mid_a = mid_a.float()
+                        if batch.do_classifier_free_guidance:
+                            mid_v_u, mid_v_t = mid_v.chunk(2)
+                            mid_a_u, mid_a_t = mid_a.chunk(2)
+                            mid_v = mid_v_u + batch.guidance_scale * (
+                                mid_v_t - mid_v_u
+                            )
+                            mid_a = mid_a_u + batch.guidance_scale * (
+                                mid_a_t - mid_a_u
+                            )
+                        return mid_v, mid_a
+                    finally:
+                        ctx.latents = original_video_latents
+                        ctx.audio_latents = original_audio_latents
+
                 ctx.latents, ctx.audio_latents = self._ltx2_stage2_res2s_step(
                     ctx=ctx,
                     batch=batch,
-                    step=step,
                     sigma=sigma,
                     sigma_next=sigma_next,
                     model_video_velocity=model_video,
                     model_audio_velocity=model_audio,
-                    base_model_kwargs=base_model_kwargs,
-                    encoder_hidden_states=batch.prompt_embeds[0],
-                    audio_encoder_hidden_states=batch.audio_prompt_embeds[0],
-                    encoder_attention_mask=prompt_attention_mask,
+                    midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
                 ctx.latents = self.scheduler.step(
