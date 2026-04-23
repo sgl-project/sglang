@@ -743,8 +743,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
         )
-        should_run_mm_processor = (
-            self.mm_processor is not None and (contains_mm_input or is_mossvl)
+        should_run_mm_processor = self.mm_processor is not None and (
+            contains_mm_input or is_mossvl
         )
 
         if should_run_mm_processor:

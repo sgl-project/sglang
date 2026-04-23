@@ -14,15 +14,17 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     SGL_USE_CUDA_IPC,
+)
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
-
-
-from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -70,9 +72,9 @@ class MossVLImageProcessor(SGLangBaseProcessor):
         if grid_thw.numel() == 0:
             return []
 
-        tokens_per_media = (
-            grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
-        ) // (self.spatial_merge_size**2)
+        tokens_per_media = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]) // (
+            self.spatial_merge_size**2
+        )
 
         if media_nums_per_sample is None:
             media_nums_per_sample = [grid_thw.shape[0]]
@@ -238,7 +240,9 @@ class MossVLImageProcessor(SGLangBaseProcessor):
 
         if len(flat_eff_h) == 0 or len(image_token_indices) == 0:
             rope_deltas = (
-                position_ids.max(dim=0).values.max(dim=-1).values + 1 - input_ids.shape[1]
+                position_ids.max(dim=0).values.max(dim=-1).values
+                + 1
+                - input_ids.shape[1]
             )
             return vision_pos_ids, position_ids, rope_deltas
 
@@ -320,9 +324,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
 
             flat_seq_inds = abs_seq_offsets.reshape(-1)
             flat_batch_inds = (
-                sub_batch_rows.unsqueeze(1)
-                .expand(-1, tokens_per_frame)
-                .reshape(-1)
+                sub_batch_rows.unsqueeze(1).expand(-1, tokens_per_frame).reshape(-1)
             )
 
             valid_mask = flat_seq_inds < max_vision_seq_len
@@ -362,24 +364,35 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             rope_deltas = (max_pos + 1 - input_ids.shape[1]).unsqueeze(1)
             return position_ids, rope_deltas, None, []
 
-        vision_token_info = self._build_vision_token_info(grid_thw, media_nums_per_sample)
+        vision_token_info = self._build_vision_token_info(
+            grid_thw, media_nums_per_sample
+        )
         max_vision_seq_len = 0
         if vision_token_info:
-            max_vision_seq_len = max(info.get("pad_end", 0) for info in vision_token_info)
+            max_vision_seq_len = max(
+                info.get("pad_end", 0) for info in vision_token_info
+            )
 
         if max_vision_seq_len == 0:
             max_pos = position_ids.max(dim=0).values.max(dim=-1).values
             rope_deltas = (max_pos + 1 - input_ids.shape[1]).unsqueeze(1)
             return position_ids, rope_deltas, None, vision_token_info
 
-        vision_position_ids, position_ids, rope_deltas = self._compute_vision_position_ids(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            vision_token_info=vision_token_info,
-            max_vision_seq_len=max_vision_seq_len,
-            attention_mask=attention_mask,
+        vision_position_ids, position_ids, rope_deltas = (
+            self._compute_vision_position_ids(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                vision_token_info=vision_token_info,
+                max_vision_seq_len=max_vision_seq_len,
+                attention_mask=attention_mask,
+            )
         )
-        return position_ids, rope_deltas.unsqueeze(1), vision_position_ids, vision_token_info
+        return (
+            position_ids,
+            rope_deltas.unsqueeze(1),
+            vision_position_ids,
+            vision_token_info,
+        )
 
     def _compute_visible_frame_counts(
         self, cross_attention_mask: Optional[Union[torch.Tensor, List]]
@@ -521,13 +534,16 @@ class MossVLImageProcessor(SGLangBaseProcessor):
                 processor_output.get("cross_attention_mask")
             )
 
-            mrope_positions, mrope_position_delta, vision_position_ids, vision_token_info = (
-                self._compute_position_metadata(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    grid_thw=grid_thw,
-                    media_nums_per_sample=media_nums_per_sample,
-                )
+            (
+                mrope_positions,
+                mrope_position_delta,
+                vision_position_ids,
+                vision_token_info,
+            ) = self._compute_position_metadata(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                grid_thw=grid_thw,
+                media_nums_per_sample=media_nums_per_sample,
             )
 
             input_ids = input_ids.flatten()
