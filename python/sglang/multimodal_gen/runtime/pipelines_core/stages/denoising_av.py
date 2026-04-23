@@ -112,6 +112,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         vae=None,
         audio_vae=None,
         pipeline=None,
+        sampler_name: str = "euler",
     ):
         super().__init__(
             transformer,
@@ -119,6 +120,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             vae,
             audio_vae,
             pipeline=pipeline,
+            sampler_name=sampler_name,
         )
         self.distilled_sigmas = torch.tensor(distilled_sigmas)
 
