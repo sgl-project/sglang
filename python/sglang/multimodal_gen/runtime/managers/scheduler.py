@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
 
@@ -205,7 +206,16 @@ class Scheduler(SchedulerDisaggMixin):
             else:
                 logger.info("Processing warmup req...")
 
-        return self.worker.execute_forward(reqs)
+        # Diffusion dispatches one generation request at a time, so reqs[0]
+        # always carries the trace context for the entire batch.
+        req = reqs[0]
+        req.trace_ctx.rebuild_thread_context()
+        with trace_slice(
+            req.trace_ctx,
+            DiffStage.SCHEDULER_DISPATCH,
+            thread_finish_flag=True,
+        ):
+            return self.worker.execute_forward(reqs)
 
     def return_result(
         self,
