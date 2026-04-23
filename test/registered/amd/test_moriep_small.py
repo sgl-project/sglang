@@ -60,7 +60,7 @@ common_args = [
     "1",
     "--enable-dp-lm-head",
     "--mem-fraction-static",
-    "0.6",
+    "0.72",  # relax for mi300x
     "--chunked-prefill-size",
     "32768",
     "--max-running-requests",
