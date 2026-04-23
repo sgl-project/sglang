@@ -66,11 +66,9 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputCheck
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
-    get_mxfp4_first_idle_rank,
     get_shared_expert_tp_params,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -279,24 +277,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         ):
-            # Idle-rank optimization: with MXFP4 + large TP (PR#21097), ranks in
-            # the upper half of the TP group receive all-zero routed expert weights.
-            # When that is the case we shard the shared expert across the upper half
-            # only; _init_idle_rank() nullifies it on active (lower-half) ranks.
-            # When no idle ranks exist (normal TP or large intermediate_size) we
-            # use full TP sharding so all ranks compute the shared expert normally.
-            inter_dim_per_rank = config.shared_expert_intermediate_size // self.tp_size
-            if (
-                _use_aiter
-                and isinstance(quant_config, QuarkConfig)
-                and quant_config.is_mxfp4_moe()
-            ):
-                first_idle_rank = get_mxfp4_first_idle_rank(
-                    inter_dim_per_rank, self.tp_size, True
-                )
-                self.has_idle_ranks = first_idle_rank < self.tp_size
-            else:
-                self.has_idle_ranks = False
+            # Idle-rank optimization: when MoE weight padding causes upper TP
+            # ranks to receive all-zero routed expert weights (e.g. MXFP4 or
+            # FP8 with small intermediate_size on aiter), the quantization
+            # scheme sets ``first_idle_rank`` on the FusedMoE layer during
+            # create_weights.  We read it here to shard the shared expert only
+            # across idle ranks; _init_idle_rank() later nullifies it on active
+            # ranks.  Schemes that don't produce idle ranks simply don't set the
+            # attribute, and we default to tp_size (all ranks active).
+            first_idle_rank = getattr(
+                self.experts, "first_idle_rank", self.tp_size
+            )
+            self.has_idle_ranks = first_idle_rank < self.tp_size
 
             se_tp_rank, se_tp_size = get_shared_expert_tp_params(
                 moe_tp_rank=self.moe_tp_rank,
@@ -481,7 +473,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if _use_aiter and not self.idle_rank_initialized:
+        if not self.idle_rank_initialized:
             self._init_idle_rank()
 
         if get_moe_a2a_backend().is_deepep():
