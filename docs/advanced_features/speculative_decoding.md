@@ -294,7 +294,7 @@ Relevant parameters:
 | `--speculative-draft-model-path` | Required DFlash draft model path/weights. | `None` |
 | `--speculative-num-draft-tokens` | DFlash verify block size. | Inferred from draft config, otherwise `16` |
 | `--speculative-dflash-block-size` | Alias of `--speculative-num-draft-tokens` for DFlash. | `None` |
-| `--speculative-dflash-draft-window-size` | Draft KV sliding-window size. Must be `>= block_size` when set. | `None` |
+| `--speculative-dflash-draft-window-size` | Draft KV sliding-window size. Must be `>= speculative-num-draft-tokens` when set. | `None` |
 
 ```bash
 python3 -m sglang.launch_server \
