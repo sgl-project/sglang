@@ -68,18 +68,31 @@ class TestLMCacheXPUConnector(unittest.TestCase):
 
         # Shared KV buffers and connector (created once)
         cls.k_buffer = [
-            torch.randn(cls.BUFFER_SIZE, cls.head_num, cls.head_dim,
-                         dtype=torch.bfloat16, device=cls.DEVICE)
+            torch.randn(
+                cls.BUFFER_SIZE,
+                cls.head_num,
+                cls.head_dim,
+                dtype=torch.bfloat16,
+                device=cls.DEVICE,
+            )
             for _ in range(cls.layer_num)
         ]
         cls.v_buffer = [
-            torch.randn(cls.BUFFER_SIZE, cls.head_num, cls.head_dim,
-                         dtype=torch.bfloat16, device=cls.DEVICE)
+            torch.randn(
+                cls.BUFFER_SIZE,
+                cls.head_num,
+                cls.head_dim,
+                dtype=torch.bfloat16,
+                device=cls.DEVICE,
+            )
             for _ in range(cls.layer_num)
         ]
         cls.connector = LMCacheLayerwiseConnector(
-            cls.model_config, tp_size=1, rank=0,
-            k_pool=cls.k_buffer, v_pool=cls.v_buffer,
+            cls.model_config,
+            tp_size=1,
+            rank=0,
+            k_pool=cls.k_buffer,
+            v_pool=cls.v_buffer,
         )
 
     @classmethod
@@ -105,14 +118,18 @@ class TestLMCacheXPUConnector(unittest.TestCase):
 
         # First retrieve should return 0 (cold cache)
         load_meta = LoadMetadata(
-            token_ids=token_ids, slot_mapping=kv_indices, offset=0,
+            token_ids=token_ids,
+            slot_mapping=kv_indices,
+            offset=0,
         )
         self.assertEqual(self.connector.start_load_kv(load_meta), 0)
 
         # Store
         store_meta = StoreMetadata(
-            last_node=None, token_ids=token_ids,
-            kv_indices=kv_indices, offset=0,
+            last_node=None,
+            token_ids=token_ids,
+            kv_indices=kv_indices,
+            offset=0,
         )
         self.connector.store_kv(store_meta)
         torch.xpu.synchronize()
@@ -155,7 +172,9 @@ class TestLMCacheXPUConnector(unittest.TestCase):
         kv_indices = torch.randint(0, self.BUFFER_SIZE, (self.INPUT_LEN,))
 
         load_meta = LoadMetadata(
-            token_ids=token_ids, slot_mapping=kv_indices, offset=0,
+            token_ids=token_ids,
+            slot_mapping=kv_indices,
+            offset=0,
         )
         self.assertEqual(self.connector.start_load_kv(load_meta), 0)
 
@@ -166,8 +185,10 @@ class TestLMCacheXPUConnector(unittest.TestCase):
 
         # Store first
         store_meta = StoreMetadata(
-            last_node=None, token_ids=token_ids,
-            kv_indices=kv_indices, offset=0,
+            last_node=None,
+            token_ids=token_ids,
+            kv_indices=kv_indices,
+            offset=0,
         )
         self.connector.store_kv(store_meta)
         torch.xpu.synchronize()
@@ -177,7 +198,9 @@ class TestLMCacheXPUConnector(unittest.TestCase):
         slot_mapping_with_neg[:8] = -1  # first 8 are "already cached"
 
         load_meta = LoadMetadata(
-            token_ids=token_ids, slot_mapping=slot_mapping_with_neg, offset=0,
+            token_ids=token_ids,
+            slot_mapping=slot_mapping_with_neg,
+            offset=0,
         )
         # Should not crash on XPU (the -1 filtering fix is critical here)
         ret = self.connector.start_load_kv(load_meta)
@@ -194,25 +217,29 @@ class TestLMCacheXPUConnector(unittest.TestCase):
             kv_indices = torch.randint(0, self.BUFFER_SIZE, (self.INPUT_LEN,))
 
             store_meta = StoreMetadata(
-                last_node=None, token_ids=token_ids,
-                kv_indices=kv_indices, offset=0,
+                last_node=None,
+                token_ids=token_ids,
+                kv_indices=kv_indices,
+                offset=0,
             )
             self.connector.store_kv(store_meta)
             torch.xpu.synchronize()
 
-            gt_k = [self.k_buffer[i][kv_indices].clone()
-                     for i in range(self.layer_num)]
+            gt_k = [self.k_buffer[i][kv_indices].clone() for i in range(self.layer_num)]
 
             for i in range(self.layer_num):
                 self.k_buffer[i].zero_()
                 self.v_buffer[i].zero_()
 
             load_meta = LoadMetadata(
-                token_ids=token_ids, slot_mapping=kv_indices, offset=0,
+                token_ids=token_ids,
+                slot_mapping=kv_indices,
+                offset=0,
             )
             ret = self.connector.start_load_kv(load_meta)
             self.assertEqual(
-                ret, self.INPUT_LEN,
+                ret,
+                self.INPUT_LEN,
                 f"Cycle {cycle}: expected {self.INPUT_LEN}, got {ret}",
             )
 
@@ -234,8 +261,10 @@ class TestLMCacheXPUConnector(unittest.TestCase):
         kv_indices = torch.randint(0, self.BUFFER_SIZE, (self.INPUT_LEN,))
 
         store_meta = StoreMetadata(
-            last_node=None, token_ids=token_ids,
-            kv_indices=kv_indices, offset=0,
+            last_node=None,
+            token_ids=token_ids,
+            kv_indices=kv_indices,
+            offset=0,
         )
         self.connector.store_kv(store_meta)
         torch.xpu.synchronize()
@@ -245,7 +274,9 @@ class TestLMCacheXPUConnector(unittest.TestCase):
             self.v_buffer[i].zero_()
 
         load_meta = LoadMetadata(
-            token_ids=token_ids, slot_mapping=kv_indices, offset=0,
+            token_ids=token_ids,
+            slot_mapping=kv_indices,
+            offset=0,
         )
         ret = self.connector.start_load_kv(load_meta)
         self.assertEqual(ret, self.INPUT_LEN)
