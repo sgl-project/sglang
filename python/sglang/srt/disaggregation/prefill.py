@@ -192,6 +192,18 @@ class PrefillBootstrapQueue:
                     )
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 kv_args.state_type = "nsa"
+                if self.draft_token_to_kv_pool is not None and isinstance(
+                    self.draft_token_to_kv_pool, NSATokenToKVPool
+                ):
+                    (
+                        draft_state_data_ptrs,
+                        draft_state_data_lens,
+                        draft_state_item_lens,
+                    ) = self.draft_token_to_kv_pool.get_state_buf_infos()
+                    kv_args.state_data_ptrs += draft_state_data_ptrs
+                    kv_args.state_data_lens += draft_state_data_lens
+                    kv_args.state_item_lens += draft_state_item_lens
+
             else:
                 kv_args.state_type = "none"
         else:
