@@ -55,12 +55,28 @@ class LMCacheMode(enum.Enum):
     IP = enum.auto()  # in-process mode
 
 
+def _create_device_stream(device):
+    """Create a device stream for the given device type."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type == "xpu":
+        return torch.xpu.Stream(device=device)
+    return torch.cuda.Stream(device=device)
+
+
+def _device_stream_context(stream):
+    """Return the appropriate stream context manager."""
+    if hasattr(torch, "xpu") and isinstance(stream, torch.xpu.Stream):
+        return torch.xpu.stream(stream)
+    return torch.cuda.stream(stream)
+
+
 class LayerTransferCounter:
     """Minimal adapter that lets the memory pool notify LMCache per-layer.
 
     The KV pool calls `wait_until(layer_id)` after finishing a layer, which we
     translate into a `load_kv_layerwise(layer_id)` call on the LMCache connector
-    within the provided CUDA stream.
+    within the provided device stream.
     """
 
     def __init__(
@@ -130,8 +146,8 @@ class LMCRadixCache(RadixCache):
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        self.load_stream = _create_device_stream(self.device)
+        self.store_stream = _create_device_stream(self.device)
 
         # MP is the default. To use the in-process layerwise connector,
         # set ``self._mode = LMCacheMode.IP`` here.
@@ -346,7 +362,15 @@ class LMCRadixCache(RadixCache):
         slot_mapping[:value_numel].fill_(-1)
         slot_mapping[value_numel:].copy_(token_slots)
 
-        num_retrieved = load_fn(slot_mapping, prefix_pad)
+
+        with _device_stream_context(self.load_stream):
+            num_retrieved = self.lmcache_connector.start_load_kv(
+                LoadMetadata(
+                    token_ids=key.token_ids,  # full page-aligned key
+                    slot_mapping=slot_mapping,
+                    offset=value.numel() - prefix_pad,  # LMCache offset convention
+                )
+            )
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
         if num_retrieved > 0:
@@ -463,7 +487,7 @@ class LMCRadixCache(RadixCache):
             offset=0,
             request_id=req.rid,
         )
-        with torch.cuda.stream(self.store_stream):
+        with _device_stream_context(self.store_stream):
             self.lmcache_connector.store_kv(store_md)
         if self._mode is LMCacheMode.MP:
             # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
