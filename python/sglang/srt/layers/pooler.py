@@ -53,7 +53,7 @@ def pool_hidden_states(
 
     Raw pooling only — no normalize, no dim truncation.
     Returns shape (batch_size, hidden_size). LAST/CLS preserve the input dtype;
-    MEAN accumulates and returns float32.
+    MEAN accumulates and returns float32 regardless of input dtype.
     """
     if pooling_type == PoolingType.LAST:
         last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
