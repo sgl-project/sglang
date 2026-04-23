@@ -9,7 +9,7 @@ FROM intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Define build arguments
-ARG PYTHON_VERSION=3.10
+ARG PYTHON_VERSION=3.12
 
 ARG SG_LANG_REPO=https://github.com/sgl-project/sglang.git
 ARG SG_LANG_BRANCH=main

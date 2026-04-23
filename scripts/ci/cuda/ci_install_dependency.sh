@@ -314,10 +314,23 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
     else
         WHEEL_ARCH="x86_64"
     fi
-    # Wheel may have +cuXYZ suffix (e.g. sglang_kernel-0.4.0+cu130-...) depending on CUDA version
-    KERNEL_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}*-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1)
+    # Wheel filenames carry a +cuXYZ local version tag (e.g. sglang_kernel-0.4.0+cu130-...).
+    # When the build matrix produces wheels for multiple CUDA versions (e.g. both cu129 and cu130),
+    # pick the one matching the test runner's $CU_VERSION so we don't trigger the PyPI-fallback reinstall
+    # below (which would replace the PR-built wheel with a public main-branch wheel).
+    KERNEL_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1)
     if [ -z "$KERNEL_WHL" ]; then
-        echo "ERROR: No matching sgl-kernel wheel found in sgl-kernel/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH}"
+        # Fallback for older branches that only build a single CUDA variant and whose wheel matches
+        # the current $CU_VERSION. Restrict to the same arch — we intentionally do NOT match a wheel
+        # whose +cuXYZ tag disagrees with $CU_VERSION here, because the post-install reinstall branch
+        # below would otherwise silently replace it with the public main-branch wheel.
+        SINGLE_CUDA_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1)
+        if [ -n "$SINGLE_CUDA_WHL" ]; then
+            KERNEL_WHL="$SINGLE_CUDA_WHL"
+        fi
+    fi
+    if [ -z "$KERNEL_WHL" ]; then
+        echo "ERROR: No matching sgl-kernel wheel found in sgl-kernel/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
         ls -alh sgl-kernel/dist/
         exit 1
     fi
