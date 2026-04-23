@@ -749,6 +749,7 @@ class VisionAttention(nn.Module):
         num_heads: int,
         projection_size: int,
         use_qkv_parallel: bool,
+        num_kv_heads: Optional[int] = None,
         qkv_backend: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         dropout: float = 0.0,
@@ -782,8 +783,10 @@ class VisionAttention(nn.Module):
         self.num_attention_heads_per_partition = dist_utils.divide(
             num_dummy_heads + num_heads, self.tp_size
         )
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
         self.num_attention_kv_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_heads, self.tp_size
+            num_dummy_heads + num_kv_heads, self.tp_size
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
@@ -837,7 +840,7 @@ class VisionAttention(nn.Module):
                 hidden_size=embed_dim,
                 head_size=self.head_size,
                 total_num_heads=num_dummy_heads + num_heads,
-                total_num_kv_heads=num_dummy_heads + num_heads,
+                total_num_kv_heads=num_dummy_heads + num_kv_heads,
                 bias=qkv_bias,
                 quant_config=quant_config,
                 tp_rank=self.tp_rank,
@@ -1069,19 +1072,20 @@ class VisionAttention(nn.Module):
             sin = rotary_pos_emb_sin
 
         if cos is not None and sin is not None:
-            original_shape = q.shape
+            q_original_shape = q.shape
+            k_original_shape = k.shape
 
             # [total_tokens, head, head_size]
             q = q.view(-1, head, self.head_size)
-            k = k.view(-1, head, self.head_size)
+            k = k.view(-1, kv_head, self.head_size)
 
             if cos.size(-1) * 2 == self.head_size:
                 cos = torch.cat([cos, cos], dim=-1)
                 sin = torch.cat([sin, sin], dim=-1)
 
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
-            q = q.view(original_shape)
-            k = k.view(original_shape)
+            q = q.view(q_original_shape)
+            k = k.view(k_original_shape)
 
         if q.dim() == 4:
             # [b, s, head, head_size] --> [b * s, head, head_size]
