@@ -102,8 +102,12 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 _aiter_top_k_renorm_probs = None
+_aiter_top_p_renorm_probs = None
+_aiter_chain_speculative_sampling = None
 try:
     from aiter.ops.sampling import top_k_renorm_probs as _aiter_top_k_renorm_probs
+    from aiter.ops.sampling import top_p_renorm_probs as _aiter_top_p_renorm_probs
+    from aiter.ops.sampling import chain_speculative_sampling as _aiter_chain_speculative_sampling
 except ImportError:
     pass
 
@@ -130,7 +134,10 @@ def _top_k_renorm_prob_torch(
 def _top_p_renorm_prob_torch(
     probs: torch.Tensor, top_p: torch.Tensor
 ) -> torch.Tensor:
-    """Pure PyTorch top-p (nucleus) renormalization fallback for ROCm."""
+    """Top-p renormalization: aiter kernel on ROCm, pure PyTorch fallback otherwise."""
+    if _aiter_top_p_renorm_probs is not None:
+        top_p_f = top_p.to(dtype=torch.float32, device=probs.device)
+        return _aiter_top_p_renorm_probs(probs.float(), top_p_f, 0.0).to(probs.dtype)
     top_p = top_p.to(dtype=probs.dtype, device=probs.device)
     sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
     cumsum = torch.cumsum(sorted_probs, dim=-1)
@@ -767,14 +774,27 @@ def compute_dflash_sampling_accept_len_and_bonus(
         accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
         bonus = predicts[accept_pos].to(torch.int64)
     else:
-        # Pure PyTorch fallback for ROCm (chain-only DFlash verification)
-        accept_len, bonus = _dflash_chain_sampling_verify_torch(
-            candidates=candidates,
-            target_probs=target_probs,
-            uniform_samples=uniform_samples,
-            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-            threshold_single=threshold_single,
-            threshold_acc=threshold_acc,
-        )
+        if _aiter_chain_speculative_sampling is not None:
+            # AITER HIP kernel for chain verification on ROCm
+            accept_len, bonus = _aiter_chain_speculative_sampling(
+                candidates.to(torch.int64),
+                target_probs,
+                uniform_samples,
+                uniform_samples_for_final_sampling,
+                threshold_single,
+                threshold_acc,
+                True,
+            )
+            bonus = bonus.to(torch.int64)
+        else:
+            # Pure PyTorch fallback for ROCm (chain-only DFlash verification)
+            accept_len, bonus = _dflash_chain_sampling_verify_torch(
+                candidates=candidates,
+                target_probs=target_probs,
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
+            )
 
     return accept_len, bonus
