@@ -27,6 +27,7 @@ from triton.experimental.gluon.language._layouts import (
     DotOperandLayout,
     PaddedSharedLayout,
 )
+from triton.language.core import _aggregate as aggregate
 
 LOG2E = tl.constexpr(1.4426950408889634)
 
@@ -557,6 +558,231 @@ def make_ext_v_dll(num_warps, BLOCK_DV, EXT_BLOCK_N):
         reg_bases=reg, lane_bases=lane, warp_bases=warp,
         block_bases=[], shape=[EXT_BLOCK_N, BLOCK_DV],
     )
+
+
+# ===-----------------------------------------------------------------------===#
+# ExtendAttentionLayouts -- dtype-aware layout bundle (BF16 / FP8 KV)
+# ===-----------------------------------------------------------------------===#
+#
+# Bundles every layout the unified extend kernel consumes behind one
+# IS_FP8 gate, so the kernel body calls ``layouts.pfx_kt_dot_layout``
+# (FP8 or BF16) instead of picking between two local constexprs. For
+# layouts whose factory signature depends on kernel-local constexprs
+# (BLOCK_N varies per dispatch path, EXT_BLOCK_N varies per config),
+# the aggregate carries only the dtype selector and we expose matching
+# ``@gluon.constexpr_function`` factories that pick the FP8 vs BF16
+# underlying helper (``prefix_kt_dll``, ``prefix_v_dll``,
+# ``extend_v_dll``, ``prefix_kt_smem_layout``, ``prefix_v_smem_layout``).
+#
+# Kernel-body simplification summary::
+#
+#                        BEFORE (two kernel files)        AFTER (unified)
+#     dot layouts        kt_dot_layout / fp8_kt_dot_...   layouts.{pfx,}kt_dot_layout
+#     prefix Q           q / fp8_q_dot (two locals)       inline IS_FP8 gate (convert + cast)
+#     prefix smem dtype  PFX_SMEM_TY local constexpr      layouts.PFX_SMEM_TY
+#     async DLL factory  make_kt_dll / make_fp8_kt_dll    prefix_kt_dll(layouts, ...)
+#     smem padding       [[512,P]] / [[1024,P],[2048,32]] prefix_kt_smem_layout(layouts, ...)
+#     smem transition    (FP8-only, inline)               (FP8-only, gated on layouts.IS_FP8)
+
+
+@aggregate
+class ExtendAttentionLayouts:
+    """Dot-operand + MMA layouts for BF16 / FP8 extend attention.
+
+    Extend phase is always BF16 (the FP8 kernel runs BF16 MFMA on the
+    live extend tensors), so ``kt_dot_layout`` / ``p_dot_layout`` /
+    ``v_dot_layout`` always hold the BF16-k_width flavor. The ``pfx_*``
+    counterparts flip to FP8-k_width when ``IS_FP8`` is True.
+    """
+
+    # ==== Shared MFMA accumulator ====
+    mma_layout: gl.constexpr
+
+    # ==== Extend-phase dot operands (always BF16) ====
+    q_dot_layout: gl.constexpr
+    kt_dot_layout: gl.constexpr
+    p_dot_layout: gl.constexpr
+    v_dot_layout: gl.constexpr
+
+    # ==== Prefix-phase dot operands (FP8 when IS_FP8, else mirrors extend) ====
+    pfx_q_dot_layout: gl.constexpr
+    pfx_kt_dot_layout: gl.constexpr
+    pfx_p_dot_layout: gl.constexpr
+    pfx_v_dot_layout: gl.constexpr
+
+    # ==== Shared blocked / slice layouts for output + row/col helpers ====
+    blocked_layout: gl.constexpr
+    offs_m_layout: gl.constexpr
+    offs_d_layout: gl.constexpr
+    mma_offs_n_col: gl.constexpr
+    mma_offs_m_row: gl.constexpr
+    mma_m_layout: gl.constexpr
+
+    # ==== Policy ====
+    IS_FP8: gl.constexpr
+    PFX_SMEM_TY: gl.constexpr          # element type for prefix smem allocation
+    ASYNC_PAD_K: gl.constexpr
+    ASYNC_PAD_V: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, IS_FP8, num_warps, q_dtype, k_buffer_dtype):
+        mma, q_dot, kt_dot, p_dot, v_dot = make_mfma_dot_layouts(
+            num_warps, 16, 16, 32, 8, 4
+        )
+        blocked, offs_m, offs_d, mma_n_col, mma_m_row, mma_m_ly = (
+            make_blocked_and_slice_layouts(num_warps, mma)
+        )
+
+        self.mma_layout = gl.constexpr(mma)
+        self.q_dot_layout = gl.constexpr(q_dot)
+        self.kt_dot_layout = gl.constexpr(kt_dot)
+        self.p_dot_layout = gl.constexpr(p_dot)
+        self.v_dot_layout = gl.constexpr(v_dot)
+        self.blocked_layout = gl.constexpr(blocked)
+        self.offs_m_layout = gl.constexpr(offs_m)
+        self.offs_d_layout = gl.constexpr(offs_d)
+        self.mma_offs_n_col = gl.constexpr(mma_n_col)
+        self.mma_offs_m_row = gl.constexpr(mma_m_row)
+        self.mma_m_layout = gl.constexpr(mma_m_ly)
+
+        if IS_FP8:
+            fp8_q, fp8_kt, fp8_p, fp8_v = make_fp8_dot_layouts(mma, 16, 8)
+            self.pfx_q_dot_layout = gl.constexpr(fp8_q)
+            self.pfx_kt_dot_layout = gl.constexpr(fp8_kt)
+            self.pfx_p_dot_layout = gl.constexpr(fp8_p)
+            self.pfx_v_dot_layout = gl.constexpr(fp8_v)
+            self.PFX_SMEM_TY = gl.constexpr(k_buffer_dtype)
+        else:
+            self.pfx_q_dot_layout = gl.constexpr(q_dot)
+            self.pfx_kt_dot_layout = gl.constexpr(kt_dot)
+            self.pfx_p_dot_layout = gl.constexpr(p_dot)
+            self.pfx_v_dot_layout = gl.constexpr(v_dot)
+            self.PFX_SMEM_TY = gl.constexpr(q_dtype)
+
+        self.IS_FP8 = gl.constexpr(IS_FP8)
+        self.ASYNC_PAD_K = gl.constexpr(16)
+        self.ASYNC_PAD_V = gl.constexpr(16)
+
+
+# ---- Prefix-side async DLL / SMEM factories (IS_FP8 aware) ------------------
+
+
+@gluon.constexpr_function
+def prefix_kt_offset_bases(layouts, BLOCK_DMODEL, BLOCK_N):
+    """K^T offset bases for an async prefix tile (shared BF16/FP8)."""
+    return make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
+
+
+@gluon.constexpr_function
+def prefix_v_offset_bases(layouts, num_warps, BLOCK_DV, BLOCK_N):
+    """V offset bases for an async prefix tile (FP8-packed layout when IS_FP8)."""
+    if layouts.IS_FP8:
+        return make_fp8_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
+    return make_v_offset_bases(BLOCK_DV, BLOCK_N)
+
+
+@gluon.constexpr_function
+def prefix_kt_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_N):
+    """Prefix K^T async DMA DLL (FP8-native partition when IS_FP8)."""
+    if layouts.IS_FP8:
+        return make_fp8_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+    return make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+
+
+@gluon.constexpr_function
+def prefix_v_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N):
+    """Prefix V async DMA DLL (FP8-native partition when IS_FP8)."""
+    if layouts.IS_FP8:
+        return make_fp8_v_dll(num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N)
+    return make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+
+
+@gluon.constexpr_function
+def prefix_kt_smem_layout(layouts, BLOCK_DMODEL, BLOCK_N, offset_bases):
+    """Prefix K^T padded smem (1024-byte interval on FP8, 512 on BF16)."""
+    if layouts.IS_FP8:
+        pad_pairs = [[1024, layouts.ASYNC_PAD_K.value], [2048, 32]]
+    else:
+        pad_pairs = [[512, layouts.ASYNC_PAD_K.value]]
+    return make_padded_smem([BLOCK_DMODEL, BLOCK_N], offset_bases, pad_pairs)
+
+
+@gluon.constexpr_function
+def prefix_v_smem_layout(layouts, BLOCK_N, BLOCK_DV, offset_bases):
+    """Prefix V padded smem (1024-byte interval on FP8, 512 on BF16)."""
+    if layouts.IS_FP8:
+        pad_pairs = [[1024, layouts.ASYNC_PAD_V.value], [2048, 32]]
+    else:
+        pad_pairs = [[512, layouts.ASYNC_PAD_V.value]]
+    return make_padded_smem([BLOCK_N, BLOCK_DV], offset_bases, pad_pairs)
+
+
+# ---- Extend-side async DLL / SMEM factories (BF16-always but differs by IS_FP8) ----
+# The FP8 kernel's BF16-extend V tile shares offset-bases with FP8 prefix V
+# (so smem is laid out the same way across the phase transition) but uses a
+# distinct DLL to get BF16-friendly vector widths. BF16 kernel's extend V tile
+# uses the standard BF16 DLL directly.
+
+
+@gluon.constexpr_function
+def extend_kt_offset_bases(layouts, BLOCK_DMODEL, BLOCK_N):
+    """K^T offset bases for the extend async tile (identical to prefix)."""
+    return make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
+
+
+@gluon.constexpr_function
+def extend_v_offset_bases(layouts, num_warps, BLOCK_DV, BLOCK_N):
+    """V offset bases for the extend async tile. On the FP8 path, inherits
+    the FP8-packed bases so the smem transition doesn't change offset
+    layouts; on BF16 uses the standard bases.
+    """
+    if layouts.IS_FP8:
+        return make_fp8_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
+    return make_v_offset_bases(BLOCK_DV, BLOCK_N)
+
+
+@gluon.constexpr_function
+def extend_kt_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_N):
+    """Extend K^T async DMA DLL (BF16, independent of IS_FP8)."""
+    return make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+
+
+@gluon.constexpr_function
+def extend_v_dll(layouts, num_warps, BLOCK_DV, BLOCK_N):
+    """Extend V async DMA DLL. The FP8 kernel uses a distinct DLL
+    (``make_fp8_extend_v_dll``) that plays nicely with FP8-packed offset
+    bases reused across the phase transition.
+    """
+    if layouts.IS_FP8:
+        return make_fp8_extend_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+    return make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+
+
+@gluon.constexpr_function
+def extend_kt_smem_layout(layouts, BLOCK_DMODEL, BLOCK_N, offset_bases):
+    """Extend K^T padded smem (always 512-byte BF16 interval)."""
+    return make_padded_smem(
+        [BLOCK_DMODEL, BLOCK_N], offset_bases, [[512, layouts.ASYNC_PAD_K.value]]
+    )
+
+
+@gluon.constexpr_function
+def extend_v_smem_layout(layouts, BLOCK_N, BLOCK_DV, offset_bases):
+    """Extend V padded smem (always 512-byte BF16 interval)."""
+    return make_padded_smem(
+        [BLOCK_N, BLOCK_DV], offset_bases, [[512, layouts.ASYNC_PAD_V.value]]
+    )
+
+
+# ---- Runtime helpers ---------------------------------------------------------
+
+# ``prepare_prefix_q_dot`` was prototyped as a @gluon.jit helper, but the
+# Gluon compiler rejects a single JIT function returning two different
+# dtypes from branches (fp8e4nv vs bf16) even when the branch is on a
+# constexpr. The kernel instead inlines a two-line ``if IS_FP8:`` gate
+# at each of the three prefix call sites (4w sw-pipeline, 4w serial,
+# 8w pingpong). See docstring of ExtendAttentionLayouts for the overall
+# Q handling shape; the cast is only needed on the FP8 path.
 
 
 # ===-----------------------------------------------------------------------===#

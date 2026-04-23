@@ -1,15 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Unified Gluon extend-attention kernel for gfx950 (BF16 path).
+"""Unified Gluon extend-attention kernel for gfx950 (BF16 + FP8 KV).
 
-Symmetric heads only (D64, D128, D256). One @gluon.jit entry folds the
-basic, persistent-CTA, and split-K launches behind two constexpr gates:
+Symmetric heads only (D64/D128/D256 for BF16, D64/D128 for FP8). One
+@gluon.jit entry folds the basic, persistent-CTA, split-K launches *and*
+both KV dtypes behind three constexpr gates:
 
     IS_PERSISTENT   : False = basic 3D grid (one CTA per (seq, head, m_tile)),
                       True  = persistent CTA tile-sweep loop (WCA scheduler)
     SPLIT_K         : 1     = no split,
                       >1    = partition prefix KV range across CTAs + reduce
+    IS_FP8          : False = BF16 KV, single-phase smem + BF16 MFMA everywhere
+                      True  = FP8 KV cache; prefix runs native FP8 MFMA on the
+                              cache buffers, extend runs BF16 MFMA on the live
+                              extend tensors. Two-phase smem: the prefix loads
+                              into a wide FP8-padded layout, then _keep_alive()
+                              releases it and the extend phase re-allocates
+                              smem with the narrower BF16 padding.
 
 When IS_PERSISTENT=False the scheduling preamble collapses to a one-shot
 iteration and the split-K branches DCE away, leaving a kernel functionally
@@ -36,7 +44,7 @@ straight to `attn_fwd_inner_prefix_unpipelined`, which masks every block.
 
 from ._common import *  # noqa: F403
 # ===-----------------------------------------------------------------------===#
-# Unified BF16 Kernel
+# Unified BF16 + FP8 KV Kernel
 # ===-----------------------------------------------------------------------===#
 
 
@@ -91,34 +99,56 @@ def gluon_extend_attn_fwd(
     actual_batch_size,  # int32 scalar -- batch count (upper bound for per-CTA inline scan)
     IS_PERSISTENT: gl.constexpr = False,  #
     SPLIT_K: gl.constexpr = 1,  #
+    IS_FP8: gl.constexpr = False,  # True when K_Buffer/V_Buffer are FP8 KV cache
+    EXT_BLOCK_N: gl.constexpr = 0,  # FP8-only extend-phase BLOCK_N (0 => BLOCK_N)
+    EXT_NUM_STAGES: gl.constexpr = 0,  # FP8-only extend-phase NUM_STAGES (0 => NUM_STAGES)
 ):
 
     num_warps: gl.constexpr = gl.num_warps()
 
-    # layouts
-    _mfma: gl.constexpr = make_mfma_dot_layouts(num_warps, 16, 16, 32, 8, 4)
-    mma_layout: gl.constexpr = _mfma[0]
-    q_dot_layout: gl.constexpr = _mfma[1]
-    kt_dot_layout: gl.constexpr = _mfma[2]
-    p_dot_layout: gl.constexpr = _mfma[3]
-    v_dot_layout: gl.constexpr = _mfma[4]
-    _blk: gl.constexpr = make_blocked_and_slice_layouts(num_warps, mma_layout)
-    blocked_layout: gl.constexpr = _blk[0]
-    offs_m_layout: gl.constexpr = _blk[1]
-    offs_d_layout: gl.constexpr = _blk[2]
-    mma_offs_n_col: gl.constexpr = _blk[3]
-    mma_offs_m_row: gl.constexpr = _blk[4]
-    mma_m_layout: gl.constexpr = _blk[5]
+    # All dot / blocked / slice layouts live on a single aggregate. The
+    # IS_FP8 gate flips ``pfx_*`` dot layouts to FP8 k_width (extend stays
+    # BF16), and ``PFX_SMEM_TY`` picks the prefix smem element type.
+    layouts: gl.constexpr = ExtendAttentionLayouts(
+        IS_FP8,
+        num_warps,
+        Q_Extend.dtype.element_ty,
+        K_Buffer.dtype.element_ty,
+    )
 
     BLOCK_DV: gl.constexpr = BLOCK_DMODEL
     ENABLE_MASK_SPLIT: gl.constexpr = BLOCK_DMODEL < 256
     SKIP_PREFIX_CUSTOM_MASK: gl.constexpr = True
-    ASYNC_PAD_K: gl.constexpr = 16
-    ASYNC_PAD_V: gl.constexpr = 16
 
-    offs_m = gl.arange(0, BLOCK_M, layout=offs_m_layout)
-    offs_d = gl.arange(0, BLOCK_DMODEL, layout=offs_d_layout)
-    offs_dv = gl.arange(0, BLOCK_DV, layout=offs_d_layout)
+    # FP8 safety rails: MFMA_F8 at D>=256 hits an unrealized_conversion_cast
+    # in the LLVM backend on gfx950; the dispatcher should never route
+    # FP8 D=256 here, but fail compilation loudly if it does.
+    if IS_FP8:
+        tl.static_assert(
+            BLOCK_DMODEL != 256,
+            "FP8 D=256 is unsupported on gfx950 (MFMA_F8 unrealized_conversion_cast). "
+            "Use BF16 KV cache for D=256 models (Gemma3 etc) or set "
+            "SGLANG_GLUON_FP8_KV_FORCE_BF16=1.",
+        )
+        # FP8 basic-path rails: the D<128 async-DMA layouts don't fit the
+        # v_async_layout register bases; LLVM fails with
+        # unrealized_conversion_cast. Persistent path has a dedicated D<128
+        # branch and does not need the gate.
+        if not IS_PERSISTENT:
+            tl.static_assert(
+                not (num_warps == 4 and NUM_STAGES >= 2 and BLOCK_DMODEL < 128),
+                "FP8 basic: NUM_STAGES>=2 requires BLOCK_DMODEL>=128 on 4-warp path. "
+                "Use NUM_STAGES=1 or route to persistent kernel for D<128.",
+            )
+            tl.static_assert(
+                not (num_warps == 8 and BLOCK_DMODEL < 128),
+                "FP8 basic: 8-warp DMA path is incomplete for BLOCK_DMODEL<128. "
+                "Route to persistent kernel which has a dedicated D<128 branch.",
+            )
+
+    offs_m = gl.arange(0, BLOCK_M, layout=layouts.offs_m_layout)
+    offs_d = gl.arange(0, BLOCK_DMODEL, layout=layouts.offs_d_layout)
+    offs_dv = gl.arange(0, BLOCK_DV, layout=layouts.offs_d_layout)
 
     # USE_PINGPONG switches between the 8-warp pingpong body (requires
     # dedicated memory/compute warp groups and >=2 LDS stages) and the
@@ -226,16 +256,16 @@ def gluon_extend_attn_fwd(
         q = gl.load(q_ptrs, mask=q_mask, other=0.0)
 
         # softmax state
-        m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=mma_m_layout)
-        l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=mma_m_layout)
-        acc = gl.zeros([BLOCK_M, BLOCK_DV], dtype=gl.float32, layout=mma_layout)
+        m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=layouts.mma_m_layout)
+        l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=layouts.mma_m_layout)
+        acc = gl.zeros([BLOCK_M, BLOCK_DV], dtype=gl.float32, layout=layouts.mma_layout)
 
         q_abs_pos = (
             seq_len_prefix
             + cur_block_m * BLOCK_M
-            + gl.arange(0, BLOCK_M, layout=mma_offs_m_row)
+            + gl.arange(0, BLOCK_M, layout=layouts.mma_offs_m_row)
         )
-        q_extend_raw = cur_block_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=mma_offs_m_row)
+        q_extend_raw = cur_block_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=layouts.mma_offs_m_row)
         if USE_CUSTOM_MASK:
             q_extend_offs = tl.minimum(q_extend_raw, tl.maximum(seq_len_extend - 1, 0))
         else:
@@ -246,11 +276,11 @@ def gluon_extend_attn_fwd(
             xai_temperature_reg = gl.where(
                 q_abs_pos > XAI_TEMPERATURE_LEN,
                 tl.log2(q_abs_pos.to(gl.float32)) * inv_log2_len,
-                gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=mma_offs_m_row),
+                gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=layouts.mma_offs_m_row),
             )
         else:
             xai_temperature_reg = gl.full(
-                [BLOCK_M], 1.0, dtype=gl.float32, layout=mma_offs_m_row
+                [BLOCK_M], 1.0, dtype=gl.float32, layout=layouts.mma_offs_m_row
             )
 
         # SWA prefix skip: jump past prefix tiles entirely outside the window.
@@ -293,23 +323,37 @@ def gluon_extend_attn_fwd(
         # vs masked extend blocks we have, and stage the K/V extend base
         # pointers. All three inner-loop paths (4w sw-pipeline, 4w serial,
         # 8w pingpong) consume the same values, so compute once here.
+        # FP8 specificity: the 4w sw-pipeline path uses EXT_BLOCK_N / EXT_NUM_STAGES
+        # for the extend phase (FP8 prefix -> BF16 extend can run a different
+        # tile size); the 4w serial and 8w pingpong paths reuse BLOCK_N /
+        # NUM_STAGES. BF16 always has EXT==PFX (0 sentinel -> BLOCK_N). The
+        # constexpr selects the right pair at compile time, so the preamble
+        # folds to a single block.
+        _SW_PIPELINE_4W: gl.constexpr = (not USE_PINGPONG) and NUM_STAGES >= 2 and BLOCK_DMODEL >= 128
+        _EXT_BN_ACTUAL: gl.constexpr = EXT_BLOCK_N if EXT_BLOCK_N > 0 else BLOCK_N
+        _EXT_NS_ACTUAL: gl.constexpr = EXT_NUM_STAGES if EXT_NUM_STAGES > 0 else NUM_STAGES
+        _EXT_N: gl.constexpr = _EXT_BN_ACTUAL if (IS_FP8 and _SW_PIPELINE_4W) else BLOCK_N
+        _EXT_NS: gl.constexpr = _EXT_NS_ACTUAL if (IS_FP8 and _SW_PIPELINE_4W) else NUM_STAGES
+
         if IS_CAUSAL:
             causal_kv_end = (cur_block_m + 1) * BLOCK_M
             effective_end = tl.minimum(seq_len_extend, causal_kv_end)
         else:
             effective_end = seq_len_extend
-        n_extend_blocks = (effective_end + BLOCK_N - 1) // BLOCK_N
+        n_extend_blocks = (effective_end + _EXT_N - 1) // _EXT_N
         if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
             # One combined dispatch covers the whole range with per-step masking.
             n_full_blocks = 0
-        elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
+        elif SLIDING_WINDOW_SIZE > 0 and (IS_FP8 or effective_end > SLIDING_WINDOW_SIZE):
             # Mixed SWA coverage: fall back to masked dispatch for all blocks.
+            # FP8 takes the fallback whenever SWS>0 (FP8 FA sliding windows
+            # rarely leave a large unmasked bulk; one dispatch is simpler).
             n_full_blocks = 0
         else:
             # Split into unmasked bulk (fast path, no per-step mask) + masked tail.
-            partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
+            partial_block = ((effective_end % _EXT_N) != 0).to(tl.int32)
             if IS_CAUSAL:
-                masked_blocks = ((BLOCK_M + BLOCK_N - 1) // BLOCK_N) + partial_block
+                masked_blocks = ((BLOCK_M + _EXT_N - 1) // _EXT_N) + partial_block
             else:
                 masked_blocks = partial_block
             masked_blocks = tl.minimum(masked_blocks, n_extend_blocks)
@@ -323,7 +367,7 @@ def gluon_extend_attn_fwd(
             swa_first_useful = tl.maximum(
                 cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
             )
-            swa_skip_n_blocks = swa_first_useful // BLOCK_N
+            swa_skip_n_blocks = swa_first_useful // _EXT_N
         else:
             swa_skip_n_blocks = 0
 
@@ -340,36 +384,74 @@ def gluon_extend_attn_fwd(
                 # 4-warp, async DMA K/V loads with NUM_STAGES prefetch depth.
                 # Requires BLOCK_DMODEL>=128 so the register bases fit the
                 # async v-layout; smaller D stays on the serial path.
-                kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
-                kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
-                v_offset_bases: gl.constexpr = make_v_offset_bases(BLOCK_DV, BLOCK_N)
-                v_async_layout: gl.constexpr = make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+                # FP8: prefix uses wide FP8 K tile with 1024-byte smem pad,
+                # then _keep_alive transitions to BF16 smem for the extend
+                # phase (FP8 kernel uses MFMA_F8 on the prefix side and MFMA
+                # on BF16 for the extend tensors).
+                kt_offset_bases: gl.constexpr = prefix_kt_offset_bases(layouts, BLOCK_DMODEL, BLOCK_N)
+                v_offset_bases: gl.constexpr = prefix_v_offset_bases(layouts, num_warps, BLOCK_DV, BLOCK_N)
+                kt_async_layout: gl.constexpr = prefix_kt_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_N)
+                v_async_layout: gl.constexpr = prefix_v_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N)
 
-                kt_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], kt_offset_bases, [[512, ASYNC_PAD_K]])
-                v_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], v_offset_bases, [[512, ASYNC_PAD_V]])
+                kt_smem_layout: gl.constexpr = prefix_kt_smem_layout(layouts, BLOCK_DMODEL, BLOCK_N, kt_offset_bases)
+                v_smem_layout: gl.constexpr = prefix_v_smem_layout(layouts, BLOCK_N, BLOCK_DV, v_offset_bases)
+
+                # Extend-phase layouts (only consumed when IS_FP8: extend
+                # runs in BF16 after a smem dtype transition). BF16 reuses
+                # the prefix layouts and smem directly, so these are
+                # ignored outside the IS_FP8 branch.
+                if IS_FP8:
+                    if _EXT_N == BLOCK_N:
+                        ext_kt_offset_bases: gl.constexpr = kt_offset_bases
+                        ext_v_offset_bases: gl.constexpr = v_offset_bases
+                        ext_kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+                        ext_v_async_layout: gl.constexpr = make_fp8_extend_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+                    else:
+                        ext_kt_offset_bases: gl.constexpr = make_ext_kt_offset_bases(num_warps, BLOCK_DMODEL, _EXT_N)
+                        ext_kt_async_layout: gl.constexpr = make_ext_kt_dll(num_warps, BLOCK_DMODEL, _EXT_N)
+                        ext_v_offset_bases: gl.constexpr = make_ext_v_offset_bases(num_warps, BLOCK_DV, _EXT_N)
+                        ext_v_async_layout: gl.constexpr = make_ext_v_dll(num_warps, BLOCK_DV, _EXT_N)
+                    ext_kt_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, _EXT_N], ext_kt_offset_bases, [[512, 16]])
+                    ext_v_smem_layout: gl.constexpr = make_padded_smem([_EXT_N, BLOCK_DV], ext_v_offset_bases, [[512, 16]])
+                else:
+                    ext_kt_async_layout: gl.constexpr = kt_async_layout
+                    ext_v_async_layout: gl.constexpr = v_async_layout
 
                 kt_smem = gl.allocate_shared_memory(
-                    Q_Extend.dtype.element_ty,
+                    layouts.PFX_SMEM_TY,
                     [NUM_STAGES, BLOCK_DMODEL, BLOCK_N],
                     layout=kt_smem_layout,
                 )
                 v_smem = gl.allocate_shared_memory(
-                    Q_Extend.dtype.element_ty,
+                    layouts.PFX_SMEM_TY,
                     [NUM_STAGES, BLOCK_N, BLOCK_DV],
                     layout=v_smem_layout,
                 )
 
-                if is_valid_tile:
+                if IS_FP8:
                     for _s in gl.static_range(NUM_STAGES):
                         v_zero = gl.zeros(
                             [BLOCK_N, BLOCK_DV],
-                            dtype=Q_Extend.dtype.element_ty,
+                            dtype=layouts.PFX_SMEM_TY,
+                            layout=v_async_layout,
+                        )
+                        v_smem.index(_s).store(v_zero)
+                    gl.barrier()
+                elif is_valid_tile:
+                    for _s in gl.static_range(NUM_STAGES):
+                        v_zero = gl.zeros(
+                            [BLOCK_N, BLOCK_DV],
+                            dtype=layouts.PFX_SMEM_TY,
                             layout=v_async_layout,
                         )
                         v_smem.index(_s).store(v_zero)
                     gl.barrier()
 
-                q_dot = gl.convert_layout(q, q_dot_layout)
+                q_dot = gl.convert_layout(q, layouts.q_dot_layout)
+                if IS_FP8:
+                    pfx_q = gl.convert_layout(q.to(tl.float8e4nv), layouts.pfx_q_dot_layout)
+                else:
+                    pfx_q = gl.convert_layout(q, layouts.pfx_q_dot_layout)
 
                 # Prefix loop: the pipelined helper floor-aligns internally
                 # and runs a masked tail block when needed. Fall back to the
@@ -390,7 +472,7 @@ def gluon_extend_attn_fwd(
                             acc,
                             l_i,
                             m_i,
-                            q_dot,
+                            pfx_q,
                             K_Buffer,
                             V_Buffer,
                             kv_indices,
@@ -423,18 +505,18 @@ def gluon_extend_attn_fwd(
                             NUM_STAGES,
                             kt_async_layout,
                             v_async_layout,
-                            kt_dot_layout,
-                            p_dot_layout,
-                            v_dot_layout,
-                            mma_layout,
-                            mma_offs_n_col,
+                            layouts.pfx_kt_dot_layout,
+                            layouts.pfx_p_dot_layout,
+                            layouts.pfx_v_dot_layout,
+                            layouts.mma_layout,
+                            layouts.mma_offs_n_col,
                         )
                     else:
                         acc, l_i, m_i = attn_fwd_inner_prefix_unpipelined(
                             acc,
                             l_i,
                             m_i,
-                            q_dot,
+                            pfx_q,
                             K_Buffer,
                             V_Buffer,
                             kv_indices,
@@ -466,14 +548,41 @@ def gluon_extend_attn_fwd(
                             BLOCK_DV,
                             kt_async_layout,
                             v_async_layout,
-                            kt_dot_layout,
-                            p_dot_layout,
-                            v_dot_layout,
-                            mma_layout,
-                            mma_offs_n_col,
+                            layouts.pfx_kt_dot_layout,
+                            layouts.pfx_p_dot_layout,
+                            layouts.pfx_v_dot_layout,
+                            layouts.mma_layout,
+                            layouts.mma_offs_n_col,
                         )
 
                 cdna4_async.wait_group(0)
+
+                # FP8 smem transition: prefix smem was allocated with FP8 dtype
+                # + 1024-byte padding; extend phase runs BF16 MFMA, so release
+                # the prefix smem via _keep_alive (kernel-local dealloc) and
+                # re-allocate smem with BF16 dtype + standard 512-byte padding.
+                # BF16 kernel skips this entirely (single-phase smem).
+                if IS_FP8:
+                    kt_smem._keep_alive()
+                    v_smem._keep_alive()
+                    kt_smem = gl.allocate_shared_memory(
+                        Q_Extend.dtype.element_ty,
+                        [_EXT_NS, BLOCK_DMODEL, _EXT_N],
+                        layout=ext_kt_smem_layout,
+                    )
+                    v_smem = gl.allocate_shared_memory(
+                        Q_Extend.dtype.element_ty,
+                        [_EXT_NS, _EXT_N, BLOCK_DV],
+                        layout=ext_v_smem_layout,
+                    )
+                    for _s in gl.static_range(_EXT_NS):
+                        v_zero = gl.zeros(
+                            [_EXT_N, BLOCK_DV],
+                            dtype=Q_Extend.dtype.element_ty,
+                            layout=ext_v_async_layout,
+                        )
+                        v_smem.index(_s).store(v_zero)
+                    gl.barrier()
 
                 # ===---- EXTEND hotloop (4w sw-pipeline) ---------------===
                 # Walks the causal/SWA-clamped extend KV range in two phases,
@@ -487,12 +596,15 @@ def gluon_extend_attn_fwd(
                 #
                 # Each phase has two helpers selected at compile time by the
                 # number of blocks at runtime:
-                #   >= NUM_STAGES  -> pipelined (async DMA, NS-deep prefetch)
-                #   <  NUM_STAGES  -> unpipelined (synchronous, one K/V at a time)
-                # so short runs skip the DMA setup cost.
+                #   >= _EXT_NS  -> pipelined (async DMA, NS-deep prefetch)
+                #   <  _EXT_NS  -> unpipelined (synchronous, one K/V at a time)
+                # so short runs skip the DMA setup cost. On FP8 _EXT_N/_EXT_NS
+                # may differ from BLOCK_N/NUM_STAGES (extend can run a
+                # different tile size from the wider FP8 prefix K tile);
+                # on BF16 they're always equal.
                 #
                 # --- UNMASKED BULK ---
-                if n_full_blocks >= NUM_STAGES:
+                if n_full_blocks >= _EXT_NS:
                     acc, l_i, m_i = attn_fwd_inner_extend_sw_pipeline_4w(
                         acc,
                         l_i,
@@ -521,18 +633,18 @@ def gluon_extend_attn_fwd(
                         USE_CUSTOM_MASK,
                         False,
                         BLOCK_M,
-                        BLOCK_N,
+                        _EXT_N,
                         BLOCK_DMODEL,
                         BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
+                        _EXT_NS,
+                        ext_kt_async_layout,
+                        ext_v_async_layout,
+                        layouts.kt_dot_layout,
+                        layouts.p_dot_layout,
+                        layouts.v_dot_layout,
+                        layouts.mma_layout,
+                        layouts.mma_offs_n_col,
+                        layouts.mma_offs_m_row,
                         SKIP_BOUNDS_CHECK=True,
                     )
                 elif n_full_blocks > 0:
@@ -564,17 +676,17 @@ def gluon_extend_attn_fwd(
                         USE_CUSTOM_MASK,
                         False,
                         BLOCK_M,
-                        BLOCK_N,
+                        _EXT_N,
                         BLOCK_DMODEL,
                         BLOCK_DV,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
+                        ext_kt_async_layout,
+                        ext_v_async_layout,
+                        layouts.kt_dot_layout,
+                        layouts.p_dot_layout,
+                        layouts.v_dot_layout,
+                        layouts.mma_layout,
+                        layouts.mma_offs_n_col,
+                        layouts.mma_offs_m_row,
                     )
                 # --- MASKED TAIL ---
                 # Start at max(n_full_blocks, swa_skip_n_blocks): n_full_blocks
@@ -585,7 +697,7 @@ def gluon_extend_attn_fwd(
                 # / custom-mask / mixed-SWA paths request above.
                 masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
                 remaining_blocks = n_extend_blocks - masked_start
-                if remaining_blocks >= NUM_STAGES:
+                if remaining_blocks >= _EXT_NS:
                     acc, l_i, m_i = attn_fwd_inner_extend_sw_pipeline_4w(
                         acc,
                         l_i,
@@ -614,18 +726,18 @@ def gluon_extend_attn_fwd(
                         USE_CUSTOM_MASK,
                         True,
                         BLOCK_M,
-                        BLOCK_N,
+                        _EXT_N,
                         BLOCK_DMODEL,
                         BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
+                        _EXT_NS,
+                        ext_kt_async_layout,
+                        ext_v_async_layout,
+                        layouts.kt_dot_layout,
+                        layouts.p_dot_layout,
+                        layouts.v_dot_layout,
+                        layouts.mma_layout,
+                        layouts.mma_offs_n_col,
+                        layouts.mma_offs_m_row,
                     )
                 elif remaining_blocks > 0:
                     acc, l_i, m_i = attn_fwd_inner_extend_unpipelined(
@@ -656,17 +768,17 @@ def gluon_extend_attn_fwd(
                         USE_CUSTOM_MASK,
                         True,
                         BLOCK_M,
-                        BLOCK_N,
+                        _EXT_N,
                         BLOCK_DMODEL,
                         BLOCK_DV,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
+                        ext_kt_async_layout,
+                        ext_v_async_layout,
+                        layouts.kt_dot_layout,
+                        layouts.p_dot_layout,
+                        layouts.v_dot_layout,
+                        layouts.mma_layout,
+                        layouts.mma_offs_n_col,
+                        layouts.mma_offs_m_row,
                     )
 
             else:
@@ -674,19 +786,21 @@ def gluon_extend_attn_fwd(
                 # 4-warp, synchronous (NUM_STAGES=1 or D<128). K/V are loaded
                 # into smem via blocked-layout gl.load, no DMA prefetch.
                 # Handles both bulk and masked tail with one helper (serial
-                # helper masks per step).
+                # helper masks per step). SMEM uses the same SwizzledShared
+                # layout across BF16 / FP8; FP8 allocates with PFX_SMEM_TY
+                # for the prefix, then transitions to BF16 for extend.
                 kt_blocked_layout: gl.constexpr = make_serial_kt_blocked(num_warps)
                 kt_serial_smem_layout: gl.constexpr = SERIAL_KT_SMEM
                 v_serial_smem_layout: gl.constexpr = SERIAL_V_SMEM
                 q_smem_layout: gl.constexpr = SERIAL_Q_SMEM
 
                 kt_serial_smem = gl.allocate_shared_memory(
-                    Q_Extend.dtype.element_ty,
+                    layouts.PFX_SMEM_TY,
                     [BLOCK_DMODEL, BLOCK_N],
                     layout=kt_serial_smem_layout,
                 )
                 v_serial_smem = gl.allocate_shared_memory(
-                    Q_Extend.dtype.element_ty,
+                    layouts.PFX_SMEM_TY,
                     [BLOCK_N, BLOCK_DV],
                     layout=v_serial_smem_layout,
                 )
@@ -697,14 +811,18 @@ def gluon_extend_attn_fwd(
                 )
 
                 q_smem.store(q)
-                q_dot = q_smem.load(q_dot_layout)
+                q_dot = q_smem.load(layouts.q_dot_layout)
+                if IS_FP8:
+                    pfx_q = gl.convert_layout(q.to(tl.float8e4nv), layouts.pfx_q_dot_layout)
+                else:
+                    pfx_q = gl.convert_layout(q, layouts.pfx_q_dot_layout)
 
                 if pfx_seq_len > 0:
                     acc, l_i, m_i = attn_fwd_inner_prefix_serial_4w(
                         acc,
                         l_i,
                         m_i,
-                        q_dot,
+                        pfx_q,
                         K_Buffer,
                         V_Buffer,
                         kv_indices,
@@ -735,12 +853,30 @@ def gluon_extend_attn_fwd(
                         BLOCK_DMODEL,
                         BLOCK_DV,
                         kt_blocked_layout,
-                        blocked_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
+                        layouts.blocked_layout,
+                        layouts.pfx_kt_dot_layout,
+                        layouts.pfx_p_dot_layout,
+                        layouts.pfx_v_dot_layout,
+                        layouts.mma_layout,
+                        layouts.mma_offs_n_col,
+                    )
+
+                # FP8 smem transition (serial path): release the FP8 prefix
+                # smem via _keep_alive and re-allocate with BF16 extend dtype.
+                # Same SwizzledSharedLayout (path-invariant); only the
+                # element type changes. BF16 kernel skips this.
+                if IS_FP8:
+                    kt_serial_smem._keep_alive()
+                    v_serial_smem._keep_alive()
+                    kt_serial_smem = gl.allocate_shared_memory(
+                        Q_Extend.dtype.element_ty,
+                        [BLOCK_DMODEL, BLOCK_N],
+                        layout=kt_serial_smem_layout,
+                    )
+                    v_serial_smem = gl.allocate_shared_memory(
+                        Q_Extend.dtype.element_ty,
+                        [BLOCK_N, BLOCK_DV],
+                        layout=v_serial_smem_layout,
                     )
 
                 # ===---- EXTEND hotloop (4w serial) ----------------------===
@@ -785,13 +921,13 @@ def gluon_extend_attn_fwd(
                         BLOCK_DMODEL,
                         BLOCK_DV,
                         kt_blocked_layout,
-                        blocked_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
+                        layouts.blocked_layout,
+                        layouts.kt_dot_layout,
+                        layouts.p_dot_layout,
+                        layouts.v_dot_layout,
+                        layouts.mma_layout,
+                        layouts.mma_offs_n_col,
+                        layouts.mma_offs_m_row,
                     )
                 # --- MASKED TAIL (same helper, different range + IS_MASKED) ---
                 masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
@@ -828,13 +964,13 @@ def gluon_extend_attn_fwd(
                         BLOCK_DMODEL,
                         BLOCK_DV,
                         kt_blocked_layout,
-                        blocked_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
+                        layouts.blocked_layout,
+                        layouts.kt_dot_layout,
+                        layouts.p_dot_layout,
+                        layouts.v_dot_layout,
+                        layouts.mma_layout,
+                        layouts.mma_offs_n_col,
+                        layouts.mma_offs_m_row,
                     )
 
         else:
@@ -842,37 +978,66 @@ def gluon_extend_attn_fwd(
             # 8-warp ping-pong: 4 warps issue async DMA loads while the other
             # 4 warps MFMA on the previous tile, alternating each iteration.
             # Uniform across BLOCK_DMODEL={64, 128, 256}: layout factories
-            # below parametrize on BLOCK_DMODEL directly.
-            kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
-            kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
-            v_offset_bases: gl.constexpr = make_v_offset_bases(BLOCK_DV, BLOCK_N)
-            v_async_layout: gl.constexpr = make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+            # below parametrize on BLOCK_DMODEL directly. FP8 path flips
+            # prefix dot operands + prefix smem padding via `layouts`; on
+            # 8w pingpong EXT_BLOCK_N always equals BLOCK_N (extend reuses
+            # the same tile size), so we only need an FP8 DLL swap.
+            kt_offset_bases: gl.constexpr = prefix_kt_offset_bases(layouts, BLOCK_DMODEL, BLOCK_N)
+            v_offset_bases: gl.constexpr = prefix_v_offset_bases(layouts, num_warps, BLOCK_DV, BLOCK_N)
+            kt_async_layout: gl.constexpr = prefix_kt_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_N)
+            v_async_layout: gl.constexpr = prefix_v_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N)
 
-            kt_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], kt_offset_bases, [[512, ASYNC_PAD_K]])
-            v_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], v_offset_bases, [[512, ASYNC_PAD_V]])
+            kt_async_smem_layout: gl.constexpr = prefix_kt_smem_layout(layouts, BLOCK_DMODEL, BLOCK_N, kt_offset_bases)
+            v_async_smem_layout: gl.constexpr = prefix_v_smem_layout(layouts, BLOCK_N, BLOCK_DV, v_offset_bases)
+
+            # Extend-phase layouts (FP8 only; BF16 reuses prefix layouts).
+            # The 8w pingpong extend shares the FP8 offset-bases ladder
+            # (so the smem transition doesn't change offset layouts) but
+            # swaps the DLLs to BF16-friendly variants.
+            if IS_FP8:
+                ext_kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+                ext_v_async_layout: gl.constexpr = make_fp8_extend_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+                ext_kt_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], kt_offset_bases, [[512, 16]])
+                ext_v_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], v_offset_bases, [[512, 16]])
+            else:
+                ext_kt_async_layout: gl.constexpr = kt_async_layout
+                ext_v_async_layout: gl.constexpr = v_async_layout
 
             kt_smem = gl.allocate_shared_memory(
-                Q_Extend.dtype.element_ty,
+                layouts.PFX_SMEM_TY,
                 [NUM_STAGES, BLOCK_DMODEL, BLOCK_N],
                 layout=kt_async_smem_layout,
             )
             v_smem = gl.allocate_shared_memory(
-                Q_Extend.dtype.element_ty,
+                layouts.PFX_SMEM_TY,
                 [NUM_STAGES, BLOCK_N, BLOCK_DV],
                 layout=v_async_smem_layout,
             )
 
-            if is_valid_tile:
+            if IS_FP8:
                 for _s in gl.static_range(NUM_STAGES):
                     v_zero = gl.zeros(
                         [BLOCK_N, BLOCK_DV],
-                        dtype=Q_Extend.dtype.element_ty,
+                        dtype=layouts.PFX_SMEM_TY,
+                        layout=v_async_layout,
+                    )
+                    v_smem.index(_s).store(v_zero)
+                gl.barrier()
+            elif is_valid_tile:
+                for _s in gl.static_range(NUM_STAGES):
+                    v_zero = gl.zeros(
+                        [BLOCK_N, BLOCK_DV],
+                        dtype=layouts.PFX_SMEM_TY,
                         layout=v_async_layout,
                     )
                     v_smem.index(_s).store(v_zero)
                 gl.barrier()
 
-            q_dot = gl.convert_layout(q, q_dot_layout)
+            q_dot = gl.convert_layout(q, layouts.q_dot_layout)
+            if IS_FP8:
+                pfx_q = gl.convert_layout(q.to(tl.float8e4nv), layouts.pfx_q_dot_layout)
+            else:
+                pfx_q = gl.convert_layout(q, layouts.pfx_q_dot_layout)
 
             # Prefix dispatch (8w pingpong): always pass the full prefix
             # length; the helper floor-aligns to BLOCK_N internally and
@@ -891,7 +1056,7 @@ def gluon_extend_attn_fwd(
                     acc,
                     l_i,
                     m_i,
-                    q_dot,
+                    pfx_q,
                     K_Buffer,
                     V_Buffer,
                     kv_indices,
@@ -924,11 +1089,11 @@ def gluon_extend_attn_fwd(
                     NUM_STAGES,
                     kt_async_layout,
                     v_async_layout,
-                    kt_dot_layout,
-                    p_dot_layout,
-                    v_dot_layout,
-                    mma_layout,
-                    mma_offs_n_col,
+                    layouts.pfx_kt_dot_layout,
+                    layouts.pfx_p_dot_layout,
+                    layouts.pfx_v_dot_layout,
+                    layouts.mma_layout,
+                    layouts.mma_offs_n_col,
                     _use_scalar_mask,
                 )
             elif pfx_seq_len > 0:
@@ -936,7 +1101,7 @@ def gluon_extend_attn_fwd(
                     acc,
                     l_i,
                     m_i,
-                    q_dot,
+                    pfx_q,
                     K_Buffer,
                     V_Buffer,
                     kv_indices,
@@ -968,12 +1133,37 @@ def gluon_extend_attn_fwd(
                     BLOCK_DV,
                     kt_async_layout,
                     v_async_layout,
-                    kt_dot_layout,
-                    p_dot_layout,
-                    v_dot_layout,
-                    mma_layout,
-                    mma_offs_n_col,
+                    layouts.pfx_kt_dot_layout,
+                    layouts.pfx_p_dot_layout,
+                    layouts.pfx_v_dot_layout,
+                    layouts.mma_layout,
+                    layouts.mma_offs_n_col,
                 )
+
+            # FP8 smem transition (8w pingpong): release the FP8 prefix
+            # smem via _keep_alive and re-allocate with BF16 extend dtype
+            # + standard 512-byte padding. BF16 kernel skips this entirely.
+            if IS_FP8:
+                kt_smem._keep_alive()
+                v_smem._keep_alive()
+                kt_smem = gl.allocate_shared_memory(
+                    Q_Extend.dtype.element_ty,
+                    [NUM_STAGES, BLOCK_DMODEL, BLOCK_N],
+                    layout=ext_kt_async_smem_layout,
+                )
+                v_smem = gl.allocate_shared_memory(
+                    Q_Extend.dtype.element_ty,
+                    [NUM_STAGES, BLOCK_N, BLOCK_DV],
+                    layout=ext_v_async_smem_layout,
+                )
+                for _s in gl.static_range(NUM_STAGES):
+                    v_zero = gl.zeros(
+                        [BLOCK_N, BLOCK_DV],
+                        dtype=Q_Extend.dtype.element_ty,
+                        layout=ext_v_async_layout,
+                    )
+                    v_smem.index(_s).store(v_zero)
+                gl.barrier()
 
             # ===---- EXTEND hotloop (8w pingpong) -----------------------===
             # Same two-phase layout as the 4w sw-pipeline path:
@@ -1017,14 +1207,14 @@ def gluon_extend_attn_fwd(
                     BLOCK_DMODEL,
                     BLOCK_DV,
                     NUM_STAGES,
-                    kt_async_layout,
-                    v_async_layout,
-                    kt_dot_layout,
-                    p_dot_layout,
-                    v_dot_layout,
-                    mma_layout,
-                    mma_offs_n_col,
-                    mma_offs_m_row,
+                    ext_kt_async_layout,
+                    ext_v_async_layout,
+                    layouts.kt_dot_layout,
+                    layouts.p_dot_layout,
+                    layouts.v_dot_layout,
+                    layouts.mma_layout,
+                    layouts.mma_offs_n_col,
+                    layouts.mma_offs_m_row,
                 )
             elif n_full_blocks > 0:
                 acc, l_i, m_i = attn_fwd_inner_extend_unpipelined(
@@ -1058,14 +1248,14 @@ def gluon_extend_attn_fwd(
                     BLOCK_N,
                     BLOCK_DMODEL,
                     BLOCK_DV,
-                    kt_async_layout,
-                    v_async_layout,
-                    kt_dot_layout,
-                    p_dot_layout,
-                    v_dot_layout,
-                    mma_layout,
-                    mma_offs_n_col,
-                    mma_offs_m_row,
+                    ext_kt_async_layout,
+                    ext_v_async_layout,
+                    layouts.kt_dot_layout,
+                    layouts.p_dot_layout,
+                    layouts.v_dot_layout,
+                    layouts.mma_layout,
+                    layouts.mma_offs_n_col,
+                    layouts.mma_offs_m_row,
                 )
             # --- MASKED TAIL ---
             masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
@@ -1103,14 +1293,14 @@ def gluon_extend_attn_fwd(
                     BLOCK_DMODEL,
                     BLOCK_DV,
                     NUM_STAGES,
-                    kt_async_layout,
-                    v_async_layout,
-                    kt_dot_layout,
-                    p_dot_layout,
-                    v_dot_layout,
-                    mma_layout,
-                    mma_offs_n_col,
-                    mma_offs_m_row,
+                    ext_kt_async_layout,
+                    ext_v_async_layout,
+                    layouts.kt_dot_layout,
+                    layouts.p_dot_layout,
+                    layouts.v_dot_layout,
+                    layouts.mma_layout,
+                    layouts.mma_offs_n_col,
+                    layouts.mma_offs_m_row,
                 )
             elif remaining_blocks > 0:
                 acc, l_i, m_i = attn_fwd_inner_extend_unpipelined(
@@ -1144,14 +1334,14 @@ def gluon_extend_attn_fwd(
                     BLOCK_N,
                     BLOCK_DMODEL,
                     BLOCK_DV,
-                    kt_async_layout,
-                    v_async_layout,
-                    kt_dot_layout,
-                    p_dot_layout,
-                    v_dot_layout,
-                    mma_layout,
-                    mma_offs_n_col,
-                    mma_offs_m_row,
+                    ext_kt_async_layout,
+                    ext_v_async_layout,
+                    layouts.kt_dot_layout,
+                    layouts.p_dot_layout,
+                    layouts.v_dot_layout,
+                    layouts.mma_layout,
+                    layouts.mma_offs_n_col,
+                    layouts.mma_offs_m_row,
                 )
 
         # sinks
@@ -1168,13 +1358,13 @@ def gluon_extend_attn_fwd(
             po_base = partial_out + split_idx * BLOCK_M * BLOCK_DV
             po_ptrs = po_base + offs_m[:, None] * BLOCK_DV + offs_dv[None, :]
             po_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) < orig_seq_len_extend
-            po_val = gl.convert_layout(acc_normed, blocked_layout)
+            po_val = gl.convert_layout(acc_normed, layouts.blocked_layout)
             gl.store(po_ptrs, po_val, mask=po_mask)
 
             pl_base = partial_lse + split_idx * BLOCK_M
             pl_ptrs = pl_base + offs_m
             pl_mask = (cur_block_m * BLOCK_M + offs_m) < orig_seq_len_extend
-            lse_val = gl.convert_layout(lse, offs_m_layout)
+            lse_val = gl.convert_layout(lse, layouts.offs_m_layout)
             gl.store(pl_ptrs, lse_val, mask=pl_mask)
 
             done = tl.atomic_add(tile_done + output_tile, 1)
@@ -1213,7 +1403,7 @@ def gluon_extend_attn_fwd(
                 r_o_base = O_Extend + cur_seq_q_start_idx * stride_obs + cur_head * stride_oh
                 r_o_offsets = ((cur_block_m * BLOCK_M + offs_m[:, None]) * stride_obs + offs_dv[None, :]).to(tl.int32)
                 r_o_mask = r_m_mask[:, None]
-                out_r = gl.convert_layout(r_acc, blocked_layout).to(O_Extend.dtype.element_ty)
+                out_r = gl.convert_layout(r_acc, layouts.blocked_layout).to(O_Extend.dtype.element_ty)
                 cdna4_buffer_store(out_r, r_o_base, r_o_offsets, mask=r_o_mask)
         else:
             l_recip = 1.0 / l_i
@@ -1223,7 +1413,7 @@ def gluon_extend_attn_fwd(
             o_base = O_Extend + cur_seq_q_start_idx * stride_obs + cur_head * stride_oh
             o_offsets = ((cur_block_m * BLOCK_M + offs_m[:, None]) * stride_obs + offs_dv[None, :]).to(tl.int32)
             o_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) < seq_len_extend
-            out = gl.convert_layout(acc, blocked_layout).to(O_Extend.dtype.element_ty)
+            out = gl.convert_layout(acc, layouts.blocked_layout).to(O_Extend.dtype.element_ty)
             cdna4_buffer_store(out, o_base, o_offsets, mask=o_mask)
 
         if IS_PERSISTENT:

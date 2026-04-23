@@ -33,12 +33,13 @@ import os
 import torch
 import triton
 
-from ._kernel_bf16_gfx950 import (
+from ._kernel_gfx950 import (
     gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric,
 )
-from ._kernel_fp8_gfx950 import (
-    gluon_extend_attn_fwd as _gluon_extend_attn_fwd_symmetric_fp8,
-)
+# FP8 routes through the same unified kernel with IS_FP8=True. Keeping the
+# alias so the existing dispatcher call-sites stay unchanged; the symmetric
+# path below passes IS_FP8 explicitly and the kernel body branches on it.
+_gluon_extend_attn_fwd_symmetric_fp8 = _gluon_extend_attn_fwd_symmetric
 # Unified BF16 kernel. Same JITFunction covers the basic path
 # (IS_PERSISTENT=False) and the WCA persistent / split-K paths
 # (IS_PERSISTENT=True).
@@ -1275,11 +1276,8 @@ def gluon_extend_attention_fwd(
         _vb_s0, _vb_s1 = v_buffer.stride(0), v_buffer.stride(1)
 
         _kernel_extra = {
+            "IS_FP8": True,
             "EXT_BLOCK_N": _EXT_BN, "EXT_NUM_STAGES": _EXT_NS,
-            "SKIP_PREFIX_CUSTOM_MASK": True,
-            "ENABLE_MASK_SPLIT": Lq < 256,
-            "BLOCK_DV": _BLOCK_DMODEL,
-            "ASYNC_PAD_K": _PAD_K, "ASYNC_PAD_V": _PAD_V,
         } if _kv_is_fp8 else {}
 
         _grid = (batch_size, head_num, (max_len_extend + _BM - 1) // _BM)
@@ -1485,11 +1483,9 @@ def gluon_extend_attention_fwd(
     _vb_s0, _vb_s1 = v_buffer.stride(0), v_buffer.stride(1)
 
     _kernel_extra_full = {
-        "EXT_BLOCK_N": EXT_BLOCK_N, "EXT_NUM_STAGES": EXT_NUM_STAGES,
-        "SKIP_PREFIX_CUSTOM_MASK": skip_prefix_custom_mask,
-        "ENABLE_MASK_SPLIT": Lq < 256,
-        "BLOCK_DV": BLOCK_DMODEL,
-        "ASYNC_PAD_K": 16, "ASYNC_PAD_V": 16,
+        "IS_FP8": True,
+        "EXT_BLOCK_N": EXT_BLOCK_N,
+        "EXT_NUM_STAGES": EXT_NUM_STAGES,
     } if _kv_is_fp8 else {}
 
     # Both BF16 and FP8 unified kernels take the persistent-superset
@@ -1720,18 +1716,11 @@ def _launch_persistent_fp8(
         v_buffer.stride(1),
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
-        ENABLE_MASK_SPLIT=enable_mask_split,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=BLOCK_DMODEL,
-        BLOCK_DV=BLOCK_DV,
         NUM_STAGES=NUM_STAGES,
-        EXT_BLOCK_N=EXT_BLOCK_N,
-        EXT_NUM_STAGES=EXT_NUM_STAGES,
-        ASYNC_PAD_K=ASYNC_PAD_K,
-        ASYNC_PAD_V=ASYNC_PAD_V,
         Sinks=sinks,
         HAS_SINK=sinks is not None,
         LOGIT_CAP=logit_cap,
@@ -1748,6 +1737,9 @@ def _launch_persistent_fp8(
         actual_batch_size=batch_size,
         IS_PERSISTENT=True,
         SPLIT_K=SPLIT_K,
+        IS_FP8=True,
+        EXT_BLOCK_N=EXT_BLOCK_N,
+        EXT_NUM_STAGES=EXT_NUM_STAGES,
         num_warps=num_warps,
         num_stages=1,
         waves_per_eu=2,
