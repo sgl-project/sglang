@@ -78,7 +78,16 @@ if [ -n "$RULER_MAX_SEQ" ]; then
     METADATA="${METADATA:-{\"max_seq_lengths\":[$RULER_MAX_SEQ]}}"
 else
     NUM_FEWSHOT="${NUM_FEWSHOT:-5}"
-    MAX_GEN_TOKS="${MAX_GEN_TOKS:-512}"
+    # Per-task max_gen_toks defaults: honor the task YAML's budget when it
+    # exceeds our floor. BBH CoT's lm-eval YAML sets max_gen_toks=1024 and
+    # its CoT chains (dyck_languages, tracking_shuffled_objects, logical_
+    # deduction_seven_objects) routinely need the full budget — 512 truncates
+    # them mid-reasoning and leaves no "So the answer is (X)." tail for the
+    # get-answer filter. Keep the 512 floor for shorter-chain tasks (gsm8k).
+    case "$TASK" in
+        bbh*) MAX_GEN_TOKS="${MAX_GEN_TOKS:-1024}" ;;
+        *)    MAX_GEN_TOKS="${MAX_GEN_TOKS:-512}" ;;
+    esac
     APPLY_CHAT_TEMPLATE="${APPLY_CHAT_TEMPLATE:-1}"
     # Wrap each fewshot exemplar as its own <|im_start|>user/assistant turn so
     # the model sees N examples of "assistant closes with <|im_end|>" before
@@ -115,6 +124,16 @@ if [ -z "${SYSTEM_INSTRUCTION+x}" ]; then
             ;;
         mmlu*|gpqa*|hellaswag|winogrande|arc_*)
             SYSTEM_INSTRUCTION='Please show your choice in the answer field with only the choice letter, e.g., "answer": "C".'
+            ;;
+        bbh*)
+            # lm-eval's BBH get-answer filter is a strict case-sensitive
+            # lookbehind for the literal phrase "the answer is " (regex:
+            # `(?<=the answer is )(.*)(?=.)`). Without this instruction,
+            # Qwen3 paraphrases as "the correct answer is (X)" or "The
+            # answer is (X)." — both miss the regex and score [invalid]
+            # even when the reasoning + final choice are correct. Pin the
+            # exact exit phrase; this only affects formatting, not CoT.
+            SYSTEM_INSTRUCTION='Think step by step and end your response with the exact phrase: "So the answer is (X).", where X is the final answer.'
             ;;
         *)
             # gsm8k intentionally left empty: the 5-shot template already ends
