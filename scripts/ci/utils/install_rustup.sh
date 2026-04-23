@@ -27,9 +27,6 @@ if ! command -v curl >/dev/null 2>&1; then
     fi
 fi
 
-export RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER:-https://rsproxy.cn}"
-export RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://rsproxy.cn/rustup}"
-
 curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path
 
