@@ -31,8 +31,7 @@ SGL_DEVICE float apply_activation_f32(float x_f32) {
   } else if constexpr (kAct == ActivationKind::kGELUTanh) {
     constexpr auto kGeluTanhAlpha = 0.044715f;
     constexpr auto kGeluTanhBeta = 0.7978845608028654f;
-    const float x_cube = x_f32 * x_f32 * x_f32;
-    const float cdf = 0.5f * (1.0f + tanhf(kGeluTanhBeta * (x_f32 + kGeluTanhAlpha * x_cube)));
+    const float cdf = 0.5f * (1.0f + tanhf(kGeluTanhBeta * (x_f32 + kGeluTanhAlpha * x_f32 * x_f32 * x_f32)));
     return x_f32 * cdf;
   } else {
     static_assert(host::dependent_false_v<decltype(kAct)>, "unsupported activation kind");
