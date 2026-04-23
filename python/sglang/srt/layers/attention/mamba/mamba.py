@@ -90,10 +90,15 @@ def mamba_v2_sharded_weight_loader(
                 weight_full_dim_list.append(
                     int(full_dim / full_dim_sum * loaded_weight.size(0))
                 )
-            assert (
-                sum(weight_full_dim_list) == loaded_weight.size(0),
-                f"Padding the loaded weight failed due to sizes are not dividable cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}",
-            )
+            assert sum(weight_full_dim_list) == loaded_weight.size(
+                0
+            ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}"
+            if loaded_weight.size(0) < full_dim_sum:
+                log_info_on_rank0(
+                    logger,
+                    f"Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {full_dim_sum}"
+                    f", where original sizes of {weight_full_dim_list} will be updated to {full_dim_list}",
+                )
 
         # - iterate over the shard specs
         for full_dim, extra, duplicate_groups in shard_spec:
@@ -124,11 +129,6 @@ def mamba_v2_sharded_weight_loader(
             # CPU logic of padding size for qwen3-next
             # TODO : make this common for all mamba.
             if is_cpu() and (loaded_weight.size(0) < full_dim_sum):
-                log_info_on_rank0(
-                    logger,
-                    f"Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {full_dim_sum}"
-                    f", where original sizes of {weight_full_dim_list} will be updated to  {full_dim_list}",
-                )
                 import copy
 
                 loaded_weight_ = copy.deepcopy(loaded_weight)

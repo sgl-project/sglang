@@ -337,10 +337,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                             cpu_split_sizes.append(
                                 int(target_size_sim * split_sizes[i] / split_size_sum)
                             )
-                            assert (
-                                sum(cpu_split_sizes) == target_size_sim,
-                                f"Padding the loaded weight failed due to sizes are not dividable cleanly from {cpu_split_sizes} to {target_size_sim}",
-                            )
+                        assert (
+                            sum(cpu_split_sizes) == target_size_sim
+                        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
                         chunks = loaded_weight.split(cpu_split_sizes, dim=split_dim)
                     else:
                         chunks = loaded_weight.split(split_sizes, dim=split_dim)

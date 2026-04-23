@@ -61,6 +61,24 @@ def get_num_heads_padding_size(tp_size, weight_block_size, head_dim=None):
     return pad_size
 
 
+def resolve_head_dim(cfg, num_heads, is_text_config):
+    # default getting head_dim by hidden_size and num_heads
+    head_dim = cfg.hidden_size // num_heads
+    # update head_dim if specified in model config
+    if is_text_config:
+        if hasattr(cfg.hf_config, "qk_head_dim"):
+            head_dim = cfg.hf_config.qk_head_dim
+        elif hasattr(cfg.hf_text_config, "head_dim"):
+            head_dim = cfg.hf_text_config.head_dim
+        elif hasattr(cfg.hf_config, "head_dim"):
+            head_dim = cfg.hf_config.head_dim
+    else:
+        if hasattr(cfg, "head_dim"):
+            head_dim = cfg.head_dim
+
+    return head_dim
+
+
 def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
     # is_post_update: whether to update an existing config
     from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
@@ -197,13 +215,9 @@ def adjust_config_with_unaligned_cpu_tp(
         total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-        head_dim = model_config.hidden_size // model_config.num_attention_heads
-        if hasattr(model_config.hf_config, "qk_head_dim"):
-            head_dim = model_config.hf_config.qk_head_dim
-        elif hasattr(model_config.hf_text_config, "head_dim"):
-            head_dim = model_config.hf_text_config.head_dim
-        elif hasattr(model_config.hf_config, "head_dim"):
-            head_dim = model_config.hf_config.head_dim
+        head_dim = resolve_head_dim(
+            model_config, model_config.num_attention_heads, True
+        )
 
         pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
@@ -276,10 +290,8 @@ def adjust_config_with_unaligned_cpu_tp(
             if num_heads % tp_size != 0:
                 from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-                multimodal_head_dim = getattr(
-                    getattr(m_config, config_name),
-                    "head_dim",
-                    getattr(m_config, config_name).hidden_size // num_heads,
+                multimodal_head_dim = resolve_head_dim(
+                    getattr(m_config, config_name), num_heads, False
                 )
                 pad_size = get_num_heads_padding_size(
                     tp_size, weight_block_size, multimodal_head_dim
