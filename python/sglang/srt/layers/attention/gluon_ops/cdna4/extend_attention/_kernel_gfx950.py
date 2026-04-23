@@ -161,14 +161,11 @@ def gluon_extend_attn_fwd(
     # sized `total_valid_tiles` via a tight upper bound on sum(ceil(ext_i/BM))
     # so we honor it directly here (no CPU sync, no extra cum_tiles tensor).
     if IS_PERSISTENT:
-        cta_id = gl.program_id(0)
-        tile_idx = cta_id
-        actual_total_valid_tiles = total_valid_tiles
+        tile_idx = gl.program_id(0)
     else:
         tile_idx = 0
-        actual_total_valid_tiles = 1  # unused in non-persistent branch
 
-    while tile_idx < (actual_total_valid_tiles if IS_PERSISTENT else 1):
+    while tile_idx < (total_valid_tiles if IS_PERSISTENT else 1):
         # Per-tile scheduling
         if not IS_PERSISTENT:
             cur_seq = gl.program_id(0)
@@ -426,16 +423,11 @@ def gluon_extend_attn_fwd(
                     layout=v_smem_layout,
                 )
 
-                if IS_FP8:
-                    for _s in gl.static_range(NUM_STAGES):
-                        v_zero = gl.zeros(
-                            [BLOCK_N, BLOCK_DV],
-                            dtype=layouts.PFX_SMEM_TY,
-                            layout=v_async_layout,
-                        )
-                        v_smem.index(_s).store(v_zero)
-                    gl.barrier()
-                elif is_valid_tile:
+                # Zero-fill V smem before the first async load: FP8 always
+                # (the prefix -> BF16-smem transition reads all NUM_STAGES
+                # slots even on short prefixes), BF16 only for valid tiles
+                # (skipped tiles bail before consuming the smem).
+                if IS_FP8 or is_valid_tile:
                     for _s in gl.static_range(NUM_STAGES):
                         v_zero = gl.zeros(
                             [BLOCK_N, BLOCK_DV],
@@ -994,16 +986,11 @@ def gluon_extend_attn_fwd(
                 layout=v_async_smem_layout,
             )
 
-            if IS_FP8:
-                for _s in gl.static_range(NUM_STAGES):
-                    v_zero = gl.zeros(
-                        [BLOCK_N, BLOCK_DV],
-                        dtype=layouts.PFX_SMEM_TY,
-                        layout=v_async_layout,
-                    )
-                    v_smem.index(_s).store(v_zero)
-                gl.barrier()
-            elif is_valid_tile:
+            # Zero-fill V smem before the first async load: FP8 always
+            # (the prefix -> BF16-smem transition reads all NUM_STAGES
+            # slots even on short prefixes), BF16 only for valid tiles
+            # (skipped tiles bail before consuming the smem).
+            if IS_FP8 or is_valid_tile:
                 for _s in gl.static_range(NUM_STAGES):
                     v_zero = gl.zeros(
                         [BLOCK_N, BLOCK_DV],

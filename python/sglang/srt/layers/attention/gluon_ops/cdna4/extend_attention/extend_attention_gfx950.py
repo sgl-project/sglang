@@ -243,6 +243,93 @@ def _ensure_splitk_workspace(total_splits, total_output_tiles, BLOCK_M, BLOCK_DV
     return po, pl, td
 
 
+def _prepare_persistent_masks(
+    q_extend, batch_size, custom_mask, mask_indptr, window_kv_offsets,
+):
+    """Return ``(custom_mask, mask_indptr, window_kv_offsets, USE_CUSTOM_MASK)``
+    with every tensor materialized (dummy when absent). Shared by the BF16
+    and FP8 persistent launchers."""
+    USE_CUSTOM_MASK = custom_mask is not None
+    if not USE_CUSTOM_MASK:
+        custom_mask, mask_indptr, _wkvo = _ensure_dummy_mask_tensors(
+            q_extend.device, q_extend.shape[0], batch_size,
+        )
+        if window_kv_offsets is None:
+            window_kv_offsets = _wkvo
+    elif window_kv_offsets is None:
+        _, _, window_kv_offsets = _ensure_dummy_mask_tensors(
+            q_extend.device, q_extend.shape[0], batch_size,
+        )
+    return custom_mask, mask_indptr, window_kv_offsets, USE_CUSTOM_MASK
+
+
+def _finalize_persistent_grid(
+    *,
+    q_extend,
+    kv_indptr,
+    batch_size,
+    head_num,
+    BLOCK_M,
+    BLOCK_N,
+    BLOCK_DV,
+    device,
+    total_prefix_len,
+    SPLIT_K,
+):
+    """Shared persistent-grid finalization: compute the tight tile count,
+    decide split-K, allocate (or re-use) the workspace, and return the
+    kernel-invocation kwargs shared by BF16 and FP8 launchers.
+
+    Returns ``dict`` with keys:
+        total_valid_tiles, total_output_tiles, total_programs,
+        partial_out, partial_lse, tile_done, SPLIT_K, grid, skip.
+    ``skip=True`` signals the launcher to return immediately (empty work).
+    """
+    total_extend_rows = q_extend.shape[0]
+    total_output_tiles = (
+        (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
+    ) * head_num
+    if total_output_tiles == 0:
+        return {"skip": True}
+
+    num_CUs = _get_num_CUs(device)
+
+    if SPLIT_K <= 1:
+        SPLIT_K = 1
+        if total_output_tiles < num_CUs:
+            if total_prefix_len is not None:
+                avg_kv_len = total_prefix_len // max(1, batch_size)
+            else:
+                avg_kv_len = int((kv_indptr[-1] - kv_indptr[0]).item()) // max(1, batch_size)
+            if avg_kv_len >= 4 * BLOCK_N:
+                SPLIT_K = _select_k_splits(total_output_tiles, num_CUs)
+
+    if SPLIT_K > 1:
+        total_splits = total_output_tiles * SPLIT_K
+        partial_out, partial_lse, tile_done = _ensure_splitk_workspace(
+            total_splits, total_output_tiles, BLOCK_M, BLOCK_DV, device,
+        )
+        total_valid_tiles = total_splits
+    else:
+        partial_out = _ensure_splitk_dummy(device)
+        partial_lse = _ensure_splitk_dummy(device)
+        tile_done = _ensure_splitk_dummy(device)
+        total_valid_tiles = total_output_tiles
+
+    total_programs = _select_persistent_grid(total_valid_tiles, num_CUs)
+    return {
+        "skip": False,
+        "total_valid_tiles": total_valid_tiles,
+        "total_output_tiles": total_output_tiles,
+        "total_programs": total_programs,
+        "partial_out": partial_out,
+        "partial_lse": partial_lse,
+        "tile_done": tile_done,
+        "SPLIT_K": SPLIT_K,
+        "grid": (total_programs,),
+    }
+
+
 def _launch_persistent(
     q_extend,
     k_extend,
@@ -272,22 +359,15 @@ def _launch_persistent(
     Lq = q_extend.shape[-1]
     BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
-    USE_CUSTOM_MASK = custom_mask is not None
-    _batch_size_prelim = qo_indptr.shape[0] - 1
-    if not USE_CUSTOM_MASK:
-        custom_mask, mask_indptr, _wkvo_dummy = _ensure_dummy_mask_tensors(
-            q_extend.device, q_extend.shape[0], _batch_size_prelim,
+    batch_size = qo_indptr.shape[0] - 1
+    custom_mask, mask_indptr, window_kv_offsets, USE_CUSTOM_MASK = (
+        _prepare_persistent_masks(
+            q_extend, batch_size, custom_mask, mask_indptr, window_kv_offsets,
         )
-        if window_kv_offsets is None:
-            window_kv_offsets = _wkvo_dummy
-    elif window_kv_offsets is None:
-        _, _, window_kv_offsets = _ensure_dummy_mask_tensors(
-            q_extend.device, q_extend.shape[0], _batch_size_prelim,
-        )
+    )
     assert q_extend.shape[1] % k_extend.shape[1] == 0
 
     BLOCK_N = 32 if BLOCK_DMODEL >= 256 else 64
-    batch_size = qo_indptr.shape[0] - 1
 
     if min_len_extend is None:
         # Conservative fallback; the GPU-computed min would cost ~6ms of
@@ -363,51 +443,35 @@ def _launch_persistent(
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     device = q_extend.device
-    total_output_tiles_upper = (
-        batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M)
-    )
-    if total_output_tiles_upper == 0:
+    # BF16 cheap degenerate guard: if ``max_len_extend`` is 0 the tight
+    # tile bound below over-provisions one tile per head anyway; catch
+    # that case with the loose upper bound so we don't launch a no-op
+    # grid on totally empty inputs.
+    if batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M) == 0:
         return
 
-    # Tight sync-free upper bound on sum(ceil(ext_i / BM)). For
-    # heterogeneous batches this is 3-4x smaller than the loose bound
-    # ``batch * ceil(max_ext/BM)`` -- the kernel's inline WCA scan
-    # tolerates the over-provisioned slots with a cheap validity check.
-    total_extend_rows = q_extend.shape[0]
-    total_output_tiles = (
-        (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
-    ) * head_num
+    _gfinal = _finalize_persistent_grid(
+        q_extend=q_extend,
+        kv_indptr=kv_indptr,
+        batch_size=batch_size,
+        head_num=head_num,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DV=BLOCK_DMODEL,
+        device=device,
+        total_prefix_len=total_prefix_len,
+        SPLIT_K=1,
+    )
+    if _gfinal["skip"]:
+        return
 
-    num_CUs = _get_num_CUs(device)
-
-    # Split-K fires whenever the non-split persistent grid underfills the
-    # GPU and the prefix is long enough that partitioning its reduction
-    # across CTAs pays off. The per-split reduction (LSE-rescale) in the
-    # kernel epilogue is tile-agnostic -- all configs covered by the
-    # auto-dispatch are safe.
-    SPLIT_K = 1
-    if total_output_tiles < num_CUs:
-        if total_prefix_len is not None:
-            avg_kv_len = total_prefix_len // max(1, batch_size)
-        else:
-            avg_kv_len = int((kv_indptr[-1] - kv_indptr[0]).item()) // max(1, batch_size)
-        if avg_kv_len >= 4 * BLOCK_N:
-            SPLIT_K = _select_k_splits(total_output_tiles, num_CUs)
-
-    if SPLIT_K > 1:
-        total_splits = total_output_tiles * SPLIT_K
-        partial_out, partial_lse, tile_done = _ensure_splitk_workspace(
-            total_splits, total_output_tiles, BLOCK_M, BLOCK_DMODEL, device,
-        )
-        total_valid_tiles = total_splits
-    else:
-        partial_out = _ensure_splitk_dummy(device)
-        partial_lse = _ensure_splitk_dummy(device)
-        tile_done = _ensure_splitk_dummy(device)
-        total_valid_tiles = total_output_tiles
-
-    total_programs = _select_persistent_grid(total_valid_tiles, num_CUs)
-    grid = (total_programs,)
+    total_valid_tiles = _gfinal["total_valid_tiles"]
+    total_programs = _gfinal["total_programs"]
+    partial_out = _gfinal["partial_out"]
+    partial_lse = _gfinal["partial_lse"]
+    tile_done = _gfinal["tile_done"]
+    SPLIT_K = _gfinal["SPLIT_K"]
+    grid = _gfinal["grid"]
 
     _enable_prefix_unmasked = enable_prefix_unmasked
     _has_sink = sinks is not None
@@ -1548,22 +1612,15 @@ def _launch_persistent_fp8(
     Lq = q_extend.shape[-1]
     BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
-    USE_CUSTOM_MASK = custom_mask is not None
-    _bs_fp8 = qo_indptr.shape[0] - 1
-    if not USE_CUSTOM_MASK:
-        custom_mask, mask_indptr, _wkvo_dummy_fp8 = _ensure_dummy_mask_tensors(
-            q_extend.device, q_extend.shape[0], _bs_fp8,
+    batch_size = qo_indptr.shape[0] - 1
+    custom_mask, mask_indptr, window_kv_offsets, USE_CUSTOM_MASK = (
+        _prepare_persistent_masks(
+            q_extend, batch_size, custom_mask, mask_indptr, window_kv_offsets,
         )
-        if window_kv_offsets is None:
-            window_kv_offsets = _wkvo_dummy_fp8
-    elif window_kv_offsets is None:
-        _, _, window_kv_offsets = _ensure_dummy_mask_tensors(
-            q_extend.device, q_extend.shape[0], _bs_fp8,
-        )
+    )
     assert q_extend.shape[1] % k_extend.shape[1] == 0
 
     BLOCK_DV = BLOCK_DMODEL
-    batch_size = qo_indptr.shape[0] - 1
 
     if min_len_extend is None:
         min_len_extend = max_len_extend
@@ -1627,44 +1684,28 @@ def _launch_persistent_fp8(
 
     device = q_extend.device
 
-    # Tight sync-free upper bound on sum(ceil(ext_i / BM)). For heterogeneous
-    # batches this is 3-4x smaller than ``batch * ceil(max_ext/BM)``; the
-    # kernel's inline WCA scan tolerates the over-provisioned slots via a
-    # cheap validity check. Mirrors the BF16 ``_launch_persistent`` above.
-    total_extend_rows = q_extend.shape[0]
-    total_output_tiles = (
-        (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
-    ) * head_num
-
-    if total_output_tiles == 0:
+    _gfinal = _finalize_persistent_grid(
+        q_extend=q_extend,
+        kv_indptr=kv_indptr,
+        batch_size=batch_size,
+        head_num=head_num,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DV=BLOCK_DV,
+        device=device,
+        total_prefix_len=total_prefix_len,
+        SPLIT_K=SPLIT_K,
+    )
+    if _gfinal["skip"]:
         return
 
-    num_CUs = _get_num_CUs(device)
-
-    if SPLIT_K <= 1:
-        SPLIT_K = 1
-        if total_output_tiles < num_CUs:
-            if total_prefix_len is not None:
-                avg_kv_len = total_prefix_len // max(1, batch_size)
-            else:
-                avg_kv_len = int((kv_indptr[-1] - kv_indptr[0]).item()) // max(1, batch_size)
-            if avg_kv_len >= 4 * BLOCK_N:
-                SPLIT_K = _select_k_splits(total_output_tiles, num_CUs)
-
-    if SPLIT_K > 1:
-        total_splits = total_output_tiles * SPLIT_K
-        partial_out, partial_lse, tile_done = _ensure_splitk_workspace(
-            total_splits, total_output_tiles, BLOCK_M, BLOCK_DV, device,
-        )
-        total_valid_tiles = total_splits
-    else:
-        partial_out = _ensure_splitk_dummy(device)
-        partial_lse = _ensure_splitk_dummy(device)
-        tile_done = _ensure_splitk_dummy(device)
-        total_valid_tiles = total_output_tiles
-
-    total_programs = _select_persistent_grid(total_valid_tiles, num_CUs)
-    grid = (total_programs,)
+    total_valid_tiles = _gfinal["total_valid_tiles"]
+    total_programs = _gfinal["total_programs"]
+    partial_out = _gfinal["partial_out"]
+    partial_lse = _gfinal["partial_lse"]
+    tile_done = _gfinal["tile_done"]
+    SPLIT_K = _gfinal["SPLIT_K"]
+    grid = _gfinal["grid"]
 
     _kernel[grid](
         q_extend,
