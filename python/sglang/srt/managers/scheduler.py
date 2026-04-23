@@ -65,6 +65,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.mamba.ops import (
@@ -1339,6 +1340,44 @@ class Scheduler(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
 
+    def _abort_all_and_rebalance_on_rank_fault(self):
+        """Rank fault detected: drain GPU, abort every in-flight request
+        (release KV + notify tokenizer), then rebalance experts and mark
+        the new snapshot as handled."""
+        self.result_queue.clear()
+        torch.cuda.synchronize()
+
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            abort_reason = FINISH_ABORT(
+                message="Elastic EP rank fault; aborted, please retry.",
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                err_type="ElasticEPRankFault",
+            )
+            for idx, req in enumerate(self.running_batch.reqs):
+                req.finished_reason = abort_reason
+                # schedule_batch.Req is not an io_struct.BaseReq, so SenderWrapper
+                # will not auto-propagate the IPC name; set it explicitly so
+                # MultiTokenizerRouter can route the abort to the right worker.
+                self.send_to_tokenizer.send_output(
+                    AbortReq(
+                        finished_reason=abort_reason.to_json(),
+                        rid=req.rid,
+                        http_worker_ipc=req.http_worker_ipc,
+                    ),
+                    req,
+                )
+                self.running_batch.release_req(idx, 0, self.server_args)
+            self.running_batch.filter_batch(keep_indices=[])
+        self.last_batch = self.cur_batch = None
+
+        gen = self.tp_worker.model_runner.eplb_manager.rebalance()
+        while True:
+            try:
+                next(gen)
+            except StopIteration:
+                break
+        ElasticEPStateManager.instance().mark_snapshot_handled()
+
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
 
@@ -1400,10 +1439,24 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
-            # Process the results of the last batch
+        _elastic_state = ElasticEPStateManager.instance()
+
+        def pop_and_process() -> bool:
+            """Commit the oldest result_queue entry. Returns True normally.
+            When elastic EP is enabled, syncing copy_done also flushes the
+            submit_active_snapshot async copy (same forward_stream, recorded
+            earlier); if the resulting snapshot differs from the last
+            handled one, the abort helper cleans up and we return False so
+            the caller skips the rest of the iteration."""
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if _elastic_state is not None:
+                if tmp_result.copy_done is not None:
+                    tmp_result.copy_done.synchronize()
+                if _elastic_state.is_stale_snapshot():
+                    self._abort_all_and_rebalance_on_rank_fault()
+                    return False
             self.process_batch_result(tmp_batch, tmp_result)
+            return True
 
         while True:
             # Receive requests
@@ -1420,7 +1473,8 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                if not pop_and_process():
+                    continue
 
             # Launch the current batch
             if batch:
@@ -1433,7 +1487,8 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    if not pop_and_process():
+                        continue
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
