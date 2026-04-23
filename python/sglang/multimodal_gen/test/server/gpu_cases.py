@@ -172,7 +172,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             extras=[
-                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode original"
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
             ],
         ),
         T2I_sampling_params,
