@@ -807,6 +807,11 @@ class PiecewiseCudaGraphRunner:
                             if output.hidden_states is not None
                             else None
                         ),
+                        mm_input_embeds=(
+                            output.mm_input_embeds[: self.raw_num_tokens]
+                            if output.mm_input_embeds is not None
+                            else None
+                        ),
                     )
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output
