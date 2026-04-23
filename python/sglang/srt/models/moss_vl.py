@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
@@ -194,7 +195,7 @@ class MossVLVisionPatchMerger(nn.Module):
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
-        base_hidden_size = config.hidden_size * (config.spatial_merge_size ** 2)
+        base_hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.input_hidden_size = base_hidden_size * (1 + num_deepstack_features)
         self.hidden_size = config.hidden_size
 
@@ -252,7 +253,7 @@ class MossVLVisionModel(nn.Module):
         self.num_position_embeddings = config.num_position_embeddings
         self.patch_size = config.patch_size
         self.spatial_merge_size = config.spatial_merge_size
-        self.spatial_merge_unit = self.spatial_merge_size ** 2
+        self.spatial_merge_unit = self.spatial_merge_size**2
         self.temporal_patch_size = config.temporal_patch_size
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
 
@@ -322,7 +323,7 @@ class MossVLVisionModel(nn.Module):
         return rotary_pos_emb
 
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        num_grid_per_side = int(self.num_position_embeddings ** 0.5)
+        num_grid_per_side = int(self.num_position_embeddings**0.5)
         grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
         device = self.pos_embed.weight.device
         dtype = self.pos_embed.weight.dtype
@@ -364,12 +365,12 @@ class MossVLVisionModel(nn.Module):
                 idx_parts[i].append(indices[i])
                 weight_parts[i].append(weights[i])
 
-        idx_tensor = torch.stack(
-            [torch.cat(parts) for parts in idx_parts]
-        ).to(dtype=torch.long)
-        weight_tensor = torch.stack(
-            [torch.cat(parts) for parts in weight_parts]
-        ).to(dtype=dtype)
+        idx_tensor = torch.stack([torch.cat(parts) for parts in idx_parts]).to(
+            dtype=torch.long
+        )
+        weight_tensor = torch.stack([torch.cat(parts) for parts in weight_parts]).to(
+            dtype=dtype
+        )
         pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
@@ -486,11 +487,13 @@ class MossVLTextCrossAttention(nn.Module):
             self.num_key_value_heads // self.model_parallel_size
         )
         self.hidden_size = config.hidden_size
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // self.num_heads)
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // self.num_heads
+        )
         self.layer_id = layer_id
         self.q_local_size = self.num_local_heads * self.head_dim
         self.kv_local_size = self.num_local_key_value_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
 
         # Query projection from text hidden states
         self.q_proj = ColumnParallelLinear(
@@ -528,9 +531,7 @@ class MossVLTextCrossAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.rope_theta = getattr(config, "rope_theta", 1000000)
-        self.max_position_embeddings = getattr(
-            config, "max_position_embeddings", 32768
-        )
+        self.max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -593,9 +594,7 @@ class MossVLTextCrossAttention(nn.Module):
         states = states.view(num_tokens, -1, rotary_emb.head_size)
         states_rot = states[..., : rotary_emb.rotary_dim]
         states_pass = states[..., rotary_emb.rotary_dim :]
-        states_rot = apply_rotary_emb(
-            states_rot, cos, sin, rotary_emb.is_neox_style
-        )
+        states_rot = apply_rotary_emb(states_rot, cos, sin, rotary_emb.is_neox_style)
         states = torch.cat((states_rot, states_pass), dim=-1).reshape(states_shape)
         return states
 
@@ -765,10 +764,12 @@ class MossVLSelfAttention(nn.Module):
         else:
             assert attn_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // self.total_num_heads)
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // self.total_num_heads
+        )
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.rope_theta = getattr(config, "rope_theta", 1000000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
@@ -1079,9 +1080,7 @@ class MossVLForConditionalGeneration(nn.Module):
         )
 
         # Learnable separator token
-        self.separator_token = nn.Parameter(
-            torch.zeros(vision_config.out_hidden_size)
-        )
+        self.separator_token = nn.Parameter(torch.zeros(vision_config.out_hidden_size))
 
         self.is_mrope_enabled = (
             hasattr(text_config, "rope_scaling")
@@ -1110,7 +1109,7 @@ class MossVLForConditionalGeneration(nn.Module):
         if grid_thw.numel() == 0:
             return 0
 
-        merge_square = self.spatial_merge_size ** 2
+        merge_square = self.spatial_merge_size**2
         tokens_per_media = torch.prod(grid_thw, dim=1) // merge_square
         num_frames_per_media = grid_thw[:, 0]
         # Each frame contributes tokens_per_frame vision tokens + 1 separator
@@ -1199,7 +1198,7 @@ class MossVLForConditionalGeneration(nn.Module):
         Input: packed vision tokens from ViT (no separators)
         Output: packed vision tokens with separator tokens inserted after each frame
         """
-        merge_square = self.spatial_merge_size ** 2
+        merge_square = self.spatial_merge_size**2
         tokens_per_media = (
             grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
         ) // merge_square
@@ -1241,7 +1240,8 @@ class MossVLForConditionalGeneration(nn.Module):
         # cross_attention_states is already packed (total_tokens, hidden_size)
         # We need to split it according to encoder_lens_need
         result = torch.zeros(
-            total_encoder_len, head_dim,
+            total_encoder_len,
+            head_dim,
             device=cross_attention_states.device,
             dtype=cross_attention_states.dtype,
         )
@@ -1256,9 +1256,9 @@ class MossVLForConditionalGeneration(nn.Module):
                         f"{encoder_len} tokens, but only "
                         f"{cross_attention_states.shape[0] - src_offset} remaining."
                     )
-                result[dst_offset : dst_offset + encoder_len] = (
-                    cross_attention_states[src_offset : src_offset + encoder_len]
-                )
+                result[dst_offset : dst_offset + encoder_len] = cross_attention_states[
+                    src_offset : src_offset + encoder_len
+                ]
             src_offset += encoder_len
             dst_offset += encoder_len
 
@@ -1310,7 +1310,7 @@ class MossVLForConditionalGeneration(nn.Module):
             FlashInfer packed row-major format, or None when no frame-level
             mask is needed.
         """
-        merge_square = self.spatial_merge_size ** 2
+        merge_square = self.spatial_merge_size**2
         device = forward_batch.seq_lens.device
 
         mask_parts = []
@@ -1327,9 +1327,7 @@ class MossVLForConditionalGeneration(nn.Module):
             if kv_len == 0 or q_len == 0:
                 continue
 
-            mm_input = (
-                forward_batch.mm_inputs[i] if forward_batch.mm_inputs else None
-            )
+            mm_input = forward_batch.mm_inputs[i] if forward_batch.mm_inputs else None
             if mm_input is None:
                 mask_parts.append(
                     torch.ones(q_len * kv_len, dtype=torch.uint8, device=device)
@@ -1374,13 +1372,11 @@ class MossVLForConditionalGeneration(nn.Module):
             # is the cached-text offset into the full text sequence.
             text_offset = extend_prefix_len
 
-            vis_counts = visible_frame_counts[
-                text_offset : text_offset + q_len
-            ].to(device)
-
-            mask = torch.zeros(
-                q_len, kv_len, dtype=torch.uint8, device=device
+            vis_counts = visible_frame_counts[text_offset : text_offset + q_len].to(
+                device
             )
+
+            mask = torch.zeros(q_len, kv_len, dtype=torch.uint8, device=device)
 
             for f, (start, end) in enumerate(frame_ranges):
                 clamped_end = min(end, kv_len)
@@ -1445,9 +1441,7 @@ class MossVLForConditionalGeneration(nn.Module):
                 full_text_row_masked_out_mask[i] = visible_frame_counts[-1] > 0
         else:
             device = forward_batch.seq_lens.device
-            total_extend_len = int(
-                forward_batch.extend_seq_lens.sum().item()
-            )
+            total_extend_len = int(forward_batch.extend_seq_lens.sum().item())
             full_text_row_masked_out_mask = torch.zeros(
                 total_extend_len, dtype=torch.bool, device=device
             )
@@ -1466,18 +1460,16 @@ class MossVLForConditionalGeneration(nn.Module):
                     continue
 
                 mm_input = (
-                    forward_batch.mm_inputs[i]
-                    if forward_batch.mm_inputs
-                    else None
+                    forward_batch.mm_inputs[i] if forward_batch.mm_inputs else None
                 )
                 visible_frame_counts = (
                     mm_input.visible_frame_counts if mm_input else None
                 )
 
                 if visible_frame_counts is None:
-                    full_text_row_masked_out_mask[
-                        offset : offset + extend_seq_len
-                    ] = True
+                    full_text_row_masked_out_mask[offset : offset + extend_seq_len] = (
+                        True
+                    )
                     offset += extend_seq_len
                     continue
 
@@ -1488,9 +1480,16 @@ class MossVLForConditionalGeneration(nn.Module):
                 vis_counts = visible_frame_counts[
                     text_offset : text_offset + extend_seq_len
                 ].to(device)
-                full_text_row_masked_out_mask[
-                    offset : offset + extend_seq_len
-                ] = vis_counts > 0
+                full_text_row_masked_out_mask[offset : offset + extend_seq_len] = (
+                    vis_counts > 0
+                )
+
+                # Last prefill chunk for this request: decode will only need
+                # visible_frame_counts[-1], so shrink the tensor to that single
+                # element and drop the rest. .clone() detaches the view from
+                # the original storage so the large tensor can be freed.
+                if text_offset + extend_seq_len >= visible_frame_counts.shape[0]:
+                    mm_input.visible_frame_counts = visible_frame_counts[-1:].clone()
 
                 offset += extend_seq_len
 
@@ -1506,8 +1505,6 @@ class MossVLForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
@@ -1545,6 +1542,21 @@ class MossVLForConditionalGeneration(nn.Module):
             cross_attention_states = self.flat_encoder_result(
                 vision_with_sep, encoder_lens_need
             )
+            # Drop heavy per-request vision tensors now that the encoder KV
+            # has been produced and will be cached. Otherwise pixel_values and
+            # vision_position_ids stay pinned on req.multimodal_inputs across
+            # the entire decode phase. (visible_frame_counts is shrunk to a
+            # single scalar element at the end of the last prefill chunk in
+            # get_full_text_row_masked_out_mask, so decode still works.)
+            # Note: the local `vision_position_ids` is still needed by the LM
+            # cross-attention below, so we keep it; but we drop the per-request
+            # copy on mm_input, which we won't read again.
+            del pixel_values, vision_hidden_states, vision_with_sep
+            for i, mm_input in enumerate(forward_batch.mm_inputs):
+                if forward_batch.encoder_cached[i] or mm_input is None:
+                    continue
+                mm_input.release_features()
+                mm_input.vision_position_ids = None
 
         # 4. Run language model with cross attention
         hidden_states = self.language_model(
@@ -1589,11 +1601,11 @@ class MossVLForConditionalGeneration(nn.Module):
             if name == "lm_head.weight":
                 name = "language_model.lm_head.weight"
             elif name.startswith("model.language_model."):
-                name = "language_model.model." + name[len("model.language_model."):]
+                name = "language_model.model." + name[len("model.language_model.") :]
             elif name.startswith("model.visual."):
-                name = name[len("model."):]
+                name = name[len("model.") :]
             elif name.startswith("model.separator_token"):
-                name = name[len("model."):]
+                name = name[len("model.") :]
 
             # VisionAttention stores fused QKV weights under qkv_proj in SGLang.
             if "visual." in name:
