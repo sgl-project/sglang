@@ -760,12 +760,20 @@ if [[ "$PD_ROLE" == "decode" ]]; then
     if bool_is_true "$ENABLE_ROUTER"; then
         ROUTER_LOG="${CASE_DIR}/router.log"
         log "Launching router at ${ROUTER_HOST}:${ROUTER_PORT}..."
+        # Health check tuning: default timeout=5s fails under high-concurrency
+        # stress because prefill's uvicorn /health shares its event loop with
+        # /generate (which is running 2048-token forwards).  Bump timeout to
+        # 120s and failure threshold to 20 so legitimate slow health responses
+        # aren't treated as the worker being dead.  Tunable via env.
         python -m sglang_router.launch_router \
             --pd-disaggregation \
             --prefill "$PREFILL_URL" "$DISAGG_BOOTSTRAP_PORT" \
             --decode "http://localhost:${DECODE_PORT}" \
             --host "$ROUTER_HOST" \
             --port "$ROUTER_PORT" \
+            --health-check-timeout-secs "${ROUTER_HEALTH_TIMEOUT_SECS:-120}" \
+            --health-check-interval-secs "${ROUTER_HEALTH_INTERVAL_SECS:-60}" \
+            --health-failure-threshold "${ROUTER_HEALTH_FAILURE_THRESHOLD:-20}" \
             > "$ROUTER_LOG" 2>&1 &
         ROUTER_PID=$!
         log "Router PID: $ROUTER_PID"
