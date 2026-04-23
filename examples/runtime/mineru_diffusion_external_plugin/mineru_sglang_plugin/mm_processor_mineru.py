@@ -18,12 +18,11 @@ class MinerUDiffusionProcessor(QwenVLImageProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        if not self.server_args.disable_fast_image_processor:
-            logger.warning(
-                "Disable fast image processor for MinerU to avoid tokenizer "
-                "kwargs incompatibility (`device` argument)."
+        if not server_args.disable_fast_image_processor:
+            raise ValueError(
+                "MinerU external processor requires --disable-fast-image-processor. "
+                "Please set it in launch args to avoid tokenizer kwargs incompatibility."
             )
-        self.server_args.disable_fast_image_processor = True
 
         if self.model_type == "mineru_diffusion":
             logger.info(

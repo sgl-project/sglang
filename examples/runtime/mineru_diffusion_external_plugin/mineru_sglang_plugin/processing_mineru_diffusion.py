@@ -8,7 +8,7 @@ from transformers.image_utils import load_image
 from transformers.processing_utils import ProcessorMixin
 
 
-class MinerUDiffusionProcessor(ProcessorMixin):
+class MinerUDiffusionHFProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
     optional_attributes = ["chat_template"]
@@ -56,26 +56,25 @@ class MinerUDiffusionProcessor(ProcessorMixin):
         }
 
     def _expand_image_tokens(self, text, image_grid_thw):
-        expanded_text = list(text)
         image_token_lengths = (image_grid_thw.prod(dim=1) // (self.downsample_size**2)).tolist()
         image_index = 0
-        for index in range(len(expanded_text)):
-            while self.image_token in expanded_text[index]:
+        new_text = []
+        for t in text:
+            parts = t.split(self.image_token)
+            expanded_t = parts[0]
+            for i in range(1, len(parts)):
                 if image_index >= len(image_token_lengths):
                     raise ValueError("Wrong image token count, more image tokens than processed images.")
-                expanded_text[index] = expanded_text[index].replace(
-                    self.image_token,
-                    "<|placeholder|>" * image_token_lengths[image_index],
-                    1,
-                )
+                expanded_t += self.image_token * image_token_lengths[image_index]
+                expanded_t += parts[i]
                 image_index += 1
-            expanded_text[index] = expanded_text[index].replace("<|placeholder|>", self.image_token)
+            new_text.append(expanded_t)
         if image_index != len(image_token_lengths):
             raise ValueError(
                 "Wrong image token count, "
                 f"image_token_count({image_index}) != image_count({len(image_token_lengths)})"
             )
-        return expanded_text
+        return new_text
 
     @staticmethod
     def _count_image_embeds(image_grid_thw, downsample_size):
@@ -133,3 +132,7 @@ class MinerUDiffusionProcessor(ProcessorMixin):
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
         return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
+
+
+# Backward-compatible alias for external imports using previous class name.
+MinerUDiffusionProcessor = MinerUDiffusionHFProcessor

@@ -40,6 +40,7 @@ export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=mineru_sglang_plugin
 python -m sglang.launch_server \
   --model-path /path/to/model \
   --enable-multimodal \
+  --disable-fast-image-processor \
   --dllm-algorithm LowConfidence \
   --dllm-algorithm-config /path/to/dllm_config.yaml
 ```
