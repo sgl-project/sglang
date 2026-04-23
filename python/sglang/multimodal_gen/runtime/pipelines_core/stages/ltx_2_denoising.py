@@ -228,9 +228,9 @@ class LTX2DenoisingStage(DenoisingStage):
 
     @staticmethod
     def _ltx2_channelwise_normalize(noise: torch.Tensor) -> torch.Tensor:
-        return noise.sub_(
-            noise.mean(dim=(-2, -1), keepdim=True)
-        ).div_(noise.std(dim=(-2, -1), keepdim=True))
+        return noise.sub_(noise.mean(dim=(-2, -1), keepdim=True)).div_(
+            noise.std(dim=(-2, -1), keepdim=True)
+        )
 
     @classmethod
     def _ltx2_res2s_new_noise(
@@ -1484,9 +1484,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 )
 
                 step_video_noise = (
-                    self._ltx2_res2s_noise_like(
-                        ctx.latents, ctx, substep=False
-                    ).float()
+                    self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=False).float()
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
                         ctx.latents, batch
@@ -1528,9 +1526,9 @@ class LTX2DenoisingStage(DenoisingStage):
                 v_video = torch.zeros_like(denoised_video)
                 v_audio = torch.zeros_like(denoised_audio)
             else:
-                v_video = ((ctx.latents.float() - denoised_video.float()) / sigma_val).to(
-                    ctx.latents.dtype
-                )
+                v_video = (
+                    (ctx.latents.float() - denoised_video.float()) / sigma_val
+                ).to(ctx.latents.dtype)
                 v_audio = (
                     (ctx.audio_latents.float() - denoised_audio.float()) / sigma_val
                 ).to(ctx.audio_latents.dtype)
