@@ -265,6 +265,13 @@ class BaseLayerWithLoRA(nn.Module):
                 "LoRA weights not merged. Please merge them first before unmerging."
             )
 
+        if getattr(self, "_lokr_merged", False):
+            raise ValueError(
+                "Cannot unmerge LoKr weights. LoKr merges are permanent - "
+                "the base weights are modified directly. "
+                "To restore original weights, reload the model."
+            )
+
         # avoid precision loss
         if isinstance(self.base_layer.weight, DTensor):
             device = self.base_layer.weight.data.device
@@ -283,6 +290,139 @@ class BaseLayerWithLoRA(nn.Module):
                 del cpu_weight_on_device
 
         self.merged = False
+
+    def _validate_and_prepare_delta(
+        self,
+        merged_weight: torch.Tensor,
+        target_shape: tuple[int, ...],
+    ) -> torch.Tensor:
+        """
+        Validate and prepare delta tensor for merging.
+
+        Args:
+            merged_weight: The delta weight tensor to validate.
+            target_shape: The expected shape after merging.
+
+        Returns:
+            The validated and reshaped delta tensor.
+
+        Raises:
+            ValueError: If shape is incompatible.
+        """
+        delta = merged_weight
+
+        delta_elements = delta.numel()
+        target_elements = torch.Size(target_shape).numel()
+
+        if delta_elements != target_elements:
+            raise ValueError(
+                f"Shape mismatch in apply_merged_weight: "
+                f"delta has {delta_elements} elements but target weight has {target_elements} elements. "
+                f"Delta shape: {delta.shape}, target shape: {target_shape}"
+            )
+
+        if delta.shape != target_shape:
+            delta = delta.reshape(target_shape)
+
+        return delta
+
+    @torch.no_grad()
+    def apply_merged_weight(
+        self,
+        merged_weight: torch.Tensor,
+        strength: float = 1.0,
+    ) -> None:
+        """
+        Directly apply pre-computed merged weight delta (e.g., from LoKr conversion).
+
+        This bypasses the LoRA A/B decomposition and directly adds the delta
+        to the base layer weight. Used for formats like LoKr where the weight
+        delta is pre-computed via Kronecker product.
+
+        Note: Unlike standard LoRA merge, LoKr merges are permanent. Calling
+        unmerge_lora_weights() after LoKr merge will raise an error. To restore
+        original weights, reload the model.
+
+        Args:
+            merged_weight: Pre-computed weight delta to apply.
+            strength: Scaling factor for the merge.
+
+        Raises:
+            ValueError: If merged_weight is not a valid tensor, or if LoRA adapters
+                are already set (LoKr and standard LoRA cannot be mixed).
+        """
+        if merged_weight is None or not isinstance(merged_weight, torch.Tensor):
+            raise ValueError(
+                "merged_weight must be a valid torch.Tensor, "
+                f"got {type(merged_weight)}"
+            )
+
+        if self.lora_weights_list:
+            raise ValueError(
+                "Cannot apply LoKr merged_weight when LoRA adapters are already set. "
+                "LoKr and standard LoRA cannot be mixed on the same layer."
+            )
+
+        if self.merged:
+            self.unmerge_lora_weights()
+
+        if isinstance(self.base_layer.weight, DTensor):
+            mesh = self.base_layer.weight.data.device_mesh
+            old_base_layer = self.base_layer
+            unsharded_base_layer = ReplicatedLinear(
+                input_size=old_base_layer.input_size,
+                output_size=old_base_layer.output_size,
+                bias=getattr(old_base_layer, "bias", None) is not None,
+                skip_bias_add=old_base_layer.skip_bias_add,
+                params_dtype=old_base_layer.params_dtype,
+                quant_config=old_base_layer.quant_config,
+                prefix=old_base_layer.prefix,
+            )
+            current_device = old_base_layer.weight.data.device
+            data = old_base_layer.weight.data.to(get_local_torch_device()).full_tensor()
+
+            delta = merged_weight.to(data.dtype).to(data.device)
+            delta = self._validate_and_prepare_delta(delta, data.shape)
+            data += strength * delta
+
+            unsharded_base_layer.weight = nn.Parameter(data.to(current_device))
+            if isinstance(getattr(old_base_layer, "bias", None), DTensor):
+                unsharded_base_layer.bias = nn.Parameter(
+                    old_base_layer.bias.to(get_local_torch_device(), non_blocking=True)
+                    .full_tensor()
+                    .to(current_device)
+                )
+
+            offload_policy = (
+                CPUOffloadPolicy() if "cpu" in str(current_device) else OffloadPolicy()
+            )
+            mp_policy = get_mixed_precision_state().mp_policy
+
+            # Delete old base_layer before reassignment to prevent memory leak
+            del old_base_layer
+            self.base_layer = fully_shard(
+                unsharded_base_layer,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+            )
+        else:
+            current_device = self.base_layer.weight.data.device
+            data = self.base_layer.weight.data.to(get_local_torch_device())
+
+            delta = merged_weight.to(data.dtype).to(data.device)
+            delta = self._validate_and_prepare_delta(delta, data.shape)
+            data += strength * delta
+
+            self.base_layer.weight.data = data.to(current_device, non_blocking=True)
+
+        self.merged = True
+        self.disable_lora = False
+        # Clear LoRA A/B since we're using merged weight path
+        self.lora_A = None
+        self.lora_B = None
+        self.lora_weights_list.clear()
+        self._lokr_merged = True
 
 
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):

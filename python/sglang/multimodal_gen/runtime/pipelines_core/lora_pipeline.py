@@ -426,13 +426,37 @@ class LoRAPipeline(ComposedPipelineBase):
             )
 
         adapted_count = 0
+        # Apply all LoRA adapters in order
         for name, layer in lora_layers.items():
-            # Apply all LoRA adapters in order
+            merged_weight_name = name + ".merged_weight"
+            lora_A_name = name + ".lora_A"
+            lora_B_name = name + ".lora_B"
+
+            has_lokr_for_layer = any(
+                merged_weight_name in self.lora_adapters[nickname]
+                for nickname in lora_nicknames
+            )
+            has_standard_lora_for_layer = any(
+                lora_A_name in self.lora_adapters[nickname]
+                and lora_B_name in self.lora_adapters[nickname]
+                for nickname in lora_nicknames
+            )
+
+            if has_lokr_for_layer and has_standard_lora_for_layer:
+                raise ValueError(
+                    f"Cannot mix LoKr and standard LoRA on the same layer '{name}'. "
+                    f"Found both formats across adapters: {lora_nicknames}"
+                )
+
             for idx, (nickname, path, lora_strength) in enumerate(
                 zip(lora_nicknames, lora_paths, strengths)
             ):
-                lora_A_name = name + ".lora_A"
-                lora_B_name = name + ".lora_B"
+                if merged_weight_name in self.lora_adapters[nickname]:
+                    merged_weight = self.lora_adapters[nickname][merged_weight_name]
+                    layer.apply_merged_weight(merged_weight, strength=lora_strength)
+                    adapted_count += 1
+                    continue
+
                 if (
                     lora_A_name in self.lora_adapters[nickname]
                     and lora_B_name in self.lora_adapters[nickname]
@@ -477,6 +501,9 @@ class LoRAPipeline(ComposedPipelineBase):
                         has_any_lora = any(
                             name + ".lora_A" in self.lora_adapters[n]
                             and name + ".lora_B" in self.lora_adapters[n]
+                            for n in lora_nicknames
+                        ) or any(
+                            name + ".merged_weight" in self.lora_adapters[n]
                             for n in lora_nicknames
                         )
                         if not has_any_lora:

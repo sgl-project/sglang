@@ -280,6 +280,18 @@ def _run_all_tests() -> List[Dict]:
         )
     )
 
+    # LOKR Z-Image Turbo LoRA (LOKR → STANDARD).
+    results.append(
+        run_single_test(
+            name="LOKR Z-Image Turbo LoRA",
+            repo_id="F16/z-image-turbo-flow-dpo",
+            filename="zit_fdpo_v1.safetensors",
+            local_name="zit_fdpo_v1.safetensors",
+            expected_before=LoRAFormat.LOKR,
+            expected_after=LoRAFormat.STANDARD,
+        )
+    )
+
     return results
 
 

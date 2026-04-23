@@ -20,6 +20,7 @@ class LoRAFormat(str, Enum):
     KOHYA_FLUX = "kohya-flux"
     WAN = "wan"
     AI_TOOLKIT_FLUX = "ai-toolkit-flux"
+    LOKR = "lokr"
 
 
 def _sample_keys(keys: Iterable[str], k: int = 20) -> list[str]:
@@ -131,6 +132,28 @@ def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> 
     return (has_double_blocks or has_single_blocks) and has_lora_ab
 
 
+def _looks_like_lokr(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """Detect LoKr (Low-Rank Kronecker) format from LyCORIS/ai-toolkit.
+
+    Key patterns: layers.X.attention.to_q.lokr_w1, layers.X.attention.to_q.lokr_w2
+    Also supports decomposed form: lokr_w1_a, lokr_w1_b, lokr_w2_a, lokr_w2_b
+    """
+    keys = list(state_dict.keys())
+    if not keys:
+        return False
+
+    # Check for lokr_w1/lokr_w2 keys (full matrix form)
+    has_lokr_w1 = _has_substring_key(keys, ".lokr_w1")
+    has_lokr_w2 = _has_substring_key(keys, ".lokr_w2")
+
+    # Check for decomposed form (lokr_w1_a, lokr_w1_b, lokr_w2_a, lokr_w2_b)
+    has_lokr_decomposed = _has_substring_key(keys, ".lokr_w1_a") or _has_substring_key(
+        keys, ".lokr_w2_a"
+    )
+
+    return (has_lokr_w1 and has_lokr_w2) or has_lokr_decomposed
+
+
 def detect_lora_format_from_state_dict(
     state_dict: Mapping[str, torch.Tensor],
 ) -> LoRAFormat:
@@ -138,6 +161,9 @@ def detect_lora_format_from_state_dict(
     keys = list(state_dict.keys())
     if not keys:
         return LoRAFormat.STANDARD
+
+    if _looks_like_lokr(state_dict):
+        return LoRAFormat.LOKR
 
     if _looks_like_ai_toolkit_flux_lora(state_dict):
         return LoRAFormat.AI_TOOLKIT_FLUX
@@ -487,12 +513,159 @@ def _convert_ai_toolkit_flux_lora(
     return final_out
 
 
+def _convert_lokr_to_merged_weights(
+    state_dict: Mapping[str, torch.Tensor],
+    log: logging.Logger,
+) -> Dict[str, torch.Tensor]:
+    """Convert LoKr format to merged weights for direct application.
+
+    LoKr uses Kronecker product decomposition: delta_W = scale * kron(w1, w2)
+    For inference, we pre-compute the full delta_W and store it as merged_weight.
+
+    Supports both full matrix form (lokr_w1, lokr_w2) and decomposed form
+    (lokr_w1_a @ lokr_w1_b, lokr_w2_a @ lokr_w2_b).
+    """
+    out: Dict[str, torch.Tensor] = {}
+    layer_weights: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    for key, tensor in state_dict.items():
+        if ".lokr_w1" in key or ".lokr_w2" in key or ".alpha" in key:
+            base = None
+            weight_type = None
+
+            for suffix in [
+                ".lokr_w1",
+                ".lokr_w2",
+                ".lokr_w1_a",
+                ".lokr_w1_b",
+                ".lokr_w2_a",
+                ".lokr_w2_b",
+                ".alpha",
+            ]:
+                if key.endswith(suffix):
+                    base = key[: -len(suffix)]
+                    weight_type = suffix[1:]
+                    break
+
+            if base is None:
+                continue
+
+            if base not in layer_weights:
+                layer_weights[base] = {}
+            layer_weights[base][weight_type] = tensor
+        else:
+            out[key] = tensor
+
+    for layer_base, weights in layer_weights.items():
+        # Get alpha for scaling (default to 1.0)
+        alpha = 1.0
+        if "alpha" in weights:
+            alpha = weights["alpha"].item()
+
+        # Compute w1 from full matrix or decomposed form
+        w1 = weights.get("lokr_w1")
+        rank1 = None
+        if w1 is None:
+            if "lokr_w1_a" in weights and "lokr_w1_b" in weights:
+                # Decomposed form: w1 = w1_a @ w1_b, rank is the shared dimension
+                w1_a = weights["lokr_w1_a"]
+                w1_b = weights["lokr_w1_b"]
+                if w1_a.shape[1] != w1_b.shape[0]:
+                    log.warning(
+                        "[LoRAFormatAdapter] Rank mismatch in LoKr w1 decomposition "
+                        "for layer %s: w1_a.shape[1]=%d != w1_b.shape[0]=%d, skipping",
+                        layer_base,
+                        w1_a.shape[1],
+                        w1_b.shape[0],
+                    )
+                    continue
+                rank1 = w1_a.shape[1]
+                w1 = w1_a @ w1_b
+            else:
+                log.warning(
+                    "[LoRAFormatAdapter] Missing lokr_w1 for layer %s, skipping",
+                    layer_base,
+                )
+                continue
+
+        # Compute w2 from full matrix or decomposed form
+        w2 = weights.get("lokr_w2")
+        rank2 = None
+        if w2 is None:
+            if "lokr_w2_a" in weights and "lokr_w2_b" in weights:
+                # Decomposed form: w2 = w2_a @ w2_b, rank is the shared dimension
+                w2_a = weights["lokr_w2_a"]
+                w2_b = weights["lokr_w2_b"]
+                if w2_a.shape[1] != w2_b.shape[0]:
+                    log.warning(
+                        "[LoRAFormatAdapter] Rank mismatch in LoKr w2 decomposition "
+                        "for layer %s: w2_a.shape[1]=%d != w2_b.shape[0]=%d, skipping",
+                        layer_base,
+                        w2_a.shape[1],
+                        w2_b.shape[0],
+                    )
+                    continue
+                rank2 = w2_a.shape[1]
+                w2 = w2_a @ w2_b
+            else:
+                log.warning(
+                    "[LoRAFormatAdapter] Missing lokr_w2 for layer %s, skipping",
+                    layer_base,
+                )
+                continue
+
+        # Compute Kronecker product
+        delta_w = torch.kron(w1.float(), w2.float()).to(w1.dtype)
+
+        # Apply alpha scaling following LyCORIS convention:
+        # - Both decomposed: scale = alpha / lora_dim (ranks should be same)
+        # - Both full matrices: scale = 1 (alpha ignored)
+        # - Mixed: use rank from decomposed one
+        if rank1 is not None and rank2 is not None:
+            # Both decomposed: ranks should be the same (LyCORIS uses shared lora_dim)
+            if rank1 != rank2:
+                log.warning(
+                    "[LoRAFormatAdapter] LoKr ranks differ for layer %s: "
+                    "rank1=%d, rank2=%d, using max(rank1, rank2)",
+                    layer_base,
+                    rank1,
+                    rank2,
+                )
+            effective_rank = max(rank1, rank2)
+            scale = alpha / effective_rank
+        elif rank1 is not None or rank2 is not None:
+            # Mixed: one decomposed, one full - use the decomposed rank
+            effective_rank = rank1 if rank1 is not None else rank2
+            scale = alpha / effective_rank
+        else:
+            # Both full matrices: scale = 1 (per LyCORIS, alpha is ignored)
+            scale = 1.0
+
+        delta_w = scale * delta_w
+
+        new_key = layer_base
+        if new_key.startswith("diffusion_model."):
+            new_key = new_key[len("diffusion_model.") :]
+
+        out[f"{new_key}.merged_weight"] = delta_w
+
+    sample = _sample_keys(out.keys(), 20)
+    log.info(
+        "[LoRAFormatAdapter] after LOKR conversion, " "sample keys (<=20): %s",
+        ", ".join(sample),
+    )
+    return out
+
+
 def convert_lora_state_dict_by_format(
     state_dict: Mapping[str, torch.Tensor],
     fmt: LoRAFormat,
     log: logging.Logger,
 ) -> Dict[str, torch.Tensor]:
     """Normalize a raw LoRA state_dict into A/B + .weight naming."""
+    if fmt == LoRAFormat.LOKR:
+        return _convert_lokr_to_merged_weights(state_dict, log)
+
     if fmt == LoRAFormat.QWEN_IMAGE_STANDARD:
         return _convert_qwen_image_standard(state_dict, log)
 
