@@ -21,13 +21,6 @@ enum class ActivationKind : uint32_t {
   kGELUTanh,
 };
 
-// Returns float so the caller can multiply by `up` in f32 before casting
-// to T. Matches flashinfer/sgl-kernel precision: gate/up are promoted to
-// f32, the activation and the gate*up multiply happen in f32, and only the
-// final result is narrowed. Downcasting the activation result before the
-// multiply (as an earlier version did) compounds bf16 rounding through
-// each MLP layer and breaks bit-exact greedy generation (e.g. Llama-2 LoRA
-// ROUGE-L < 1.0 on H100).
 template <ActivationKind kAct>
 SGL_DEVICE float apply_activation_f32(float x_f32) {
   if constexpr (kAct == ActivationKind::kSiLU) {

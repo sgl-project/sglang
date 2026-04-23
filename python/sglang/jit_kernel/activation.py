@@ -19,13 +19,8 @@ if TYPE_CHECKING:
 
 
 def _fast_math_flags() -> list[str]:
-    # Match sgl-kernel's CMake policy for activation.cu:
-    # - SM90 build uses -use_fast_math
-    # - SM100+ (Blackwell) builds use precise math — expf must match
-    #   sgl_kernel's reference bit-for-bit, otherwise downstream scoring/
-    #   generation diverges enough to fail tolerance checks (e.g.
-    #   test_multi_item_scoring on 5090).
-    # - nvcc-only; hipcc (ROCm, clang-based) rejects the flag.
+    # Mirrors sgl-kernel's CMake policy: fast-math on SM90, precise on
+    # SM100+ (Blackwell needs bit-exact expf), off on HIP (clang rejects).
     if is_hip_runtime():
         return []
     if get_jit_cuda_arch().major >= 10:
