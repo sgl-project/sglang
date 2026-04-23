@@ -428,6 +428,7 @@ class Step3p5Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             sliding_window_size=sliding_window_size,  # if is -1 ,normal attention,else ,window attention
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream

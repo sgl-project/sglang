@@ -162,10 +162,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        if isinstance(layer, RadixAttention):
+            if self._is_fp8_kv_cache_scheme(self.kv_cache_scheme):
+                from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+                return BaseKVCacheMethod(self)
+            return None
 
         if isinstance(layer, LinearBase):
-            # If linear_fp8_config is set, use FP8 for linear layers
-            # This allows mixed quantization: experts with int4, linear layers with fp8
             if self.linear_fp8_config is not None:
                 return Fp8LinearMethod(self.linear_fp8_config)
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
@@ -187,6 +193,26 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
             return CompressedTensorsFusedMoEMethod(self)
         return None
+
+    @staticmethod
+    def _is_fp8_kv_cache_scheme(kv_cache_scheme: Optional[Dict[str, Any]]) -> bool:
+        """Check if kv_cache_scheme represents FP8 per-tensor quantization."""
+        if not kv_cache_scheme:
+            return False
+        quant_type = kv_cache_scheme.get("type", None)
+        num_bits = kv_cache_scheme.get("num_bits", None)
+        strategy = kv_cache_scheme.get("strategy", None)
+        if quant_type is None or num_bits is None or strategy is None:
+            return False
+        try:
+            num_bits_int = int(num_bits)
+        except (TypeError, ValueError):
+            return False
+        return (
+            num_bits_int == 8
+            and str(quant_type).lower() == "float"
+            and str(strategy).lower() in ("tensor", "per_tensor")
+        )
 
     def _add_fused_moe_to_target_scheme_map(self):
         """
@@ -239,12 +265,17 @@ class CompressedTensorsConfig(QuantizationConfig):
                 weight_block_size=fp8_cfg.get("weight_block_size"),
             )
 
+        kv_cache_scheme = cast(
+            Optional[Dict[str, Any]], config.get("kv_cache_scheme")
+        )
+
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
             quant_format=quant_format,
             sparsity_scheme_map=sparsity_scheme_map,
             sparsity_ignore_list=sparsity_ignore_list,
+            kv_cache_scheme=kv_cache_scheme,
             config=config,
             packed_modules_mapping=packed_modules_mapping,
             linear_fp8_config=linear_fp8_config,

@@ -83,7 +83,21 @@ The JSON file should follow this format:
 }
 ```
 
-Where the outer keys in `scaling_factor` are tensor parallel ranks and inner keys are layer indices.
+Where the outer keys in `scaling_factor` are tensor parallel ranks and inner keys are layer indices. Each layer's value can be either a single float (used as both `k_scale` and `v_scale`) or a list `[k_scale, v_scale]` when K and V need separate scales:
+
+```json
+{
+  "kv_cache": {
+    "dtype": "float8_e4m3fn",
+    "scaling_factor": {
+      "0": {
+        "0": [0.8, 1.2],
+        "1": [0.9, 1.1]
+      }
+    }
+  }
+}
+```
 
 ```{warning}
 If scaling factors are not provided and not found in the checkpoint, it will default to 1.0, which may cause accuracy issues.

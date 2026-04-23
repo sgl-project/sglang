@@ -369,6 +369,7 @@ class GptOssAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
         )

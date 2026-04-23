@@ -251,6 +251,7 @@ class BertSelfAttention(nn.Module):
             scaling=self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=f"{prefix}.attn",
             attn_type=AttentionType.ENCODER_ONLY,
         )

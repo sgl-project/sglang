@@ -44,6 +44,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
+    apply_kv_cache_scales,
     default_weight_loader,
     kv_cache_scales_loader,
 )
@@ -366,7 +367,7 @@ class OPTModel(nn.Module):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
-        for layer_idx, scaling_factor in kv_cache_scales_loader(
+        for layer_idx, k_scale, v_scale in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
             tp_size,
@@ -375,14 +376,7 @@ class OPTModel(nn.Module):
         ):
             if not isinstance(self.decoder.layers[layer_idx], nn.Identity):
                 layer_self_attn = self.decoder.layers[layer_idx].self_attn
-
-            if hasattr(layer_self_attn.attn, "k_scale"):
-                layer_self_attn.attn.k_scale = scaling_factor
-                layer_self_attn.attn.v_scale = scaling_factor
-            else:
-                raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
-                )
+                apply_kv_cache_scales(layer_self_attn, k_scale, v_scale)
 
 
 class OPTForCausalLM(nn.Module):

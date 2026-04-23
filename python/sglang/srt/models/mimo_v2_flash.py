@@ -65,6 +65,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
+    apply_kv_cache_scales,
     default_weight_loader,
     kv_cache_scales_loader,
 )
@@ -926,7 +927,7 @@ class MiMoV2Model(nn.Module):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-        for layer_idx, scaling_factor in kv_cache_scales_loader(
+        for layer_idx, k_scale, v_scale in kv_cache_scales_loader(
             quantization_param_path,
             attn_tp_rank,
             attn_tp_size,
@@ -935,13 +936,7 @@ class MiMoV2Model(nn.Module):
         ):
             if not isinstance(self.layers[layer_idx], nn.Identity):
                 layer_self_attn = self.layers[layer_idx].self_attn
-            if hasattr(layer_self_attn.attn, "k_scale"):
-                layer_self_attn.attn.k_scale = scaling_factor
-                layer_self_attn.attn.v_scale = scaling_factor
-            else:
-                raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
-                )
+                apply_kv_cache_scales(layer_self_attn, k_scale, v_scale)
 
 
 class MiMoV2FlashForCausalLM(nn.Module):

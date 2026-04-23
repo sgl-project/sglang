@@ -1393,16 +1393,17 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
 class KVCacheQuantSchema(BaseModel):
     dtype: str
     # Each key is a TP rank. Each value is a dictionary mapping a TP rank's
-    # layer indices to their per-tensor KV cache scaling factor.
-    # TODO: Consider pulling this and its validation methods out into its
-    # own schema class (tricky as its members are variable)
-    scaling_factor: Dict[int, Dict[int, float]]
+    # layer indices to their per-tensor KV cache scaling factor(s).
+    # Two formats are accepted per layer:
+    #   - A single float (e.g. 1.0): used as both k_scale and v_scale
+    #   - A list of two floats (e.g. [0.8, 1.2]): [k_scale, v_scale]
+    scaling_factor: Dict[int, Dict[int, Union[float, List[float]]]]
 
     @model_validator(mode="after")
     def check_is_fp8(self) -> "KVCacheQuantSchema":
-        assert self.dtype == "float8_e4m3fn", (
+        assert self.dtype in ("float8_e4m3fn", "float8_e5m2"), (
             "Loaded scaling factors intended for KV cache dtype = "
-            f"{self.dtype} rather than float8_e4m3fn!"
+            f"{self.dtype} rather than float8_e4m3fn or float8_e5m2!"
         )
         return self
 
@@ -1470,13 +1471,15 @@ def kv_cache_scales_loader(
     tp_size: int,
     num_hidden_layers: int,
     model_type: Optional[str],
-) -> Iterable[Tuple[int, float]]:
+) -> Iterable[Tuple[int, float, float]]:
     """
-    A simple utility to read in KV cache scaling factors that have been
-    previously serialized to disk. Used by the model to populate the appropriate
-    KV cache scaling factors. The serialization should represent a dictionary
-    whose keys are the TP ranks and values are another dictionary mapping layers
-    to their KV cache scaling factors.
+    Read KV cache scaling factors from a JSON file.
+
+    Each layer's scaling factor can be either:
+      - A single float: used as both k_scale and v_scale (backward compatible)
+      - A list [k_scale, v_scale]: separate scales for K and V
+
+    Returns an iterable of (layer_idx, k_scale, v_scale) tuples.
     """
     try:
         with open(filename) as f:
@@ -1489,22 +1492,72 @@ def kv_cache_scales_loader(
             schema_dct = json.load(f)
             schema = QuantParamSchema.model_validate(schema_dct, context=context)
             layer_scales_map = schema.kv_cache.scaling_factor[tp_rank]
-            return layer_scales_map.items()
+            scales = []
+            for layer_idx, scale in layer_scales_map.items():
+                if isinstance(scale, list):
+                    if len(scale) != 2:
+                        raise ValueError(
+                            f"Layer {layer_idx} scale list must have exactly "
+                            f"2 elements [k_scale, v_scale], got {len(scale)}."
+                        )
+                    k_scale = float(scale[0])
+                    v_scale = float(scale[1])
+                else:
+                    k_scale = float(scale)
+                    v_scale = float(scale)
+                scales.append((layer_idx, k_scale, v_scale))
+            return scales
     except FileNotFoundError:
         logger.error("File or directory '%s' not found.", filename)
     except json.JSONDecodeError:
         logger.error("Error decoding JSON in file '%s'.", filename)
     except Exception:
-        logger.error("An error occurred while reading '%s'.", filename)
-    # This section is reached if and only if any of the excepts are hit
-    # Return an empty iterable (list) => no KV cache scales are loaded
-    # which ultimately defaults to 1.0 scales
+        logger.error("An error occurred while reading '%s'.", filename, exc_info=True)
     logger.warning(
         "Defaulting to KV cache scaling factors = 1.0 for all "
         "layers in TP rank %d as an error occurred during loading.",
         tp_rank,
     )
     return []
+
+
+def apply_kv_cache_scales(
+    layer_self_attn: torch.nn.Module, k_scale: float, v_scale: float
+) -> None:
+    """Apply k_scale and v_scale to an attention layer's RadixAttention module.
+
+    Ensures k_scale/v_scale are stored as nn.Parameters (creating them if
+    needed), handles FP8 FNuz adjustment, and sets the k_scale_float /
+    v_scale_float attributes consumed by attention backends.
+    """
+    from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+
+    attn = layer_self_attn.attn
+
+    if is_fp8_fnuz():
+        k_scale *= 2
+        v_scale *= 2
+
+    device = next(layer_self_attn.parameters()).device
+
+    if isinstance(attn.k_scale, torch.nn.Parameter):
+        attn.k_scale.fill_(k_scale)
+    else:
+        attn.k_scale = torch.nn.Parameter(
+            torch.tensor(k_scale, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+
+    if isinstance(attn.v_scale, torch.nn.Parameter):
+        attn.v_scale.fill_(v_scale)
+    else:
+        attn.v_scale = torch.nn.Parameter(
+            torch.tensor(v_scale, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+
+    attn.k_scale_float = k_scale
+    attn.v_scale_float = v_scale
 
 
 def get_actual_shard_size(shard_size, weight_start, weight_end):

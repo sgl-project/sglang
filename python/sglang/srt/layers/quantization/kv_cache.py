@@ -46,35 +46,31 @@ class BaseKVCacheMethod(QuantizeMethodBase):
 
     def process_weights_after_loading(self, layer) -> None:
         if layer.k_scale > 0.0 and layer.v_scale > 0.0:
-            # We prefer to use separate k_scale and v_scale if present
             k_scale = layer.k_scale.to("cpu").tolist()
             v_scale = layer.v_scale.to("cpu").tolist()
+            layer.kv_cache_scales_loaded = True
             if is_fp8_fnuz():
                 k_scale *= 2
                 v_scale *= 2
         elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
-            # If no scales were loaded (both scales are invalid negative
-            # values), use the default value of 1.0
             k_scale = 1.0
             v_scale = 1.0
+            layer.kv_cache_scales_loaded = False
         else:
-            # If we find a single kv_scale in the checkpoint, we remap
-            # kv_scale to k_scale during weight loading, and duplicate
-            # k_scale to v_scale here
             assert layer.k_scale > 0.0
             scale_to_duplicate = max(layer.k_scale, layer.v_scale)
             k_scale = scale_to_duplicate.to("cpu").tolist()
             v_scale = scale_to_duplicate.to("cpu").tolist()
+            layer.kv_cache_scales_loaded = True
             if is_fp8_fnuz():
                 k_scale *= 2
                 v_scale *= 2
 
         if not isinstance(k_scale, float) or not isinstance(v_scale, float):
             raise ValueError(
-                "Only support per-tensor scaling factor " "for fp8 KV cache"
+                "Only support per-tensor scaling factor for fp8 KV cache"
             )
 
-        # These are used in the final Attention.forward()
         layer.k_scale.copy_(k_scale)
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale

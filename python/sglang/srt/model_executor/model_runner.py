@@ -1300,7 +1300,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.pyt_hooks = PytHooks()
             self.pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        if self.server_args.kv_cache_dtype == "fp8_e4m3":
+        if self.server_args.kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
                     self.model.load_kv_cache_scales(
@@ -1317,11 +1317,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         self.model.__class__,
                     )
             else:
-                logger.warning(
-                    "Using FP8 KV cache but no scaling factors "
-                    "provided. Defaulting to scaling factors of 1.0. "
-                    "This may lead to less accurate results!"
-                )
+                from sglang.srt.layers.radix_attention import RadixAttention
+
+                scales_loaded = False
+                scales_supported = False
+                for module in self.model.modules():
+                    if not isinstance(module, RadixAttention):
+                        continue
+                    loaded_flag = getattr(module, "kv_cache_scales_loaded", None)
+                    if loaded_flag is True:
+                        scales_loaded = True
+                        break
+                    if loaded_flag is not None:
+                        scales_supported = True
+
+                if scales_loaded:
+                    logger.info(
+                        "Using FP8 KV cache with scaling factors loaded "
+                        "from checkpoint."
+                    )
+                elif scales_supported:
+                    logger.warning(
+                        "Using FP8 KV cache but no scaling factors found "
+                        "in checkpoint. Defaulting to scaling factors of 1.0. "
+                        "This may lead to less accurate results!"
+                    )
+                else:
+                    logger.warning(
+                        "Using FP8 KV cache but no scaling factors "
+                        "provided. Defaulting to scaling factors of 1.0. "
+                        "This may lead to less accurate results!"
+                    )
 
         # Parse other args
         self.sliding_window_size = None
