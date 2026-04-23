@@ -2712,33 +2712,52 @@ def has_fp8_weights_in_checkpoint(model_path: str) -> bool:
     experts without declaring it in quantization_config, while other models
     sharing the same architecture (e.g. Moonlight) are purely BF16.
 
-    Only reads the safetensors header (a few KB of JSON), not the actual weights.
+    Accepts a local directory or a HuggingFace repo ID. For remote repos, only
+    safetensors headers (a few KB) are fetched via byte-range reads; full
+    shards are never downloaded.
     """
     import json
     import struct
 
     try:
-        index_path = os.path.join(model_path, "model.safetensors.index.json")
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                index = json.load(f)
-            weight_map = index.get("weight_map", {})
-            expert_files = {
-                v for k, v in weight_map.items() if "experts" in k and "weight" in k
-            }
-            shard_file = next(iter(expert_files), None) or next(
-                iter(set(weight_map.values())), None
+        if os.path.isdir(model_path):
+
+            def _open(name):
+                return open(os.path.join(model_path, name), "rb")
+
+            def _exists(name):
+                return os.path.exists(os.path.join(model_path, name))
+
+        else:
+            from huggingface_hub import HfFileSystem
+
+            fs = HfFileSystem()
+
+            def _open(name):
+                return fs.open(f"{model_path}/{name}", "rb")
+
+            def _exists(name):
+                return fs.exists(f"{model_path}/{name}")
+
+        if _exists("model.safetensors.index.json"):
+            with _open("model.safetensors.index.json") as f:
+                weight_map = json.loads(f.read()).get("weight_map", {})
+            expert_files = sorted(
+                {v for k, v in weight_map.items() if "experts" in k and "weight" in k}
+            )
+            shard_file = (
+                expert_files[0]
+                if expert_files
+                else next(iter(sorted(set(weight_map.values()))), None)
             )
             if shard_file is None:
                 return False
-            shard_path = os.path.join(model_path, shard_file)
+        elif _exists("model.safetensors"):
+            shard_file = "model.safetensors"
         else:
-            shard_path = os.path.join(model_path, "model.safetensors")
-
-        if not os.path.exists(shard_path):
             return False
 
-        with open(shard_path, "rb") as f:
+        with _open(shard_file) as f:
             header_len = struct.unpack("<Q", f.read(8))[0]
             header = json.loads(f.read(header_len))
 
