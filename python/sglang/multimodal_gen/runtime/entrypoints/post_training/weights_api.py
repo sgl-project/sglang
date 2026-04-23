@@ -4,8 +4,8 @@ from fastapi import APIRouter, Request
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
-    UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client

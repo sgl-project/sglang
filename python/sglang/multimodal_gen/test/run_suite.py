@@ -788,7 +788,9 @@ def _is_in_ci() -> bool:
 def _maybe_pin_update_weights_model_pair(suite_files_rel: list[str]) -> None:
     if not _is_in_ci():
         return
-    if not any(test_file in suite_files_rel for test_file in _UPDATE_WEIGHTS_TEST_FILES):
+    if not any(
+        test_file in suite_files_rel for test_file in _UPDATE_WEIGHTS_TEST_FILES
+    ):
         return
     if os.environ.get(_UPDATE_WEIGHTS_MODEL_PAIR_ENV):
         print(

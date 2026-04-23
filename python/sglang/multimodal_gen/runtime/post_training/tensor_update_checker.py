@@ -63,7 +63,9 @@ class TensorUpdateChecker:
             return False, f"Module '{target_module}' is not initialized"
 
         local_named_tensors = dict(
-            self._iter_module_named_tensors(module, expected_named_tensors_sha256.keys())
+            self._iter_module_named_tensors(
+                module, expected_named_tensors_sha256.keys()
+            )
         )
         reference_tensors = dict(module.named_parameters())
         reference_tensors.update(dict(module.named_buffers()))
@@ -76,9 +78,11 @@ class TensorUpdateChecker:
                 [None] * tp_world_size if tp_rank == 0 else None
             )
             torch.distributed.gather_object(
-                _materialize_local_tensor(local_named_tensors[name])
-                if name in local_named_tensors
-                else None,
+                (
+                    _materialize_local_tensor(local_named_tensors[name])
+                    if name in local_named_tensors
+                    else None
+                ),
                 gathered_tensors,
                 dst=tp_root_rank,
                 group=tp_cpu_group,
@@ -86,7 +90,9 @@ class TensorUpdateChecker:
             if tp_rank != 0:
                 continue
 
-            valid_tensors = [tensor for tensor in gathered_tensors if tensor is not None]
+            valid_tensors = [
+                tensor for tensor in gathered_tensors if tensor is not None
+            ]
             if len(valid_tensors) != len(gathered_tensors):
                 continue
 
@@ -116,7 +122,10 @@ class TensorUpdateChecker:
                 shard_dim %= first_tensor.ndim
                 compatible = True
                 for tensor in valid_tensors[1:]:
-                    if tensor.ndim != first_tensor.ndim or tensor.dtype != first_tensor.dtype:
+                    if (
+                        tensor.ndim != first_tensor.ndim
+                        or tensor.dtype != first_tensor.dtype
+                    ):
                         compatible = False
                         break
                     if any(

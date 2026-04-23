@@ -37,10 +37,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -432,6 +432,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return OutputBatch(error="Lora is not enabled")
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
+
 
 OOM_MSG = f"""
 OOM detected. Possible solutions:

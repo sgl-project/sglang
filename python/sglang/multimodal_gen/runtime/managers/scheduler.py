@@ -21,8 +21,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
-    UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (

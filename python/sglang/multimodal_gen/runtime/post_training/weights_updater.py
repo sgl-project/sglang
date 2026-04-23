@@ -147,7 +147,9 @@ def load_weights_into_model(
             weight_loader(param, loaded_weight.to(param.dtype))
         else:
             dtensor_param = param if isinstance(param, DTensor) else None
-            if dtensor_param is None and isinstance(getattr(param, "data", None), DTensor):
+            if dtensor_param is None and isinstance(
+                getattr(param, "data", None), DTensor
+            ):
                 dtensor_param = param.data
 
             if dtensor_param is not None:

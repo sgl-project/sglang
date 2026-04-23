@@ -94,9 +94,7 @@ class GPUWorkerPostTrainingMixin:
         import torch
 
         is_sp_root = self.sp_group.rank_in_group == 0
-        gathered_results = (
-            [None] * self.sp_group.world_size if is_sp_root else None
-        )
+        gathered_results = [None] * self.sp_group.world_size if is_sp_root else None
         torch.distributed.gather_object(
             result,
             gathered_results,
