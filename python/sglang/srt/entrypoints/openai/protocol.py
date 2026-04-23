@@ -166,6 +166,7 @@ class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
     structures: List[StructuresResponseFormat]
     triggers: List[str]
+    at_least_one: bool = False
 
 
 StructuralTagResponseFormat: TypeAlias = Union[
@@ -453,11 +454,23 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
     audio_url: ChatCompletionMessageContentAudioURL
 
 
+class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
+    # GLM-specific extension used alongside `defer_loading` tools. The chat
+    # template looks up `tools[*].function.name == tr.name` and renders the
+    # referenced tool schemas inline for the current turn. Not part of any
+    # OpenAI API; included here so Pydantic accepts the content through the
+    # Chat Completions path (the Anthropic endpoint translates its
+    # `tool_name` field to `name` before forwarding).
+    type: Literal["tool_reference"]
+    name: str
+
+
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
+    ChatCompletionMessageContentToolReferenceBlock,
 ]
 
 # Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
@@ -527,6 +540,14 @@ class Function(BaseModel):
     name: str
     parameters: Optional[object] = None
     strict: bool = False
+    defer_loading: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
 
 
 class Tool(BaseModel):
@@ -534,6 +555,13 @@ class Tool(BaseModel):
 
     type: str = Field(default="function", examples=["function"])
     function: Function
+    defer_loading: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _propagate_defer_loading(self) -> "Tool":
+        if self.defer_loading is not None and self.function.defer_loading is None:
+            self.function.defer_loading = self.defer_loading
+        return self
 
 
 class ToolChoiceFuncName(BaseModel):
@@ -942,6 +970,11 @@ class EmbeddingRequest(BaseModel):
     priority: Optional[int] = None
     # LoRA adapter path(s)
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # Placeholder token id used to locate embedding override positions in input token IDs.
+    embed_override_token_id: Optional[int] = None
+    # Per-input embedding overrides (null entries skip that input).
+    # Shape: [num_inputs][num_replacements][hidden_size]
+    embed_overrides: Optional[List[Optional[List[List[float]]]]] = None
 
 
 class EmbeddingObject(BaseModel):
@@ -995,11 +1028,22 @@ class ScoringRequest(BaseModel):
     items: Optional[Union[str, List[str], List[List[int]]]] = (
         None  # Item text(s) or pre-tokenized token IDs
     )
+    # Placeholder token id used to locate embedding override positions in query/items.
+    embed_override_token_id: Optional[int] = None
+    # Query embedding overrides.
+    query_embed_overrides: Optional[List[List[float]]] = (
+        None  # [num_query_embed_overrides][hidden_size]
+    )
+    # Per-item embedding overrides (null entries skip that item).
+    item_embed_overrides: Optional[List[Optional[List[List[float]]]]] = (
+        None  # [num_items][num_item_embed_overrides][hidden_size]
+    )
     label_token_ids: Optional[List[int]] = (
         None  # Token IDs to compute probabilities for
     )
     apply_softmax: bool = False
     item_first: bool = False
+    return_pooled_hidden_states: bool = False
     model: str = DEFAULT_MODEL_NAME
 
 
@@ -1007,6 +1051,7 @@ class ScoringResponse(BaseModel):
     scores: List[
         List[float]
     ]  # List of lists of probabilities, each in the order of label_token_ids
+    pooled_hidden_states: Optional[List[Optional[List[float]]]] = None
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"

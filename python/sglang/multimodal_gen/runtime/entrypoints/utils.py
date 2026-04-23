@@ -69,6 +69,13 @@ class ShutdownReq:
     pass
 
 
+@dataclass
+class GetDisaggStatsReq:
+    """Request to get disagg pipeline metrics from the scheduler."""
+
+    pass
+
+
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],
@@ -108,6 +115,7 @@ class GenerationResult:
     metrics: dict = field(default_factory=dict)
     trajectory_latents: Any = None
     trajectory_timesteps: Any = None
+    rollout_trajectory_data: Any = None
     trajectory_decoded: Any = None
     prompt_index: int = 0
     output_file_path: str | None = None
@@ -288,12 +296,7 @@ def prepare_request(
         sampling_params=sampling_params,
         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
-    try:
-        diffusers_kwargs = sampling_params.diffusers_kwargs
-    except AttributeError:
-        diffusers_kwargs = None
-    if diffusers_kwargs:
-        req.extra["diffusers_kwargs"] = diffusers_kwargs
+    sampling_params.apply_request_extra(req)
 
     req.adjust_size(server_args)
 

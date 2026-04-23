@@ -78,6 +78,9 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if is_known_non_diffusers_diffusion_model(model_path):
         return True
 
+    if _is_registered_diffusion_model(model_path):
+        return True
+
     try:
         if envs.SGLANG_USE_MODELSCOPE.get():
             from modelscope import model_file_download

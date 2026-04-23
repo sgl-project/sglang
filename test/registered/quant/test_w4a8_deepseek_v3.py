@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=520, suite="stage-c-test-8-gpu-h20")
+register_cuda_ci(est_time=700, suite="stage-c-test-8-gpu-h20")
 
 
 class TestDeepseekV3W4afp8(CustomTestCase):
