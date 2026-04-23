@@ -2249,7 +2249,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Config does not support fused shared expert(s)."
-        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
+        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (9, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = (
