@@ -187,10 +187,25 @@ async fn v1_chat_completions(
     headers: http::HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
+    // Helper closure to create error responses.
+    let create_error = |message: String, code: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "code": code
+                }
+            })),
+        )
+            .into_response()
+    };
+
     // Normalize tool definitions: add default "parameters" if missing.
     // The OpenAI API spec treats "parameters" as optional, but the
     // ChatCompletionRequest struct requires it.  Patch the raw JSON so
-    // that callers who omit the field (e.g. ZhiPu) are not rejected.
+    // that callers who omit the field are not rejected.
     if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
         for tool in tools {
             if let Some(func) = tool.get_mut("function") {
@@ -206,33 +221,13 @@ async fn v1_chat_completions(
     let body: ChatCompletionRequest = match serde_json::from_value(body) {
         Ok(req) => req,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": format!("Invalid JSON data: {}", e),
-                        "type": "invalid_request_error",
-                        "code": "json_parse_error"
-                    }
-                })),
-            )
-                .into_response();
+            return create_error(format!("Invalid JSON data: {}", e), "json_parse_error");
         }
     };
 
     // Run the same validation that ValidatedJson would perform.
     if let Err(e) = body.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": {
-                    "message": format!("Validation error: {}", e),
-                    "type": "invalid_request_error",
-                    "code": "validation_error"
-                }
-            })),
-        )
-            .into_response();
+        return create_error(format!("Validation error: {}", e), "validation_error");
     }
 
     state
