@@ -92,6 +92,15 @@ else
 fi
 # LIMIT caps eval docs for quick/smoke sweeps (passed as --limit to bench_eval).
 LIMIT="${LIMIT:-}"
+# INCLUDE_PER_DOC=1 → passes --include-per-doc to bench_eval so the output
+# JSONL carries per-sample prompts/responses/scores (for manual inspection
+# on smoke runs). Off by default since full sweeps don't need the bloat.
+INCLUDE_PER_DOC="${INCLUDE_PER_DOC:-0}"
+# GEN_KWARGS_JSON → JSON dict merged into generation_kwargs (overrides task
+# YAML). Required for BBH CoT, whose default `until=["Q","\n\n"]` triggers
+# on any capital Q (e.g. words like "Quail", "Questions") and kills CoT
+# responses mid-token. Use '{"until":["\nQ:","</s>"]}' for BBH.
+GEN_KWARGS_JSON="${GEN_KWARGS_JSON:-}"
 # bench_eval.py defaults temperature=0.7 (non-thinking), which overrides the
 # per-task greedy setting and causes runaway generation up to MAX_GEN_TOKS.
 # Force greedy here; override with TEMPERATURE=<x> if needed.
@@ -199,6 +208,10 @@ run_bench() {
         [ -n "$METADATA" ] && meta_flag=(--metadata "$METADATA")
         local lim_flag=()
         [ -n "$LIMIT" ] && lim_flag=(--limit "$LIMIT")
+        local perdoc_flag=()
+        [ "$INCLUDE_PER_DOC" = "1" ] && perdoc_flag=(--include-per-doc)
+        local genkw_flag=()
+        [ -n "$GEN_KWARGS_JSON" ] && genkw_flag=(--gen-kwargs-json "$GEN_KWARGS_JSON")
         python3 -m sglang.bench_eval \
             --task "${BENCH_TASK:-$TASK}" \
             --base-url "http://${HOST}:${port}" \
@@ -215,6 +228,8 @@ run_bench() {
             "${sys_flag[@]}" \
             "${meta_flag[@]}" \
             "${lim_flag[@]}" \
+            "${perdoc_flag[@]}" \
+            "${genkw_flag[@]}" \
             --output-file "$out" > "$log" 2>&1
     fi
 }
