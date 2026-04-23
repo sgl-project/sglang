@@ -5,15 +5,26 @@ and ``test_qwen3_30b.py`` (MHA CP) — one e2e file per CP flavor.
 Cheaper helper-level coverage lives in ``test_cp_utils.py`` and
 ``test_mla_cp_fa3_parity.py``.
 
-Topology: ``tp=8, dp=2, attn-cp=4``, FA3 backend. The last three
-knobs (``enable-dp-attention``, ``attn-cp-size``, plus DeepEP MoE
-with ``ep=8``, ``moe-dense-tp-size=1``) are auto-configured by
-``_handle_model_specific_adjustments`` — mirrors NSA CP's
-in-seq-split auto-config for DSv3.2. No MTP in this baseline
-(MTP x MLA CP is a follow-up).
+Two topologies, both FA3 backend, both gated on GSM8k 0.935
+(matches the non-CP DSv3 baseline in ``test_deepseek_v3_basic.py``
+/ ``test_deepseek_v3_mtp.py``). No MTP in this baseline (MTP x
+MLA CP is a follow-up).
 
-GSM8k threshold 0.935 matches the non-CP DSv3 baseline in
-``test_deepseek_v3_basic.py`` / ``test_deepseek_v3_mtp.py``.
+1. ``TestDeepseekV3CPInSeqSplit`` — ``tp=8, dp=2, attn-cp=4``. The
+   last three knobs (``enable-dp-attention``, ``attn-cp-size``,
+   plus DeepEP MoE with ``ep=8``, ``moe-dense-tp-size=1``) are
+   auto-configured by ``_handle_model_specific_adjustments`` —
+   mirrors NSA CP's in-seq-split auto-config for DSv3.2.
+
+2. ``TestDeepseekV3CPAttnTPOnly`` — ``tp=8, dp=1, attn-cp=4``
+   (attn-tp=2). Matches ``scripts/playground/mla_prefill_cp/
+   launch_server.sh`` — the "just TP + CP" path. ``dp=1`` causes
+   ``_handle_data_parallelism`` to force-disable DP attention,
+   so the MLA CP auto-config's ``enable_dp_attention = True`` is
+   clobbered back to ``False``. EP still auto-enables at
+   ``ep_size == tp_size == 8`` (MLA CP auto-config pins this;
+   it is not reachable without patching ``server_args.py``).
+   Sibling to NSA CP's ``TestDeepseekV32CPRoundRobinSplit``.
 """
 
 import unittest
@@ -43,6 +54,8 @@ GSM8K_ACCURACY_THRESHOLD = 0.935
 
 
 class TestDeepseekV3CPInSeqSplit(CustomTestCase):
+    """tp=8, dp=2, attn-cp=4 — DP attention + DeepEP MoE + MLA CP."""
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_V3_MODEL_PATH
@@ -96,6 +109,75 @@ class TestDeepseekV3CPInSeqSplit(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_a_gsm8k (deepseek-v3-mla-cp-in-seq-split)\n"
+                f'{metrics["score"]=:.3f}\n'
+            )
+            self.assertGreater(metrics["score"], GSM8K_ACCURACY_THRESHOLD)
+
+
+class TestDeepseekV3CPAttnTPOnly(CustomTestCase):
+    """tp=8, dp=1, attn-cp=4, attn-tp=2 — just TP + CP, no DP attention.
+
+    ``dp=1`` causes ``_handle_data_parallelism`` to force
+    ``enable_dp_attention = False`` *after* the MLA CP auto-config
+    tried to set it to True, so this exercises the non-DP-attention
+    MLA CP path. Matches ``scripts/playground/mla_prefill_cp/
+    launch_server.sh``.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEEPSEEK_V3_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--tp",
+            "8",
+            "--dp",
+            "1",
+            "--disable-radix-cache",
+            "--attn-cp-size",
+            "4",
+            "--enable-prefill-context-parallel",
+            "--attention-backend",
+            "fa3",
+            "--mem-frac",
+            "0.7",
+            "--cuda-graph-max-bs",
+            "32",
+            "--max-running-requests",
+            "32",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=500,
+            num_threads=32,
+            num_shots=20,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_a_gsm8k (deepseek-v3-mla-cp-attn-tp-only)\n"
                 f'{metrics["score"]=:.3f}\n'
             )
             self.assertGreater(metrics["score"], GSM8K_ACCURACY_THRESHOLD)

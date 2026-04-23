@@ -2518,20 +2518,24 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # Minor fix for multi-modal model: input_ids is None
+        len_input_ids = (
+            input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
+        )
         if self.nsa_enable_prefill_cp:
             if can_nsa_cp_split(
-                len(input_ids), self.cp_size, self.use_nsa, forward_batch
+                len_input_ids, self.cp_size, self.use_nsa, forward_batch
             ):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
+                    len_input_ids,
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
         elif self.mla_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, forward_batch):
+            if can_cp_split(len_input_ids, self.cp_size, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
+                    len_input_ids,
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
