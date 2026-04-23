@@ -8,6 +8,7 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import inspect
 import os
 import shutil
 import subprocess
@@ -39,6 +40,38 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
+
+
+# NOTE: we currently write videos via libx264 and optionally mux audio via ffmpeg
+# into an MP4 container. Keep the output extension consistent with the actual
+# container we write.
+VIDEO_OUTPUT_EXTENSIONS = frozenset({".mp4"})
+
+# Audio sample-rate bounds used for best-effort validation/inference.
+MIN_AUDIO_SAMPLE_RATE = 8000
+MAX_AUDIO_SAMPLE_RATE = 192000
+DEFAULT_AUDIO_SAMPLE_RATE = 24000
+
+
+def _video_writer_likely_supports_quality_kwarg(*, save_file_path: str) -> bool:
+    """Best-effort check whether the selected video writer supports `quality=`.
+
+    This is intentionally conservative: if we can't confidently determine support,
+    we return False and avoid passing `quality`.
+    """
+
+    try:
+        fmt = imageio.formats.search_write_format(save_file_path)
+        writer_cls = getattr(fmt, "Writer", None)
+        if writer_cls is None:
+            return False
+        params = inspect.signature(writer_cls.__init__).parameters
+        if "quality" in params:
+            return True
+        # If Writer uses **kwargs, it may still reject unknown kwargs later, so be conservative.
+        return False
+    except Exception:
+        return False
 
 
 @dataclass
@@ -158,8 +191,10 @@ def _pick_audio_sample_rate(
 ) -> int:
     """Pick a plausible sample rate, falling back to inferring from video duration."""
     selected_sr = int(audio_sample_rate) if audio_sample_rate is not None else None
-    if selected_sr is None or not (8000 <= selected_sr <= 192000):
-        selected_sr = 24000
+    if selected_sr is None or not (
+        MIN_AUDIO_SAMPLE_RATE <= selected_sr <= MAX_AUDIO_SAMPLE_RATE
+    ):
+        selected_sr = DEFAULT_AUDIO_SAMPLE_RATE
         try:
             duration_s = float(num_frames) / float(fps) if fps else 0.0
             if duration_s > 0:
@@ -169,7 +204,7 @@ def _pick_audio_sample_rate(
                     else int(audio_np.shape[-1])
                 )
                 inferred_sr = int(round(float(audio_len) / duration_s))
-                if 8000 <= inferred_sr <= 192000:
+                if MIN_AUDIO_SAMPLE_RATE <= inferred_sr <= MAX_AUDIO_SAMPLE_RATE:
                     selected_sr = inferred_sr
         except Exception:
             pass
@@ -369,6 +404,18 @@ def save_outputs(
     output_paths: list[str] = []
     for idx, output in enumerate(outputs):
         save_file_path = build_output_path(idx)
+        if data_type == DataType.VIDEO and save_file_path:
+            _, ext = os.path.splitext(save_file_path)
+            if not ext or ext.lower() not in VIDEO_OUTPUT_EXTENSIONS:
+                base = save_file_path if not ext else save_file_path[: -len(ext)]
+                corrected_path = f"{base}.mp4"
+                logger.warning(
+                    "Video output path %s has non-video extension %s; saving as %s",
+                    save_file_path,
+                    ext or "<none>",
+                    corrected_path,
+                )
+                save_file_path = corrected_path
         sample = output
         if data_type == DataType.VIDEO:
             sample = attach_audio_to_video_sample(sample, audio, idx)
@@ -493,17 +540,25 @@ def post_process_sample(
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
-                quality = (
-                    output_compression / 10 if output_compression is not None else 5
-                )
-                imageio.mimsave(
-                    save_file_path,
-                    frames,
-                    fps=fps,
-                    format=data_type.get_default_extension(),
-                    codec="libx264",
-                    quality=quality,
-                )
+                mimsave_kwargs = {
+                    "fps": fps,
+                    "format": data_type.get_default_extension(),
+                    "codec": "libx264",
+                }
+                if (
+                    output_compression is not None
+                    and _video_writer_likely_supports_quality_kwarg(
+                        save_file_path=save_file_path
+                    )
+                ):
+                    mimsave_kwargs["quality"] = output_compression / 10
+
+                try:
+                    imageio.mimsave(save_file_path, frames, **mimsave_kwargs)
+                except TypeError:
+                    # As a final fallback, retry without optional kwargs that may not be supported.
+                    mimsave_kwargs.pop("quality", None)
+                    imageio.mimsave(save_file_path, frames, **mimsave_kwargs)
 
                 _maybe_mux_audio_into_mp4(
                     save_file_path=save_file_path,
