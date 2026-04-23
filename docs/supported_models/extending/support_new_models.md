@@ -512,7 +512,7 @@ python -m sglang.launch_server \
 
 ### Integration checklist for MLLM + DLLM external adapters
 
-When adapting multimodal diffusion models through `SGLANG_EXTERNAL_*` plugins, keep the
+When adapting multimodal and diffusion models through `SGLANG_EXTERNAL_*` plugins, keep the
 adapter `forward()` logic minimal and aligned with built-in multimodal models:
 
 - Avoid preprocessing `input_ids` in adapter `forward()` unless required by the model
