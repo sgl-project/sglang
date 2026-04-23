@@ -403,9 +403,7 @@ class LTX2DenoisingStage(DenoisingStage):
             denoised_video = ctx.latents.float()
             denoised_audio = ctx.audio_latents.float()
         else:
-            denoised_video = (
-                ctx.latents.float() - sigma * model_video_velocity.float()
-            )
+            denoised_video = ctx.latents.float() - sigma * model_video_velocity.float()
             denoised_audio = (
                 ctx.audio_latents.float() - sigma * model_audio_velocity.float()
             )
@@ -436,9 +434,7 @@ class LTX2DenoisingStage(DenoisingStage):
             else self._randn_like_with_batch_generators(ctx.latents, batch).float()
         )
         sub_noise_audio = (
-            self._ltx2_res2s_noise_like(
-                ctx.audio_latents, ctx, substep=True
-            ).float()
+            self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=True).float()
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(
                 ctx.audio_latents, batch
@@ -480,49 +476,51 @@ class LTX2DenoisingStage(DenoisingStage):
         mid_kwargs = dict(base_model_kwargs)
         mid_kwargs["hidden_states"] = midpoint_video_latents.to(ctx.target_dtype)
         mid_kwargs["audio_hidden_states"] = midpoint_audio_latents.to(ctx.target_dtype)
-        # Pre-squash stage-2 midpoint used RAW sigma (not sigma*1000) as the
-        # DiT timestep for LTX-2.3 non-legacy path, with per-token expansion
-        # for video/audio (ndim-3) latents. Matches `build_stage1_step_inputs`
-        # from 80edc98c0.
+        # Stage-2 primary call uses sigma*1000 timesteps via
+        # `_prepare_ltx2_model_inputs`; midpoint re-eval must match scale.
+        timestep_scale_multiplier = float(
+            getattr(step.current_model, "timestep_scale_multiplier", 1000)
+        )
         local_batch_size = int(midpoint_video_latents.shape[0])
-        sub_sigma_raw = sub_sigma.to(
-            device=midpoint_video_latents.device, dtype=torch.float32
+        sub_t_scalar = (
+            sub_sigma.to(device=midpoint_video_latents.device, dtype=torch.float32)
+            * timestep_scale_multiplier
         )
-        timestep_local = sub_sigma_raw.expand(local_batch_size)
-        use_raw_sigma_timestep = (
-            ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage
-        )
+        timestep_local = sub_t_scalar.expand(local_batch_size)
         if ctx.denoise_mask is not None:
-            if use_raw_sigma_timestep:
-                timestep_video_local = timestep_local.view(
-                    local_batch_size, *([1] * (ctx.denoise_mask.ndim - 1))
-                ) * ctx.denoise_mask
-            else:
-                timestep_video_local = (
-                    timestep_local.unsqueeze(-1) * ctx.denoise_mask.squeeze(-1)
-                )
-        elif use_raw_sigma_timestep and midpoint_video_latents.ndim == 3:
-            timestep_video_local = timestep_local.view(
-                local_batch_size, 1, 1
-            ).expand(local_batch_size, int(midpoint_video_latents.shape[1]), 1)
+            timestep_video_local = (
+                timestep_local.unsqueeze(-1) * ctx.denoise_mask.squeeze(-1)
+            )
+        elif ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage:
+            timestep_video_local = timestep_local.view(local_batch_size, 1).expand(
+                local_batch_size, int(midpoint_video_latents.shape[1])
+            )
         else:
             timestep_video_local = timestep_local
-        if use_raw_sigma_timestep and midpoint_audio_latents.ndim == 3:
-            timestep_audio_local = timestep_local.view(
-                local_batch_size, 1, 1
-            ).expand(local_batch_size, int(midpoint_audio_latents.shape[1]), 1)
+        if (
+            ctx.is_ltx23_variant
+            and not ctx.use_ltx23_legacy_one_stage
+            and midpoint_audio_latents.ndim == 3
+        ):
+            timestep_audio_local = timestep_local.view(local_batch_size, 1).expand(
+                local_batch_size, int(midpoint_audio_latents.shape[1])
+            )
         else:
             timestep_audio_local = timestep_local
         mid_kwargs["timestep"] = timestep_video_local
         mid_kwargs["audio_timestep"] = timestep_audio_local
-        # prompt_timestep is scalar per batch (raw sigma).
-        if "prompt_timestep" in mid_kwargs and mid_kwargs["prompt_timestep"] is not None:
-            mid_kwargs["prompt_timestep"] = sub_sigma_raw.expand(local_batch_size)
+        # prompt_timestep scalar per batch at sigma*1000 scale.
+        sub_prompt_t = sub_t_scalar.expand(local_batch_size)
+        if (
+            "prompt_timestep" in mid_kwargs
+            and mid_kwargs["prompt_timestep"] is not None
+        ):
+            mid_kwargs["prompt_timestep"] = sub_prompt_t
         if (
             "audio_prompt_timestep" in mid_kwargs
             and mid_kwargs["audio_prompt_timestep"] is not None
         ):
-            mid_kwargs["audio_prompt_timestep"] = sub_sigma_raw.expand(local_batch_size)
+            mid_kwargs["audio_prompt_timestep"] = sub_prompt_t
         mid_kwargs["encoder_hidden_states"] = encoder_hidden_states
         mid_kwargs["audio_encoder_hidden_states"] = audio_encoder_hidden_states
         mid_kwargs["encoder_attention_mask"] = encoder_attention_mask
@@ -558,9 +556,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     ]
                 )
                 mid_kwargs["encoder_attention_mask"] = repeated_attention_mask
-                mid_kwargs["audio_encoder_attention_mask"] = (
-                    repeated_attention_mask
-                )
+                mid_kwargs["audio_encoder_attention_mask"] = repeated_attention_mask
 
         with set_forward_context(
             current_timestep=step.step_index, attn_metadata=step.attn_metadata
@@ -575,12 +571,8 @@ class LTX2DenoisingStage(DenoisingStage):
             mid_v = mid_v_u + batch.guidance_scale * (mid_v_t - mid_v_u)
             mid_a = mid_a_u + batch.guidance_scale * (mid_a_t - mid_a_u)
 
-        midpoint_denoised_video = (
-            midpoint_video_latents.float() - sub_sigma * mid_v
-        )
-        midpoint_denoised_audio = (
-            midpoint_audio_latents.float() - sub_sigma * mid_a
-        )
+        midpoint_denoised_video = midpoint_video_latents.float() - sub_sigma * mid_v
+        midpoint_denoised_audio = midpoint_audio_latents.float() - sub_sigma * mid_a
 
         eps2_video = midpoint_denoised_video.double() - anchor_video
         eps2_audio = midpoint_denoised_audio.double() - anchor_audio
@@ -594,9 +586,7 @@ class LTX2DenoisingStage(DenoisingStage):
             else self._randn_like_with_batch_generators(ctx.latents, batch).float()
         )
         step_noise_audio = (
-            self._ltx2_res2s_noise_like(
-                ctx.audio_latents, ctx, substep=False
-            ).float()
+            self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=False).float()
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(
                 ctx.audio_latents, batch
@@ -806,40 +796,13 @@ class LTX2DenoisingStage(DenoisingStage):
             )
 
         batch_size = int(latent_model_input.shape[0])
-        # HQ pipeline DiT AdaLN was trained against raw sigma as the timestep
-        # (see pre-squash `use_raw_sigma_timestep` path at 80edc98c0). The
-        # squash normalized everything to sigma*1000 which regresses HQ by
-        # ~3.7 dB vs the official canonical. Legacy LTX-2/LTX-2.3 two-stage
-        # baselines were re-generated against the post-squash sigma*1000
-        # schedule so they must keep that scale.
-        use_raw_sigma_timestep = (
-            ctx.is_ltx23_variant
-            and not ctx.use_ltx23_legacy_one_stage
-            and server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
-        )
-        if use_raw_sigma_timestep:
-            timestep = (
-                sigma.to(device=ctx.latents.device, dtype=torch.float32)
-                .expand(batch_size)
-            )
-        else:
-            timestep = step.t_device.expand(batch_size)
+        timestep = step.t_device.expand(batch_size)
         if ctx.denoise_mask is not None:
-            if use_raw_sigma_timestep:
-                timestep_video = timestep.view(
-                    batch_size, *([1] * (ctx.denoise_mask.ndim - 1))
-                ) * ctx.denoise_mask
-            else:
-                timestep_video = timestep.unsqueeze(-1) * ctx.denoise_mask.squeeze(-1)
+            timestep_video = timestep.unsqueeze(-1) * ctx.denoise_mask.squeeze(-1)
         elif ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage:
-            if use_raw_sigma_timestep:
-                timestep_video = timestep.view(batch_size, 1, 1).expand(
-                    batch_size, int(latent_model_input.shape[1]), 1
-                )
-            else:
-                timestep_video = timestep.view(batch_size, 1).expand(
-                    batch_size, int(latent_model_input.shape[1])
-                )
+            timestep_video = timestep.view(batch_size, 1).expand(
+                batch_size, int(latent_model_input.shape[1])
+            )
         else:
             timestep_video = timestep
 
@@ -848,39 +811,26 @@ class LTX2DenoisingStage(DenoisingStage):
             and not ctx.use_ltx23_legacy_one_stage
             and audio_latent_model_input.ndim == 3
         ):
-            if use_raw_sigma_timestep:
-                timestep_audio = timestep.view(batch_size, 1, 1).expand(
-                    batch_size, int(audio_latent_model_input.shape[1]), 1
-                )
-            else:
-                timestep_audio = timestep.view(batch_size, 1).expand(
-                    batch_size, int(audio_latent_model_input.shape[1])
-                )
+            timestep_audio = timestep.view(batch_size, 1).expand(
+                batch_size, int(audio_latent_model_input.shape[1])
+            )
         else:
             timestep_audio = timestep
 
         prompt_timestep_video = None
         prompt_timestep_audio = None
         if ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage:
-            if use_raw_sigma_timestep:
-                prompt_timestep_video = sigma.to(
-                    device=latent_model_input.device, dtype=torch.float32
-                ).expand(batch_size)
-                prompt_timestep_audio = sigma.to(
-                    device=audio_latent_model_input.device, dtype=torch.float32
-                ).expand(batch_size)
-            else:
-                timestep_scale_multiplier = float(
-                    getattr(step.current_model, "timestep_scale_multiplier", 1000)
-                )
-                prompt_timestep_video = (
-                    sigma.to(device=latent_model_input.device, dtype=torch.float32)
-                    * timestep_scale_multiplier
-                ).expand(batch_size)
-                prompt_timestep_audio = (
-                    sigma.to(device=audio_latent_model_input.device, dtype=torch.float32)
-                    * timestep_scale_multiplier
-                ).expand(batch_size)
+            timestep_scale_multiplier = float(
+                getattr(step.current_model, "timestep_scale_multiplier", 1000)
+            )
+            prompt_timestep_video = (
+                sigma.to(device=latent_model_input.device, dtype=torch.float32)
+                * timestep_scale_multiplier
+            ).expand(batch_size)
+            prompt_timestep_audio = (
+                sigma.to(device=audio_latent_model_input.device, dtype=torch.float32)
+                * timestep_scale_multiplier
+            ).expand(batch_size)
 
         if ctx.use_ltx23_legacy_one_stage:
             video_self_attention_mask = None
