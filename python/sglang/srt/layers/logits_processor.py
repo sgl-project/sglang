@@ -536,11 +536,16 @@ class LogitsProcessor(nn.Module):
             if aux_pruned_states_lists is not None:
                 aux_pruned_states = [torch.cat(lst) for lst in aux_pruned_states_lists]
             sample_indices = torch.tensor(
-                sample_indices, device=pruned_states.device, dtype=torch.int64
-            )
-            input_logprob_indices = torch.tensor(
-                input_logprob_indices, device=pruned_states.device, dtype=torch.int64
-            )
+                sample_indices, 
+                dtype=torch.int64, 
+                device="cpu", 
+                pin_memory=True
+            ).to(pruned_states.device, non_blocking=True)
+            input_logprob_indices = torch.tensor(input_logprob_indices,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True
+            ).to(pruned_states.device, non_blocking=True)
 
         return (
             pruned_states,
