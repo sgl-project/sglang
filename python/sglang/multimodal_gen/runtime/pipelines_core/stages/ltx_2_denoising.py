@@ -1291,9 +1291,12 @@ class LTX2DenoisingStage(DenoisingStage):
         # NOTE: this flag must be identical across all SP ranks so that every
         # rank executes the same number of model-forward calls (each of which
         # contains NCCL collectives).
-        use_split_two_stage_ti2v_guider = (
-            is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
-            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
+        use_split_stage1_guided_passes = (
+            server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
+            or (
+                is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
+                and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
+            )
         )
 
         def evaluate_stage1_guided_x0(
@@ -1471,7 +1474,7 @@ class LTX2DenoisingStage(DenoisingStage):
                             ]
                         ),
                     )
-                    if use_split_two_stage_ti2v_guider:
+                    if use_split_stage1_guided_passes:
                         split_sizes = [1] * expanded_batch_size
                         batched_video_chunks = []
                         batched_audio_chunks = []
