@@ -21,7 +21,7 @@ on:
 
 concurrency:
   group: pr-test-xeon-${{ inputs.ref || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
   # ==================== Check Changes ==================== #

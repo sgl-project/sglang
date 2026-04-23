@@ -64,9 +64,9 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         draft_token: torch.Tensor = None,
         custom_mask: torch.Tensor = None,
         positions: torch.Tensor = None,
-        retrive_index: torch.Tensor = None,
-        retrive_next_token: torch.Tensor = None,
-        retrive_next_sibling: torch.Tensor = None,
+        retrieve_index: torch.Tensor = None,
+        retrieve_next_token: torch.Tensor = None,
+        retrieve_next_sibling: torch.Tensor = None,
         draft_token_num: int = -1,
         grammar: BaseGrammarObject = None,
         future_indices: Optional[FutureIndices] = None,
@@ -79,9 +79,9 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         self.draft_token = draft_token
         self.custom_mask = custom_mask
         self.positions = positions
-        self.retrive_index = retrive_index
-        self.retrive_next_token = retrive_next_token
-        self.retrive_next_sibling = retrive_next_sibling
+        self.retrieve_index = retrieve_index
+        self.retrieve_next_token = retrieve_next_token
+        self.retrieve_next_sibling = retrieve_next_sibling
 
         self.draft_token_num = (
             draft_token_num
@@ -356,9 +356,9 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             accept_index=self.accepted_indices,  # mutable
             accept_token_num=self.accept_length,  # mutable
             candidates=candidates,
-            retrive_index=self.retrive_index,
-            retrive_next_token=self.retrive_next_token,
-            retrive_next_sibling=self.retrive_next_sibling,
+            retrieve_index=self.retrieve_index,
+            retrieve_next_token=self.retrieve_next_token,
+            retrieve_next_sibling=self.retrieve_next_sibling,
             target_predict=target_predict,
         )
 
@@ -418,9 +418,10 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             accept_index=self.accepted_indices,  # mutable
             accept_token_num=self.accept_length,  # mutable
             candidates=candidates.to(torch.int64),
-            retrive_index=self.retrive_index.to(torch.int64),
-            retrive_next_token=self.retrive_next_token.to(torch.int64),
-            retrive_next_sibling=self.retrive_next_sibling.to(torch.int64),
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=self.retrieve_index.to(torch.int64),
+            retrive_next_token=self.retrieve_next_token.to(torch.int64),
+            retrive_next_sibling=self.retrieve_next_sibling.to(torch.int64),
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
@@ -437,13 +438,15 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
-        bs = self.retrive_index.shape[0]
+        bs = self.retrieve_index.shape[0]
         sampling_info = batch.sampling_info
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
-            # NOTE: retrive_index are the indices of the requests that are kept.
-            sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
+            # NOTE: retrieve_index are the indices of the requests that are kept.
+            sampling_info.filter_batch(
+                self.retrieve_index.tolist(), self.retrieve_index
+            )
 
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:

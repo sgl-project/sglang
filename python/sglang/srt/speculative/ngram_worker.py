@@ -131,12 +131,12 @@ class NGRAMWorker:
             dtype=torch.int64,
             device=self.device,
         )
-        self.retrive_next_token = torch.empty(
+        self.retrieve_next_token = torch.empty(
             (self.max_batch_size, self.draft_token_num),
             dtype=torch.int64,
             device=self.device,
         )
-        self.retrive_next_sibling = torch.empty(
+        self.retrieve_next_sibling = torch.empty(
             (self.max_batch_size, self.draft_token_num),
             dtype=torch.int64,
             device=self.device,
@@ -151,14 +151,14 @@ class NGRAMWorker:
         self.draft_tokens_batch = []
         self.tree_mask_batch = []
         self.retrieve_indexes_batch = []
-        self.retrive_next_token_batch = []
-        self.retrive_next_sibling_batch = []
+        self.retrieve_next_token_batch = []
+        self.retrieve_next_sibling_batch = []
         self.positions_batch = []
 
         for bs in range(0, self.max_batch_size + 1):
             self.retrieve_indexes_batch.append(self.retrieve_indexes[:bs, :])
-            self.retrive_next_token_batch.append(self.retrive_next_token[:bs, :])
-            self.retrive_next_sibling_batch.append(self.retrive_next_sibling[:bs, :])
+            self.retrieve_next_token_batch.append(self.retrieve_next_token[:bs, :])
+            self.retrieve_next_sibling_batch.append(self.retrieve_next_sibling[:bs, :])
             self.positions_batch.append(self.positions[: bs * self.draft_token_num])
             self.draft_tokens_batch.append(
                 self.draft_tokens[: bs * self.draft_token_num]
@@ -224,9 +224,9 @@ class NGRAMWorker:
 
         bs = len(batch.reqs)
 
-        retrive_index = self.retrieve_indexes_batch[bs]
-        retrive_next_token = self.retrive_next_token_batch[bs]
-        retrive_next_sibling = self.retrive_next_sibling_batch[bs]
+        retrieve_index = self.retrieve_indexes_batch[bs]
+        retrieve_next_token = self.retrieve_next_token_batch[bs]
+        retrieve_next_sibling = self.retrieve_next_sibling_batch[bs]
         positions = self.positions_batch[bs]
         tree_mask = self.tree_mask_batch[bs]
         draft_tokens = self.draft_tokens_batch[bs]
@@ -240,9 +240,9 @@ class NGRAMWorker:
             tree_mask,
             batch.seq_lens,
             positions,  # mutable
-            retrive_index,  # mutable
-            retrive_next_token,  # mutable
-            retrive_next_sibling,  # mutable
+            retrieve_index,  # mutable
+            retrieve_next_token,  # mutable
+            retrieve_next_sibling,  # mutable
             bs,
             self.draft_token_num,
         )
@@ -287,9 +287,9 @@ class NGRAMWorker:
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=positions,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
             draft_token_num=self.draft_token_num,
         )
 
@@ -336,10 +336,10 @@ class NGRAMWorker:
         if model_worker_batch.forward_mode.is_target_verify():
             # Prepare grammar data on CPU if needed
             if model_worker_batch.has_grammar:
-                retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
-                retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
+                retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+                retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
                 draft_tokens_cpu = verify_input.draft_token.view(
-                    verify_input.retrive_next_token.shape
+                    verify_input.retrieve_next_token.shape
                 ).cpu()
 
             set_time_batch(
@@ -371,7 +371,7 @@ class NGRAMWorker:
 
                 if vocab_mask is not None:
                     assert verify_input.grammar is not None
-                    vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                    vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
                     # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                     # and will be applied to produce wrong results
                     model_worker_batch.sampling_info.vocab_mask = None
