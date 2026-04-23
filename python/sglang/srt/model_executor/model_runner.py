@@ -1080,17 +1080,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.pre_warm_nccl and (
                 self.tp_size > 1 or self.pp_size > 1 or self.moe_ep_size > 1
             ):
-
                 warmup_start = time.perf_counter()
                 tp_group_handle = get_tp_group().device_group
-                device_module = torch.get_device_module(self.device)
-                # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
-                warmup_tensor = torch.zeros(1, device=self.device)
+
+                # Single warmup all_reduce to initialize NCCL/RCCL communicator
+                warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
                 dist.all_reduce(warmup_tensor, group=tp_group_handle)
-                device_module.synchronize()
+                torch.cuda.synchronize()
+
                 warmup_elapsed = time.perf_counter() - warmup_start
                 logger.info(
-                    f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
+                    f"NCCL/RCCL warmup completed in {warmup_elapsed:.3f}s "
                     f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
                 )
 
