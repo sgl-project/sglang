@@ -48,6 +48,13 @@ logger = init_logger(__name__)
 
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
+# Placeholder negative_prompt used in synthesized warmup Reqs when
+# --enable-cfg-parallel is on. A non-empty, real word (vs "" or " ") so
+# every tokenizer backend emits a predictable, non-degenerate token
+# sequence — rank 1's uncond branch then produces a valid tensor for
+# _combine_cfg_parallel's all-reduce.
+DEFAULT_PLACEHOLDER_PROMPT = "warmup"
+
 
 class Scheduler(SchedulerDisaggMixin):
     """
@@ -241,22 +248,25 @@ class Scheduler(SchedulerDisaggMixin):
             for resolution in self.server_args.warmup_resolutions:
                 width, height = _parse_size(resolution)
 
+                # CFG-parallel splits cond/uncond across ranks, so rank 1
+                # needs a real uncond pass. Force do_classifier_free_guidance
+                # + non-empty negative_prompt when cfg-parallel is on, so the
+                # synthesized warmup Req exercises both ranks' denoising paths.
+                # When cfg-parallel is off, the Req construction is
+                # byte-identical to the pre-fix behavior.
+                req_kwargs = dict(
+                    data_type=task_type.data_type(),
+                    width=width,
+                    height=height,
+                    prompt="",
+                )
                 if requires_warmup_image:
-                    req = Req(
-                        data_type=task_type.data_type(),
-                        width=width,
-                        height=height,
-                        prompt="",
-                        negative_prompt="",
-                        image_path=[warmup_input_path],
-                    )
-                else:
-                    req = Req(
-                        data_type=task_type.data_type(),
-                        width=width,
-                        height=height,
-                        prompt="",
-                    )
+                    req_kwargs["negative_prompt"] = ""
+                    req_kwargs["image_path"] = [warmup_input_path]
+                if self.server_args.enable_cfg_parallel:
+                    req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
+                    req_kwargs["do_classifier_free_guidance"] = True
+                req = Req(**req_kwargs)
                 req.set_as_warmup(self.server_args.warmup_steps)
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup

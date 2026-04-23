@@ -559,7 +559,23 @@ def _summary_has_retryable_failure(summary_lines: list[str]) -> bool:
     return False
 
 
+def _is_consistency_failure(full_output: str) -> bool:
+    summary_lines = _extract_short_test_summary(full_output)
+    for line in summary_lines:
+        if "Consistency check failed for" in line or "GT not found for" in line:
+            return True
+
+    return (
+        "Consistency check failed for " in full_output
+        or "GT not found for " in full_output
+        or "--- MISSING GROUND TRUTH DETECTED ---" in full_output
+    )
+
+
 def _is_retryable_failure(full_output: str) -> bool:
+    if _is_consistency_failure(full_output):
+        return False
+
     summary_lines = _extract_short_test_summary(full_output)
     is_perf_assertion = (
         "multimodal_gen/test/server/test_server_utils.py" in full_output
