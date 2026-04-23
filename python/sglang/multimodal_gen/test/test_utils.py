@@ -1129,7 +1129,7 @@ def compare_with_gt(
 
     status = "PASSED" if passed else "FAILED"
     print(f"\n{'=' * 60}")
-    print(f"[CLIP Consistency] {case_id}: {status}")
+    print(f"[Consistency Check] {case_id}: {status}")
     print(
         "  Thresholds: "
         f"clip>={thresholds.clip_threshold}, "

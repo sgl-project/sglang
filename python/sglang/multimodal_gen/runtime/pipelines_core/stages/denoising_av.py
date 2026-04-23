@@ -3,9 +3,7 @@ import copy
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
-    is_ltx23_native_variant,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
@@ -84,6 +82,20 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             batch.latents = latents
             batch.audio_latents = audio_latents
 
+        pipeline = self.pipeline() if self.pipeline else None
+        current_phase = (
+            str(getattr(batch, "extra", {}).get("ltx2_phase", ""))
+            if hasattr(batch, "extra")
+            else ""
+        )
+        release_phase_state = (
+            getattr(pipeline, "release_ltx2_phase_state", None)
+            if pipeline is not None
+            else None
+        )
+        if callable(release_phase_state):
+            release_phase_state(current_phase)
+
         if isinstance(self.transformer, OffloadableDiTMixin):
             for manager in self.transformer.layerwise_offload_managers:
                 manager.release_all()
@@ -93,9 +105,15 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     """Stage-2 refinement wrapper that re-noises distilled LTX latents once."""
 
     def __init__(
-        self, transformer, scheduler, distilled_sigmas, vae=None, audio_vae=None
+        self,
+        transformer,
+        scheduler,
+        distilled_sigmas,
+        vae=None,
+        audio_vae=None,
+        pipeline=None,
     ):
-        super().__init__(transformer, scheduler, vae, audio_vae)
+        super().__init__(transformer, scheduler, vae, audio_vae, pipeline=pipeline)
         self.distilled_sigmas = torch.tensor(distilled_sigmas)
 
     @staticmethod
@@ -156,23 +174,59 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the distilled refinement schedule on top of the shared AV denoiser."""
         batch.extra["ltx2_phase"] = "stage2"
+        original_clean_latent_background = getattr(
+            batch, "ltx2_ti2v_clean_latent_background", None
+        )
+        is_native_ti2v = (
+            is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config)
+            and batch.image_path is not None
+            and isinstance(batch.latents, torch.Tensor)
+        )
+        if is_native_ti2v:
+            # Official two-stage TI2V keeps the upsampled stage-2 latent as the
+            # clean background and only overwrites the conditioned frame tokens.
+            batch.ltx2_ti2v_clean_latent_background = batch.latents.detach().clone()
+        else:
+            batch.ltx2_ti2v_clean_latent_background = None
         if self._should_reset_stage2_generators(server_args):
             self._reset_stage2_generators(batch)
-        noise_scale = self.distilled_sigmas[0].to(batch.latents.device)
-        video_noise = self._randn_like_with_batch_generators(batch.latents, batch)
-        batch.latents = video_noise * noise_scale + batch.latents * (1 - noise_scale)
+        noise_scale = float(self.distilled_sigmas[0].item())
+        if is_native_ti2v:
+            prepared_latents, denoise_mask, _ = self._prepare_ltx2_ti2v_clean_state(
+                latents=batch.latents,
+                image_latent=batch.image_latent,
+                num_img_tokens=int(getattr(batch, "ltx2_num_image_tokens", 0)),
+                zero_clean_latent=True,
+                clean_latent_background=batch.ltx2_ti2v_clean_latent_background,
+            )
+            video_noise = self._randn_like_with_batch_generators(
+                prepared_latents, batch
+            )
+            scaled_mask = (
+                denoise_mask.to(device=prepared_latents.device, dtype=torch.float32)
+                * noise_scale
+            )
+            batch.latents = (
+                video_noise * scaled_mask + prepared_latents * (1 - scaled_mask)
+            ).to(prepared_latents.dtype)
+        else:
+            video_noise = self._randn_like_with_batch_generators(batch.latents, batch)
+            batch.latents = (
+                video_noise * noise_scale + batch.latents * (1 - noise_scale)
+            ).to(batch.latents.dtype)
 
         if isinstance(batch.audio_latents, torch.Tensor):
             audio_noise = self._randn_like_with_batch_generators(
                 batch.audio_latents, batch
             )
-            audio_noise_scale = noise_scale.to(
-                batch.audio_latents.device, batch.audio_latents.dtype
+            audio_scaled_mask = (
+                torch.ones_like(batch.audio_latents[..., :1], dtype=torch.float32)
+                * noise_scale
             )
             batch.audio_latents = (
-                audio_noise * audio_noise_scale
-                + batch.audio_latents * (1 - audio_noise_scale)
-            )
+                audio_noise * audio_scaled_mask
+                + batch.audio_latents * (1 - audio_scaled_mask)
+            ).to(batch.audio_latents.dtype)
         if not is_ltx23_native_variant(
             server_args.pipeline_config.vae_config.arch_config
         ):
@@ -183,9 +237,6 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 batch.audio_latents = batch.audio_latents.to(
                     device=batch.audio_latents.device, dtype=torch.float32
                 )
-
-        batch.image_latent = None
-        batch.ltx2_num_image_tokens = 0
 
         original_scheduler = self.scheduler
         original_batch_timesteps = batch.timesteps
@@ -214,5 +265,6 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             batch.timesteps = original_batch_timesteps
             batch.num_inference_steps = original_batch_num_inference_steps
             batch.do_classifier_free_guidance = original_do_cfg
+            batch.ltx2_ti2v_clean_latent_background = original_clean_latent_background
 
         return batch

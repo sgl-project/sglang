@@ -68,11 +68,6 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "HF AutoencoderDC checkpoint leaves required to_qkv_multiscale weights missing, so VAE transfer would compare against partially initialized reference weights"
         )
     },
-    "mova_360p_1gpu": {
-        ComponentType.TRANSFORMER: ComponentSkip(
-            "HF reference transformer cannot be materialized from the video_dit repo layout"
-        )
-    },
     "qwen_image_t2i_cache_dit_enabled": {
         ComponentType.VAE: ComponentSkip(
             "Representative VAE accuracy is already covered by qwen_image_t2i for the same source component and topology"
@@ -317,14 +312,6 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
         ),
     },
     "mova_360p_ring1_uly2": {
-        ComponentType.TRANSFORMER: ComponentSkip(
-            "HF reference transformer cannot be materialized from the MOVA video_dit repo layout"
-        ),
-        ComponentType.TEXT_ENCODER: ComponentSkip(
-            "Text encoder diverges from HF baseline in 2-GPU accuracy run (CosSim ~0.31) after 100% matched weight transfer"
-        ),
-    },
-    "mova_360p_ring2_uly1": {
         ComponentType.TRANSFORMER: ComponentSkip(
             "HF reference transformer cannot be materialized from the MOVA video_dit repo layout"
         ),
