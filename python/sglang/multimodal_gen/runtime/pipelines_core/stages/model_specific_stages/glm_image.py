@@ -664,6 +664,20 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
+
+        if height is None:
+            height = self.default_sample_size * self.vae_scale_factor
+        if width is None:
+            width = self.default_sample_size * self.vae_scale_factor
+
+        # Load vision_language_encoder to GPU if needed
+        if server_args.vision_language_encoder_cpu_offload:
+            if (
+                next(self.vision_language_encoder.parameters()).device.type
+                != device.type
+            ):
+                self.vision_language_encoder.to(device)
+
         time_start = time.time()
         prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
             prompt=prompt,
@@ -674,6 +688,14 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prior_token_id = prior_token_id.to(device=device)
         time_end = time.time()
         logger.info(f"generate_prior_tokens time: {time_end - time_start}")
+
+        # Offload vision_language_encoder after use to free GPU memory
+        if server_args.vision_language_encoder_cpu_offload:
+            if (
+                next(self.vision_language_encoder.parameters()).device.type
+                == device.type
+            ):
+                self.vision_language_encoder.to("cpu")
 
         # 3. Encode input prompt
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
