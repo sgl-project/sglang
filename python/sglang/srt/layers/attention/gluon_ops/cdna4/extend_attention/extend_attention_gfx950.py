@@ -20,9 +20,9 @@ the attention layers of a single forward pass. The persistent kernel walks
 
 Env vars
 --------
-- ``SGLANG_GLUON_FP8_KV_FORCE_BF16=1`` (user-facing safety rail): route
-  FP8 KV through the BF16 kernels by casting per call. Used when a new
-  FP8 config hits a numerical issue in production.
+- ``SGLANG_GLUON_FP8_KV_FORCE_BF16=1`` (user-facing safety rail): cast
+  FP8 KV to BF16 per call and route through the IS_FP8=False path. Used
+  when a new FP8 config hits a numerical issue in production.
 """
 
 import functools
@@ -33,9 +33,10 @@ import os
 import torch
 import triton
 
-# Unified BF16+FP8 kernel. Same JITFunction covers:
-#   * basic vs persistent/split-K paths (IS_PERSISTENT constexpr)
-#   * BF16 vs FP8 KV cache (IS_FP8 constexpr)
+# Unified extend kernel. One JITFunction covers every path:
+#   * IS_PERSISTENT    basic 3D grid vs persistent-CTA tile sweep
+#   * SPLIT_K          prefix partitioning for persistent (SPLIT_K > 1)
+#   * IS_FP8           BF16 vs FP8 KV cache
 from ._kernel_gfx950 import gluon_extend_attn_fwd as _kernel
 
 _dummy_cm = None
@@ -46,7 +47,7 @@ _dummy_wkvo_size = 0
 # Singleton passed to the kernel when HAS_SINK=False. The kernel body
 # never loads from it and DCE eliminates the path.
 _dummy_sinks = None
-# Singletons passed to the unified BF16 kernel when IS_PERSISTENT=False.
+# Singletons passed to the kernel on the IS_PERSISTENT=False path.
 # Triton specializes CompiledKernel on pointer element dtype, so they must
 # match the live tensor dtypes on the persistent path (fp32 / int32). The
 # kernel body gates every access on `if IS_PERSISTENT:` so these are never
@@ -82,7 +83,7 @@ def _ensure_dummies(device, mi_size, wkvo_size):
         _dummy_tile_done = torch.zeros(1, dtype=torch.int32, device=device)
 
 
-# User-facing safety rail: route FP8 KV through the BF16 kernels (pays a
+# User-facing safety rail: cast FP8 KV to BF16 at call time (pays a
 # per-call dtype cast). Referenced in user-visible error messages.
 _FP8_KV_FORCE_BF16 = int(os.getenv("SGLANG_GLUON_FP8_KV_FORCE_BF16", "0")) != 0
 
@@ -91,11 +92,11 @@ _FP8_KV_FORCE_BF16 = int(os.getenv("SGLANG_GLUON_FP8_KV_FORCE_BF16", "0")) != 0
 # Persistent / split-K launch helpers
 # ===-----------------------------------------------------------------------===#
 #
-# ``_launch_persistent`` and ``_launch_splitk`` wrap ``_kernel`` (IS_PERSISTENT=
-# True path, BF16 when IS_FP8=False) with tile-scheduling and split-K workspace
-# management. ``_launch_persistent_fp8`` / ``_launch_splitk_fp8`` do the same for
-# IS_FP8=True. Kernels are launched via standard ``kernel[grid](...)``; Triton's
-# own compile cache absorbs the JIT cost on warm calls.
+# ``_launch_persistent`` and ``_launch_splitk`` wrap ``_kernel`` with
+# IS_PERSISTENT=True and SPLIT_K=1 vs >1 respectively. The ``_fp8``
+# variants do the same with IS_FP8=True. Kernels launch via the standard
+# ``kernel[grid](...)`` path; Triton's own compile cache absorbs the JIT
+# cost on warm calls.
 
 
 _QK_SPLIT_CACHE = {}
@@ -267,7 +268,6 @@ def _launch_persistent(
     enable_prefix_unmasked=True,
     min_len_extend=None,
     total_prefix_len=None,
-    skip_prefix_custom_mask=True,  # accepted for FP8-symmetric dispatch; BF16 kernel hardcodes this True
 ):
     Lq = q_extend.shape[-1]
     BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
@@ -363,8 +363,9 @@ def _launch_persistent(
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     device = q_extend.device
-    n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
-    total_output_tiles_upper = batch_size * head_num * n_m_tiles
+    total_output_tiles_upper = (
+        batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M)
+    )
     if total_output_tiles_upper == 0:
         return
 
@@ -447,7 +448,6 @@ def _launch_persistent(
         SLIDING_WINDOW_SIZE=sliding_window_size,
         v_scale=_v_scale_final,
         num_heads=head_num,
-        n_m_tiles=n_m_tiles,
         total_valid_tiles=total_valid_tiles,
         total_programs=total_programs,
         partial_out=partial_out,
@@ -479,8 +479,9 @@ def _launch_splitk(
     device = q_extend.device
     batch_size = qo_indptr.shape[0] - 1
 
-    n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
-    total_output_tiles = batch_size * head_num * n_m_tiles
+    total_output_tiles = (
+        batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M)
+    )
     if total_output_tiles == 0:
         return
 
@@ -538,9 +539,8 @@ def _launch_splitk(
     sm_scale = sm_scale * k_scale
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
-    # n_m_tiles may have shifted if we forced a different BLOCK_M above.
-    n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
     # Tight sync-free upper bound on total_output_tiles (see _launch_persistent).
+    # BLOCK_M may have shifted above, so this is recomputed here.
     total_output_tiles = (
         (q_extend.shape[0] + batch_size * (BLOCK_M - 1)) // BLOCK_M
     ) * head_num
@@ -580,7 +580,7 @@ def _launch_splitk(
         XAI_TEMPERATURE_LEN=xai_temperature_len,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         v_scale=_v_scale_final,
-        num_heads=head_num, n_m_tiles=n_m_tiles,
+        num_heads=head_num,
         total_valid_tiles=total_valid_tiles, total_programs=total_programs,
         partial_out=partial_out, partial_lse=partial_lse,
         tile_done=tile_done,
@@ -977,7 +977,10 @@ def gluon_extend_attention_fwd(
     v_scale=1.0,
     sm_scale=None,
     logit_cap=0.0,
-    skip_prefix_custom_mask=True,
+    # ``skip_prefix_custom_mask`` is accepted for API parity with the Triton
+    # extend-attention backend. Gluon always skips the prefix custom-mask path
+    # (it was dead code pre-cleanup), so this argument is ignored.
+    skip_prefix_custom_mask=True,  # noqa: ARG001
     sliding_window_size=-1,
     sinks=None,
     window_kv_offsets=None,
@@ -1130,7 +1133,6 @@ def gluon_extend_attention_fwd(
                 custom_mask, is_causal, mask_indptr, max_len_extend,
                 k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
                 logit_cap=logit_cap,
-                skip_prefix_custom_mask=skip_prefix_custom_mask,
                 sliding_window_size=sliding_window_size,
                 sinks=sinks, window_kv_offsets=window_kv_offsets,
                 xai_temperature_len=xai_temperature_len,
@@ -1317,7 +1319,7 @@ def gluon_extend_attention_fwd(
             XAI_TEMPERATURE_LEN=xai_temperature_len,
             SLIDING_WINDOW_SIZE=sliding_window_size,
             v_scale=v_scale,
-            num_heads=0, n_m_tiles=0,
+            num_heads=0,
             total_valid_tiles=0, total_programs=0,
             partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
             tile_done=_dummy_tile_done,
@@ -1340,8 +1342,9 @@ def gluon_extend_attention_fwd(
     num_CUs = _get_num_CUs(q_extend.device)
 
     _BM_est = 64 if Lq < 256 else 128
-    n_m_tiles_est = (max_len_extend + _BM_est - 1) // _BM_est
-    total_tiles_est = batch_size * head_num * n_m_tiles_est
+    total_tiles_est = (
+        batch_size * head_num * ((max_len_extend + _BM_est - 1) // _BM_est)
+    )
 
     # Default routing: splitk for D<=128 causal (no custom_mask), basic
     # otherwise. D>=256 always falls through to the basic path below.
@@ -1523,7 +1526,7 @@ def gluon_extend_attention_fwd(
         XAI_TEMPERATURE_LEN=xai_temperature_len,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         v_scale=v_scale,
-        num_heads=0, n_m_tiles=0,
+        num_heads=0,
         total_valid_tiles=0, total_programs=0,
         partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
         tile_done=_dummy_tile_done,
@@ -1556,7 +1559,6 @@ def _launch_persistent_fp8(
     v_scale=1.0,
     sm_scale=None,
     logit_cap=0.0,
-    skip_prefix_custom_mask=True,
     sliding_window_size=-1,
     sinks=None,
     window_kv_offsets=None,
@@ -1649,7 +1651,6 @@ def _launch_persistent_fp8(
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     device = q_extend.device
-    n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
 
     # Tight sync-free upper bound on sum(ceil(ext_i / BM)). For heterogeneous
     # batches this is 3-4x smaller than ``batch * ceil(max_ext/BM)``; the
@@ -1731,7 +1732,6 @@ def _launch_persistent_fp8(
         SLIDING_WINDOW_SIZE=sliding_window_size,
         v_scale=1.0 if SPLIT_K > 1 else v_scale,
         num_heads=head_num,
-        n_m_tiles=n_m_tiles,
         total_valid_tiles=total_valid_tiles,
         total_programs=total_programs,
         partial_out=partial_out,
@@ -1773,8 +1773,9 @@ def _launch_splitk_fp8(
     device = q_extend.device
     batch_size = qo_indptr.shape[0] - 1
 
-    n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
-    total_output_tiles = batch_size * head_num * n_m_tiles
+    total_output_tiles = (
+        batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M)
+    )
     if total_output_tiles == 0:
         return
 

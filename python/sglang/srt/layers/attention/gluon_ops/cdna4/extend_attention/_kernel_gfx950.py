@@ -25,9 +25,9 @@ identical to a plain basic launch. The persistent path walks a single
 output_tile -> (seq, head, block_m) inline scan over qo_indptr (no CPU-side
 cum_tiles tensor); split-K layers on top by striping the prefix across CTAs.
 
-Internally derived (not user-tunable) constexprs: BLOCK_DV (=BLOCK_DMODEL),
-ENABLE_MASK_SPLIT / SKIP_PREFIX_CUSTOM_MASK, ASYNC_PAD_K/V. BLOCK_DPE is
-absent -- DeepSeek/MLA lives in a separate kernel.
+Internally derived (not user-tunable) constexprs: BLOCK_DV (=BLOCK_DMODEL)
+and ENABLE_MASK_SPLIT (=BLOCK_DMODEL<256). There is no BLOCK_DPE --
+DeepSeek/MLA lives in a separate kernel.
 
 Inner-loop dispatch (selected by num_warps, NUM_STAGES, D):
     USE_PINGPONG=False, NS>=2, D>=128 -> 4-warp sw-pipeline (async DMA, pipelined)
@@ -90,7 +90,6 @@ def gluon_extend_attn_fwd(
     SLIDING_WINDOW_SIZE: gl.constexpr,  #
     v_scale,  #
     num_heads,  #         int32 scalar -- total Q heads (persistent)
-    n_m_tiles,  #         int32 scalar -- ceil(max_len_extend / BLOCK_M)
     total_valid_tiles,  # int32 scalar -- batch * heads * tiles [* SPLIT_K]
     total_programs,  #    int32 scalar (= grid dim 0 for persistent)
     partial_out,  #       workspace for split-K partials
@@ -118,7 +117,6 @@ def gluon_extend_attn_fwd(
 
     BLOCK_DV: gl.constexpr = BLOCK_DMODEL
     ENABLE_MASK_SPLIT: gl.constexpr = BLOCK_DMODEL < 256
-    SKIP_PREFIX_CUSTOM_MASK: gl.constexpr = True
 
     # FP8 safety rails: MFMA_F8 at D>=256 hits an unrealized_conversion_cast
     # in the LLVM backend on gfx950; the dispatcher should never route
@@ -289,7 +287,6 @@ def gluon_extend_attn_fwd(
         pfx_kv_start = cur_seq_kv_start_idx
         pfx_seq_len = seq_len_prefix
         pfx_q_abs_pos = q_abs_pos
-        pfx_mask_base = mask_base_idx
         if SLIDING_WINDOW_SIZE > 0:
             q_min_abs = seq_len_prefix + cur_block_m * BLOCK_M
             first_useful_pos = tl.maximum(q_min_abs - SLIDING_WINDOW_SIZE, 0)
@@ -297,8 +294,6 @@ def gluon_extend_attn_fwd(
             pfx_kv_start = cur_seq_kv_start_idx + prefix_skip_n
             pfx_seq_len = seq_len_prefix - prefix_skip_n
             pfx_q_abs_pos = q_abs_pos - prefix_skip_n
-            if USE_CUSTOM_MASK:
-                pfx_mask_base = mask_base_idx + prefix_skip_n.to(tl.int64)
 
 
         # Split-K: partition prefix KV range (persistent only)
@@ -313,8 +308,6 @@ def gluon_extend_attn_fwd(
             pfx_seq_len = tl.minimum(my_block_end * BLOCK_N, pfx_seq_len) - split_start_offset
             pfx_seq_len = tl.maximum(pfx_seq_len, 0)
             pfx_q_abs_pos = pfx_q_abs_pos - split_start_offset
-            if USE_CUSTOM_MASK:
-                pfx_mask_base = pfx_mask_base + split_start_offset.to(tl.int64)
             if k_split_id < SPLIT_K - 1:
                 seq_len_extend = 0
 
@@ -386,9 +379,9 @@ def gluon_extend_attn_fwd(
                 # async v-layout; smaller D stays on the serial path.
                 # FP8: prefix uses wide FP8 K tile with 1024-byte smem pad,
                 # then _keep_alive transitions to BF16 smem for the extend
-                # phase (FP8 kernel uses MFMA_F8 on the prefix side and MFMA
-                # on BF16 for the extend tensors).
-                kt_offset_bases: gl.constexpr = prefix_kt_offset_bases(layouts, BLOCK_DMODEL, BLOCK_N)
+                # phase (IS_FP8=True runs MFMA_F8 on the prefix side and BF16
+                # MFMA on the live extend tensors).
+                kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
                 v_offset_bases: gl.constexpr = prefix_v_offset_bases(layouts, num_warps, BLOCK_DV, BLOCK_N)
                 kt_async_layout: gl.constexpr = prefix_kt_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_N)
                 v_async_layout: gl.constexpr = prefix_v_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N)
@@ -491,12 +484,6 @@ def gluon_extend_attn_fwd(
                             XAI_TEMPERATURE_LEN,
                             pfx_q_abs_pos,
                             SLIDING_WINDOW_SIZE,
-                            Mask,
-                            pfx_mask_base,
-                            mask_row_stride,
-                            q_extend_offs,
-                            USE_CUSTOM_MASK,
-                            SKIP_PREFIX_CUSTOM_MASK,
                             ENABLE_PREFIX_UNMASKED,
                             BLOCK_M,
                             BLOCK_N,
@@ -535,12 +522,6 @@ def gluon_extend_attn_fwd(
                             XAI_TEMPERATURE_LEN,
                             pfx_q_abs_pos,
                             SLIDING_WINDOW_SIZE,
-                            Mask,
-                            pfx_mask_base,
-                            mask_row_stride,
-                            q_extend_offs,
-                            USE_CUSTOM_MASK,
-                            SKIP_PREFIX_CUSTOM_MASK,
                             ENABLE_PREFIX_UNMASKED,
                             BLOCK_M,
                             BLOCK_N,
@@ -561,7 +542,7 @@ def gluon_extend_attn_fwd(
                 # + 1024-byte padding; extend phase runs BF16 MFMA, so release
                 # the prefix smem via _keep_alive (kernel-local dealloc) and
                 # re-allocate smem with BF16 dtype + standard 512-byte padding.
-                # BF16 kernel skips this entirely (single-phase smem).
+                # IS_FP8=False skips this entirely (single-phase smem).
                 if IS_FP8:
                     kt_smem._keep_alive()
                     v_smem._keep_alive()
@@ -841,12 +822,6 @@ def gluon_extend_attn_fwd(
                         XAI_TEMPERATURE_LEN,
                         pfx_q_abs_pos,
                         SLIDING_WINDOW_SIZE,
-                        Mask,
-                        pfx_mask_base,
-                        mask_row_stride,
-                        q_extend_offs,
-                        USE_CUSTOM_MASK,
-                        SKIP_PREFIX_CUSTOM_MASK,
                         ENABLE_PREFIX_UNMASKED,
                         BLOCK_M,
                         BLOCK_N,
@@ -864,7 +839,7 @@ def gluon_extend_attn_fwd(
                 # FP8 smem transition (serial path): release the FP8 prefix
                 # smem via _keep_alive and re-allocate with BF16 extend dtype.
                 # Same SwizzledSharedLayout (path-invariant); only the
-                # element type changes. BF16 kernel skips this.
+                # element type changes. IS_FP8=False skips this.
                 if IS_FP8:
                     kt_serial_smem._keep_alive()
                     v_serial_smem._keep_alive()
@@ -982,7 +957,7 @@ def gluon_extend_attn_fwd(
             # prefix dot operands + prefix smem padding via `layouts`; on
             # 8w pingpong EXT_BLOCK_N always equals BLOCK_N (extend reuses
             # the same tile size), so we only need an FP8 DLL swap.
-            kt_offset_bases: gl.constexpr = prefix_kt_offset_bases(layouts, BLOCK_DMODEL, BLOCK_N)
+            kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
             v_offset_bases: gl.constexpr = prefix_v_offset_bases(layouts, num_warps, BLOCK_DV, BLOCK_N)
             kt_async_layout: gl.constexpr = prefix_kt_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_N)
             v_async_layout: gl.constexpr = prefix_v_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N)
@@ -1075,12 +1050,6 @@ def gluon_extend_attn_fwd(
                     XAI_TEMPERATURE_LEN,
                     pfx_q_abs_pos,
                     SLIDING_WINDOW_SIZE,
-                    Mask,
-                    pfx_mask_base,
-                    mask_row_stride,
-                    q_extend_offs,
-                    USE_CUSTOM_MASK,
-                    SKIP_PREFIX_CUSTOM_MASK,
                     ENABLE_PREFIX_UNMASKED,
                     BLOCK_M,
                     BLOCK_N,
@@ -1120,12 +1089,6 @@ def gluon_extend_attn_fwd(
                     XAI_TEMPERATURE_LEN,
                     pfx_q_abs_pos,
                     SLIDING_WINDOW_SIZE,
-                    Mask,
-                    pfx_mask_base,
-                    mask_row_stride,
-                    q_extend_offs,
-                    USE_CUSTOM_MASK,
-                    SKIP_PREFIX_CUSTOM_MASK,
                     ENABLE_PREFIX_UNMASKED,
                     BLOCK_M,
                     BLOCK_N,
@@ -1142,7 +1105,7 @@ def gluon_extend_attn_fwd(
 
             # FP8 smem transition (8w pingpong): release the FP8 prefix
             # smem via _keep_alive and re-allocate with BF16 extend dtype
-            # + standard 512-byte padding. BF16 kernel skips this entirely.
+            # + standard 512-byte padding. IS_FP8=False skips this entirely.
             if IS_FP8:
                 kt_smem._keep_alive()
                 v_smem._keep_alive()

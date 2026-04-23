@@ -668,12 +668,6 @@ class ExtendAttentionLayouts:
 
 
 @gluon.constexpr_function
-def prefix_kt_offset_bases(layouts, BLOCK_DMODEL, BLOCK_N):
-    """K^T offset bases for an async prefix tile (shared BF16/FP8)."""
-    return make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
-
-
-@gluon.constexpr_function
 def prefix_v_offset_bases(layouts, num_warps, BLOCK_DV, BLOCK_N):
     """V offset bases for an async prefix tile (FP8-packed layout when IS_FP8)."""
     if layouts.IS_FP8:
@@ -715,63 +709,6 @@ def prefix_v_smem_layout(layouts, BLOCK_N, BLOCK_DV, offset_bases):
     else:
         pad_pairs = [[512, layouts.ASYNC_PAD_V.value]]
     return make_padded_smem([BLOCK_N, BLOCK_DV], offset_bases, pad_pairs)
-
-
-# ---- Extend-side async DLL / SMEM factories (BF16-always but differs by IS_FP8) ----
-# The FP8 kernel's BF16-extend V tile shares offset-bases with FP8 prefix V
-# (so smem is laid out the same way across the phase transition) but uses a
-# distinct DLL to get BF16-friendly vector widths. BF16 kernel's extend V tile
-# uses the standard BF16 DLL directly.
-
-
-@gluon.constexpr_function
-def extend_kt_offset_bases(layouts, BLOCK_DMODEL, BLOCK_N):
-    """K^T offset bases for the extend async tile (identical to prefix)."""
-    return make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
-
-
-@gluon.constexpr_function
-def extend_v_offset_bases(layouts, num_warps, BLOCK_DV, BLOCK_N):
-    """V offset bases for the extend async tile. On the FP8 path, inherits
-    the FP8-packed bases so the smem transition doesn't change offset
-    layouts; on BF16 uses the standard bases.
-    """
-    if layouts.IS_FP8:
-        return make_fp8_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
-    return make_v_offset_bases(BLOCK_DV, BLOCK_N)
-
-
-@gluon.constexpr_function
-def extend_kt_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_N):
-    """Extend K^T async DMA DLL (BF16, independent of IS_FP8)."""
-    return make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
-
-
-@gluon.constexpr_function
-def extend_v_dll(layouts, num_warps, BLOCK_DV, BLOCK_N):
-    """Extend V async DMA DLL. The FP8 kernel uses a distinct DLL
-    (``make_fp8_extend_v_dll``) that plays nicely with FP8-packed offset
-    bases reused across the phase transition.
-    """
-    if layouts.IS_FP8:
-        return make_fp8_extend_v_dll(num_warps, BLOCK_DV, BLOCK_N)
-    return make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
-
-
-@gluon.constexpr_function
-def extend_kt_smem_layout(layouts, BLOCK_DMODEL, BLOCK_N, offset_bases):
-    """Extend K^T padded smem (always 512-byte BF16 interval)."""
-    return make_padded_smem(
-        [BLOCK_DMODEL, BLOCK_N], offset_bases, [[512, layouts.ASYNC_PAD_K.value]]
-    )
-
-
-@gluon.constexpr_function
-def extend_v_smem_layout(layouts, BLOCK_N, BLOCK_DV, offset_bases):
-    """Extend V padded smem (always 512-byte BF16 interval)."""
-    return make_padded_smem(
-        [BLOCK_N, BLOCK_DV], offset_bases, [[512, layouts.ASYNC_PAD_V.value]]
-    )
 
 
 # ---- Runtime helpers ---------------------------------------------------------
@@ -1044,18 +981,15 @@ def compute_softmax_prefix(
     XAI_TEMPERATURE_LEN: gl.constexpr,  #
     q_abs_pos,
     SLIDING_WINDOW_SIZE: gl.constexpr,  #
-    Mask,
-    mask_base_idx,
-    mask_row_stride,
-    q_extend_offs,  #
-    USE_CUSTOM_MASK: gl.constexpr,
-    SKIP_PREFIX_CUSTOM_MASK: gl.constexpr,  #
     ENABLE_PREFIX_UNMASKED: gl.constexpr,  #
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,  #
 ):
+    # Prefix softmax. Custom-mask application lives in the extend phase
+    # (``compute_softmax_extend``); the prefix tokens are only gated by
+    # the sequence-length bound and -- when enabled -- the sliding window.
     qk_scaled = qk * qk_scale
     if LOGIT_CAP > 0:
         log2_cap: gl.constexpr = LOGIT_CAP * LOG2E
@@ -1066,7 +1000,6 @@ def compute_softmax_prefix(
     if XAI_TEMPERATURE_LEN > 0:
         qk_scaled = qk_scaled * xai_temperature_reg[:, None]
     bound_offs = start_n + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)
-    use_custom_prefix_mask = USE_CUSTOM_MASK and (not SKIP_PREFIX_CUSTOM_MASK)
     is_partial_tail = (start_n + BLOCK_N) > seq_len_prefix
     if SLIDING_WINDOW_SIZE > 0:
         swa_safe = (tl.max(q_abs_pos) <= start_n + SLIDING_WINDOW_SIZE)
@@ -1075,7 +1008,6 @@ def compute_softmax_prefix(
     use_unmasked_path = (
         ENABLE_PREFIX_UNMASKED
         and swa_safe
-        and (not use_custom_prefix_mask)
         and (not is_partial_tail)
     )
 
@@ -1089,16 +1021,6 @@ def compute_softmax_prefix(
             bound_mask = bound_mask & (
                 q_abs_pos[:, None] <= bound_offs[None, :] + SLIDING_WINDOW_SIZE
             )
-        if use_custom_prefix_mask:
-            mask_ptrs = (
-                Mask
-                + mask_base_idx
-                + q_extend_offs[:, None] * mask_row_stride
-                + start_n
-                + gl.arange(0, BLOCK_N, layout=mma_offs_n_col)[None, :]
-            )
-            mask_vals = gl.load(mask_ptrs, mask=bound_mask, other=0)
-            bound_mask = bound_mask & (mask_vals != 0)
         qk_scaled = gl.where(
             bound_mask,
             qk_scaled,
@@ -1109,7 +1031,7 @@ def compute_softmax_prefix(
 
         m_ij = nan_propagating_max(qk_scaled, axis=1)
         m_new = gl.maximum(m_i, m_ij, propagate_nan=tl.PropagateNan.ALL)
-        if SLIDING_WINDOW_SIZE > 0 or use_custom_prefix_mask:
+        if SLIDING_WINDOW_SIZE > 0:
             m_new = gl.maximum(
                 m_new,
                 gl.full(
@@ -1338,12 +1260,6 @@ def attn_fwd_inner_prefix_pingpong_8w(
     XAI_TEMPERATURE_LEN: gl.constexpr,  #
     q_abs_pos,
     SLIDING_WINDOW_SIZE: gl.constexpr,  #
-    Mask,
-    mask_base_idx,
-    mask_row_stride,
-    q_extend_offs,  #
-    USE_CUSTOM_MASK: gl.constexpr,
-    SKIP_PREFIX_CUSTOM_MASK: gl.constexpr,  #
     ENABLE_PREFIX_UNMASKED: gl.constexpr,  #
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
@@ -1497,12 +1413,6 @@ def attn_fwd_inner_prefix_pingpong_8w(
                 XAI_TEMPERATURE_LEN,
                 q_abs_pos,
                 SLIDING_WINDOW_SIZE,
-                Mask,
-                mask_base_idx,
-                mask_row_stride,
-                q_extend_offs,
-                USE_CUSTOM_MASK,
-                SKIP_PREFIX_CUSTOM_MASK,
                 ENABLE_PREFIX_UNMASKED,
                 BLOCK_M,
                 BLOCK_N,
@@ -1582,12 +1492,6 @@ def attn_fwd_inner_prefix_pingpong_8w(
             XAI_TEMPERATURE_LEN,
             q_abs_pos,
             SLIDING_WINDOW_SIZE,
-            Mask,
-            mask_base_idx,
-            mask_row_stride,
-            q_extend_offs,
-            USE_CUSTOM_MASK,
-            SKIP_PREFIX_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED,
             BLOCK_M,
             BLOCK_N,
@@ -1631,12 +1535,6 @@ def attn_fwd_inner_prefix_pingpong_8w(
             XAI_TEMPERATURE_LEN,
             q_abs_pos,
             SLIDING_WINDOW_SIZE,
-            Mask,
-            mask_base_idx,
-            mask_row_stride,
-            q_extend_offs,
-            USE_CUSTOM_MASK,
-            SKIP_PREFIX_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED,
             BLOCK_M,
             BLOCK_N,
@@ -1679,12 +1577,6 @@ def attn_fwd_inner_prefix_unpipelined(
     XAI_TEMPERATURE_LEN: gl.constexpr,  #
     q_abs_pos,
     SLIDING_WINDOW_SIZE: gl.constexpr,  #
-    Mask,
-    mask_base_idx,
-    mask_row_stride,
-    q_extend_offs,  #
-    USE_CUSTOM_MASK: gl.constexpr,
-    SKIP_PREFIX_CUSTOM_MASK: gl.constexpr,  #
     ENABLE_PREFIX_UNMASKED: gl.constexpr,  #
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
@@ -1750,12 +1642,6 @@ def attn_fwd_inner_prefix_unpipelined(
             XAI_TEMPERATURE_LEN,
             q_abs_pos,
             SLIDING_WINDOW_SIZE,
-            Mask,
-            mask_base_idx,
-            mask_row_stride,
-            q_extend_offs,
-            USE_CUSTOM_MASK,
-            SKIP_PREFIX_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED,
             BLOCK_M,
             BLOCK_N,
@@ -1796,12 +1682,6 @@ def attn_fwd_inner_prefix_sw_pipeline_4w(
     XAI_TEMPERATURE_LEN: gl.constexpr,  #
     q_abs_pos,
     SLIDING_WINDOW_SIZE: gl.constexpr,  #
-    Mask,
-    mask_base_idx,
-    mask_row_stride,
-    q_extend_offs,  #
-    USE_CUSTOM_MASK: gl.constexpr,
-    SKIP_PREFIX_CUSTOM_MASK: gl.constexpr,  #
     ENABLE_PREFIX_UNMASKED: gl.constexpr,  #
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
@@ -1943,12 +1823,6 @@ def attn_fwd_inner_prefix_sw_pipeline_4w(
             XAI_TEMPERATURE_LEN,
             q_abs_pos,
             SLIDING_WINDOW_SIZE,
-            Mask,
-            mask_base_idx,
-            mask_row_stride,
-            q_extend_offs,
-            USE_CUSTOM_MASK,
-            SKIP_PREFIX_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED,
             BLOCK_M,
             BLOCK_N,
@@ -2008,12 +1882,6 @@ def attn_fwd_inner_prefix_sw_pipeline_4w(
             XAI_TEMPERATURE_LEN,
             q_abs_pos,
             SLIDING_WINDOW_SIZE,
-            Mask,
-            mask_base_idx,
-            mask_row_stride,
-            q_extend_offs,
-            USE_CUSTOM_MASK,
-            SKIP_PREFIX_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED,
             BLOCK_M,
             BLOCK_N,
@@ -2055,12 +1923,6 @@ def attn_fwd_inner_prefix_sw_pipeline_4w(
             XAI_TEMPERATURE_LEN,
             q_abs_pos,
             SLIDING_WINDOW_SIZE,
-            Mask,
-            mask_base_idx,
-            mask_row_stride,
-            q_extend_offs,
-            USE_CUSTOM_MASK,
-            SKIP_PREFIX_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED,
             BLOCK_M,
             BLOCK_N,
@@ -2523,12 +2385,6 @@ def attn_fwd_inner_prefix_serial_4w(
     XAI_TEMPERATURE_LEN: gl.constexpr,  #
     q_abs_pos,
     SLIDING_WINDOW_SIZE: gl.constexpr,  #
-    Mask,
-    mask_base_idx,
-    mask_row_stride,
-    q_extend_offs,  #
-    USE_CUSTOM_MASK: gl.constexpr,
-    SKIP_PREFIX_CUSTOM_MASK: gl.constexpr,  #
     ENABLE_PREFIX_UNMASKED: gl.constexpr,  #
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,  #
@@ -2590,12 +2446,6 @@ def attn_fwd_inner_prefix_serial_4w(
             XAI_TEMPERATURE_LEN,
             q_abs_pos,
             SLIDING_WINDOW_SIZE,
-            Mask,
-            mask_base_idx,
-            mask_row_stride,
-            q_extend_offs,
-            USE_CUSTOM_MASK,
-            SKIP_PREFIX_CUSTOM_MASK,
             ENABLE_PREFIX_UNMASKED,
             BLOCK_M,
             BLOCK_N,
