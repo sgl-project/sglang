@@ -763,9 +763,9 @@ class EAGLEWorker(TpModelWorker):
         (
             tree_mask,
             position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             spec_info.verified_id,
@@ -783,10 +783,10 @@ class EAGLEWorker(TpModelWorker):
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
@@ -897,10 +897,10 @@ class EAGLEWorker(TpModelWorker):
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         if batch.has_grammar:
-            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
             draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrive_next_token.shape
+                spec_info.retrieve_next_token.shape
             ).cpu()
 
         # Forward
@@ -927,7 +927,7 @@ class EAGLEWorker(TpModelWorker):
 
             if vocab_mask is not None:
                 assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
+                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
                 # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
