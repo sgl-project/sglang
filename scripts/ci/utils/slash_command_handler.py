@@ -367,6 +367,18 @@ def handle_rerun_stage(
         )
         print(f"PR is from fork: {is_fork}")
 
+        # If the PR modifies sgl-kernel/, the target stage would otherwise use the
+        # PyPI sgl-kernel wheel instead of the PR's changes (sgl-kernel-build-wheels
+        # skips in target_stage mode by default). Set include_wheel_build=true so the
+        # workflow runs sgl-kernel-build-wheels alongside the target stage; the target
+        # stage waits for the build via its needs list.
+        kernel_changes = has_sgl_kernel_changes(pr)
+        if kernel_changes:
+            print(
+                "PR modifies sgl-kernel/ - setting include_wheel_build=true so the "
+                "target stage gets the freshly-built wheel instead of the PyPI one."
+            )
+
         # pr_head_sha is used for fork PRs (passed to workflow and used for URL lookup)
         pr_head_sha = None
 
@@ -378,25 +390,29 @@ def handle_rerun_stage(
             print(
                 f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
             )
-            if is_amd_stage:
-                inputs = {
-                    "target_stage": stage_name,
-                    "pr_head_sha": pr_head_sha,
-                }
-            else:
-                inputs = {
-                    "target_stage": stage_name,
-                    "pr_head_sha": pr_head_sha,
-                }
+            inputs = {
+                "target_stage": stage_name,
+                "pr_head_sha": pr_head_sha,
+            }
         else:
             # For non-fork PRs: dispatch on the PR branch directly
             # This allows testing workflow changes before merge
             ref = pr.head.ref
             print(f"Triggering {workflow_name} workflow on branch: {ref}")
-            if is_amd_stage:
-                inputs = {"target_stage": stage_name}
-            else:
-                inputs = {"target_stage": stage_name}
+            inputs = {"target_stage": stage_name}
+
+        # For NVIDIA stages, honor the sgl-kernel / include_wheel_build flow. AMD is
+        # a separate workflow that doesn't share the same wheel-build pipeline.
+        if kernel_changes and not is_amd_stage:
+            inputs["include_wheel_build"] = "true"
+            # include_wheel_build relies on filter-api detecting kernel changes, which
+            # requires pr_head_sha. Ensure it's set even for non-fork PRs, and keep
+            # the local pr_head_sha in sync so find_workflow_run_url builds the
+            # expected display_title with the SHA suffix (the workflow's run-name
+            # includes the SHA whenever inputs.pr_head_sha is set).
+            if not is_fork:
+                inputs["pr_head_sha"] = pr.head.sha
+                pr_head_sha = pr.head.sha
 
         # Record dispatch time before triggering
         dispatch_time = time.time()
