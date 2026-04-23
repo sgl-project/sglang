@@ -487,14 +487,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
-                (
-                    (
-                        BatchStrOutput,
-                        BatchEmbeddingOutput,
-                        BatchTokenIDOutput,
-                    ),
-                    self._handle_batch_output,
-                ),
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
@@ -1623,11 +1615,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
+            if isinstance(
+                recv_obj,
+                (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
+            ):
+                await self._handle_batch_output(recv_obj)
+            else:
+                self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
-    def _handle_batch_output(
+    async def _handle_batch_output(
         self,
         recv_obj: Union[
             BatchStrOutput,
@@ -1635,6 +1633,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
+        pending_notify: dict[str, ReqState] = {}
+        batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1833,15 +1833,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
-                state.event.set()
+                pending_notify[rid] = state
 
-            # Log metrics and dump
+                if len(pending_notify) >= batch_notify_size:
+                    for s in pending_notify.values():
+                        s.event.set()
+                    pending_notify = {}
+                    await asyncio.sleep(0)
+
             if self.enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
+
+        # handle_loop awaits next recv immediately
+        for s in pending_notify.values():
+            s.event.set()
 
         # When skip_tokenizer_init is enabled, tokensizer_manager receives
         # BatchTokenIDOutput.
