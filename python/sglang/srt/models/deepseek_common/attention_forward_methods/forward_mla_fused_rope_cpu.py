@@ -100,7 +100,7 @@ class DeepseekMLACpuForwardMixin:
                         else None
                     )
                 ),
-                self.w_scale,
+                self.w_scale if self.qkv_proj_with_rope_is_fp8 else None,
                 True,  # is_vnni
                 self.weight_block_size,
                 self.q_lora_rank,
@@ -145,7 +145,7 @@ class DeepseekMLACpuForwardMixin:
             attn_output.transpose(0, 1),
             self.w_vc,
             True,  # is_vnni
-            self.w_scale,  # scale
+            self.w_scale if self.qkv_proj_with_rope_is_fp8 else None,  # scale
         )
         attn_output = output
         output, _ = self.o_proj(attn_output)

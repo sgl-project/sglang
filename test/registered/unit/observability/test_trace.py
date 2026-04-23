@@ -1,31 +1,10 @@
 """Unit tests for trace.py — no server, no model loading."""
 
-# ── Stubs for heavy transitive deps ──
 import os
-import sys
-import types
-
-
-def _ensure_module(name):
-    if name not in sys.modules:
-        sys.modules[name] = types.ModuleType(name)
-    return sys.modules[name]
-
-
-_su = _ensure_module("sglang.srt.utils")
-if not hasattr(_su, "get_int_env_var"):
-    _su.get_int_env_var = lambda name, default=0: int(os.getenv(name, str(default)))
-_ensure_module("sglang.srt.utils.common")
-
-_ensure_module("sglang.srt.managers")
-_sb = _ensure_module("sglang.srt.managers.schedule_batch")
-_sb.BaseFinishReason = type("BaseFinishReason", (), {"to_json": lambda self: {}})
-
-# ── End stubs ──
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 
 import threading
 import unittest
@@ -468,7 +447,9 @@ class TestTraceReqContextEnabled(unittest.TestCase):
     def test_abort_with_base_finish_reason(self):
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
-        abort_obj = _sb.BaseFinishReason()
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+
+        abort_obj = FINISH_LENGTH(length=10)
         ctx.abort(ts=2000, abort_info=abort_obj)
         self.assertIsNone(ctx.thread_context)
 

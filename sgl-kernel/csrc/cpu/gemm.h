@@ -34,6 +34,11 @@ inline bool can_use_brgemm<int8_t>(int M) {
 }
 
 template <>
+inline bool can_use_brgemm<uint8_t>(int M) {
+  return M > 4;
+}
+
+template <>
 inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
   return M > 4;
 }
@@ -52,6 +57,12 @@ inline int64_t get_row_size<int8_t>(int64_t K) {
   return K + sizeof(int32_t);
 }
 
+// uint8: mxfp4 or int4
+template <>
+inline int64_t get_row_size<uint8_t>(int64_t K) {
+  return K >> 1;
+}
+
 inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
@@ -63,6 +74,16 @@ constexpr bool operator==(CPUQuantMethod a, int64_t b) {
 }
 
 constexpr bool operator==(int64_t a, CPUQuantMethod b) {
+  return a == static_cast<int64_t>(b);
+}
+
+enum class CPUQuantAlgo : int64_t { AWQ = 0, GPTQ = 1 };
+
+constexpr bool operator==(CPUQuantAlgo a, int64_t b) {
+  return static_cast<int64_t>(a) == b;
+}
+
+constexpr bool operator==(int64_t a, CPUQuantAlgo b) {
   return a == static_cast<int64_t>(b);
 }
 
@@ -287,3 +308,22 @@ void tinygemm_kernel(
     int64_t ldc_s,
     bool store_out,
     bool use_brgemm);
+
+// mxfp4
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    const uint8_t* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack = true);

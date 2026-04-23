@@ -1,7 +1,11 @@
 import logging
 from typing import Any, Dict, Optional
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.whisper import WhisperForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import load_audio
@@ -187,12 +191,12 @@ class WhisperProcessor(BaseMultimodalProcessor):
             return_tensors="pt",
         )["input_features"][0]
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": [
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=[
                 MultimodalDataItem(
                     feature=input_features,
                     modality=Modality.AUDIO,
                 )
             ],
-        }
+        )
