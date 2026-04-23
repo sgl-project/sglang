@@ -210,9 +210,8 @@ class BaseTpWorker(ABC):
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch).logits_output
-        embeddings = logits_output.embeddings
-        return embeddings
+        output = self.model_runner.forward(forward_batch).logits_output
+        return output  # Returns EmbeddingPoolerOutput
 
 
 class TpModelWorker(BaseTpWorker):

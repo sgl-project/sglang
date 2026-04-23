@@ -1,95 +1,78 @@
-"""End-to-end MLX model runner for Apple Silicon.
+"""MLX model runner for Apple Silicon.
 
-Runs the entire model within MLX, bypassing PyTorch MPS entirely.
+Slot allocation and radix-trie prefix matching are handled by the
+scheduler (``TokenToKVPoolAllocator`` / ``RadixCache``).  This runner
+reads cached KV from ``MlxKVPool``, runs the forward pass, and writes
+new KV back.  Each request also keeps a ``ContiguousKVCache`` for
+decode-time attention.
 """
 
 import logging
 import time
-from dataclasses import dataclass
 
 import mlx.core as mx
+import psutil
 from mlx_lm import load as mlx_lm_load
-from mlx_lm.models.cache import (
-    BatchKVCache,
-    BatchRotatingKVCache,
-    KVCache,
-    RotatingKVCache,
-    make_prompt_cache,
+
+from sglang.srt.hardware_backend.mlx.kv_cache import (
+    BatchedDecodeContext,
+    ContiguousKVCache,
+    MLXAttentionWrapper,
+    OffsetCache,
+    PoolBackedCache,
+    clear_context,
+    find_attention_layers,
+    get_num_layers,
+    patch_model_attention,
+    set_context,
 )
+from sglang.srt.hardware_backend.mlx.kv_cache.kv_pool import MlxKVPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class MlxRequestState:
-    """Per-request state for MLX inference."""
-
-    token_ids: list[int]
-    cache: list  # List of KVCache per layer
-    generated_tokens: int = 0
-
-
-def _merge_kv_caches(
-    caches_list: list[list],
-) -> list:
-    """Merge multiple per-request caches into batched caches."""
-    if not caches_list:
-        return []
-
-    num_layers = len(caches_list[0])
-    merged = []
-
-    for layer_idx in range(num_layers):
-        layer_caches = [caches[layer_idx] for caches in caches_list]
-        if isinstance(layer_caches[0], KVCache):
-            batch_cache = BatchKVCache.merge(layer_caches)
-        elif isinstance(layer_caches[0], RotatingKVCache):
-            batch_cache = BatchRotatingKVCache.merge(layer_caches)
-        else:
-            raise TypeError(f"Unsupported cache type: {type(layer_caches[0]).__name__}")
-        merged.append(batch_cache)
-
-    return merged
-
-
-def _extract_kv_cache(batch_caches: list, idx: int) -> list:
-    """Extract a single request's cache from batched caches.
-
-    Works with both BatchKVCache (has .extract) and plain KVCache
-    populated with batched data of shape (B, H, L, D).
-    """
-    extracted = []
-    for cache in batch_caches:
-        if hasattr(cache, "extract"):
-            extracted.append(cache.extract(idx))
-        else:
-            # Plain KVCache with batched data — slice along batch dim
-            new_cache = KVCache()
-            new_cache.keys = mx.contiguous(cache.keys[idx : idx + 1])
-            new_cache.values = mx.contiguous(cache.values[idx : idx + 1])
-            new_cache.offset = cache.offset
-            extracted.append(new_cache)
-    return extracted
-
-
 class MlxModelRunner:
-    """Model runner that executes the entire model in MLX.
-
-    This avoids the MPS<->MLX tensor bridge overhead by keeping all
-    computation within MLX.
-    """
+    """MLX model runner with radix-cache prefix sharing."""
 
     def __init__(
         self,
         model_path: str,
         trust_remote_code: bool = False,
+        disable_radix_cache: bool = False,
+        pool_size: int | None = None,
+        mem_fraction_static: float = 0.8,
     ):
         self.model_path = model_path
         self.trust_remote_code = trust_remote_code
         self.model = None
-        self._request_states: dict[str, MlxRequestState] = {}
+        self.disable_radix_cache = disable_radix_cache
+        self._mem_fraction_static = mem_fraction_static
 
         self._load_model()
+
+        # Pin MLX allocations to prevent OS paging
+        device_info = mx.device_info()
+        max_wired = int(device_info.get("max_recommended_working_set_size", 0))
+        if max_wired > 0:
+            mx.set_wired_limit(max_wired)
+            logger.info(f"Wired memory limit set to {max_wired / (1024**3):.1f} GB")
+
+        patch_model_attention(self.model)
+
+        self._num_layers = get_num_layers(self.model)
+        self._max_seq_len = 4096  # doubles on overflow
+
+        self._req_caches: dict[str, list[ContiguousKVCache | PoolBackedCache]] = {}
+        self._req_token_ids: dict[str, list[int]] = {}
+        self._cache_pool: list[list[ContiguousKVCache]] = []  # reusable caches
+
+        self._kv_pool: MlxKVPool | None = None
+        self._req_to_token_pool: ReqToTokenPool | None = None
+        self._req_pool_idx: dict[str, int] = {}
+        self._req_synced_offset: dict[str, int] = {}
+
+        self._pool_size = self._compute_pool_size(pool_size)
 
     @staticmethod
     def _extract_logits(model_output):
@@ -97,6 +80,29 @@ class MlxModelRunner:
         if isinstance(model_output, tuple):
             return model_output[0]
         return model_output
+
+    def _acquire_cache(self) -> list[ContiguousKVCache]:
+        """Get a reusable cache list from the pool, or create a new one."""
+        if self._cache_pool:
+            cache = self._cache_pool.pop()
+            for c in cache:
+                c.offset = 0
+            return cache
+        return [
+            ContiguousKVCache(max_seq_len=self._max_seq_len)
+            for _ in range(self._num_layers)
+        ]
+
+    def _release_cache(self, cache: list[ContiguousKVCache]) -> None:
+        """Return a cache list to the pool for reuse."""
+        self._cache_pool.append(cache)
+
+    @staticmethod
+    def _eval_with_cache(
+        token_result: mx.array, cache: list[ContiguousKVCache | PoolBackedCache]
+    ) -> None:
+        """Evaluate token result and all cache buffers in one mx.eval call."""
+        mx.eval(token_result, *[s for c in cache for s in c.state])
 
     def _load_model(self):
         """Load model using mlx_lm."""
@@ -107,200 +113,336 @@ class MlxModelRunner:
             self.model_path,
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
         )
+        # Force-evaluate weights so mx.get_active_memory() reflects
+        # actual usage before KV pool sizing.
+        mx.eval(self.model.parameters())
 
         load_time = time.time() - start_time
         logger.info(f"MLX model loaded in {load_time:.2f}s")
 
+    def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
+        """Return (n_kv_heads, head_dim, dtype) from the model."""
+        layer_list, attn_attr = find_attention_layers(self.model)
+        if not layer_list:
+            raise RuntimeError("Cannot determine attention config: no layers found")
+        sample_attn = getattr(layer_list[0], attn_attr)
+        if isinstance(sample_attn, MLXAttentionWrapper):
+            sample_attn = sample_attn._inner
+        n_kv_heads = sample_attn.n_kv_heads
+        if hasattr(sample_attn, "head_dim"):
+            head_dim = sample_attn.head_dim
+        elif hasattr(sample_attn, "k_proj") and hasattr(sample_attn.k_proj, "weight"):
+            head_dim = sample_attn.k_proj.weight.shape[0] // n_kv_heads
+        else:
+            raise RuntimeError("Cannot determine head_dim from attention module")
+        dtype = mx.float16
+        if hasattr(sample_attn, "k_proj") and hasattr(sample_attn.k_proj, "weight"):
+            dtype = sample_attn.k_proj.weight.dtype
+        return n_kv_heads, head_dim, dtype
+
+    def _compute_pool_size(self, explicit_size: int | None) -> int:
+        """Determine pool slot count (auto-size from available memory if needed)."""
+        if explicit_size is not None:
+            return explicit_size
+        n_kv_heads, head_dim, dtype = self._get_attn_config()
+        num_layers = self._num_layers
+        sys_available = psutil.virtual_memory().available
+        mlx_limit = mx.device_info().get(
+            "max_recommended_working_set_size",
+            mx.device_info().get("memory_size", 0),
+        )
+        mlx_used = mx.get_active_memory()
+        mlx_usable = int(mlx_limit * self._mem_fraction_static)
+        kv_budget = min(
+            max(mlx_usable - mlx_used, 0),
+            int(sys_available * self._mem_fraction_static),
+        )
+        bytes_per_slot = 2 * num_layers * n_kv_heads * head_dim * dtype.size
+        pool_size = max(kv_budget // bytes_per_slot, 256)
+        logger.info(
+            f"Auto-sized KV pool: "
+            f"sys_available={sys_available / (1024**3):.2f} GB, "
+            f"mlx_limit={mlx_limit / (1024**3):.1f} GB, "
+            f"mlx_used={mlx_used / (1024**3):.2f} GB, "
+            f"kv_budget={kv_budget / (1024**3):.2f} GB, "
+            f"bytes_per_slot={bytes_per_slot}, pool_size={pool_size}"
+        )
+        return pool_size
+
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
+
+    def init_kv_pool(self, req_to_token_pool: ReqToTokenPool) -> None:
+        """Create MlxKVPool (+1 for padding slot 0) and wire scheduler pools."""
+        self._req_to_token_pool = req_to_token_pool
+        if self.disable_radix_cache:
+            return
+        n_kv_heads, head_dim, dtype = self._get_attn_config()
+        # +1 for padding slot 0
+        self._kv_pool = MlxKVPool(
+            pool_size=self._pool_size + 1,
+            num_layers=self._num_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+        logger.info(
+            f"KV pool initialized: pool_size={self._pool_size} "
+            f"(buffer size {self._pool_size + 1} incl. padding slot 0), "
+            f"{self._num_layers} layers, {n_kv_heads} kv_heads, {head_dim} head_dim"
+        )
+
     def prefill(
         self,
         req_id: str,
-        token_ids: list[int],
+        new_token_ids: list[int],
+        full_token_ids: list[int],
+        prefix_slot_ids: list[int],
+        new_slot_ids: list[int],
+        req_pool_idx: int,
     ) -> int:
-        """Run prefill for a single request.
+        """Prefill a request.  Returns next_token_id."""
+        num_layers = self._num_layers
+        prefix_len = len(prefix_slot_ids)
 
-        If a request with the same req_id already has state (e.g. from a
-        previous partial prefill), the existing KV cache is reused and only
-        the new tokens are fed through the model.
+        if self.disable_radix_cache:
+            cache = self._acquire_cache()
+            input_ids = mx.array([new_token_ids], dtype=mx.int32)
+            model_output = self.model(input_ids, cache=cache)
+            logits = self._extract_logits(model_output)
+            next_token_mlx = mx.argmax(logits[:, -1, :], axis=-1)
+            self._eval_with_cache(next_token_mlx, cache)
+            next_token = int(next_token_mlx.item())
 
-        Args:
-            req_id: Request identifier
-            token_ids: Input token IDs (full sequence, including any
-                previously prefilled tokens)
+            self._req_token_ids[req_id] = list(full_token_ids) + [next_token]
+            self._req_caches[req_id] = cache
+            self._req_pool_idx[req_id] = req_pool_idx
+            self._req_synced_offset[req_id] = 0
+            return next_token
 
-        Returns:
-            Next token ID (greedy sampled)
-        """
-        existing_state = self._request_states.get(req_id)
-        if existing_state is not None:
-            # Continuation: reuse existing cache, feed only new tokens
-            cached_input_len = (
-                len(existing_state.token_ids) - existing_state.generated_tokens
-            )
-            new_tokens = token_ids[cached_input_len:]
-            cache = existing_state.cache
+        assert self._kv_pool is not None
+
+        new_token_count = len(new_token_ids)
+
+        if prefix_len > 0:
+            slot_ids_mx = mx.array(prefix_slot_ids, dtype=mx.int32)
+            cache = [
+                PoolBackedCache(self._kv_pool, i, slot_ids_mx, prefix_len)
+                for i in range(num_layers)
+            ]
         else:
-            new_tokens = token_ids
-            cache = make_prompt_cache(self.model)
+            cache = self._acquire_cache()
 
-        input_ids = mx.array([new_tokens], dtype=mx.int32)
+        if new_token_count > 0:
+            extend_tokens = new_token_ids
+        else:
+            # Full cache hit — rerun last token to get next-token logits
+            extend_tokens = full_token_ids[-1:]
+            for c in cache:
+                c.offset = max(c.offset - 1, 0)
+
+        input_ids = mx.array([extend_tokens], dtype=mx.int32)
         model_output = self.model(input_ids, cache=cache)
-
         logits = self._extract_logits(model_output)
 
         last_logits = logits[:, -1, :]
         next_token_mlx = mx.argmax(last_logits, axis=-1)
 
-        # Evaluate everything together
-        mx.eval(next_token_mlx, *[c.state for c in cache])
+        # Convert PoolBackedCache → ContiguousKVCache for decode
+        if prefix_len > 0:
+            contiguous_cache = self._acquire_cache()
+            for layer_idx in range(num_layers):
+                pbc = cache[layer_idx]
+                contiguous_cache[layer_idx].update_and_fetch(
+                    pbc._full_keys, pbc._full_values
+                )
+            cache = contiguous_cache
+
+        self._eval_with_cache(next_token_mlx, cache)
         next_token = int(next_token_mlx.item())
 
-        # Store state for future decoding
-        self._request_states[req_id] = MlxRequestState(
-            token_ids=list(token_ids) + [next_token],
-            cache=cache,
-            generated_tokens=1,
-        )
+        if new_slot_ids:
+            self._sync_new_kv_to_pool(cache, prefix_len, new_slot_ids)
+
+        self._req_token_ids[req_id] = list(full_token_ids) + [next_token]
+        self._req_caches[req_id] = cache
+        self._req_pool_idx[req_id] = req_pool_idx
+        self._req_synced_offset[req_id] = prefix_len + len(new_slot_ids)
 
         return next_token
 
-    def prefill_batch(
+    def extend(
         self,
-        req_ids: list[str],
-        token_ids_list: list[list[int]],
-    ) -> list[int]:
-        """Run batched prefill for multiple requests in a single forward pass.
+        req_id: str,
+        new_token_ids: list[int],
+        new_slot_ids: list[int],
+    ) -> int:
+        """Continue prefill for a chunked request.  Returns next_token_id."""
+        assert req_id in self._req_caches, f"extend called for unknown request {req_id}"
 
-        When all sequences have the same length, they are stacked into a single
-        batch tensor for one forward pass.  For variable-length sequences the
-        method falls back to serial prefill.
+        cache = self._req_caches[req_id]
 
-        Args:
-            req_ids: List of request identifiers
-            token_ids_list: List of token ID sequences, one per request
-
-        Returns:
-            List of next token IDs (greedy sampled)
-        """
-        if len(req_ids) == 1:
-            return [self.prefill(req_ids[0], token_ids_list[0])]
-
-        # Check if all sequences have the same length (enables true batching)
-        lengths = [len(tids) for tids in token_ids_list]
-        if len(set(lengths)) != 1:
-            # Variable lengths – fall back to serial prefill
-            return [
-                self.prefill(rid, tids) for rid, tids in zip(req_ids, token_ids_list)
-            ]
-
-        # All same length – use a single set of fresh caches;
-        # they'll be populated with shape (batch_size, ...) on the first forward pass
-        batch_cache = make_prompt_cache(self.model)
-
-        # Stack into (batch_size, seq_len)
-        batched_input = mx.array(
-            [list(tids) for tids in token_ids_list], dtype=mx.int32
-        )
-
-        # Single forward pass
-        model_output = self.model(batched_input, cache=batch_cache)
+        input_ids = mx.array([new_token_ids], dtype=mx.int32)
+        model_output = self.model(input_ids, cache=cache)
         logits = self._extract_logits(model_output)
 
         last_logits = logits[:, -1, :]
-        next_tokens_mlx = mx.argmax(last_logits, axis=-1)
+        next_token_mlx = mx.argmax(last_logits, axis=-1)
+        self._eval_with_cache(next_token_mlx, cache)
+        next_token = int(next_token_mlx.item())
 
-        # Evaluate everything together
-        mx.eval(next_tokens_mlx, *[c.state for c in batch_cache])
-        next_tokens = next_tokens_mlx.tolist()
+        prev_tokens = self._req_token_ids[req_id]
+        if prev_tokens:
+            prev_tokens.pop()  # remove stale intermediate token
+        prev_tokens.extend(new_token_ids)
+        prev_tokens.append(next_token)
 
-        # Extract individual caches and store per-request state
-        for i, req_id in enumerate(req_ids):
-            individual_cache = _extract_kv_cache(batch_cache, i)
-            self._request_states[req_id] = MlxRequestState(
-                token_ids=list(token_ids_list[i]) + [next_tokens[i]],
-                cache=individual_cache,
-                generated_tokens=1,
-            )
+        # Sync new chunk KV to pool immediately
+        if not self.disable_radix_cache and new_slot_ids:
+            synced = self._req_synced_offset[req_id]
+            self._sync_new_kv_to_pool(cache, synced, new_slot_ids)
+            self._req_synced_offset[req_id] = synced + len(new_slot_ids)
 
-        return next_tokens
+        return next_token
+
+    def _sync_new_kv_to_pool(
+        self,
+        cache: list[ContiguousKVCache],
+        cache_start: int,
+        slot_ids: list[int],
+    ) -> None:
+        """Sync KV from contiguous cache to pool at the given slot IDs."""
+        if not slot_ids or self._kv_pool is None:
+            return
+        num_layers = len(cache)
+        end = cache_start + len(slot_ids)
+        slot_ids_mx = mx.array(slot_ids, dtype=mx.int32)
+        # Transpose cache (1, n_kv_heads, S, head_dim) → pool (S, n_kv_heads, head_dim)
+        k_all = mx.stack(
+            [
+                cache[i].keys[0, :, cache_start:end, :].transpose(1, 0, 2)
+                for i in range(num_layers)
+            ]
+        )
+        v_all = mx.stack(
+            [
+                cache[i].values[0, :, cache_start:end, :].transpose(1, 0, 2)
+                for i in range(num_layers)
+            ]
+        )
+        self._kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
+
+    def _sync_decode_kv_to_pool(self, req_id: str) -> None:
+        """Sync un-flushed decode KV for *req_id* to the shared pool."""
+        if self._kv_pool is None or self._req_to_token_pool is None:
+            return
+        cache = self._req_caches.get(req_id)
+        if cache is None:
+            return
+        current_offset = cache[0].offset
+        synced_offset = self._req_synced_offset.get(req_id, 0)
+        if current_offset <= synced_offset:
+            return
+        req_pool_idx = self._req_pool_idx.get(req_id)
+        if req_pool_idx is None:
+            return
+        # Read slot IDs from scheduler's req_to_token_pool
+        slot_ids = (
+            self._req_to_token_pool.req_to_token[
+                req_pool_idx, synced_offset:current_offset
+            ]
+            .to(dtype=int)
+            .tolist()
+        )
+        self._sync_new_kv_to_pool(cache, synced_offset, slot_ids)
+        self._req_synced_offset[req_id] = current_offset
+
+    def flush_all_decode_kv(self) -> None:
+        """Sync all active requests' un-flushed decode KV to the pool."""
+        if self.disable_radix_cache or self._kv_pool is None:
+            return
+        for req_id in list(self._req_caches.keys()):
+            self._sync_decode_kv_to_pool(req_id)
 
     def decode_batch(
         self,
         req_ids: list[str],
     ) -> list[int]:
-        """Run batched decode for multiple requests.
+        """Decode one token per request."""
+        batch_size = len(req_ids)
+        num_layers = self._num_layers
 
-        Args:
-            req_ids: List of request IDs to decode
+        caches = [self._req_caches[rid] for rid in req_ids]
+        seq_lens = [caches[i][0].offset for i in range(batch_size)]
 
-        Returns:
-            List of next token IDs
-        """
-        if len(req_ids) == 1:
-            return [self._decode_single(req_ids[0])]
+        if batch_size == 1:
+            cache = caches[0]
+            last_token = self._req_token_ids[req_ids[0]][-1]
+            input_ids = mx.array([[last_token]], dtype=mx.int32)
+            model_output = self.model(input_ids, cache=cache)
+            logits = self._extract_logits(model_output)
+            next_tokens_mlx = mx.argmax(logits[:, -1, :], axis=-1)
+            self._eval_with_cache(next_tokens_mlx, cache)
+        else:
+            layer_caches = [
+                [caches[i][layer_idx] for i in range(batch_size)]
+                for layer_idx in range(num_layers)
+            ]
+            ctx = BatchedDecodeContext(
+                batch_size=batch_size,
+                seq_lens=seq_lens,
+                layer_caches=layer_caches,
+            )
+            set_context(ctx)
+            try:
+                max_offset = max(seq_lens)
+                shim_cache = [OffsetCache(offset=max_offset) for _ in range(num_layers)]
+                last_tokens = [self._req_token_ids[rid][-1] for rid in req_ids]
+                batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
+                model_output = self.model(batched_input, cache=shim_cache)
+                logits = self._extract_logits(model_output)
+                next_tokens_mlx = mx.argmax(logits[:, -1, :], axis=-1)
 
-        decode_reqs = []
-        for req_id in req_ids:
-            state = self._request_states[req_id]
-            decode_reqs.append((req_id, state))
+                eval_targets = [next_tokens_mlx]
+                for c_list in caches:
+                    for c in c_list:
+                        eval_targets.append(c.keys)
+                        eval_targets.append(c.values)
+                mx.eval(*eval_targets)
+            finally:
+                clear_context()
 
-        return self._batched_decode(decode_reqs)
-
-    def _decode_single(self, req_id: str) -> int:
-        """Decode a single token for one request."""
-        state = self._request_states[req_id]
-        last_token = state.token_ids[-1]
-
-        input_ids = mx.array([[last_token]], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=state.cache)
-
-        logits = self._extract_logits(model_output)
-
-        last_logits = logits[:, -1, :]
-        next_token_mlx = mx.argmax(last_logits, axis=-1)
-
-        mx.eval(next_token_mlx, *[c.state for c in state.cache])
-        next_token = int(next_token_mlx.item())
-
-        state.token_ids.append(next_token)
-        state.generated_tokens += 1
-
-        return next_token
-
-    def _batched_decode(
-        self, decode_reqs: list[tuple[str, MlxRequestState]]
-    ) -> list[int]:
-        """Run a single batched forward pass for multiple decode requests."""
-        last_tokens = [state.token_ids[-1] for _, state in decode_reqs]
-
-        # Merge individual KV caches into batched cache
-        caches_list = [state.cache for _, state in decode_reqs]
-        batch_cache = _merge_kv_caches(caches_list)
-
-        # Create batched input: shape (batch_size, 1)
-        batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
-
-        # Single forward pass
-        model_output = self.model(batched_input, cache=batch_cache)
-        logits = self._extract_logits(model_output)
-
-        next_token_logits = logits[:, -1, :]
-        next_tokens_mlx = mx.argmax(next_token_logits, axis=-1)
-
-        mx.eval(next_tokens_mlx, *[c.state for c in batch_cache])
         next_tokens = next_tokens_mlx.tolist()
 
-        # Extract updated caches back to individual requests
-        for i, (_, state) in enumerate(decode_reqs):
-            state.cache = _extract_kv_cache(batch_cache, i)
-            state.token_ids.append(next_tokens[i])
-            state.generated_tokens += 1
+        for i, rid in enumerate(req_ids):
+            self._req_token_ids[rid].append(next_tokens[i])
 
         return next_tokens
 
+    def has_request(self, req_id: str) -> bool:
+        """Check if a request has active state."""
+        return req_id in self._req_caches
+
     def remove_request(self, req_id: str):
-        """Clean up state for a completed request."""
-        self._request_states.pop(req_id, None)
+        """Sync remaining decode KV to pool, then release request state."""
+        if not self.disable_radix_cache:
+            self._sync_decode_kv_to_pool(req_id)
+
+        self._req_token_ids.pop(req_id, None)
+        cache = self._req_caches.pop(req_id, None)
+        if cache is not None:
+            self._release_cache(cache)
+        self._req_pool_idx.pop(req_id, None)
+        self._req_synced_offset.pop(req_id, None)
 
     def clear(self):
         """Clear all request states."""
-        self._request_states.clear()
+        self._req_token_ids.clear()
+        for cache in self._req_caches.values():
+            self._cache_pool.append(cache)
+        self._req_caches.clear()
+        self._req_pool_idx.clear()
+        self._req_synced_offset.clear()
+        if self._kv_pool is not None:
+            self._kv_pool.clear()

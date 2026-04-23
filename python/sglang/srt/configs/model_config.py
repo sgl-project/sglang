@@ -1436,6 +1436,17 @@ def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
     )
 
 
+# SequenceClassification models that use CrossEncodingPooler
+_cross_encoding_pooler_archs = [
+    "BertForSequenceClassification",
+    "XLMRobertaForSequenceClassification",
+]
+
+
+def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
+    return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
+
+
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0

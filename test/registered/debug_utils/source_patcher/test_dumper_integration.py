@@ -55,3 +55,11 @@ class TestDumperApplySourcePatches:
             cls.greet.__code__ = original_code
 
         assert obj.greet("world") == "hello world"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -43,6 +43,9 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     INDEXER = "indexer"
 
+    def __str__(self) -> str:
+        return self.value
+
 
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.

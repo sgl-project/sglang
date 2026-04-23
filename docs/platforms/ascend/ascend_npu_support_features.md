@@ -398,7 +398,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--disaggregation-transfer-backend`                     | `mooncake` | `ascend`                              |      A2, A3      |
 | `--disaggregation-bootstrap-port`                       | `8998`     | Type: int                             |      A2, A3      |
 | `--disaggregation-ib-device`                            | `None`     | Type: str                             | Special for GPU  |
-| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | `False`                               |     Planned      |
+| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | `False`                               |      A2, A3      |
 | `--num-reserved-decode-tokens`                          | `512`      | Type: int                             |      A2, A3      |
 | `--disaggregation-decode-`<br/>`polling-interval`       | `1`        | Type: int                             |      A2, A3      |
 
@@ -480,10 +480,4 @@ The following parameters have some functional deficiencies on community
 
 | Argument                              | Defaults | Options                        |
 |---------------------------------------|----------|--------------------------------|
-| `--enable-double-sparsity`            | `False`  | bool flag<br/> (set to enable) |
-| `--ds-channel-config-path`            | `None`   | Type: str                      |
-| `--ds-heavy-channel-num`              | `32`     | Type: int                      |
-| `--ds-heavy-token-num`                | `256`    | Type: int                      |
-| `--ds-heavy-channel-type`             | `qk`     | Type: str                      |
-| `--ds-sparse-decode-`<br/>`threshold` | `4096`   | Type: int                      |
 | `--tool-server`                       | `None`   | Type: str                      |
