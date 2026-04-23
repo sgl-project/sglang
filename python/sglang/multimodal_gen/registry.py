@@ -633,6 +633,7 @@ def _register_configs():
             lambda path: "ltx-2.3" in path.lower(),
         ],
     )
+    # register dedicated sampling params for LTX2TwoStageHQPipeline
     _PIPELINE_CONFIG_REGISTRY.setdefault(
         "LTX2TwoStageHQPipeline",
         (LTX2PipelineConfig, LTX23HQSamplingParams),
