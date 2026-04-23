@@ -21,27 +21,30 @@ enum class ActivationKind : uint32_t {
   kGELUTanh,
 };
 
-template <typename T, ActivationKind kAct>
-SGL_DEVICE T apply_activation(T x) {
-  const float x_f32 = device::cast<fp32_t>(x);
-  float y_f32 = 0.0f;
-
+// Returns float so the caller can multiply by `up` in f32 before casting
+// to T. Matches flashinfer/sgl-kernel precision: gate/up are promoted to
+// f32, the activation and the gate*up multiply happen in f32, and only the
+// final result is narrowed. Downcasting the activation result before the
+// multiply (as an earlier version did) compounds bf16 rounding through
+// each MLP layer and breaks bit-exact greedy generation (e.g. Llama-2 LoRA
+// ROUGE-L < 1.0 on H100).
+template <ActivationKind kAct>
+SGL_DEVICE float apply_activation_f32(float x_f32) {
   if constexpr (kAct == ActivationKind::kSiLU) {
-    y_f32 = x_f32 / (1.0f + expf(-x_f32));
+    return x_f32 / (1.0f + expf(-x_f32));
   } else if constexpr (kAct == ActivationKind::kGELU) {
     constexpr auto kSqrt1Over2 = 0.7071067811865475f;
-    y_f32 = x_f32 * (0.5f * (1.0f + erff(x_f32 * kSqrt1Over2)));
+    return x_f32 * (0.5f * (1.0f + erff(x_f32 * kSqrt1Over2)));
   } else if constexpr (kAct == ActivationKind::kGELUTanh) {
     constexpr auto kGeluTanhAlpha = 0.044715f;
     constexpr auto kGeluTanhBeta = 0.7978845608028654f;
     const float x_cube = x_f32 * x_f32 * x_f32;
     const float cdf = 0.5f * (1.0f + tanhf(kGeluTanhBeta * (x_f32 + kGeluTanhAlpha * x_cube)));
-    y_f32 = x_f32 * cdf;
+    return x_f32 * cdf;
   } else {
-    static_assert(host::dependent_false_v<T>, "unsupported activation kind");
+    static_assert(host::dependent_false_v<decltype(kAct)>, "unsupported activation kind");
+    return 0.0f;
   }
-
-  return device::cast<T>(y_f32);
 }
 
 struct ActivationParams {
@@ -70,7 +73,9 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   vec_t out;
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i) {
-    out[i] = apply_activation<T, kAct>(gate[i]) * up[i];
+    const float gate_f32 = device::cast<fp32_t>(gate[i]);
+    const float up_f32 = device::cast<fp32_t>(up[i]);
+    out[i] = device::cast<T>(apply_activation_f32<kAct>(gate_f32) * up_f32);
   }
   device::store_as<vec_t>(params.out, out, output_offset);
   PDLTriggerSecondary<kUsePDL>();
