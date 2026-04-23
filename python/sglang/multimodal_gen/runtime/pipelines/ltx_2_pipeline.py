@@ -194,8 +194,6 @@ def _add_ltx2_front_stages(pipeline: ComposedPipelineBase):
 
 def _add_ltx2_stage1_generation_stages(
     pipeline: ComposedPipelineBase,
-    *,
-    denoising_sampler_name: str = "euler",
 ):
     pipeline.add_stage(LTX2SigmaPreparationStage())
     pipeline.add_standard_timestep_preparation_stage(
@@ -216,7 +214,6 @@ def _add_ltx2_stage1_generation_stages(
                 scheduler=pipeline.get_module("scheduler"),
                 vae=pipeline.get_module("vae"),
                 audio_vae=pipeline.get_module("audio_vae"),
-                sampler_name=denoising_sampler_name,
                 pipeline=pipeline,
             ),
         ]
@@ -694,8 +691,6 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
     STAGE_1_DISTILLED_LORA_STRENGTH = 0.0
     STAGE_2_DISTILLED_LORA_STRENGTH = 1.0
-    STAGE_1_DENOISING_SAMPLER_NAME = "euler"
-    STAGE_2_DENOISING_SAMPLER_NAME = "euler"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -910,10 +905,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self.add_stage(
             LTX2LoRASwitchStage(pipeline=self, phase="stage1"),
         )
-        _add_ltx2_stage1_generation_stages(
-            self,
-            denoising_sampler_name=self.STAGE_1_DENOISING_SAMPLER_NAME,
-        )
+        _add_ltx2_stage1_generation_stages(self)
         self.add_stages(
             [
                 LTX2UpsampleStage(
@@ -939,7 +931,6 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                     vae=self.get_module("vae"),
                     audio_vae=self.get_module("audio_vae"),
                     pipeline=self,
-                    sampler_name=self.STAGE_2_DENOISING_SAMPLER_NAME,
                 ),
             ]
         )
@@ -952,8 +943,6 @@ class LTX2TwoStageHQPipeline(LTX2TwoStagePipeline):
     sampling_params_cls = LTX23HQSamplingParams
     STAGE_1_DISTILLED_LORA_STRENGTH = 0.25
     STAGE_2_DISTILLED_LORA_STRENGTH = 0.5
-    STAGE_1_DENOISING_SAMPLER_NAME = "res2s"
-    STAGE_2_DENOISING_SAMPLER_NAME = "res2s"
 
 
 EntryClass = [LTX2Pipeline, LTX2TwoStagePipeline, LTX2TwoStageHQPipeline]
