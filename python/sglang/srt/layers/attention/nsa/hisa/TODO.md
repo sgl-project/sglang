@@ -41,6 +41,12 @@ Each of these attacks a specific overhead identified in the stages microbench. P
 
 ## P2 — Cleanup / polish
 
+- [ ] **Remove the `SGLANG_HISA_VERIFY` debug path** in `hierarchy_indexer.py` (env-gated v3-vs-v1 logits + topk-IoU compare). Components to delete:
+    - `import os` at top of file (only this verify path uses it)
+    - the `if use_pool_cache and os.environ.get("SGLANG_HISA_VERIFY") == "1" and not get_is_capture_mode():` block inside `_get_topk_paged`
+    - the entire `_hisa_verify_vs_v1` method
+    - It was kept in for a specific verification round. Once we trust v3's numerical parity (samsum stable + byte-equal unit tests), this can go. Zero overhead when unset, so no rush.
+
 - [ ] Rename legacy `max_pool_blocks_per_req` mentions that leaked through after v2→v3. Grep: `grep -rn "max_pool_blocks_per_req" python/sglang/srt/layers/attention/nsa/hisa/`.
 
 - [ ] Delete `benchmark/benchmark_indexer.py` v2b dead-code comments (already removed the fns, but some column/label names in `bench_decode` still mention v2b).

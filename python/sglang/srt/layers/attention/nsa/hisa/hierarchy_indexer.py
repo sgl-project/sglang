@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -535,6 +536,38 @@ class HisaIndexer(MultiPlatformOp):
             k_block_size=self.hisa_k_block_size,
             ks=None,
         )
+
+        # ------------------------------------------------------------------
+        # DEBUG: SGLANG_HISA_VERIFY=1 compares v3 (with pool cache) against
+        # a freshly-computed v1 reference. Prints only for divergence above
+        # the configured thresholds (LOGITS_ABS / LOGITS_REL / IOU env vars,
+        # defaults 0.01 / 0.05 / 0.95).
+        #
+        # Cuda-graph safe: gated on ``not get_is_capture_mode()`` — during
+        # capture we skip the compare so the graph doesn't grow.  During
+        # replay the Python code path isn't executed anyway. The compare
+        # fires in warmup, extend forwards, and any non-captured decode.
+        # ------------------------------------------------------------------
+        if (
+            use_pool_cache
+            and os.environ.get("SGLANG_HISA_VERIFY") == "1"
+            and not get_is_capture_mode()
+        ):
+            self._hisa_verify_vs_v1(
+                layer_id=layer_id,
+                q_fp8=q_fp8,
+                kv_cache_fp8=kv_cache_fp8,
+                weights=weights,
+                seqlens_32=seqlens_32,
+                block_tables=block_tables,
+                schedule_metadata=schedule_metadata,
+                max_seq_len=max_seq_len,
+                q_offset=q_offset,
+                v3_block_sparse_logits=block_sparse_logits,
+                v3_topk_block_indices=topk_block_indices,
+                v3_topk_result=topk_result,
+            )
+
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -546,6 +579,115 @@ class HisaIndexer(MultiPlatformOp):
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
+
+    @torch.inference_mode()
+    def _hisa_verify_vs_v1(
+        self,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        seqlens_32: torch.Tensor,
+        block_tables: torch.Tensor,
+        schedule_metadata,
+        max_seq_len: int,
+        q_offset: int,
+        v3_block_sparse_logits: torch.Tensor,   # [B, sparse_len] already squeezed
+        v3_topk_block_indices: torch.Tensor,    # [B, block_topk] int64 already squeezed
+        v3_topk_result: torch.Tensor,           # [q_offset, index_topk] int32
+    ) -> None:
+        """DEBUG: re-run v1 fresh hierarchy paged MQA and compare logits
+        + final topk indices against the v3 (pool-cache) output.
+
+        Prints one line per row that exceeds a threshold. Env knobs:
+          SGLANG_HISA_VERIFY_LOGITS_ABS  (default 0.01)
+          SGLANG_HISA_VERIFY_LOGITS_REL  (default 0.05)
+          SGLANG_HISA_VERIFY_IOU         (default 0.95)
+        """
+        abs_th = float(os.environ.get("SGLANG_HISA_VERIFY_LOGITS_ABS", "0.01"))
+        rel_th = float(os.environ.get("SGLANG_HISA_VERIFY_LOGITS_REL", "0.05"))
+        iou_th = float(os.environ.get("SGLANG_HISA_VERIFY_IOU", "0.95"))
+
+        # --- v1 reference: fresh mean-pool + block_mqa + sparse_paged ---
+        v1_block_sparse, v1_topk_block = fp8_native_hierarchy_paged_mqa_logits(
+            q_fp8[:q_offset],
+            kv_cache_fp8,
+            weights[:q_offset],
+            seqlens_32,
+            block_tables,
+            schedule_metadata,
+            max_model_len=max_seq_len,
+            max_seq_len=max_seq_len,
+            k_block_size=self.hisa_k_block_size,
+            block_topk=self.hisa_block_topk,
+        )
+        v1_block_sparse = v1_block_sparse.squeeze(1)   # [B, sparse_len]
+        v1_topk_block = v1_topk_block.squeeze(1)       # [B, block_topk] int64
+
+        from sgl_kernel import fast_topk_v2
+        B, sparse_len = v1_block_sparse.shape
+        full_lens = torch.full(
+            (B,), sparse_len, dtype=torch.int32, device=v1_block_sparse.device,
+        )
+        v1_relevant = fast_topk_v2(v1_block_sparse, full_lens, self.index_topk)
+        v1_topk_result = hisa_coord_transform(
+            v1_relevant, v1_topk_block,
+            lens=seqlens_32[:q_offset],
+            k_block_size=self.hisa_k_block_size,
+            ks=None,
+        )  # [B, index_topk] int32
+
+        # --- topk IoU check (final absolute-K-position sets per row) ---
+        v3_tr = v3_topk_result[:B].cpu()
+        v1_tr = v1_topk_result.cpu()
+        for b in range(B):
+            v3_set = set(int(x) for x in v3_tr[b].tolist()) - {-1}
+            v1_set = set(int(x) for x in v1_tr[b].tolist()) - {-1}
+            inter = v3_set & v1_set
+            union = v3_set | v1_set
+            iou = len(inter) / max(len(union), 1)
+            if iou < iou_th:
+                print(
+                    f"[HISA_VERIFY layer={layer_id} b={b}] topk IoU={iou:.4f} "
+                    f"< {iou_th}  |v1|={len(v1_set)} |v3|={len(v3_set)} "
+                    f"|∩|={len(inter)}",
+                    flush=True,
+                )
+
+        # --- logits check: only where v1/v3 topk_block_indices set match
+        # (otherwise their block_sparse_logits describe different K-blocks
+        # and element-wise compare is meaningless). ---
+        v3_blk_cpu = v3_topk_block_indices[:B].cpu()
+        v1_blk_cpu = v1_topk_block.cpu()
+        kbs = self.hisa_k_block_size
+        for b in range(B):
+            v1_blk = [int(x) for x in v1_blk_cpu[b].tolist()]
+            v3_blk = [int(x) for x in v3_blk_cpu[b].tolist()]
+            if sorted(v1_blk) != sorted(v3_blk):
+                # Different block selections — IoU check above already
+                # flagged this. Skip element-wise logits compare.
+                continue
+            v1_order = {bid: idx for idx, bid in enumerate(v1_blk)}
+            max_abs_row = 0.0
+            max_rel_row = 0.0
+            for pos_v3, bid in enumerate(v3_blk):
+                pos_v1 = v1_order[bid]
+                seg_v1 = v1_block_sparse[b, pos_v1 * kbs : (pos_v1 + 1) * kbs]
+                seg_v3 = v3_block_sparse_logits[b, pos_v3 * kbs : (pos_v3 + 1) * kbs]
+                finite = torch.isfinite(seg_v1) & torch.isfinite(seg_v3)
+                if not finite.any():
+                    continue
+                abs_d = (seg_v1 - seg_v3)[finite].abs()
+                rel_d = abs_d / (seg_v1[finite].abs() + 1e-6)
+                max_abs_row = max(max_abs_row, abs_d.max().item())
+                max_rel_row = max(max_rel_row, rel_d.max().item())
+            if max_abs_row > abs_th or max_rel_row > rel_th:
+                print(
+                    f"[HISA_VERIFY layer={layer_id} b={b}] logits diff: "
+                    f"abs_max={max_abs_row:.4e} (th {abs_th})  "
+                    f"rel_max={max_rel_row:.4e} (th {rel_th})",
+                    flush=True,
+                )
 
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
