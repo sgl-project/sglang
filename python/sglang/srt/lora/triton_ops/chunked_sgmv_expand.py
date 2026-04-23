@@ -52,8 +52,6 @@ def _chunked_lora_expand_kernel(
         output (Tensor): The output tensor where the result is stored.
             Shape: (s, output_dim).
     """
-    tl.static_assert(NUM_SLICES <= 3)
-
     x_stride_0: tl.constexpr = NUM_SLICES * MAX_RANK
     x_stride_1: tl.constexpr = 1
 

@@ -285,7 +285,7 @@ class LoRAMemoryPool:
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        c = get_stacked_multiply(module_name)
+        c = get_stacked_multiply(module_name, self.base_model)
         if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             input_dim = divide(input_dim, self.tp_size)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
@@ -307,7 +307,7 @@ class LoRAMemoryPool:
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        c = get_stacked_multiply(module_name)
+        c = get_stacked_multiply(module_name, self.base_model)
         # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
         effective_tp_size = (
             self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
@@ -411,6 +411,7 @@ class LoRAMemoryPool:
         )
 
     def init_buffers(self, base_model: torch.nn.Module):
+        self.base_model = base_model
         device = next(base_model.parameters()).device
 
         # Cached once so the per-expert load path doesn't re-walk the HF
@@ -786,7 +787,7 @@ class LoRAMemoryPool:
                 )
 
             for name, weights in temp_A_buffer.items():
-                c = get_stacked_multiply(name)
+                c = get_stacked_multiply(name, self.base_model)
                 max_r = self.max_lora_rank
                 target_buffer = self.A_buffer[name][layer_id]
 

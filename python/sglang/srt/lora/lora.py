@@ -27,7 +27,6 @@ from torch import nn
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
@@ -137,6 +136,10 @@ class LoRAAdapter(nn.Module):
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self._rename_expert_w_to_proj(layer.weights)
+            # Stack gate_proj + x_proj → in_proj for Mamba layers (before gate_up normalization)
+            self._normalize_in_proj(layer.weights)
+            # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
+            self._normalize_in_proj_qkvz(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
@@ -212,26 +215,83 @@ class LoRAAdapter(nn.Module):
         for old_name, new_name in renames.items():
             weights[new_name] = weights.pop(old_name)
 
+    def _normalize_in_proj(self, weights: Dict[str, torch.Tensor]):
+        """Stack gate_proj + x_proj → in_proj for Mamba layers.
+
+        Detects Mamba layers by the presence of both gate_proj and x_proj.
+        Must run BEFORE normalize_gate_up_proj to prevent gate_proj from
+        being consumed by the gate+up stacking.
+        """
+        # Find gate_proj weights that have a matching x_proj (Mamba pattern)
+        for weight_name in list(weights.keys()):
+            if "gate_proj" not in weight_name:
+                continue
+            x_name = weight_name.replace("gate_proj", "x_proj")
+            if x_name not in weights:
+                continue
+            # This is a Mamba layer: stack gate_proj + x_proj → in_proj
+            in_proj_name = weight_name.replace("gate_proj", "in_proj")
+            cat_dim = weights[weight_name].dim() - 2
+            weights[in_proj_name] = torch.cat(
+                (weights[weight_name], weights[x_name]), cat_dim
+            )
+            weights.pop(weight_name)
+            weights.pop(x_name)
+
+    def _normalize_in_proj_qkvz(self, weights: Dict[str, torch.Tensor]):
+        """Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz
+        for GDN (GatedDeltaNet) layers like Qwen3.5.
+
+        Detects GDN layers by the presence of in_proj_q with matching
+        in_proj_k, in_proj_v, and in_proj_z.
+        """
+        for weight_name in list(weights.keys()):
+            if "in_proj_q." not in weight_name:
+                continue
+            k_name = weight_name.replace("in_proj_q", "in_proj_k")
+            v_name = weight_name.replace("in_proj_q", "in_proj_v")
+            z_name = weight_name.replace("in_proj_q", "in_proj_z")
+            if k_name not in weights or v_name not in weights or z_name not in weights:
+                continue
+            qkvz_name = weight_name.replace("in_proj_q", "in_proj_qkvz")
+            cat_dim = weights[weight_name].dim() - 2
+            weights[qkvz_name] = torch.cat(
+                (
+                    weights[weight_name],
+                    weights[k_name],
+                    weights[v_name],
+                    weights[z_name],
+                ),
+                cat_dim,
+            )
+            weights.pop(weight_name)
+            weights.pop(k_name)
+            weights.pop(v_name)
+            weights.pop(z_name)
+
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
+        # Track which up_proj names were consumed by a matching gate_proj
+        consumed_up_names = set()
         for weight_name in weight_names:
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
-                if up_name not in weights:
-                    weights[up_name] = torch.zeros_like(weights[weight_name])
-                    assert self.lora_backend.name in LORA_SUPPORTED_BACKENDS, (
-                        f"LoRA weight initialization currently only supported for LoRA backends: {', '.join(b for b in LORA_SUPPORTED_BACKENDS)}"
-                        f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
-                        f"or consider implementing custom initialization logic for other backends."
+                if up_name not in weights or weights[up_name].numel() == 0:
+                    # No up_proj (non-gated MoE): just rename gate_proj -> gate_up_proj
+                    # without stacking. Buffer uses stacked_multiply=1 for these.
+                    weights[gate_up_name] = weights.pop(weight_name)
+                    if up_name in weights:
+                        consumed_up_names.add(up_name)
+                        weights.pop(up_name)
+                else:
+                    cat_dim = weights[weight_name].dim() - 2
+                    weights[gate_up_name] = torch.cat(
+                        (weights[weight_name], weights[up_name]), cat_dim
                     )
-                cat_dim = weights[weight_name].dim() - 2
-                weights[gate_up_name] = torch.cat(
-                    (weights[weight_name], weights[up_name]), cat_dim
-                )
-                weights.pop(weight_name)
-                if up_name in weights:
+                    weights.pop(weight_name)
+                    consumed_up_names.add(up_name)
                     weights.pop(up_name)
             elif "gate_up_proj" in weight_name:
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
@@ -242,6 +302,10 @@ class LoRAAdapter(nn.Module):
                     repeat_dims[ndim - 2] = 2
                     weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
                 # else: no-op as LoRA B weight is already stacked.
+
+        # Orphan up_proj weights (no matching gate_proj) are kept as-is.
+        # Models with non-gated MLP/shared-experts declare up_proj in
+        # supported_lora_modules so they get their own buffer and wrapping.
 
     def normalize_fused_qkv_a_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
