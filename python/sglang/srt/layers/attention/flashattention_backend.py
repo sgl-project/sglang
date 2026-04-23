@@ -863,6 +863,27 @@ class FlashAttentionBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
                 # Do multi-head attention with chunked prefix cache
+                # Prepare Q/K/V — quantize to FP8 when FA4 + FP8 KV cache
+                fa4_fp8 = self.fa_impl_ver == 4 and self.kv_cache_dtype_str != "auto"
+                if fa4_fp8:
+                    q_input = q.view(-1, layer.tp_q_head_num, layer.head_dim).to(
+                        torch.float8_e4m3fn
+                    )
+                    k_input = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(
+                        torch.float8_e4m3fn
+                    )
+                    v_input = v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(
+                        torch.float8_e4m3fn
+                    )
+                else:
+                    q_input = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                    k_input = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(
+                        q.dtype
+                    )
+                    v_input = v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(
+                        q.dtype
+                    )
+
                 if forward_batch.attn_attend_prefix_cache:
                     assert not get_global_server_args().disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
@@ -875,9 +896,9 @@ class FlashAttentionBackend(AttentionBackend):
 
                     assert forward_batch.mha_return_lse
                     output = flash_attn_varlen_func(
-                        q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                        q=q_input,
+                        k=k_input,
+                        v=v_input,
                         cu_seqlens_q=metadata.cu_seqlens_q,
                         cu_seqlens_k=forward_batch.prefix_chunk_cu_seq_lens[chunk_idx],
                         max_seqlen_q=metadata.max_seq_len_q,
@@ -901,9 +922,9 @@ class FlashAttentionBackend(AttentionBackend):
                         else metadata.max_seq_len_k
                     )
                     output = flash_attn_varlen_func(
-                        q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                        q=q_input,
+                        k=k_input,
+                        v=v_input,
                         cu_seqlens_q=metadata.cu_seqlens_q,
                         cu_seqlens_k=cu_seqlens_k,
                         max_seqlen_q=metadata.max_seq_len_q,
@@ -920,25 +941,11 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
+                assert self.fa_impl_ver == 3, "Only FA3 support here"
                 # Do absorbed multi-latent attention
-                fa4_fp8 = (
-                    self.kv_cache_dtype_str != "auto" and self.fa_impl_ver == 4
-                )
-                if fa4_fp8:
-                    # FA4 FP8 native: keep KV cache in FP8, cast q to match.
-                    # No descale — upstream FA4 kernel asserts qv and descale
-                    # are mutually exclusive.  MLA quantization uses scale=1.0
-                    # (direct cast), so identity descale is correct.
-                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                        layer.layer_id
-                    )
-                    q = q.to(self.kv_cache_dtype)
-                    if q_rope is not None:
-                        q_rope = q_rope.to(self.kv_cache_dtype)
-                else:
-                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-                        layer.layer_id
-                    ).to(q.dtype)
+                kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                    layer.layer_id
+                ).to(q.dtype)
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = k_rope.view(
