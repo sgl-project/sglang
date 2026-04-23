@@ -903,23 +903,42 @@ def _apply_fp8_overrides(Lq, batch_size, max_len_extend, pfx_bucket,
             and max_len_extend <= 64
             and pfx_bucket >= 3
         ):
-            # Long-prefix short-extend at moderate batch (B=8 with pfx>=2k
-            # avg per seq). Same pad-waste argument as the B>=16 clause
-            # but the prefix is long enough that tile-utilisation on the
-            # prefix phase also matters. Sweep shows B=8 pfx=2k ext=64
-            # goes 0.64x -> 1.14x with this demotion; shorter prefixes
-            # at B=8 still win with the 8-warp default so we don't
-            # demote them.
-            BM, NW, NS = 64, 4, 1
-            EXT_NS = 1
+            # Long-prefix short-extend at moderate batch (B in [8,15]
+            # with avg pfx>=2k). Same pad-waste argument as the B>=16
+            # clause but the prefix is long enough that tile-utilisation
+            # on the prefix phase also matters. At B<=15 NS=2 (pipelined
+            # loads on top of MFMA) wins 1.5-1.8x over NS=1 across all
+            # of pfx_bucket>=3: bench shows B=8 ext=32 pfx=16k
+            # 585->326us, B=8 ext=64 pfx=8k 265->156us, B=8 ext=1
+            # pfx=4k 137->86us, and B=8 het decode 519->286us with NS=2.
+            # NS=1 only stays the right call at B>=16 where the DMA
+            # overhead isn't amortized because per-tile work is tiny.
+            BM, NW = 64, 4
+            if batch_size <= 15:
+                NS, EXT_NS = 2, 2
+            else:
+                NS, EXT_NS = 1, 1
         return BM, BN, NW, NS, EXT_BN, EXT_NS
 
     if Lq == 64:
         BM, BN, NW, NS = 128, 128, 4, 1
         EXT_BN, EXT_NS = 128, 1
-        # BM=64 wins wherever tiles are pad-heavy.
+        # BM=64 wins wherever tiles are pad-heavy. NS stays at 1 on
+        # the D=64 FP8 basic path (the kernel static_asserts NS=1 for
+        # BLOCK_DMODEL<128 on the 4-warp path; NS>=2 would need the
+        # persistent kernel which has its own dedicated D<128 branch).
         if max_len_extend <= 8 or (
             batch_size >= 16 and max_len_extend <= 128
+        ) or (
+            # B in [8,15] short-ext long-pfx decode-continuation and
+            # short-ext heterogeneous decode (forced to basic at D=64
+            # FP8): BM=128 pads 50-87% of Q rows; BM=64 gets full Q
+            # utilization at the same NS=1 and beats BM=128 by ~15%
+            # (bench: B=8 ext=64 pfx=8192 245->192us, B=8 ext=32
+            # pfx=16384 474->374us, B=8 het decode 437->~380us).
+            batch_size >= 8
+            and max_len_extend <= 64
+            and pfx_bucket >= 3
         ):
             BM = 64
         return BM, BN, NW, NS, EXT_BN, EXT_NS
@@ -1142,6 +1161,26 @@ def gluon_extend_attention_fwd(
         # still benefit from WCA but we can't cheaply distinguish it from
         # uniform at dispatch time.
         and not (_kv_is_fp8 and Lq == 128 and max_len_extend <= 64)
+        # FP8 D=128 B<=4 ext=128: basic SPLIT_K=2 fills the grid (128
+        # output tiles x 2 splits = 256 CTAs = gfx950 num_CUs) without
+        # paying ~25us of WCA setup. Moderate prefix doesn't amortize
+        # WCA at this batch size. Persistent still handles genuinely
+        # long prefixes at B<=4 via the explicit _need_persistent gate
+        # below (_avg_pfx >= 16384).
+        and not (
+            _kv_is_fp8 and Lq == 128
+            and batch_size <= 4 and max_len_extend >= 128
+        )
+        # FP8 D=64 B>=8 ext<=64 long-prefix: persistent (NS=2) loses
+        # ~0.82x to basic (NS=1) here because the D=64 pipelined path
+        # doesn't amortize the extra DMA stage at small per-tile work.
+        # Basic BM=128 BN=128 NW=4 NS=1 beats WCA BM=128 BN=128 NW=4 NS=2
+        # by ~20% on B=8 ext=64 pfx=8192 and B=8 ext=32 pfx=16384.
+        and not (
+            _kv_is_fp8 and Lq == 64
+            and batch_size >= 8 and max_len_extend <= 64
+            and _total_pfx_est_pre >= batch_size * 8192
+        )
     )
     _is_ragged = _is_ragged_ext or _is_ragged_pfx
 
@@ -1225,19 +1264,32 @@ def gluon_extend_attention_fwd(
             _avg_pfx = _total_pfx // max(1, batch_size)
             if _kv_is_fp8:
                 if Lq == 128:
+                    # B=4 ext>=128 with moderate prefix goes through the
+                    # splitk path instead (SPLIT_K=2 on B=4 fills the grid
+                    # and we drop ~20us of WCA setup). Long prefix (>=16k)
+                    # or short extend (<=64) keeps the straight persistent
+                    # win on decode-like shapes.
                     _need_persistent = (
                         _total_tiles_est < _num_CUs
                         and (
-                            (_avg_pfx >= 4096 and max_len_extend <= 128)
+                            (_avg_pfx >= 4096 and max_len_extend <= 64)
+                            or (_avg_pfx >= 4096 and max_len_extend <= 128
+                                and batch_size >= 5)
                             or (_avg_pfx >= 16384 and max_len_extend <= 256)
                         )
                     )
                 elif Lq == 64:
+                    # B>=8 ext<=64 long-pfx: basic NS=1 beats persistent
+                    # NS=2 by ~20%. Keep persistent only on B<=7 here.
                     _need_persistent = (
                         _total_tiles_est < _num_CUs
                         and (
                             (_avg_pfx >= 4096 and max_len_extend <= 256)
                             or (_avg_pfx >= 16384 and max_len_extend <= 512)
+                        )
+                        and not (
+                            batch_size >= 8 and max_len_extend <= 64
+                            and _avg_pfx >= 8192
                         )
                     )
                 else:
@@ -1631,12 +1683,22 @@ def _launch_persistent_fp8(
     # that each tile iterates a long prefix, BM=64 NW=4 NS=1 BN=128 beats
     # the default BM>=128 NW=8 by ~1.5-2x (no waste on short extends,
     # better LDS/CU utilization per tile).
+    #
+    # B=4 edge: at batch==4 with ext>=128, per-tile compute on the prefix
+    # phase is substantial and the basic BM=128 NW=8 NS=2 cfg beats the
+    # small-tile here (bench: B=4 ext=128 pfx=4096 0.81x -> 1.03x). So
+    # require either B>=5, an even longer prefix (>=16k), or a short
+    # extend (ext<=64) to keep the small-tile win on decode-heavy shapes.
     _total_pfx_fp8 = total_prefix_len if total_prefix_len is not None else 0
     _avg_pfx_fp8 = _total_pfx_fp8 // max(1, batch_size)
     _fp8_prefix_dominated = (
         Lq == 128
         and _avg_pfx_fp8 >= 4096
-        and (batch_size >= 4 or _avg_pfx_fp8 >= 16384)
+        and (
+            batch_size >= 5
+            or _avg_pfx_fp8 >= 16384
+            or (batch_size >= 4 and max_len_extend <= 64)
+        )
     )
 
     if SPLIT_K > 1:
