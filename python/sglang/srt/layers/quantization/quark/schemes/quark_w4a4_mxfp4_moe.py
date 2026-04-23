@@ -10,7 +10,11 @@ import torch
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_moe_tensor_parallel_rank
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_weight_sizes, get_mxfp4_first_idle_rank
+from sglang.srt.layers.moe.utils import (
+    get_first_idle_rank,
+    get_moe_padding_size,
+    get_moe_weight_sizes,
+)
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -94,6 +98,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         params_dtype = torch.uint8
         layer.inter_dim = intermediate_size_per_partition
+
+        # Compute idle-rank info at init time (before weight loading) so that
+        # models can read layer.first_idle_rank to set up shared-expert sharding.
+        if _use_aiter:
+            tp_size = get_tensor_model_parallel_world_size()
+            padding_size = get_moe_padding_size(True)
+            w2_down_dim_unpadded = intermediate_size_per_partition // 2
+            layer.first_idle_rank = get_first_idle_rank(
+                w2_down_dim_unpadded, tp_size, padding_size
+            )
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
@@ -183,12 +197,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
 
         if _use_aiter:
-            tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_moe_tensor_parallel_rank()
-            first_idle_rank = get_mxfp4_first_idle_rank(
-                layer.inter_dim, tp_size, True
-            )
-            layer.is_idle_rank = tp_rank >= first_idle_rank
+            layer.is_idle_rank = tp_rank >= layer.first_idle_rank
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

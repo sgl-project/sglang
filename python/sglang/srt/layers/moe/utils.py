@@ -424,16 +424,14 @@ def get_moe_weight_sizes(
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
 
 
-def get_mxfp4_first_idle_rank(
-    inter_dim: int,
+def get_first_idle_rank(
+    w2_down_dim: int,
     tp_size: int,
-    is_aiter_moe: bool,
+    padding_size: int,
 ):
-    if not is_aiter_moe or tp_size < 2:
+    if padding_size == 0 or tp_size < 2:
         return tp_size
 
-    padding_size = get_moe_padding_size(True)
-    w2_down_dim = inter_dim // 2
     if w2_down_dim % padding_size == 0:
         return tp_size
 
