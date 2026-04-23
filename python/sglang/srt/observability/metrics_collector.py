@@ -94,6 +94,9 @@ class SchedulerStats:
     cache_hit_rate: float = 0.0
 
     max_total_num_tokens: int = 0
+    kv_available_tokens: int = 0
+    kv_evictable_tokens: int = 0
+    kv_used_tokens: int = 0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -275,6 +278,25 @@ class SchedulerMetricsCollector:
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.kv_available_tokens = Gauge(
+            name="sglang:kv_available_tokens",
+            documentation="Number of free token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_evictable_tokens = Gauge(
+            name="sglang:kv_evictable_tokens",
+            documentation="Number of evictable (radix-cached) token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_used_tokens = Gauge(
+            name="sglang:kv_used_tokens",
+            documentation="Number of actively used token slots in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -664,7 +686,7 @@ class SchedulerMetricsCollector:
         if self.enable_streaming_session:
             self.num_streaming_sessions = Gauge(
                 name="sglang:num_streaming_sessions",
-                documentation="The number of active streaming sessions.",
+                documentation="The number of streaming sessions.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
@@ -1014,6 +1036,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+        self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
+        self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
+        self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)

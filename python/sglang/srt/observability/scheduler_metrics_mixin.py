@@ -12,8 +12,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DisaggregationMetrics,
-    GetLoadReqInput,
-    GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
     LoRAMetrics,
@@ -166,14 +164,17 @@ class SchedulerMetricsMixin:
                     reporter=self.metrics_collector.increment_gpu_overlap_wait_seconds,
                 )
 
-        if self.enable_kv_cache_events:
-            self.init_kv_events(self.server_args.kv_events_config)
+        self.init_kv_events(self.server_args.kv_events_config)
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
         )
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
+        self.enable_kv_cache_events = bool(
+            kv_events_config and self.attn_tp_rank == 0 and self.attn_cp_rank == 0
+        )
+
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, self.attn_dp_rank
@@ -603,7 +604,7 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
-            self.stats.num_streaming_sessions = self._alive_streaming_session_count()
+            self.stats.num_streaming_sessions = self._streaming_session_count()
             self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
             # Speculative decoding
@@ -775,42 +776,17 @@ class SchedulerMetricsMixin:
 
         Args:
             chunk_deduct: extra tokens to subtract from the chunked request's
-                remaining count.  At batch-scheduling time the current chunk
+                remaining count. At batch-scheduling time the current chunk
                 has been planned but ``prefix_indices`` does not yet include it,
-                so callers pass ``extend_input_len`` here.  At query time
-                (``get_load``) ``prefix_indices`` is already up-to-date, so
-                the default 0 is correct.
+                so callers pass ``extend_input_len`` here. At load-reporting
+                time ``prefix_indices`` is already up-to-date, so the default
+                0 is correct.
         """
         num_pending_tokens = sum(req.seqlen for req in self.waiting_queue)
         if self.chunked_req is not None:
             req = self.chunked_req
             num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
         return num_pending_tokens
-
-    def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
-        num_tokens, _ = self.get_pool_stats().get_kv_token_stats()
-        num_pending_tokens = self._get_num_pending_tokens()
-
-        # Tokens and request count in waiting queue, bootstrap queue, prealloc queue
-        waiting_queues = [self.waiting_queue]
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
-            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
-            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
-
-        num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
-        num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-
-        return GetLoadReqOutput(
-            dp_rank=self.dp_rank,
-            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
-            num_waiting_reqs=num_waiting_reqs,
-            num_tokens=num_tokens,
-            num_pending_tokens=num_pending_tokens,
-            ts_tic=time.perf_counter(),
-        )
 
     def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
         """
@@ -840,6 +816,9 @@ class SchedulerMetricsMixin:
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_used_tokens, kv_token_usage = self.get_pool_stats().get_kv_token_stats()
+        num_total_tokens = num_used_tokens + sum(
+            req.seqlen for queue in waiting_queues for req in queue
+        )
 
         memory = None
         if include_all or "memory" in include:
@@ -924,6 +903,7 @@ class SchedulerMetricsMixin:
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_used_tokens=num_used_tokens,
+            num_total_tokens=num_total_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             token_usage=round(kv_token_usage, 4),
             gen_throughput=round(self.stats.gen_throughput, 2),

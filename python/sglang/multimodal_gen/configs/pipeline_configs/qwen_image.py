@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     maybe_unpad_latents,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
+    QwenImageRolloutPipelineMixin,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
@@ -127,7 +130,7 @@ def _pack_latents(latents, batch_size, num_channels_latents, height, width):
 
 
 @dataclass
-class QwenImagePipelineConfig(ImagePipelineConfig):
+class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig):
     """Configuration for the QwenImage pipeline."""
 
     should_use_guidance: bool = False
@@ -243,6 +246,18 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
         # img_shapes: for global entire image
         img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
+
+        max_txt_seq_len = max(txt_seq_lens) if txt_seq_lens else 0
+        txt_cache_len = int(txt_freqs.shape[0])
+        if max_txt_seq_len > txt_cache_len:
+            overflow = max_txt_seq_len - txt_cache_len
+            raise ValueError(
+                "QwenImage RoPE text cache overflow before denoising: "
+                f"required_txt_seq_len={max_txt_seq_len}, txt_cache_len={txt_cache_len}, "
+                f"overflow={overflow}. "
+                "Please reduce the number of input images, shorten the prompt, "
+                "or lower the requested resolution."
+            )
 
         # flashinfer RoPE expects a float32 cos/sin cache concatenated on the last dim
         img_cos_half = img_freqs.real.to(dtype=torch.float32).contiguous()

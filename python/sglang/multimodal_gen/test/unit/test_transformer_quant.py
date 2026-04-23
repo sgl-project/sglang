@@ -100,6 +100,26 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertEqual(resolved, [f.name])
 
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
+        side_effect=lambda path, **kw: path,
+    )
+    def test_resolve_transformer_safetensors_to_load_prefers_mixed_export(
+        self, _mock_download
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mixed = f"{tmpdir}/flux2-dev-nvfp4-mixed.safetensors"
+            full = f"{tmpdir}/flux2-dev-nvfp4.safetensors"
+            open(mixed, "a").close()
+            open(full, "a").close()
+
+            server_args = self._make_server_args(transformer_weights_path=tmpdir)
+            resolved = resolve_transformer_safetensors_to_load(
+                server_args, "/unused/component/path"
+            )
+
+        self.assertEqual(resolved, [mixed])
+
     def test_filter_transformer_precision_variants_prefers_canonical_file(self):
         files = [
             "/tmp/transformer/diffusion_pytorch_model.fp16.safetensors",
@@ -263,8 +283,18 @@ class TestTransformerQuantHelpers(unittest.TestCase):
     @patch(
         "sglang.multimodal_gen.runtime.layers.linear.get_tp_group", return_value=None
     )
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+        return_value=1,
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_global_server_args",
+        return_value=SimpleNamespace(attention_backend=None),
+    )
     def test_flux_single_transformer_block_modelopt_excludes_use_full_prefix(
         self,
+        _mock_server_args,
+        _mock_ring_world_size,
         _mock_tp_group,
         _mock_group_size,
         _mock_group_rank,

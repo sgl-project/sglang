@@ -208,26 +208,38 @@ class GPUWorker:
             f"Related offload server args to disable: {suggested_args_str}"
         )
 
-    def execute_forward(self, batch: List[Req]) -> OutputBatch:
+    def execute_forward(
+        self, batch: List[Req], return_req: bool = False
+    ) -> OutputBatch | Req:
         """
         Execute a forward pass.
+
+        Args:
+            batch: List of requests to process.
+            return_req: If True, return the raw Req instead of OutputBatch.
+                Used by disaggregated pipelines to access intermediate tensors.
         """
         assert self.pipeline is not None
         req = batch[0]
         output_batch = None
         try:
-            if self.rank == 0:
+            if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
 
             # capture memory baseline before forward
-            if self.rank == 0 and req.metrics:
+            if self.rank == 0 and req.metrics and not current_platform.is_cpu():
                 baseline_snapshot = capture_memory_snapshot()
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
+
+            # For disagg roles, return raw Req to let the caller handle
+            # the role-to-role tensor transfer before OutputBatch conversion.
+            if return_req and isinstance(result, Req):
+                return result
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
@@ -247,7 +259,11 @@ class GPUWorker:
                 output_batch = result
 
             # capture memory after forward (peak)
-            if self.rank == 0 and output_batch.metrics:
+            if (
+                self.rank == 0
+                and output_batch.metrics
+                and not current_platform.is_cpu()
+            ):
                 peak_snapshot = capture_memory_snapshot()
                 output_batch.metrics.record_memory_snapshot(
                     "after_forward", peak_snapshot
@@ -256,12 +272,14 @@ class GPUWorker:
             if (
                 self.rank == 0
                 and not req.suppress_logs
+                and not current_platform.is_cpu()
                 and logger.isEnabledFor(logging.DEBUG)
             ):
                 self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
-            output_batch.metrics.total_duration_ms = duration_ms
+            if output_batch.metrics is not None:
+                output_batch.metrics.total_duration_ms = duration_ms
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
@@ -526,6 +544,7 @@ def run_scheduler_process(
             port_args=port_args,
             task_pipes_to_slaves=task_pipes_to_slaves,
             result_pipes_from_slaves=result_pipes_from_slaves,
+            local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(

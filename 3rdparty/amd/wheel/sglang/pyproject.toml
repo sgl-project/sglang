@@ -123,8 +123,11 @@ srt_musa = [
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.45",
+  "torchada>=0.1.50",
   "mthreads-ml-py",
+  "mate>=0.2.0",
+  "deep-gemm>=0.1.3",
+  "flash_attn_3>=0.1.4",
   "numpy<2.0",
 ]
 
@@ -210,4 +213,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+# Allow editable installs even when .git metadata is not available.
+fallback_version = "0.0.0.dev0"
