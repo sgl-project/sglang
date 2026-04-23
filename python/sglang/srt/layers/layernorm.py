@@ -362,13 +362,20 @@ class RMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
-        if residual is not None:
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x, residual
-        out = rmsnorm(x, self.weight.data, self.variance_epsilon)
-        return out
+        try:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            return out
+        except RuntimeError as e:
+            # Some XPU kernels require flattenable leading dimensions when handling
+            # higher-rank tensors. Fall back to the native path for correctness.
+            if "flattenable leading dimensions" in str(e):
+                return self.forward_native(x, residual, post_residual_addition)
+            raise
 
     def forward_with_allreduce_fusion(
         self,
