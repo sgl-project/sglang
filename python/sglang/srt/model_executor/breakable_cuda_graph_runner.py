@@ -91,6 +91,8 @@ class BreakableCudaGraphRunner:
 
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.is_multimodal
+        # Read by the shared replay_prepare (bound from PiecewiseCudaGraphRunner).
+        self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # Capture sizes
         capture_tokens = model_runner.server_args.piecewise_cuda_graph_tokens
