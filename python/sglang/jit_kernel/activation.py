@@ -33,19 +33,25 @@ def _jit_activation_module(dtype: torch.dtype) -> Module:
 SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh"}
 
 
-@register_custom_op(mutates_args=["out"], out_shape="input")
-def run_activation(
-    op_name: str, input: torch.Tensor, out: Optional[torch.Tensor]
-) -> torch.Tensor:
-    assert op_name in SUPPORTED_ACTIVATIONS, f"Unsupported activation: {op_name}"
-
+@register_custom_op(mutates_args=["out"])
+def _run_activation_inplace(
+    op_name: str, input: torch.Tensor, out: torch.Tensor
+) -> None:
     hidden_size = input.shape[-1] // 2
-    if out is None:
-        out = input.new_empty(*input.shape[:-1], hidden_size)
     module = _jit_activation_module(input.dtype)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
     module.run_activation(input_2d, out_2d, op_name)
+
+
+def run_activation(
+    op_name: str, input: torch.Tensor, out: Optional[torch.Tensor]
+) -> torch.Tensor:
+    assert op_name in SUPPORTED_ACTIVATIONS, f"Unsupported activation: {op_name}"
+    hidden_size = input.shape[-1] // 2
+    if out is None:
+        out = input.new_empty(*input.shape[:-1], hidden_size)
+    _run_activation_inplace(op_name, input, out)
     return out
 
 
