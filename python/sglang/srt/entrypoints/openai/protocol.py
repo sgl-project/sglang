@@ -1320,10 +1320,13 @@ class ResponsesRequest(BaseModel):
             "repetition_penalty": get_param("repetition_penalty"),
         }
 
-        if self.text and self.text.format and self.text.format.type == "json_schema":
-            params["json_schema"] = convert_json_schema_to_str(self.text.format.schema_)
-        elif self.text and self.text.format and self.text.format.type == "json_object":
-            params["json_schema"] = '{"type": "object"}'
+        if self.text and self.text.format:
+            if self.text.format.type == "json_schema":
+                params["json_schema"] = convert_json_schema_to_str(
+                    self.text.format.schema_
+                )
+            elif self.text.format.type == "json_object":
+                params["json_schema"] = '{"type": "object"}'
 
         # Apply any additional default parameters
         for key, value in default_params.items():

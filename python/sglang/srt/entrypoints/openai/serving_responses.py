@@ -24,9 +24,6 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from openai.types.responses.response_reasoning_item import (
-    Content as ResponseReasoningTextContent,
-)
 from openai_harmony import Message as OpenAIMessage
 
 from sglang.srt.entrypoints.context import (
@@ -73,6 +70,180 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_responses_input(
+    input_items: list,
+) -> list[ChatCompletionMessageParam]:
+    """Normalize Responses API input messages to Chat Completions format.
+
+    Converts Responses API items (message, reasoning, function_call, function_call_output)
+    to Chat Completions messages format, merging related assistant items.
+    """
+    messages: list[ChatCompletionMessageParam] = []
+    pending_assistant: Optional[dict] = None
+
+    def _flush_pending_assistant():
+        """Add pending assistant message to messages if exists."""
+        nonlocal pending_assistant
+        if pending_assistant is not None:
+            # Clean up empty fields
+            if not pending_assistant.get("content"):
+                pending_assistant["content"] = None
+            if not pending_assistant.get("tool_calls"):
+                del pending_assistant["tool_calls"]
+            messages.append(pending_assistant)  # type: ignore[arg-type]
+            pending_assistant = None
+
+    for raw_item in input_items:
+        # Convert Pydantic models to dicts for uniform handling
+        item = raw_item
+        if hasattr(raw_item, "model_dump"):
+            item = raw_item.model_dump()
+
+        if not isinstance(item, dict):
+            messages.append(raw_item)  # type: ignore[arg-type]
+            continue
+
+        item_type = item.get("type", "message")
+        role = item.get("role")
+
+        if item_type == "message" and role == "user":
+            _flush_pending_assistant()
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _normalize_content(item.get("content")),
+                }
+            )
+
+        elif item_type == "reasoning":
+            if pending_assistant is None:
+                pending_assistant = {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": None,
+                    "tool_calls": [],
+                }
+            # Extract reasoning text from summary or content
+            reasoning_text = ""
+            summary = item.get("summary", [])
+            if summary:
+                for s in summary:
+                    if hasattr(s, "model_dump"):
+                        s = s.model_dump()
+                    if isinstance(s, dict) and s.get("type") == "summary_text":
+                        reasoning_text = s.get("text", "")
+                        break
+            if not reasoning_text:
+                content = item.get("content", [])
+                for c in content:
+                    if hasattr(c, "model_dump"):
+                        c = c.model_dump()
+                    if isinstance(c, dict) and c.get("type") == "reasoning_text":
+                        reasoning_text = c.get("text", "")
+                        break
+            pending_assistant["reasoning_content"] = reasoning_text
+
+        elif item_type == "function_call":
+            if pending_assistant is None:
+                pending_assistant = {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": None,
+                    "tool_calls": [],
+                }
+            if "tool_calls" not in pending_assistant:
+                pending_assistant["tool_calls"] = []
+            pending_assistant["tool_calls"].append(
+                {
+                    "id": item.get("call_id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+            )
+
+        elif item_type == "message" and role == "assistant":
+            if pending_assistant is None:
+                pending_assistant = {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": None,
+                    "tool_calls": [],
+                }
+            pending_assistant["content"] = _normalize_content(item.get("content"))
+
+        elif item_type == "function_call_output":
+            _flush_pending_assistant()
+            # Find the corresponding function_call to get the name
+            call_id = item.get("call_id", "")
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": item.get("output", ""),
+                }
+            )
+
+        else:
+            # Pass through other items (e.g., system messages)
+            _flush_pending_assistant()
+            normalized_item = dict(item)
+            if "content" in normalized_item:
+                normalized_item["content"] = _normalize_content(
+                    normalized_item["content"]
+                )
+            messages.append(normalized_item)  # type: ignore[arg-type]
+
+    _flush_pending_assistant()
+    return messages
+
+
+def _normalize_content(content) -> Optional[Union[str, list]]:
+    """Normalize content: convert input_text/output_text to text type."""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+
+    if hasattr(content, "__iter__") and not isinstance(content, list):
+        try:
+            content = list(content)
+        except Exception as e:
+            logger.warning(f"Failed to convert content iterator: {e}")
+            return str(content)
+
+    if isinstance(content, list):
+        normalized = []
+        for part in content:
+            if hasattr(part, "model_dump"):
+                part = part.model_dump()
+            normalized.append(_normalize_content_part(part))
+        return normalized
+    return content
+
+
+def _normalize_content_part(part: dict) -> dict:
+    """Convert a Responses API content part to Chat Completions format."""
+    if isinstance(part, dict):
+        part_type = part.get("type")
+        if part_type in ("input_text", "output_text"):
+            return {"type": "text", "text": part.get("text", "")}
+        elif part_type == "input_image":
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": part.get("image_url", ""),
+                    "detail": part.get("detail", "auto"),
+                },
+            }
+        elif part_type == "input_audio":
+            return {"type": "audio_url", "audio_url": {"url": part.get("data", "")}}
+    return part
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -331,6 +502,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                         bootstrap_port=request.bootstrap_port,
                         bootstrap_room=request.bootstrap_room,
                         data_parallel_rank=request.data_parallel_rank,
+                        image_data=processed_messages.image_data,
+                        video_data=processed_messages.video_data,
+                        audio_data=processed_messages.audio_data,
+                        modalities=processed_messages.modalities,
+                        priority=request.priority,
+                        routing_key=self.extract_routing_key(raw_request),
+                        custom_labels=self.extract_custom_labels(raw_request),
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -617,12 +795,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_item = ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
                 type="reasoning",
-                summary=[],
-                content=[
-                    ResponseReasoningTextContent(
-                        type="reasoning_text", text=reasoning_content
+                summary=[
+                    openai_responses_types.response_reasoning_item.Summary(
+                        type="summary_text",
+                        text=reasoning_content,
                     ),
                 ],
+                content=[],
                 status="completed",
             )
             output_items.append(reasoning_item)
@@ -714,7 +893,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         if isinstance(request.input, str):
             messages.append({"role": "user", "content": request.input})
         else:
-            messages.extend(request.input)  # type: ignore
+            messages.extend(_normalize_responses_input(request.input))  # type: ignore
         return messages
 
     def _construct_input_messages_with_harmony(
@@ -1339,13 +1518,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                         reasoning_item = ResponseReasoningItem(
                             id=f"rs_{random_uuid()}",
                             type="reasoning",
-                            summary=[],
-                            content=[
-                                ResponseReasoningTextContent(
+                            summary=[
+                                openai_responses_types.response_reasoning_item.Summary(
+                                    type="summary_text",
                                     text=previous_item.content[0].text,
-                                    type="reasoning_text",
                                 ),
                             ],
+                            content=[],
                             status="completed",
                         )
                         yield _send_event(
@@ -1798,6 +1977,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 bootstrap_port=adapted_request.bootstrap_port,
                 bootstrap_room=adapted_request.bootstrap_room,
                 data_parallel_rank=adapted_request.data_parallel_rank,
+                image_data=adapted_request.image_data,
+                video_data=adapted_request.video_data,
+                audio_data=adapted_request.audio_data,
+                modalities=adapted_request.modalities,
+                priority=adapted_request.priority,
+                routing_key=adapted_request.routing_key,
+                custom_labels=adapted_request.custom_labels,
             )
 
             # Update sampling params with reduced max_tokens
