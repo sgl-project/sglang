@@ -1084,6 +1084,26 @@ def gluon_extend_attention_fwd(
     if _kv_is_fp8 and not _is_uniform and max_len_extend <= 64:
         _is_ragged = False
 
+    def _dispatch_wca():
+        """Launch the WCA (persistent-CTA) kernel; picks BF16 vs FP8 by
+        checking ``_kv_is_fp8`` in the enclosing scope. All three WCA call
+        sites below share the identical argument list, so factor it once."""
+        _fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
+        _min_ext = min_len_extend if min_len_extend is not None else max_len_extend
+        _fn(
+            q_extend, k_extend, v_extend, o_extend,
+            k_buffer, v_buffer,
+            qo_indptr, kv_indptr, kv_indices,
+            custom_mask, is_causal, mask_indptr, max_len_extend,
+            k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
+            logit_cap=logit_cap,
+            sliding_window_size=sliding_window_size,
+            sinks=sinks, window_kv_offsets=window_kv_offsets,
+            xai_temperature_len=xai_temperature_len,
+            min_len_extend=_min_ext,
+            total_prefix_len=total_prefix_len,
+        )
+
     # D=128 B<=4: every WCA clause requires B>=5 so short-circuit.
     # D=256 stays on basic (tuned tree is sufficient and WCA BM=256 has
     # LDS issues).
@@ -1125,20 +1145,7 @@ def gluon_extend_attention_fwd(
             # Launcher picks the BM/NW tile config internally (small-tile for
             # ext-dominated or ragged batches, big-tile for prefix-dominated
             # chat-mix).
-            _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-            _wca_fn(
-                q_extend, k_extend, v_extend, o_extend,
-                k_buffer, v_buffer,
-                qo_indptr, kv_indptr, kv_indices,
-                custom_mask, is_causal, mask_indptr, max_len_extend,
-                k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
-                logit_cap=logit_cap,
-                sliding_window_size=sliding_window_size,
-                sinks=sinks, window_kv_offsets=window_kv_offsets,
-                xai_temperature_len=xai_temperature_len,
-                min_len_extend=min_len_extend,
-                total_prefix_len=total_prefix_len,
-            )
+            _dispatch_wca()
             return
 
     if _can_route_wca:
@@ -1206,27 +1213,10 @@ def gluon_extend_attention_fwd(
                         )
                     )
             if _need_persistent and _can_route_wca:
-                if min_len_extend is None:
-                    # Avoid the 6ms CPU sync that computing min_len_extend
-                    # would cost; falling back to max is conservative.
-                    min_len_extend = max_len_extend
                 # Both launchers auto-select tiles for prefix-dominated
                 # chat-mix (BF16 via _use_small_tile+_lq128_ext_dominated,
                 # FP8 via _fp8_prefix_dominated).
-                _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-                _wca_fn(
-                    q_extend, k_extend, v_extend, o_extend,
-                    k_buffer, v_buffer,
-                    qo_indptr, kv_indptr, kv_indices,
-                    custom_mask, is_causal, mask_indptr, max_len_extend,
-                    k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
-                    logit_cap=logit_cap,
-                    sliding_window_size=sliding_window_size,
-                    sinks=sinks, window_kv_offsets=window_kv_offsets,
-                    xai_temperature_len=xai_temperature_len,
-                    min_len_extend=min_len_extend,
-                    total_prefix_len=total_prefix_len,
-                )
+                _dispatch_wca()
                 return
 
         _sm = (sm_scale if sm_scale is not None else Lq**-0.5) * k_scale
@@ -1250,22 +1240,7 @@ def gluon_extend_attention_fwd(
                 and _tiles_256 < _get_num_CUs(q_extend.device)
             )
             if _need_persistent_256 and _can_route_wca:
-                if min_len_extend is None:
-                    min_len_extend = max_len_extend
-                _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-                _wca_fn(
-                    q_extend, k_extend, v_extend, o_extend,
-                    k_buffer, v_buffer,
-                    qo_indptr, kv_indptr, kv_indices,
-                    custom_mask, is_causal, mask_indptr, max_len_extend,
-                    k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
-                    logit_cap=logit_cap,
-                    sliding_window_size=sliding_window_size,
-                    sinks=sinks, window_kv_offsets=window_kv_offsets,
-                    xai_temperature_len=xai_temperature_len,
-                    min_len_extend=min_len_extend,
-                    total_prefix_len=total_prefix_len,
-                )
+                _dispatch_wca()
                 return
 
         # Cached dispatch config lookup (O(0.1us) after warmup).

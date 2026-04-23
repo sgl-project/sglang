@@ -25,9 +25,11 @@ identical to a plain basic launch. The persistent path walks a single
 output_tile -> (seq, head, block_m) inline scan over qo_indptr (no CPU-side
 cum_tiles tensor); split-K layers on top by striping the prefix across CTAs.
 
-Internally derived (not user-tunable) constexprs: BLOCK_DV (=BLOCK_DMODEL)
-and ENABLE_MASK_SPLIT (=BLOCK_DMODEL<256). There is no BLOCK_DPE --
-DeepSeek/MLA lives in a separate kernel.
+The only internally derived (not user-tunable) constexpr is BLOCK_DV
+(=BLOCK_DMODEL). There is no BLOCK_DPE -- DeepSeek/MLA lives in a
+separate kernel. The masked-tail vs unmasked-bulk split is enabled for
+BLOCK_DMODEL < 256; at D=256 the smem budget forces a single masked
+dispatch over the whole range.
 
 Inner-loop dispatch (selected by num_warps, NUM_STAGES, D):
     USE_PINGPONG=False, NS>=2, D>=128 -> 4-warp sw-pipeline (async DMA, pipelined)
@@ -116,7 +118,6 @@ def gluon_extend_attn_fwd(
     )
 
     BLOCK_DV: gl.constexpr = BLOCK_DMODEL
-    ENABLE_MASK_SPLIT: gl.constexpr = BLOCK_DMODEL < 256
 
     # FP8 safety rails: MFMA_F8 at D>=256 hits an unrealized_conversion_cast
     # in the LLVM backend on gfx950; the dispatcher should never route
@@ -334,7 +335,11 @@ def gluon_extend_attn_fwd(
         else:
             effective_end = seq_len_extend
         n_extend_blocks = (effective_end + _EXT_N - 1) // _EXT_N
-        if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
+        # Split the extend range into a fully-unmasked bulk + a masked tail.
+        # This is only profitable when D<256; at D=256 the tile math has no
+        # room for a separate masked-tail kernel, so we fall through to the
+        # single-dispatch masked path below.
+        if BLOCK_DMODEL >= 256 or USE_CUSTOM_MASK:
             # One combined dispatch covers the whole range with per-step masking.
             n_full_blocks = 0
         elif SLIDING_WINDOW_SIZE > 0 and (IS_FP8 or effective_end > SLIDING_WINDOW_SIZE):
@@ -674,8 +679,8 @@ def gluon_extend_attn_fwd(
                 # is where the unmasked bulk ended, swa_skip_n_blocks fast-
                 # forwards past blocks that lie entirely outside the SWA
                 # window (no-op when SWA is inactive). If both are zero we
-                # mask the whole extend range, which is what NOT ENABLE_MASK_SPLIT
-                # / custom-mask / mixed-SWA paths request above.
+                # mask the whole extend range, which is what the D>=256 /
+                # custom-mask / mixed-SWA paths request above.
                 masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
                 remaining_blocks = n_extend_blocks - masked_start
                 if remaining_blocks >= _EXT_NS:

@@ -990,6 +990,12 @@ def compute_softmax_prefix(
     # Prefix softmax. Custom-mask application lives in the extend phase
     # (``compute_softmax_extend``); the prefix tokens are only gated by
     # the sequence-length bound and -- when enabled -- the sliding window.
+    #
+    # LOGIT_CAP > 0 enables logit capping (Gemma-class models): we apply
+    #     qk_scaled = cap * tanh(qk_scaled / cap)
+    # in log2 space via sigmoid (tanh(x) = 2*sig(2x) - 1). LOGIT_CAP is a
+    # constexpr so the branch + log2_cap/inv_cap fold away at compile time
+    # when capping is off (the common case).
     qk_scaled = qk * qk_scale
     if LOGIT_CAP > 0:
         log2_cap: gl.constexpr = LOGIT_CAP * LOG2E
@@ -1141,6 +1147,11 @@ def compute_softmax_extend_part0(
     Produces (p, alpha, m_new) without touching acc or l_i.
     Intended to run between QK MMA and V wait so the VALU work
     overlaps with the V global→LDS DMA.
+
+    LOGIT_CAP > 0 mirrors ``compute_softmax_prefix``: logit capping
+    (Gemma-style tanh bound) expressed in log2 space via sigmoid. The
+    branch and cap constants fold away at compile time when capping is
+    off.
     """
     qk_scaled = qk * qk_scale
     if LOGIT_CAP > 0:
