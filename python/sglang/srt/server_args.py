@@ -499,6 +499,13 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_csd_enabled: bool = False
+    speculative_csd_table_path: Optional[str] = None
+    speculative_csd_freq_threshold: int = 6
+    speculative_csd_prob_ratio: float = 0.01
+    speculative_csd_dynamic_update: bool = False
+    speculative_csd_delta_save_path: Optional[str] = None
+    speculative_csd_force_accept_disabled: bool = False
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
@@ -2983,6 +2990,30 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if self.speculative_csd_enabled:
+            if self.speculative_csd_freq_threshold < 1:
+                raise ValueError(
+                    "--speculative-csd-freq-threshold must be at least 1."
+                )
+            if not 0 < self.speculative_csd_prob_ratio <= 1:
+                raise ValueError(
+                    "--speculative-csd-prob-ratio must be in the range (0, 1]."
+                )
+            if (
+                not self.speculative_csd_dynamic_update
+                and self.speculative_csd_table_path is None
+            ):
+                raise ValueError(
+                    "--speculative-csd requires either --speculative-csd-table-path or --speculative-csd-dynamic-update."
+                )
+            if (
+                self.speculative_csd_dynamic_update
+                and self.speculative_csd_delta_save_path is None
+            ):
+                logger.warning(
+                    "CSD dynamic update is enabled without --speculative-csd-delta-save-path; dynamic pairs will not be persisted automatically."
+                )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -4814,6 +4845,49 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-csd",
+            dest="speculative_csd_enabled",
+            action="store_true",
+            default=ServerArgs.speculative_csd_enabled,
+            help="Enable CSD-enhanced verification for speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-csd-table-path",
+            type=str,
+            default=ServerArgs.speculative_csd_table_path,
+            help="Path to the static CSD pair-frequency table loaded by the server.",
+        )
+        parser.add_argument(
+            "--speculative-csd-freq-threshold",
+            type=int,
+            default=ServerArgs.speculative_csd_freq_threshold,
+            help="Minimum pair frequency required before CSD may force-accept a rejected draft token.",
+        )
+        parser.add_argument(
+            "--speculative-csd-prob-ratio",
+            type=float,
+            default=ServerArgs.speculative_csd_prob_ratio,
+            help="Minimum target-model probability ratio p(draft) / p(target) required for CSD acceptance.",
+        )
+        parser.add_argument(
+            "--speculative-csd-dynamic-update",
+            action="store_true",
+            default=ServerArgs.speculative_csd_dynamic_update,
+            help="Enable dynamic CSD pair collection during the current server run.",
+        )
+        parser.add_argument(
+            "--speculative-csd-delta-save-path",
+            type=str,
+            default=ServerArgs.speculative_csd_delta_save_path,
+            help="Optional path to save dynamically collected CSD pair deltas.",
+        )
+        parser.add_argument(
+            "--speculative-csd-force-accept-disabled",
+            action="store_true",
+            default=ServerArgs.speculative_csd_force_accept_disabled,
+            help="Record CSD candidate pairs without changing acceptance decisions.",
         )
         parser.add_argument(
             "--speculative-token-map",
