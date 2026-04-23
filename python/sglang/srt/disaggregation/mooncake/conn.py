@@ -713,11 +713,17 @@ class MooncakeKVManager(CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
+        dst_tp_rank: Optional[int] = None,
+        dst_attn_tp_size: Optional[int] = None,
+        dst_kv_item_len: Optional[int] = None,
     ) -> int:
         """Send KV cache for a single transformer layer via RDMA.
 
         For MHA models, kv_data_ptrs layout is [K0..K_{N-1}, V0..V_{N-1}].
         For MLA models, kv_data_ptrs layout is [KV0..KV_{N-1}].
+
+        When dst_attn_tp_size is provided and differs from prefill TP,
+        head slicing is applied for MHA models (MLA is TP-invariant).
         """
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -727,7 +733,7 @@ class MooncakeKVManager(CommonKVManager):
             src_kv_ptrs, dst_kv_ptrs_pp, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
             )
-            # MLA: single combined KV per layer
+            # MLA: single combined KV per layer (TP-invariant, no head slicing)
             src_ptr = src_kv_ptrs[layer_id]
             dst_ptr = dst_kv_ptrs_pp[layer_id]
             item_len = self.kv_args.kv_item_lens[layer_id]
@@ -742,22 +748,137 @@ class MooncakeKVManager(CommonKVManager):
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
             )
-            # MHA: separate K and V arrays, each indexed by layer_id
-            k_item_len = self.kv_args.kv_item_lens[layer_id]
-            v_item_len = self.kv_args.kv_item_lens[layers_current_pp_stage + layer_id]
-            transfer_blocks = []
-            for src_ptr, dst_ptr, item_len in [
-                (src_k_ptrs[layer_id], dst_k_ptrs[layer_id], k_item_len),
-                (src_v_ptrs[layer_id], dst_v_ptrs[layer_id], v_item_len),
-            ]:
-                for prefill_index, decode_index in zip(
-                    prefill_kv_blocks, dst_kv_blocks
-                ):
-                    src_addr = src_ptr + int(prefill_index[0]) * item_len
-                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                    length = item_len * len(prefill_index)
-                    transfer_blocks.append((src_addr, dst_addr, length))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            need_head_slice = (
+                dst_attn_tp_size is not None and self.attn_tp_size != dst_attn_tp_size
+            )
+
+            if not need_head_slice:
+                # Same-TP fast path: transfer full K and V pages
+                k_item_len = self.kv_args.kv_item_lens[layer_id]
+                v_item_len = self.kv_args.kv_item_lens[
+                    layers_current_pp_stage + layer_id
+                ]
+                transfer_blocks = []
+                for src_ptr, dst_ptr, item_len in [
+                    (src_k_ptrs[layer_id], dst_k_ptrs[layer_id], k_item_len),
+                    (src_v_ptrs[layer_id], dst_v_ptrs[layer_id], v_item_len),
+                ]:
+                    for prefill_index, decode_index in zip(
+                        prefill_kv_blocks, dst_kv_blocks
+                    ):
+                        src_addr = src_ptr + int(prefill_index[0]) * item_len
+                        dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                        length = item_len * len(prefill_index)
+                        transfer_blocks.append((src_addr, dst_addr, length))
+                return self._transfer_data(mooncake_session_id, transfer_blocks)
+            else:
+                # Different-TP path: per-token head slicing for a single layer
+                return self._send_kvcache_layer_head_slice(
+                    mooncake_session_id,
+                    layer_id,
+                    prefill_kv_indices,
+                    dst_kv_indices,
+                    src_k_ptrs,
+                    src_v_ptrs,
+                    dst_k_ptrs,
+                    dst_v_ptrs,
+                    layers_current_pp_stage,
+                    dst_tp_rank,
+                    dst_attn_tp_size,
+                    dst_kv_item_len,
+                )
+
+    def _send_kvcache_layer_head_slice(
+        self,
+        mooncake_session_id: str,
+        layer_id: int,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+        src_k_ptrs: list[int],
+        src_v_ptrs: list[int],
+        dst_k_ptrs: list[int],
+        dst_v_ptrs: list[int],
+        layers_current_pp_stage: int,
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_len: int,
+    ) -> int:
+        """Per-layer head-sliced KV transfer for MHA with different TP sizes.
+
+        Mirrors the head-offset math from send_kvcache_slice but applies it
+        to a single layer, using vectorized numpy addressing.
+        """
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        src_kv_item_len = self.kv_args.kv_item_lens[0]
+        dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+        page_size = self.kv_args.page_size
+
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if total_kv_heads <= 0:
+            total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
+
+        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
+        bytes_per_head_slice = dst_kv_item_len // page_size // dst_heads_per_rank
+        src_replication = max(1, self.attn_tp_size // total_kv_heads)
+
+        if self.attn_tp_size > dst_attn_tp_size:
+            src_head_start_offset = 0
+            num_heads_to_send = src_heads_per_rank
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start_offset = (
+                unique_head_idx * src_heads_per_rank
+            ) % dst_heads_per_rank
+        else:
+            src_head_start_offset = (
+                dst_tp_rank_in_group * dst_heads_per_rank
+            ) % src_heads_per_rank
+            num_heads_to_send = dst_heads_per_rank
+            dst_head_start_offset = 0
+
+        src_head_slice_offset = src_head_start_offset * bytes_per_head_slice
+        dst_head_slice_offset = dst_head_start_offset * bytes_per_head_slice
+        heads_bytes_per_token = num_heads_to_send * bytes_per_head_slice
+
+        bytes_per_token_src = src_kv_item_len // page_size
+        bytes_per_token_dst = dst_kv_item_len // page_size
+
+        # Vectorized address computation (same pattern as send_kvcache_slice)
+        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
+        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
+        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
+        src_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_src + src_head_slice_offset
+        )
+        dst_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_dst + dst_head_slice_offset
+        )
+
+        for src_layer_ptr, dst_layer_ptr in [
+            (src_k_ptrs[layer_id], dst_k_ptrs[layer_id]),
+            (src_v_ptrs[layer_id], dst_v_ptrs[layer_id]),
+        ]:
+            src_addrs = (
+                src_layer_ptr
+                + prefill_page_indices * src_kv_item_len
+                + src_token_slot_offsets
+            ).reshape(-1)
+            dst_addrs = (
+                dst_layer_ptr
+                + decode_page_indices * dst_kv_item_len
+                + dst_token_slot_offsets
+            ).reshape(-1)
+            src_list = src_addrs.tolist()
+            if not src_list:
+                continue
+            dst_list = dst_addrs.tolist()
+            length_list = [heads_bytes_per_token] * len(src_list)
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id, src_list, dst_list, length_list
+            )
+            if ret != 0:
+                return ret
+        return 0
 
     def send_kvcache_hisparse(
         self,
@@ -1324,13 +1445,30 @@ class MooncakeKVManager(CommonKVManager):
                             # Layer-pipelined mode: sync CUDA event, send single layer
                             if kv_chunk.cuda_event is not None:
                                 kv_chunk.cuda_event.synchronize()
-                            ret = self.send_kvcache_layer(
-                                req.mooncake_session_id,
-                                kv_chunk.layer_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                            )
+                            # Detect TP mismatch for MHA head slicing
+                            if (
+                                not self.is_mla_backend
+                                and self.attn_tp_size
+                                != target_rank_registration_info.dst_attn_tp_size
+                            ):
+                                ret = self.send_kvcache_layer(
+                                    req.mooncake_session_id,
+                                    kv_chunk.layer_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                                    dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                    dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
+                                )
+                            else:
+                                ret = self.send_kvcache_layer(
+                                    req.mooncake_session_id,
+                                    kv_chunk.layer_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                )
                         elif self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
