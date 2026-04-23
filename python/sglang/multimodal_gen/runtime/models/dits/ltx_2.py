@@ -776,22 +776,6 @@ class LTX2FeedForward(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if getattr(self, "_use_ltx23_hq_legacy_ff", False):
-            in_dtype = x.dtype
-            proj_in = torch.nn.functional.linear(
-                x.float(),
-                self.proj_in.weight.float(),
-                self.proj_in.bias.float() if self.proj_in.bias is not None else None,
-            )
-            act = self.act(proj_in)
-            out = torch.nn.functional.linear(
-                act,
-                self.proj_out.weight.float(),
-                self.proj_out.bias.float()
-                if self.proj_out.bias is not None
-                else None,
-            )
-            return out.to(in_dtype)
         x, _ = self.proj_in(x)
         x = self.act(x)
         x, _ = self.proj_out(x)
@@ -1614,9 +1598,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 "audio_num_frames must be provided for RoPE coordinate generation."
             )
         perturbation_configs = kwargs.get("perturbation_configs")
-        use_ltx23_hq_legacy_ff = bool(
-            kwargs.get("_sglang_use_ltx23_hq_legacy_ff", False)
-        )
         if perturbation_configs is not None and len(perturbation_configs) != batch_size:
             raise ValueError(
                 "perturbation_configs length must match batch size, got "
@@ -1773,8 +1754,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         skip_video_self_attn_blocks = set(skip_video_self_attn_blocks or ())
         skip_audio_self_attn_blocks = set(skip_audio_self_attn_blocks or ())
         for block in self.transformer_blocks:
-            block.ff._use_ltx23_hq_legacy_ff = use_ltx23_hq_legacy_ff
-            block.audio_ff._use_ltx23_hq_legacy_ff = use_ltx23_hq_legacy_ff
             video_self_attn_perturbation_mask = None
             audio_self_attn_perturbation_mask = None
             a2v_cross_attn_perturbation_mask = None
