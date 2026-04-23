@@ -474,20 +474,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         lora_backend: BaseLoRABackend,
     ) -> None:
         super().__init__(base_layer, lora_backend)
-        partition_sizes = self.base_layer.output_partition_sizes
-        self.n_slices = len(partition_sizes)
-
-        # Build cumulative output offsets: [0, part0, part0+part1, ...]
-        offsets = [0]
-        for ps in partition_sizes:
-            offsets.append(offsets[-1] + ps)
-        self.output_offset = torch.tensor(
-            offsets,
-            dtype=torch.int32,
-            device=next(self.base_layer.parameters()).device,
-        )
-        self.output_offset_cpu = self.output_offset.cpu()
-        self.max_out_dim = max(partition_sizes)
+        self.n_slices = len(self.base_layer.output_partition_sizes)
 
     def set_lora_info(
         self,
@@ -497,6 +484,37 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
+
+        # Build cumulative output offsets from the first `lora_n_slices`
+        # base partitions. `lora_n_slices` may be smaller than self.n_slices
+        # when only a subset of partitions are LoRA'd (e.g. Mamba in_proj
+        # has 5 partitions but stacked_multiply=2), so we can't precompute
+        # these in __init__.
+        lora_n_slices = self._get_lora_n_slices()
+        if lora_n_slices <= 0 or lora_n_slices > self.n_slices:
+            raise ValueError(
+                f"Invalid LoRA slice count {lora_n_slices} for "
+                f"{self.n_slices} base output partitions."
+            )
+        partition_sizes = list(self.base_layer.output_partition_sizes[:lora_n_slices])
+        offsets = [0]
+        for ps in partition_sizes:
+            offsets.append(offsets[-1] + ps)
+        if offsets[-1] != B_buffer.shape[-2]:
+            raise ValueError(
+                f"LoRA B output dim {B_buffer.shape[-2]} does not match "
+                f"base partition prefix dim {offsets[-1]} for {lora_n_slices} slices."
+            )
+        self.output_offset = torch.tensor(
+            offsets,
+            dtype=torch.int32,
+            device=next(self.base_layer.parameters()).device,
+        )
+        self.output_offset_cpu = self.output_offset.cpu()
+        self.max_out_dim = max(partition_sizes)
+        self.use_gate_up_lora = (
+            lora_n_slices == 2 and partition_sizes[0] == partition_sizes[1]
+        )
 
     def _get_lora_n_slices(self) -> int:
         """Actual number of LoRA slices from the buffer shapes.
@@ -512,7 +530,15 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_n_slices = self._get_lora_n_slices()
-        if lora_n_slices >= 3:
+        if lora_n_slices == 2 and self.use_gate_up_lora:
+            lora_output = self.lora_backend.run_gate_up_lora(
+                x=x,
+                gate_up_lora_a=self.A_buffer,
+                gate_up_lora_b=self.B_buffer,
+                output_offset=self.output_offset,
+                base_output=base_output,
+            )
+        else:
             lora_output = self.lora_backend.run_qkv_lora(
                 x=x,
                 qkv_lora_a=self.A_buffer,
@@ -522,15 +548,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 max_qkv_out_dim=self.max_out_dim,
                 base_output=base_output,
                 n_slices=lora_n_slices,
-            )
-        else:
-            # For 2-slice (gate+up, in_proj) use the gate_up path
-            lora_output = self.lora_backend.run_gate_up_lora(
-                x=x,
-                gate_up_lora_a=self.A_buffer,
-                gate_up_lora_b=self.B_buffer,
-                output_offset=self.output_offset,
-                base_output=base_output,
             )
         return lora_output
 
@@ -753,7 +770,16 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
                 dtype=torch.int32,
                 device=B_buffer.device,
             )
+            self._output_offset_cpu = self._output_offset.cpu()
             self._max_out_dim = max(first_dim, second_dim)
+        else:
+            # Single-projection path: csgmv backend requires an explicit
+            # slice_offsets tensor of shape [0, output_dim].
+            self._output_offset = torch.tensor(
+                [0, B_buffer.shape[-2]],
+                dtype=torch.int32,
+                device=B_buffer.device,
+            )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         first_dim = self.first_output_dim
@@ -762,7 +788,10 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
             # Simple single-projection (e.g. fc1_latent_proj, fc2_latent_proj)
             lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
             lora_output = self.lora_backend.run_lora_b_sgemm(
-                lora_a_output, self.B_buffer, base_output=base_output
+                x=lora_a_output,
+                weights=self.B_buffer,
+                output_offset=self._output_offset,
+                base_output=base_output,
             )
             return lora_output
 
@@ -774,6 +803,7 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
             qkv_lora_a=self.A_buffer,
             qkv_lora_b=self.B_buffer,
             output_offset=self._output_offset,
+            output_offset_cpu=self._output_offset_cpu,
             max_qkv_out_dim=self._max_out_dim,
             base_output=base_output,
             n_slices=2,
