@@ -157,19 +157,28 @@ class LTX2SigmaPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage1"
         if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
-            latent_num_frames = (int(batch.num_frames) - 1) // int(
-                server_args.pipeline_config.vae_temporal_compression
-            ) + 1
-            latent_height = int(batch.height) // int(
-                server_args.pipeline_config.vae_scale_factor
-            )
-            latent_width = int(batch.width) // int(
-                server_args.pipeline_config.vae_scale_factor
-            )
-            batch.sigmas = build_official_ltx2_sigmas(
-                int(batch.num_inference_steps),
-                number_of_tokens=latent_num_frames * latent_height * latent_width,
-            )
+            # Resolution-aware sigma shift is only required for the HQ pipeline
+            # (which targets 1080p+ resolutions and was aligned against official
+            # LTX-2.3 HQ sigmas). Legacy one-stage and two-stage LTX-2.3 paths
+            # were baselined against the constant-anchor schedule.
+            if server_args.pipeline_class_name == "LTX2TwoStageHQPipeline":
+                latent_num_frames = (int(batch.num_frames) - 1) // int(
+                    server_args.pipeline_config.vae_temporal_compression
+                ) + 1
+                latent_height = int(batch.height) // int(
+                    server_args.pipeline_config.vae_scale_factor
+                )
+                latent_width = int(batch.width) // int(
+                    server_args.pipeline_config.vae_scale_factor
+                )
+                batch.sigmas = build_official_ltx2_sigmas(
+                    int(batch.num_inference_steps),
+                    number_of_tokens=latent_num_frames * latent_height * latent_width,
+                )
+            else:
+                batch.sigmas = build_official_ltx2_sigmas(
+                    int(batch.num_inference_steps)
+                )
         else:
             batch.sigmas = np.linspace(
                 1.0,
