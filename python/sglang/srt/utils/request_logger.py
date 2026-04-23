@@ -206,6 +206,7 @@ class RequestLogger:
                     "input_ids",
                     "input_embeds",
                     "image_data",
+                    "video_data",
                     "audio_data",
                     "lora_path",
                     "sampling_params",
@@ -218,6 +219,7 @@ class RequestLogger:
                     "input_ids",
                     "input_embeds",
                     "image_data",
+                    "video_data",
                     "audio_data",
                     "lora_path",
                 }
