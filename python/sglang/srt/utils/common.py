@@ -2338,16 +2338,18 @@ def human_readable_int(value: str) -> int:
 
 def pyspy_dump_schedulers():
     """py-spy dump on all scheduler in a local node."""
-    try:
-        pid = psutil.Process().pid
-        # Command to run py-spy with the PID
-        cmd = f"py-spy dump --native --pid {pid}"
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, check=True
-        )
-        logger.error(f"Pyspy dump for PID {pid}:\n{result.stdout}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Pyspy failed to dump PID {pid}. Error: {e.stderr}")
+    pid = psutil.Process().pid
+    for attempt, native_flag in enumerate(["--native", ""]):
+        try:
+            cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, check=True
+            )
+            logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
+            return
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
+    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
 
 
 def kill_itself_when_parent_died():

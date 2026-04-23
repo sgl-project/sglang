@@ -1,0 +1,55 @@
+---
+title: SGLang Diffusion
+description: Accelerated image and video generation with diffusion models.
+---
+SGLang Diffusion is a high-performance inference framework for image and video generation. It provides native SGLang pipelines, diffusers backend support, an OpenAI-compatible server, and an optimized kernel stack built on both precompiled `sgl-kernel` operators and JIT kernels for key inference paths.
+
+## Key Features
+
+- Broad model support across Wan, Hunyuan, Qwen-Image, FLUX, Z-Image, GLM-Image, and more
+- Fast inference with `sgl-kernel`, JIT kernels, scheduler improvements, and caching acceleration
+- Multiple interfaces: `sglang generate`, `sglang serve`, and an OpenAI-compatible API
+- Multi-platform support for NVIDIA, AMD, Intel XPU, Ascend, Apple Silicon, and Moore Threads
+
+## Quick Start
+
+```bash
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+```bash
+sglang generate --model-path Qwen/Qwen-Image \
+  --prompt "A beautiful sunset over the mountains" \
+  --save-output
+```
+
+```bash
+sglang serve --model-path Qwen/Qwen-Image --port 30010
+```
+
+## Start Here
+
+- [Installation](/docs/sglang-diffusion/installation): install SGLang Diffusion and platform dependencies
+- [Compatibility Matrix](/docs/sglang-diffusion/compatibility_matrix): check model, optimization, and component override support
+- [CLI](/docs/sglang-diffusion/api/cli): run one-off generation jobs or launch a persistent server
+- [OpenAI-Compatible API](/docs/sglang-diffusion/api/openai_api): send image and video requests to the HTTP server
+- [Attention Backends](/docs/sglang-diffusion/attention_backends): choose the best backend for your model and hardware
+- [Caching Acceleration](/docs/sglang-diffusion/caching-acceleration): use Cache-DiT or TeaCache to reduce denoising cost
+- [Quantization](/docs/sglang-diffusion/quantization): load quantized transformer checkpoints
+- [Contributing](/docs/sglang-diffusion/contributing): contribution workflow, adding new models, and CI perf baselines
+
+## Additional Documentation
+
+- [Post-Processing](/docs/sglang-diffusion/api/post_processing): frame interpolation and upscaling
+- [Performance Overview](/docs/sglang-diffusion/performance-optimization): overview of attention, caching, and profiling
+- [Environment Variables](/docs/sglang-diffusion/environment_variables): platform, caching, storage, and debugging configuration
+- [Support New Models](/docs/sglang-diffusion/support_new_models): implementation guide for new diffusion pipelines
+- [CI Performance](/docs/sglang-diffusion/ci_perf): performance baseline generation
+
+## References
+
+- [SGLang GitHub](https://github.com/sgl-project/sglang)
+- [Cache-DiT](https://github.com/vipshop/cache-dit)
+- [FastVideo](https://github.com/hao-ai-lab/FastVideo)
+- [xDiT](https://github.com/xdit-project/xDiT)
+- [Diffusers](https://github.com/huggingface/diffusers)
