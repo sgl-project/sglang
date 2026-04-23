@@ -580,13 +580,17 @@ def make_ext_v_dll(num_warps, BLOCK_DV, EXT_BLOCK_N):
 
 
 @gluon.jit
-def _nan_propagating_max(a, b):
+def _nan_propagating_maximum(a, b):
+    # Elementwise binary-op used as the combinator for `nan_propagating_max`
+    # below. Named `maximum` (not `max`) to match the triton/numpy convention:
+    # `maximum` is the elementwise binary-op, `max` is the reduction.
     return gl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
 
 
 @gluon.jit
 def nan_propagating_max(x, axis):
-    return gl.reduce(x, axis, _nan_propagating_max)
+    # Reduction along `axis` using NaN-propagating maximum as the combinator.
+    return gl.reduce(x, axis, _nan_propagating_maximum)
 
 
 @gluon.jit
@@ -1081,11 +1085,26 @@ def compute_softmax_extend_part1(acc, l_i, p, alpha, m_new):
 
 # ===-----------------------------------------------------------------------===#
 # Prefix inner loops
+#
+# Four helpers, selected by (warp count, NUM_STAGES, BLOCK_DMODEL):
+#
+#   attn_fwd_inner_prefix_pingpong_8w     -- 8-warp pingpong (warp_pipeline_stage), NS>=2, any D
+#   attn_fwd_inner_prefix_sw_pipeline_4w  -- 4-warp sw-pipeline (manual async DMA), NS>=2, D>=128
+#   attn_fwd_inner_prefix_serial_4w       -- 4-warp synchronous (no async), NS=1 or D<128
+#   attn_fwd_inner_prefix_unpipelined     -- 1-stage fallback; also the
+#                                            short-prefix path (n_full_prefix < NUM_STAGES)
+#
+# Callers always pass the full prefix length as ``seq_len_prefix``. The
+# pingpong and sw-pipeline helpers floor-align to ``BLOCK_N`` internally
+# and run a single masked-tail block (via the unpipelined helper) when
+# the full length isn't a multiple of ``BLOCK_N``. On the persistent
+# path ``seq_len_prefix`` is already aligned (split-K partitions on
+# ``BLOCK_N`` boundaries), so the tail is a runtime no-op.
 # ===-----------------------------------------------------------------------===#
 
 
 @gluon.jit
-def attn_fwd_inner_prefix_pipelined(
+def attn_fwd_inner_prefix_pingpong_8w(
     acc,
     l_i,
     m_i,
@@ -1095,7 +1114,7 @@ def attn_fwd_inner_prefix_pipelined(
     kv_indices,  #
     kv_start,
     cur_kv_head,
-    seq_len_prefix,  #
+    seq_len_prefix,  # full prefix length; helper floor-aligns to BLOCK_N for the pipelined bulk
     stride_buf_kbs,
     stride_buf_kh,  #
     stride_buf_vbs,
@@ -1129,20 +1148,33 @@ def attn_fwd_inner_prefix_pipelined(
     mma_offs_n_col: gl.constexpr,  #
     SCALAR_MASK: gl.constexpr = False,  # True: _hot DMA with scalar seq>0 mask (fewer insts, +22% geomean on persistent)
 ):
+    """8-warp pingpong prefix: warp_pipeline_stage-scheduled async DMA loop.
+
+    Runs compute ("compute*") and memory ("memory*") on alternating warp
+    groups; requires NUM_STAGES>=2 physical LDS buffers for deterministic
+    pipeline scheduling. Callers pass the full prefix length -- the helper
+    processes the BLOCK_N-aligned bulk via the pipelined loop and then
+    runs a single masked block covering any partial tail. On the
+    persistent path ``seq_len_prefix`` is already BLOCK_N-aligned, so
+    that tail branch is a runtime no-op.
+    """
     STREAMS: gl.constexpr = 2
     # warp_pipeline_stage requires >=2 physical LDS buffers. With NS=1 the
     # stage_idx collapses to 0, and iter N's DMA write to smem[0] races
     # iter N+1's relaxed read from smem[0] because membarFilter skips
     # barriers between BufferLoadToLocalOp and syncedViaAsyncWait loads.
-    # Callers wanting NS=1 must route to the non-pipelined DMA path
-    # (attn_fwd_inner_prefix_dma_simple).
+    # Callers wanting NS=1 must route to attn_fwd_inner_prefix_unpipelined
+    # (or the 4-warp sw_pipeline / serial variants).
     tl.static_assert(
         NUM_STAGES >= 2,
-        "attn_fwd_inner_prefix_pipelined requires NUM_STAGES>=2 for "
+        "attn_fwd_inner_prefix_pingpong_8w requires NUM_STAGES>=2 for "
         "determinism (warp_pipeline_stage needs multiple LDS buffers).",
     )
 
-    n_prefix_blocks = (seq_len_prefix + BLOCK_N - 1) // BLOCK_N
+    # BLOCK_N-aligned bulk: the pingpong loop only touches whole BLOCK_N
+    # slices. Any partial tail is handled after the pipeline drains.
+    aligned_prefix_len = (seq_len_prefix // BLOCK_N) * BLOCK_N
+    n_prefix_blocks = aligned_prefix_len // BLOCK_N
     k_prefix_base = K_Buffer + cur_kv_head * stride_buf_kh
     v_prefix_base = V_Buffer + cur_kv_head * stride_buf_vh
 
@@ -1360,11 +1392,60 @@ def attn_fwd_inner_prefix_pipelined(
         p_dot_tail = gl.convert_layout(p_cast, p_dot_layout)
         acc = do_mma(p_dot_tail, v_dot_tail, acc)
 
+    # Masked tail: one partial block covering [aligned_prefix_len, seq_len_prefix).
+    # Runs *after* the pingpong flush drained every async op, so smem slot 0
+    # is free to reuse via the unpipelined helper. Branch is False on the
+    # persistent path (seq_len_prefix is BLOCK_N-aligned there).
+    if seq_len_prefix > aligned_prefix_len:
+        acc, l_i, m_i = attn_fwd_inner_prefix_unpipelined(
+            acc,
+            l_i,
+            m_i,
+            q_dot,
+            K_Buffer,
+            V_Buffer,
+            kv_indices,
+            kv_start,
+            cur_kv_head,
+            seq_len_prefix,
+            stride_buf_kbs,
+            stride_buf_kh,
+            stride_buf_vbs,
+            stride_buf_vh,
+            kt_smem,
+            v_smem,
+            qk_scale,
+            LOGIT_CAP,
+            xai_temperature_reg,
+            XAI_TEMPERATURE_LEN,
+            q_abs_pos,
+            SLIDING_WINDOW_SIZE,
+            Mask,
+            mask_base_idx,
+            mask_row_stride,
+            q_extend_offs,
+            USE_CUSTOM_MASK,
+            SKIP_PREFIX_CUSTOM_MASK,
+            ENABLE_PREFIX_UNMASKED,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DV,
+            kt_async_layout,
+            v_async_layout,
+            kt_dot_layout,
+            p_dot_layout,
+            v_dot_layout,
+            mma_layout,
+            mma_offs_n_col,
+            block_start=n_prefix_blocks,
+        )
+
     return acc, l_i, m_i
 
 
 @gluon.jit
-def attn_fwd_inner_prefix_short(
+def attn_fwd_inner_prefix_unpipelined(
     acc,
     l_i,
     m_i,
@@ -1481,7 +1562,7 @@ def attn_fwd_inner_prefix_short(
 
 
 @gluon.jit
-def attn_fwd_inner_prefix_dma_simple(
+def attn_fwd_inner_prefix_sw_pipeline_4w(
     acc,
     l_i,
     m_i,
@@ -1491,7 +1572,7 @@ def attn_fwd_inner_prefix_dma_simple(
     kv_indices,  #
     kv_start,
     cur_kv_head,
-    seq_len_prefix,  #
+    seq_len_prefix,  # full prefix length; helper floor-aligns to BLOCK_N for the pipelined bulk
     stride_buf_kbs,
     stride_buf_kh,  #
     stride_buf_vbs,
@@ -1524,9 +1605,21 @@ def attn_fwd_inner_prefix_dma_simple(
     mma_layout: gl.constexpr,
     mma_offs_n_col: gl.constexpr,  #
 ):
+    """4-warp sw-pipeline prefix: manually-scheduled async DMA loop (NS>=2, D>=128).
+
+    Explicitly issues K_future / V_future loads and consumes them with
+    ``cdna4_async.wait_group`` counters (no warp_pipeline_stage). Callers
+    pass the full prefix length; the helper floor-aligns to ``BLOCK_N``
+    for the pipelined bulk and runs one masked tail block if the full
+    length isn't a multiple of ``BLOCK_N``.
+    """
     STREAMS: gl.constexpr = 2
 
-    n_prefix_blocks = (seq_len_prefix + BLOCK_N - 1) // BLOCK_N
+    # Pipelined bulk runs over whole BLOCK_N slices only; any unaligned
+    # tail is handled after the sw-pipeline drains (runtime no-op on the
+    # persistent path, since seq_len_prefix is BLOCK_N-aligned there).
+    aligned_prefix_len = (seq_len_prefix // BLOCK_N) * BLOCK_N
+    n_prefix_blocks = aligned_prefix_len // BLOCK_N
     k_prefix_base = K_Buffer + cur_kv_head * stride_buf_kh
     v_prefix_base = V_Buffer + cur_kv_head * stride_buf_vh
     kv_indices_base = kv_indices + kv_start
@@ -1725,6 +1818,53 @@ def attn_fwd_inner_prefix_dma_simple(
         p_dot_tail = gl.convert_layout(p_cast, p_dot_layout)
         acc = do_mma(p_dot_tail, v_dot_tail, acc)
 
+    # Masked tail: one partial block covering [aligned_prefix_len, seq_len_prefix).
+    # Runs after the sw-pipeline drain so smem slot 0 is free to reuse.
+    if seq_len_prefix > aligned_prefix_len:
+        acc, l_i, m_i = attn_fwd_inner_prefix_unpipelined(
+            acc,
+            l_i,
+            m_i,
+            q_dot,
+            K_Buffer,
+            V_Buffer,
+            kv_indices,
+            kv_start,
+            cur_kv_head,
+            seq_len_prefix,
+            stride_buf_kbs,
+            stride_buf_kh,
+            stride_buf_vbs,
+            stride_buf_vh,
+            kt_smem,
+            v_smem,
+            qk_scale,
+            LOGIT_CAP,
+            xai_temperature_reg,
+            XAI_TEMPERATURE_LEN,
+            q_abs_pos,
+            SLIDING_WINDOW_SIZE,
+            Mask,
+            mask_base_idx,
+            mask_row_stride,
+            q_extend_offs,
+            USE_CUSTOM_MASK,
+            SKIP_PREFIX_CUSTOM_MASK,
+            ENABLE_PREFIX_UNMASKED,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DV,
+            kt_async_layout,
+            v_async_layout,
+            kt_dot_layout,
+            p_dot_layout,
+            v_dot_layout,
+            mma_layout,
+            mma_offs_n_col,
+            block_start=n_prefix_blocks,
+        )
+
     return acc, l_i, m_i
 
 
@@ -1734,7 +1874,7 @@ def attn_fwd_inner_prefix_dma_simple(
 
 
 @gluon.jit
-def attn_fwd_inner_extend_dma(
+def attn_fwd_inner_extend_sw_pipeline_4w(
     acc,
     l_i,
     m_i,
@@ -1928,7 +2068,7 @@ def attn_fwd_inner_extend_dma(
 
 
 @gluon.jit
-def attn_fwd_inner_extend_pipelined(
+def attn_fwd_inner_extend_pingpong_8w(
     acc,
     l_i,
     m_i,
@@ -1975,11 +2115,11 @@ def attn_fwd_inner_extend_pipelined(
     # stage_idx collapses to 0, and iter N's DMA write to smem[0] races
     # iter N+1's relaxed read from smem[0] because membarFilter skips
     # barriers between BufferLoadToLocalOp and syncedViaAsyncWait loads.
-    # Callers wanting NS=1 must route to the non-pipelined DMA path
-    # (attn_fwd_inner_extend_dma).
+    # Callers wanting NS=1 must route to attn_fwd_inner_extend_unpipelined
+    # or the 4-warp sw_pipeline / serial variants.
     tl.static_assert(
         NUM_STAGES >= 2,
-        "attn_fwd_inner_extend_pipelined requires NUM_STAGES>=2 for "
+        "attn_fwd_inner_extend_pingpong_8w requires NUM_STAGES>=2 for "
         "determinism (warp_pipeline_stage needs multiple LDS buffers).",
     )
     cdna4_async.wait_group(0)
@@ -2149,7 +2289,7 @@ def attn_fwd_inner_extend_pipelined(
 
 
 @gluon.jit
-def attn_fwd_inner_prefix_serial(
+def attn_fwd_inner_prefix_serial_4w(
     acc,
     l_i,
     m_i,
@@ -2273,7 +2413,7 @@ def attn_fwd_inner_prefix_serial(
 
 
 @gluon.jit
-def attn_fwd_inner_extend_serial(
+def attn_fwd_inner_extend_serial_4w(
     acc,
     l_i,
     m_i,
@@ -2390,7 +2530,7 @@ def attn_fwd_inner_extend_serial(
 
 
 @gluon.jit
-def attn_fwd_inner_extend_short(
+def attn_fwd_inner_extend_unpipelined(
     acc,
     l_i,
     m_i,

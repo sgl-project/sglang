@@ -4,28 +4,34 @@
 """Unified Gluon extend-attention kernel for gfx950 (BF16 path).
 
 Symmetric heads only (D64, D128, D256). One @gluon.jit entry folds the
-basic (3D grid, one CTA per (seq, head, m_tile)), persistent-CTA, and
-split-K paths behind three constexpr gates:
+basic, persistent-CTA, and split-K launches behind two constexpr gates:
 
-    IS_PERSISTENT   : False = basic 3D grid, True = CTA tile-sweep loop
-    SPLIT_K         : 1     = no split, >1 = partition prefix KV range + reduce
-    TILE_MAP_MODE   : 0     = cum_tiles binary search, 1 = WCA inline linear scan
+    IS_PERSISTENT   : False = basic 3D grid (one CTA per (seq, head, m_tile)),
+                      True  = persistent CTA tile-sweep loop (WCA scheduler)
+    SPLIT_K         : 1     = no split,
+                      >1    = partition prefix KV range across CTAs + reduce
 
-When IS_PERSISTENT=False, the scheduling preamble collapses to a 1-iteration
-loop and the split-K + tile-map branches DCE away, leaving a kernel that is
-functionally identical to the pre-refactor basic kernel. When True, the
-same body services persistent / split-K / WCA launches.
+When IS_PERSISTENT=False the scheduling preamble collapses to a one-shot
+iteration and the split-K branches DCE away, leaving a kernel functionally
+identical to a plain basic launch. The persistent path walks a single
+output_tile -> (seq, head, block_m) inline scan over qo_indptr (no CPU-side
+cum_tiles tensor); split-K layers on top by striping the prefix across CTAs.
 
-The following constexprs are derived internally (not accepted as parameters):
-BLOCK_DV (=BLOCK_DMODEL), ENABLE_MASK_SPLIT/SKIP_PREFIX_CUSTOM_MASK (True),
-ASYNC_PAD_K/V (from BLOCK_DMODEL). BLOCK_DPE is not present -- DeepSeek/MLA
-will use a separate kernel.
+Internally derived (not user-tunable) constexprs: BLOCK_DV (=BLOCK_DMODEL),
+ENABLE_MASK_SPLIT / SKIP_PREFIX_CUSTOM_MASK, ASYNC_PAD_K/V. BLOCK_DPE is
+absent -- DeepSeek/MLA lives in a separate kernel.
 
-Prefix dispatch uses the "unmasked bulk + masked tail" split across all 3
-paths (dma_simple / pipelined / serial): pipelined runs on the BLOCK_N-aligned
-interior (no per-step tail masking), then a single `prefix_short` call cleans
-up the partial tail when `pfx_seq_len % BLOCK_N != 0`. This avoids the
-tail-masking overhead the naive "call pipelined on everything" pattern pays.
+Inner-loop dispatch (selected by num_warps, NUM_STAGES, D):
+    USE_PINGPONG=False, NS>=2, D>=128 -> 4-warp sw-pipeline (async DMA, pipelined)
+    USE_PINGPONG=False, else          -> 4-warp serial      (synchronous, NS=1)
+    USE_PINGPONG=True  (8 warps)      -> 8-warp pingpong    (async DMA, pipelined)
+
+The sw_pipeline_4w and pingpong_8w prefix helpers accept an unaligned
+`seq_len_prefix`; they floor-align to BLOCK_N internally, run the
+pipelined bulk on the aligned portion, and close with a single
+masked-tail block when the length isn't a clean multiple of BLOCK_N.
+Short prefixes (n_full_prefix < NUM_STAGES) bypass the pipeline and go
+straight to `attn_fwd_inner_prefix_unpipelined`, which masks every block.
 """
 
 from ._common import *  # noqa: F403
@@ -82,12 +88,9 @@ def gluon_extend_attn_fwd(
     partial_out,  #       workspace for split-K partials
     partial_lse,  #       workspace for split-K LSE
     tile_done,  #         int32 atomic counter per output tile (split-K)
-    cum_tiles_per_batch,  # int32 ptr of size batch_size+1, prefix-sum of ceil(ext_lens/BLOCK_M) (mode 0)
-    actual_batch_size,  # int32 scalar -- batch count (scan bound / binary-search upper)
+    actual_batch_size,  # int32 scalar -- batch count (upper bound for per-CTA inline scan)
     IS_PERSISTENT: gl.constexpr = False,  #
     SPLIT_K: gl.constexpr = 1,  #
-    MAX_BATCH_LOG2: gl.constexpr = 8,  # max batches supported by binary search (=256) (mode 0)
-    TILE_MAP_MODE: gl.constexpr = 0,  # 0=binary search on cum_tiles, 1=WCA inline linear scan
     PREFIX_MASK_MODE: gl.constexpr = 0,  # 0=auto (scalar on persistent, pipelined on basic), 1=force scalar_mask, 2=force pipelined
 ):
 
@@ -119,23 +122,21 @@ def gluon_extend_attn_fwd(
     offs_d = gl.arange(0, BLOCK_DMODEL, layout=offs_d_layout)
     offs_dv = gl.arange(0, BLOCK_DV, layout=offs_d_layout)
 
-    USE_SERIAL: gl.constexpr = num_warps < 8
+    # USE_PINGPONG switches between the 8-warp pingpong body (requires
+    # dedicated memory/compute warp groups and >=2 LDS stages) and the
+    # 4-warp body (serial or sw-pipeline). num_warps>=8 guarantees two
+    # warp groups for pingpong scheduling.
+    USE_PINGPONG: gl.constexpr = num_warps >= 8
     qk_scale = sm_scale * LOG2E
 
-    # Unified loop: basic = 1 iteration (exits via return), persistent = CTA tile loop
+    # Unified loop: basic = 1 iteration (exits via return), persistent = CTA tile loop.
+    # Each persistent CTA picks up work from the shared tile_idx counter; Python
+    # sized `total_valid_tiles` via a tight upper bound on sum(ceil(ext_i/BM))
+    # so we honor it directly here (no CPU sync, no extra cum_tiles tensor).
     if IS_PERSISTENT:
         cta_id = gl.program_id(0)
         tile_idx = cta_id
-        if TILE_MAP_MODE == 1:
-            # WCA: Python computed the exact total_valid_tiles via one CPU sync on
-            # qo_indptr. The kernel honors that count directly. No cum_tiles tensor
-            # read needed here -- the inline scan (below) walks qo_indptr per tile.
-            actual_total_valid_tiles = total_valid_tiles
-        else:
-            # cum_tiles mode: derive exact count from the Python-prepped prefix sum
-            # (no CPU sync; the tensor is built on device via torch.cumsum).
-            _actual_total_seq_tiles = gl.load(cum_tiles_per_batch + actual_batch_size).to(tl.int32)
-            actual_total_valid_tiles = num_heads * _actual_total_seq_tiles * SPLIT_K
+        actual_total_valid_tiles = total_valid_tiles
     else:
         tile_idx = 0
         actual_total_valid_tiles = 1  # unused in non-persistent branch
@@ -163,75 +164,44 @@ def gluon_extend_attn_fwd(
                 output_tile = tile_idx
                 k_split_id = 0
 
-            if TILE_MAP_MODE == 1:
-                # WCA: inline serial scan over qo_indptr to find the (seq, head,
-                # block_m) for this output_tile. Grid is sized to the upper bound
-                # `batch_size * num_heads * max_n_m_tiles` (sync-free launch), so
-                # some CTAs may pop an over-provisioned slot for which no seq
-                # has enough tiles. In that case the scan reaches cur_seq ==
-                # actual_batch_size with found=0 and we mark the tile invalid.
-                # Linear O(B) scan; trivial for typical serving batches (B<=32).
-                cur_seq = 0
-                cum_tiles = 0
-                found = 0
-                while (cur_seq < actual_batch_size) & (found == 0):
-                    _s_start = gl.load(qo_indptr + cur_seq)
-                    _s_end = gl.load(qo_indptr + cur_seq + 1)
-                    s_ext = (_s_end - _s_start).to(tl.int32)
-                    s_tiles = tl.maximum((s_ext + BLOCK_M - 1) // BLOCK_M, 0) * num_heads
-                    next_cum = cum_tiles + s_tiles
-                    if next_cum > output_tile:
-                        found = 1
-                    else:
-                        cum_tiles = next_cum
-                        cur_seq = cur_seq + 1
-                is_valid_tile = found == 1
-                # Clamp cur_seq to [0, actual_batch_size-1] so the subsequent
-                # qo_indptr / kv_indptr loads stay in bounds for invalid tiles.
-                cur_seq = tl.minimum(cur_seq, actual_batch_size - 1)
-                local_tile = output_tile - cum_tiles
-                seq_ext_len = (gl.load(qo_indptr + cur_seq + 1) - gl.load(qo_indptr + cur_seq)).to(tl.int32)
-                tiles_per_head = tl.maximum((seq_ext_len + BLOCK_M - 1) // BLOCK_M, 1)
-                cur_head = local_tile // tiles_per_head
-                cur_block_m = local_tile % tiles_per_head
-                cur_kv_head = cur_head // kv_group_num
+            # WCA tile map: inline linear scan over qo_indptr to resolve
+            # output_tile -> (seq, head, block_m). The grid is sized with a
+            # tight upper bound on sum(ceil(ext_i/BM)), so some CTAs may claim
+            # an over-provisioned slot for which no seq has enough tiles; the
+            # scan walks off the end with found=0 and we mark the tile invalid.
+            # Linear O(B) work, trivial for typical serving batches (B<=32).
+            cur_seq = 0
+            cum_tiles = 0
+            found = 0
+            while (cur_seq < actual_batch_size) & (found == 0):
+                _s_start = gl.load(qo_indptr + cur_seq)
+                _s_end = gl.load(qo_indptr + cur_seq + 1)
+                s_ext = (_s_end - _s_start).to(tl.int32)
+                s_tiles = tl.maximum((s_ext + BLOCK_M - 1) // BLOCK_M, 0) * num_heads
+                next_cum = cum_tiles + s_tiles
+                if next_cum > output_tile:
+                    found = 1
+                else:
+                    cum_tiles = next_cum
+                    cur_seq = cur_seq + 1
+            is_valid_tile = found == 1
+            # Clamp cur_seq to [0, actual_batch_size-1] so subsequent qo/kv
+            # indptr loads stay in bounds for invalid tiles (we mask off the
+            # work via seq_len_extend=0 below).
+            cur_seq = tl.minimum(cur_seq, actual_batch_size - 1)
+            local_tile = output_tile - cum_tiles
+            seq_ext_len = (gl.load(qo_indptr + cur_seq + 1) - gl.load(qo_indptr + cur_seq)).to(tl.int32)
+            tiles_per_head = tl.maximum((seq_ext_len + BLOCK_M - 1) // BLOCK_M, 1)
+            cur_head = local_tile // tiles_per_head
+            cur_block_m = local_tile % tiles_per_head
+            cur_kv_head = cur_head // kv_group_num
 
-                cur_seq_q_start_idx = gl.load(qo_indptr + cur_seq)
-                seq_len_extend = tl.where(is_valid_tile, seq_ext_len, 0)
+            cur_seq_q_start_idx = gl.load(qo_indptr + cur_seq)
+            seq_len_extend = tl.where(is_valid_tile, seq_ext_len, 0)
 
-                cur_seq_kv_start_idx = gl.load(kv_indptr + cur_seq)
-                seq_len_prefix_raw = (gl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx).to(tl.int32)
-                seq_len_prefix = tl.where(is_valid_tile, seq_len_prefix_raw, 0)
-            else:
-                # cum_tiles binary search: MAX_BATCH_LOG2-step static loop over
-                # the GPU-resident prefix-sum tensor, no CPU sync required.
-                cur_seq = 0
-                for _sb in gl.static_range(MAX_BATCH_LOG2):
-                    step = 1 << (MAX_BATCH_LOG2 - 1 - _sb)
-                    _mid = cur_seq + step
-                    if _mid <= actual_batch_size:
-                        _cum_mid = gl.load(cum_tiles_per_batch + _mid).to(tl.int32)
-                        if num_heads * _cum_mid <= output_tile:
-                            cur_seq = _mid
-
-                _cum_cur = gl.load(cum_tiles_per_batch + cur_seq).to(tl.int32)
-                _cum_next = gl.load(cum_tiles_per_batch + cur_seq + 1).to(tl.int32)
-                tiles_this_seq = _cum_next - _cum_cur
-                base_tile = num_heads * _cum_cur
-                local = output_tile - base_tile
-                cur_head = local // tiles_this_seq
-                cur_block_m = local % tiles_this_seq
-                cur_kv_head = cur_head // kv_group_num
-
-                cur_seq_q_start_idx = gl.load(qo_indptr + cur_seq)
-                seq_len_extend = (gl.load(qo_indptr + cur_seq + 1) - cur_seq_q_start_idx).to(tl.int32)
-
-                is_valid_tile = cur_block_m * BLOCK_M < seq_len_extend
-                seq_len_extend = tl.where(is_valid_tile, seq_len_extend, 0)
-
-                cur_seq_kv_start_idx = gl.load(kv_indptr + cur_seq)
-                seq_len_prefix_raw = (gl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx).to(tl.int32)
-                seq_len_prefix = tl.where(is_valid_tile, seq_len_prefix_raw, 0)
+            cur_seq_kv_start_idx = gl.load(kv_indptr + cur_seq)
+            seq_len_prefix_raw = (gl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx).to(tl.int32)
+            seq_len_prefix = tl.where(is_valid_tile, seq_len_prefix_raw, 0)
 
         if USE_CUSTOM_MASK:
             mask_base_idx = gl.load(MaskIndptr + cur_seq).to(tl.int64)
@@ -320,8 +290,58 @@ def gluon_extend_attn_fwd(
             if k_split_id < SPLIT_K - 1:
                 seq_len_extend = 0
 
-        if USE_SERIAL:
+        # --- Extend preamble (path-independent) ---
+        # Derive the causal/SWA-clamped extend range, decide how many full
+        # vs masked extend blocks we have, and stage the K/V extend base
+        # pointers. All three inner-loop paths (4w sw-pipeline, 4w serial,
+        # 8w pingpong) consume the same values, so compute once here.
+        if IS_CAUSAL:
+            causal_kv_end = (cur_block_m + 1) * BLOCK_M
+            effective_end = tl.minimum(seq_len_extend, causal_kv_end)
+        else:
+            effective_end = seq_len_extend
+        n_extend_blocks = (effective_end + BLOCK_N - 1) // BLOCK_N
+        if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
+            # One combined dispatch covers the whole range with per-step masking.
+            n_full_blocks = 0
+        elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
+            # Mixed SWA coverage: fall back to masked dispatch for all blocks.
+            n_full_blocks = 0
+        else:
+            # Split into unmasked bulk (fast path, no per-step mask) + masked tail.
+            partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
+            if IS_CAUSAL:
+                masked_blocks = ((BLOCK_M + BLOCK_N - 1) // BLOCK_N) + partial_block
+            else:
+                masked_blocks = partial_block
+            masked_blocks = tl.minimum(masked_blocks, n_extend_blocks)
+            n_full_blocks = n_extend_blocks - masked_blocks
+
+        # SWA fast-skip: any extend block whose last key-pos <
+        # (min_q - SWS) is fully outside the causal+SWA intersection,
+        # so skip the load and compute entirely. `masked_start` below
+        # is clamped by this value. No-op when SWA inactive.
+        if SLIDING_WINDOW_SIZE > 0 and IS_CAUSAL:
+            swa_first_useful = tl.maximum(
+                cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
+            )
+            swa_skip_n_blocks = swa_first_useful // BLOCK_N
+        else:
+            swa_skip_n_blocks = 0
+
+        k_extend_base = (
+            K_Extend + cur_seq_q_start_idx * stride_kbs + cur_kv_head * stride_kh
+        )
+        v_extend_base = (
+            V_Extend + cur_seq_q_start_idx * stride_vbs + cur_kv_head * stride_vh
+        )
+
+        if not USE_PINGPONG:
             if NUM_STAGES >= 2 and BLOCK_DMODEL >= 128:
+                # ---- 4w sw-pipeline ----
+                # 4-warp, async DMA K/V loads with NUM_STAGES prefetch depth.
+                # Requires BLOCK_DMODEL>=128 so the register bases fit the
+                # async v-layout; smaller D stays on the serial path.
                 kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
                 kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
                 v_offset_bases: gl.constexpr = make_v_offset_bases(BLOCK_DV, BLOCK_N)
@@ -353,24 +373,22 @@ def gluon_extend_attn_fwd(
 
                 q_dot = gl.convert_layout(q, q_dot_layout)
 
-                # prefix -- basic path (IS_PERSISTENT=False) splits into
-                # unmasked bulk + masked tail; persistent path keeps the
-                # original "pipelined handles tail internally" pattern to
-                # avoid the +10-15% regression on split-K re-partitioned
-                # prefixes where the last split is naturally unaligned.
+                # Prefix loop: the pipelined helper floor-aligns internally
+                # and runs a masked tail block when needed. Fall back to the
+                # unpipelined helper for short prefixes (< NUM_STAGES blocks)
+                # or when LOGIT_CAP would bloat register pressure.
                 if pfx_seq_len > 0:
-                    if IS_PERSISTENT:
-                        pfx_full_len = pfx_seq_len
-                        n_full_prefix = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
-                    else:
-                        pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
-                        n_full_prefix = pfx_seq_len // BLOCK_N
+                    n_full_prefix = pfx_seq_len // BLOCK_N
                     n_extend_est = (seq_len_extend + BLOCK_N - 1) // BLOCK_N
+                    # LOGIT_CAP gating: if the extend phase is itself large
+                    # enough to pipeline, running a pipelined prefix ahead of
+                    # it inflates LOGIT_CAP register pressure. Fall back to
+                    # the unpipelined prefix to keep occupancy.
                     use_pipe_prefix = n_full_prefix >= NUM_STAGES
                     if LOGIT_CAP > 0:
                         use_pipe_prefix = use_pipe_prefix and (n_extend_est < NUM_STAGES)
                     if use_pipe_prefix:
-                        acc, l_i, m_i = attn_fwd_inner_prefix_dma_simple(
+                        acc, l_i, m_i = attn_fwd_inner_prefix_sw_pipeline_4w(
                             acc,
                             l_i,
                             m_i,
@@ -380,7 +398,7 @@ def gluon_extend_attn_fwd(
                             kv_indices,
                             pfx_kv_start,
                             cur_kv_head,
-                            pfx_full_len,
+                            pfx_seq_len,
                             stride_buf_kbs,
                             stride_buf_kh,
                             stride_buf_vbs,
@@ -414,7 +432,7 @@ def gluon_extend_attn_fwd(
                             mma_offs_n_col,
                         )
                     else:
-                        acc, l_i, m_i = attn_fwd_inner_prefix_short(
+                        acc, l_i, m_i = attn_fwd_inner_prefix_unpipelined(
                             acc,
                             l_i,
                             m_i,
@@ -455,95 +473,29 @@ def gluon_extend_attn_fwd(
                             v_dot_layout,
                             mma_layout,
                             mma_offs_n_col,
-                        )
-                    if use_pipe_prefix and pfx_seq_len > pfx_full_len:
-                        acc, l_i, m_i = attn_fwd_inner_prefix_short(
-                            acc,
-                            l_i,
-                            m_i,
-                            q_dot,
-                            K_Buffer,
-                            V_Buffer,
-                            kv_indices,
-                            pfx_kv_start,
-                            cur_kv_head,
-                            pfx_seq_len,
-                            stride_buf_kbs,
-                            stride_buf_kh,
-                            stride_buf_vbs,
-                            stride_buf_vh,
-                            kt_smem,
-                            v_smem,
-                            qk_scale,
-                            LOGIT_CAP,
-                            xai_temperature_reg,
-                            XAI_TEMPERATURE_LEN,
-                            pfx_q_abs_pos,
-                            SLIDING_WINDOW_SIZE,
-                            Mask,
-                            pfx_mask_base,
-                            mask_row_stride,
-                            q_extend_offs,
-                            USE_CUSTOM_MASK,
-                            SKIP_PREFIX_CUSTOM_MASK,
-                            ENABLE_PREFIX_UNMASKED,
-                            BLOCK_M,
-                            BLOCK_N,
-                            BLOCK_DMODEL,
-                            BLOCK_DV,
-                            kt_async_layout,
-                            v_async_layout,
-                            kt_dot_layout,
-                            p_dot_layout,
-                            v_dot_layout,
-                            mma_layout,
-                            mma_offs_n_col,
-                            block_start=n_full_prefix,
                         )
 
                 cdna4_async.wait_group(0)
 
-                # EXTEND: per-CTA dispatch (v2 change)
-                if IS_CAUSAL:
-                    causal_kv_end = (cur_block_m + 1) * BLOCK_M
-                    effective_end = tl.minimum(seq_len_extend, causal_kv_end)
-                else:
-                    effective_end = seq_len_extend
-                n_extend_blocks = (effective_end + BLOCK_N - 1) // BLOCK_N
-                if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
-                    n_full_blocks = 0
-                elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
-                    n_full_blocks = 0
-                else:
-                    partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
-                    if IS_CAUSAL:
-                        masked_blocks = ((BLOCK_M + BLOCK_N - 1) // BLOCK_N) + partial_block
-                    else:
-                        masked_blocks = partial_block
-                    masked_blocks = tl.minimum(masked_blocks, n_extend_blocks)
-                    n_full_blocks = n_extend_blocks - masked_blocks
-
-                # SWA fast-skip: any extend block whose last key-pos <
-                # (min_q - SWS) is fully outside the causal+SWA intersection,
-                # so skip the load and compute entirely. `masked_start` below
-                # is clamped by this value. No-op when SWA inactive.
-                if SLIDING_WINDOW_SIZE > 0 and IS_CAUSAL:
-                    swa_first_useful = tl.maximum(
-                        cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
-                    )
-                    swa_skip_n_blocks = swa_first_useful // BLOCK_N
-                else:
-                    swa_skip_n_blocks = 0
-
-                k_extend_base = (
-                    K_Extend + cur_seq_q_start_idx * stride_kbs + cur_kv_head * stride_kh
-                )
-                v_extend_base = (
-                    V_Extend + cur_seq_q_start_idx * stride_vbs + cur_kv_head * stride_vh
-                )
-
+                # ===---- EXTEND hotloop (4w sw-pipeline) ---------------===
+                # Walks the causal/SWA-clamped extend KV range in two phases,
+                # using the hoisted n_full_blocks / swa_skip_n_blocks / bases:
+                #
+                #   [0, n_full_blocks)                       -- UNMASKED BULK
+                #       All rows fully in range, no per-step softmax mask.
+                #   [max(n_full_blocks, swa_skip_n_blocks),
+                #                            n_extend_blocks) -- MASKED TAIL
+                #       Causal diagonal / SWA edge / partial BLOCK_N block.
+                #
+                # Each phase has two helpers selected at compile time by the
+                # number of blocks at runtime:
+                #   >= NUM_STAGES  -> pipelined (async DMA, NS-deep prefetch)
+                #   <  NUM_STAGES  -> unpipelined (synchronous, one K/V at a time)
+                # so short runs skip the DMA setup cost.
+                #
+                # --- UNMASKED BULK ---
                 if n_full_blocks >= NUM_STAGES:
-                    acc, l_i, m_i = attn_fwd_inner_extend_dma(
+                    acc, l_i, m_i = attn_fwd_inner_extend_sw_pipeline_4w(
                         acc,
                         l_i,
                         m_i,
@@ -586,7 +538,7 @@ def gluon_extend_attn_fwd(
                         SKIP_BOUNDS_CHECK=True,
                     )
                 elif n_full_blocks > 0:
-                    acc, l_i, m_i = attn_fwd_inner_extend_short(
+                    acc, l_i, m_i = attn_fwd_inner_extend_unpipelined(
                         acc,
                         l_i,
                         m_i,
@@ -626,10 +578,17 @@ def gluon_extend_attn_fwd(
                         mma_offs_n_col,
                         mma_offs_m_row,
                     )
+                # --- MASKED TAIL ---
+                # Start at max(n_full_blocks, swa_skip_n_blocks): n_full_blocks
+                # is where the unmasked bulk ended, swa_skip_n_blocks fast-
+                # forwards past blocks that lie entirely outside the SWA
+                # window (no-op when SWA is inactive). If both are zero we
+                # mask the whole extend range, which is what NOT ENABLE_MASK_SPLIT
+                # / custom-mask / mixed-SWA paths request above.
                 masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
                 remaining_blocks = n_extend_blocks - masked_start
                 if remaining_blocks >= NUM_STAGES:
-                    acc, l_i, m_i = attn_fwd_inner_extend_dma(
+                    acc, l_i, m_i = attn_fwd_inner_extend_sw_pipeline_4w(
                         acc,
                         l_i,
                         m_i,
@@ -671,7 +630,7 @@ def gluon_extend_attn_fwd(
                         mma_offs_m_row,
                     )
                 elif remaining_blocks > 0:
-                    acc, l_i, m_i = attn_fwd_inner_extend_short(
+                    acc, l_i, m_i = attn_fwd_inner_extend_unpipelined(
                         acc,
                         l_i,
                         m_i,
@@ -713,7 +672,11 @@ def gluon_extend_attn_fwd(
                     )
 
             else:
-                # 4-warp serial path (unchanged -- already correct for any n_extend_blocks)
+                # ---- 4w serial ----
+                # 4-warp, synchronous (NUM_STAGES=1 or D<128). K/V are loaded
+                # into smem via blocked-layout gl.load, no DMA prefetch.
+                # Handles both bulk and masked tail with one helper (serial
+                # helper masks per step).
                 kt_blocked_layout: gl.constexpr = make_serial_kt_blocked(num_warps)
                 kt_serial_smem_layout: gl.constexpr = SERIAL_KT_SMEM
                 v_serial_smem_layout: gl.constexpr = SERIAL_V_SMEM
@@ -739,7 +702,7 @@ def gluon_extend_attn_fwd(
                 q_dot = q_smem.load(q_dot_layout)
 
                 if pfx_seq_len > 0:
-                    acc, l_i, m_i = attn_fwd_inner_prefix_serial(
+                    acc, l_i, m_i = attn_fwd_inner_prefix_serial_4w(
                         acc,
                         l_i,
                         m_i,
@@ -782,46 +745,17 @@ def gluon_extend_attn_fwd(
                         mma_offs_n_col,
                     )
 
-                if IS_CAUSAL:
-                    causal_kv_end = (cur_block_m + 1) * BLOCK_M
-                    effective_end = tl.minimum(seq_len_extend, causal_kv_end)
-                else:
-                    effective_end = seq_len_extend
-                n_extend_blocks = (effective_end + BLOCK_N - 1) // BLOCK_N
-                if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
-                    n_full_blocks = 0
-                elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
-                    n_full_blocks = 0
-                else:
-                    partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
-                    if IS_CAUSAL:
-                        masked_blocks = ((BLOCK_M + BLOCK_N - 1) // BLOCK_N) + partial_block
-                    else:
-                        masked_blocks = partial_block
-                    masked_blocks = tl.minimum(masked_blocks, n_extend_blocks)
-                    n_full_blocks = n_extend_blocks - masked_blocks
-
-                # SWA fast-skip: any extend block whose last key-pos <
-                # (min_q - SWS) is fully outside the causal+SWA intersection,
-                # so skip the load and compute entirely. `masked_start` below
-                # is clamped by this value. No-op when SWA inactive.
-                if SLIDING_WINDOW_SIZE > 0 and IS_CAUSAL:
-                    swa_first_useful = tl.maximum(
-                        cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
-                    )
-                    swa_skip_n_blocks = swa_first_useful // BLOCK_N
-                else:
-                    swa_skip_n_blocks = 0
-
-                k_extend_base = (
-                    K_Extend + cur_seq_q_start_idx * stride_kbs + cur_kv_head * stride_kh
-                )
-                v_extend_base = (
-                    V_Extend + cur_seq_q_start_idx * stride_vbs + cur_kv_head * stride_vh
-                )
-
+                # ===---- EXTEND hotloop (4w serial) ----------------------===
+                # Same two-phase structure as the pipelined path, but there
+                # is only one helper: attn_fwd_inner_extend_serial_4w masks
+                # per step, so we reuse it for both the unmasked bulk and
+                # the masked tail and pick the two ranges via (start, end):
+                #   [0, n_full_blocks)              -- bulk   (IS_MASKED=False)
+                #   [masked_start, n_extend_blocks) -- tail   (IS_MASKED=True)
+                # swa_skip_n_blocks fast-forwards the tail past any blocks
+                # fully outside the SWA window (no-op when SWA is inactive).
                 if n_full_blocks > 0:
-                    acc, l_i, m_i = attn_fwd_inner_extend_serial(
+                    acc, l_i, m_i = attn_fwd_inner_extend_serial_4w(
                         acc,
                         l_i,
                         m_i,
@@ -861,9 +795,10 @@ def gluon_extend_attn_fwd(
                         mma_offs_n_col,
                         mma_offs_m_row,
                     )
+                # --- MASKED TAIL (same helper, different range + IS_MASKED) ---
                 masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
                 if n_extend_blocks > masked_start:
-                    acc, l_i, m_i = attn_fwd_inner_extend_serial(
+                    acc, l_i, m_i = attn_fwd_inner_extend_serial_4w(
                         acc,
                         l_i,
                         m_i,
@@ -905,785 +840,324 @@ def gluon_extend_attn_fwd(
                     )
 
         else:
-            # 8-warp DMA path
+            # ---- 8w pingpong ----
+            # 8-warp ping-pong: 4 warps issue async DMA loads while the other
+            # 4 warps MFMA on the previous tile, alternating each iteration.
+            # Uniform across BLOCK_DMODEL={64, 128, 256}: layout factories
+            # below parametrize on BLOCK_DMODEL directly.
+            kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
+            kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+            v_offset_bases: gl.constexpr = make_v_offset_bases(BLOCK_DV, BLOCK_N)
+            v_async_layout: gl.constexpr = make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
 
-            if BLOCK_DMODEL >= 128:
-                kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
-                kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
-                v_offset_bases: gl.constexpr = make_v_offset_bases(BLOCK_DV, BLOCK_N)
-                v_async_layout: gl.constexpr = make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
+            kt_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], kt_offset_bases, [[512, ASYNC_PAD_K]])
+            v_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], v_offset_bases, [[512, ASYNC_PAD_V]])
 
-                kt_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], kt_offset_bases, [[512, ASYNC_PAD_K]])
-                v_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], v_offset_bases, [[512, ASYNC_PAD_V]])
+            kt_smem = gl.allocate_shared_memory(
+                Q_Extend.dtype.element_ty,
+                [NUM_STAGES, BLOCK_DMODEL, BLOCK_N],
+                layout=kt_async_smem_layout,
+            )
+            v_smem = gl.allocate_shared_memory(
+                Q_Extend.dtype.element_ty,
+                [NUM_STAGES, BLOCK_N, BLOCK_DV],
+                layout=v_async_smem_layout,
+            )
 
-                kt_smem = gl.allocate_shared_memory(
-                    Q_Extend.dtype.element_ty,
-                    [NUM_STAGES, BLOCK_DMODEL, BLOCK_N],
-                    layout=kt_async_smem_layout,
+            if is_valid_tile:
+                for _s in gl.static_range(NUM_STAGES):
+                    v_zero = gl.zeros(
+                        [BLOCK_N, BLOCK_DV],
+                        dtype=Q_Extend.dtype.element_ty,
+                        layout=v_async_layout,
+                    )
+                    v_smem.index(_s).store(v_zero)
+                gl.barrier()
+
+            q_dot = gl.convert_layout(q, q_dot_layout)
+
+            # Prefix dispatch (8w pingpong): always pass the full prefix
+            # length; the helper floor-aligns to BLOCK_N internally and
+            # runs a one-block masked tail when the length isn't a
+            # multiple of BLOCK_N. On the persistent path pfx_seq_len is
+            # BLOCK_N-aligned (split-K partitioning), so the tail branch
+            # is a runtime no-op.
+            n_full_prefix = pfx_seq_len // BLOCK_N
+            # PREFIX_MASK_MODE: 0=auto, 1=force scalar_mask, 2=force pipelined.
+            # Auto picks scalar_mask on persistent path (geomean 0.82x,
+            # up to 0.47x on big-ragged D=128) and pipelined on basic
+            # (scalar and pipelined are within 0.3% on basic -- bench
+            # bench_scalar_mask.py Apr 2026).
+            _use_scalar_mask: gl.constexpr = (PREFIX_MASK_MODE == 1) or (
+                PREFIX_MASK_MODE == 0 and IS_PERSISTENT
+            )
+            if n_full_prefix >= NUM_STAGES:
+                acc, l_i, m_i = attn_fwd_inner_prefix_pingpong_8w(
+                    acc,
+                    l_i,
+                    m_i,
+                    q_dot,
+                    K_Buffer,
+                    V_Buffer,
+                    kv_indices,
+                    pfx_kv_start,
+                    cur_kv_head,
+                    pfx_seq_len,
+                    stride_buf_kbs,
+                    stride_buf_kh,
+                    stride_buf_vbs,
+                    stride_buf_vh,
+                    kt_smem,
+                    v_smem,
+                    qk_scale,
+                    LOGIT_CAP,
+                    xai_temperature_reg,
+                    XAI_TEMPERATURE_LEN,
+                    pfx_q_abs_pos,
+                    SLIDING_WINDOW_SIZE,
+                    Mask,
+                    pfx_mask_base,
+                    mask_row_stride,
+                    q_extend_offs,
+                    USE_CUSTOM_MASK,
+                    SKIP_PREFIX_CUSTOM_MASK,
+                    ENABLE_PREFIX_UNMASKED,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_DMODEL,
+                    BLOCK_DV,
+                    NUM_STAGES,
+                    kt_async_layout,
+                    v_async_layout,
+                    kt_dot_layout,
+                    p_dot_layout,
+                    v_dot_layout,
+                    mma_layout,
+                    mma_offs_n_col,
+                    _use_scalar_mask,
                 )
-                v_smem = gl.allocate_shared_memory(
-                    Q_Extend.dtype.element_ty,
-                    [NUM_STAGES, BLOCK_N, BLOCK_DV],
-                    layout=v_async_smem_layout,
-                )
-
-                if is_valid_tile:
-                    for _s in gl.static_range(NUM_STAGES):
-                        v_zero = gl.zeros(
-                            [BLOCK_N, BLOCK_DV],
-                            dtype=Q_Extend.dtype.element_ty,
-                            layout=v_async_layout,
-                        )
-                        v_smem.index(_s).store(v_zero)
-                    gl.barrier()
-
-                q_dot = gl.convert_layout(q, q_dot_layout)
-
-                # prefix dispatch -- basic path splits into unmasked bulk
-                # + masked tail; persistent path uses the original straight
-                # pattern (pipelined handles tail masking internally) to
-                # avoid perf regression on split-K unaligned partitions.
-                if IS_PERSISTENT:
-                    pfx_full_len = pfx_seq_len
-                    n_full_prefix = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
-                else:
-                    pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
-                    n_full_prefix = pfx_seq_len // BLOCK_N
-                if n_full_prefix >= NUM_STAGES:
-                    # PREFIX_MASK_MODE: 0=auto, 1=force scalar_mask, 2=force pipelined.
-                    # Auto picks scalar_mask on persistent path (geomean 0.82x,
-                    # up to 0.47x on big-ragged D=128) and pipelined on basic
-                    # (scalar and pipelined are within 0.3% on basic -- bench
-                    # bench_scalar_mask.py Apr 2026).
-                    _use_scalar_mask: gl.constexpr = (PREFIX_MASK_MODE == 1) or (
-                        PREFIX_MASK_MODE == 0 and IS_PERSISTENT
-                    )
-                    acc, l_i, m_i = attn_fwd_inner_prefix_pipelined(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        K_Buffer,
-                        V_Buffer,
-                        kv_indices,
-                        pfx_kv_start,
-                        cur_kv_head,
-                        pfx_full_len,
-                        stride_buf_kbs,
-                        stride_buf_kh,
-                        stride_buf_vbs,
-                        stride_buf_vh,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        pfx_q_abs_pos,
-                        SLIDING_WINDOW_SIZE,
-                        Mask,
-                        pfx_mask_base,
-                        mask_row_stride,
-                        q_extend_offs,
-                        USE_CUSTOM_MASK,
-                        SKIP_PREFIX_CUSTOM_MASK,
-                        ENABLE_PREFIX_UNMASKED,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        _use_scalar_mask,
-                    )
-                    if pfx_seq_len > pfx_full_len:
-                        acc, l_i, m_i = attn_fwd_inner_prefix_short(
-                            acc,
-                            l_i,
-                            m_i,
-                            q_dot,
-                            K_Buffer,
-                            V_Buffer,
-                            kv_indices,
-                            pfx_kv_start,
-                            cur_kv_head,
-                            pfx_seq_len,
-                            stride_buf_kbs,
-                            stride_buf_kh,
-                            stride_buf_vbs,
-                            stride_buf_vh,
-                            kt_smem,
-                            v_smem,
-                            qk_scale,
-                            LOGIT_CAP,
-                            xai_temperature_reg,
-                            XAI_TEMPERATURE_LEN,
-                            pfx_q_abs_pos,
-                            SLIDING_WINDOW_SIZE,
-                            Mask,
-                            pfx_mask_base,
-                            mask_row_stride,
-                            q_extend_offs,
-                            USE_CUSTOM_MASK,
-                            SKIP_PREFIX_CUSTOM_MASK,
-                            ENABLE_PREFIX_UNMASKED,
-                            BLOCK_M,
-                            BLOCK_N,
-                            BLOCK_DMODEL,
-                            BLOCK_DV,
-                            kt_async_layout,
-                            v_async_layout,
-                            kt_dot_layout,
-                            p_dot_layout,
-                            v_dot_layout,
-                            mma_layout,
-                            mma_offs_n_col,
-                            block_start=n_full_prefix,
-                        )
-                elif pfx_seq_len > 0:
-                    acc, l_i, m_i = attn_fwd_inner_prefix_short(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        K_Buffer,
-                        V_Buffer,
-                        kv_indices,
-                        pfx_kv_start,
-                        cur_kv_head,
-                        pfx_seq_len,
-                        stride_buf_kbs,
-                        stride_buf_kh,
-                        stride_buf_vbs,
-                        stride_buf_vh,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        pfx_q_abs_pos,
-                        SLIDING_WINDOW_SIZE,
-                        Mask,
-                        pfx_mask_base,
-                        mask_row_stride,
-                        q_extend_offs,
-                        USE_CUSTOM_MASK,
-                        SKIP_PREFIX_CUSTOM_MASK,
-                        ENABLE_PREFIX_UNMASKED,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                    )
-
-                # EXTEND: per-CTA dispatch (v2 core change)
-                if IS_CAUSAL:
-                    causal_kv_end = (cur_block_m + 1) * BLOCK_M
-                    effective_end = tl.minimum(seq_len_extend, causal_kv_end)
-                else:
-                    effective_end = seq_len_extend
-                n_extend_blocks = (effective_end + BLOCK_N - 1) // BLOCK_N
-                if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
-                    n_full_blocks = 0
-                elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
-                    n_full_blocks = 0
-                else:
-                    partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
-                    if IS_CAUSAL:
-                        masked_blocks = ((BLOCK_M + BLOCK_N - 1) // BLOCK_N) + partial_block
-                    else:
-                        masked_blocks = partial_block
-                    masked_blocks = tl.minimum(masked_blocks, n_extend_blocks)
-                    n_full_blocks = n_extend_blocks - masked_blocks
-
-                # SWA fast-skip: any extend block whose last key-pos <
-                # (min_q - SWS) is fully outside the causal+SWA intersection,
-                # so skip the load and compute entirely. `masked_start` below
-                # is clamped by this value. No-op when SWA inactive.
-                if SLIDING_WINDOW_SIZE > 0 and IS_CAUSAL:
-                    swa_first_useful = tl.maximum(
-                        cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
-                    )
-                    swa_skip_n_blocks = swa_first_useful // BLOCK_N
-                else:
-                    swa_skip_n_blocks = 0
-
-                k_extend_base = (
-                    K_Extend + cur_seq_q_start_idx * stride_kbs + cur_kv_head * stride_kh
-                )
-                v_extend_base = (
-                    V_Extend + cur_seq_q_start_idx * stride_vbs + cur_kv_head * stride_vh
+            elif pfx_seq_len > 0:
+                acc, l_i, m_i = attn_fwd_inner_prefix_unpipelined(
+                    acc,
+                    l_i,
+                    m_i,
+                    q_dot,
+                    K_Buffer,
+                    V_Buffer,
+                    kv_indices,
+                    pfx_kv_start,
+                    cur_kv_head,
+                    pfx_seq_len,
+                    stride_buf_kbs,
+                    stride_buf_kh,
+                    stride_buf_vbs,
+                    stride_buf_vh,
+                    kt_smem,
+                    v_smem,
+                    qk_scale,
+                    LOGIT_CAP,
+                    xai_temperature_reg,
+                    XAI_TEMPERATURE_LEN,
+                    pfx_q_abs_pos,
+                    SLIDING_WINDOW_SIZE,
+                    Mask,
+                    pfx_mask_base,
+                    mask_row_stride,
+                    q_extend_offs,
+                    USE_CUSTOM_MASK,
+                    SKIP_PREFIX_CUSTOM_MASK,
+                    ENABLE_PREFIX_UNMASKED,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_DMODEL,
+                    BLOCK_DV,
+                    kt_async_layout,
+                    v_async_layout,
+                    kt_dot_layout,
+                    p_dot_layout,
+                    v_dot_layout,
+                    mma_layout,
+                    mma_offs_n_col,
                 )
 
-                if n_full_blocks >= NUM_STAGES:
-                    acc, l_i, m_i = attn_fwd_inner_extend_pipelined(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        k_extend_base,
-                        v_extend_base,
-                        cur_block_m,
-                        seq_len_extend,
-                        stride_kbs,
-                        stride_vbs,
-                        0,
-                        n_full_blocks,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        SLIDING_WINDOW_SIZE,
-                        IS_CAUSAL,
-                        Mask,
-                        mask_base_idx,
-                        mask_row_stride,
-                        mask_kv_col_offset,
-                        USE_CUSTOM_MASK,
-                        False,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
-                    )
-                elif n_full_blocks > 0:
-                    acc, l_i, m_i = attn_fwd_inner_extend_short(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        k_extend_base,
-                        v_extend_base,
-                        cur_block_m,
-                        seq_len_extend,
-                        stride_kbs,
-                        stride_vbs,
-                        0,
-                        n_full_blocks,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        SLIDING_WINDOW_SIZE,
-                        IS_CAUSAL,
-                        Mask,
-                        mask_base_idx,
-                        mask_row_stride,
-                        mask_kv_col_offset,
-                        USE_CUSTOM_MASK,
-                        False,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
-                    )
-                masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
-                remaining_blocks = n_extend_blocks - masked_start
-                if remaining_blocks >= NUM_STAGES:
-                    acc, l_i, m_i = attn_fwd_inner_extend_pipelined(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        k_extend_base,
-                        v_extend_base,
-                        cur_block_m,
-                        seq_len_extend,
-                        stride_kbs,
-                        stride_vbs,
-                        masked_start,
-                        n_extend_blocks,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        SLIDING_WINDOW_SIZE,
-                        IS_CAUSAL,
-                        Mask,
-                        mask_base_idx,
-                        mask_row_stride,
-                        mask_kv_col_offset,
-                        USE_CUSTOM_MASK,
-                        True,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
-                    )
-                elif remaining_blocks > 0:
-                    acc, l_i, m_i = attn_fwd_inner_extend_short(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        k_extend_base,
-                        v_extend_base,
-                        cur_block_m,
-                        seq_len_extend,
-                        stride_kbs,
-                        stride_vbs,
-                        masked_start,
-                        n_extend_blocks,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        SLIDING_WINDOW_SIZE,
-                        IS_CAUSAL,
-                        Mask,
-                        mask_base_idx,
-                        mask_row_stride,
-                        mask_kv_col_offset,
-                        USE_CUSTOM_MASK,
-                        True,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
-                    )
-
-            else:
-                # 8-warp BLOCK_DMODEL < 128
-                kt_offset_bases: gl.constexpr = make_kt_offset_bases(BLOCK_DMODEL, BLOCK_N)
-                kt_async_layout: gl.constexpr = make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
-                v_offset_bases: gl.constexpr = make_v_offset_bases(BLOCK_DV, BLOCK_N)
-                v_async_layout: gl.constexpr = make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
-
-                kt_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_DMODEL, BLOCK_N], kt_offset_bases, [[512, ASYNC_PAD_K]])
-                v_async_smem_layout: gl.constexpr = make_padded_smem([BLOCK_N, BLOCK_DV], v_offset_bases, [[512, ASYNC_PAD_V]])
-
-                kt_smem = gl.allocate_shared_memory(
-                    Q_Extend.dtype.element_ty,
-                    [NUM_STAGES, BLOCK_DMODEL, BLOCK_N],
-                    layout=kt_async_smem_layout,
+            # ===---- EXTEND hotloop (8w pingpong) -----------------------===
+            # Same two-phase layout as the 4w sw-pipeline path:
+            #   [0, n_full_blocks)                       -- UNMASKED BULK
+            #   [max(n_full_blocks, swa_skip_n_blocks),
+            #                            n_extend_blocks) -- MASKED TAIL
+            # Each phase picks pingpong_8w (>=NUM_STAGES) or unpipelined
+            # (<NUM_STAGES), so short runs skip the async DMA setup cost.
+            #
+            # --- UNMASKED BULK ---
+            if n_full_blocks >= NUM_STAGES:
+                acc, l_i, m_i = attn_fwd_inner_extend_pingpong_8w(
+                    acc,
+                    l_i,
+                    m_i,
+                    q_dot,
+                    k_extend_base,
+                    v_extend_base,
+                    cur_block_m,
+                    seq_len_extend,
+                    stride_kbs,
+                    stride_vbs,
+                    0,
+                    n_full_blocks,
+                    kt_smem,
+                    v_smem,
+                    qk_scale,
+                    LOGIT_CAP,
+                    xai_temperature_reg,
+                    XAI_TEMPERATURE_LEN,
+                    SLIDING_WINDOW_SIZE,
+                    IS_CAUSAL,
+                    Mask,
+                    mask_base_idx,
+                    mask_row_stride,
+                    mask_kv_col_offset,
+                    USE_CUSTOM_MASK,
+                    False,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_DMODEL,
+                    BLOCK_DV,
+                    NUM_STAGES,
+                    kt_async_layout,
+                    v_async_layout,
+                    kt_dot_layout,
+                    p_dot_layout,
+                    v_dot_layout,
+                    mma_layout,
+                    mma_offs_n_col,
+                    mma_offs_m_row,
                 )
-                v_smem = gl.allocate_shared_memory(
-                    Q_Extend.dtype.element_ty,
-                    [NUM_STAGES, BLOCK_N, BLOCK_DV],
-                    layout=v_async_smem_layout,
+            elif n_full_blocks > 0:
+                acc, l_i, m_i = attn_fwd_inner_extend_unpipelined(
+                    acc,
+                    l_i,
+                    m_i,
+                    q_dot,
+                    k_extend_base,
+                    v_extend_base,
+                    cur_block_m,
+                    seq_len_extend,
+                    stride_kbs,
+                    stride_vbs,
+                    0,
+                    n_full_blocks,
+                    kt_smem,
+                    v_smem,
+                    qk_scale,
+                    LOGIT_CAP,
+                    xai_temperature_reg,
+                    XAI_TEMPERATURE_LEN,
+                    SLIDING_WINDOW_SIZE,
+                    IS_CAUSAL,
+                    Mask,
+                    mask_base_idx,
+                    mask_row_stride,
+                    mask_kv_col_offset,
+                    USE_CUSTOM_MASK,
+                    False,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_DMODEL,
+                    BLOCK_DV,
+                    kt_async_layout,
+                    v_async_layout,
+                    kt_dot_layout,
+                    p_dot_layout,
+                    v_dot_layout,
+                    mma_layout,
+                    mma_offs_n_col,
+                    mma_offs_m_row,
                 )
-
-                if is_valid_tile:
-                    for _s in gl.static_range(NUM_STAGES):
-                        v_zero = gl.zeros(
-                            [BLOCK_N, BLOCK_DV],
-                            dtype=Q_Extend.dtype.element_ty,
-                            layout=v_async_layout,
-                        )
-                        v_smem.index(_s).store(v_zero)
-                    gl.barrier()
-
-                q_dot = gl.convert_layout(q, q_dot_layout)
-
-                # prefix -- basic path splits into unmasked bulk + masked
-                # tail; persistent path uses the straight pattern (see
-                # other sites).
-                if IS_PERSISTENT:
-                    pfx_full_len = pfx_seq_len
-                    n_full_prefix = (pfx_seq_len + BLOCK_N - 1) // BLOCK_N
-                else:
-                    pfx_full_len = (pfx_seq_len // BLOCK_N) * BLOCK_N
-                    n_full_prefix = pfx_seq_len // BLOCK_N
-                if n_full_prefix >= NUM_STAGES:
-                    _use_scalar_mask: gl.constexpr = (PREFIX_MASK_MODE == 1) or (
-                        PREFIX_MASK_MODE == 0 and IS_PERSISTENT
-                    )
-                    acc, l_i, m_i = attn_fwd_inner_prefix_pipelined(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        K_Buffer,
-                        V_Buffer,
-                        kv_indices,
-                        pfx_kv_start,
-                        cur_kv_head,
-                        pfx_full_len,
-                        stride_buf_kbs,
-                        stride_buf_kh,
-                        stride_buf_vbs,
-                        stride_buf_vh,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        pfx_q_abs_pos,
-                        SLIDING_WINDOW_SIZE,
-                        Mask,
-                        pfx_mask_base,
-                        mask_row_stride,
-                        q_extend_offs,
-                        USE_CUSTOM_MASK,
-                        SKIP_PREFIX_CUSTOM_MASK,
-                        ENABLE_PREFIX_UNMASKED,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        _use_scalar_mask,
-                    )
-                elif pfx_seq_len > 0:
-                    acc, l_i, m_i = attn_fwd_inner_prefix_short(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        K_Buffer,
-                        V_Buffer,
-                        kv_indices,
-                        pfx_kv_start,
-                        cur_kv_head,
-                        pfx_seq_len,
-                        stride_buf_kbs,
-                        stride_buf_kh,
-                        stride_buf_vbs,
-                        stride_buf_vh,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        pfx_q_abs_pos,
-                        SLIDING_WINDOW_SIZE,
-                        Mask,
-                        pfx_mask_base,
-                        mask_row_stride,
-                        q_extend_offs,
-                        USE_CUSTOM_MASK,
-                        SKIP_PREFIX_CUSTOM_MASK,
-                        ENABLE_PREFIX_UNMASKED,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                    )
-                if n_full_prefix >= NUM_STAGES and pfx_seq_len > pfx_full_len:
-                    acc, l_i, m_i = attn_fwd_inner_prefix_short(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        K_Buffer,
-                        V_Buffer,
-                        kv_indices,
-                        pfx_kv_start,
-                        cur_kv_head,
-                        pfx_seq_len,
-                        stride_buf_kbs,
-                        stride_buf_kh,
-                        stride_buf_vbs,
-                        stride_buf_vh,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        pfx_q_abs_pos,
-                        SLIDING_WINDOW_SIZE,
-                        Mask,
-                        pfx_mask_base,
-                        mask_row_stride,
-                        q_extend_offs,
-                        USE_CUSTOM_MASK,
-                        SKIP_PREFIX_CUSTOM_MASK,
-                        ENABLE_PREFIX_UNMASKED,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        block_start=n_full_prefix,
-                    )
-
-                # EXTEND: per-CTA dispatch (v2 core change)
-                if IS_CAUSAL:
-                    causal_kv_end = (cur_block_m + 1) * BLOCK_M
-                    effective_end = tl.minimum(seq_len_extend, causal_kv_end)
-                else:
-                    effective_end = seq_len_extend
-                n_extend_blocks = (effective_end + BLOCK_N - 1) // BLOCK_N
-                if (not ENABLE_MASK_SPLIT) or USE_CUSTOM_MASK:
-                    n_full_blocks = 0
-                elif SLIDING_WINDOW_SIZE > 0 and effective_end > SLIDING_WINDOW_SIZE:
-                    n_full_blocks = 0
-                else:
-                    partial_block = ((effective_end % BLOCK_N) != 0).to(tl.int32)
-                    if IS_CAUSAL:
-                        masked_blocks = ((BLOCK_M + BLOCK_N - 1) // BLOCK_N) + partial_block
-                    else:
-                        masked_blocks = partial_block
-                    masked_blocks = tl.minimum(masked_blocks, n_extend_blocks)
-                    n_full_blocks = n_extend_blocks - masked_blocks
-
-                # SWA fast-skip: any extend block whose last key-pos <
-                # (min_q - SWS) is fully outside the causal+SWA intersection,
-                # so skip the load and compute entirely. `masked_start` below
-                # is clamped by this value. No-op when SWA inactive.
-                if SLIDING_WINDOW_SIZE > 0 and IS_CAUSAL:
-                    swa_first_useful = tl.maximum(
-                        cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
-                    )
-                    swa_skip_n_blocks = swa_first_useful // BLOCK_N
-                else:
-                    swa_skip_n_blocks = 0
-
-                k_extend_base = (
-                    K_Extend + cur_seq_q_start_idx * stride_kbs + cur_kv_head * stride_kh
+            # --- MASKED TAIL ---
+            masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
+            remaining_blocks = n_extend_blocks - masked_start
+            if remaining_blocks >= NUM_STAGES:
+                acc, l_i, m_i = attn_fwd_inner_extend_pingpong_8w(
+                    acc,
+                    l_i,
+                    m_i,
+                    q_dot,
+                    k_extend_base,
+                    v_extend_base,
+                    cur_block_m,
+                    seq_len_extend,
+                    stride_kbs,
+                    stride_vbs,
+                    masked_start,
+                    n_extend_blocks,
+                    kt_smem,
+                    v_smem,
+                    qk_scale,
+                    LOGIT_CAP,
+                    xai_temperature_reg,
+                    XAI_TEMPERATURE_LEN,
+                    SLIDING_WINDOW_SIZE,
+                    IS_CAUSAL,
+                    Mask,
+                    mask_base_idx,
+                    mask_row_stride,
+                    mask_kv_col_offset,
+                    USE_CUSTOM_MASK,
+                    True,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_DMODEL,
+                    BLOCK_DV,
+                    NUM_STAGES,
+                    kt_async_layout,
+                    v_async_layout,
+                    kt_dot_layout,
+                    p_dot_layout,
+                    v_dot_layout,
+                    mma_layout,
+                    mma_offs_n_col,
+                    mma_offs_m_row,
                 )
-                v_extend_base = (
-                    V_Extend + cur_seq_q_start_idx * stride_vbs + cur_kv_head * stride_vh
+            elif remaining_blocks > 0:
+                acc, l_i, m_i = attn_fwd_inner_extend_unpipelined(
+                    acc,
+                    l_i,
+                    m_i,
+                    q_dot,
+                    k_extend_base,
+                    v_extend_base,
+                    cur_block_m,
+                    seq_len_extend,
+                    stride_kbs,
+                    stride_vbs,
+                    masked_start,
+                    n_extend_blocks,
+                    kt_smem,
+                    v_smem,
+                    qk_scale,
+                    LOGIT_CAP,
+                    xai_temperature_reg,
+                    XAI_TEMPERATURE_LEN,
+                    SLIDING_WINDOW_SIZE,
+                    IS_CAUSAL,
+                    Mask,
+                    mask_base_idx,
+                    mask_row_stride,
+                    mask_kv_col_offset,
+                    USE_CUSTOM_MASK,
+                    True,
+                    BLOCK_M,
+                    BLOCK_N,
+                    BLOCK_DMODEL,
+                    BLOCK_DV,
+                    kt_async_layout,
+                    v_async_layout,
+                    kt_dot_layout,
+                    p_dot_layout,
+                    v_dot_layout,
+                    mma_layout,
+                    mma_offs_n_col,
+                    mma_offs_m_row,
                 )
-
-                if n_full_blocks >= NUM_STAGES:
-                    acc, l_i, m_i = attn_fwd_inner_extend_pipelined(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        k_extend_base,
-                        v_extend_base,
-                        cur_block_m,
-                        seq_len_extend,
-                        stride_kbs,
-                        stride_vbs,
-                        0,
-                        n_full_blocks,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        SLIDING_WINDOW_SIZE,
-                        IS_CAUSAL,
-                        Mask,
-                        mask_base_idx,
-                        mask_row_stride,
-                        mask_kv_col_offset,
-                        USE_CUSTOM_MASK,
-                        False,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
-                    )
-                elif n_full_blocks > 0:
-                    acc, l_i, m_i = attn_fwd_inner_extend_short(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        k_extend_base,
-                        v_extend_base,
-                        cur_block_m,
-                        seq_len_extend,
-                        stride_kbs,
-                        stride_vbs,
-                        0,
-                        n_full_blocks,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        SLIDING_WINDOW_SIZE,
-                        IS_CAUSAL,
-                        Mask,
-                        mask_base_idx,
-                        mask_row_stride,
-                        mask_kv_col_offset,
-                        USE_CUSTOM_MASK,
-                        False,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
-                    )
-                masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
-                remaining_blocks = n_extend_blocks - masked_start
-                if remaining_blocks >= NUM_STAGES:
-                    acc, l_i, m_i = attn_fwd_inner_extend_pipelined(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        k_extend_base,
-                        v_extend_base,
-                        cur_block_m,
-                        seq_len_extend,
-                        stride_kbs,
-                        stride_vbs,
-                        masked_start,
-                        n_extend_blocks,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        SLIDING_WINDOW_SIZE,
-                        IS_CAUSAL,
-                        Mask,
-                        mask_base_idx,
-                        mask_row_stride,
-                        mask_kv_col_offset,
-                        USE_CUSTOM_MASK,
-                        True,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        NUM_STAGES,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
-                    )
-                elif remaining_blocks > 0:
-                    acc, l_i, m_i = attn_fwd_inner_extend_short(
-                        acc,
-                        l_i,
-                        m_i,
-                        q_dot,
-                        k_extend_base,
-                        v_extend_base,
-                        cur_block_m,
-                        seq_len_extend,
-                        stride_kbs,
-                        stride_vbs,
-                        masked_start,
-                        n_extend_blocks,
-                        kt_smem,
-                        v_smem,
-                        qk_scale,
-                        LOGIT_CAP,
-                        xai_temperature_reg,
-                        XAI_TEMPERATURE_LEN,
-                        SLIDING_WINDOW_SIZE,
-                        IS_CAUSAL,
-                        Mask,
-                        mask_base_idx,
-                        mask_row_stride,
-                        mask_kv_col_offset,
-                        USE_CUSTOM_MASK,
-                        True,
-                        BLOCK_M,
-                        BLOCK_N,
-                        BLOCK_DMODEL,
-                        BLOCK_DV,
-                        kt_async_layout,
-                        v_async_layout,
-                        kt_dot_layout,
-                        p_dot_layout,
-                        v_dot_layout,
-                        mma_layout,
-                        mma_offs_n_col,
-                        mma_offs_m_row,
-                    )
-
 
         # sinks
         if HAS_SINK:

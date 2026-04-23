@@ -13,9 +13,10 @@ FP8 basic, FP8 WCA persistent). All kernels are launched via the standard
 Triton ``kernel[grid](...)`` JIT entry point. Triton's own compile cache
 avoids recompilation on warm launches; a small shape-keyed tile-config
 cache avoids rerunning the heuristic tree on every call, and WCA metadata
-(``cum_tiles_per_batch``, split-K workspace, dummy mask buffers) is
-computed once and reused across the attention layers of a single forward
-pass.
+(split-K workspace, dummy mask buffers) is computed once and reused across
+the attention layers of a single forward pass. The persistent kernel walks
+``qo_indptr`` directly via an inline O(B) scan to resolve
+``tile_idx -> (seq, head, block_m)`` -- no cumsum tensor is needed.
 
 Env vars
 --------
@@ -62,7 +63,6 @@ _dummy_sinks = None
 _dummy_partial_out = None
 _dummy_partial_lse = None
 _dummy_tile_done = None
-_dummy_cum_tiles = None
 
 _LOGGED_FP8_KV_MODE = False
 logger = logging.getLogger(__name__)
@@ -72,7 +72,7 @@ def _ensure_dummies(device, mi_size, wkvo_size):
     """Lazy-init module-level singleton dummy tensors on first use."""
     global _dummy_cm, _dummy_mi, _dummy_mi_size, _dummy_wkvo, _dummy_wkvo_size
     global _dummy_sinks
-    global _dummy_partial_out, _dummy_partial_lse, _dummy_tile_done, _dummy_cum_tiles
+    global _dummy_partial_out, _dummy_partial_lse, _dummy_tile_done
     if _dummy_cm is None:
         _dummy_cm = torch.empty(0, dtype=torch.uint8, device=device)
     if _dummy_mi is None or _dummy_mi_size < mi_size:
@@ -89,8 +89,6 @@ def _ensure_dummies(device, mi_size, wkvo_size):
         _dummy_partial_lse = torch.empty(1, dtype=torch.float32, device=device)
     if _dummy_tile_done is None:
         _dummy_tile_done = torch.zeros(1, dtype=torch.int32, device=device)
-    if _dummy_cum_tiles is None:
-        _dummy_cum_tiles = torch.zeros(1, dtype=torch.int32, device=device)
 
 
 # User-facing safety rail: route FP8 KV through the BF16 kernels (pays a
@@ -110,29 +108,6 @@ _cached_num_xcds = {}
 # tile-scheduling and split-K workspace management. Kernels are launched via
 # standard ``kernel[grid](...)``; Triton's own compile cache absorbs the JIT
 # cost on warm calls.
-
-
-# MAX_BATCH_LOG2=8 supports batch_size up to 256 with 8 static iterations
-# of per-tile binary search; fixed as constexpr so all launches share a
-# single compiled kernel.
-_DEFAULT_MAX_BATCH_LOG2 = 8
-
-
-# Tile-map mode override for bench/test scripts: 0 = cum_tiles binary
-# search, 1 = WCA inline linear scan. None restores per-call defaults.
-_GLOBAL_TILE_MAP_MODE = None
-
-
-def set_global_tile_map_mode(mode):
-    """Override the persistent TILE_MAP_MODE constexpr process-wide."""
-    global _GLOBAL_TILE_MAP_MODE
-    _GLOBAL_TILE_MAP_MODE = None if mode is None else int(mode)
-
-
-def _effective_tile_map_mode(explicit: int) -> int:
-    if _GLOBAL_TILE_MAP_MODE is not None:
-        return _GLOBAL_TILE_MAP_MODE
-    return int(explicit)
 
 
 _QK_SPLIT_CACHE = {}
@@ -209,6 +184,16 @@ def _select_k_splits(total_output_tiles, num_CUs, min_prefix_blocks=4):
     Goal: fill the GPU when there are fewer output tiles than CUs.
     Each split multiplies the grid by SPLIT_K, so we pick the smallest
     power-of-two that brings CU utilization above ~75%.
+
+    Example on MI350 (num_CUs=256, long-prefix decode batch):
+        B=1, pfx=64k, ext=1, qH=32, kvH=8, BLOCK_M=64
+        output tiles = B * qH * ceil(ext / BLOCK_M) = 1 * 32 * 1 = 32
+        32 < 256, so return the smallest sk in {2, 4, 8} with
+        32 * sk >= 256. 32*8 = 256 -> SPLIT_K = 8. Each of the 32
+        output tiles is duplicated 8 ways across the prefix KV range,
+        giving 32*8 = 256 CTAs, one per CU. The partial outputs are
+        later reduced on the winning CTA (see the SPLIT_K epilogue
+        inside the kernel).
     """
     if total_output_tiles >= num_CUs:
         return 1
@@ -231,54 +216,6 @@ def _ensure_splitk_dummy(device):
 _splitk_ws_out = None
 _splitk_ws_lse = None
 _splitk_ws_done = None
-
-_cum_tiles_buf = None
-_cum_tiles_cap = 0
-
-
-# Cross-layer reuse: when the same ``qo_indptr`` object drives all 32
-# attention layers of one forward pass, the cum_tiles cumsum runs once
-# and subsequent calls with the same (data_ptr, BLOCK_M, batch_size) hit
-# the cache. Keyed on data_ptr rather than id() because PyTorch may alias
-# the same storage under a new Tensor wrapper.
-_cum_tiles_cache_key = None
-
-
-def _ensure_cum_tiles(qo_indptr, BLOCK_M, num_heads, batch_size):
-    """Compute cum_tiles_per_batch = cumsum of ceil(ext_i / BM) on-device.
-
-    The kernel's persistent path binary-searches this buffer to map
-    ``tile_idx -> (seq, head, block_m)``, enabling dense packing of valid
-    tiles across CTAs regardless of batch heterogeneity.
-    """
-    global _cum_tiles_buf, _cum_tiles_cap, _cum_tiles_cache_key
-    device = qo_indptr.device
-    needed = batch_size + 1
-    if (
-        _cum_tiles_buf is None
-        or _cum_tiles_buf.device != device
-        or _cum_tiles_cap < needed
-    ):
-        _cum_tiles_cap = max(needed, 256)
-        _cum_tiles_buf = torch.zeros(_cum_tiles_cap, dtype=torch.int32, device=device)
-        _cum_tiles_cache_key = None
-    cum_tiles = _cum_tiles_buf[:needed]
-    _key = (qo_indptr.data_ptr(), BLOCK_M, batch_size)
-    if _cum_tiles_cache_key == _key:
-        return cum_tiles
-    ext_lens = (qo_indptr[1:batch_size + 1] - qo_indptr[:batch_size]).to(torch.int32)
-    n_tiles_per_batch = (ext_lens + (BLOCK_M - 1)) // BLOCK_M
-    cum_tiles[0] = 0
-    torch.cumsum(n_tiles_per_batch, 0, dtype=torch.int32, out=cum_tiles[1:])
-    _cum_tiles_cache_key = _key
-    return cum_tiles
-
-
-def _wca_total_seq_tiles(qo_indptr, BLOCK_M, batch_size):
-    """Exact ``sum(ceil(ext/BM))`` across seqs. Costs one CPU sync."""
-    ext_lens = qo_indptr[1:batch_size + 1] - qo_indptr[:batch_size]
-    n_tiles = (ext_lens + (BLOCK_M - 1)) // BLOCK_M
-    return int(n_tiles.sum().item())
 
 
 def _ensure_splitk_workspace(total_splits, total_output_tiles, BLOCK_M, BLOCK_DV, device):
@@ -374,7 +311,7 @@ def _launch_persistent(
         min_len_extend = max_len_extend
     head_num = q_extend.shape[1]
 
-    # Tile-config auto-select. Three regimes on top of the D>=256 and
+    # Tile-config auto-select. Two regimes on top of the D>=256 and
     # default BM=128 NW=8 paths:
     #   * small-tile (BM=64 NW=4 NS=2): per-seq work is small or the
     #     batch is ragged enough that BM=128 wastes compute on masked
@@ -382,9 +319,6 @@ def _launch_persistent(
     #     with a substantial prefix -- each tile iterates the full
     #     per-seq prefix regardless of BM, so larger BM amortizes the
     #     scan over more query rows.
-    #   * bsearch tile map (TILE_MAP_MODE=0): Lq=128 full-batch prefill
-    #     (B>=16, max_ext>=2048, avg_ext>=512) where the tighter
-    #     bsearch schedule beats inline scan.
     _het_ratio = max_len_extend / max(min_len_extend, 1)
     _total_pfx_est = (
         total_prefix_len if total_prefix_len is not None
@@ -408,12 +342,6 @@ def _launch_persistent(
             or (min_len_extend < 64 and max_len_extend <= 512 and batch_size <= 4)
             or _lq128_ext_dominated
         )
-    )
-    _use_bsearch = (
-        Lq == 128
-        and batch_size >= 16
-        and max_len_extend >= 2048
-        and _avg_ext >= 512
     )
 
     if BLOCK_DMODEL >= 256:
@@ -456,22 +384,12 @@ def _launch_persistent(
 
     # Tight sync-free upper bound on sum(ceil(ext_i / BM)). For
     # heterogeneous batches this is 3-4x smaller than the loose bound
-    # ``batch * ceil(max_ext/BM)`` -- cuts WCA's empty-slot scans
-    # proportionally without a .item() sync.
+    # ``batch * ceil(max_ext/BM)`` -- the kernel's inline WCA scan
+    # tolerates the over-provisioned slots with a cheap validity check.
     total_extend_rows = q_extend.shape[0]
-    total_output_tiles_tight = (
+    total_output_tiles = (
         (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
     ) * head_num
-
-    TILE_MAP_MODE = _effective_tile_map_mode(0 if _use_bsearch else 1)
-    if TILE_MAP_MODE == 1:
-        # WCA inline-scan: tolerates empty slots; pass the tight bound.
-        total_output_tiles = total_output_tiles_tight
-        cum_tiles_per_batch = _ensure_splitk_dummy(device)
-    else:
-        # cum_tiles path: exact GPU-computed per-seq counts.
-        total_output_tiles = total_output_tiles_tight
-        cum_tiles_per_batch = _ensure_cum_tiles(qo_indptr, BLOCK_M, head_num, batch_size)
 
     num_CUs = _get_num_CUs(device)
 
@@ -553,12 +471,9 @@ def _launch_persistent(
         partial_out=partial_out,
         partial_lse=partial_lse,
         tile_done=tile_done,
-        cum_tiles_per_batch=cum_tiles_per_batch,
         actual_batch_size=batch_size,
         IS_PERSISTENT=True,
         SPLIT_K=SPLIT_K,
-        MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
-        TILE_MAP_MODE=TILE_MAP_MODE,
         PREFIX_MASK_MODE=0,
         num_warps=num_warps,
         num_stages=1,
@@ -649,9 +564,6 @@ def _launch_splitk(
         (q_extend.shape[0] + batch_size * (BLOCK_M - 1)) // BLOCK_M
     ) * head_num
 
-    TILE_MAP_MODE = _effective_tile_map_mode(1)
-    cum_tiles_per_batch = _ensure_splitk_dummy(device)
-
     total_splits = total_output_tiles * SPLIT_K
     partial_out, partial_lse, tile_done = _ensure_splitk_workspace(
         total_splits, total_output_tiles, BLOCK_M, BLOCK_DMODEL, device,
@@ -691,11 +603,8 @@ def _launch_splitk(
         total_valid_tiles=total_valid_tiles, total_programs=total_programs,
         partial_out=partial_out, partial_lse=partial_lse,
         tile_done=tile_done,
-        cum_tiles_per_batch=cum_tiles_per_batch,
         actual_batch_size=batch_size,
         IS_PERSISTENT=True, SPLIT_K=SPLIT_K,
-        MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
-        TILE_MAP_MODE=TILE_MAP_MODE,
         PREFIX_MASK_MODE=0,
         num_warps=num_warps, num_stages=1,
         waves_per_eu=2,
@@ -721,10 +630,17 @@ def _get_num_xcds(device):
 def _select_d256_dispatch(
     batch_size: int,
     max_len_extend: int,
+    min_len_extend: int,
     total_prefix_len: int,
     total_extend_len: int,
+    avg_pfx_proxy: int = 0,
 ):
     """D=256 launch policy (Gemma-style models).
+
+    Narrow oracle-tuned overrides for B>=4 ext>=256 and B=1 ext>=2048 fire
+    first; everything else falls through to the prior tree. ``avg_pfx_proxy``
+    is a coarse proxy for avg prefix length supplied by the caller when
+    ``total_prefix_len`` is not threaded through.
 
     NS=1 is avoided even where it would win: the prefix-pipelined kernel
     hard-asserts NS>=2 for determinism, so NS=2 is used throughout at a
@@ -732,6 +648,8 @@ def _select_d256_dispatch(
     """
     total_tokens = max(1, total_prefix_len + total_extend_len)
     prefix_frac = total_prefix_len / total_tokens
+    ext_ratio = max_len_extend / max(1, min_len_extend)
+    avg_pfx = total_prefix_len // max(1, batch_size)
 
     if batch_size >= 4 and max_len_extend >= 256:
         return 128, 8, 2, 16, 16
@@ -748,7 +666,18 @@ def _select_d256_dispatch(
             return 64, 4, 2, 16, 16
         return 128, 8, 3, 16, 16
 
-    return 64, 4, 2, 16, 16
+    if batch_size <= 4:
+        if max_len_extend <= 128 and avg_pfx >= 2048:
+            return 64, 4, 4, 16, 16
+        return 64, 4, 2, 16, 16
+
+    if max_len_extend <= 128 and avg_pfx >= 2048:
+        return 64, 8, 4, 16, 16
+
+    if ext_ratio <= 2.5:
+        return 64, 4, 2, 16, 16
+
+    return 64, 8, 4, 16, 16
 
 
 # FP8 dispatch defaults for the rare D not in {64, 128} fallthrough. The
@@ -907,7 +836,7 @@ def _apply_fp8_overrides(Lq, batch_size, max_len_extend, pfx_bucket,
             # closes the gap — sweep over 10 weak-bucket shapes moves
             # this path from 0.66x-1.02x to 1.25x-1.55x vs Triton.
             # Kernel body has the NW<8 serial branch guarded by
-            # `USE_SERIAL = num_warps < 8`; NS=1 skips the DMA pipeline.
+            # `USE_PINGPONG = num_warps >= 8`; NS=1 skips the DMA pipeline.
             BM, NW, NS = 64, 4, 1
             EXT_NS = 1
         elif (
@@ -989,15 +918,14 @@ def _get_basic_dispatch_config(
 
     if Lq == 256:
         _avg_pfx_proxy = (
-            0 if pfx_bucket == 0
-            else 256 if pfx_bucket == 1
+            0 if pfx_bucket <= 1
             else 1024 if pfx_bucket == 2
-            else 4096 if pfx_bucket == 3
-            else 16384
+            else 2048 if pfx_bucket == 3
+            else 8192
         )
-        _total_pfx_proxy = _avg_pfx_proxy * batch_size
         _BM, _NW, _NS, _PAD_K, _PAD_V = _select_d256_dispatch(
-            batch_size, max_len_extend, _total_pfx_proxy, _total_ext,
+            batch_size, max_len_extend, max_len_extend, 0, _total_ext,
+            avg_pfx_proxy=_avg_pfx_proxy,
         )
         _BN = 32
         _EXT_BN, _EXT_NS = _BN, _NS
@@ -1202,9 +1130,9 @@ def gluon_extend_attention_fwd(
                     and (batch_size >= 5 or _total_pfx_est >= 512))
             )
         if _use_wca:
-            # Launcher internally picks between three BF16 variants (bsearch
-            # tile map for full-batch prefill, small-tile for ext-dominated
-            # batches, default for prefix-dominated chat-mix) based on shape.
+            # Launcher picks the BM/NW tile config internally (small-tile for
+            # ext-dominated or ragged batches, big-tile for prefix-dominated
+            # chat-mix).
             _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
             _wca_fn(
                 q_extend, k_extend, v_extend, o_extend,
@@ -1316,6 +1244,37 @@ def gluon_extend_attention_fwd(
         if _wkvo is None:
             _wkvo = _dummy_wkvo[:batch_size]
 
+        # D=256 prefix-aware WCA routing. FP8 D=256 persistent overflows
+        # LDS (204KB > 160KB) and hits LLVM codegen bugs, so BF16 only.
+        if Lq == 256 and not _kv_is_fp8:
+            _total_pfx_256 = total_prefix_len if total_prefix_len is not None else 0
+            _avg_pfx_256 = _total_pfx_256 // max(1, batch_size)
+            _n_m_256 = (max_len_extend + 63) // 64
+            _tiles_256 = batch_size * head_num * _n_m_256
+            _need_persistent_256 = (
+                _avg_pfx_256 >= 4096
+                and (batch_size >= 4 or _avg_pfx_256 >= 16384)
+                and _tiles_256 < _get_num_CUs(q_extend.device)
+            )
+            if _need_persistent_256 and _can_route_wca:
+                if min_len_extend is None:
+                    min_len_extend = max_len_extend
+                _wca_fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
+                _wca_fn(
+                    q_extend, k_extend, v_extend, o_extend,
+                    k_buffer, v_buffer,
+                    qo_indptr, kv_indptr, kv_indices,
+                    custom_mask, is_causal, mask_indptr, max_len_extend,
+                    k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
+                    logit_cap=logit_cap,
+                    sliding_window_size=sliding_window_size,
+                    sinks=sinks, window_kv_offsets=window_kv_offsets,
+                    xai_temperature_len=xai_temperature_len,
+                    min_len_extend=min_len_extend,
+                    total_prefix_len=total_prefix_len,
+                )
+                return
+
         # Cached dispatch config lookup (O(0.1us) after warmup).
         _pfx_b_full = _pfx_bucket(total_prefix_len, batch_size)
         _BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS = (
@@ -1374,8 +1333,8 @@ def gluon_extend_attention_fwd(
             total_valid_tiles=0, total_programs=0,
             partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
             tile_done=_dummy_tile_done,
-            cum_tiles_per_batch=_dummy_cum_tiles, actual_batch_size=0,
-            IS_PERSISTENT=False, SPLIT_K=1, MAX_BATCH_LOG2=8, TILE_MAP_MODE=0,
+            actual_batch_size=0,
+            IS_PERSISTENT=False, SPLIT_K=1,
             PREFIX_MASK_MODE=0,
             num_warps=_NW, num_stages=1, waves_per_eu=2,
             matrix_instr_nonkdim=32,
@@ -1599,8 +1558,8 @@ def gluon_extend_attention_fwd(
         total_valid_tiles=0, total_programs=0,
         partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
         tile_done=_dummy_tile_done,
-        cum_tiles_per_batch=_dummy_cum_tiles, actual_batch_size=0,
-        IS_PERSISTENT=False, SPLIT_K=1, MAX_BATCH_LOG2=8, TILE_MAP_MODE=0,
+        actual_batch_size=0,
+        IS_PERSISTENT=False, SPLIT_K=1,
         PREFIX_MASK_MODE=0,
         num_warps=num_warps, num_stages=1,
         waves_per_eu=2,
@@ -1731,19 +1690,13 @@ def _launch_persistent_fp8(
     n_m_tiles = (max_len_extend + BLOCK_M - 1) // BLOCK_M
 
     # Tight sync-free upper bound on sum(ceil(ext_i / BM)). For heterogeneous
-    # batches this is 3-4x smaller than ``batch * ceil(max_ext/BM)`` -- cuts
-    # WCA empty-slot scans proportionally without a .item() sync. Mirrors the
-    # BF16 ``_launch_persistent`` above.
+    # batches this is 3-4x smaller than ``batch * ceil(max_ext/BM)``; the
+    # kernel's inline WCA scan tolerates the over-provisioned slots via a
+    # cheap validity check. Mirrors the BF16 ``_launch_persistent`` above.
     total_extend_rows = q_extend.shape[0]
-    total_output_tiles_tight = (
+    total_output_tiles = (
         (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
     ) * head_num
-
-    TILE_MAP_MODE = _effective_tile_map_mode(1)
-    # WCA inline-scan: tolerates empty slots; tight bound keeps the grid
-    # small enough that the linear O(B) prologue stays cheap.
-    total_output_tiles = total_output_tiles_tight
-    cum_tiles_per_batch = _ensure_splitk_dummy(device)
 
     if total_output_tiles == 0:
         return
@@ -1829,12 +1782,9 @@ def _launch_persistent_fp8(
         partial_out=partial_out,
         partial_lse=partial_lse,
         tile_done=tile_done,
-        cum_tiles_per_batch=cum_tiles_per_batch,
         actual_batch_size=batch_size,
         IS_PERSISTENT=True,
         SPLIT_K=SPLIT_K,
-        MAX_BATCH_LOG2=_DEFAULT_MAX_BATCH_LOG2,
-        TILE_MAP_MODE=TILE_MAP_MODE,
         PREFIX_MASK_MODE=0,
         num_warps=num_warps,
         num_stages=1,
