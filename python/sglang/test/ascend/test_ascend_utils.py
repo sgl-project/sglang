@@ -13,16 +13,21 @@ Please remember to sort by variable name within each section.
 
 import asyncio
 import copy
+import logging
 import os
 import subprocess
+import time
 from types import SimpleNamespace
 from typing import Awaitable, Callable, NamedTuple, Optional
+from urllib.parse import urlparse
 
 from sglang.bench_serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    _create_clean_subprocess_env,
+    _wait_for_server_health,
     auto_config_device,
     popen_launch_server,
 )
@@ -256,6 +261,10 @@ SKYWORK_REWARD_LLAMA_3_1_8B_V0_2_WEIGHTS_PATH = os.path.join(
 
 # Other
 DEEPSEEK_CODER_JSON_PATH = "/__w/sglang/sglang/test/registered/ascend/basic_function/parameter/deepseek_coder.json"
+CONFIG_YAML_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "../../../test/registered/ascend/basic_function/ConfigurationFileSupport/config.yaml",
+)
 
 
 class ModelTestConfig(NamedTuple):
@@ -549,3 +558,57 @@ def run_bench_serving(
 
     assert res["completed"] == num_prompts
     return res
+
+
+# launch server with "--config" parameter
+def popen_launch_server_with_config_yaml(config_file, base_url, timeout):
+    parsed_url = urlparse(base_url)
+    host = parsed_url.hostname
+    port = parsed_url.port
+    command = [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--config",
+        config_file,
+        "--host",
+        host,
+        "--port",
+        port,
+    ]
+
+    env = _create_clean_subprocess_env(os.environ.copy())
+    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+    _wait_for_server_health(process, base_url, None, timeout)
+    return process
+
+
+# hook factory
+def create_attention_monitor_hook_factory(config):
+    layer_index = config.get("layer_index", 0)
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+    def attention_monitor_hook(module, inputs, output):
+        # The actual hook function is called during the forward propagation of the self-attention layer.
+        timestamp = time.time()
+
+        hidden_states = inputs[1] if inputs and len(inputs) > 1 else None
+
+        monitor_record = {
+            "timestamp": timestamp,
+            "layer_index": layer_index,
+            "module_type": type(module).__name__,
+            "inputs": hidden_states.sum(-1)[:5] if hidden_states is not None else None,
+            "outputs": output.sum(-1)[:5],
+        }
+
+        logging.info(f"hook effect: {monitor_record}")
+
+        return output
+
+    return attention_monitor_hook
