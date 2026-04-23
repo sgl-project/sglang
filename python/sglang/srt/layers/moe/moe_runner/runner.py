@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.lora.lora_moe_runners import LoRAHooks
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -98,9 +97,6 @@ class MoeRunner:
         assert self.runner_core is not None
 
         def _maybe_build_lora_hooks(_runner_input: Any) -> LoRAHooks:
-            if not self.lora_enabled or lora_info is None:
-                return None
-
             from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
             from sglang.srt.lora.lora_moe_runners import build_lora_hooks
 
@@ -109,19 +105,16 @@ class MoeRunner:
                     _runner_input.hidden_states,
                     _runner_input.topk_output.topk_ids,
                 )
-            elif hasattr(_runner_input, "topk_ids"):
-                hidden_states, topk_ids = (
-                    _runner_input.hidden_states,
-                    _runner_input.topk_ids,
-                )
             else:
-                return None
-
-            return build_lora_hooks(
-                hidden_states,
-                lora_info,
-                topk_ids,
-            )
+                hidden_states = _runner_input.hidden_states
+                topk_ids = getattr(_runner_input, "topk_ids", None)
+            if self.lora_enabled and lora_info is not None:
+                return build_lora_hooks(
+                    hidden_states,
+                    lora_info,
+                    topk_ids,
+                )
+            return None
 
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
         # bypass the pre-permute step and do their own alignment internally.

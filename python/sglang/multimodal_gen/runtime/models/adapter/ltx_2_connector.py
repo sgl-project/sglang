@@ -517,6 +517,7 @@ class LTX2TextConnectors(nn.Module):
     ):
         super().__init__()
         caption_channels = config.caption_channels
+        self.caption_channels = caption_channels
         text_proj_in_factor = config.text_proj_in_factor
         video_connector_num_attention_heads = config.video_connector_num_attention_heads
         video_connector_attention_head_dim = config.video_connector_attention_head_dim
@@ -641,7 +642,7 @@ class LTX2TextConnectors(nn.Module):
                 audio_hidden_states = audio_hidden_states.to(
                     self.audio_aggregate_embed.weight.dtype
                 )
-            source_dim = self.video_aggregate_embed.out_features
+            source_dim = self.caption_channels
             video_hidden_states = self._rescale_v2_features(
                 video_hidden_states,
                 self.video_aggregate_embed.out_features,

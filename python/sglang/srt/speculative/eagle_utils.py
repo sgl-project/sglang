@@ -104,10 +104,10 @@ def build_tree_kernel_efficient(
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
 
     # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
-    retrive_buf = torch.full(
+    retrieve_buf = torch.full(
         (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
     )
-    retrive_index, retrive_next_token, retrive_next_sibling = retrive_buf
+    retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve_buf
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
@@ -125,9 +125,9 @@ def build_tree_kernel_efficient(
             seq_lens,
             tree_mask,
             positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             topk,
             spec_steps,
             num_verify_tokens,
@@ -140,9 +140,9 @@ def build_tree_kernel_efficient(
             seq_lens,
             tree_mask,
             positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             topk,
             spec_steps,
             num_verify_tokens,
@@ -151,9 +151,9 @@ def build_tree_kernel_efficient(
     return (
         tree_mask,
         positions,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
         draft_tokens,
     )
 
@@ -163,9 +163,9 @@ def verify_tree_greedy_func(
     accept_index: torch.Tensor,
     accept_token_num: torch.Tensor,
     candidates: torch.Tensor,
-    retrive_index: torch.Tensor,
-    retrive_next_token: torch.Tensor,
-    retrive_next_sibling: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
@@ -177,9 +177,10 @@ def verify_tree_greedy_func(
             accept_index=accept_index,  # mutable
             accept_token_num=accept_token_num,  # mutable
             candidates=candidates,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
 
@@ -191,9 +192,10 @@ def verify_tree_greedy_func(
             accept_index=accept_index,
             accept_token_num=accept_token_num,
             candidates=candidates,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
     return predicts, accept_index, accept_token_num

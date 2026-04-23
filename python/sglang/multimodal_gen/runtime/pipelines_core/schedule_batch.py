@@ -16,7 +16,7 @@ import os
 import pprint
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import PIL.Image
 import torch
@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.utils import align_to
+from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
 
@@ -102,11 +103,16 @@ class Req:
     audio_latents: torch.Tensor | None = None
     audio_noise: torch.Tensor | None = None
     raw_audio_latent_shape: tuple[int, ...] | None = None
+    did_sp_shard_audio_latents: bool = False
+    sp_audio_start_frame: int = 0
+    sp_audio_orig_num_frames: int = 0
 
     # Audio Parameters
     generate_audio: bool = True
 
     raw_latent_shape: torch.Tensor | None = None
+    did_sp_shard_latents: bool = False
+    sp_video_start_frame: int = 0
     noise_pred: torch.Tensor | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
@@ -155,6 +161,11 @@ class Req:
 
     # stage logging
     metrics: Optional["RequestMetrics"] = None
+
+    # tracing context (TraceReqContext or TraceNullContext)
+    trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
+        default_factory=TraceNullContext
+    )
 
     # results
     output: torch.Tensor | None = None

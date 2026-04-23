@@ -341,6 +341,41 @@ python3 -m sglang.bench_serving \
   --random-output-len 256
 ```
 
+10) Fake decode stress testing (PD disaggregation, decode-only):
+
+When benchmarking pure decode performance in a PD disaggregation setup, you can bypass the prefill node entirely by using `--fake-prefill`. This requires the decode server to be started with `--disaggregation-transfer-backend fake`:
+
+```bash
+# Step 1: Start a decode-only server with fake transfer backend
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend fake \
+  --port 30001
+
+# Step 2: Run bench_serving with --fake-prefill
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 --port 30001 \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --dataset-name random \
+  --num-prompts 500 \
+  --random-input-len 1024 --random-output-len 256 \
+  --fake-prefill
+```
+
+Similarly, `bench_one_batch_server` also supports `--fake-prefill`:
+
+```bash
+python3 -m sglang.bench_one_batch_server \
+  --base-url http://127.0.0.1:30001 \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --batch-size 32 --input-len 1024 --output-len 256 \
+  --fake-prefill
+```
+
+The `--fake-prefill` flag automatically injects special sentinel values into each request, telling the decode server to skip real KV transfer and generate fake KV data locally.
+
 ### Troubleshooting
 
 - All requests failed: verify `--backend`, server URL/port, `--model`, and authentication. Check warmup errors printed by the script.

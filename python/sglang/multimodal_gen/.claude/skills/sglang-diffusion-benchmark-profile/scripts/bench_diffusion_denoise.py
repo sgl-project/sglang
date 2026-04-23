@@ -12,7 +12,7 @@ Usage:
     # Tag the run for later compare_perf.py usage
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
 
-    # All 12 preset models
+    # All 14 preset models
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
 
     # Show preset order, model path, and nightly mapping
@@ -53,6 +53,11 @@ from diffusion_skill_env import (
 REPO_ROOT = get_repo_root()
 ASSET_DIR = ensure_dir(get_assets_dir(REPO_ROOT))
 GATED_MODELS = {"flux", "flux2"}
+DIFFUSERS_FALLBACK_SIGNALS = (
+    "falling back to diffusers backend",
+    "using diffusers backend",
+    "loaded diffusers pipeline",
+)
 
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
@@ -193,6 +198,39 @@ MODELS = {
         ],
     },
     # 10. Skill-only extra preset
+    "ltx23-one-stage": {
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--width=768",
+            "--height=512",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=30",
+            "--guidance-scale=3.0",
+            "--num-gpus=2",
+        ],
+    },
+    # 11. Skill-only extra preset
+    "ltx23-two-stage": {
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=1536",
+            "--height=1024",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=30",
+            "--guidance-scale=3.0",
+            "--num-gpus=2",
+        ],
+    },
+    # 12. Skill-only extra preset
     "hunyuanvideo": {
         "path": "hunyuanvideo-community/HunyuanVideo",
         "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
@@ -205,7 +243,7 @@ MODELS = {
             "--num-inference-steps=30",
         ],
     },
-    # 11. Skill-only extra preset
+    # 13. Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
@@ -221,7 +259,7 @@ MODELS = {
             "--num-inference-steps=2",
         ],
     },
-    # 12. Skill-only extra preset
+    # 14. Skill-only extra preset
     "helios": {
         "path": "BestWishYsh/Helios-Base",
         "prompt": "A curious raccoon",
@@ -247,6 +285,8 @@ def required_gpus_for_model(model_key: str) -> int:
         return 4
     if model_key == "mova-720p":
         return 4
+    if model_key in {"ltx23-one-stage", "ltx23-two-stage"}:
+        return 2
     return 1
 
 
@@ -260,11 +300,11 @@ def print_model_catalog():
     print("=" * 95)
     print("MODEL PRESETS — Nightly-aligned first, skill-only extras after")
     print("=" * 95)
-    print(f"{'Preset':<14} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
+    print(f"{'Preset':<17} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
     print("-" * 95)
     for model_key, cfg in MODELS.items():
         print(
-            f"{model_key:<14} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
+            f"{model_key:<17} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
         )
     print("-" * 112)
     print(
@@ -291,6 +331,7 @@ def build_sglang_cmd(
         "generate",
         f"--model-path={cfg['path']}",
         f"--prompt={cfg['prompt']}",
+        "--backend=sglang",
         "--log-level=info",
     ]
 
@@ -323,6 +364,7 @@ def run_benchmark_once(
     label: str,
     output_dir: Path,
     warmup: bool = True,
+    torch_compile: bool = True,
 ) -> dict:
     """Run a single benchmark pass and return results dict."""
     perf_path = output_dir / f"{model_key}_{label}.json"
@@ -331,6 +373,7 @@ def run_benchmark_once(
         model_key,
         perf_dump_path=str(perf_path),
         warmup=warmup,
+        torch_compile=torch_compile,
     )
 
     env = os.environ.copy()
@@ -362,11 +405,32 @@ def run_benchmark_once(
     print()
 
     t0 = time.time()
-    result = subprocess.run(cmd, env=env, text=True)
+    process = subprocess.Popen(
+        cmd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    fallback_detected = False
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="")
+        if any(signal in line.lower() for signal in DIFFUSERS_FALLBACK_SIGNALS):
+            fallback_detected = True
+    returncode = process.wait()
     elapsed = time.time() - t0
 
-    if result.returncode != 0:
-        print(f"  ERROR: exit code {result.returncode}")
+    if fallback_detected:
+        print(
+            "  ERROR: model fell back to the diffusers backend. "
+            "Fix native SGLang diffusion backend selection before collecting perf data."
+        )
+        return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
+
+    if returncode != 0:
+        print(f"  ERROR: exit code {returncode}")
         return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
 
     metrics = {"model": model_key, "label": label, "elapsed_s": elapsed, "error": False}
@@ -474,7 +538,7 @@ def main():
         choices=list(MODELS.keys()),
         help="Model to benchmark (default: flux)",
     )
-    parser.add_argument("--all", action="store_true", help="Benchmark all 12 models")
+    parser.add_argument("--all", action="store_true", help="Benchmark all 14 models")
     parser.add_argument(
         "--list-models",
         action="store_true",
@@ -493,6 +557,11 @@ def main():
         help="Directory for perf dump JSON files",
     )
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup")
+    parser.add_argument(
+        "--no-torch-compile",
+        action="store_true",
+        help="Keep torch.compile disabled for eager-mode comparisons.",
+    )
 
     args = parser.parse_args()
 
@@ -503,12 +572,21 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     warmup = not args.no_warmup
+    torch_compile = not args.no_torch_compile
 
     models_to_run = list(MODELS.keys()) if args.all else [args.model or "flux"]
     results = []
 
     for model_key in models_to_run:
-        results.append(run_benchmark_once(model_key, args.label, output_dir, warmup))
+        results.append(
+            run_benchmark_once(
+                model_key,
+                args.label,
+                output_dir,
+                warmup=warmup,
+                torch_compile=torch_compile,
+            )
+        )
 
     if results:
         print_results_table(results)

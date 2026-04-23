@@ -15,7 +15,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    is_ltx2_two_stage_pipeline_name,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -61,6 +64,12 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
         batch: Req,
         server_args: ServerArgs,
     ):
+        if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+            if is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name):
+                return server_args.pipeline_config.get_latent_dtype(
+                    batch.prompt_embeds[0].dtype
+                )
+            return torch.float32
         return torch.float32
 
     @staticmethod
