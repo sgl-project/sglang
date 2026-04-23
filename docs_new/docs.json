@@ -1067,6 +1067,12 @@
                     "pages": [
                       "cookbook/autoregressive/FlashLabs/Chroma1.0"
                     ]
+                  },
+                  {
+                    "group": "Tencent",
+                    "pages": [
+                      "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
+                    ]
                   }
                 ]
               },
