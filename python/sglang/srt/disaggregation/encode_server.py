@@ -252,6 +252,18 @@ class MMEncoder:
             )
         self.background_tasks: Set[asyncio.Task] = set()
 
+        # Rate limiting: cap concurrent encode requests to prevent OOM
+        self.encoder_max_running_requests = (
+            server_args.max_running_requests
+            if server_args.max_running_requests is not None
+            else 64
+        )
+        self.encode_semaphore = asyncio.Semaphore(self.encoder_max_running_requests)
+        self.running_encode_count = 0
+        logger.info(
+            f"Encoder max running requests: {self.encoder_max_running_requests}"
+        )
+
         if self.server_args.enable_mm_global_cache:
             from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
                 EmbeddingCacheController,
@@ -1445,13 +1457,14 @@ async def handle_encode_request(request: dict):
             encoder.background_tasks.add(task)
             task.add_done_callback(encoder.background_tasks.discard)
 
-        # broadcast request
-        request.update({"enter_time": time.time()})
-        for socket in send_sockets:
-            socket.send_pyobj(request)
-        if encoder.mm_global_cache is not None:
-            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode_with_global_cache(
+        async def _broadcast_and_encode():
+            # broadcast request to non-rank-0 workers
+            request.update({"enter_time": time.time()})
+            for socket in send_sockets:
+                socket.send_pyobj(request)
+
+            if encoder.mm_global_cache is not None:
+                return await encoder.encode_with_global_cache(
                     mm_items=request["mm_items"],
                     modality=Modality.from_str(request["modality"]),
                     req_id=request["req_id"],
@@ -1459,17 +1472,40 @@ async def handle_encode_request(request: dict):
                     part_idx=request["part_idx"],
                     hashes=request.get("hashes", None),
                 )
-            )
-        else:
-            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode(
+            else:
+                return await encoder.encode(
                     mm_items=request["mm_items"],
                     modality=Modality.from_str(request["modality"]),
                     req_id=request["req_id"],
                     num_parts=request["num_parts"],
                     part_idx=request["part_idx"],
                 )
+
+        # Rate limit: acquire semaphore before broadcasting and encoding
+        # to prevent OOM from too many concurrent encode requests.
+        # The semaphore must gate both broadcast and encode together because
+        # encoding uses distributed collectives across all TP ranks.
+        wait_start = time.time()
+        if encoder.running_encode_count >= encoder.encoder_max_running_requests:
+            logger.warning(
+                f"[{req_id}] Encode request throttled: "
+                f"{encoder.running_encode_count}/{encoder.encoder_max_running_requests} "
+                f"running, waiting for a slot..."
             )
+        async with encoder.encode_semaphore:
+            wait_duration = time.time() - wait_start
+            encoder.running_encode_count += 1
+            if wait_duration > 0.01:
+                logger.info(
+                    f"[{req_id}] Semaphore acquired after {wait_duration:.3f}s, "
+                    f"running: {encoder.running_encode_count}/{encoder.encoder_max_running_requests}"
+                )
+            try:
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await _broadcast_and_encode()
+                )
+            finally:
+                encoder.running_encode_count -= 1
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
