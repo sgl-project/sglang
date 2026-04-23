@@ -73,7 +73,7 @@ logger = init_logger(__name__)
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
-LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline",)
+LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 

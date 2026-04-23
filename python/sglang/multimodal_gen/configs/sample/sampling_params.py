@@ -102,9 +102,7 @@ class SamplingParams:
 
     # Text inputs
     prompt: str | list[str] | None = None
-    negative_prompt: str = (
-        "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
-    )
+    negative_prompt: str = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     prompt_path: str | None = None
     output_path: str | None = None
     output_file_name: str | None = None
@@ -187,12 +185,8 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
-    rollout_return_denoising_env: bool = (
-        False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
-    )
-    rollout_return_dit_trajectory: bool = (
-        False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
-    )
+    rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
+    rollout_return_dit_trajectory: bool = False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
@@ -571,18 +565,28 @@ class SamplingParams:
     def from_user_sampling_params_args(
         model_path: str, server_args: "ServerArgs", *args, **kwargs
     ):
+        pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
         try:
-            sampling_params = SamplingParams.from_pretrained(
-                model_path, backend=server_args.backend, model_id=server_args.model_id
-            )
-        except (AttributeError, ValueError) as e:
+            sampling_params = None
+            if pipeline_class_name:
+                from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+                config_classes = get_pipeline_config_classes(pipeline_class_name)
+                if config_classes is not None:
+                    _, sampling_params_cls = config_classes
+                    sampling_params = sampling_params_cls()
+
+            if sampling_params is None:
+                sampling_params = SamplingParams.from_pretrained(
+                    model_path,
+                    backend=server_args.backend,
+                    model_id=server_args.model_id,
+                )
+        except (AttributeError, ValueError):
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
             if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
                 # Determine which sampling params to use based on pipeline_class_name
-                pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
-
-                # Try to get SamplingParams from registry
                 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 
                 config_classes = (
@@ -616,7 +620,7 @@ class SamplingParams:
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
 
-        user_sampling_params = SamplingParams(*args, **user_kwargs)
+        user_sampling_params = type(sampling_params)(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
@@ -795,6 +799,92 @@ class SamplingParams:
             "--guidance-rescale",
             type=float,
             help="Guidance rescale factor",
+        )
+        add_argument(
+            "--video-cfg-guidance-scale",
+            type=float,
+            dest="video_cfg_scale",
+            help="Official LTX-2 video CFG guidance scale override.",
+        )
+        add_argument(
+            "--video-stg-guidance-scale",
+            type=float,
+            dest="video_stg_scale",
+            help="Official LTX-2 video STG guidance scale override.",
+        )
+        add_argument(
+            "--video-rescale-scale",
+            type=float,
+            dest="video_rescale_scale",
+            help="Official LTX-2 video guidance rescale override.",
+        )
+        add_argument(
+            "--video-stg-blocks",
+            type=int,
+            nargs="*",
+            dest="video_stg_blocks",
+            help="Official LTX-2 video STG block override.",
+        )
+        add_argument(
+            "--a2v-guidance-scale",
+            type=float,
+            dest="video_modality_scale",
+            help="Official LTX-2 audio-to-video guidance scale override.",
+        )
+        add_argument(
+            "--video-skip-step",
+            type=int,
+            dest="video_skip_step",
+            help="Official LTX-2 video skip-step override.",
+        )
+        add_argument(
+            "--audio-cfg-guidance-scale",
+            type=float,
+            dest="audio_cfg_scale",
+            help="Official LTX-2 audio CFG guidance scale override.",
+        )
+        add_argument(
+            "--audio-stg-guidance-scale",
+            type=float,
+            dest="audio_stg_scale",
+            help="Official LTX-2 audio STG guidance scale override.",
+        )
+        add_argument(
+            "--audio-rescale-scale",
+            type=float,
+            dest="audio_rescale_scale",
+            help="Official LTX-2 audio guidance rescale override.",
+        )
+        add_argument(
+            "--audio-stg-blocks",
+            type=int,
+            nargs="*",
+            dest="audio_stg_blocks",
+            help="Official LTX-2 audio STG block override.",
+        )
+        add_argument(
+            "--v2a-guidance-scale",
+            type=float,
+            dest="audio_modality_scale",
+            help="Official LTX-2 video-to-audio guidance scale override.",
+        )
+        add_argument(
+            "--audio-skip-step",
+            type=int,
+            dest="audio_skip_step",
+            help="Official LTX-2 audio skip-step override.",
+        )
+        add_argument(
+            "--distilled-lora-strength-stage-1",
+            type=float,
+            dest="distilled_lora_strength_stage_1",
+            help="Official LTX-2.3 HQ stage-1 distilled LoRA strength override.",
+        )
+        add_argument(
+            "--distilled-lora-strength-stage-2",
+            type=float,
+            dest="distilled_lora_strength_stage_2",
+            help="Official LTX-2.3 HQ stage-2 distilled LoRA strength override.",
         )
         add_argument(
             "--cfg-normalization",
@@ -982,7 +1072,14 @@ class SamplingParams:
         for field in dataclasses.fields(user_params):
             field_name = field.name
             user_value = getattr(user_params, field_name)
-            default_class_value = getattr(SamplingParams, field_name)
+            if hasattr(SamplingParams, field_name):
+                default_class_value = getattr(SamplingParams, field_name)
+            elif field.default is not dataclasses.MISSING:
+                default_class_value = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                default_class_value = field.default_factory()
+            else:
+                default_class_value = dataclasses.MISSING
 
             is_user_modified = user_value != default_class_value or (
                 explicit_fields is not None and field_name in explicit_fields

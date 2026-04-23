@@ -55,7 +55,7 @@ class LTX2LoRASwitchStage(PipelineStage):
             raise ValueError(
                 "LTX2LoRASwitchStage requires pipeline.switch_lora_phase()"
             )
-        switch_fn(self.phase)
+        switch_fn(self.phase, batch=batch)
         batch.extra["ltx2_phase"] = self.phase
         return batch
 

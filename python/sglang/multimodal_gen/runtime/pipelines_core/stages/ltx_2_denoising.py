@@ -22,6 +22,36 @@ from sglang.multimodal_gen.runtime.server_args import (
     is_ltx2_two_stage_pipeline_name,
 )
 
+LTX23_TWO_STAGE_STAGE1_GUIDER_DEFAULTS: dict[str, object] = {
+    "video_cfg_scale": 3.0,
+    "video_stg_scale": 1.0,
+    "video_rescale_scale": 0.7,
+    "video_modality_scale": 3.0,
+    "video_skip_step": 0,
+    "video_stg_blocks": [28],
+    "audio_cfg_scale": 7.0,
+    "audio_stg_scale": 1.0,
+    "audio_rescale_scale": 0.7,
+    "audio_modality_scale": 3.0,
+    "audio_skip_step": 0,
+    "audio_stg_blocks": [28],
+}
+
+LTX23_TWO_STAGE_HQ_STAGE1_GUIDER_DEFAULTS: dict[str, object] = {
+    "video_cfg_scale": 3.0,
+    "video_stg_scale": 0.0,
+    "video_rescale_scale": 0.45,
+    "video_modality_scale": 3.0,
+    "video_skip_step": 0,
+    "video_stg_blocks": [],
+    "audio_cfg_scale": 7.0,
+    "audio_stg_scale": 0.0,
+    "audio_rescale_scale": 1.0,
+    "audio_modality_scale": 3.0,
+    "audio_skip_step": 0,
+    "audio_stg_blocks": [],
+}
+
 
 @dataclass(slots=True)
 class LTX2DenoisingContext(DenoisingContext):
@@ -94,10 +124,19 @@ class LTX2DenoisingStage(DenoisingStage):
         "audio_encoder_attention_mask",
     )
 
-    def __init__(self, transformer, scheduler, vae=None, **kwargs):
+    def __init__(
+        self,
+        transformer,
+        scheduler,
+        vae=None,
+        *,
+        sampler_name: str = "euler",
+        **kwargs,
+    ):
         super().__init__(
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
+        self.sampler_name = sampler_name
 
     @staticmethod
     def _get_video_latent_num_frames_for_model(
@@ -168,7 +207,21 @@ class LTX2DenoisingStage(DenoisingStage):
     ) -> dict[str, object] | None:
         if stage != "stage1":
             return None
-        return batch.extra.get("ltx2_stage1_guider_params")
+        request_params = batch.extra.get("ltx2_stage1_guider_params")
+        if not is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name):
+            return request_params
+        default_params = copy.deepcopy(
+            LTX23_TWO_STAGE_HQ_STAGE1_GUIDER_DEFAULTS
+            if server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
+            else LTX23_TWO_STAGE_STAGE1_GUIDER_DEFAULTS
+        )
+        if request_params is None:
+            return default_params
+        for key, value in request_params.items():
+            if value is None:
+                continue
+            default_params[key] = list(value) if isinstance(value, list) else value
+        return default_params
 
     @staticmethod
     def _ltx2_should_skip_step(step_index: int, skip_step: int) -> bool:
@@ -676,7 +729,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 else None
             )
             if callable(switch_lora_phase):
-                switch_lora_phase(ctx.stage)
+                switch_lora_phase(ctx.stage, batch=batch)
             ensure_phase_ready = (
                 getattr(pipeline, "ensure_ltx2_phase_ready", None)
                 if pipeline is not None
