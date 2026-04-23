@@ -416,6 +416,7 @@ def prepare_context_parallel_metadata(
     cp_rank,
     cp_size,
     seqs_len,
+    extend_lens,
 ):
     from sglang.srt.layers.attention.nsa.utils import (
         is_nsa_prefill_cp_round_robin_split,
@@ -470,18 +471,12 @@ def prepare_context_parallel_metadata(
     bs_per_cp_group = 1
     kv_len_origin = kv_len
 
-    # Derive prefix offset from the full sequence length on CPU.
-    # NOTE: forward_batch.seq_lens_cpu includes cached prefix + extend tokens.
-    # In CP we only split the extend tokens, but cache_seqlens passed to FA must
-    # include the cached prefix.
-    prefix_len = 0
-    try:
-        if seqs_len is not None and len(seqs_len) == 1:
-            prefix_len = int(seqs_len[0]) - int(kv_len_origin.item())
-            if prefix_len < 0:
-                prefix_len = 0
-    except Exception:
-        prefix_len = 0
+    # Derive prefix offset from unpadded CPU tensors. Both `seqs_len` and `extend_lens` are unpadded by the caller
+    # Using the padded `kv_len` here would undercount `prefix_len` by the padding amount and shift the FA causal horizon.
+    assert (
+        len(seqs_len) == 1 and len(extend_lens) == 1
+    ), "Prefill Context Parallel only supports batch_size == 1 for now"
+    prefix_len = max(0, int(seqs_len[0]) - int(extend_lens[0]))
     # get zigzag index
     cp_segment_num = cp_size * 2
     seq_per_batch = kv_len // cp_segment_num  # seq_len for each batch and segment

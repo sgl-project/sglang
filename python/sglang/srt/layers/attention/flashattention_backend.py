@@ -506,6 +506,25 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
+
+            # MLA/MHA CP: prepare_mlp_sync_batch pads extend tokens up to
+            # lcm(attn_tp_size, attn_cp_size), so cache_seqlens_cp can exceed
+            # seq_lens_cpu.max(). Widen page_table by the pad delta to keep
+            # FA3's causal reads in-bounds; widened columns index KV slot 0
+            # (req_to_token is zero-init) and outputs for padding queries are
+            # discarded downstream.
+            if (
+                self.attn_cp_size > 1
+                and forward_batch.global_num_tokens_cpu is not None
+                and forward_batch.extend_num_tokens is not None
+                and forward_batch.extend_seq_lens_cpu is not None
+            ):
+                padded_extend = int(forward_batch.extend_num_tokens)
+                real_extend = int(sum(forward_batch.extend_seq_lens_cpu))
+                pad_delta = padded_extend - real_extend
+                if pad_delta > 0:
+                    metadata.max_seq_len_k += pad_delta
+
             metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]

@@ -1887,7 +1887,7 @@ class ServerArgs:
                     self.enable_dp_attention = True
                     # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
                     self.moe_dense_tp_size = 1
-                    # self.moe_a2a_backend = "deepep"
+                    self.moe_a2a_backend = "deepep"
                     self.ep_size = self.tp_size
                     logger.warning(
                         "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
