@@ -175,7 +175,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
                 "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode original"
             ],
         ),
-        T2I_sampling_params
+        T2I_sampling_params,
     ),
 ]
 
