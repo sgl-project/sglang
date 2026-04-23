@@ -119,6 +119,7 @@ def _qwen3_rerank_score(p_yes: float, p_no: float) -> float:
 def _get_jinja_env():
     try:
         import jinja2  # Lazy import: server env should provide this dependency.
+        from jinja2.sandbox import ImmutableSandboxedEnvironment
     except ModuleNotFoundError as e:
         raise ValueError(
             "Rendering Qwen3 reranker prompts requires `jinja2`. "
@@ -126,11 +127,11 @@ def _get_jinja_env():
         ) from e
 
     return jinja2.Environment(
+    return ImmutableSandboxedEnvironment(
         loader=jinja2.BaseLoader(),
         autoescape=False,
         undefined=jinja2.Undefined,
     )
-
 
 def _render_jinja_chat_template(
     chat_template: str,
