@@ -1,85 +1,106 @@
-# Draft: Fuzzy Prefix Matching for SGLang RadixCache
+# Draft: Fuzzy Prefix Matching for SGLang RadixCache
 
 ---
 
-## 1. Overview
+## 1. Overview
 
-This document describes the design for **fuzzy prefix matching** in SGLang's RadixCache system. Current prefix matching is strictly exact (token-by-token comparison from the beginning). Fuzzy matching extends this capability to handle two additional scenarios:
+This document describes the design for **fuzzy prefix matching** in SGLang's RadixCache system. Current prefix matching is strictly exact (token-by-token comparison from the beginning). Fuzzy matching extends this capability to handle two additional scenarios:
 
-1.  **Token-Level Matching**: Token sequences with identical token IDs and count, but at different positions within the cached prompt (non-prefix substrings).
+1.  **Token-Level Matching**: Token sequences with identical token IDs and count, but at different positions within the cached prompt (non-prefix substrings).
     
-2.  **Semantic Matching**: Token sequences that are semantically similar but differ in token IDs and/or token count (e.g., "Hello, how are you?" vs "Hi, how are you doing?").
-    
-
-Note: This document focuses on an experimental implementation of **Token-Level Matching**; **Semantic Matching** is not yet included.
-
-### 1.1 Motivation
-
-In real-world workloads, exact prefix matches are often insufficient:
-
-*   Different prompts may share common sub-sequences that are not prefixes
-    
-*   Multi-turn conversations may re-use middle segments of previous prompts
+2.  **Semantic Matching**: Token sequences that are semantically similar but differ in token IDs and/or token count (e.g., "Hello, how are you?" vs "Hi, how are you doing?").
     
 
-Fuzzy matching allows reusing previously computed KV cache for these near-miss scenarios, reducing recomputation and improving throughput.
+Note: This document focuses on an experimental implementation of **Token-Level Matching**; **Semantic Matching** is not yet included.
 
-### 1.2 Key Design Principles
+### 1.1 Motivation
 
-1.  **Non-pollution**: Fuzzy-matched KV cache must not contaminate the original radix tree used for exact prefix matching.
+In real-world workloads, exact prefix matches are often insufficient:
+
+*   Different prompts may share common sub-sequences that are not prefixes
     
-2.  **Config-driven**: Fuzzy matching is opt-in via configuration, with configurable thresholds and provider selection.
-    
-3.  **Position-aware**: When matched tokens come from non-prefix positions, position IDs must be adjusted accordingly.
-    
-4.  **No double-counting**: Pool indices are stored only in the radix tree. The fuzzy store references radix tree nodes instead of duplicating indices.
+*   Multi-turn conversations may re-use middle segments of previous prompts
     
 
-## 2. Architecture
+Fuzzy matching allows reusing previously computed KV cache for these near-miss scenarios, reducing recomputation and improving throughput.
 
-### 2.1 Storage Architecture
+### 1.2 Key Design Principles
 
-The original RadixTree for exact prefix matching remains untouched. A single additional storage structure is introduced for fuzzy matching.
+1.  **Non-pollution**: Fuzzy-matched KV cache must not contaminate the original radix tree used for exact prefix matching. The new-slot allocation approach ensures original pool locations (owned by the source request's radix tree) are never mutated.
+    
+2.  **Config-driven**: Fuzzy matching is opt-in via configuration, with configurable thresholds and provider selection.
+    
+3.  **Position-aware**: When matched tokens come from non-prefix positions, RoPE correction is applied at the model executor level before the forward pass.
+    
+4.  **No double-counting**: Pool indices are stored only in the radix tree. The fuzzy store references radix tree nodes instead of duplicating indices.
+    
+
+## 2. Architecture
+
+### 2.1 Prompt Token Decomposition
+
+When fuzzy prefix matching is enabled, a prompt of `total_len` tokens is decomposed into three contiguous regions by `match_prefix`:
 
 ```plaintext
-┌─────────────────────────────────────────────────────────────────┐
-│                        Request arrives                          │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Matching Order (priority)                    │
-│                                                                 │
-│  ┌──────────────────────┐                                       │
-│  │  1. Exact Prefix     │  ← Original RadixTree (unchanged)     │
-│  │     RadixTree        │    Existing SGLang logic, no mods     │
-│  └──────────┬───────────┘                                       │
-│             │ miss (matched n < L-1)                            │
-│             ▼                                                   │
-│  ┌──────────────────────┐                                       │
-│  │  2. Non-Prefix       │  ← NEW: flat store for non-prefix     │
-│  │     KV Cache Store   │     cached segments (semantic/token)  │
-│  └──────────────────────┘                                       │
-└─────────────────────────────────────────────────────────────────┘
+|<-- exact_matched_len -->|<-- fuzzy_matched_len -->|<--- miss_len --->|
+       exact match              fuzzy match             new tokens
+     (from radix tree)    (from non_prefix_store)     (need compute)
 
 ```
 
-#### Storage 1 (existing): Original RadixTree
-
-No changes needed. SGLang's existing `RadixCache` handles exact prefix matching.
-
-#### Storage 2: `NonPrefixKVStore`
-
-*   **Purpose**: Stores all cached segments (both prefix-complete sequences and mid-prompt subsequences) for fuzzy matching.
+*   **exact prefix tokens**: Matched from the radix tree. KV indices are shared directly, no recomputation needed.
     
-*   **Data structure**: Flat list with block-hash indexing. Stores `NodeRef` objects (references to radix tree nodes) instead of duplicating pool indices.
+*   **fuzzy prefix tokens**: Matched from `NonPrefixKVStore`. The KV data exists in the pool but with RoPE applied at the original cached positions. Before the forward pass, `_correct_fuzzy_kv_rope` allocates new pool slots, performs reverse-RoPE + apply-RoPE to correct the positional encoding, then updates `req_to_token_pool` to point to the new slots.
     
-*   **Write condition**: When `RadixCache.cache_finished_req()` completes and fuzzy caching is enabled.
-    
-*   **Why NodeRef-based**: Pool indices are stored only in the radix tree's `TreeNode.value`. The fuzzy store references nodes by ID/offset/length, avoiding double-counting in memory accounting.
+*   **miss tokens**: No cached KV available. These tokens are computed during the forward pass.
     
 
-### 2.2 Component Overview
+When `fuzzy_matched_len = 0`, the behavior is identical to standard chunk prefill (only exact prefix + miss tokens). When `fuzzy_matched_len > 0`, the only additional work before the forward pass is allocating new pool slots and correcting RoPE on the fuzzy tokens' K values.
+
+### 2.2 Storage Architecture
+
+The original RadixTree for exact prefix matching remains untouched. A single additional storage structure is introduced for fuzzy matching.
+
+```plaintext
++---------------------------------------------------------------+
+|                        Request arrives                          |
++---------------------------------------------------------------+
+                              |
+                              v
++---------------------------------------------------------------+
+|                    Matching Order (priority)                    |
+|                                                                 |
+|  +----------------------+                                       |
+|  |  1. Exact Prefix     |  <- Original RadixTree (unchanged)    |
+|  |     RadixTree        |    Existing SGLang logic, no mods     |
+|  +----------+-----------+                                       |
+|             | miss (matched n < L-1)                            |
+|             v                                                   |
+|  +----------------------+                                       |
+|  |  2. Non-Prefix       |  <- NEW: flat store for non-prefix    |
+|  |     KV Cache Store   |     cached segments (semantic/token)  |
+|  +----------------------+                                       |
++---------------------------------------------------------------+
+
+
+```
+
+#### Storage 1 (existing): Original RadixTree
+
+No changes needed. SGLang's existing `RadixCache` handles exact prefix matching.
+
+#### Storage 2: `NonPrefixKVStore`
+
+*   **Purpose**: Stores all cached segments (both prefix-complete sequences and mid-prompt subsequences) for fuzzy matching.
+    
+*   **Data structure**: Flat list with block-hash indexing. Stores `NodeRef` objects (references to radix tree nodes) instead of duplicating pool indices.
+    
+*   **Write condition**: When `RadixCache.cache_finished_req()` completes and fuzzy caching is enabled, `cache_on_request_finished` is called to store the request's token sequence and node references into the `NonPrefixKVStore`.
+    
+*   **Why NodeRef-based**: Pool indices are stored only in the radix tree's `TreeNode.value`. The fuzzy store references nodes by ID/offset/length, avoiding double-counting in memory accounting.
+    
+
+### 2.3 Component Overview
 
 ```plaintext
 +----------------------------------------------------------+
@@ -122,13 +143,23 @@ No changes needed. SGLang's existing `RadixCache` handles exact prefix 
 |  +----------------------------------------------------+  |
 +----------------------------------------------------------+
 
++----------------------------------------------------------+
+|                  MatchPrefixParams                         |
+|  +----------------------------------------------------+  |
+|  |  key: RadixKey                                       |  |
+|  |  cow_mamba: bool = False                             |  |
+|  |  req: Optional[Req] = None                           |  |
+|  |  caller: str = ""   (for logging identification)     |  |
+|  +----------------------------------------------------+  |
++----------------------------------------------------------+
+
 ```
 
-## 3. FuzzyMatchProvider Interface
+## 3. FuzzyMatchProvider Interface
 
-The `FuzzyMatchProvider` is a pluggable interface that allows community implementations for different fuzzy matching strategies.
+The `FuzzyMatchProvider` is a pluggable interface that allows community implementations for different fuzzy matching strategies.
 
-### 3.1 Abstract Base Class
+### 3.1 Abstract Base Class
 
 ```python
 from abc import ABC, abstractmethod
@@ -211,9 +242,10 @@ class FuzzyMatchProvider(ABC):
         """
         pass
 
+
 ```
 
-### 3.2 Provider Factory
+### 3.2 Provider Factory
 
 ```python
 def create_fuzzy_match_provider(config: FuzzyMatchConfig) -> Optional[FuzzyMatchProvider]:
@@ -229,11 +261,12 @@ def create_fuzzy_match_provider(config: FuzzyMatchConfig) -> Optional[FuzzyMatch
     else:
         raise ValueError(f"Unknown fuzzy match provider: {config.fuzzy_match_provider}")
 
+
 ```
 
-### 3.3 Provider Implementation: TokenBlockMatchProvider
+### 3.3 Provider Implementation: TokenBlockMatchProvider
 
-This provider uses exact token ID matching but allows matching at **any starting position** in the prompt (not just the beginning). Block hashing accelerates the comparison.
+This provider uses exact token ID matching but allows matching at **any starting position** in the prompt (not just the beginning). Block hashing accelerates the comparison.
 
 **Example:**
 
@@ -246,6 +279,7 @@ Remaining from position 4: [A, B, C, D, E, F, M, N]
 
 Fuzzy matching finds [A, B, C, D, E, F] (6 tokens) matches.
 Total matched: 4 (exact) + 6 (fuzzy) = 10 tokens
+
 
 ```
 ```python
@@ -373,9 +407,10 @@ class TokenBlockMatchProvider(FuzzyMatchProvider):
             _match_entry=entry,
         )
 
+
 ```
 
-### 3.4 Supporting Data Structures
+### 3.4 Supporting Data Structures
 
 ```python
 @dataclass
@@ -543,14 +578,14 @@ class NonPrefixKVStore:
         """TODO: Not yet implemented. Reserved for future embedding-based matching."""
         raise NotImplementedError("Semantic matching is not yet implemented.")
 
+
 ```
----
 
-## 4. Integration with RadixCache
+## 4. Integration with RadixCache
 
-### 4.1 Modified `match_prefix` Flow
+### 4.1 Modified `match_prefix` Flow
 
-The existing `RadixCache.match_prefix()` is extended to invoke fuzzy matching when exact matching falls short.
+The existing `RadixCache.match_prefix()` is extended to invoke fuzzy matching when exact matching falls short.
 
 ```python
 class RadixCache:
@@ -578,35 +613,61 @@ class RadixCache:
 
         exact_matched_len = len(value)
         total_len = len(key.token_ids)
+        caller_tag = f" caller={params.caller}" if params.caller else ""
 
         # Step 2: If exact match is incomplete AND fuzzy is enabled, try fuzzy matching
-        if exact_matched_len < total_len and self.fuzzy_match_provider is not None:
-            fuzzy_result = self.match_prefix_fuzzy(
-                params=MatchPrefixParams(key=key),
-                exact_matched_len=exact_matched_len,
+        fuzzy_matched_len = 0
+        if exact_matched_len < total_len:
+            logger.info(
+                f"[FUZZY RADIX] match_prefix:{caller_tag} exact={exact_matched_len}, fuzzy=0, "
+                f"miss={total_len - exact_matched_len}, total={total_len}, attempting fuzzy..."
             )
 
-            if fuzzy_result is not None:
-                # Merge exact + fuzzy KV indices
-                fuzzy_kv_indices = torch.tensor(
-                    fuzzy_result.kv_cache_indices,
-                    device=value.device,
-                    dtype=value.dtype,
+            if self.fuzzy_match_provider is not None:
+                fuzzy_result = self.match_prefix_fuzzy(
+                    params=MatchPrefixParams(key=key),
+                    exact_matched_len=exact_matched_len,
                 )
 
-                # Mark request as fuzzy-matched
-                if params.req is not None:
-                    params.req.fuzzy_match_result = fuzzy_result
+                if fuzzy_result is not None:
+                    fuzzy_matched_len = fuzzy_result.cached_token_count
+                    miss_len = total_len - exact_matched_len - fuzzy_matched_len
+                    logger.info(
+                        f"[FUZZY RADIX] match_prefix:{caller_tag} exact={exact_matched_len}, "
+                        f"fuzzy={fuzzy_matched_len}, miss={miss_len}, total={total_len}, "
+                        f"cached_start_pos={fuzzy_result.cached_start_pos}"
+                    )
 
-                merged_value = torch.cat([value, fuzzy_kv_indices])
+                    # Merge exact + fuzzy KV indices
+                    fuzzy_kv_indices = torch.tensor(
+                        fuzzy_result.kv_cache_indices,
+                        device=value.device,
+                        dtype=value.dtype,
+                    )
 
-                return MatchResult(
-                    device_indices=merged_value,
-                    last_device_node=last_node,
-                    last_host_node=last_node,
-                    fuzzy_matched_len=fuzzy_result.cached_token_count,
-                    cache_protected_len=exact_matched_len + fuzzy_result.cached_token_count,
-                )
+                    # Mark request as fuzzy-matched
+                    if params.req is not None:
+                        params.req.fuzzy_match_result = fuzzy_result
+
+                    merged_value = torch.cat([value, fuzzy_kv_indices])
+
+                    return MatchResult(
+                        device_indices=merged_value,
+                        last_device_node=last_node,
+                        last_host_node=last_node,
+                        fuzzy_matched_len=fuzzy_result.cached_token_count,
+                        cache_protected_len=exact_matched_len + fuzzy_result.cached_token_count,
+                    )
+                else:
+                    logger.info(
+                        f"[FUZZY RADIX] match_prefix:{caller_tag} exact={exact_matched_len}, fuzzy=0, "
+                        f"miss={total_len - exact_matched_len}, total={total_len}, fuzzy match failed"
+                    )
+        else:
+            logger.info(
+                f"[FUZZY RADIX] match_prefix:{caller_tag} exact={exact_matched_len}, fuzzy=0, "
+                f"miss=0, total={total_len}"
+            )
 
         return MatchResult(
             device_indices=value,
@@ -621,7 +682,6 @@ class RadixCache:
         exact_matched_len: int,
     ) -> Optional[FuzzyMatchResult]:
         """Perform fuzzy prefix matching when exact matching falls short."""
-        # Check minimum match length: need enough exact match to anchor fuzzy search
         if exact_matched_len > 0 and exact_matched_len < self.fuzzy_config.fuzzy_min_match_length:
             return None
 
@@ -636,68 +696,22 @@ class RadixCache:
             logger.error(f"Exception during fuzzy matching: {e}")
             return None
 
+
 ```
 
-### 4.2 `cache_finished_req` Flow
+### 4.2 `cache_finished_req`: Caching to NonPrefixKVStore
 
-When a request finishes, the system handles fuzzy-matched tokens via a **realization** strategy:
+When a request finishes, `cache_finished_req` performs standard radix tree insert (unchanged from baseline SGLang). The fuzzy-specific behavior is the call to `cache_on_request_finished`, which stores the completed request's token sequence and radix tree node references into `NonPrefixKVStore` for future fuzzy matching:
 
 ```python
 def cache_finished_req(self, req: Req, is_insert: bool = True):
     """Cache request when it finishes."""
-    # ... token_ids and kv_indices preparation ...
+    # ... standard radix tree insert (unchanged) ...
 
-    fuzzy_realized = False
-    new_prefix_len = 0
-
-    if is_insert:
-        fuzzy_matched_len = req.cache_fuzzy_matched_len
-        priority = getattr(req, "priority", 0) or 0
-
-        if fuzzy_matched_len > 0:
-            # Fuzzy-matched tokens borrow indices from another request's tree.
-            # Allocate new pool slots and copy KV data to "realize" them.
-            protected_len = req.cache_protected_len
-            new_indices = self.token_to_kv_pool_allocator.alloc(protected_len)
-
-            if new_indices is not None:
-                borrowed_indices = kv_indices[:protected_len]
-
-                # Copy KV data from borrowed slots to new slots
-                kvcache = self.token_to_kv_pool_allocator._kvcache
-                for layer_idx in range(kvcache.start_layer,
-                                       kvcache.start_layer + kvcache.layer_num):
-                    k_buffer, v_buffer = kvcache.get_kv_buffer(layer_idx)
-                    k_buffer[new_indices] = k_buffer[borrowed_indices]
-                    v_buffer[new_indices] = v_buffer[borrowed_indices]
-
-                realized_values = values.clone()
-                realized_values[:protected_len] = new_indices
-                kv_indices[:protected_len] = new_indices
-
-                # Insert realized tokens into radix tree
-                result = self.insert(
-                    InsertParams(key=radix_key, value=realized_values, priority=priority)
-                )
-                new_prefix_len = result.prefix_len
-                fuzzy_realized = True
-            # Note: borrowed indices are NOT freed here -- they belong to
-            # another request's tree (via non_prefix_store) and are freed on eviction.
-        else:
-            # No fuzzy tokens to realize, insert normally
-            result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
-            )
-            new_prefix_len = result.prefix_len
-
-    # Cache to non_prefix_store BEFORE freeing indices.
-    # Skip if fuzzy tokens were already realized and inserted into the radix tree.
-    if self._fuzzy_cache_enabled and not fuzzy_realized:
-        cache_start = getattr(req, 'cache_start_pos', 0)
-        cache_end = getattr(req, 'cache_end_pos', len(token_ids))
-        if cache_end == -1:
-            cache_end = len(token_ids)
-
+    # Fuzzy-specific: cache to NonPrefixKVStore for future fuzzy matching.
+    # This is called BEFORE freeing duplicate indices, since non_prefix_store
+    # stores NodeRef references that must point to valid tree nodes.
+    if self._fuzzy_cache_enabled:
         self.fuzzy_match_provider.cache_on_request_finished(
             request=req,
             token_ids=token_ids,
@@ -707,159 +721,105 @@ def cache_finished_req(self, req: Req, is_insert: bool = True):
             radix_tree=self,
         )
 
-    # Free duplicates already in the tree
-    if is_insert:
-        free_start = req.cache_protected_len
-        free_end = new_prefix_len
-        if free_start < free_end:
-            self.token_to_kv_pool_allocator.free(kv_indices[free_start:free_end])
-    else:
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_fuzzy_matched_len : len(keys)]
-        )
-
-    # Free the unaligned tail
-    self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
-
-    self.dec_lock_ref(req.last_node)
+    # ... standard duplicate slot freeing (unchanged) ...
 
 ```
 
-### 4.3 Position ID Adjustment
+Note: Fuzzy token realization (new pool slots + RoPE correction) has already been done by `model_runner._correct_fuzzy_kv_rope` before the forward pass. By the time `cache_finished_req` runs, and the KV indices in `req_to_token_pool` already point to the correctly RoPE-corrected new slots.
 
-RoPE reversal is handled at the model level in `forward_prepare_native` using `fuzzy_cached_start_pos`. The `FuzzyMatchResult.cached_start_pos` field carries the original position information.
+## 5. RoPE Handling
+
+### 5.1 The Problem
+
+SGLang applies RoPE at the model layer during forward pass. The KV cache stores **after-RoPE** key vectors. This means:
+
+*   Cached K at position `p` has rotation `R(p)` already applied: `K_cached = R(p) * K_raw`
+    
+*   If we want to reuse this cache at a different position `q`, we need: `K_new = R(q) * K_raw`
+    
+*   We can recover `K_raw` by reverse rotation: `K_raw = R(-p) * K_cached`
+    
+*   Then apply new rotation: `K_new = R(q) @ R(-p) @ K_cached = R(q-p) @ K_cached`
+    
+
+There are two ways to achieve this. 1、**Reverse at Storage:** Apply `reverse-RoPE` when storing the cache to save it in a pre-RoPE state. During inference, the model applies RoPE according to its original logic (though this may require adjusting `position_ids` outside the model layer). 2、**Reverse at Runtime:** Store the post-RoPE KVCache directly. During inference, perform a `reverse-RoPE` followed by an `apply-RoPE` operation.
+
+Currently we adopt Reverse at Runtime, which means the start and end positions of the stored KVCache must also be persisted.
+
+### 5.2 Reverse at Runtime by New-Slot Allocation with RoPE Correction
+
+Before the forward pass, `model_runner._correct_fuzzy_kv_rope` handles RoPE correction for fuzzy-matched tokens:
+
+1.  **Allocate new pool slots** for the fuzzy tokens (preserving original pool locations which belong to the source request's radix tree).
+    
+2.  **Copy V** directly from old slots to new slots (V has no positional encoding).
+    
+3.  **Copy K with RoPE correction**: For each layer, reverse the old RoPE at `cached_start_pos` and apply new RoPE at `exact_matched_len` (the target position in the current request).
+    
+4.  **Update** `**req_to_token_pool**` to point to the new slots.
+    
+
+Core logic (simplified from `model_runner._correct_fuzzy_kv_rope`):
 
 ```python
-# In the model's forward preparation:
-if req.fuzzy_match_result is not None:
-    cached_start_pos = req.fuzzy_match_result.cached_start_pos
-    # Use cached_start_pos for RoPE reversal of the fuzzy-matched tokens
+# Locate fuzzy tokens in the pool
+fuzzy_start = exact_matched_len
+fuzzy_end = exact_matched_len + cache_fuzzy_matched_len
+old_indices = req_to_token_pool[req_pool_idx, fuzzy_start:fuzzy_end]
 
+# 1. Allocate new pool slots
+new_indices = token_to_kv_pool.alloc(cache_fuzzy_matched_len)
+
+# 2. Compute cos/sin for old and new positions
+cos_old, sin_old = cos_sin_cache[cached_start_pos : cached_start_pos + cache_fuzzy_matched_len]
+cos_new, sin_new = cos_sin_cache[exact_matched_len : exact_matched_len + cache_fuzzy_matched_len]
+
+# 3. Per-layer: copy V directly, copy K with RoPE correction
+for layer_id in range(num_layers):
+    v_old = token_to_kv_pool.get_value(layer_id, old_indices)
+    token_to_kv_pool.set_value(layer_id, new_indices, v_old)          # V: direct copy
+
+    k_old = token_to_kv_pool.get_key(layer_id, old_indices)
+    k_no_rope = reverse_rotary_emb(k_old, cos_old, sin_old, is_neox)  # undo old RoPE
+    k_new = apply_rotary_emb(k_no_rope, cos_new, sin_new, is_neox)    # apply new RoPE
+    token_to_kv_pool.set_key(layer_id, new_indices, k_new)
+
+# 4. Update req_to_token_pool to point to new slots
+req_to_token_pool[req_pool_idx, fuzzy_start:fuzzy_end] = new_indices
 ```
-
-## 5. RoPE Handling
-
-### 5.1 The Problem
-
-SGLang applies RoPE at the model layer during forward pass. The KV cache stores **after-RoPE** key vectors. This means:
-
-*   Cached K at position `p` has rotation `R(p)` already applied: `K_cached = R(p) @ K_raw`
-    
-*   If we want to reuse this cache at a different position `q`, we need: `K_new = R(q) @ K_raw`
-    
-*   We can recover `K_raw` by reverse rotation: `K_raw = R(-p) @ K_cached`
-    
-*   Then apply new rotation: `K_new = R(q) @ R(-p) @ K_cached = R(q-p) @ K_cached`
-    
-
-Currently, RoPE operations are implemented within the model layer, preventing the direct external storage of pre-RoPE KVCache. Consequently, there are two approaches to retrieve pre-RoPE KVCache:
-
-Reverse at Storage: Apply `reverse-RoPE` when storing the cache to save it in a pre-RoPE state. During inference, the model applies RoPE according to its original logic (though this may require adjusting `position_ids` outside the model layer).
-
-Reverse at Runtime: Store the post-RoPE KVCache directly. During inference, perform a `reverse-RoPE` followed by an `apply-RoPE` operation.
-
-Currently we adopt Reverse at Runtime, which means the start and end positions of the stored KVCache must also be persisted.
-
-### 5.2 Model-Level RoPE Reversal Implementation
-
-At the model level (e.g., `Qwen3Attention.forward_prepare_native`), the system performs explicit RoPE reversal and re-application:
-
-```python
-def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
-    qkv, _ = self.qkv_proj(hidden_states)
-    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-    # Check if fuzzy-matched tokens need RoPE repositioning
-    fuzzy_matched_len = getattr(forward_batch, 'fuzzy_matched_len', 0)
-    fuzzy_cached_start_pos = getattr(forward_batch, 'fuzzy_cached_start_pos', 0)
-
-    if fuzzy_matched_len > 0 and fuzzy_cached_start_pos > 0:
-        num_fuzzy = fuzzy_matched_len
-
-        # Original positions where the cached KV was computed
-        orig_positions = torch.arange(
-            fuzzy_cached_start_pos,
-            fuzzy_cached_start_pos + num_fuzzy,
-            device=positions.device,
-        )
-        # New positions where the KV will be used
-        new_positions = positions[:num_fuzzy]
-
-        k_fuzzy = k[:num_fuzzy].clone()
-
-        # Step 1: Reverse RoPE to get raw K
-        q_dummy = torch.zeros_like(k_fuzzy)
-        _, k_raw = self.reverse_rotary_emb(orig_positions, q_dummy, k_fuzzy)
-
-        # Step 2: Apply RoPE at new positions
-        q_dummy2 = torch.zeros_like(k_raw)
-        _, k_repositioned = self.rotary_emb(new_positions, q_dummy2, k_raw)
-
-        # Replace fuzzy portion of K with repositioned version
-        k = torch.cat([k_repositioned, k[num_fuzzy:]], dim=0)
-
-    # Apply normal RoPE to all tokens
-    q, k = self.rotary_emb(positions, q, k)
-    return q, k, v
-
-```
-
-The `ReverseRotaryEmbedding` module is created during model initialization:
-
-```python
-# In Qwen3Attention.__init__:
-self.reverse_rotary_emb = get_reverse_rope(
-    self.head_dim,
-    rotary_dim=self.head_dim,
-    max_position=max_position_embeddings,
-    base=rope_theta,
-    is_neox_style=self.rotary_emb.is_neox_style,
-    rope_scaling=rope_scaling,
-)
-
-```
-
-#### 4.3.4 Key Implementation Details
-
-1.  **Only K is affected**: Q is newly computed from the current prompt, so it doesn't need RoPE adjustment. Only the fuzzy-matched K tokens (which came from cached KV with RoPE already applied) need reversal.
-    
-2.  **Dummy Q for RoPE API**: The `rotary_emb` and `reverse_rotary_emb` APIs take both Q and K. A zero tensor is passed as dummy Q since only K needs adjustment.
-    
-3.  **Clone to avoid in-place modification**: `k_fuzzy = k[:num_fuzzy].clone()` ensures the original tensor is not modified.
-    
-4.  **Standard RoPE applied after**: After fuzzy repositioning, `self.rotary_emb(positions, q, k)` is called on all tokens, which applies RoPE to the non-fuzzy portion and re-applies to the fuzzy portion (which was already repositioned).
-    
-
 ---
 
-## 6. Request Flow
+## 6. Request Flow
 
-### 6.1 Flowchart
+### 6.1 Flowchart
 
 ```mermaid
 flowchart TD
-    A[New Request arrives] --> B[Tokenize prompt\nGet full token IDs]
-    B --> C[Exact prefix match\non original RadixTree]
-    C --> D{Matched n tokens\nNeed L total}
-    D -->|n >= L\nfully matched| E[Proceed with compute\nfor remaining tokens]
-    D -->|n < L\npartial match| F{Fuzzy matching\nenabled?}
-    F -->|Yes| G[Call provider\nmatch_on_prefix_miss]
-    F -->|No| H[Proceed with compute\nfor all remaining tokens]
+    A[New Request arrives] --> B[Tokenize prompt, get full token IDs]
+    B --> C[Exact prefix match on original RadixTree]
+    C --> D{Matched n tokens, Need L total}
+    D -->|n >= L, fully matched| E[Proceed with compute for remaining tokens]
+    D -->|n < L, partial match| F{Fuzzy matching enabled?}
+    F -->|Yes| G[Call provider match_on_prefix_miss]
+    F -->|No| H[Proceed with compute for all remaining tokens]
     G --> I{Match found?}
-    I -->|Yes| J[Reuse cached KV\nvia resolved pool indices\nCompute remaining tokens]
+    I -->|Yes| J[Merge exact + fuzzy KV indices]
     I -->|No| H
-    J --> K[Model forward\nfor unmatched tokens only]
-    H --> K
-    K --> L[Request complete\ncache_finished_req]
-    L --> M{fuzzy_matched > 0?}
-    M -->|Yes| N[Realize: alloc new slots\ncopy KV data\ninsert into radix tree]
-    M -->|No| O[Cache to non_prefix_store\nwith NodeRef references]
-    N --> O
-    O --> P[Done]
+    J --> K[forward_extend: _correct_fuzzy_kv_rope allocates new pool slots, corrects RoPE on K]
+    H --> K2[forward_extend: normal forward]
+    K --> L[Model forward for unmatched tokens only]
+    K2 --> L
+    L --> M[cache_unfinished_req: insert into radix tree, re-match to sync indices]
+    M --> N[Decode phase: generate remaining tokens]
+    N --> O[Request complete: cache_finished_req]
+    O --> P[Cache to non_prefix_store with NodeRef references]
+    P --> Q[Free duplicate pool slots]
+    Q --> R[Done]
+
 
 ```
 
-### 6.2 Sequence Diagram
+### 6.2 Sequence Diagram
 
 ```mermaid
 sequenceDiagram
@@ -869,9 +829,10 @@ sequenceDiagram
     participant P as FuzzyMatchProvider
     participant N as NonPrefixKVStore
     participant T as RadixTree
+    participant MR as ModelRunner
 
     C->>S: Request
-    S->>R: match_prefix()
+    S->>R: match_prefix(caller="scheduling")
     R->>R: exact prefix match
     alt n < total_len and fuzzy enabled
         R->>P: match_on_prefix_miss(prompt_ids, n, extra_key)
@@ -884,26 +845,37 @@ sequenceDiagram
         N-->>P: pool indices tensor
         P-->>R: FuzzyMatchResult
     end
-    R-->>S: MatchResult (exact + fuzzy)
-    S->>S: forward pass (remaining tokens)
-    R-->>S: output
-    S-->>C: Response
-    S->>R: cache_finished_req()
-    alt fuzzy_matched > 0
-        R->>R: realize: alloc new slots, copy KV, insert into tree
-    end
-    alt _fuzzy_cache_enabled and not realized
+    R-->>S: MatchResult (exact + fuzzy + miss breakdown)
+
+    S->>MR: forward_extend(forward_batch)
+    MR->>MR: _correct_fuzzy_kv_rope: alloc new slots, copy V, correct K RoPE
+    Note over MR: Sets req.cache_fuzzy_matched_len = 0
+    MR->>MR: model forward pass (compute miss tokens only)
+    MR-->>S: output (first generated token)
+
+    S->>R: cache_unfinished_req(req)
+    R->>R: insert into tree (fuzzy slots now have correct RoPE)
+    R->>R: match_prefix(caller="cache_unfinished_req") to re-sync indices
+
+    Note over S: Decode phase: generate remaining tokens
+
+    S->>R: cache_finished_req(req)
+    alt _fuzzy_cache_enabled
         R->>P: cache_on_request_finished()
         P->>T: _create_node_refs_from_tree()
         P->>N: insert(token_ids, node_refs)
     end
+    R->>R: free duplicate pool slots
+    R-->>S: done
+    S-->>C: Response
+
 
 ```
 ---
 
-## 6. Configuration
+## 7. Configuration
 
-### 6.1 Server Arguments
+### 7.1 Server Arguments
 
 ```python
 @dataclass
@@ -918,9 +890,10 @@ class FuzzyMatchConfig:
     fuzzy_block_size: int = 16
     embedding_model_name: str = "all-MiniLM-L6-v2"
 
+
 ```
 
-### 6.2 Example Usage
+### 7.2 Example Usage
 
 ```bash
 python3 -m sglang.launch_server \
@@ -931,7 +904,7 @@ python3 -m sglang.launch_server \
     --fuzzy-match-provider TokenBlockMatch \
     --cache-fuzzy-results
 
-#case1:
+#case1: Cache a segment starting from position 4, then fuzzy-match it
 curl http://127.0.0.1:30000/v1/completions     -H "Content-Type: application/json"     -d '{
         "model": "/mnt/models/Qwen/Qwen3-4B",
         "prompt": "书上说：人工智能是计算机科学的一个分支，它试图理解智能的实质。",
@@ -948,7 +921,7 @@ curl http://127.0.0.1:30000/v1/completions     -H "Content-Type: application/jso
         "temperature": 0
     }
 
-#case2:
+#case2: Three-request scenario testing exact + fuzzy reuse
 curl http://127.0.0.1:30000/v1/completions     -H "Content-Type: application/json"     -d '{
         "model": "/mnt/models/Qwen/Qwen3-4B",
         "prompt": "人工智能是计算机科学的一个分支，它试图理解智能的实质。",
@@ -970,25 +943,37 @@ curl http://127.0.0.1:30000/v1/completions     -H "Content-Type: application/jso
         "temperature": 0
     }'
 
+
 ```
 ---
 
-## Appendix: File Locations
+## Appendix: File Locations
 
 ```plaintext
 python/sglang/srt/
-├── mem_cache/
-│   ├── radix_cache.py              # Modified: fuzzy match integration
-│   ├── base_prefix_cache.py        # Modified: added fuzzy_matched_len, cache_protected_len
-│   └── fuzzy_match/
-│       ├── __init__.py             # Package exports
-│       ├── config.py               # FuzzyMatchConfig
-│       ├── fuzzy_match_provider.py # Abstract FuzzyMatchProvider, FuzzyMatchResult
-│       ├── token_block_match.py    # TokenBlockMatchProvider implementation
-│       └── non_prefix_store.py     # NonPrefixKVStore, NonPrefixEntry, NodeRef
-├── managers/
-│   └── schedule_batch.py           # Modified: cache_fuzzy_matched_len, cache_protected_len
-└── model_executor/
-    └── forward_batch_info.py       # Modified: fuzzy_matched_len, fuzzy_cached_start_pos
++-- mem_cache/
+|   +-- radix_cache.py              # Modified: fuzzy match integration, match_prefix with
+|   |                                  caller logging, cache_on_request_finished in cache_finished_req
+|   +-- base_prefix_cache.py        # Modified: MatchPrefixParams.caller field,
+|   |                                  fuzzy_matched_len, cache_protected_len
+|   +-- fuzzy_match/
+|       +-- __init__.py             # Package exports
+|       +-- config.py               # FuzzyMatchConfig
+|       +-- fuzzy_match_provider.py # Abstract FuzzyMatchProvider, FuzzyMatchResult
+|       +-- token_block_match.py    # TokenBlockMatchProvider implementation
+|       +-- non_prefix_store.py     # NonPrefixKVStore, NonPrefixEntry, NodeRef
++-- managers/
+|   +-- schedule_batch.py           # Modified: cache_fuzzy_matched_len, cache_protected_len,
+|   |                                  match_prefix caller="scheduling"
+|   +-- schedule_policy.py          # Modified: match_prefix caller="schedule_policy"
++-- model_executor/
+|   +-- model_runner.py             # Modified: _correct_fuzzy_kv_rope (new-slot allocation),
+|   |                                  called in forward_extend
+|   +-- forward_batch_info.py       # Modified: fuzzy_matched_len, fuzzy_cached_start_pos,
+|                                      reqs field for signaling cache_fuzzy_matched_len=0
++-- layers/
+    +-- rotary_embedding/
+        +-- utils.py                # New: apply_rotary_emb, reverse_rotary_emb helpers
+
 
 ```

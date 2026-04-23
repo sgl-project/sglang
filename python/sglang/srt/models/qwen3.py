@@ -19,7 +19,6 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.rotary_embedding.factory import get_reverse_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -142,16 +141,6 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        # Create reverse RoPE embedding for fuzzy match support
-        self.reverse_rotary_emb = get_reverse_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            is_neox_style=self.rotary_emb.is_neox_style,
-            rope_scaling=rope_scaling,
-        )
-
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -175,7 +164,7 @@ class Qwen3Attention(nn.Module):
             self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
             self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
-    def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
+    def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
@@ -186,44 +175,6 @@ class Qwen3Attention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
-        
-        # Handle fuzzy match RoPE repositioning at model level.
-        # Fuzzy-matched K tokens come from KV cache with RoPE at cached_start_pos,
-        # but need RoPE at their NEW positions. We:
-        # 1. Reverse RoPE on fuzzy-matched K to get raw K
-        # 2. Apply RoPE at the new positions
-        # Q is NOT affected - it's newly computed.
-        fuzzy_matched_len = getattr(forward_batch, 'fuzzy_matched_len', 0) if forward_batch else 0
-        fuzzy_cached_start_pos = getattr(forward_batch, 'fuzzy_cached_start_pos', 0) if forward_batch else 0
-        
-        if fuzzy_matched_len > 0 and fuzzy_cached_start_pos > 0:
-            num_fuzzy = fuzzy_matched_len
-            
-            # Get positions for original (cached) and new positions
-            orig_positions = torch.arange(
-                fuzzy_cached_start_pos, 
-                fuzzy_cached_start_pos + num_fuzzy, 
-                device=positions.device
-            )
-            new_positions = positions[:num_fuzzy]
-            
-            # Process only the fuzzy-matched portion of K
-            k_fuzzy = k[:num_fuzzy].clone()  # Clone to avoid in-place modification
-            
-            # Step 1: Reverse RoPE to get raw K using factory's reverse_rotary_emb
-            # The forward method of ReverseRotaryEmbedding takes positions and q, k
-            # and returns them with RoPE reversed
-            q_dummy = torch.zeros_like(k_fuzzy)
-            _, k_raw = self.reverse_rotary_emb(orig_positions, q_dummy, k_fuzzy)
-            
-            # Step 2: Apply RoPE at new positions using the standard rotary_emb
-            q_dummy2 = torch.zeros_like(k_raw)
-            _, k_repositioned = self.rotary_emb(new_positions, q_dummy2, k_raw)
-            
-            # Replace fuzzy portion of K with repositioned version
-            k = torch.cat([k_repositioned, k[num_fuzzy:]], dim=0)
-        
-        # Apply normal RoPE to all tokens
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
@@ -337,7 +288,6 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
-                forward_batch=forward_batch,
             )
         else:
             q, k, v = self.forward_prepare_npu(

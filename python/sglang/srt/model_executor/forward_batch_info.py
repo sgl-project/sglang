@@ -439,6 +439,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For fuzzy prefix matching
     fuzzy_matched_len: int = 0  # Number of tokens from fuzzy match
     fuzzy_cached_start_pos: int = 0  # Original position where fuzzy KV was computed
+    # Reference to req objects (for fuzzy realization flag propagation)
+    reqs: Optional[list] = None
 
     @classmethod
     def init_new(
@@ -493,6 +495,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Populate fuzzy match info from the first request (single-request batch assumption)
         if batch.reqs and len(batch.reqs) > 0:
+            ret.reqs = batch.reqs
             first_req = batch.reqs[0]
             ret.fuzzy_matched_len = getattr(first_req, 'cache_fuzzy_matched_len', 0)
             fuzzy_match_result = getattr(first_req, 'fuzzy_match_result', None)

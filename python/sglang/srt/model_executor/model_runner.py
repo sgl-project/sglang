@@ -2750,6 +2750,114 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             **kwargs,
         )
 
+    def _correct_fuzzy_kv_rope(self, forward_batch: ForwardBatch):
+        """Correct RoPE on fuzzy-matched K values by allocating new pool slots.
+
+        Fuzzy-matched tokens have their K values stored in the pool with RoPE
+        applied at the original cached positions. We allocate new pool slots,
+        copy V directly and K with RoPE correction (reverse old + apply new),
+        then update req_to_token_pool to point to the new slots.
+
+        This avoids mutating the original pool locations (which belong to the
+        radix tree of another request) and eliminates the need for save/restore.
+        """
+        num_fuzzy = forward_batch.fuzzy_matched_len
+        cached_start_pos = forward_batch.fuzzy_cached_start_pos
+        if num_fuzzy <= 0:
+            return
+
+        pool = forward_batch.token_to_kv_pool
+        if not hasattr(pool, 'k_buffer'):
+            return
+
+        # Get the pool locations for fuzzy-matched tokens.
+        # prefix_len = exact_matched_len + fuzzy_matched_len
+        # fuzzy tokens occupy the LAST fuzzy_matched_len positions of the prefix.
+        req_idx = forward_batch.req_pool_indices[0].item()
+        prefix_len = forward_batch.extend_prefix_lens_cpu[0]
+        exact_matched_len = prefix_len - num_fuzzy
+
+        # Skip RoPE correction if positions are already correct
+        if cached_start_pos == exact_matched_len:
+            return
+        old_fuzzy_locs = forward_batch.req_to_token_pool.req_to_token[
+            req_idx, exact_matched_len:prefix_len
+        ]
+
+        # Allocate new pool slots for the fuzzy tokens
+        new_fuzzy_locs = self.token_to_kv_pool_allocator.alloc(num_fuzzy)
+        if new_fuzzy_locs is None:
+            logger.warning("[FUZZY] Failed to allocate new pool slots for fuzzy tokens, skipping RoPE correction")
+            return
+
+        # Compute old and new positions
+        device = pool.k_buffer[0].device
+        old_positions = torch.arange(
+            cached_start_pos, cached_start_pos + num_fuzzy,
+            device=device, dtype=torch.long,
+        )
+        new_positions = torch.arange(
+            exact_matched_len, exact_matched_len + num_fuzzy,
+            device=device, dtype=torch.long,
+        )
+
+        # Get the rotary embedding's cos_sin_cache from the model.
+        rotary_emb = None
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            layer0 = self.model.model.layers[0]
+            if hasattr(layer0, 'self_attn') and hasattr(layer0.self_attn, 'rotary_emb'):
+                rotary_emb = layer0.self_attn.rotary_emb
+        if rotary_emb is None:
+            logger.warning("[FUZZY] Cannot find rotary_emb on model, skipping RoPE correction")
+            self.token_to_kv_pool_allocator.free(new_fuzzy_locs)
+            return
+
+        cos_sin_cache = rotary_emb.cos_sin_cache
+        is_neox_style = rotary_emb.is_neox_style
+        rotary_dim = rotary_emb.rotary_dim
+
+        # Get cos/sin for old and new positions
+        old_cos_sin = cos_sin_cache.index_select(0, old_positions)
+        new_cos_sin = cos_sin_cache.index_select(0, new_positions)
+        old_cos, old_sin = old_cos_sin.chunk(2, dim=-1)
+        new_cos, new_sin = new_cos_sin.chunk(2, dim=-1)
+
+        from sglang.srt.layers.rotary_embedding.utils import (
+            apply_rotary_emb,
+            reverse_rotary_emb,
+        )
+
+        for layer_id in range(pool.layer_num):
+            # Copy V directly to new slots
+            pool.v_buffer[layer_id][new_fuzzy_locs] = pool.v_buffer[layer_id][old_fuzzy_locs]
+
+            # Copy K with RoPE correction to new slots
+            k = pool.k_buffer[layer_id][old_fuzzy_locs]  # [num_fuzzy, head_num, head_dim]
+            k_rot = k[..., :rotary_dim]
+            k_pass = k[..., rotary_dim:]
+
+            k_raw = reverse_rotary_emb(k_rot, old_cos, old_sin, is_neox_style)
+            k_new = apply_rotary_emb(k_raw, new_cos, new_sin, is_neox_style)
+
+            pool.k_buffer[layer_id][new_fuzzy_locs] = torch.cat(
+                (k_new, k_pass), dim=-1
+            )
+
+        # Update req_to_token_pool to point to new slots
+        forward_batch.req_to_token_pool.req_to_token[
+            req_idx, exact_matched_len:prefix_len
+        ] = new_fuzzy_locs
+
+        # Mark fuzzy tokens as realized so cache_finished_req skips the realize step
+        if forward_batch.reqs and len(forward_batch.reqs) > 0:
+            forward_batch.reqs[0].cache_fuzzy_matched_len = 0
+
+        logger.info(
+            f"[FUZZY] Realized {num_fuzzy} fuzzy tokens: allocated new pool slots, "
+            f"corrected RoPE from positions [{cached_start_pos}..{cached_start_pos + num_fuzzy - 1}] "
+            f"to [{exact_matched_len}..{prefix_len - 1}]"
+        )
+
     def forward_extend(
         self,
         forward_batch: ForwardBatch,
@@ -2758,6 +2866,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
+        # Correct RoPE on fuzzy-matched K values by allocating new pool slots
+        self._correct_fuzzy_kv_rope(forward_batch)
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
