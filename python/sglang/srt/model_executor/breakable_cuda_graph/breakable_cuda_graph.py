@@ -248,15 +248,11 @@ class BreakableCUDAGraph:
     def replay(self) -> None:
         stream = torch.cuda.current_stream()
         token = _current_stream_var.set(stream)
-        i = -1
         try:
             for i, seg in enumerate(self._segments):
                 seg.replay()
                 if i < len(self._break_fns):
                     self._break_fns[i]()
-        except Exception as e:
-            logger.exception("[BCG] replay failed at segment %d: %s", i, e)
-            raise
         finally:
             _current_stream_var.reset(token)
 
