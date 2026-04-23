@@ -239,9 +239,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         # official LTX-2.3 HQ output. Legacy two-stage paths were baselined
         # against `batch.generator`'s natural advance through stage-1, so keep
         # them on the original `_randn_like_with_batch_generators` sampling.
-        is_hq_pipeline = (
-            server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
-        )
+        is_hq_pipeline = server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
         if is_hq_pipeline:
             video_reference_for_gen = (
                 batch.latents if isinstance(batch.latents, torch.Tensor) else None
@@ -284,9 +282,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 ).to(prepared_latents.dtype)
         else:
             if is_hq_pipeline:
-                video_noise = self._ltx2_renoise_like(
-                    batch.latents, renoise_generator
-                )
+                video_noise = self._ltx2_renoise_like(batch.latents, renoise_generator)
                 batch.latents = (
                     video_noise.float() * noise_scale
                     + batch.latents.float() * (1.0 - noise_scale)
@@ -313,9 +309,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                     batch.audio_latents, batch
                 )
                 audio_scaled_mask = (
-                    torch.ones_like(
-                        batch.audio_latents[..., :1], dtype=torch.float32
-                    )
+                    torch.ones_like(batch.audio_latents[..., :1], dtype=torch.float32)
                     * noise_scale
                 )
                 batch.audio_latents = (
