@@ -1,0 +1,533 @@
+---
+title: GLM-4.5V
+metatags:
+    description: "Deploy GLM-4.5V vision-language model with SGLang - SOTA multimodal performance, 64K context, image reasoning and video understanding."
+---
+
+## 1. Model Introduction
+
+[GLM-4.5V](https://huggingface.co/zai-org/GLM-4.5V) is a state-of-the-art multimodal vision-language model from ZhipuAI, built on the next-generation flagship text foundation model GLM-4.5-Air (106B parameters, 12B active). It achieves SOTA performance among models of the same scale across 42 public vision-language benchmarks. Through efficient hybrid training, GLM-4.5V focuses on real-world usability and enables full-spectrum vision reasoning across diverse visual content types.
+
+**Hardware Support:** NVIDIA B200/H100/H200, AMD MI300X/MI325X/MI355X
+
+GLM-4.5V introduces several key features:
+
+- **Image Reasoning & Grounding** Scene understanding, complex multi-image analysis, and spatial recognition with precise visual element localization. Supports bounding box predictions with normalized coordinates (0-1000) for accurate object detection.
+- **Video Understanding** Long video segmentation and event recognition, supporting comprehensive temporal analysis across extended video sequences.
+- **GUI Agent Tasks** Screen reading, icon recognition, and desktop operation assistance for agent-based applications. Enables natural interaction with graphical user interfaces.
+- **Complex Chart & Long Document Parsing** Research report analysis and information extraction from documents with text, charts, tables, and figures. Processes up to 64K tokens of multimodal context.
+- **Thinking Mode Switch** Allows users to balance between quick responses and deep reasoning. Users can enable/disable Chain-of-Thought reasoning based on task requirements for improved accuracy and interpretability.
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+The GLM-4.5V offers models in various sizes and architectures, optimized for different hardware platforms. The recommended launch configurations vary by hardware and model size.
+
+**Interactive Command Generator**: Use the interactive configuration generator below to customize your deployment settings. Select your hardware platform, model size, quantization method, and other options to generate the appropriate launch command.
+
+import { GLM45VDeployment } from "/src/snippets/autoregressive/glm-45v-deployment.jsx";
+
+<GLM45VDeployment />
+
+### 3.2 Configuration Tips
+- **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)
+- **TP=8 Configuration**: When using Tensor Parallelism (TP) of 8, the vision attention's 12 heads cannot be evenly divided. You can resolve this by adding `--mm-enable-dp-encoder`.
+- **Fast Model Loading**: For large models (like the 106B version), you can speed up model loading by using `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
+- For more detailed configuration tips, please refer to [GLM-4.5V/GLM-4.6V Usage](../../../docs/basic_usage/glmv).
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+- [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Multi-Modal Inputs
+
+GLM-4.5V supports both image and video inputs. Here's a basic example with image input:
+
+```python Example
+import time
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="EMPTY",
+    base_url="http://localhost:30000/v1",
+    timeout=3600
+)
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png"
+                }
+            },
+            {
+                "type": "text",
+                "text": "Describe this image in detail."
+            }
+        ]
+    }
+]
+
+start = time.time()
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.5V",
+    messages=messages,
+    max_tokens=2048
+)
+print(f"Response costs: {time.time() - start:.2f}s")
+print(f"Generated text: {response.choices[0].message.content}")
+```
+
+**Example Output:**
+
+```text Output
+Response costs: 3.37s
+Generated text: Auntie Anne's
+
+CINNAMON SUGAR
+1 x 17,000                    17,000
+
+SUB TOTAL                    17,000
+
+GRAND TOTAL                  17,000
+
+CASH IDR                     20,000
+
+CHANGE DUE                  3,000
+```
+
+**Multi-Image Input Example:**
+
+GLM-4.5V can process multiple images in a single request for comparison or analysis:
+
+```python Example
+import time
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="EMPTY",
+    base_url="http://localhost:30000/v1",
+    timeout=3600
+)
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://www.civitatis.com/f/china/hong-kong/guia/taxi.jpg"
+                }
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://cdn.cheapoguides.com/wp-content/uploads/sites/7/2025/05/GettyImages-509614603-1280x600.jpg"
+                }
+            },
+            {
+                "type": "text",
+                "text": "Compare these two images and describe the differences in 100 words or less. Focus on the key visual elements, colors, textures, and any notable contrasts between the two scenes. Be specific about what you see in each image."
+            }
+        ]
+    }
+]
+
+start = time.time()
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.5V",
+    messages=messages,
+    max_tokens=2048
+)
+print(f"Response costs: {time.time() - start:.2f}s")
+print(f"Generated text: {response.choices[0].message.content}")
+```
+
+**Example Output:**
+
+```text Output
+Response costs: 3.86s
+Generated text: The first image shows a close - up of a few red taxis on a street with storefronts in the background. The taxis are in a line, and the scene has an urban, busy feel with visible shop displays. The second image is an aerial view of a large taxi parking area with numerous red and green taxis, some with hoods open. The scene is more open, with a parking lot layout, and includes elements like a bridge and grassy areas. Key differences: number of taxis (few vs many), perspective (close - up vs aerial), color variety (mostly red vs red and green), and setting (street with shops vs parking lot).
+```
+
+**Video Input Example:**
+
+GLM-4.5V supports video understanding by processing video URLs:
+
+```python Example
+import time
+from openai import OpenAI
+
+client = OpenAI(
+    api_key="EMPTY",
+    base_url="http://localhost:30000/v1",
+    timeout=3600
+)
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": "https://videos.pexels.com/video-files/4114797/4114797-uhd_3840_2160_25fps.mp4"
+                }
+            },
+            {
+                "type": "text",
+                "text": "Describe what happens in this video."
+            }
+        ]
+    }
+]
+
+start = time.time()
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.5V",
+    messages=messages,
+    max_tokens=2048
+)
+print(f"Response costs: {time.time() - start:.2f}s")
+print(f"Generated text: {response.choices[0].message.content}")
+```
+
+**Note:**
+
+- For video processing, ensure you have sufficient context length configured (up to 64K tokens)
+- Video processing may require more memory; adjust `--mem-fraction-static` accordingly
+- You can also provide local file paths using `file://` protocol
+
+**Example Output:**
+
+```text Output
+Response costs: 3.89s
+Generated text: A person wearing blue gloves is using a microscope. They are adjusting the focus knob with one hand while holding a pipette with the other, suggesting they are preparing or examining a sample on the slide beneath the objective lens. The microscope's 40x objective lens is positioned over the slide, indicating a high-magnification observation. The person carefully manipulates the slide and the microscope controls, likely to achieve a clear view of the specimen.
+```
+
+#### 4.2.2 Thinking Mode
+
+GLM-4.5V supports thinking mode for enhanced reasoning. Enable thinking mode during deployment:
+
+```shell Command
+python -m sglang.launch_server \
+  --model-path zai-org/GLM-4.5V \
+  --reasoning-parser glm45 \
+  --tp 4 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+**Streaming with Thinking Process:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Enable streaming to see the thinking process in real-time
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.5V",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    temperature=0.7,
+    max_tokens=2048,
+    stream=True
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
+
+**Disable Thinking Mode:**
+
+To disable thinking mode for a specific request:
+
+```python Example
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.5V",
+    messages=[{"role": "user", "content": "What is the capital of France?"}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+)
+```
+
+#### 4.2.3 Tool Calling
+
+GLM-4.5V supports tool calling capabilities. Enable the tool call parser:
+
+```shell Command
+python -m sglang.launch_server \
+  --model-path zai-org/GLM-4.5V \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm45 \
+  --tp 4 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+**Python Example (with Thinking Process):**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.5V",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    temperature=0.7,
+    stream=True
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+tool_calls_accumulator = {}
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Accumulate tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================\n", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                index = tool_call.index
+                if index not in tool_calls_accumulator:
+                    tool_calls_accumulator[index] = {
+                        'name': None,
+                        'arguments': ''
+                    }
+
+                if tool_call.function:
+                    if tool_call.function.name:
+                        tool_calls_accumulator[index]['name'] = tool_call.function.name
+                    if tool_call.function.arguments:
+                        tool_calls_accumulator[index]['arguments'] += tool_call.function.arguments
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+# Print accumulated tool calls
+for index, tool_call in sorted(tool_calls_accumulator.items()):
+    print(f"🔧 Tool Call: {tool_call['name']}")
+    print(f"   Arguments: {tool_call['arguments']}")
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+The user is asking about the weather in Beijing. I need to use the get_weather function to retrieve this information.
+I should call the function with location="Beijing".
+=============== Content =================
+
+🔧 Tool Call: get_weather
+   Arguments: {"location": "Beijing", "unit": "celsius"}
+```
+
+**Note:**
+
+- The reasoning parser shows how the model decides to use a tool
+- Tool calls are clearly marked with the function name and arguments
+- You can then execute the function and send the result back to continue the conversation
+
+**Handling Tool Call Results:**
+
+```python Example
+# After getting the tool call, execute the function
+def get_weather(location, unit="celsius"):
+    # Your actual weather API call here
+    return f"The weather in {location} is 22°{unit[0].upper()} and sunny."
+
+# Send tool result back to the model
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Beijing", "unit": "celsius"}'
+            }
+        }]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": get_weather("Beijing", "celsius")
+    }
+]
+
+final_response = client.chat.completions.create(
+    model="zai-org/GLM-4.5V",
+    messages=messages,
+    temperature=0.7
+)
+
+print(final_response.choices[0].message.content)
+# Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+## 5. Benchmark
+
+### 5.1 Accuracy Benchmark
+
+Document model accuracy on standard benchmarks:
+
+#### 5.1.1 MMMU Benchmark
+
+- Benchmark Command
+
+```bash Command
+python3 benchmark/mmmu/bench_sglang.py --response-answer-regex "<\|begin_of_box\|>(.*)<\|end_of_box\|>" --port 30000 --concurrency 64
+```
+
+- Test Result
+
+```text Output
+Benchmark time: 616.6163094160147
+answers saved to: ./answer_sglang.json
+Evaluating...
+answers saved to: ./answer_sglang.json
+{'Accounting': {'acc': 0.867, 'num': 30},
+ 'Agriculture': {'acc': 0.567, 'num': 30},
+ 'Architecture_and_Engineering': {'acc': 0.667, 'num': 30},
+ 'Art': {'acc': 0.667, 'num': 30},
+ 'Art_Theory': {'acc': 0.9, 'num': 30},
+ 'Basic_Medical_Science': {'acc': 0.8, 'num': 30},
+ 'Biology': {'acc': 0.6, 'num': 30},
+ 'Chemistry': {'acc': 0.533, 'num': 30},
+ 'Clinical_Medicine': {'acc': 0.667, 'num': 30},
+ 'Computer_Science': {'acc': 0.8, 'num': 30},
+ 'Design': {'acc': 0.867, 'num': 30},
+ 'Diagnostics_and_Laboratory_Medicine': {'acc': 0.667, 'num': 30},
+ 'Economics': {'acc': 0.833, 'num': 30},
+ 'Electronics': {'acc': 0.433, 'num': 30},
+ 'Energy_and_Power': {'acc': 0.733, 'num': 30},
+ 'Finance': {'acc': 0.767, 'num': 30},
+ 'Geography': {'acc': 0.667, 'num': 30},
+ 'History': {'acc': 0.8, 'num': 30},
+ 'Literature': {'acc': 0.9, 'num': 30},
+ 'Manage': {'acc': 0.733, 'num': 30},
+ 'Marketing': {'acc': 0.9, 'num': 30},
+ 'Materials': {'acc': 0.567, 'num': 30},
+ 'Math': {'acc': 0.8, 'num': 30},
+ 'Mechanical_Engineering': {'acc': 0.767, 'num': 30},
+ 'Music': {'acc': 0.3, 'num': 30},
+ 'Overall': {'acc': 0.732, 'num': 900},
+ 'Overall-Art and Design': {'acc': 0.683, 'num': 120},
+ 'Overall-Business': {'acc': 0.82, 'num': 150},
+ 'Overall-Health and Medicine': {'acc': 0.787, 'num': 150},
+ 'Overall-Humanities and Social Science': {'acc': 0.783, 'num': 120},
+ 'Overall-Science': {'acc': 0.707, 'num': 150},
+ 'Overall-Tech and Engineering': {'acc': 0.648, 'num': 210},
+ 'Pharmacy': {'acc': 0.9, 'num': 30},
+ 'Physics': {'acc': 0.933, 'num': 30},
+ 'Psychology': {'acc': 0.767, 'num': 30},
+ 'Public_Health': {'acc': 0.9, 'num': 30},
+ 'Sociology': {'acc': 0.667, 'num': 30}}
+eval out saved to ./val_sglang.json
+Overall accuracy: 0.732
+```
