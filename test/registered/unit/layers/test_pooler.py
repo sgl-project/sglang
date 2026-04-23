@@ -260,3 +260,7 @@ class TestPooler(unittest.TestCase):
             atol=1e-6,
             rtol=1e-6,
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
