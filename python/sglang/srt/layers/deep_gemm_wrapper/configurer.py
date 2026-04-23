@@ -23,3 +23,12 @@ ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_blackwell_supported()
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
+
+if ENABLE_JIT_DEEPGEMM:
+    import deep_gemm
+
+    DEEPGEMM_MEGA_AVAILABLE = DEEPGEMM_BLACKWELL and hasattr(
+        deep_gemm, "fp8_fp4_mega_moe"
+    )
+else:
+    DEEPGEMM_MEGA_AVAILABLE = False

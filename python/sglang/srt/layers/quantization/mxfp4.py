@@ -292,6 +292,15 @@ class Mxfp4Config(QuantizationConfig):
             elif _is_hip:
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
+            if (
+                get_moe_runner_backend().is_deep_gemm_mega()
+                and not self.is_checkpoint_mxfp4_serialized
+            ):
+                raise NotImplementedError(
+                    "deep_gemm_mega requires an offline-converted, serialized "
+                    "mxfp4 checkpoint. Dynamic/in-serving MXFP4 quantization "
+                    "is not supported."
+                )
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
             else:
@@ -317,6 +326,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.topk_indices_dtype = None
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
+        self.use_deep_gemm_mega = get_moe_runner_backend().is_deep_gemm_mega()
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
@@ -441,6 +451,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if self.use_deep_gemm_mega:
+            from sglang.srt.layers.moe.moe_runner.deep_gemm_mega import (
+                prepare_deep_gemm_mega_weights,
+            )
+
+            prepare_deep_gemm_mega_weights(layer)
+            return
         if self.use_flashinfer:
             # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
@@ -743,11 +760,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
+        if self.use_deep_gemm_mega:
+            from sglang.srt.layers.moe.moe_runner import deep_gemm_mega as _  # noqa: F401
+
+            backend = MoeRunnerBackend.DEEP_GEMM_MEGA
+        else:
+            backend = (
+                MoeRunnerBackend.TRITON_KERNELS
+                if self.use_triton_kernels
+                else MoeRunnerBackend.TRITON
+            )
         self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
@@ -761,6 +783,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+
+        if self.use_deep_gemm_mega:
+            from sglang.srt.layers.moe.moe_runner.deep_gemm_mega import (
+                DeepGemmMegaMoeQuantInfo,
+                ensure_deep_gemm_mega_runtime,
+            )
+
+            runtime = ensure_deep_gemm_mega_runtime(layer)
+            quant_info = DeepGemmMegaMoeQuantInfo(
+                runtime=runtime,
+                activation_clamp=self.moe_runner_config.gemm1_clamp_limit,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,

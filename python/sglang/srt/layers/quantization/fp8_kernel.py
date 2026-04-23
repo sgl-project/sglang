@@ -311,7 +311,6 @@ def _per_token_group_quant_8bit_raw(
     if scale_ue8m0:
         from deep_gemm import transform_sf_into_required_layout
 
-        assert group_size == 128
         x_s = transform_sf_into_required_layout(
             x_s,
             num_groups=None,
@@ -381,7 +380,6 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
         scale_ue8m0=scale_ue8m0,
     )
 
-    assert group_size == 128
     output_scale = transform_sf_into_required_layout(
         output_scale_for_kernel,
         num_groups=output.shape[0],
@@ -396,6 +394,13 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
         output_scale = output_scale.squeeze(0)
 
     return output, output_scale
+
+
+def _get_packed_ue8m0_scale_width(k: int, group_size: int) -> int:
+    assert k % group_size == 0
+    unpacked_scale_width = k // group_size
+    packed_scale_width = ceil_align(unpacked_scale_width, 4) // 4
+    return packed_scale_width
 
 
 def per_token_group_quant_8bit(
@@ -442,12 +447,13 @@ def create_per_token_group_quant_fp8_output_scale(
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
         *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        x_s_mn = x_q_mn
+        x_s_k = _get_packed_ue8m0_scale_width(x_q_k, group_size)
         aligned_mn = ceil_align(x_s_mn, 4)
-        aligned_k = ceil_align(x_s_k, 4)
+        aligned_k = ceil_align(x_s_k, 1)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
         return torch.empty(
-            (*x_batch, aligned_k // 4, aligned_mn),
+            (*x_batch, aligned_k, aligned_mn),
             device=device,
             dtype=torch.int,
         ).transpose(-1, -2)[..., :x_s_mn, :]

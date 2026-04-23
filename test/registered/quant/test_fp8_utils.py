@@ -7,6 +7,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
+from sglang.srt.layers.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,6 +44,36 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
             assert torch.all(
                 sf_fp32_original == sf_fp32_recreated
             ), f"{sf_fp32_original=} {sf_fp32_recreated}"
+
+
+class TestPackedUe8m0ScaleShape(CustomTestCase):
+    def test_group32_shape_matches_mega_contract(self):
+        num_tokens = 17
+        hidden = 7168
+        x_s = create_per_token_group_quant_fp8_output_scale(
+            x_shape=(num_tokens, hidden),
+            device="cpu",
+            group_size=32,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        self.assertEqual(x_s.dtype, torch.int32)
+        self.assertEqual(x_s.shape, (num_tokens, hidden // 128))
+
+    def test_group128_shape_preserves_existing_packed_contract(self):
+        num_tokens = 17
+        hidden = 7168
+        x_s = create_per_token_group_quant_fp8_output_scale(
+            x_shape=(num_tokens, hidden),
+            device="cpu",
+            group_size=128,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+        self.assertEqual(x_s.dtype, torch.int32)
+        self.assertEqual(x_s.shape, (num_tokens, hidden // 512))
 
 
 if __name__ == "__main__":

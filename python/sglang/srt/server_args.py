@@ -170,6 +170,7 @@ MIS_DELIMITER_TOKEN_ID = 9999
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
+    "deep_gemm_mega",
     "triton",
     "triton_kernel",
     "flashinfer_trtllm",
@@ -2904,6 +2905,32 @@ class ServerArgs:
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
             )
 
+        if self.moe_runner_backend == "deep_gemm_mega":
+            from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+                DEEPGEMM_MEGA_AVAILABLE,
+            )
+
+            assert self.quantization == "mxfp4", (
+                f"Invalid quantization '{self.quantization}'. \n"
+                "DeepGEMM Mega MoE currently supports only: 'mxfp4'."
+            )
+            assert self.moe_a2a_backend == "none", (
+                "DeepGEMM Mega MoE requires moe_a2a_backend='none' because "
+                "the kernel owns dispatch/combine within the EP group."
+            )
+            assert (
+                self.ep_size > 1 and self.ep_size == self.tp_size
+            ), "DeepGEMM Mega MoE requires ep_size == tp_size and ep_size > 1."
+            assert DEEPGEMM_MEGA_AVAILABLE, (
+                "DeepGEMM Mega MoE requires Blackwell + DeepGEMM with "
+                "fp8_fp4_mega_moe support."
+            )
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "DeepGEMM Mega MoE is enabled. "
+                "--disable-shared-experts-fusion is automatically set."
+            )
+
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert self.quantization in [
                 "modelopt_fp4",
@@ -3213,6 +3240,9 @@ class ServerArgs:
             assert not MoeRunnerBackend(
                 self.speculative_moe_runner_backend
             ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
+            assert not MoeRunnerBackend(
+                self.speculative_moe_runner_backend
+            ).is_deep_gemm_mega(), "Currently speculative MoE runner backend doesn't support deep_gemm_mega."
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"

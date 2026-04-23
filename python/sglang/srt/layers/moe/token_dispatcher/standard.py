@@ -94,6 +94,7 @@ class StandardDispatcher(BaseDispatcher):
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
             or backend.is_flashinfer_trtllm_routed()
+            or backend.is_deep_gemm_mega()
         )
         self.enable_flashinfer_trtllm_routed_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()

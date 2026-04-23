@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
+    DEEPGEMM_MEGA_AVAILABLE,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
@@ -114,6 +115,63 @@ def gemm_nt_bf16bf16f32(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.bf16_gemm_nt(lhs, rhs, out)
+
+
+def get_symm_buffer_for_mega_moe(
+    group: Any,
+    num_experts: int,
+    num_max_tokens_per_rank: int,
+    num_topk: int,
+    hidden: int,
+    intermediate_hidden: int,
+    use_fp8_dispatch: bool = True,
+    activation: str = "swiglu",
+):
+    if not DEEPGEMM_MEGA_AVAILABLE:
+        raise RuntimeError("DeepGEMM Mega MoE is not available in this environment.")
+    return deep_gemm.get_symm_buffer_for_mega_moe(
+        group,
+        num_experts,
+        num_max_tokens_per_rank,
+        num_topk,
+        hidden,
+        intermediate_hidden,
+        use_fp8_dispatch=use_fp8_dispatch,
+        activation=activation,
+    )
+
+
+def transform_weights_for_mega_moe(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+):
+    if not DEEPGEMM_MEGA_AVAILABLE:
+        raise RuntimeError("DeepGEMM Mega MoE is not available in this environment.")
+    return deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
+
+
+def fp8_fp4_mega_moe(
+    out: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    symm_buffer: Any,
+    recipe: Tuple[int, int, int] = (1, 1, 32),
+    activation: str = "swiglu",
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+):
+    if not DEEPGEMM_MEGA_AVAILABLE:
+        raise RuntimeError("DeepGEMM Mega MoE is not available in this environment.")
+    return deep_gemm.fp8_fp4_mega_moe(
+        out,
+        l1_weights,
+        l2_weights,
+        symm_buffer,
+        recipe=recipe,
+        activation=activation,
+        activation_clamp=activation_clamp,
+        fast_math=fast_math,
+    )
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
