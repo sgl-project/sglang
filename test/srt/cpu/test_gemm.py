@@ -11,6 +11,7 @@ from utils import (
     per_token_quant_int8,
     precision,
     unpack_and_dequant_awq,
+    unpack_and_dequant_gptq,
 )
 
 from sglang.test.test_utils import CustomTestCase
@@ -230,7 +231,42 @@ class TestGemm(CustomTestCase):
 
         packed_weight, packed_zero, packed_scales = (
             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                awq_weight, awq_zero, awq_scales
+                awq_weight, awq_zero, awq_scales, 0
+            )
+        )
+        target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x,
+            packed_weight,
+            packed_zero,
+            packed_scales,
+            bias,
+        )
+
+        atol = rtol = precision[ref_res.dtype]
+        torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
+
+    @parametrize(
+        M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
+    )
+    def test_int4_gptq_gemm(self, M, N, K, group_size, has_bias):
+        torch.manual_seed(127)
+        gptq_weight = torch.randint(-128, 128, (K // 8, N)).to(torch.int)
+        gptq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
+        gptq_scales = torch.rand(int(K // group_size), N).to(torch.bfloat16) // 10
+
+        bf16_weight = unpack_and_dequant_gptq(gptq_weight, gptq_zero, gptq_scales)
+        if has_bias:
+            bias = torch.rand(bf16_weight.shape[0]).to(torch.float)
+        else:
+            bias = None
+        x = torch.rand(M, bf16_weight.size(-1)).to(torch.bfloat16)
+        ref_res = torch.nn.functional.linear(
+            x, bf16_weight, bias=bias.to(torch.bfloat16) if has_bias else None
+        )
+
+        packed_weight, packed_zero, packed_scales = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                gptq_weight, gptq_zero, gptq_scales, 1
             )
         )
         target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
