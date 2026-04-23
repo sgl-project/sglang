@@ -16,13 +16,14 @@ limitations under the License.
 """Inference-only Eagle3 model with DeepSeek MLA attention for speculative decoding."""
 
 import copy
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -38,7 +39,7 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2ForCausalLM,
     DeepseekV2MLP,
 )
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import BumpAllocator, add_prefix
 
 
 class DeepseekEagle3DecoderLayer(nn.Module):
@@ -95,6 +96,12 @@ class DeepseekEagle3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("self_attn.fused_qkv_a_proj_with_mqa", prefix),
             )
+            # The DeepSeek V3 fused-A GEMM fast path (`dsv3_fused_a_gemm`) is
+            # gated on (bf16, weight.shape == (2112, 7168)) — it asserts
+            # mat_a.shape[1] == 7168. Our overridden projection takes a
+            # 14336-wide input, so we must disable the fast path explicitly,
+            # otherwise it activates for bf16 weights and crashes.
+            self.self_attn.use_min_latency_fused_a_gemm = False
         else:
             # Fallback for models without q_lora_rank: override q_proj and kv_a_proj
             from sglang.srt.layers.linear import ColumnParallelLinear
@@ -136,22 +143,42 @@ class DeepseekEagle3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        zero_allocator: "BumpAllocator" = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        residual = hidden_states
-
-        # Normalize embeddings and hidden states separately, then concatenate
+        # Match vLLM's DeepseekV2Eagle3DecoderLayer flow (_norm_after_residual variant):
+        #   residual = hidden_states (unnormalized, 7168)
+        #   hidden_states = hidden_norm(hidden_states) (normalized, 7168)
+        #   embeds = input_layernorm(embeds)
+        #   hidden_states = cat([embeds, hidden_states]) -> 14336
+        #   hidden_states = self_attn(...) -> 7168
+        #   hidden_states, residual = post_attention_layernorm(hidden_states, residual)  [fused add+norm]
+        #   hidden_states = mlp(hidden_states)
+        #   return (hidden_states, residual)
         embeds = self.input_layernorm(embeds)
+        residual = hidden_states
         hidden_states = self.hidden_norm(hidden_states)
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
-        # Self Attention (MLA)
+        target_dtype = self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype
+        if hidden_states.dtype != target_dtype:
+            hidden_states = hidden_states.to(target_dtype)
+
+        # Seed attn_tp context so DeepseekV2AttentionMLA forward_absorb_prepare can fetch latent.
+        get_attn_tp_context().set_attn_inputs(
+            AttentionInputs(
+                hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
+            )
+        )
+
+        # Self Attention (MLA) - input is 14336-dim concat, output is 7168-dim
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
         )
 
-        # Post-attention norm + residual
+        # Fused add + norm: residual <- attn_out + residual, hidden <- norm(residual)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Dense MLP
@@ -179,12 +206,21 @@ class DeepseekEagle3Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        # Target hidden size may differ from draft hidden size
+        # Target hidden size may differ from draft hidden size.
+        # Falls back to config.hidden_size if not explicitly set.
         target_hidden_size = getattr(config, "target_hidden_size", config.hidden_size)
 
-        # FC layer to project concatenated aux hidden states (3 layers) to hidden_size
+        # Number of aux layers to concatenate is derived from eagle_config so that the
+        # fc input size stays in sync with how many layer outputs the target captures.
+        # Falls back to 3 (the EAGLE3 default) if eagle_config is absent.
+        eagle_config = getattr(config, "eagle_config", {}) or {}
+        num_aux_layers = len(
+            eagle_config.get("eagle_aux_hidden_state_layer_ids", [None, None, None])
+        )
+
+        # FC layer to project concatenated aux hidden states → hidden_size
         self.fc = torch.nn.Linear(
-            target_hidden_size * 3,
+            target_hidden_size * num_aux_layers,
             config.hidden_size,
             bias=getattr(config, "bias", False),
         )
@@ -193,6 +229,11 @@ class DeepseekEagle3Model(nn.Module):
         self.midlayer = DeepseekEagle3DecoderLayer(
             config, layer_id=0, quant_config=quant_config, prefix=prefix
         )
+
+        # Expose DeepSeek-like layer metadata so post_load_weights can process MLA buffers.
+        self.layers = nn.ModuleList([self.midlayer])
+        self.start_layer = 0
+        self.end_layer = 1
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -203,6 +244,7 @@ class DeepseekEagle3Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        zero_allocator: Optional["BumpAllocator"] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             embeds = forward_batch.mm_input_embeds
@@ -222,6 +264,9 @@ class DeepseekEagle3Model(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            fc_dtype = self.fc.weight.dtype
+            if hidden_states.dtype != fc_dtype:
+                hidden_states = hidden_states.to(fc_dtype)
             hidden_states = self.fc(hidden_states)
 
         # Idle batch
@@ -235,6 +280,7 @@ class DeepseekEagle3Model(nn.Module):
             hidden_states,
             forward_batch,
             residual,
+            zero_allocator=zero_allocator,
         )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
@@ -318,8 +364,26 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+
+        # Create zero_allocator for attention operations (matching DeepseekV2 pattern)
+        device = (
+            input_embeds.device
+            if input_embeds is not None
+            else self.model.embed_tokens.weight.device
+        )
+        zero_allocator = BumpAllocator(
+            buffer_size=2 * (2 if forward_batch.can_run_tbo else 1),
+            dtype=torch.float32,
+            device=device,
+        )
+
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors,
+            zero_allocator=zero_allocator,
         )
 
         aux_hidden_states = None
@@ -342,12 +406,18 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         # Cache for fusing q_a_proj + kv_a_proj_with_mqa
         cached_a_proj = {} if self.fuse_qkv_a_proj else None
 
+        loaded_any_weight = False
+
         for name, loaded_weight in weights:
+            # Checkpoint stores decoder layer under "layers.0.*" but our module
+            # registers it as `self.midlayer` first, so named_parameters yields
+            # "model.midlayer.*". Rename so the loader can find the params.
+            if name.startswith("layers.0."):
+                name = name.replace("layers.0.", "midlayer.", 1)
+
             # Handle d2t (draft-to-target) token mapping
             if "d2t" in name:
-                self.hot_token_id = loaded_weight + torch.arange(
-                    loaded_weight.shape[0]
-                )
+                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
                 continue
 
             if "t2d" in name:
@@ -369,6 +439,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, shard_id)
+                    loaded_any_weight = True
                 is_stacked = True
                 break
 
@@ -395,14 +466,10 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                 if q_a_proj_name in cached_a_proj and kv_a_proj_name in cached_a_proj:
                     q_a_proj_weight = cached_a_proj[q_a_proj_name]
                     kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                    fused_weight = torch.cat(
-                        [q_a_proj_weight, kv_a_proj_weight], dim=0
-                    )
+                    fused_weight = torch.cat([q_a_proj_weight, kv_a_proj_weight], dim=0)
 
-                    fused_name = (
-                        q_a_proj_name.replace(
-                            "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                        )
+                    fused_name = q_a_proj_name.replace(
+                        "q_a_proj", "fused_qkv_a_proj_with_mqa"
                     )
                     full_name = (
                         fused_name
@@ -415,6 +482,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, fused_weight)
+                        loaded_any_weight = True
                     cached_a_proj.pop(q_a_proj_name)
                     cached_a_proj.pop(kv_a_proj_name)
                 continue
@@ -425,6 +493,11 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
                 param = params_dict[full_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_any_weight = True
+
+        # Initialize MLA post-load buffers (w_kc/w_vc/w_scale) used in forward_mla.
+        if loaded_any_weight:
+            self.post_load_weights(is_nextn=False, weight_names=None)
 
     def get_hot_token_id(self):
         return self.hot_token_id

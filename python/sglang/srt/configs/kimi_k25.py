@@ -6,6 +6,17 @@ from transformers import DeepseekV3Config
 from transformers.configuration_utils import PretrainedConfig
 
 
+class KimiK2Config(DeepseekV3Config):
+    """Config for Kimi-K2 text/draft models (model_type='kimi_k2').
+
+    Kimi-K2 text and EAGLE3 draft models share the same architecture as
+    DeepseekV3 but use a distinct model_type key in their config.json.
+    This thin subclass registers that key so AutoConfig can load them.
+    """
+
+    model_type = "kimi_k2"
+
+
 class KimiK25VisionConfig(PretrainedConfig):
     """Vision configuration for K2-VL (vision tower + mm projector).
 
