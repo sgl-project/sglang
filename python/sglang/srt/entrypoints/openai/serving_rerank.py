@@ -118,15 +118,14 @@ def _qwen3_rerank_score(p_yes: float, p_no: float) -> float:
 
 def _get_jinja_env():
     try:
-        import jinja2  # Lazy import: server env should provide this dependency.
+        import jinja2  
         from jinja2.sandbox import ImmutableSandboxedEnvironment
     except ModuleNotFoundError as e:
         raise ValueError(
             "Rendering Qwen3 reranker prompts requires `jinja2`. "
             "Please install it in your runtime environment (e.g., `pip install jinja2`)."
         ) from e
-
-    return jinja2.Environment(
+    # Using a sandboxed environement to stop malicious execution during model loading.
     return ImmutableSandboxedEnvironment(
         loader=jinja2.BaseLoader(),
         autoescape=False,
