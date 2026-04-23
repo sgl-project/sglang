@@ -167,6 +167,16 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             extras={"enable_upscaling": True, "upscaling_scale": 4},
         ),
     ),
+    DiffusionTestCase(
+        "ltx_2_3_hq_pipeline",
+        DiffusionServerArgs(
+            model_path="Lightricks/LTX-2.3",
+            extras=[
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode original"
+            ],
+        ),
+        T2I_sampling_params
+    ),
 ]
 
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
