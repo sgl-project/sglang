@@ -380,7 +380,6 @@ class BreakableCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
-                num_tokens=static_num_tokens,
             ):
                 self.graphs[static_num_tokens].replay()
 
