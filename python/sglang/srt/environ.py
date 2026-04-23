@@ -266,6 +266,12 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER = EnvFloat(1.0)
+    # For non-streaming requests, the scheduler still flushes intermediate
+    # output batches to the tokenizer manager every N decoded tokens so that
+    # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
+    # an accurate TTFT for benchmarking; the upstream default of 50 trades
+    # off some TTFT-metric accuracy for less IPC overhead.
+    SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -533,8 +539,8 @@ class Envs:
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
-    # Tokenizer
-    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+    # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
+    SGLANG_PATCH_TOKENIZER = EnvBool(True)
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)

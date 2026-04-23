@@ -382,7 +382,7 @@ class PrefillAdder:
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
-        mixed_with_decode_tokens: int = 0,
+        num_mixed_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
         max_prefill_bs: int = 0,
         max_running_requests: Optional[int] = None,
@@ -395,7 +395,7 @@ class PrefillAdder:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
-        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
+        self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
 
@@ -403,9 +403,9 @@ class PrefillAdder:
             self._init_dllm_meta(dllm_config)
 
         if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= mixed_with_decode_tokens
-        self.rem_total_token_offset = mixed_with_decode_tokens
-        self.cur_rem_token_offset = mixed_with_decode_tokens
+            self.rem_chunk_tokens -= num_mixed_decode_tokens
+        self.rem_total_token_offset = num_mixed_decode_tokens
+        self.cur_rem_token_offset = num_mixed_decode_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -416,6 +416,7 @@ class PrefillAdder:
         self.log_input_tokens = 0
 
         if running_batch is not None:
+            # Estimate the offset in the remaining token space
             self.rem_total_token_offset += sum(
                 [
                     self._get_running_request_total_token_offset(r)
