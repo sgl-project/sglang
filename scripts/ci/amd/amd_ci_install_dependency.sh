@@ -200,15 +200,15 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 if [[ "${GPU_ARCH}" == "mi35x" ]]; then
     echo "[CI-AITER-CHECK] Using gfx950 block from Dockerfile..."
     REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_950 AS gfx950' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
+                        | grep 'AITER_COMMIT_DEFAULT=' \
                         | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
 else
     echo "[CI-AITER-CHECK] Using gfx942 block from Dockerfile..."
     REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
+                        | grep 'AITER_COMMIT_DEFAULT=' \
                         | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
 fi
 
 
@@ -264,12 +264,13 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # clone a fresh copy to /sgl-workspace/aiter
     docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
-    # checkout correct version
+    # checkout correct version and install requirements
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
         git checkout ${REPO_AITER_COMMIT} && \
-        git submodule update --init --recursive
+        git submodule update --init --recursive && \
+        pip install -r requirements.txt
     "
 
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then

@@ -7,12 +7,12 @@ from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=350, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=446, suite="stage-b-test-2-gpu-large")
 
 
 class TestDPAttentionDP2TP2(
@@ -154,26 +154,26 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
         print(
             f"###test_gsm8k (deepseek-v3 mtp + dp):\n"
-            f"accuracy={metrics['accuracy']=:.3f}\n"
+            f"accuracy={metrics['score']=:.3f}\n"
             f"{avg_spec_accept_length=:.3f}\n"
         )
         self.assertGreater(avg_spec_accept_length, 2.5)

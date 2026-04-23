@@ -1,8 +1,8 @@
 """
 Benchmark: fused_qknorm_rope JIT vs AOT (sgl_kernel)
 
-Measures throughput (us) for fused_qk_norm_rope across typical
-LLM configurations (head_dim x num_heads x num_tokens).
+Measures throughput (µs) for fused_qk_norm_rope across typical
+LLM configurations (head_dim × num_heads × num_tokens).
 
 Run:
     python python/sglang/jit_kernel/benchmark/bench_fused_qknorm_rope.py
@@ -39,7 +39,7 @@ NUM_TOKENS_RANGE = get_benchmark_range(
     ci_range=[64, 512],
 )
 
-# (head_dim, num_heads_q, num_heads_k, num_heads_v) - typical MoE/dense configs
+# (head_dim, num_heads_q, num_heads_k, num_heads_v) — typical MoE/dense configs
 MODEL_CONFIGS = get_benchmark_range(
     full_range=[
         (64, 32, 8, 8),  # small
@@ -48,6 +48,16 @@ MODEL_CONFIGS = get_benchmark_range(
     ],
     ci_range=[(128, 32, 8, 8)],
 )
+
+# Real production shapes (self-attention; num_heads_k == num_heads_v == num_heads_q).
+# Format: (name, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim, rotary_dim)
+PRODUCTION_SHAPES = [
+    ("flux_1024", 4096, 24, 24, 24, 128, 128),
+    ("qwen_image_1024", 4096, 32, 32, 32, 128, 128),
+    ("qwen_image_partial", 4096, 32, 32, 32, 128, 64),
+    ("zimage_1024", 4096, 30, 30, 30, 128, 128),
+    ("batch2_medium", 4096, 24, 24, 24, 128, 128),  # B=2, T=2048
+]
 
 LINE_VALS = ["jit", "aot"] if AOT_AVAILABLE else ["jit"]
 LINE_NAMES = ["JIT (new)", "AOT sgl_kernel"] if AOT_AVAILABLE else ["JIT (new)"]
@@ -124,13 +134,82 @@ def bench_fused_qknorm_rope(
 
 
 # ---------------------------------------------------------------------------
+# Benchmark: fused_qk_norm_rope — real production shapes (with speedup column)
+# ---------------------------------------------------------------------------
+
+
+def bench_fused_qknorm_rope_production():
+    device = "cuda"
+    header = f"{'name':<22} {'tokens':>6} {'nq':>4} {'nk':>4} {'nv':>4} {'hd':>4} {'rdim':>5}  {'JIT(us)':>9}  {'AOT(us)':>9}  {'speedup':>8}"
+    sep = "-" * len(header)
+    print("\nfused-qknorm-rope-production-shapes:")
+    print(sep)
+    print(header)
+    print(sep)
+
+    for (
+        name,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+    ) in PRODUCTION_SHAPES:
+        total_heads = num_heads_q + num_heads_k + num_heads_v
+        qkv = torch.randn(
+            (num_tokens, total_heads * head_dim), dtype=torch.bfloat16, device=device
+        )
+        q_weight = torch.ones(head_dim, dtype=torch.bfloat16, device=device)
+        k_weight = torch.ones(head_dim, dtype=torch.bfloat16, device=device)
+        position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
+
+        common_kwargs = dict(
+            num_heads_q=num_heads_q,
+            num_heads_k=num_heads_k,
+            num_heads_v=num_heads_v,
+            head_dim=head_dim,
+            eps=1e-5,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            base=10000.0,
+            is_neox=False,
+            position_ids=position_ids,
+            factor=1.0,
+            low=1.0,
+            high=32.0,
+            attention_factor=1.0,
+            rotary_dim=rotary_dim,
+        )
+
+        jit_us, _, _ = run_benchmark(
+            lambda: fused_qk_norm_rope_jit(qkv.clone(), **common_kwargs)
+        )
+        if AOT_AVAILABLE:
+            aot_us, _, _ = run_benchmark(
+                lambda: fused_qk_norm_rope_aot(qkv.clone(), **common_kwargs)
+            )
+            speedup = f"{aot_us / jit_us:.2f}x"
+            aot_str = f"{aot_us:9.3f}"
+        else:
+            aot_str = f"{'N/A':>9}"
+            speedup = "N/A"
+
+        print(
+            f"{name:<22} {num_tokens:>6} {num_heads_q:>4} {num_heads_k:>4} {num_heads_v:>4}"
+            f" {head_dim:>4} {rotary_dim:>5}  {jit_us:9.3f}  {aot_str}  {speedup:>8}"
+        )
+    print(sep)
+
+
+# ---------------------------------------------------------------------------
 # Quick correctness diff
 # ---------------------------------------------------------------------------
 
 
 def calculate_diff():
     if not AOT_AVAILABLE:
-        print("sgl_kernel not available - skipping AOT diff check")
+        print("sgl_kernel not available — skipping AOT diff check")
         return
 
     device = "cuda"
@@ -184,3 +263,5 @@ if __name__ == "__main__":
     calculate_diff()
     print()
     bench_fused_qknorm_rope.run(print_data=True)
+    print()
+    bench_fused_qknorm_rope_production()

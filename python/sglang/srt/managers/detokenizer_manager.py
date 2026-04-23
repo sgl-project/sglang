@@ -185,8 +185,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # fast path
         first_skip, first_space = skip_list[0], space_list[0]
-        if all(s == first_skip for s in skip_list) and all(
-            sp == first_space for sp in space_list
+        if all(
+            s == first_skip and sp == first_space
+            for s, sp in zip(skip_list, space_list)
         ):
             return self.tokenizer.batch_decode(
                 ids_list,
@@ -294,8 +295,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
-                if len(new_text) > 0 and not new_text.endswith("�"):
-                    s.decoded_text = s.decoded_text + new_text
+                if new_text and not new_text.endswith("�"):
+                    s.decoded_text += new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
                     new_text = ""
@@ -332,6 +333,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
+            reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,

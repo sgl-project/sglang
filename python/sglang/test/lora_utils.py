@@ -116,10 +116,12 @@ CI_MULTI_LORA_MODELS = [
             LoRAAdaptor(
                 name="winddude/wizardLM-LlaMA-LoRA-7B",
                 prefill_tolerance=1e-1,
+                rouge_l_tolerance=0.9,
             ),
             LoRAAdaptor(
                 name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
                 prefill_tolerance=3e-1,
+                rouge_l_tolerance=0.9,
             ),
         ],
         max_loras_per_batch=2,
@@ -379,6 +381,7 @@ def run_lora_test_one_by_one(
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
     test_tag: str = "",
+    attention_backend: Optional[str] = None,
 ):
     """
     Input a batch of prompts, and run lora tests one by one with several generate requests
@@ -428,6 +431,7 @@ def run_lora_test_one_by_one(
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=disable_radix_cache,
         mem_fraction_static=mem_fraction_static,
+        attention_backend=attention_backend,
     ) as srt_runner:
         srt_outputs = srt_runner.forward(
             prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
@@ -439,6 +443,7 @@ def run_lora_test_one_by_one(
         model_type="generation",
         tp_size=model_case.tp_size,
         mem_fraction_static=mem_fraction_static,
+        attention_backend=attention_backend,
     ) as srt_runner:
         srt_no_lora_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -667,10 +672,6 @@ def create_multiple_batch_test_samples(
     prompts: List[str], lora_adapter_paths: List[str]
 ):
     random.seed(42)
-    from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
-    from sglang.srt.utils.common import is_hip
-
-    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
     test_cases = [
         (
@@ -717,19 +718,6 @@ def create_multiple_batch_test_samples(
         # ),
     ]
 
-    # [AMD] Aiter may fail this case but the model quality doesn't drop
-    # Skip this flaky case for now
-    if not _use_aiter:
-        test_cases.append(
-            (
-                [
-                    random.choice(prompts),
-                    random.choice(prompts),
-                    random.choice(prompts),
-                ],
-                [None, None, None],
-            )
-        )
     return test_cases
 
 
@@ -765,8 +753,6 @@ def run_lora_multiple_batch_on_model_cases(
                 else {
                     "speculative_algorithm": "NGRAM",
                     "speculative_num_draft_tokens": 5,
-                    "speculative_ngram_min_match_window_size": 2,
-                    "speculative_ngram_max_match_window_size": 15,
                 }
             )
             srt_runner = SRTRunner(

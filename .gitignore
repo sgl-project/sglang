@@ -178,6 +178,7 @@ benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
 tmp*.txt
+/tmp/
 
 # Torch Compile logs
 tl_out/
@@ -191,6 +192,7 @@ work_dirs/
 *.csv
 
 !logo.png
+!docs_new/images/*.png
 
 # Prerequisites
 *.d
@@ -257,6 +259,7 @@ inputs/
 
 # setuptools-scm generated version file
 python/sglang/_version.py
+python/kernel.lock
 
 # MUSA section
 # Generated source files by torchada
@@ -272,3 +275,4 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+artifacts/

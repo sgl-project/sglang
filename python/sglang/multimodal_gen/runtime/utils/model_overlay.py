@@ -24,8 +24,14 @@ from sglang.utils import load_diffusion_overlay_registry_from_env
 logger = init_logger(__name__)
 
 # Built-in diffusion model overlay registry.
-# Keep this empty until concrete overlay repos are ready to ship.
-BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {}
+BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
+    "Lightricks/LTX-2.3": {
+        # TODO: consider move to lmsys hf repo
+        "overlay_repo_id": "MickJ/LTX-2.3-overlay",
+        "overlay_revision": "main",
+        "bundled_overlay_subdir": "ltx_2_3",
+    },
+}
 
 
 MODEL_OVERLAY_METADATA_PATTERNS = [
@@ -40,6 +46,43 @@ MODEL_OVERLAY_METADATA_PATTERNS = [
 ]
 
 _MODEL_OVERLAY_REGISTRY_CACHE: dict[str, dict[str, Any]] | None = None
+
+
+def _compute_overlay_fingerprint(overlay_dir: str) -> str:
+    hasher = hashlib.sha256()
+    for root, dir_names, file_names in os.walk(overlay_dir):
+        dir_names[:] = sorted(
+            d for d in dir_names if d != "__pycache__" and not d.endswith(".egg-info")
+        )
+        for file_name in sorted(file_names):
+            if file_name.endswith((".safetensors", ".bin", ".pth", ".pt")):
+                continue
+            file_path = os.path.join(root, file_name)
+            rel_path = os.path.relpath(file_path, overlay_dir).replace(os.sep, "/")
+            hasher.update(rel_path.encode("utf-8"))
+            with open(file_path, "rb") as f:
+                hasher.update(hashlib.sha256(f.read()).digest())
+    return hasher.hexdigest()
+
+
+def _resolve_bundled_overlay_dir(overlay_spec: dict[str, Any]) -> str | None:
+    bundled_overlay_subdir = overlay_spec.get("bundled_overlay_subdir")
+    if not bundled_overlay_subdir:
+        return None
+    bundled_overlay_dir = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "model_overlays",
+            str(bundled_overlay_subdir),
+        )
+    )
+    if not os.path.isdir(bundled_overlay_dir):
+        return None
+    if load_overlay_manifest_if_present(bundled_overlay_dir) is None:
+        return None
+    return bundled_overlay_dir
 
 
 def get_diffusion_cache_root() -> str:
@@ -300,6 +343,15 @@ def download_overlay_metadata(
     *,
     snapshot_download_fn: Callable[..., str],
 ) -> str:
+    bundled_overlay_dir = _resolve_bundled_overlay_dir(overlay_spec)
+    if bundled_overlay_dir is not None:
+        logger.info(
+            "Using bundled overlay metadata for %s from %s",
+            source_model_id,
+            bundled_overlay_dir,
+        )
+        return bundled_overlay_dir
+
     overlay_repo_id = str(overlay_spec["overlay_repo_id"])
     if os.path.exists(overlay_repo_id):
         logger.info(
@@ -419,6 +471,7 @@ def materialize_overlay_model(
     materializer_version = str(manifest.get("materializer_version", "v1"))
     overlay_repo_id = str(overlay_spec["overlay_repo_id"])
     overlay_revision = str(overlay_spec.get("overlay_revision", "main"))
+    overlay_fingerprint = _compute_overlay_fingerprint(overlay_dir)
     cache_key = hashlib.sha256(
         json.dumps(
             {
@@ -426,6 +479,7 @@ def materialize_overlay_model(
                 "overlay_repo_id": overlay_repo_id,
                 "overlay_revision": overlay_revision,
                 "materializer_version": materializer_version,
+                "overlay_fingerprint": overlay_fingerprint,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -502,6 +556,7 @@ def materialize_overlay_model(
                     "overlay_repo_id": overlay_repo_id,
                     "overlay_revision": overlay_revision,
                     "materializer_version": materializer_version,
+                    "overlay_fingerprint": overlay_fingerprint,
                 },
                 f,
                 indent=2,

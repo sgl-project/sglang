@@ -18,6 +18,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.multimodal.evs import EVSProcessor
 from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
@@ -202,11 +203,11 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             input_ids_list=prompt_ids_list,
         )
 
-        return {
-            "input_ids": prompt_ids_list,
-            "mm_items": items,
-            "im_start_id": self.img_start_token_id,
-            "im_end_id": self.img_end_token_id,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.image_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=prompt_ids_list,
+            mm_items=items,
+            im_start_id=self.img_start_token_id,
+            im_end_id=self.img_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.image_token_id,
+        )

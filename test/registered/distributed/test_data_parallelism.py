@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=73, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=78, suite="stage-b-test-2-gpu-large")
 register_amd_ci(est_time=73, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -57,13 +57,13 @@ class TestDataParallelism(CustomTestCase, GSM8KMixin):
         assert response.status_code == 200
 
     def test_get_memory_pool_size(self):
-        # use `get_server_info` instead since `get_memory_pool_size` is merged into `get_server_info`
-        response = requests.get(self.base_url + "/get_server_info")
+        # use `server_info` instead since `get_memory_pool_size` is merged into `server_info`
+        response = requests.get(self.base_url + "/server_info")
         assert response.status_code == 200
 
         time.sleep(1)
 
-        response = requests.get(self.base_url + "/get_server_info")
+        response = requests.get(self.base_url + "/server_info")
         assert response.status_code == 200
 
 
