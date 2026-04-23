@@ -10,8 +10,38 @@ on:
         required: true
 
 jobs:
-  publish:
+  check-release-branch:
     if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if tag is on release branch
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            echo "Manual trigger - proceeding with release"
+          else
+            # Get all branches containing this tag's commit
+            BRANCHES=$(git branch -r --contains ${{ github.sha }} | grep 'origin/release/' || true)
+            if [ -z "$BRANCHES" ]; then
+              echo "should_release=false" >> $GITHUB_OUTPUT
+              echo "Tag is not on a release/* branch - skipping release"
+            else
+              echo "should_release=true" >> $GITHUB_OUTPUT
+              echo "Tag is on release branch: $BRANCHES"
+            fi
+          fi
+
+  publish:
+    needs: check-release-branch
+    if: github.repository == 'sgl-project/sglang' && needs.check-release-branch.outputs.should_release == 'true'
     runs-on: ubuntu-24.04
     environment: 'prod'
     strategy:
