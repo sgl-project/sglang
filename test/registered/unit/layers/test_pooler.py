@@ -1,64 +1,12 @@
-import importlib.util
-import sys
-import types
-import unittest
-from pathlib import Path
 from types import SimpleNamespace
-
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import torch
 
+from sglang.srt.layers.pooler import Pooler, PoolingType
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-def _load_pooler_module():
-    activation_mod = types.ModuleType("sglang.srt.layers.activation")
-    activation_mod.get_cross_encoder_activation_function = lambda config: (lambda x: x)
-
-    forward_batch_mod = types.ModuleType("sglang.srt.model_executor.forward_batch_info")
-
-    class ForwardBatch:
-        pass
-
-    forward_batch_mod.ForwardBatch = ForwardBatch
-
-    transformers_mod = types.ModuleType("transformers")
-
-    class PretrainedConfig:
-        pass
-
-    transformers_mod.PretrainedConfig = PretrainedConfig
-
-    repo_root = Path(__file__).resolve().parents[4]
-    pooler_path = repo_root / "python" / "sglang" / "srt" / "layers" / "pooler.py"
-    spec = importlib.util.spec_from_file_location("test_pooler_isolated", pooler_path)
-    module = importlib.util.module_from_spec(spec)
-    patched_modules = {
-        "sglang.srt.layers.activation": activation_mod,
-        "sglang.srt.model_executor.forward_batch_info": forward_batch_mod,
-        "transformers": transformers_mod,
-        spec.name: module,
-    }
-    previous_modules = {
-        name: sys.modules.get(name) for name in patched_modules if name in sys.modules
-    }
-
-    try:
-        sys.modules.update(patched_modules)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        for name in patched_modules:
-            if name in previous_modules:
-                sys.modules[name] = previous_modules[name]
-            else:
-                sys.modules.pop(name, None)
-
-
-_POOLER_MODULE = _load_pooler_module()
-Pooler = _POOLER_MODULE.Pooler
-PoolingType = _POOLER_MODULE.PoolingType
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 def _make_forward_batch(extend_seq_lens, dimensions=None, extend_seq_lens_cpu=None):
@@ -73,7 +21,7 @@ def _make_forward_batch(extend_seq_lens, dimensions=None, extend_seq_lens_cpu=No
     )
 
 
-class TestPooler(unittest.TestCase):
+class TestPooler(CustomTestCase):
     def test_last_pooling_returns_last_token(self):
         hidden_states = torch.tensor(
             [
@@ -182,8 +130,32 @@ class TestPooler(unittest.TestCase):
             ]
         )
         forward_batch = _make_forward_batch(
-            [2, 3], extend_seq_lens_cpu=torch.tensor([2, 3], dtype=torch.int32)
+            [1, 4], extend_seq_lens_cpu=torch.tensor([2, 3], dtype=torch.int32)
         )
+
+        output = Pooler(PoolingType.MEAN, normalize=False)(hidden_states, forward_batch)
+
+        torch.testing.assert_close(
+            output.embeddings,
+            torch.tensor(
+                [
+                    [2.0, 3.0],
+                    [7.0, 8.0],
+                ]
+            ),
+        )
+
+    def test_mean_pooling_prefers_extend_seq_lens_cpu(self):
+        hidden_states = torch.tensor(
+            [
+                [1.0, 2.0],
+                [3.0, 4.0],
+                [5.0, 6.0],
+                [7.0, 8.0],
+                [9.0, 10.0],
+            ]
+        )
+        forward_batch = _make_forward_batch([1, 4], extend_seq_lens_cpu=[2, 3])
 
         output = Pooler(PoolingType.MEAN, normalize=False)(hidden_states, forward_batch)
 
