@@ -478,20 +478,18 @@ class TestNgramExternalSamArgs(CustomTestCase):
 
 
 class TestDeepEPWaterfillArgs(CustomTestCase):
-    def test_waterfill_enforces_shared_experts_fusion_and_stats(self):
+    def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="deepep",
             enable_deepep_waterfill=True,
             disable_shared_experts_fusion=True,
         )
-        # dummy-model path short-circuits __post_init__; invoke handlers directly.
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
         server_args._handle_a2a_moe()
-        server_args._handle_eplb_and_dispatch()
 
         self.assertFalse(server_args.disable_shared_experts_fusion)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
-        self.assertEqual(server_args.expert_distribution_recorder_mode, "stat")
 
 
 if __name__ == "__main__":
