@@ -179,6 +179,8 @@ class AWQConfig(QuantizationConfig):
                     return UnquantizedLinearMethod()
                 return AWQLinearAscendMethod(self)
             elif isinstance(layer, FusedMoE):
+                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                    return None
                 return AWQMoEAscendMethod(self)
             return None
 
@@ -322,6 +324,8 @@ class AWQMarlinConfig(QuantizationConfig):
                 )
             return AWQMarlinLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                return None
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
             if not check_moe_marlin_supports_layer(layer, self.group_size):
