@@ -600,6 +600,11 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
+                and not (
+                    get_global_server_args().enable_torch_compile
+                    and hidden_states.shape[0]
+                    <= get_global_server_args().torch_compile_max_bs
+                )
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
