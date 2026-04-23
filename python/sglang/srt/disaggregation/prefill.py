@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -388,13 +389,29 @@ class SchedulerDisaggregationPrefillMixin:
 
         return batch
 
-    def _should_use_pipelined(self: Scheduler, batch) -> bool:
-        """Check if the batch should use layer-pipelined KV transfer."""
+    def _get_pipeline_group_size(self: Scheduler, batch) -> int:
+        """Return adaptive group_size, or 0 if pipelining should not be used."""
         if not envs.SGLANG_PIPELINED_KV_TRANSFER.get():
-            return False
+            return 0
         min_tokens = envs.SGLANG_PIPELINE_MIN_TOKENS.get()
         avg_tokens = sum(req.extend_input_len for req in batch.reqs) // len(batch.reqs)
-        return avg_tokens >= min_tokens
+        if avg_tokens < min_tokens:
+            return 0
+
+        # If user explicitly set group_size, respect it (backward compatible)
+        explicit = os.environ.get("SGLANG_PIPELINE_GROUP_SIZE")
+        if explicit is not None:
+            return int(explicit)
+
+        # Adaptive: control iterations in [6, 10] based on prompt length
+        num_layers = self.model_config.num_hidden_layers
+        if avg_tokens < 4096:
+            target_iters = 10
+        elif avg_tokens < 8192:
+            target_iters = 8
+        else:
+            target_iters = 6
+        return max(1, num_layers // target_iters)
 
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -419,8 +436,9 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                if self._should_use_pipelined(batch):
-                    result = self.run_batch_pipelined(batch)
+                group_size = self._get_pipeline_group_size(batch)
+                if group_size > 0:
+                    result = self.run_batch_pipelined(batch, group_size=group_size)
                     self.process_batch_result_pipelined_prefill(batch, result)
                 else:
                     result = self.run_batch(batch)

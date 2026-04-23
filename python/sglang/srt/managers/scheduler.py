@@ -3208,14 +3208,16 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
-    def run_batch_pipelined(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def run_batch_pipelined(
+        self, batch: ScheduleBatch, group_size: int = 10
+    ) -> GenerationBatchResult:
         """Run a batch with layer-pipelined KV transfer.
 
         Instead of computing all layers then transferring all KV at once,
         this runs layers in groups and enqueues KV transfer after each group.
         Transfer of group N overlaps with GPU compute of group N+1.
 
-        Group size is controlled by SGLANG_PIPELINE_GROUP_SIZE (default=10).
+        group_size is computed adaptively by _get_pipeline_group_size().
         """
         self.forward_ct += 1
         self._profile_batch_predicate(batch)
@@ -3227,7 +3229,6 @@ class Scheduler(
 
         num_layers = self.model_config.num_hidden_layers
         page_size = self.token_to_kv_pool_allocator.page_size
-        group_size = envs.SGLANG_PIPELINE_GROUP_SIZE.get()
 
         # Prepare KV page indices for all requests (same for every layer)
         req_page_indices_list = []
