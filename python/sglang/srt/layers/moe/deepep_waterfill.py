@@ -510,3 +510,30 @@ class DeepEPWaterfillBalancer:
             topk_ids=expanded_ids,
             router_logits=topk_output.router_logits,
         )
+
+
+class WaterfillTopK:
+    """TopK wrapper: dispatches the shared expert via DeepEP waterfill.
+
+    Drop-in replacement for a base TopK when waterfill is enabled. __call__
+    and empty_topk_output return output already expanded from (N, 8) to
+    (N, 9) with the shared expert routed to the least-loaded EP rank.
+    Other attribute access is forwarded to the base TopK.
+    """
+
+    def __init__(self, base_topk, balancer: DeepEPWaterfillBalancer):
+        self._base = base_topk
+        self._balancer = balancer
+
+    def __call__(self, hidden_states, router_logits, **kwargs):
+        self._balancer.update_static_weights()
+        topk_output = self._base(hidden_states, router_logits, **kwargs)
+        return self._balancer.expand_topk(topk_output, hidden_states.shape[0])
+
+    def empty_topk_output(self, device):
+        self._balancer.update_static_weights()
+        topk_output = self._base.empty_topk_output(device)
+        return self._balancer.expand_topk(topk_output, 0)
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)

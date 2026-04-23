@@ -583,21 +583,25 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
-        # DeepEP waterfill balancer
+        # DeepEP waterfill: wrap self.topk so that the shared expert is
+        # dispatched to the least-loaded EP rank via expand_topk.
         self._enable_deepep_waterfill = _enable_deepep_waterfill
-        self.deepep_waterfill_balancer = None
         if self._enable_deepep_waterfill:
             from sglang.srt.distributed import get_moe_expert_parallel_rank
-            from sglang.srt.layers.moe.deepep_waterfill import DeepEPWaterfillBalancer
+            from sglang.srt.layers.moe.deepep_waterfill import (
+                DeepEPWaterfillBalancer,
+                WaterfillTopK,
+            )
 
-            self.deepep_waterfill_balancer = DeepEPWaterfillBalancer(
+            balancer = DeepEPWaterfillBalancer(
                 num_routed_experts=config.n_routed_experts,
                 world_size=self.moe_ep_size,
                 rank=get_moe_expert_parallel_rank(),
                 layer_id=self.layer_id,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
-            self.deepep_waterfill_balancer.update_static_weights()
+            balancer.update_static_weights()
+            self.topk = WaterfillTopK(self.topk, balancer)
 
     def get_moe_weights(self):
         return [
@@ -830,9 +834,6 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self._enable_deepep_waterfill:
-            self.deepep_waterfill_balancer.update_static_weights()
-
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
@@ -862,15 +863,13 @@ class DeepseekV2MoE(nn.Module):
                     layer_id=self.layer_id,
                 ),
             )
-            if self._enable_deepep_waterfill:
-                topk_output = self.deepep_waterfill_balancer.expand_topk(
-                    topk_output, hidden_states.shape[0]
-                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-            if self._enable_deepep_waterfill:
-                topk_output = self.deepep_waterfill_balancer.expand_topk(topk_output, 0)
-            elif is_deepep_class_backend() and self.num_fused_shared_experts > 0:
+            if (
+                not self._enable_deepep_waterfill
+                and is_deepep_class_backend()
+                and self.num_fused_shared_experts > 0
+            ):
                 n = self.num_fused_shared_experts
                 topk_output = topk_output._replace(
                     topk_ids=topk_output.topk_ids.new_empty(
@@ -2264,11 +2263,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         disable_reason = None
-        if get_global_server_args().enable_deepep_waterfill:
-            server_args.enforce_shared_experts_fusion = True
-        elif (
-            is_deepep_class_backend() and server_args.enforce_shared_experts_fusion
-        ):
+        if is_deepep_class_backend() and server_args.enforce_shared_experts_fusion:
             pass
         elif is_sbo_enabled() or is_tbo_enabled():
             disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."

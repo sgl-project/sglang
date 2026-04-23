@@ -485,6 +485,9 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
             enable_deepep_waterfill=True,
             disable_shared_experts_fusion=True,
         )
+        # dummy-model path short-circuits __post_init__; invoke handlers directly.
+        server_args._handle_a2a_moe()
+        server_args._handle_eplb_and_dispatch()
 
         self.assertFalse(server_args.disable_shared_experts_fusion)
         self.assertTrue(server_args.enforce_shared_experts_fusion)

@@ -2884,6 +2884,7 @@ class ServerArgs:
                         "disable_shared_experts_fusion is overridden to False because DeepEP Waterfill requires shared expert fusion."
                     )
                     self.disable_shared_experts_fusion = False
+                self.enforce_shared_experts_fusion = True
                 logger.info(
                     "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
                 )
@@ -2959,10 +2960,12 @@ class ServerArgs:
                 ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
     def _handle_eplb_and_dispatch(self):
-        if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
+        if (self.enable_eplb or self.enable_deepep_waterfill) and (
+            self.expert_distribution_recorder_mode is None
+        ):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(
-                "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+                "EPLB or DeepEP Waterfill is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
         if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
