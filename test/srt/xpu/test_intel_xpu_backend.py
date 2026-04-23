@@ -60,7 +60,7 @@ class TestIntelXPUBackend(CustomTestCase):
 
     @intel_xpu_benchmark(
         ["--attention-backend", "intel_xpu", "--page-size", "128"],
-        mem_fraction_static="0.25",
+        mem_fraction_static="0.5",
     )
     def test_attention_backend(self):
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE
